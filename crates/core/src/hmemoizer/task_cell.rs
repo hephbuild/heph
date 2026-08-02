@@ -238,78 +238,83 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = V> + Send + 'static,
     {
-        let cell = {
+        let cell = 'cell: {
             let mut cache = self.cache_lock();
-            match cache.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    if let Some(v) = e.get().peek() {
-                        return v.clone();
-                    }
-                    // Under the lock, so a cancellation racing us either sees
-                    // this interest and stands down, or already evicted the
-                    // entry and we never find it — same rule as the poll cell.
-                    e.get().acquire_interest();
-                    Arc::clone(e.get())
+            // The hit path *borrows* the key. `entry` needs an owned one, so
+            // asking for it up front cloned on every call — including the
+            // hits, which are the common case — to look up a key the map
+            // already holds an equal copy of. For the allocating key types
+            // (`String`, `PkgBuf`, the `(Addr, String)` tuples) that clone is
+            // a malloc + copy per memoized call, discarded microseconds later.
+            //
+            // The cold path pays a second hash for the `insert` below, which
+            // is noise next to the task spawn it sits in front of.
+            if let Some(existing) = cache.get(&key) {
+                if let Some(v) = existing.peek() {
+                    return v.clone();
                 }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    // Lazy async blocks: `f()` only builds the state machine,
-                    // so constructing it under the lock is free. Built BEFORE
-                    // the grave is taken out of the map: a caller closure that
-                    // panics here would otherwise unwind with the removed
-                    // grave in hand, losing the predecessor's handle — the
-                    // next caller would then spawn against a still-dying
-                    // predecessor with nothing to serialize on.
-                    let fut = f();
-                    let grave = self
-                        .maps
-                        .graves
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .remove(&key);
-                    let restarts = grave.as_ref().map_or(0, |g| g.restarts + 1);
-                    let cell = Arc::new(TaskCell {
-                        outcome: OnceLock::new(),
-                        notify: tokio::sync::Notify::new(),
-                        interest: AtomicUsize::new(0),
-                        task: Mutex::new(None),
-                        created: Instant::now(),
-                        restarts,
-                    });
-                    cell.acquire_interest();
-                    let body = BodyTask {
-                        cell: Arc::clone(&cell),
-                        maps: Arc::clone(&self.maps),
-                        key: key.clone(),
-                        grave,
-                    };
-                    // Spawn while still holding the cache lock: publish also
-                    // takes that lock, so the task cannot publish before its
-                    // handle is stored below — a `Done` cell never ends up
-                    // holding a live handle.
-                    //
-                    // The spawn itself is guarded: on a shut-down runtime,
-                    // tokio either panics the spawn or drops the task without
-                    // ever polling it. Both degrade to a poisoned cell (the
-                    // drop path via `BodyTask::drop`), so a joiner gets a loud
-                    // failure — never an eternal park, and never an unwind out
-                    // of this frame into a cdylib seam.
-                    let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        super::spawn_on_with_cycle_ctx(&self.handle, body.run(fut))
-                    }));
-                    match spawned {
-                        Ok(task) => {
-                            *cell.task_slot() = Some(task);
-                        }
-                        Err(_) => {
-                            let _already_poisoned = cell
-                                .outcome
-                                .set(Err("memoized task could not spawn (runtime shut down)"));
-                        }
-                    }
-                    e.insert(Arc::clone(&cell));
-                    cell
+                // Under the lock, so a cancellation racing us either sees
+                // this interest and stands down, or already evicted the
+                // entry and we never find it — same rule as the poll cell.
+                existing.acquire_interest();
+                break 'cell Arc::clone(existing);
+            }
+            // Lazy async blocks: `f()` only builds the state machine,
+            // so constructing it under the lock is free. Built BEFORE
+            // the grave is taken out of the map: a caller closure that
+            // panics here would otherwise unwind with the removed
+            // grave in hand, losing the predecessor's handle — the
+            // next caller would then spawn against a still-dying
+            // predecessor with nothing to serialize on.
+            let fut = f();
+            let grave = self
+                .maps
+                .graves
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+            let restarts = grave.as_ref().map_or(0, |g| g.restarts + 1);
+            let cell = Arc::new(TaskCell {
+                outcome: OnceLock::new(),
+                notify: tokio::sync::Notify::new(),
+                interest: AtomicUsize::new(0),
+                task: Mutex::new(None),
+                created: Instant::now(),
+                restarts,
+            });
+            cell.acquire_interest();
+            let body = BodyTask {
+                cell: Arc::clone(&cell),
+                maps: Arc::clone(&self.maps),
+                key: key.clone(),
+                grave,
+            };
+            // Spawn while still holding the cache lock: publish also
+            // takes that lock, so the task cannot publish before its
+            // handle is stored below — a `Done` cell never ends up
+            // holding a live handle.
+            //
+            // The spawn itself is guarded: on a shut-down runtime,
+            // tokio either panics the spawn or drops the task without
+            // ever polling it. Both degrade to a poisoned cell (the
+            // drop path via `BodyTask::drop`), so a joiner gets a loud
+            // failure — never an eternal park, and never an unwind out
+            // of this frame into a cdylib seam.
+            let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::spawn_on_with_cycle_ctx(&self.handle, body.run(fut))
+            }));
+            match spawned {
+                Ok(task) => {
+                    *cell.task_slot() = Some(task);
+                }
+                Err(_) => {
+                    let _already_poisoned = cell
+                        .outcome
+                        .set(Err("memoized task could not spawn (runtime shut down)"));
                 }
             }
+            cache.insert(key.clone(), Arc::clone(&cell));
+            cell
         };
 
         // Cancel the computation if we turn out to be its last awaiter —
@@ -1179,5 +1184,110 @@ mod repro {
             // Drain the grave (if the canceller won) so rounds stay independent.
             m.maps.graves.lock().unwrap().remove(&format!("k{round}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod hit_path_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn within<T>(fut: impl Future<Output = T>) -> T {
+        tokio::time::timeout(TIMEOUT, fut)
+            .await
+            .expect("test future must complete within the timeout")
+    }
+
+    /// A key whose `Clone` is counted. Equality and hashing go through `name`
+    /// alone, so the counter is invisible to the map.
+    #[derive(Debug)]
+    struct CountedKey {
+        name: &'static str,
+        clones: Arc<AtomicU32>,
+    }
+
+    impl CountedKey {
+        fn new(name: &'static str, clones: &Arc<AtomicU32>) -> Self {
+            Self {
+                name,
+                clones: Arc::clone(clones),
+            }
+        }
+    }
+
+    impl Clone for CountedKey {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::SeqCst);
+            Self {
+                name: self.name,
+                clones: Arc::clone(&self.clones),
+            }
+        }
+    }
+
+    impl PartialEq for CountedKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.name == other.name
+        }
+    }
+    impl Eq for CountedKey {}
+
+    impl std::hash::Hash for CountedKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.name.hash(state);
+        }
+    }
+
+    /// A memoizer hit answers from a borrow and takes no key clone.
+    ///
+    /// `entry` needs an owned key, so the shape this replaced cloned on every
+    /// call — hits included, and hits are the common case. For the allocating
+    /// key types in the engine (`String`, `PkgBuf`, the `(Addr, String)`
+    /// tuples) that was a malloc + copy per memoized call, thrown away as soon
+    /// as the lookup found the equal key the map already held.
+    ///
+    /// The cold path is deliberately not asserted on: it must take owned keys,
+    /// one for the map and one for the body task, and that is not a
+    /// regression to guard.
+    #[tokio::test]
+    async fn a_memoizer_hit_never_clones_the_key() {
+        let m: TaskInner<CountedKey, u32> =
+            TaskInner::new("hit-clone-test", tokio::runtime::Handle::current());
+        let clones = Arc::new(AtomicU32::new(0));
+        let runs = Arc::new(AtomicU32::new(0));
+
+        // Cold: publishes the cell.
+        let v = within(m.process(CountedKey::new("k", &clones), {
+            let runs = Arc::clone(&runs);
+            move || async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                7
+            }
+        }))
+        .await;
+        assert_eq!(v, 7);
+
+        clones.store(0, Ordering::SeqCst);
+
+        // Hit: the value is already published, so this must be answered
+        // without touching the key beyond the borrow the lookup needs.
+        let v = within(m.process(CountedKey::new("k", &clones), {
+            let runs = Arc::clone(&runs);
+            move || async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                9
+            }
+        }))
+        .await;
+        assert_eq!(v, 7, "the memoized value is returned, not recomputed");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "no recompute");
+        assert_eq!(
+            clones.load(Ordering::SeqCst),
+            0,
+            "the hit path cloned the key"
+        );
     }
 }
