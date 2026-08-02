@@ -1061,9 +1061,15 @@ pub fn render_stall(r: &StallReport) -> String {
     // it is exactly what cannot help — the TUI clears ISIG, so the terminal
     // never raises SIGINT. Name the escalation that does work, here, where it is
     // read, rather than leaving it to be rediscovered per incident.
+    // Names the inventory and *not* the backtraces: `--diag-backtrace` is off by
+    // default because capturing a stack from a signal handler calls the unwinder
+    // and the allocator, and a thread interrupted inside `malloc` deadlocks the
+    // whole process (`src/diag.rs`). This line is read by someone whose build is
+    // already in trouble — pointing them at the half that can wedge it is the one
+    // thing it must not do.
     out.push_str(&format!(
-        "\n  Still stuck? `kill -QUIT {}` writes every thread's backtrace plus the\n  \
-         full in-flight inventory next to this file; it does not kill the process.\n",
+        "\n  Still stuck? `kill -QUIT {}` writes the full in-flight inventory next\n  \
+         to this file; it does not kill the process.\n",
         std::process::id()
     ));
 
@@ -1992,6 +1998,13 @@ mod tests {
     /// A frozen TUI swallows Ctrl-C (raw mode clears ISIG), so the paragraph must
     /// name the escalation that does work instead of leaving it to be
     /// rediscovered per incident.
+    ///
+    /// And it must name the *safe* escalation. `SIGQUIT` used to dump every
+    /// thread's stack unconditionally, which calls the unwinder and the allocator
+    /// from a signal handler and deadlocks a process interrupted inside `malloc`
+    /// (`src/diag.rs`). This paragraph is read by someone whose build is already
+    /// in trouble; advertising the half that can wedge it is the one thing it
+    /// must not do, and the claim went stale silently when the default changed.
     #[test]
     fn the_paragraph_names_the_next_step() {
         let s = state();
@@ -2001,6 +2014,16 @@ mod tests {
         assert!(
             text.contains(&std::process::id().to_string()),
             "the pid must be filled in, not left as a placeholder: {text}"
+        );
+        assert!(
+            text.contains("in-flight inventory"),
+            "the paragraph must name what the dump actually produces: {text}"
+        );
+        assert!(
+            !text.contains("backtrace"),
+            "the paragraph must not promise thread backtraces: they are behind \
+             --diag-backtrace precisely because that path can deadlock the \
+             process this reader is trying to rescue: {text}"
         );
     }
 
