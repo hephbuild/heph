@@ -118,7 +118,7 @@ fn main() -> ExitCode {
     // did not anticipate — you would have to have passed a flag on the run that
     // is already stuck. Costs one `signal(2)` at startup; the file is opened
     // lazily inside the handler.
-    diag::install();
+    diag::install(cli.global.diag_backtrace);
 
     // When `--pprof-cpu` is set, start the sampler + `SIGUSR2` dump watcher.
     let pprof_watcher = match cli.global.pprof_cpu.clone() {

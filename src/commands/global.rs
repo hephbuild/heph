@@ -43,6 +43,21 @@ pub struct GlobalOptions {
         global = true
     )]
     pub stall_notice: std::time::Duration,
+    /// Also dump every thread's backtrace on `SIGQUIT`. Can deadlock the process
+    ///
+    /// `SIGQUIT` always writes the in-flight report (what work is open and what
+    /// it is waiting on), which is the half that names the stuck work and is
+    /// written by an ordinary thread. This flag adds per-thread backtraces,
+    /// which are captured *inside a signal handler* — that calls the DWARF
+    /// unwinder and the allocator, neither of which is async-signal-safe. A
+    /// thread interrupted inside `malloc` re-enters it from its own handler and
+    /// deadlocks holding the arena lock, taking the whole process with it.
+    ///
+    /// Off by default because that outcome is the opposite of what a hang
+    /// diagnostic is for. Turn it on only when the in-flight report was not
+    /// enough, on a run you are willing to lose.
+    #[arg(long = "diag-backtrace", global = true)]
+    pub diag_backtrace: bool,
     /// Disable the interactive TUI (force CI/log-only output)
     #[arg(long = "no-tui", global = true)]
     pub no_tui: bool,

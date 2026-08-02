@@ -1,31 +1,55 @@
-//! On-demand thread backtraces for diagnosing hangs. Always installed.
+//! On-demand in-flight state for diagnosing hangs. Always installed.
 //!
 //! When a run hangs in a locked-down CI container, every external tool is blocked:
 //! ptrace is denied (no gdb/perf/`gcore`), the root fs is read-only (kernel core
 //! dumps are dropped), and `--pprof-cpu` only samples a run it was passed on —
 //! which is never the run that turns out to hang. The one channel left is the
-//! process dumping its own stacks. A `SIGUSR1` handler
-//! appends the *signalled* thread's backtrace to a file, so signalling the busy
-//! thread reveals the loop — and a file beats stderr when hundreds of threads
-//! dump at once.
+//! process reporting on itself.
 //!
-//! Dump every thread of a stuck process by sending it `SIGQUIT` — which is
-//! `Ctrl-\\` at the terminal, so a human staring at a frozen TUI needs no
-//! forethought, no flag, and no recipe:
+//! Dump a stuck process by sending it `SIGQUIT` — which is `Ctrl-\\` at the
+//! terminal, so a human staring at a frozen TUI needs no forethought, no flag,
+//! and no recipe:
 //! ```sh
 //! kill -QUIT <pid>          # or just press Ctrl-\\
-//! cat .heph3/diag/dump-<pid>.txt
+//! cat <home>/diag/dump-<pid>.txt
 //! ```
 //! `SIGQUIT` follows the Go/JVM convention and, unlike `SIGUSR1`, is not already
-//! taken here (`SIGUSR2` belongs to the pprof sampler). The handler dumps and
-//! continues; it never terminates the process.
+//! taken here (`SIGUSR2` belongs to the pprof sampler). The handler sets one
+//! atomic and returns; the work happens on the sweeper thread, and the process
+//! keeps running.
 //!
-//! The handler is not strictly async-signal-safe (capturing a backtrace
-//! allocates), but it targets a CPU-bound hang, where the interrupted thread is
-//! looping in compute rather than inside the allocator — a pragmatic trade for a
-//! diagnostic that is off unless `--diag-backtrace` is passed. Backtraces resolve
-//! to function names only when the binary keeps its symbol table
-//! (`strip = "debuginfo"`, not `strip = true`).
+//! # What the dump contains, and why backtraces are opt-in
+//!
+//! By default: the **in-flight report** — every memoized computation that is
+//! open, how long it has been open, and what it is waiting on. It is produced by
+//! [`write_inventory`] on an ordinary thread, allocating and locking normally,
+//! and it is the half that names the stuck work. See [`inventory_report`].
+//!
+//! With `--diag-backtrace`: every thread's stack too. That half is captured
+//! *inside a signal handler* ([`on_dump_signal`]), which calls
+//! `Backtrace::force_capture` — the DWARF unwinder, which takes libgcc's global
+//! `object_mutex` and re-enters `dl_iterate_phdr` — and then `format!`, which
+//! allocates. Neither is async-signal-safe.
+//!
+//! This used to be unconditional, on the reasoning that it "targets a CPU-bound
+//! hang, where the interrupted thread is looping in compute rather than inside
+//! the allocator". That premise does not hold for this engine: a real run
+//! measured ~11% of its CPU in drop glue alone, so at any instant some worker is
+//! very likely inside `malloc`. Signal *that* thread and its handler re-enters
+//! the allocator, deadlocks on the arena lock it already holds, and never
+//! returns — so every other thread blocks on the same lock and the process
+//! freezes with all threads at 0% CPU. Observed in practice, on the very
+//! workload someone reached for `SIGQUIT` to diagnose.
+//!
+//! Serialising the sweep does not fix it (and the cap and inter-thread gap below
+//! were never able to): the deadlock needs only *one* thread interrupted in the
+//! wrong place, not two overlapping. The same class of bug made `--pprof-cpu`
+//! segfault the process it was diagnosing, fixed there by walking frame pointers
+//! instead of calling the unwinder. Doing that here would make the backtrace
+//! half safe as well; until then it is behind a flag that says what it costs.
+//!
+//! Backtraces resolve to function names only when the binary keeps its symbol
+//! table (the `debug` release flavour; the stripped `std` one yields addresses).
 
 use std::backtrace::Backtrace;
 use std::ffi::CString;
@@ -37,14 +61,23 @@ use tracing::warn;
 /// File descriptor the handler appends dumps to; `-1` until [`install`] opens it.
 static DIAG_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// Install the `SIGQUIT` → backtrace-to-file handler. Called unconditionally at
-/// startup.
+/// Whether this run also dumps per-thread backtraces. Set once by [`install`]
+/// from `--diag-backtrace`; read by [`sweep`]. See the module docs for why the
+/// backtrace half can deadlock the process and the in-flight report cannot.
+static BACKTRACES: AtomicBool = AtomicBool::new(false);
+
+/// Install the `SIGQUIT` → dump handler. Called unconditionally at startup.
 ///
 /// Unconditionally, because the opt-in version could not work: nobody passes a
 /// diagnostic flag on the run they do not yet know will hang, and on a process
 /// started without it `SIGQUIT` defaults to *terminating* — so reaching for the
 /// dump would kill the build being inspected. The cost is one `signal(2)`.
-pub fn install() {
+///
+/// `backtraces` gates only the *contents*, never the handler: `SIGQUIT` always
+/// writes the in-flight report, so the always-on guarantee above still holds for
+/// the half that is safe to produce.
+pub fn install(backtraces: bool) {
+    BACKTRACES.store(backtraces, Ordering::Relaxed);
     let handler = on_sigquit as extern "C" fn(libc::c_int);
     // SAFETY: the handler only stores to an `AtomicBool` (async-signal-safe);
     // installed once at startup before the runtime matters.
@@ -107,13 +140,10 @@ fn dump_path() -> std::path::PathBuf {
 
 /// Poll for a requested dump and perform the sweep off the signal handler.
 ///
-/// The sweep must not run *in* the handler: capturing a backtrace allocates and
-/// takes the unwinder's global lock, and signalling every thread at once puts all
-/// of them inside `_Unwind_Backtrace` together — one interrupted mid-`malloc`
-/// then re-enters the allocator from its handler. That is the same class of bug
-/// that made `--pprof-cpu` segfault the process it was diagnosing, and heph runs
-/// a lot of threads (tokio workers, the blocking pool, tokio's own blocking pool,
-/// the sandbox cleaner). So: serial, with a gap, and capped.
+/// The sweep must not run *in* the handler: it opens files, allocates, and takes
+/// locks. Doing it on a plain thread is also what keeps the default path — the
+/// in-flight report — entirely free of the re-entrancy hazard that put
+/// `--diag-backtrace` behind a flag (module docs).
 fn spawn_sweeper() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -166,18 +196,35 @@ fn sweep() {
     }
     DIAG_FD.store(fd, Ordering::Relaxed);
 
-    let handler = on_dump_signal as extern "C" fn(libc::c_int);
-    // SAFETY: installed before any thread is signalled below.
-    unsafe {
-        libc::signal(DUMP_SIGNAL, handler as libc::sighandler_t);
-    }
-
-    let n = sweep_threads();
+    // Opt-in, and deliberately *before* the inventory: the backtrace half is the
+    // half that can wedge the process (module docs), so if it does, the reader
+    // still gets a file whose contents show how far it got.
+    let n = if BACKTRACES.load(Ordering::Relaxed) {
+        let handler = on_dump_signal as extern "C" fn(libc::c_int);
+        // SAFETY: installed before any thread is signalled below.
+        unsafe {
+            libc::signal(DUMP_SIGNAL, handler as libc::sighandler_t);
+        }
+        sweep_threads()
+    } else {
+        0
+    };
     write_inventory(fd);
     // `warn!`, not `info!`: someone pressed `Ctrl-\` on a frozen build and the one
     // thing they need back is where the dump went. At `info!` that line sits in
     // the same stream as ordinary build chatter and scrolls past unread.
-    warn!(threads = n, path = %path.display(), "Wrote thread backtraces");
+    //
+    // Naming the flag matters as much as the path: a reader who needed stacks and
+    // got none has no other way to learn they were available.
+    if n == 0 {
+        warn!(
+            path = %path.display(),
+            "Wrote in-flight report (no thread backtraces; pass --diag-backtrace to add them, \
+             at the risk of deadlocking the process)"
+        );
+    } else {
+        warn!(threads = n, path = %path.display(), "Wrote thread backtraces and in-flight report");
+    }
 }
 
 /// Append the parked-future state to the dump, after the thread backtraces.
@@ -353,6 +400,73 @@ mod tests {
         // Unset in a test process, so both must self-describe.
         assert!(text.contains("HEPH_DEBUG_MEMOIZER_CYCLE"), "{text}");
         assert!(text.contains("HEPH_PHASE_TRACE"), "{text}");
+    }
+
+    /// `SIGQUIT` writes the in-flight report and installs **no** signal handler
+    /// unless `--diag-backtrace` asked for one.
+    ///
+    /// The handler is the hazard: it captures a backtrace (DWARF unwinder) and
+    /// `format!`s it (allocator) from inside a signal, so a thread interrupted
+    /// in `malloc` deadlocks the process — observed on a real run, which is how
+    /// this default came to be. Asserting on `SIGUSR1`'s disposition rather than
+    /// on the file contents is deliberate: "no backtrace text appeared" would
+    /// also pass on a build where the sweep ran and simply found nothing, while
+    /// a handler still installed is the actual footgun.
+    ///
+    /// Only the *off* path is exercised end to end. Driving the on path here
+    /// would signal every thread of the test binary — i.e. reproduce the
+    /// deadlock this test exists because of. For the same reason the flag round
+    /// trip is asserted *inside* this test rather than beside it: `BACKTRACES`
+    /// is process-global, and a sibling test setting it to `true` in parallel
+    /// with the `sweep()` below is exactly that reproduction, by accident.
+    #[test]
+    fn a_dump_installs_no_handler_unless_backtraces_were_asked_for() {
+        fn sigusr1_disposition() -> libc::sighandler_t {
+            // SAFETY: all-zero is a valid initial `sigaction`; it is only an
+            // out-param here.
+            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: a null `act` queries the disposition without installing
+            // anything; `old` is a valid out-param `sigaction` only writes to.
+            unsafe {
+                libc::sigaction(DUMP_SIGNAL, std::ptr::null(), &mut old);
+            }
+            old.sa_sigaction
+        }
+
+        // The flag reaches the sweeper. Without this the gate below could be
+        // wired to a constant and still pass.
+        install(true);
+        assert!(BACKTRACES.load(Ordering::Relaxed));
+        install(false);
+        assert!(!BACKTRACES.load(Ordering::Relaxed));
+
+        let before = sigusr1_disposition();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_dump_dir(dir.path());
+        let path = dump_path();
+        assert!(
+            path.starts_with(dir.path()),
+            "DUMP_DIR is a OnceLock and something set it first, so this test would \
+             write into the working tree instead of {dir:?}: {path:?}"
+        );
+
+        sweep();
+
+        assert_eq!(
+            sigusr1_disposition(),
+            before,
+            "the default dump installed a handler for signal {DUMP_SIGNAL}; that is \
+             the path that deadlocks a process interrupted inside the allocator"
+        );
+
+        // The half that is always safe to produce must still be there — the
+        // point of the gate is to keep it, not to make SIGQUIT do nothing.
+        let text = std::fs::read_to_string(&path).expect("dump written");
+        assert!(
+            text.contains("in-flight inventory"),
+            "the default dump must still carry the in-flight report: {text}"
+        );
     }
 
     /// The dump lands at an absolute path.
