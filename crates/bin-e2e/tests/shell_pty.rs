@@ -37,6 +37,32 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// How often `wait_for` re-checks the accumulated output.
 const POLL: Duration = Duration::from_millis(20);
 
+/// An `echo` command plus the marker it prints, built so the marker does
+/// **not** appear in the command line itself. Returns `(command, marker)`.
+///
+/// A PTY echoes back what we type. `wait_for` only searches bytes after its
+/// cursor, which protects it from output that arrived *earlier* — but the
+/// echo of the line we are about to send arrives *later*, after the cursor,
+/// so it matches like real output. `send_str("echo done\n")` followed by
+/// `wait_for("done")` therefore returns the instant our own keystrokes come
+/// back, before bash has run anything at all.
+///
+/// That is worse than a no-op assertion, and it is what made this file flaky.
+/// A wait that returns early does not just prove nothing itself — it hands
+/// the command's entire runtime to whatever waits *next*. Here that was the
+/// `wait_for("shellpty#")` prompt sync, whose own 10s budget then had to
+/// cover 200 stderr writes (or 900 KiB of output) that the sentinel wait was
+/// supposed to have absorbed. On a loaded `linux/arm64` runner it did not,
+/// and the test failed inside `wait_for` while the command was still
+/// streaming.
+///
+/// bash concatenates the empty quotes away, so the executed command prints
+/// `head + tail` whole while the echoed line carries `''` in the middle and
+/// cannot satisfy `wait_for(marker)`.
+fn echo_marker(head: &str, tail: &str) -> (String, String) {
+    (format!("echo {head}''{tail}"), format!("{head}{tail}"))
+}
+
 struct ShellSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     captured: Arc<Mutex<Vec<u8>>>,
@@ -161,6 +187,12 @@ impl ShellSession {
     /// now?") and lets the test race ahead on nothing but luck. Tracking a
     /// cursor and only searching bytes after it makes every call require a
     /// fresh occurrence of `needle`.
+    ///
+    /// The cursor does **not** protect against the terminal echoing the line
+    /// we are about to send: that echo lands after the cursor and matches
+    /// like real output, so a needle visible in the typed command satisfies
+    /// this the moment our own keystrokes come back. Build such markers with
+    /// [`echo_marker`], which keeps the literal out of the command line.
     fn wait_for(&mut self, needle: &str, timeout: Duration) {
         let started = Instant::now();
         let needle = needle.as_bytes();
@@ -228,8 +260,11 @@ fn shell_echoes_typed_input_and_exits_promptly() {
     session.ready();
 
     for i in 0..3 {
-        let marker = format!("marco-{i}-polo");
-        session.send_str(&format!("echo {marker}\n"));
+        // Split so the marker cannot be satisfied by the PTY's echo of this
+        // very line — otherwise the round-trip this test exists to prove is
+        // never actually observed. See `echo_marker`.
+        let (cmd, marker) = echo_marker("marco-", &format!("{i}-polo"));
+        session.send_str(&format!("{cmd}\n"));
         session.wait_for(&marker, Duration::from_secs(10));
         session.wait_for("shellpty#", Duration::from_secs(10));
     }
@@ -323,8 +358,11 @@ fn ctrl_c_interrupts_foreground_child_not_the_session() {
     );
 
     // The session itself must still be alive and usable after the interrupt.
-    session.send_str("echo still-alive\n");
-    session.wait_for("still-alive", Duration::from_secs(10));
+    // Split marker: matching our own echo would prove the PTY relayed a
+    // keystroke, not that bash survived the interrupt and ran a command.
+    let (alive_cmd, alive_marker) = echo_marker("still-", "alive");
+    session.send_str(&format!("{alive_cmd}\n"));
+    session.wait_for(&alive_marker, Duration::from_secs(10));
 
     let before_exit = Instant::now();
     session.send_str("exit\n");
@@ -372,14 +410,27 @@ fn exit_is_prompt_after_chatty_and_large_output() {
 
     // Chatty on stderr, silent on stdout — the exact shape #245's commit
     // message names as the case the old per-stream `tokio::join!` starved.
-    session.send_str("for i in $(seq 1 200); do echo err-$i >&2; done; echo stderr-batch-done\n");
-    session.wait_for("stderr-batch-done", Duration::from_secs(15));
-    session.wait_for("shellpty#", Duration::from_secs(10));
+    //
+    // Both waits here are *synchronization*, not assertions: this test's
+    // claim is about how fast `exit` returns, which is measured by
+    // `wait_exit` below. So they get `DEADLINE` rather than a tight bound —
+    // a genuine hang still fails the test, just at 60s instead of 15s, and
+    // a budget sized to a loaded runner's worst case is the only kind that
+    // does not eventually go flaky.
+    let (batch_cmd, batch_marker) = echo_marker("stderr-batch", "-done");
+    session.send_str(&format!(
+        "for i in $(seq 1 200); do echo err-$i >&2; done; {batch_cmd}\n"
+    ));
+    session.wait_for(&batch_marker, DEADLINE);
+    session.wait_for("shellpty#", DEADLINE);
 
     // Comfortably past the 512 KiB drain bound plus the 64 KiB pipe.
-    session.send_str("head -c 900000 /dev/zero | tr '\\0' 'x'; echo large-output-done\n");
-    session.wait_for("large-output-done", Duration::from_secs(20));
-    session.wait_for("shellpty#", Duration::from_secs(10));
+    let (large_cmd, large_marker) = echo_marker("large-output", "-done");
+    session.send_str(&format!(
+        "head -c 900000 /dev/zero | tr '\\0' 'x'; {large_cmd}\n"
+    ));
+    session.wait_for(&large_marker, DEADLINE);
+    session.wait_for("shellpty#", DEADLINE);
 
     let before_exit = Instant::now();
     session.send_str("exit\n");
@@ -403,5 +454,36 @@ fn exit_is_prompt_after_chatty_and_large_output() {
         // returning `exited: false`.
         elapsed < Duration::from_secs(15),
         "exit took {elapsed:?} after `exit` was typed {before_exit:?} ago — should be prompt",
+    );
+}
+
+/// [`echo_marker`]'s contract, in both directions.
+///
+/// Cheap enough to belong here despite the `bin-e2e` bar (see
+/// `.claude/testing.md`): it spawns no heph binary and needs no staged dist —
+/// it only pins the helper every other test in this file now depends on. The
+/// `bash` half is not ceremony: the whole trick rests on the shell folding
+/// `''` away, and the shell that actually runs these sessions on macOS CI is
+/// bash 3.2.57.
+#[test]
+fn echo_marker_prints_the_marker_without_typing_it() {
+    let (cmd, marker) = echo_marker("stderr-batch", "-done");
+    assert_eq!(marker, "stderr-batch-done");
+    assert!(
+        !cmd.contains(&marker),
+        "command {cmd:?} contains the marker it prints, so the terminal's echo \
+         of it would satisfy wait_for({marker:?}) before the command had run"
+    );
+
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&cmd)
+        .output()
+        .expect("run bash");
+    assert!(out.status.success(), "bash rejected {cmd:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        marker,
+        "bash must still print the marker whole"
     );
 }

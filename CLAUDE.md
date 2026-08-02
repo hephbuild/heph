@@ -31,11 +31,14 @@ The `gen` script is a devenv-provided alias, assume its present. It must be run 
 
 ```bash
 e2e                          # build the artifacts from this tree, then test them
-e2e tui_pty                  # one test file
+e2e --test tui_pty           # one test file
+e2e restores_the_terminal    # one test, by name substring
 e2e -- --nocapture           # args after `--` reach cargo test
 HEPH_E2E_FROM=dist e2e       # test an already-downloaded artifact set (what CI does)
 HEPH_E2E_KEEP_DIST=1 e2e     # keep the staged artifacts instead of deleting them
 ```
+
+Selecting a file needs `--test`. Everything after `e2e` is forwarded to `cargo test` verbatim, so a bare `e2e tui_pty` is a *test-name* filter — and no test in `tui_pty.rs` is named `tui_pty`, so it matches nothing, runs zero tests, and **exits 0**. A run that tested nothing is indistinguishable from a run that passed; always check the `running N tests` count.
 
 One script, one code path — CI runs the same `e2e`, differing only in where the artifacts come from. Do not add a parallel script or inline the steps into the workflow.
 
