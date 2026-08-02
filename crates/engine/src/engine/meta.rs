@@ -1,4 +1,4 @@
-use crate::engine::request_state::RequestState;
+use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
 use crate::engine::{EResult, Engine, OutputMatcher, ResultOptions};
 use anyhow::Context;
@@ -26,7 +26,7 @@ impl Engine {
             .data
             .mem_meta
             .once(
-                addr.clone(),
+                AddrKey(addr.clone()),
                 enclose!((self => engine, rs, addr) move || async move {
                     engine.inner_meta(rs, &addr).await
                 }),

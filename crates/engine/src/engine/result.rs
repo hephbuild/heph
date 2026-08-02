@@ -9,7 +9,7 @@ use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
     TargetSpec,
 };
-use crate::engine::request_state::RequestState;
+use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::spec::EngineTargetSpec;
 use async_recursion::async_recursion;
 use enclose::enclose;
@@ -1409,7 +1409,7 @@ impl Engine {
         // is_top variant needs its own memoizer cell or a race could bake the
         // wrong is_top into the shared computation. The second variant hits the
         // on-disk cache (keyed by hashin, not is_top), so there is no re-execute.
-        let key = (addr.clone(), key_outputs, is_top);
+        let key = (AddrKey(addr.clone()), key_outputs, is_top);
         let opts = opts.clone();
         let interactive = opts.interactive.is_some();
         let res = rs
@@ -2294,7 +2294,7 @@ impl Engine {
             async {
                 let mut pulls = Vec::with_capacity(missing.len());
                 for name in &missing {
-                    let key = (addr.clone(), hashin.clone(), name.clone());
+                    let key = (AddrKey(addr.clone()), hashin.clone(), name.clone());
                     let engine = Arc::clone(self);
                     let rs_owned = Arc::clone(rs);
                     let rev = Arc::clone(rev);
@@ -2353,7 +2353,7 @@ impl Engine {
         rs.data
             .mem_locked_result
             .once(
-                addr,
+                AddrKey(addr),
                 enclose!((self => engine, rs) move || async move {
                     // is_top/frozen are deliberately fixed here: the shared cell
                     // is addr-keyed and output/is_top-agnostic. It never runs
@@ -2951,7 +2951,7 @@ impl Engine {
         let use_tmp_cache = !opts.def.target.cache.enabled || opts.shell;
         let interactive = opts.interactive.clone();
         let shell = opts.shell;
-        let key = (addr.clone(), hashin.clone());
+        let key = (AddrKey(addr.clone()), hashin.clone());
 
         rs.data
             .mem_execute_cache
@@ -3391,7 +3391,7 @@ impl Engine {
         rs.data
             .mem_def
             .once(
-                addr.clone(),
+                AddrKey(addr.clone()),
                 enclose!((self => engine, rs, addr) move || async move {
                     engine.get_def_inner(rs, &addr, true).await.with_context(|| format!("get_def: {}", addr))
                 }),
@@ -3593,7 +3593,7 @@ impl Engine {
         rs.data
             .mem_spec
             .once(
-                addr.clone(),
+                AddrKey(addr.clone()),
                 enclose!((self => engine, rs, addr) move || async move {
                     engine.get_spec_inner(&rs, &addr).await
                 }),

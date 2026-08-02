@@ -2,7 +2,7 @@ use crate::engine::Engine;
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::path::Content;
 use crate::engine::driver::targetdef::{Input, InputMode};
-use crate::engine::request_state::RequestState;
+use crate::engine::request_state::{AddrKey, RequestState};
 use async_recursion::async_recursion;
 use enclose::enclose;
 use hcore::hmemoizer::unwrap_arc_err;
@@ -137,7 +137,7 @@ impl Engine {
         rs.data
             .mem_expanded_inputs
             .once(
-                addr.clone(),
+                AddrKey(addr.clone()),
                 enclose!((self => engine, rs, addr) move || async move {
                     // _no_track: result_addr (the upstream entry point) already set
                     // parent=addr before getting here, so tracked get_def would
