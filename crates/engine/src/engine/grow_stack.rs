@@ -1,10 +1,15 @@
 //! On-demand stack growth for the transparent-group re-inline — the one
 //! recursion in `result_addr` that still nests poll frames.
 //!
-//! With task-backed request memoizers, the memoized result/meta descent is a
-//! chain of tasks: per-poll stack depth is O(1) in graph depth, and this
-//! wrapper is not involved (the `deep_warm_chain_completes_on_a_2mib_stack`
-//! test pins that without it). Transparent groups are different by design:
+//! The memoized result/meta descent is O(1) stack per level, but no longer
+//! because a task-backed memoizer puts every body on its own stack: since
+//! `hmemoizer::task_cell` began polling cold bodies inline, that descent
+//! recurses on the caller's stack and is kept flat by its *own*
+//! `stacker::maybe_grow` (see `INLINE_RED_ZONE` there). So
+//! `deep_warm_chain_completes_on_a_2mib_stack` still passes without this
+//! wrapper — just for a different reason than it used to.
+//!
+//! Transparent groups are different by design:
 //! they are inlined *before* the memoizer — nothing to deduplicate — so a
 //! group whose member is another group recurses through `result_addr` in the
 //! caller's own poll, one boxed `#[async_recursion]` frame per nesting level.

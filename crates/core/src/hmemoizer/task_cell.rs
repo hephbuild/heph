@@ -51,7 +51,7 @@
 //!   the still-live N, and overlap it.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
@@ -84,6 +84,13 @@ pub(crate) struct TaskCell<V> {
     /// How many aborted predecessors this key has had. Rendered in the dump so
     /// abort/rejoin thrash is visible instead of read as "mysteriously slow".
     restarts: u32,
+    /// Set while [`TaskInner::process`] is driving this cell's body *inline*,
+    /// before any task exists for it (see the inline-first path there).
+    ///
+    /// Only [`Self::task_live`] reads it, and only so that window does not read
+    /// as "stranded": during it the cell is genuinely being driven, just by the
+    /// caller's own stack rather than by a spawned task.
+    inline: AtomicBool,
 }
 
 impl<V> TaskCell<V> {
@@ -137,6 +144,12 @@ impl<V> TaskCell<V> {
     /// cancelled away). `false` on an incomplete cell is the stranded signal:
     /// the task died without publishing.
     pub(crate) fn task_live(&self) -> bool {
+        // The inline window has no task by construction, but the body *is*
+        // being polled — on the caller's stack. Reporting it as stranded would
+        // put a false "no driver" line in every SIGQUIT dump taken during one.
+        if self.inline.load(Ordering::Acquire) {
+            return true;
+        }
         match self.task.try_lock() {
             Ok(slot) => slot.as_ref().is_some_and(|h| !h.is_finished()),
             // Same stance as `task_slot` / `TaskSource::collect`: a poisoned
@@ -156,6 +169,50 @@ impl<V> TaskCell<V> {
 
     pub(crate) fn restarts(&self) -> u32 {
         self.restarts
+    }
+}
+
+/// If less than this much stack remains when a body is polled inline, grow.
+/// Matches `engine::grow_stack`'s red zone — sized for the ~100 KiB frames a
+/// memoized descent puts on the stack.
+const INLINE_RED_ZONE: usize = 512 * 1024;
+
+/// Size of each freshly allocated stack segment for the inline poll.
+const INLINE_STACK_PER_GROW: usize = 8 * 1024 * 1024;
+
+/// Whether `process` polls a cold body inline before spawning a task for it.
+///
+/// On by default. `HEPH_MEMOIZER_INLINE=0` restores the always-spawn path, so
+/// the two can be compared in one binary on one corpus — which is how the
+/// numbers in `process`'s inline-first comment were taken.
+fn inline_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HEPH_MEMOIZER_INLINE").as_deref() != Ok("0"))
+}
+
+/// Spawn `fut` as this cell's driving task and store the handle.
+///
+/// The caller must hold the cache lock: `publish` takes it too, so releasing it
+/// between the spawn and the store would let a fast body publish first and
+/// leave a `Done` cell holding a live handle. A spawn that panics (shut-down
+/// runtime) degrades to a poisoned cell rather than unwinding out of this frame
+/// into a cdylib seam.
+fn spawn_body<V, F>(handle: &tokio::runtime::Handle, cell: &Arc<TaskCell<V>>, fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::spawn_on_with_cycle_ctx(handle, fut)
+    }));
+    match spawned {
+        Ok(task) => {
+            *cell.task_slot() = Some(task);
+        }
+        Err(_) => {
+            let _already_poisoned = cell
+                .outcome
+                .set(Err("memoized task could not spawn (runtime shut down)"));
+        }
     }
 }
 
@@ -281,6 +338,7 @@ where
                 task: Mutex::new(None),
                 created: Instant::now(),
                 restarts,
+                inline: AtomicBool::new(inline_first()),
             });
             cell.acquire_interest();
             let body = BodyTask {
@@ -289,31 +347,94 @@ where
                 key: key.clone(),
                 grave,
             };
-            // Spawn while still holding the cache lock: publish also
-            // takes that lock, so the task cannot publish before its
-            // handle is stored below — a `Done` cell never ends up
-            // holding a live handle.
-            //
-            // The spawn itself is guarded: on a shut-down runtime,
-            // tokio either panics the spawn or drops the task without
-            // ever polling it. Both degrade to a poisoned cell (the
-            // drop path via `BodyTask::drop`), so a joiner gets a loud
-            // failure — never an eternal park, and never an unwind out
-            // of this frame into a cdylib seam.
-            let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                super::spawn_on_with_cycle_ctx(&self.handle, body.run(fut))
-            }));
-            match spawned {
-                Ok(task) => {
-                    *cell.task_slot() = Some(task);
-                }
-                Err(_) => {
-                    let _already_poisoned = cell
-                        .outcome
-                        .set(Err("memoized task could not spawn (runtime shut down)"));
-                }
-            }
             cache.insert(key.clone(), Arc::clone(&cell));
+
+            if !inline_first() {
+                // Spawn while still holding the cache lock: publish also
+                // takes that lock, so the task cannot publish before its
+                // handle is stored below — a `Done` cell never ends up
+                // holding a live handle.
+                //
+                // The spawn itself is guarded: on a shut-down runtime,
+                // tokio either panics the spawn or drops the task without
+                // ever polling it. Both degrade to a poisoned cell (the
+                // drop path via `BodyTask::drop`), so a joiner gets a loud
+                // failure — never an eternal park, and never an unwind out
+                // of this frame into a cdylib seam.
+                spawn_body(&self.handle, &cell, body.run(fut));
+                break 'cell cell;
+            }
+
+            // Inline-first: poll the body once on this stack, and only spawn
+            // if it actually suspends.
+            //
+            // A memoized computation that resolves without ever yielding — an
+            // in-memory lookup, a hit that only reads already-loaded state — is
+            // the common case here, and paying a full tokio task for it is pure
+            // overhead: `OwnedTasks` push + a global `added` atomic on spawn,
+            // then a shard-mutex unlink + a global `count` atomic on
+            // completion, plus the `Notify` wake machinery. Measured on a
+            // 192k-target resolution, `OwnedTasks::remove` alone went from
+            // 3.82s of CPU on one core to 25.88s on ten — for identical work.
+            // That is contention on tokio's registry, and the only way heph can
+            // shrink it is to stop handing tokio so many tasks.
+            //
+            // The cache lock MUST be released first: a body that completes
+            // inline calls `publish`, which takes that same lock. Releasing it
+            // is safe because this caller already holds an interest, so no
+            // concurrent `cancel_abandoned` can evict the cell out from under
+            // the poll — the abandonment decision only fires when interest
+            // reaches zero.
+            drop(cache);
+            let mut body_fut = Box::pin(body.run(fut));
+            // Under `stacker::maybe_grow`, because this is the one thing the
+            // task-per-cell design was silently buying besides isolation: a
+            // spawned body starts on its *own* stack, so a memoized descent
+            // (`get_spec` -> `get_def` -> `get_spec` -> ...) cost O(1) stack per
+            // level no matter how deep the graph. Polled inline it recurses on
+            // the caller's stack instead, and a deep enough chain overflows a
+            // 2 MiB worker stack — which is exactly what
+            // `deep_warm_chain_completes_on_a_2mib_stack` caught, on all three
+            // targets at once.
+            //
+            // Same wrapper, same constants, and the same reasoning as
+            // `engine::grow_stack` already applies to the transparent-group
+            // re-inline: a couple of instructions on the hot path, a fresh
+            // segment allocated only when headroom actually runs low.
+            let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let waker = futures::task::noop_waker();
+                let mut cx = std::task::Context::from_waker(&waker);
+                stacker::maybe_grow(INLINE_RED_ZONE, INLINE_STACK_PER_GROW, || {
+                    body_fut.as_mut().poll(&mut cx)
+                })
+            }));
+            match polled {
+                // Completed on this stack. `run` already published under the
+                // cache lock, so there is nothing to spawn and no handle to
+                // store — exactly the `Done`-cell-holds-no-handle end state.
+                Ok(std::task::Poll::Ready(())) => {}
+                Ok(std::task::Poll::Pending) => {
+                    // Suspended, so it needs a task after all. Re-take the
+                    // cache lock for the same reason the non-inline path never
+                    // let go of it: the handle must be stored before the body
+                    // can publish.
+                    //
+                    // Polling with a no-op waker first is sound: a future must
+                    // honour the waker from its most recent poll, and tokio
+                    // polls immediately on spawn — so whatever it registered
+                    // against the no-op waker is re-registered against the real
+                    // one before anything could wake it.
+                    let _arbiter = self.cache_lock();
+                    spawn_body(&self.handle, &cell, body_fut);
+                }
+                // The body panicked on this stack rather than inside a task.
+                // Dropping `body_fut` ran `BodyTask::drop`, which poisons the
+                // cell, so the wait below surfaces it loudly — the same
+                // outcome as a panicking spawned body, and it must not unwind
+                // further and cross a cdylib seam.
+                Err(_) => {}
+            }
+            cell.inline.store(false, Ordering::Release);
             cell
         };
 
@@ -696,6 +817,14 @@ mod tests {
         entered: Arc<std::sync::atomic::AtomicBool>,
         release: Arc<std::sync::atomic::AtomicBool>,
     ) -> u32 {
+        // Suspend before doing anything else, so `process` spawns a task for
+        // this body instead of running it inline (see `inline_first`). Every
+        // test using this body is about aborting a *live predecessor*, and
+        // there is no predecessor to abort if the body already ran to
+        // completion on the caller's stack. This is the harness constructing
+        // the scenario, not a workaround: a body that never suspends is one
+        // nothing can cancel, by construction.
+        tokio::task::yield_now().await;
         let _occ = Occupancy::enter(&occupancy);
         entered.store(true, Ordering::SeqCst);
         // Time-bounded: if the test panics before flipping `release`, the
@@ -844,6 +973,75 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         let v = within(gen3).await.expect("gen 3 joiner");
         assert_eq!(v, 3);
+    }
+
+    /// A body that never suspends is finished on the caller's stack, without a
+    /// task ever existing for it.
+    ///
+    /// This is the whole point of `inline_first`: a memoized computation that
+    /// resolves without yielding used to cost a full tokio task — `OwnedTasks`
+    /// push plus a global `added` atomic on spawn, a shard-mutex unlink plus a
+    /// global `count` atomic on completion, and the `Notify` wake machinery in
+    /// between. On a 192k-target resolution that overhead was the single
+    /// largest cost in the profile, and it is contention, not work:
+    /// `OwnedTasks::remove` measured 3.82s of CPU on one core against 25.88s on
+    /// ten, for byte-identical work.
+    ///
+    /// Asserting on the *first poll* is what makes this observable: driven
+    /// inline the value is already there when `process` first returns, where a
+    /// spawned body could only publish from another thread later.
+    ///
+    /// Asserts the default. Under `HEPH_MEMOIZER_INLINE=0` — the escape hatch
+    /// that restores always-spawn — this test fails, deliberately: a silent
+    /// skip would let the optimization rot away unnoticed, which is the whole
+    /// failure mode a regression test exists to prevent.
+    #[tokio::test]
+    async fn a_body_that_never_suspends_is_driven_inline() {
+        let m: TaskInner<String, u32> = inner("inline-first-test");
+        let mut fut = Box::pin(m.process("k".to_string(), || async { 7 }));
+        let first = futures::poll!(&mut fut);
+        assert_eq!(
+            first,
+            std::task::Poll::Ready(7),
+            "a non-suspending body must complete on the first poll, not be handed to a task"
+        );
+        // And it left the cell in the normal terminal state.
+        let cell = m.cache_lock().get("k").cloned().expect("cell retained");
+        assert_eq!(cell.peek(), Some(&7));
+        assert!(
+            cell.task_slot().is_none(),
+            "a cell finished inline must hold no task handle"
+        );
+    }
+
+    /// A body that *does* suspend still gets a task — inline-first is an
+    /// optimization for the fast path, not a removal of the task-backed model.
+    /// Without this, `inline_first` could regress to "never spawn" and every
+    /// suspending computation would stall with nothing driving it.
+    #[tokio::test]
+    async fn a_body_that_suspends_still_gets_a_task() {
+        let m: Arc<TaskInner<String, u32>> = Arc::new(inner("inline-spawn-test"));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut fut = Box::pin(m.process("k".to_string(), {
+            let gate = Arc::clone(&gate);
+            move || async move {
+                gate.notified().await;
+                9
+            }
+        }));
+        assert!(
+            futures::poll!(&mut fut).is_pending(),
+            "a suspending body cannot have completed inline"
+        );
+        {
+            let cell = m.cache_lock().get("k").cloned().expect("cell present");
+            assert!(
+                cell.task_live(),
+                "a suspended body must be driven by a spawned task"
+            );
+        }
+        gate.notify_one();
+        assert_eq!(within(&mut fut).await, 9);
     }
 
     /// A stale cancellation must never evict a completed cell — the value
@@ -1015,8 +1213,16 @@ mod tests {
             .await
             .expect("shut down the runtime");
 
+        // The body suspends, so `process` must spawn to finish it — which is
+        // what fails here. A body that completed inline would need no runtime
+        // at all and would legitimately succeed, testing nothing about a dead
+        // one (see `inline_first`).
         let joined = within(
-            std::panic::AssertUnwindSafe(m.process("k".to_string(), || async { 1 })).catch_unwind(),
+            std::panic::AssertUnwindSafe(m.process("k".to_string(), || async {
+                tokio::task::yield_now().await;
+                1
+            }))
+            .catch_unwind(),
         )
         .await;
         let panic = joined.expect_err("a dead runtime must not produce a value");
