@@ -17,18 +17,14 @@
 
 mod common;
 
-use common::Dist;
+// `DSR_CURSOR` is the cursor-position query. Only the interactive backend ever
+// issues one, which makes it the marker for "the TUI engaged"; answering every
+// occurrence is the harness's job — see `common::take_dsr_queries`.
+use common::{DSR_CURSOR, Dist};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read as _, Write as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-/// CSI 6n — Device Status Report, "where is the cursor?". The inline viewport
-/// needs the answer to know where to draw, and the child blocks until it gets
-/// one, so the harness must reply the way a real terminal would. Only the
-/// interactive backend ever asks, which also makes it the marker for "the TUI
-/// engaged".
-const DSR_CURSOR: &[u8] = b"\x1b[6n";
 
 /// CSI ?25l / ?25h — hide and show the cursor, around the TUI's lifetime.
 const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
@@ -39,18 +35,35 @@ const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 /// rather than hang it.
 const DEADLINE: Duration = Duration::from_secs(180);
 
+/// The sleep is in a *dependency*, not in the target the command names, and
+/// that is the whole trick.
+///
+/// A run that names one target hands that target the terminal: the engine wraps
+/// its execution in the interactive wrapper, which **pauses the TUI for the
+/// target's entire runtime** so the target owns the terminal. So the box is only
+/// on screen before execution starts — and with the sleep in the named target
+/// itself, that window was "however long discovery, BUILD evaluation and hashing
+/// take", against an 80 ms frame tick. On a warm, fast runner that window closed
+/// before the first tick and the run drew *zero* frames: the terminal received a
+/// viewport, an immediate collapse, the target's own `e2e-ok`, and the final
+/// summary, with nothing rendered in between. That is the flake this shape
+/// removes, and it read as "the target never appeared" because the box carrying
+/// its name was never painted at all.
+///
+/// Dependencies never inherit the terminal (`ResultOptions::default()`), so
+/// while `//pkg:slow` runs the TUI stays up and ticking — a guaranteed second of
+/// frames, all of them carrying the run's label in the box footer.
+const BUILD: &str = concat!(
+    "target(name = \"slow\", driver = \"bash\", run = \"sleep 1\", cache = False)\n",
+    "target(name = \"ok\", driver = \"bash\", run = \"echo e2e-ok\", cache = False,",
+    " deps = {\"slow\": [\"//pkg:slow\"]})\n",
+);
+
 #[test]
 fn tui_renders_the_run_and_restores_the_terminal() {
     let dist = Dist::locate();
     let ws = common::Workspace::new().expect("workspace");
-    // The sleep guarantees the run is observable: without it the target can
-    // finish inside a single frame interval and the in-flight rendering this
-    // test is about never happens.
-    ws.write(
-        "pkg/BUILD",
-        "target(name = \"ok\", driver = \"bash\", run = \"sleep 1; echo e2e-ok\", cache = False)\n",
-    )
-    .expect("write BUILD");
+    ws.write("pkg/BUILD", BUILD).expect("write BUILD");
 
     let session = run_in_pty(&dist, ws.root(), &["run", "//pkg:ok"]);
 
@@ -64,16 +77,14 @@ fn tui_renders_the_run_and_restores_the_terminal() {
         "interactive TUI never engaged with a tty attached\n{}",
         session.report()
     );
-    // Raw bytes, not the vt100-rendered screen: `rendered` snapshots the
-    // screen once per pty `read()`, and on a loaded CI runner several ticks'
-    // worth of draws can land in one read before the pump thread gets
-    // scheduled — the in-progress frame is overwritten by the next one before
-    // it is ever sampled, even though it was genuinely painted. The address
-    // only ever reaches stderr as literal text drawn by the viewport (there is
-    // no other path that would write it), so its presence in the byte stream
-    // still proves it was rendered, just not caught at a read boundary.
+    // The vt100-rendered screens, not the raw bytes: this is the assertion the
+    // file exists for — that the viewport put the run into actual cells — and
+    // with the box up for the dependency's whole runtime there are frames enough
+    // to catch it at a read boundary. (It was weakened to a raw-byte scan when
+    // the box was only up for a race-length window; the fix for that was the
+    // window, not the assertion.)
     assert!(
-        contains(&session.raw, b"//pkg:ok"),
+        session.rendered.contains("//pkg:ok"),
         "the target never appeared in the rendered output\n{}",
         session.report()
     );
@@ -187,8 +198,9 @@ fn run_in_pty(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
         // A pty is a pipe, not a terminal: nothing on this end answers queries.
         // The TUI asks where the cursor is (DSR) while setting up its inline
         // viewport and blocks until the terminal replies, so a harness that only
-        // reads deadlocks the child. `tail` carries the last few bytes across
-        // reads in case a request straddles a chunk boundary.
+        // reads deadlocks the child. `tail` carries bytes across reads in case a
+        // request straddles a chunk boundary — see `take_dsr_queries`, which owns
+        // that rule and the boundary case it used to get wrong.
         let mut tail = Vec::<u8>::new();
         loop {
             match reader.read(&mut buf) {
@@ -198,24 +210,10 @@ fn run_in_pty(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
                     parser.process(chunk);
 
                     tail.extend_from_slice(chunk);
-                    let replies = tail
-                        .windows(DSR_CURSOR.len())
-                        .filter(|w| *w == DSR_CURSOR)
-                        .count();
-                    for _ in 0..replies {
-                        // Cursor at row 1, column 1 — the state a fresh terminal
-                        // is in. The value only positions the inline viewport.
-                        if writer.write_all(b"\x1b[1;1R").is_err() || writer.flush().is_err() {
+                    for _ in 0..common::take_dsr_queries(&mut tail) {
+                        if writer.write_all(common::DSR_REPLY).is_err() || writer.flush().is_err() {
                             break;
                         }
-                    }
-                    // Keep only enough tail to catch a split request, and drop
-                    // anything already answered.
-                    if replies > 0 {
-                        tail.clear();
-                    } else if tail.len() > DSR_CURSOR.len() {
-                        let keep = tail.len() - (DSR_CURSOR.len() - 1);
-                        tail.drain(..keep);
                     }
 
                     let screen = parser.screen().contents();
