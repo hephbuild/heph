@@ -1352,13 +1352,13 @@ impl Engine {
             // nesting depth.
             //
             // Sharing the terminal between siblings is not merely untidy: each
-            // member's wrapper builds its own `TtyReader` on fd 0, the first
-            // member to finish resumes the TUI (re-enabling raw mode and
-            // clearing Ctrl-C suppression) underneath its live siblings, and
-            // `TtyReader::drop` restores blocking mode on fd 0 while a sibling
-            // still drives it through `AsyncFd` — leaving a blocking `read(0)`
-            // on a tokio worker that the request's cancellation token cannot
-            // reach.
+            // member's wrapper builds its own `TtyReader`, so several readers
+            // race the same terminal input queue and a keystroke lands in
+            // whichever one the kernel picks; and the first member to finish
+            // resumes the TUI (re-enabling raw mode and clearing Ctrl-C
+            // suppression) underneath its live siblings — including the
+            // cursor-position query the resume re-anchor issues, whose reply a
+            // sibling's reader can swallow.
             if !has_single_member(&def.target_def.inputs) {
                 if opts.shell {
                     return Err(ShellNeedsSingleTarget::Group {
