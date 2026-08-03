@@ -246,6 +246,53 @@ target(
     Ok(())
 }
 
+// A dep that declares no transitive sandbox is skipped by the transitive
+// collector without disturbing the deps that do declare one.
+//
+// The collector numbers each merged sandbox by its position in the consumer's
+// runtime input list, and that number ends up in the merged tool/dep ids — so a
+// skip that renumbered would silently move def hashes and invalidate cached
+// artifacts. Here `plain` sorts before `carrier` in the consumer's inputs, so
+// `carrier`'s sandbox is *not* at position 0: if skipping `plain` shifted it,
+// or dropped it, `$SRC_HIDDEN` would not resolve.
+#[tokio::test]
+async fn test_transitive_survives_a_preceding_dep_without_one() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "mixed",
+        r#"
+target(name = "hidden", driver = "bash", run = "printf hidden_value > $OUT", out = "h.txt")
+target(name = "plain", driver = "bash", run = "printf plain_value > $OUT", out = "p.txt")
+target(
+    name = "carrier",
+    driver = "bash",
+    run = "printf carrier_value > $OUT",
+    out = "c.txt",
+    transitive = {"deps": {"hidden": ["//mixed:hidden"]}},
+)
+target(
+    name = "consumer",
+    driver = "bash",
+    run = "printf '%s %s' \"$(cat $SRC_PLAIN)\" \"$(cat $SRC_HIDDEN)\" > $OUT",
+    out = "out.txt",
+    deps = {"plain": ["//mixed:plain"], "carrier": ["//mixed:carrier"]},
+)
+"#,
+    );
+
+    let result = ws.run("//mixed:consumer").await?;
+    let content = common::artifact_string(&result);
+    assert!(
+        content.contains("plain_value"),
+        "missing plain_value, got: {content:?}"
+    );
+    assert!(
+        content.contains("hidden_value"),
+        "transitive dep behind a non-transitive dep was dropped, got: {content:?}"
+    );
+    Ok(())
+}
+
 // Direct cycle A → B → A must be rejected
 #[tokio::test]
 async fn test_direct_cyclic_dep_detected() -> anyhow::Result<()> {
