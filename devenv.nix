@@ -287,8 +287,12 @@ in
       # branch's binary, and every assertion would still pass. Fingerprint the
       # artifacts around the copy so that becomes a loud failure instead of a
       # green run against the wrong bytes.
+      # Selected by which `stat` is on PATH, not by `$os`: the devenv shell puts
+      # GNU coreutils ahead of /usr/bin on macOS too, so keying this off `darwin`
+      # ran BSD syntax against GNU stat (`-f` there means "filesystem") and every
+      # local `e2e` on a Mac died before running a single test.
       fingerprint() {
-        if [ "$os" = "darwin" ]; then stat -f '%i %z %m' "$@"; else stat -c '%i %s %Y' "$@"; fi
+        stat -c '%i %s %Y' "$@" 2>/dev/null || stat -f '%i %z %m' "$@"
       }
       before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext")"
 
