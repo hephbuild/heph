@@ -37,6 +37,100 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// How often `wait_for` re-checks the accumulated output.
 const POLL: Duration = Duration::from_millis(20);
 
+/// One poll's outcome in [`scan_once`].
+#[derive(Debug, PartialEq, Eq)]
+enum Scan {
+    /// `needle` ends at this absolute offset; the cursor moves here.
+    Found { end: usize },
+    /// Not present yet. The next poll may start here — everything before it has
+    /// been searched.
+    Resume { from: usize },
+}
+
+/// Search `buf[scan_from..]` for `needle`, and say where the next poll should
+/// pick up.
+///
+/// Split out of `wait_for` so the thing that actually went wrong is testable
+/// without a pty, a child process, or a 900 KiB transfer.
+///
+/// The rule that matters: on a miss the next scan resumes at the end of what was
+/// just searched, minus `needle.len() - 1` so an occurrence straddling a poll
+/// boundary is still found. Re-searching from `scan_from` every poll instead
+/// makes the work O(bytes x polls) with the capture lock held, which starves the
+/// pty relay thread and stalls the very output being waited on.
+fn scan_once(buf: &[u8], needle: &[u8], scan_from: usize) -> Scan {
+    let hay = buf.get(scan_from..).unwrap_or(&[]);
+    if let Some(pos) = hay.windows(needle.len()).position(|w| w == needle) {
+        return Scan::Found {
+            end: scan_from + pos + needle.len(),
+        };
+    }
+    Scan::Resume {
+        from: buf
+            .len()
+            .saturating_sub(needle.len().saturating_sub(1))
+            .max(scan_from),
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::{Scan, scan_once};
+
+    /// The straddling case the overlap exists for: a needle split across two
+    /// polls is found by the second one.
+    ///
+    /// Without the `needle.len() - 1` rewind, `Resume { from }` would land past
+    /// the needle's first byte and the marker would never be seen — the test
+    /// would hang to its deadline with the bytes sitting in the buffer.
+    #[test]
+    fn a_needle_split_across_two_polls_is_found() {
+        let needle = b"done";
+        let first = b"...do";
+        let Scan::Resume { from } = scan_once(first, needle, 0) else {
+            panic!("must not match on a partial needle");
+        };
+        let mut whole = first.to_vec();
+        whole.extend_from_slice(b"ne...");
+        assert_eq!(
+            scan_once(&whole, needle, from),
+            Scan::Found { end: 7 },
+            "the second poll must find a needle that straddles the boundary"
+        );
+    }
+
+    /// A miss advances the resume point, so the next poll re-reads only the
+    /// overlap rather than the whole tail. This is the O(bytes x polls) fix, and
+    /// it is asserted as an offset because that is the only observable form it
+    /// has.
+    #[test]
+    fn a_miss_does_not_rescan_from_the_start() {
+        let needle = b"done";
+        let buf = vec![b'x'; 100_000];
+        let Scan::Resume { from } = scan_once(&buf, needle, 0) else {
+            panic!("no match expected");
+        };
+        assert_eq!(
+            from,
+            buf.len() - (needle.len() - 1),
+            "a miss must leave only the straddle overlap to re-read"
+        );
+    }
+
+    /// The resume point never rewinds behind where this `wait_for` call started,
+    /// so a needle already consumed by an earlier call cannot satisfy a later
+    /// one — the property the `cursor` exists for.
+    #[test]
+    fn the_resume_point_never_rewinds_behind_the_cursor() {
+        let needle = b"shellpty#";
+        let buf = b"shellpty# ".to_vec();
+        let Scan::Resume { from } = scan_once(&buf, needle, 10) else {
+            panic!("must not re-match output before the cursor");
+        };
+        assert!(from >= 10, "resumed at {from}, behind the cursor at 10");
+    }
+}
+
 /// An `echo` command plus the marker it prints, built so the marker does
 /// **not** appear in the command line itself. Returns `(command, marker)`.
 ///
@@ -199,23 +293,31 @@ impl ShellSession {
         if needle.is_empty() {
             return;
         }
+        // Where the next poll starts searching. Distinct from `cursor`, which
+        // only moves on a match: this advances every poll to the end of what has
+        // already been searched and found not to contain the needle.
+        //
+        // Without it each poll re-searched the whole unseen tail, so the work was
+        // O(bytes x polls) rather than O(bytes) — and it ran with the capture
+        // lock held. Against the 900 KiB case that is ~45 MB/s of memcmp at 50
+        // polls a second, during which the relay thread cannot append, so the pty
+        // backs up and the child stalls. The test then misses its 60s budget
+        // *because it was watching*, which is why it failed on a different CI
+        // target almost every run rather than reproducibly.
+        //
+        // Searching under the lock (rather than cloning first) is still right,
+        // and for the same reason — the clone was the earlier version of this
+        // bug. Both halves are needed: don't copy, and don't re-read.
+        let mut scan_from = self.cursor;
         loop {
-            // Search *under* the lock rather than cloning the buffer first.
-            // `output_snapshot` copies everything captured so far, and this
-            // runs every `POLL`; against a command that emits 900 KiB that is a
-            // fresh ~900 KiB allocation and memcpy 50 times a second, with the
-            // capture lock held for each one — so the relay thread cannot drain
-            // the pty while it happens, the child backs up, and the whole thing
-            // degrades as the output grows. It only stayed invisible while
-            // these waits were matching their own echo and returning on the
-            // first poll; making them wait for real output surfaced it as a
-            // 60s timeout on `large-output-done`.
             {
                 let buf = self.captured.lock().expect("capture lock");
-                let unseen = buf.get(self.cursor..).unwrap_or(&[]);
-                if let Some(pos) = unseen.windows(needle.len()).position(|w| w == needle) {
-                    self.cursor += pos + needle.len();
-                    return;
+                match scan_once(&buf, needle, scan_from) {
+                    Scan::Found { end } => {
+                        self.cursor = end;
+                        return;
+                    }
+                    Scan::Resume { from } => scan_from = from,
                 }
             }
             assert!(
