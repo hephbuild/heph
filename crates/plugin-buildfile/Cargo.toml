@@ -27,6 +27,17 @@ once_cell = "1"
 starlark = "0.14.2"
 starlark_lsp = "0.14.2"
 allocative = "0.3"
+# This trio is held back by `starlark_lsp` (above), not by inertia — the LSP
+# proxy hands types straight between starlark_lsp and these, so they have to
+# agree on one `lsp-types`. `starlark_lsp` 0.14.2 requires `lsp-server ^0.7.2`
+# and `lsp-types ^0.97`, so:
+#   - lsp-server 0.10 would resolve to a SECOND copy alongside starlark_lsp's
+#     0.7, and the two `Connection`/`Message` types are not interchangeable.
+#   - tower-lsp-server 0.23 re-platformed off `lsp-types` onto a new `ls-types`
+#     crate and dropped `UriExt`, so every type crossing the proxy boundary
+#     would need translating — a port, not a bump, and worth nothing until
+#     starlark_lsp moves too.
+# Revisit when starlark_lsp does.
 lsp-server = "0.7"
 lsp-types = "0.97"
 tower-lsp-server = "0.22"

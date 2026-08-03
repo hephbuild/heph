@@ -300,7 +300,7 @@ fn fetch(
 
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    let got = format!("{:x}", hasher.finalize());
+    let got = hex::encode(hasher.finalize());
     verify_checksum(expected_sha256, &got, url)?;
 
     std::fs::write(dest, &bytes).with_context(|| format!("write {dest:?}"))?;

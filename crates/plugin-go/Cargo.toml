@@ -32,7 +32,11 @@ tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "p
 # and extract (flate2 + tar) the pinned Go SDK tarball so the build never
 # reads a `go` binary or GOROOT from the host.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
-sha2 = "0.10"
+sha2 = "0.11"
+# sha2 0.11 (digest 0.11) returns an `Array` that no longer implements
+# `LowerHex`, so the old `format!("{:x}", ..)` is out. `hex::encode` emits the
+# same lowercase, unseparated digest, which these checksum comparisons rely on.
+hex = "0.4"
 flate2 = "1.1.9"
 tar = "0.4"
 tracing = "0.1"
