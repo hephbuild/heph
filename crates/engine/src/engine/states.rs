@@ -4,7 +4,7 @@ use crate::engine::request_state::RequestState;
 use enclose::enclose;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
-use hmodel::htmatcher::{MatchResult, Matcher};
+use hmodel::htmatcher::Matcher;
 use hmodel::htpkg::PkgBuf;
 use std::sync::Arc;
 
@@ -31,14 +31,6 @@ pub struct PackageStates {
     pub states: Vec<State>,
 }
 
-/// Whether `pkg` is selected by `m`. States are declared per package and carry
-/// no target name, so a matcher arm that needs one (`Label`, `TreeOutputTo`)
-/// can only shrug — those are treated as selecting the package, keeping the
-/// scan inclusive rather than silently dropping declarations.
-fn matches_package(m: &Matcher, pkg: &PkgBuf) -> bool {
-    m.matches_pkg(pkg) != MatchResult::MatchNo
-}
-
 impl Engine {
     /// Resolve the `provider_state(...)` declarations for every package matching `m`.
     ///
@@ -50,6 +42,12 @@ impl Engine {
     /// Packages are returned in lexical order, each with its states — including
     /// packages that have none, so callers can distinguish "no state here" from
     /// "package not matched".
+    ///
+    /// `packages()` already answers within `m`'s package scope, so there is no
+    /// second filter here. Its tri-state prune is the inclusive one this needs:
+    /// states are declared per package and carry no target name, so an arm that
+    /// needs one (`Label`, `TreeOutputTo`) shrugs rather than rejecting, and the
+    /// package is kept rather than silently dropping its declarations.
     pub async fn states(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -61,10 +59,7 @@ impl Engine {
             _ => {
                 let mut pkgs: Vec<PkgBuf> = Vec::new();
                 for p in self.packages(m, &rs).await? {
-                    let pkg = PkgBuf::from(p?.as_str());
-                    if matches_package(m, &pkg) {
-                        pkgs.push(pkg);
-                    }
+                    pkgs.push(PkgBuf::from(p?.as_str()));
                 }
                 pkgs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
                 pkgs
@@ -318,11 +313,28 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn label_matcher_shrug_keeps_the_package() {
-        // A label says nothing about a package, and states have no target name
-        // to test it against — stay inclusive.
-        assert!(matches_package(&Matcher::Label("l".to_string()), &pkg("a")));
-        assert!(!matches_package(&Matcher::Package(pkg("b")), &pkg("a")));
+    /// A label says nothing about a package, and states carry no target name to
+    /// test it against, so every discovered package must survive the scan. The
+    /// scoping now happens inside `Engine::packages`, so this asserts the
+    /// inclusive half of that prune through the behavior rather than through the
+    /// local helper it replaced.
+    #[tokio::test]
+    async fn label_matcher_keeps_every_package() -> anyhow::Result<()> {
+        let engine = make_engine(&["p1"])?;
+        let rs = engine.new_state();
+
+        let out = engine
+            .states(
+                rs,
+                &Matcher::Label("l".to_string()),
+                &StatesOptions::default(),
+            )
+            .await?;
+
+        // `@heph/fs` comes from the always-on built-in provider; it is a package
+        // like any other and a label cannot rule it out either.
+        let scanned: Vec<&str> = out.iter().map(|ps| ps.package.as_str()).collect();
+        assert_eq!(scanned, vec!["@heph/fs", "a", "a/b", "other"]);
+        Ok(())
     }
 }

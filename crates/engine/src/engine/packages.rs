@@ -31,10 +31,31 @@ fn narrowing_prefix(m: &htmatcher::Matcher) -> PkgBuf {
 }
 
 impl Engine {
-    /// Every package matching `m`'s narrowing prefix, deduped, in an order that
+    /// Every package that can hold a match for `m`, deduped, in an order that
     /// does not depend on the order any provider returned: each provider's block
     /// is sorted, then the blocks are concatenated in provider-registration
     /// order.
+    ///
+    /// # Scope is the engine's guarantee, not the provider's
+    ///
+    /// [`ListPackagesRequest::prefix`] is a *hint*. Honoring it is an
+    /// optimization a provider may skip, and the buildfile provider does skip it
+    /// — one shared workspace walk serves both `list_packages` and the
+    /// `heph.core.packages()` builtin, which needs the whole list. So the prefix
+    /// narrows the *walk* where a provider bothers (plugin-go joins it onto the
+    /// search root), and the matcher narrows the *answer* here, for everyone.
+    ///
+    /// Leaving the second half to each caller did not hold: `query` and `states`
+    /// re-pruned, `EngineProviderExecutor::states_under` did not — so
+    /// `states_under("some/dir")` probed every package in the workspace, and a
+    /// probe is a whole-package Starlark evaluation. `heph inspect packages
+    /// //foo/...` and `heph tool build-fmt //foo/...` did not re-prune either,
+    /// and answered for the whole workspace. One filter here, at the only place
+    /// that sees both the matcher and the provider answers, is what makes a
+    /// scoped selector cost its scope — and `MatchNo` is the sound half of the
+    /// tri-state (see [`htmatcher::Matcher::matches_pkg`]): every arm that
+    /// cannot decide from the package path alone shrugs, so the filter is
+    /// over-inclusive by construction and can only cost time, never a result.
     ///
     /// The order is load-bearing, not cosmetic. It reaches a def hash by more
     /// than one route — `query` → `pluginquery`'s `deps` → `plugingroup` folds
@@ -159,11 +180,25 @@ impl Engine {
         // finished first.
         let mut seen: FxHashSet<String> = FxHashSet::default();
 
+        // A whole-graph selector rejects nothing, so skip the check rather than
+        // build a `PkgBuf` per package to be told so — `//...` is the single
+        // most common selector and the one with the most packages to say it
+        // about. Every other matcher pays one `PkgBuf` per *unique* package
+        // (after the dedup below), and saves a probe plus a `list` for each one
+        // it rejects.
+        let scoped = !matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
+
         for pkgs in &per_provider {
             for p in pkgs.iter() {
-                if seen.insert(p.clone()) {
-                    all_packages.push(p.clone());
+                if !seen.insert(p.clone()) {
+                    continue;
                 }
+                if scoped
+                    && m.matches_pkg(&PkgBuf::from(p.as_str())) == htmatcher::MatchResult::MatchNo
+                {
+                    continue;
+                }
+                all_packages.push(p.clone());
             }
         }
 
@@ -612,6 +647,89 @@ mod tests {
         // land *after* `zeta`, so this is not one global sort). That composite
         // is the order that reaches a def hash.
         assert_eq!(pkgs, vec!["@heph/fs", "alpha", "zeta", "mid", "beta"]);
+        Ok(())
+    }
+
+    /// The listing is scoped by the *matcher*, not by whether the provider
+    /// honored `ListPackagesRequest::prefix` — `ListsPkgs` ignores it, exactly
+    /// like the buildfile provider (one shared workspace walk also serves
+    /// `heph.core.packages()`).
+    ///
+    /// Without this, every consumer had to re-prune, and the ones that forgot
+    /// answered for the whole workspace: `states_under("foo")` probed — i.e.
+    /// Starlark-evaluated — every package in the tree, and `heph inspect
+    /// packages //foo/...` printed all of them.
+    #[tokio::test]
+    async fn packages_scopes_the_listing_to_the_matcher() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = engine_with_builtins(&root)?;
+        engine.register_provider(move |_| {
+            Box::new(ListsPkgs::new(
+                "p1",
+                &["bar", "foo", "foo/deep", "foobar", "unrelated"],
+            ))
+        })?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        let pkgs: Vec<String> = engine
+            .packages(&Matcher::PackagePrefix(pkg("foo")), &rs)
+            .await?
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // `foobar` is not under `foo`: the prefix is a package prefix, not a
+        // string one. The built-in `fs` provider's `@heph/fs` is dropped too —
+        // it is out of scope like any other package.
+        assert_eq!(pkgs, vec!["foo".to_string(), "foo/deep".to_string()]);
+        Ok(())
+    }
+
+    /// The shape `heph run <label> //some/dir/...` parses to. The label arm can
+    /// never prune on a package path, but it must not *widen* the scan either:
+    /// `And` intersects, so the package arm still decides.
+    #[tokio::test]
+    async fn packages_scope_survives_an_unprunable_and_arm() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = engine_with_builtins(&root)?;
+        engine.register_provider(move |_| {
+            Box::new(ListsPkgs::new(
+                "p1",
+                &["bar", "foo", "foo/deep", "unrelated"],
+            ))
+        })?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        let m = Matcher::And(vec![
+            Matcher::Label("lint".to_string()),
+            Matcher::PackagePrefix(pkg("foo")),
+        ]);
+        let pkgs: Vec<String> = engine
+            .packages(&m, &rs)
+            .await?
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        assert_eq!(pkgs, vec!["foo".to_string(), "foo/deep".to_string()]);
+        Ok(())
+    }
+
+    /// The other half of the same prune: an arm that cannot decide from the
+    /// package path shrugs, and a shrug keeps the package. Over-inclusive costs
+    /// time; dropping a package here would lose results outright.
+    #[tokio::test]
+    async fn packages_keeps_everything_for_an_unprunable_matcher() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = engine_with_builtins(&root)?;
+        engine.register_provider(move |_| Box::new(ListsPkgs::new("p1", &["bar", "foo"])))?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        let pkgs: Vec<String> = engine
+            .packages(&Matcher::Label("lint".to_string()), &rs)
+            .await?
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        assert_eq!(pkgs, vec!["@heph/fs", "bar", "foo"]);
         Ok(())
     }
 
