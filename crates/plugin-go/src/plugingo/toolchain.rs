@@ -563,7 +563,7 @@ fn download_verify_extract(
 
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    let got = format!("{:x}", hasher.finalize());
+    let got = hex::encode(hasher.finalize());
     verify_checksum(expected_sha256, &got, version, url)?;
 
     let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.as_ref()));

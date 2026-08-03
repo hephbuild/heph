@@ -639,9 +639,18 @@ fn flush_once() -> anyhow::Result<()> {
             .build()
             .map_err(|e| anyhow::anyhow!("building telemetry client options: {e}"))?;
         let client = posthog_rs::client(options).await;
+        // `capture_batch_immediate`, not `capture_batch`: as of posthog-rs 0.21
+        // the latter is fire-and-forget (returns `()`, enqueues onto a
+        // background transport). We must not delete the spooled rows below
+        // until the send is *confirmed*, or a failed flush silently loses the
+        // batch. The returned `CaptureSummary` is discarded on purpose: its
+        // `not_persisted()` is only ever non-zero under the non-default
+        // `capture-v1` feature, so on the v0 pipeline an `Ok` already means the
+        // whole batch persisted — the same guarantee 0.12's `capture_batch` gave.
         client
-            .capture_batch(events, false)
+            .capture_batch_immediate(events, false)
             .await
+            .map(|_| ())
             .map_err(|e| anyhow::anyhow!("telemetry batch capture failed: {e}"))
     })?;
 

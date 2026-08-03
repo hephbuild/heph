@@ -43,26 +43,29 @@ glob = "0.3"
 google-cloud-auth = { version = "1.13", default-features = false }
 indexmap = "2"
 memoize = "0.6.0"
-object_store = { version = "0.13.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
+object_store = { version = "0.14.1", features = ["aws", "gcp", "azure", "http", "tokio"] }
 parking_lot = "0.12"
-quick_cache = "0.6"
+quick_cache = "0.7"
 r2d2 = "0.8"
-r2d2_sqlite = "0.34"
+r2d2_sqlite = "0.35"
 rayon = "1.12.0"
-# Blocking HTTP client, used only to download `url:` plugin manifests/cdylibs.
-# rustls-tls avoids a system OpenSSL link; blocking runs on its own thread so it
-# is safe to call from inside the async runtime (see plugin_load::download_plugin).
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
-# object_store 0.13 talks to reqwest 0.12 internally. To inject our own HTTP
-# client into its store builders (so cache transfers negotiate HTTP/2 via ALPN
-# and fall back to HTTP/1.1, instead of object_store's HTTP/1.1-only default that
-# storms connections under a wide fan-out), we build a reqwest 0.12 `Client` and
-# hand it to `object_store::client::HttpClient::new`. That requires the SAME
-# reqwest major as object_store, hence this second, renamed dependency. No
+# Two jobs, one client crate:
+#  - `blocking`: downloading `url:` plugin manifests/cdylibs. Blocking runs on
+#    its own thread so it is safe to call from inside the async runtime (see
+#    plugin_load::download_plugin).
+#  - `http2` + `stream`: the client we inject into object_store's store builders
+#    so cache transfers negotiate HTTP/2 via ALPN and fall back to HTTP/1.1,
+#    instead of object_store's HTTP/1.1-only default that storms connections
+#    under a wide fan-out (see remote_cache_objstore::NegotiatingConnector).
+# object_store 0.14 moved to reqwest 0.13 — the same major we already use — so
+# injecting a client no longer needs a second, renamed copy of reqwest kept in
+# lockstep with object_store's internal one (0.13 dropped that duplicate whole
+# HTTP+TLS stack from the build). `rustls` avoids a system OpenSSL link and
+# carries the platform trust store, matching object_store's own TLS setup. No
 # gzip/brotli features → responses are not auto-decompressed (cache blobs stay
-# raw). rustls-native-roots matches object_store's own TLS setup.
-reqwest012 = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2", "stream"] }
-rusqlite = { version = "0.39", features = ["bundled", "blob"] }
+# raw).
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "stream"] }
+rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 rustc-hash = "2"
 # Needed only to install a process-wide rustls crypto provider for
 # `google-cloud-auth` (its reqwest uses `rustls-no-provider`). `ring` keeps us
@@ -70,7 +73,7 @@ rustc-hash = "2"
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 serde_yaml = "0.9"
 similar = "3"

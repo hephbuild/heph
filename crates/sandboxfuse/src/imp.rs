@@ -1535,7 +1535,10 @@ impl Mount {
             config.clone_fd = true;
         }
         let fs_clone = fs.clone();
-        let session = fuser::spawn_mount2(MountFs(fs), mountpoint, &config)
+        // fuser 0.18 dropped the legacy `&[MountOption]` `spawn_mount` and
+        // renamed the `&Config` one (`spawn_mount2`) to take its place; same
+        // signature, same semantics.
+        let session = fuser::spawn_mount(MountFs(fs), mountpoint, &config)
             .with_context(|| format!("mount FUSE at {:?}", mountpoint))?;
         // Plumb a Notifier so the FS can invalidate kernel caches after
         // creating new entries — macFUSE 5.x otherwise caches negative

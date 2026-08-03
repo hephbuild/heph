@@ -7,7 +7,7 @@ edition = "2021"
 prost = "0.14"
 prost-types = "0.14"
 serde = { version = "1.0", features = ["derive"] }
-pbjson = "0.7"
+pbjson = "0.9"
 
 [lints.clippy]
 all = "allow"

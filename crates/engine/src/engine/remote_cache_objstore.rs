@@ -96,7 +96,7 @@ struct NegotiatingConnector;
 
 impl HttpConnector for NegotiatingConnector {
     fn connect(&self, _options: &ClientOptions) -> object_store::Result<HttpClient> {
-        // reqwest 0.12 rustls uses the process-default crypto provider.
+        // reqwest's rustls backend uses the process-default crypto provider.
         ensure_rustls_provider_installed();
         // Default builder = ALPN offering h2 + http/1.1 (server picks), env
         // proxies honored, no gzip/brotli features so blobs aren't decompressed.
@@ -106,7 +106,7 @@ impl HttpConnector for NegotiatingConnector {
         // connection would throttle aggregate throughput on a fixed 64 KiB
         // window — the very reason object_store defaults to HTTP/1.1. With it, we
         // get h2's few-connections benefit *and* full throughput.
-        let client = reqwest012::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .http2_adaptive_window(true)
             .build()

@@ -19,14 +19,14 @@ crossbeam-channel = "0.5"
 # dependency. That lets the cross-compiled (zigbuild) arm64 release binary link
 # cleanly — there is no C library to find for the target arch.
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.17", optional = true }
+fuser = { version = "0.18", optional = true }
 
 # macOS has no pure-Rust mount path, so it must link libfuse (macFUSE). The
 # shipped macOS binary dynamically links libosxfuse and therefore requires
 # macFUSE installed at runtime to launch — unless the final binary is linked
 # with `-weak-lfuse` (see build.rs), which every binary-producing crate emits.
 [target.'cfg(target_os = "macos")'.dependencies]
-fuser = { version = "0.17", optional = true, features = ["libfuse"] }
+fuser = { version = "0.18", optional = true, features = ["libfuse"] }
 
 [features]
 # FUSE sandbox is on by default. Linux links nothing (pure-Rust); macOS links
