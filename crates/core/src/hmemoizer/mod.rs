@@ -8,7 +8,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use xxhash_rust::xxh3::Xxh3Default;
 
@@ -249,11 +249,26 @@ fn format_phases() -> String {
 /// every other test in the binary also locks, permanently, for the rest of
 /// the process.
 fn format_phases_from(m: &Mutex<HashMap<u64, &'static str>>) -> String {
+    // `try_lock`, for the same reason `TaskSource::collect` uses it: never block
+    // a diagnostic dump on the process being dumped. With `HEPH_PHASE_TRACE=1`
+    // this mutex is touched by every invocation on every phase transition, and
+    // std's `Mutex` is not fair — a blocking `lock()` here can be starved by a
+    // busy engine for as long as the engine stays busy, which turns "dump the
+    // state" into "hang the dumper" on exactly the run someone is trying to
+    // diagnose.
+    //
     // A panic while some other caller held this lock (mid `set_phase` or
     // `clear_phase`) must not turn this diagnostic dump into a second panic —
     // recover the guard rather than propagating the poison, same as
     // `ApprovalCenter::lock`.
-    let map = m.lock().unwrap_or_else(PoisonError::into_inner);
+    let map = match m.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return "  (not sampled — the phase map was busy; the engine is still running)"
+                .to_string();
+        }
+    };
     if map.is_empty() {
         return "  (none)".to_string();
     }
@@ -870,9 +885,21 @@ fn format_wait_graph() -> String {
 /// [`format_phases_from`]: so a test can poison a private `Mutex` instead of
 /// the process-wide static.
 fn format_wait_graph_from(m: &Mutex<WaitGraph>) -> String {
+    // `try_lock` — see `format_phases_from` for why a diagnostic must never
+    // block on the process it is diagnosing. `HEPH_DEBUG_MEMOIZER_CYCLE=1`
+    // makes this mutex hot on every `once()`, so a blocking `lock()` is
+    // starvable by a busy engine.
+    //
     // Recover a poisoned guard instead of panicking a second time — see
     // `format_phases`.
-    let wg = m.lock().unwrap_or_else(PoisonError::into_inner);
+    let wg = match m.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return "  (not sampled — the wait-for graph was busy; the engine is still running)"
+                .to_string();
+        }
+    };
     let mut out = String::new();
     if wg.cells.is_empty() && wg.waiting.is_empty() {
         out.push_str("  (empty)");
@@ -2117,6 +2144,44 @@ mod tests {
     /// real `phases()` static would poison it for every other test in this
     /// binary for the rest of the process (a `Mutex`'s poison never clears),
     /// not just this one.
+    /// A held lock must not block the dump.
+    ///
+    /// `TaskSource::collect` states the rule — "never block a diagnostic dump on
+    /// the process being dumped" — and takes its map with `try_lock`. These two
+    /// sections did not, and they are the ones gated behind `HEPH_PHASE_TRACE=1`
+    /// and `HEPH_DEBUG_MEMOIZER_CYCLE=1`, which are precisely the flags that make
+    /// these mutexes hot: every phase transition and every `once()` respectively.
+    /// std's `Mutex` is not fair, so a blocking `lock()` here is starvable by a
+    /// busy engine for as long as it stays busy — turning "dump the state" into
+    /// "hang the dumper" on the exact run someone is trying to diagnose.
+    ///
+    /// Deterministic without a second thread: `try_lock` on a mutex this thread
+    /// already holds returns `WouldBlock` (std's `Mutex` is not reentrant), so
+    /// the guard below reproduces contention exactly.
+    #[test]
+    fn format_phases_does_not_block_on_a_held_lock() {
+        let m: Mutex<HashMap<u64, &'static str>> = Mutex::new(HashMap::new());
+        let _held = m.lock().expect("hold the lock");
+        let text = format_phases_from(&m);
+        assert!(
+            text.contains("not sampled"),
+            "a busy phase map must yield a note, not block: {text}"
+        );
+    }
+
+    /// Same as `format_phases_does_not_block_on_a_held_lock`, for the
+    /// wait-for-graph lock.
+    #[test]
+    fn format_wait_graph_does_not_block_on_a_held_lock() {
+        let m: Mutex<WaitGraph> = Mutex::new(WaitGraph::new());
+        let _held = m.lock().expect("hold the lock");
+        let text = format_wait_graph_from(&m);
+        assert!(
+            text.contains("not sampled"),
+            "a busy wait-for graph must yield a note, not block: {text}"
+        );
+    }
+
     #[test]
     fn format_phases_recovers_from_a_poisoned_lock() {
         let m: Mutex<HashMap<u64, &'static str>> = Mutex::new(HashMap::new());
