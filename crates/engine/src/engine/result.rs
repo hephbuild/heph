@@ -331,18 +331,17 @@ impl ProviderExecutor for EngineProviderExecutor {
                 // <=K tasks already spawned instead of spawning one per remaining
                 // package — see `Engine::query`.
                 .take_while(enclose!((stop) move |_| !stop.load(std::sync::atomic::Ordering::Relaxed)))
-                .filter_map(|pkg_str| {
+                .map(|pkg_str| {
                 let pkg = PkgBuf::from(pkg_str.as_str());
 
-                // Same pruning as `Engine::query`: skip packages the matcher
-                // cannot select before paying for probe + list. Done here, off
-                // the buffered stream, so a pruned package costs no slot.
-                if m.matches_pkg(&pkg) == hmodel::htmatcher::MatchResult::MatchNo {
-                    return None;
-                }
-
+                // No package-scope prune here, same as `Engine::query`:
+                // `packages()` above already answers within `m`'s scope
+                // regardless of what the provider did with the prefix hint, so
+                // no package reaching this point can be rejected on its path
+                // alone.
+                //
                 // Spawned here, not through a later `.map()` — see `Engine::query`.
-                Some(hcore::hmemoizer::spawn_with_cycle_ctx(
+                hcore::hmemoizer::spawn_with_cycle_ctx(
                     enclose!((engine, rs, executor, stop, extra_skip) async move {
                         // See `Engine::query`: an abandoning walk stops evaluating
                         // packages it has not started, so the drain below costs a
@@ -392,7 +391,7 @@ impl ProviderExecutor for EngineProviderExecutor {
 
                         anyhow::Ok(candidates)
                     }),
-                ))
+                )
             }))
             // One task per package — see the long note in `Engine::query`: as
             // plain futures the `PKG_EVAL_SLOTS` permit holders would be
@@ -4511,6 +4510,125 @@ mod tests {
     /// the sum of every probe. plugin-go calls this for a whole module root
     /// before it can emit a single addr, so it sits on the critical path of a
     /// Go workspace's discovery.
+    /// `states_under(prefix)` means "the packages at or under `prefix`" — and a
+    /// probe is not cheap: `pluginbuildfile::probe` is `run_pkg`, a whole-package
+    /// Starlark evaluation holding a `PKG_EVAL_SLOTS` permit.
+    ///
+    /// It used to probe the *whole workspace* for any prefix. `list_packages`'s
+    /// prefix is only a hint — the buildfile provider ignores it, as the fake
+    /// here does — and this walk, unlike `Engine::query`, never re-pruned what
+    /// came back. plugin-go calls it once per first-party library package with
+    /// the module root, so a `heph run <label> //some/dir/...` in a workspace
+    /// with a root-level module paid a full-workspace evaluation per library.
+    /// `Engine::packages` now applies the matcher itself, which is what bounds
+    /// this to the subtree.
+    #[tokio::test]
+    async fn states_under_probes_only_packages_under_the_prefix() -> anyhow::Result<()> {
+        /// Records every package it is asked to probe; ignores the list prefix.
+        struct RecordingProbe {
+            pkgs: Vec<String>,
+            probed: SArc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl crate::engine::provider::Provider for RecordingProbe {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "recording".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                _req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                    .pkgs
+                    .iter()
+                    .map(|p| {
+                        Ok(ListPackageResponse {
+                            pkg: PkgBuf::from(p.as_str()),
+                        })
+                    })
+                    .collect();
+                Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                let pkg = req.package.clone();
+                self.probed
+                    .lock()
+                    .expect("probed")
+                    .push(pkg.as_str().to_string());
+                Box::pin(async move {
+                    Ok(ProbeResponse {
+                        states: vec![State {
+                            package: pkg,
+                            provider: "recording".to_string(),
+                            state: Default::default(),
+                        }],
+                    })
+                })
+            }
+        }
+
+        let probed = SArc::new(std::sync::Mutex::new(Vec::new()));
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let pkgs: Vec<String> = ["bar", "foo", "foo/deep", "foobar", "unrelated"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        engine.register_provider(enclose!((probed) move |_| Box::new(RecordingProbe {
+            pkgs: pkgs.clone(),
+            probed: SArc::clone(&probed),
+        })))?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let states = states_under_of(&engine, &rs)
+            .states_under(&PkgBuf::from("foo"))
+            .await?;
+
+        let mut got = probed.lock().expect("probed").clone();
+        got.sort();
+        // `foobar` is not under `foo` — the scope is a package prefix, not a
+        // string one.
+        assert_eq!(got, vec!["foo".to_string(), "foo/deep".to_string()]);
+        let declared: Vec<&str> = states.iter().map(|s| s.package.as_str()).collect();
+        assert_eq!(declared, vec!["foo", "foo/deep"]);
+        Ok(())
+    }
+
     /// A failed `states_under` walk must stop probing.
     ///
     /// `Buffered` refills its queue from the underlying iterator on *every*

@@ -21,12 +21,26 @@ impl PkgBuf {
         self.0.split('/').filter(|s| !s.is_empty())
     }
 
+    /// Whether this package is `prefix` or lives under it. The boundary check is
+    /// what makes it a *package* prefix rather than a string one: `a/b` is under
+    /// `a`, `ab` is not.
+    ///
+    /// Allocation-free on purpose — this is the predicate every package-scope
+    /// prune runs, once per package per walk (`Matcher::matches_pkg`) and once
+    /// per candidate (`matches_addr`), so the `format!("{p}/")` it used to build
+    /// was a heap allocation per call on the hottest filter in discovery.
     pub fn has_prefix(&self, prefix: &PkgBuf) -> bool {
         let p = prefix.as_str();
+        // The root package is everyone's prefix, and it is the one case with no
+        // separator to check for: `""` + `/` is not how `a` spells its path.
         if p.is_empty() {
             return true;
         }
-        self.0 == p || self.0.starts_with(&format!("{}/", p))
+        match self.0.strip_prefix(p) {
+            Some("") => true,
+            Some(rest) => rest.starts_with('/'),
+            None => false,
+        }
     }
 
     /// Iterator yielding this package, then each ancestor up to (and including)
@@ -178,6 +192,17 @@ mod tests {
     #[test]
     fn no_partial_component_match() {
         assert!(!pkg("foo/bar/baz").has_prefix(&pkg("foo/ba")));
+        // The sibling case a plain `starts_with` gets wrong, and the one a
+        // package-scope prune is asked about constantly: `//foo/...` must not
+        // pull in `foobar`.
+        assert!(!pkg("foobar").has_prefix(&pkg("foo")));
+        assert!(!pkg("foobar/deep").has_prefix(&pkg("foo")));
+    }
+
+    #[test]
+    fn shorter_than_prefix_is_not_a_match() {
+        assert!(!pkg("foo").has_prefix(&pkg("foo/bar")));
+        assert!(!pkg("").has_prefix(&pkg("foo")));
     }
 
     #[test]

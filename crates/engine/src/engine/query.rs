@@ -114,26 +114,23 @@ impl Engine {
                 // to have each one bail. Ending the iterator makes the drain
                 // await only the <=K handles already spawned.
                 .take_while(enclose!((stop) move |_| !stop.load(std::sync::atomic::Ordering::Relaxed)))
-                .filter_map(|pkg_str| {
+                .map(|pkg_str| {
                 let pkg = PkgBuf::from(pkg_str);
 
-                // Prune before probing or listing. `list` is a whole-package
-                // Starlark evaluation for the buildfile provider, so without
-                // this a scoped query (`//foo/...`, `label(l) && //foo/...`,
-                // a bare `//foo:bar`) still pays to evaluate every BUILD file
-                // in the repo and then throws the results away at the addr
-                // check below. Providers are free to ignore `ListPackagesRequest::prefix`
-                // — most do — so the narrowing has to happen here too. Done
-                // before the stream so a pruned package never takes a slot.
-                if m.matches_pkg(&pkg) == MatchResult::MatchNo {
-                    return None;
-                }
-
+                // No package-scope prune here: `packages()` above already
+                // returns only packages `m` can match, whatever the provider
+                // did with `ListPackagesRequest::prefix`. That matters because
+                // `list` is a whole-package Starlark evaluation for the
+                // buildfile provider — a scoped selector (`//foo/...`,
+                // `label(l) && //foo/...`, a bare `//foo:bar`) must not pay to
+                // evaluate every BUILD file in the repo only to throw the
+                // results away at the addr check below.
+                //
                 // Spawned here rather than through a later `.map()`: handing the
                 // async block to a generic fn through a combinator makes its
                 // captured lifetimes late-bound and trips "implementation of
                 // `FnOnce` is not general enough".
-                Some(hcore::hmemoizer::spawn_with_cycle_ctx(enclose!((self => engine, rs, executor, stop) async move {
+                hcore::hmemoizer::spawn_with_cycle_ctx(enclose!((self => engine, rs, executor, stop) async move {
                     // An abandoned walk must not start evaluating packages it has
                     // not reached yet — that is what keeps the drains below (and
                     // in `Engine::result`) to a cheap poll per remaining package
@@ -174,7 +171,7 @@ impl Engine {
                     }
 
                     anyhow::Ok(candidates)
-                })))
+                }))
             }))
             // Each package runs as its own task, not merely as a future inside
             // `Buffered`. That is what makes the serial consumer below safe.
