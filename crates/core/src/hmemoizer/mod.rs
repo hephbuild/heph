@@ -768,7 +768,15 @@ where
     /// *completed* (not in-flight, not absent). Lets a caller take a cheap path
     /// on a cache hit (e.g. registering a dep edge with `note_dep` instead of a
     /// full `result`) without disturbing the cache or deduping with in-flight work.
-    pub fn peek(&self, key: &K) -> Option<V> {
+    ///
+    /// Borrowed-key generic like `HashMap::get`: the hit path is the whole point
+    /// of this method, and making the caller mint an owned key to ask puts an
+    /// allocation back on it.
+    pub fn peek<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         self.inner.peek(key)
     }
 

@@ -1207,6 +1207,25 @@ fn pkg_eval_slots() -> usize {
 
 impl Provider {
     pub(crate) async fn run_pkg(&self, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
+        // Answer a completed entry before building anything. Everything below
+        // this point exists only to construct the closure `once` runs on a
+        // *miss* — a `PathBuf` clone, a full clone of the function registry,
+        // five `Arc` bumps and a `String` — and it was all paid on every call,
+        // hit included.
+        //
+        // That is not a marginal saving here, because the call rate is not
+        // bounded by the number of packages. `probe` calls this for every
+        // package whose `provider_state` ancestry is consulted, and each
+        // top-level target with a `codegen = in_place` output re-runs its whole
+        // resolution under a *fresh* `RequestState` whose probe memo starts
+        // empty (`Engine::new_hash_only_state`). Measured on a fully cached
+        // `run lint //go/large/...` over 2000 Go packages: **12.27 million**
+        // calls, 11.4M of them from `probe` — against 13 BUILD files in the
+        // tree. The evaluation itself was already memoized; the preamble was
+        // not, and it was ~4% of the run's CPU.
+        if let Some(hit) = self.pkg_cache.peek(pkg) {
+            return hit.map_err(unwrap_arc_err);
+        }
         let key = pkg.to_string();
         let root = self.root.clone();
         let patterns = self.build_file_patterns.clone();
