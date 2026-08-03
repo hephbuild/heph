@@ -589,6 +589,27 @@ pub struct RequestState {
     ///
     /// [`track_dep`]: RequestState::track_dep
     speculative: bool,
+    /// Children this state has already committed to the shared [`DepDag`].
+    ///
+    /// Resolving one target walks its input list three times — `link` calls
+    /// `get_def` per input, `collect_transitive_deps` calls `get_spec` per
+    /// input, and `inputs_result_meta` calls `result_addr` per input — and all
+    /// three run against *this* `RequestState`, so each one offers the engine
+    /// the same `parent → input` edge. `DepDag::add_dep` already treats the
+    /// second and third as no-ops, but only after taking the process-wide
+    /// `dep_dag` mutex to look them up: profiling a fully-cached Go corpus put
+    /// 10.4% of all CPU in `track_dep`, of which 91% was acquiring that one
+    /// lock and under 4% was `add_dep` doing any work.
+    ///
+    /// Answering the repeat here keeps it off the shared lock entirely. Scoped
+    /// to the `RequestState` rather than to the request so it holds only this
+    /// target's own children and is freed with the state — a request-wide set
+    /// would mirror `DepDag::edges` for the whole build.
+    ///
+    /// Only *successful* edges are recorded: a rejected one must stay
+    /// unrecorded so an identical later attempt is re-checked and re-rejected,
+    /// which is the same rule `add_dep` follows for `DepDag::edges` itself.
+    tracked: Mutex<FxHashSet<AddrKey>>,
 }
 
 impl RequestState {
@@ -765,6 +786,7 @@ impl RequestState {
             skip_providers: Arc::clone(&self.skip_providers),
             crumbs,
             speculative: self.speculative,
+            tracked: Mutex::new(FxHashSet::default()),
         })
     }
 
@@ -778,6 +800,7 @@ impl RequestState {
             skip_providers: Arc::new(set),
             crumbs: self.crumbs.clone(),
             speculative: self.speculative,
+            tracked: Mutex::new(FxHashSet::default()),
         })
     }
 
@@ -796,6 +819,7 @@ impl RequestState {
             skip_providers: Arc::clone(&self.skip_providers),
             crumbs: self.crumbs.clone(),
             speculative: true,
+            tracked: Mutex::new(FxHashSet::default()),
         })
     }
 
@@ -822,7 +846,32 @@ impl RequestState {
             }
             Ok(())
         } else if let Some(parent) = &self.parent {
-            self.data.dep_dag.lock().add_dep(parent, addr)
+            // Already committed from this state: `add_dep` would find the edge
+            // in `DepDag::edges` and return `Ok(())` unchanged, so answer it
+            // here instead of queueing for the shared lock. See `tracked`.
+            //
+            // One `tracked` acquisition, held across the `dep_dag` one, rather
+            // than lock-check-unlock / lock-insert-unlock around it. A repeat —
+            // the case this exists for, two calls in three — still costs exactly
+            // one uncontended acquisition, and a first offer now costs two rather
+            // than three.
+            //
+            // Lock order is `tracked` then `dep_dag`, and only ever that way:
+            // this is the sole place either is taken together, and `add_dep`
+            // touches nothing but the `DepDag` it is called on. Holding `tracked`
+            // across the `dep_dag` wait does not cost a sibling anything real —
+            // a sibling is resolving a *different* input, so its own check would
+            // miss and queue for `dep_dag` regardless.
+            let mut tracked = self.tracked.lock();
+            let key = AddrKey(addr.clone());
+            if tracked.contains(&key) {
+                return Ok(());
+            }
+            // `?` before the insert: a rejected edge must stay unrecorded so an
+            // identical later attempt is re-checked and re-rejected.
+            self.data.dep_dag.lock().add_dep(parent, addr)?;
+            tracked.insert(key);
+            Ok(())
         } else {
             Ok(())
         }
@@ -996,6 +1045,7 @@ impl Engine {
             skip_providers: Arc::new(HashSet::new()),
             crumbs: None,
             speculative: false,
+            tracked: Mutex::new(FxHashSet::default()),
         });
 
         if let Ok(mut requests) = self.requests.lock() {
@@ -1252,6 +1302,47 @@ mod tests {
         let b = addr("b");
         assert!(dag.add_dep(&a, &b).is_ok());
         assert!(dag.add_dep(&a, &b).is_ok());
+    }
+
+    /// `track_dep` answers a repeated edge from the per-state `tracked` set
+    /// instead of the shared `DepDag`, so that set must learn only about edges
+    /// the DAG actually accepted — otherwise a cycle would be rejected once and
+    /// silently allowed on every later attempt.
+    #[test]
+    fn track_dep_caches_accepted_edges_but_never_rejected_ones() -> anyhow::Result<()> {
+        let (_dir, engine) = test_engine()?;
+        let root = engine.new_state();
+
+        let a = addr("a");
+        let b = addr("b");
+
+        // From A: A→B is accepted, and repeats stay accepted (this is the
+        // repeat the cache is here to absorb — `link`, `collect_transitive_deps`
+        // and `inputs_result_meta` each offer it once).
+        let from_a = root.with_parent(a.clone());
+        for _ in 0..3 {
+            assert!(from_a.track_dep(&b).is_ok(), "A→B must stay accepted");
+        }
+
+        // From B: B→A closes the cycle. Rejected, and it must be rejected every
+        // single time — a cached rejection would read as "already tracked".
+        let from_b = root.with_parent(b.clone());
+        for i in 0..3 {
+            assert!(
+                from_b.track_dep(&a).is_err(),
+                "B→A closes a cycle and must stay rejected (attempt {i})"
+            );
+        }
+
+        // A self-loop bails before the DAG records anything, so it must not be
+        // cached as accepted either.
+        for i in 0..3 {
+            assert!(
+                from_a.track_dep(&a).is_err(),
+                "A→A is a self-loop and must stay rejected (attempt {i})"
+            );
+        }
+        Ok(())
     }
 
     #[test]
