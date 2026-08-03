@@ -384,6 +384,7 @@ async fn tee_stream(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Some(mut source) = source else { return };
     let mut buf = vec![0u8; 8192];
+    let mut lost = SinkLoss::default();
     loop {
         match source.read(&mut buf).await {
             Ok(0) => break,
@@ -408,13 +409,65 @@ async fn tee_stream(
                     drop(g.write_all(slice));
                 }
                 if let Some(ref mut out) = sink {
-                    drop(out.write_all(slice).await);
+                    let wrote = out.write_all(slice).await;
                     // Flush immediately so interactive shells see each byte
                     // appear as it's typed (tokio::io::stdout is line-buffered
                     // when wired to a tty).
-                    drop(out.flush().await);
+                    let flushed = out.flush().await;
+                    // `tokio::io::stdout` buffers, so a rejected write usually
+                    // surfaces at the flush rather than at `write_all` — take
+                    // whichever failed.
+                    if let Err(e) = wrote.and(flushed) {
+                        lost.record(n, e);
+                    }
                 }
             }
+        }
+    }
+    lost.finish(addr, stream);
+}
+
+/// Output the sink refused, and why.
+///
+/// The sink write used to be `drop(out.write_all(..).await)`. When it failed,
+/// the target's output vanished from the user's terminal while `log.txt` kept
+/// every byte — the two disagreed and nothing anywhere said why. That is how a
+/// non-blocking stdout (see `tui::tty`, where the bug was) went unnoticed long
+/// enough to read as a flaky test: `EAGAIN` on a full terminal queue is a
+/// *silent* truncation, and it only shows up under output large enough to fill
+/// the queue.
+///
+/// Counting is per-chunk, not per-byte: `write_all` does not report how far it
+/// got before failing, so the whole chunk in flight is charged. The number is a
+/// floor on what the terminal missed, and is reported as such.
+#[derive(Default)]
+struct SinkLoss {
+    dropped_bytes: usize,
+    first: Option<std::io::Error>,
+}
+
+impl SinkLoss {
+    fn record(&mut self, chunk_len: usize, error: std::io::Error) {
+        self.dropped_bytes = self.dropped_bytes.saturating_add(chunk_len);
+        if self.first.is_none() {
+            self.first = Some(error);
+        }
+    }
+
+    /// Report once, at the end, rather than per failing chunk: the failure is
+    /// almost always the same error repeating for every chunk that follows, and
+    /// a warning per 8 KiB would bury the run's real output.
+    fn finish(self, addr: &str, stream: &str) {
+        if let Some(error) = self.first {
+            tracing::warn!(
+                addr,
+                stream,
+                dropped_bytes = self.dropped_bytes,
+                %error,
+                "heph could not write some of this target's output to the terminal, so at \
+                 least this many bytes of it were not shown. The full output is in the \
+                 target's log.txt"
+            );
         }
     }
 }
@@ -462,6 +515,7 @@ async fn tee_output<'io>(
     use tokio::io::AsyncWriteExt;
     let Some(mut reader) = reader else { return };
     let mut absorbed = SinkCost::default();
+    let (mut lost_stdout, mut lost_stderr) = (SinkLoss::default(), SinkLoss::default());
     loop {
         let (stream, chunk) = match reader.recv().await {
             Ok(Some(c)) => c,
@@ -495,10 +549,18 @@ async fn tee_output<'io>(
             proc_exec::StreamId::Stderr => stderr.as_mut(),
         };
         if let Some(out) = sink {
-            drop(out.write_all(&chunk).await);
+            let wrote = out.write_all(&chunk).await;
             // Flush immediately so an interactive consumer sees each chunk
             // as it appears rather than at process exit.
-            drop(out.flush().await);
+            let flushed = out.flush().await;
+            // Same silent-truncation trap as the PTY path — see [`SinkLoss`].
+            if let Err(e) = wrote.and(flushed) {
+                match stream {
+                    proc_exec::StreamId::Stdout => &mut lost_stdout,
+                    proc_exec::StreamId::Stderr => &mut lost_stderr,
+                }
+                .record(chunk.len(), e);
+            }
         }
         if absorbed.record(stream, started.elapsed()) {
             tracing::warn!(
@@ -511,6 +573,8 @@ async fn tee_output<'io>(
         }
     }
     absorbed.finish(addr);
+    lost_stdout.finish(addr, "stdout");
+    lost_stderr.finish(addr, "stderr");
 }
 
 /// Cumulative time a target spent blocked while heph wrote the target's own
@@ -1726,6 +1790,85 @@ mod tests {
     fn log_file(dir: &tempfile::TempDir) -> Arc<std::sync::Mutex<std::fs::File>> {
         let file = std::fs::File::create(dir.path().join("log.txt")).expect("create log file");
         Arc::new(std::sync::Mutex::new(file))
+    }
+
+    /// `AsyncWrite` double that swallows writes and then refuses to flush with
+    /// `WouldBlock` — the shape a *non-blocking* stdout takes once the
+    /// terminal's output queue fills. Refusing at the flush rather than the
+    /// write is not incidental: `tokio::io::stdout` buffers, so that is where
+    /// the real `EAGAIN` surfaced.
+    struct WouldBlockSink;
+
+    impl tokio::io::AsyncWrite for WouldBlockSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "synthetic EAGAIN",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Output the terminal refuses must be *reported*, not discarded.
+    ///
+    /// This is the regression for a silent truncation: the sink write was
+    /// `drop(out.write_all(..).await)`, so when stdout was accidentally
+    /// non-blocking (see `tui::tty`) heph read the target's output, wrote every
+    /// byte to `log.txt`, and dropped an arbitrary tail of it on the way to the
+    /// terminal — with nothing logged, and the two records silently disagreeing.
+    /// A user's only symptom was output that stopped mid-stream.
+    #[tokio::test]
+    async fn tee_stream_reports_output_the_sink_refused() {
+        let (guard, log) = capture_tracing();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bytes_read = std::sync::atomic::AtomicUsize::new(0);
+        let payload = vec![b'x'; 4096];
+        let mut sink = WouldBlockSink;
+
+        tee_stream(
+            Some(&payload[..]),
+            log_file(&tmp),
+            Some(&mut sink),
+            "//pkg:target",
+            "pty",
+            &bytes_read,
+        )
+        .await;
+        drop(guard);
+
+        let text = log.text();
+        assert!(
+            text.contains("could not write some of this target's output"),
+            "the refused output was not reported: {text}"
+        );
+        assert!(text.contains("//pkg:target"), "missing addr field: {text}");
+        // One 8 KiB read covers the whole payload, so the count is exact rather
+        // than merely a floor here.
+        assert!(
+            text.contains("dropped_bytes=4096"),
+            "missing or wrong dropped byte count: {text}"
+        );
+        assert!(
+            text.contains("synthetic EAGAIN"),
+            "missing underlying error: {text}"
+        );
     }
 
     #[tokio::test]
