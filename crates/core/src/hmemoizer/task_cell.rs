@@ -172,6 +172,14 @@ impl<V> TaskCell<V> {
     }
 }
 
+/// If less than this much stack remains when a body is polled inline, grow.
+/// Matches `engine::grow_stack`'s red zone — sized for the ~100 KiB frames a
+/// memoized descent puts on the stack.
+const INLINE_RED_ZONE: usize = 512 * 1024;
+
+/// Size of each freshly allocated stack segment for the inline poll.
+const INLINE_STACK_PER_GROW: usize = 8 * 1024 * 1024;
+
 /// Whether `process` polls a cold body inline before spawning a task for it.
 ///
 /// On by default. `HEPH_MEMOIZER_INLINE=0` restores the always-spawn path, so
@@ -379,10 +387,26 @@ where
             // reaches zero.
             drop(cache);
             let mut body_fut = Box::pin(body.run(fut));
+            // Under `stacker::maybe_grow`, because this is the one thing the
+            // task-per-cell design was silently buying besides isolation: a
+            // spawned body starts on its *own* stack, so a memoized descent
+            // (`get_spec` -> `get_def` -> `get_spec` -> ...) cost O(1) stack per
+            // level no matter how deep the graph. Polled inline it recurses on
+            // the caller's stack instead, and a deep enough chain overflows a
+            // 2 MiB worker stack — which is exactly what
+            // `deep_warm_chain_completes_on_a_2mib_stack` caught, on all three
+            // targets at once.
+            //
+            // Same wrapper, same constants, and the same reasoning as
+            // `engine::grow_stack` already applies to the transparent-group
+            // re-inline: a couple of instructions on the hot path, a fresh
+            // segment allocated only when headroom actually runs low.
             let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let waker = futures::task::noop_waker();
                 let mut cx = std::task::Context::from_waker(&waker);
-                body_fut.as_mut().poll(&mut cx)
+                stacker::maybe_grow(INLINE_RED_ZONE, INLINE_STACK_PER_GROW, || {
+                    body_fut.as_mut().poll(&mut cx)
+                })
             }));
             match polled {
                 // Completed on this stack. `run` already published under the
