@@ -8,6 +8,13 @@ use tracing::error;
 use heph::diag;
 mod pprof_dump;
 
+/// Resolution is allocator-bound: a warm 85k-target `validate` spends ~15% of
+/// its on-CPU samples inside the platform allocator, spread across every worker
+/// thread. mimalloc's per-thread free lists take that traffic off the shared
+/// arena locks that libmalloc/glibc-malloc serialize on.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "heph")]
 #[command(about = "An efficient build system", long_about = None)]
