@@ -361,7 +361,12 @@ where
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    pub(crate) fn peek(&self, key: &K) -> Option<V> {
+    /// Borrowed-key generic like `HashMap::get`, so a hit needs no owned key.
+    pub(crate) fn peek<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         self.cache_lock(key)
             .get(key)
             .and_then(|c| c.peek().cloned())
