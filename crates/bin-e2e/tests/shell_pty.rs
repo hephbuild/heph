@@ -200,11 +200,23 @@ impl ShellSession {
             return;
         }
         loop {
-            let snapshot = self.output_snapshot();
-            let unseen = snapshot.get(self.cursor..).unwrap_or(&[]);
-            if let Some(pos) = unseen.windows(needle.len()).position(|w| w == needle) {
-                self.cursor += pos + needle.len();
-                return;
+            // Search *under* the lock rather than cloning the buffer first.
+            // `output_snapshot` copies everything captured so far, and this
+            // runs every `POLL`; against a command that emits 900 KiB that is a
+            // fresh ~900 KiB allocation and memcpy 50 times a second, with the
+            // capture lock held for each one — so the relay thread cannot drain
+            // the pty while it happens, the child backs up, and the whole thing
+            // degrades as the output grows. It only stayed invisible while
+            // these waits were matching their own echo and returning on the
+            // first poll; making them wait for real output surfaced it as a
+            // 60s timeout on `large-output-done`.
+            {
+                let buf = self.captured.lock().expect("capture lock");
+                let unseen = buf.get(self.cursor..).unwrap_or(&[]);
+                if let Some(pos) = unseen.windows(needle.len()).position(|w| w == needle) {
+                    self.cursor += pos + needle.len();
+                    return;
+                }
             }
             assert!(
                 started.elapsed() < timeout,
@@ -426,8 +438,14 @@ fn exit_is_prompt_after_chatty_and_large_output() {
 
     // Comfortably past the 512 KiB drain bound plus the 64 KiB pipe.
     let (large_cmd, large_marker) = echo_marker("large-output", "-done");
+    // `fold` so the 900 KiB arrives as lines rather than one 900 KiB line. The
+    // volume is the point (comfortably past the 512 KiB drain bound plus the
+    // 64 KiB pipe); a single unbroken line is not, and a pty's line discipline
+    // handles one that long badly enough that the transfer does not finish
+    // inside a 60s budget. That never showed while these waits were matching
+    // their own echo instead of the output.
     session.send_str(&format!(
-        "head -c 900000 /dev/zero | tr '\\0' 'x'; {large_cmd}\n"
+        "head -c 900000 /dev/zero | tr '\\0' 'x' | fold -w 256; {large_cmd}\n"
     ));
     session.wait_for(&large_marker, DEADLINE);
     session.wait_for("shellpty#", DEADLINE);
