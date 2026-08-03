@@ -27,6 +27,13 @@
 //! re-reads `interest` and `is_done` under that same lock before evicting.
 //! No fence argument, no reasoning from the atomic alone.
 //!
+//! The arbiter is **sharded by key hash** (see [`Maps::cells`]) — it is a
+//! per-key arbiter that happened to be implemented as one lock, and every
+//! operation on the map is confined to a single key. Read "the cache lock"
+//! throughout this module as "the shard owning this key"; publish and the
+//! cancel decision for one key still take the very same lock as each other,
+//! which is the whole of what the argument above needs.
+//!
 //! ## No two bodies for one key, ever
 //!
 //! `abort()` is a request — the task dies when the runtime next processes it,
@@ -223,16 +230,73 @@ struct Grave {
     restarts: u32,
 }
 
+/// Independent cell maps the key space is split across. See [`Maps::cells`].
+///
+/// Only has to exceed the runtime's worker count by enough that two workers
+/// rarely collide, so it is sized for a machine larger than any heph runs on
+/// rather than tuned. 16 and 64 were measured against each other on a 12-core
+/// host and came out identical — 3.44s/3.02 GB against 3.39s/3.04 GB — so the
+/// larger value costs nothing here and leaves headroom on a wider one.
+const SHARDS: usize = 64;
+/// `SHARDS.trailing_zeros()` — the top bits of the hash used to pick a shard.
+const SHARD_BITS: u32 = 6;
+
 /// The memoizer's shared state, behind ONE `Arc`: every spawned body clones a
 /// single pointer instead of two, and the inventory holds a single `Weak`.
 pub(crate) struct Maps<K, V> {
-    /// Live cells. Also the arbiter lock between publish and the cancel
-    /// decision (module docs).
-    cells: Mutex<FxHashMap<K, Arc<TaskCell<V>>>>,
+    /// Live cells, sharded by key hash. Also the arbiter lock between publish
+    /// and the cancel decision (module docs).
+    ///
+    /// Sharded because the arbiter was the last process-wide serialization
+    /// point on the resolution path, and it is taken on *every* memoized call —
+    /// hits included. Measured on a warm 85k-target `validate` with one map: the
+    /// runtime's workers spent 19% of their non-idle time parked in
+    /// `__psynch_mutexwait` on this one lock, with `publish`,
+    /// `collect_transitive_deps`, `get_spec_no_track` and `get_def_no_track` the
+    /// four largest waiters — while only ~5.8 of 12 cores were ever busy.
+    ///
+    /// Every operation on this map is confined to one key (lookup, insert,
+    /// publish, evict), so per-key locking is not a weakening of the arbiter: it
+    /// *is* the arbiter, since publish and the cancel decision for a given key
+    /// land on the same shard. Nothing takes two shards at once, so the nesting
+    /// discipline (cache → task-slot, cache → graves) is unchanged and no
+    /// shard-order deadlock is reachable.
+    cells: [Mutex<FxHashMap<K, Arc<TaskCell<V>>>>; SHARDS],
     /// Aborted-but-possibly-still-dying predecessors, per key. Entries are
     /// consumed by the next caller for the key; unconsumed entries die with
     /// the memoizer (bounded by cancelled keys per request).
+    ///
+    /// Deliberately *not* sharded: it is touched only on the cancellation path,
+    /// which is rare, and it is empty in the steady state.
     graves: Mutex<FxHashMap<K, Grave>>,
+}
+
+impl<K, V> Maps<K, V> {
+    /// The shard owning `key`.
+    ///
+    /// Generic over a borrowed form of `K` for the same reason `HashMap::get`
+    /// is: the hit path looks a key up without owning one. `Borrow`'s contract
+    /// (equal values hash equally) is what makes that sound here — a `&str` and
+    /// the `String` it borrows from must land on the same shard, or a lookup
+    /// would take one lock and miss a cell living under another.
+    ///
+    /// Takes the hash's **top** `SHARD_BITS` rather than its low bits: the inner
+    /// `FxHashMap` buckets on the low bits, so splitting on those would confine
+    /// every key of a shard to a narrow slice of that shard's bucket array.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a u64 shifted right by 64 - SHARD_BITS cannot exceed \
+                  2^SHARD_BITS - 1 = SHARDS - 1, so the index is in range by \
+                  construction"
+    )]
+    fn shard<Q>(&self, key: &Q) -> &Mutex<FxHashMap<K, Arc<TaskCell<V>>>>
+    where
+        Q: std::hash::Hash + ?Sized,
+    {
+        use std::hash::BuildHasher as _;
+        let h = rustc_hash::FxBuildHasher.hash_one(key);
+        &self.cells[(h >> (u64::BITS - SHARD_BITS)) as usize]
+    }
 }
 
 /// Task-backed implementation behind `Memoizer`. Same map + interest protocol
@@ -255,7 +319,7 @@ where
 {
     pub(crate) fn new(tag: &'static str, handle: tokio::runtime::Handle) -> Self {
         let maps = Arc::new(Maps {
-            cells: Mutex::new(FxHashMap::default()),
+            cells: std::array::from_fn(|_| Mutex::new(FxHashMap::default())),
             graves: Mutex::new(FxHashMap::default()),
         });
         super::register_source(Box::new(TaskSource {
@@ -273,7 +337,7 @@ where
     /// An in-flight cell is never touched — same contract as the poll path's
     /// cycle-error eviction.
     pub(crate) fn evict_if(&self, key: &K, pred: impl FnOnce(&V) -> bool) {
-        let mut cache = self.cache_lock();
+        let mut cache = self.cache_lock(key);
         if cache
             .get(key)
             .is_some_and(|cell| cell.peek().is_some_and(pred))
@@ -282,12 +346,25 @@ where
         }
     }
 
-    fn cache_lock(&self) -> MutexGuard<'_, FxHashMap<K, Arc<TaskCell<V>>>> {
-        self.maps.cells.lock().unwrap_or_else(|e| e.into_inner())
+    /// Lock the arbiter shard owning `key` (see [`Maps::cells`]).
+    ///
+    /// Borrowed-key generic like `HashMap::get`, so the hit path need not build
+    /// an owned key just to find its shard.
+    fn cache_lock<Q>(&self, key: &Q) -> MutexGuard<'_, FxHashMap<K, Arc<TaskCell<V>>>>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.maps
+            .shard(key)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn peek(&self, key: &K) -> Option<V> {
-        self.cache_lock().get(key).and_then(|c| c.peek().cloned())
+        self.cache_lock(key)
+            .get(key)
+            .and_then(|c| c.peek().cloned())
     }
 
     pub(crate) async fn process<F, Fut>(&self, key: K, f: F) -> V
@@ -296,7 +373,7 @@ where
         Fut: Future<Output = V> + Send + 'static,
     {
         let cell = 'cell: {
-            let mut cache = self.cache_lock();
+            let mut cache = self.cache_lock(&key);
             // The hit path *borrows* the key. `entry` needs an owned one, so
             // asking for it up front cloned on every call — including the
             // hits, which are the common case — to look up a key the map
@@ -424,7 +501,7 @@ where
                     // polls immediately on spawn — so whatever it registered
                     // against the no-op waker is re-registered against the real
                     // one before anything could wake it.
-                    let _arbiter = self.cache_lock();
+                    let _arbiter = self.cache_lock(&key);
                     spawn_body(&self.handle, &cell, body_fut);
                 }
                 // The body panicked on this stack rather than inside a task.
@@ -464,7 +541,7 @@ where
     /// worker here, never on this stack).
     fn cancel_abandoned(&self, key: &K, cell: &Arc<TaskCell<V>>) {
         let abort = {
-            let mut cache = self.cache_lock();
+            let mut cache = self.cache_lock(key);
             if cell.interest() != 0 || cell.is_done() {
                 return;
             }
@@ -580,7 +657,11 @@ where
         // cell holds no dead task harness. (Dropping one's own JoinHandle is a
         // detach, which is exactly right — the task is finishing.)
         {
-            let _arbiter = self.maps.cells.lock().unwrap_or_else(|p| p.into_inner());
+            let _arbiter = self
+                .maps
+                .shard(&self.key)
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let _first_publish = self.cell.outcome.set(Ok(v));
             *self.cell.task_slot() = None;
         }
@@ -745,24 +826,32 @@ where
         let Some(maps) = self.maps.upgrade() else {
             return false;
         };
-        // `try_lock`: never block a diagnostic dump on the process being dumped.
-        let map = match maps.cells.try_lock() {
-            Ok(m) => m,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return true,
-        };
-        for (key, cell) in map.iter() {
-            if cell.is_done() {
-                continue;
+        // Shard by shard, and one at a time: the dump must never hold two of
+        // the arbiter's locks at once, or it would be the only thing in the
+        // process that can order them against each other.
+        for shard in &maps.cells {
+            // `try_lock`: never block a diagnostic dump on the process being
+            // dumped. A contended shard is skipped rather than abandoning the
+            // whole dump — the other 63 still have cells worth naming, and the
+            // one being written to is the *least* likely to be stuck.
+            let map = match shard.try_lock() {
+                Ok(m) => m,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+            };
+            for (key, cell) in map.iter() {
+                if cell.is_done() {
+                    continue;
+                }
+                out.push(super::StuckCell {
+                    tag: self.tag,
+                    key: format!("{key:?}"),
+                    waiters: Some(cell.interest()),
+                    has_driver: cell.task_live(),
+                    restarts: cell.restarts(),
+                    age: Some(cell.age()),
+                });
             }
-            out.push(super::StuckCell {
-                tag: self.tag,
-                key: format!("{key:?}"),
-                waiters: Some(cell.interest()),
-                has_driver: cell.task_live(),
-                restarts: cell.restarts(),
-                age: Some(cell.age()),
-            });
         }
         true
     }
@@ -788,6 +877,49 @@ mod tests {
         tokio::time::timeout(TIMEOUT, fut)
             .await
             .expect("test future must complete within the timeout")
+    }
+
+    /// A borrowed key must reach the same shard as the owned key it borrows
+    /// from, and every key must reach a shard that exists.
+    ///
+    /// The sharp edge sharding introduces: [`TaskInner::peek`] and the hit path
+    /// in `process` look a cell up through `Borrow` (`&str` against a `String`
+    /// map). If the two spellings hashed to different shards, the lookup would
+    /// take one lock, find that shard empty, and report a miss for a cell that
+    /// is very much present — a silently-lost memoization, not a crash, and one
+    /// no functional test would attribute to sharding.
+    ///
+    /// Asserted directly on the shard pointers rather than through a `process`
+    /// round trip, because the failure this guards is a *coincidence* the round
+    /// trip would hide: with 64 shards a mismatched pair still agrees 1 time in
+    /// 64, so a test that memoized one key and read it back would pass on most
+    /// keys even with the property broken.
+    #[test]
+    fn a_borrowed_key_and_its_owned_form_share_a_shard() {
+        let maps: Maps<String, ()> = Maps {
+            cells: std::array::from_fn(|_| Mutex::new(FxHashMap::default())),
+            graves: Mutex::new(FxHashMap::default()),
+        };
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..512 {
+            let owned = format!("//pkg/{i}:target@v=host");
+            let borrowed: &str = owned.as_str();
+            assert!(
+                std::ptr::eq(maps.shard(&owned), maps.shard(borrowed)),
+                "`{owned}` hashes to a different shard as a &str than as a String; \
+                 every borrowed lookup for it would miss"
+            );
+            seen.insert(std::ptr::from_ref(maps.shard(&owned)));
+        }
+        // Not a distribution assertion — just that the index is not stuck. A
+        // shift that took the wrong end of the hash, or a mask that collapsed,
+        // would land every key on one shard and quietly restore the single lock.
+        assert!(
+            seen.len() > SHARDS / 2,
+            "512 distinct keys reached only {} of {SHARDS} shards; the shard index \
+             is not spreading and the arbiter is effectively unsharded",
+            seen.len()
+        );
     }
 
     /// RAII occupancy guard for the no-overlap tests: `enter` fails the body
@@ -967,7 +1099,11 @@ mod tests {
             1,
             "gen 3 must not run while gen 1 still lives — it serialized on the wrong grave"
         );
-        let cell = m.cache_lock().get("k").cloned().expect("gen 3 cell in map");
+        let cell = m
+            .cache_lock("k")
+            .get("k")
+            .cloned()
+            .expect("gen 3 cell in map");
         assert_eq!(cell.restarts(), 2, "two generations died before gen 3");
 
         release.store(true, Ordering::SeqCst);
@@ -1006,7 +1142,7 @@ mod tests {
             "a non-suspending body must complete on the first poll, not be handed to a task"
         );
         // And it left the cell in the normal terminal state.
-        let cell = m.cache_lock().get("k").cloned().expect("cell retained");
+        let cell = m.cache_lock("k").get("k").cloned().expect("cell retained");
         assert_eq!(cell.peek(), Some(&7));
         assert!(
             cell.task_slot().is_none(),
@@ -1034,7 +1170,7 @@ mod tests {
             "a suspending body cannot have completed inline"
         );
         {
-            let cell = m.cache_lock().get("k").cloned().expect("cell present");
+            let cell = m.cache_lock("k").get("k").cloned().expect("cell present");
             assert!(
                 cell.task_live(),
                 "a suspended body must be driven by a spawned task"
@@ -1063,7 +1199,7 @@ mod tests {
         assert_eq!(v, 5);
 
         let cell = m
-            .cache_lock()
+            .cache_lock("k")
             .get("k")
             .cloned()
             .expect("a completed cell is retained as the memoized answer");
@@ -1092,7 +1228,7 @@ mod tests {
         }));
         assert!(futures::poll!(&mut first).is_pending());
         let old_cell = m
-            .cache_lock()
+            .cache_lock("k")
             .get("k")
             .cloned()
             .expect("in-flight cell is in the map");
@@ -1129,7 +1265,7 @@ mod tests {
         let m: TaskInner<String, u32> = inner("done-handle-test");
         let v = within(m.process("k".to_string(), || async { 9 })).await;
         assert_eq!(v, 9);
-        let cell = m.cache_lock().get("k").cloned().expect("completed cell");
+        let cell = m.cache_lock("k").get("k").cloned().expect("completed cell");
         assert!(
             cell.task_slot().is_none(),
             "a Done cell must not retain its JoinHandle"
@@ -1281,7 +1417,7 @@ mod tests {
                 futures::future::pending::<u32>().await
             }));
             assert!(futures::poll!(&mut hung).is_pending());
-            let cell = m.cache_lock().get("k").cloned().expect("in-flight cell");
+            let cell = m.cache_lock("k").get("k").cloned().expect("in-flight cell");
             assert_eq!(cell.restarts(), expected);
             drop(hung);
         }
