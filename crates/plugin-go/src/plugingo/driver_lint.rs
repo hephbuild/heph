@@ -211,8 +211,7 @@ impl ManagedDriver for GoLintDriver {
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
         let pkg_str = pkg.as_str();
-        let spec =
-            GoLintSpec::from(req.target_spec.config.clone()).context("parse go_lint config")?;
+        let spec = GoLintSpec::from(&req.target_spec.config).context("parse go_lint config")?;
 
         let mut inputs: Vec<Input> = Vec::new();
         let mut groups: Vec<&String> = spec.deps.keys().collect();
@@ -711,8 +710,7 @@ impl ManagedDriver for GoLintGateDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let spec =
-            GoLintGateSpec::from(req.target_spec.config.clone()).context("parse go_lint_gate")?;
+        let spec = GoLintGateSpec::from(&req.target_spec.config).context("parse go_lint_gate")?;
 
         let mut inputs: Vec<Input> = Vec::new();
         let mut groups: Vec<&String> = spec.deps.keys().collect();
@@ -1063,8 +1061,7 @@ impl ManagedDriver for GoLintFixDriver {
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
         let pkg_str = pkg.as_str();
-        let spec =
-            GoLintFixSpec::from(req.target_spec.config.clone()).context("parse go_lint_fix")?;
+        let spec = GoLintFixSpec::from(&req.target_spec.config).context("parse go_lint_fix")?;
 
         let mut inputs: Vec<Input> = Vec::new();
         let mut groups: Vec<&String> = spec.deps.keys().collect();

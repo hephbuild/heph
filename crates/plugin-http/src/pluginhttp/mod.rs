@@ -110,8 +110,8 @@ impl ManagedDriver for Driver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
-        let spec = HttpFetchSpec::from(req.target_spec.config.clone())
-            .context("parse http_fetch config")?;
+        let spec =
+            HttpFetchSpec::from(&req.target_spec.config).context("parse http_fetch config")?;
 
         // Rendered here, not at run time: the URL an arg combination resolves to
         // is part of the target's identity, so it must feed the hash below.

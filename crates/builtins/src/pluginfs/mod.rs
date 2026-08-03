@@ -898,7 +898,7 @@ impl hplugin::driver::Driver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let spec = FsSpec::from(req.target_spec.config.clone()).context("parse fs config")?;
+        let spec = FsSpec::from(&req.target_spec.config).context("parse fs config")?;
 
         let file_path = spec
             .f

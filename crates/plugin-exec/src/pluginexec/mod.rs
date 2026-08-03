@@ -767,7 +767,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let spec = spec::TargetSpec::from(req.target_spec.config.clone())?;
+        let spec = spec::TargetSpec::from(&req.target_spec.config)?;
 
         let pkg = req.target_spec.addr.package.clone();
 

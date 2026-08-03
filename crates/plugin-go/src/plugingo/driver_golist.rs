@@ -128,8 +128,7 @@ impl ManagedDriver for GoGolistDriver {
         let pkg = req.target_spec.addr.package.clone();
         let pkg_str = pkg.as_str();
 
-        let spec =
-            GoGolistSpec::from(req.target_spec.config.clone()).context("parse go_golist config")?;
+        let spec = GoGolistSpec::from(&req.target_spec.config).context("parse go_golist config")?;
 
         // Parse deps (srcfiles, modfiles) — no go_bin here
         let dep_strings = spec.deps;

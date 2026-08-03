@@ -204,7 +204,7 @@ impl ManagedDriver for GoFormatDriver {
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
         let pkg_str = pkg.as_str();
-        let spec = GoFormatSpec::from(req.target_spec.config.clone()).context("parse go_format")?;
+        let spec = GoFormatSpec::from(&req.target_spec.config).context("parse go_format")?;
         let inputs = parse_inputs(&spec, &pkg)?;
 
         let outputs: Vec<Output> = spec
@@ -325,8 +325,7 @@ impl ManagedDriver for GoFormatCheckDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let spec =
-            GoFormatSpec::from(req.target_spec.config.clone()).context("parse go_format_check")?;
+        let spec = GoFormatSpec::from(&req.target_spec.config).context("parse go_format_check")?;
         let inputs = parse_inputs(&spec, &pkg)?;
 
         let hash = {

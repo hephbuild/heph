@@ -43,7 +43,7 @@ impl hplugin::driver::Driver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let deps = GroupSpec::from(req.target_spec.config.clone())
+        let deps = GroupSpec::from(&req.target_spec.config)
             .context("parse group config")?
             .deps;
 

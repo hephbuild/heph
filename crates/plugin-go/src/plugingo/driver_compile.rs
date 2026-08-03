@@ -189,8 +189,8 @@ impl ManagedDriver for GoCompileDriver {
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
         let pkg_str = pkg.as_str();
-        let spec = GoCompileSpec::from(req.target_spec.config.clone())
-            .context("parse go_compile config")?;
+        let spec =
+            GoCompileSpec::from(&req.target_spec.config).context("parse go_compile config")?;
 
         let mut inputs: Vec<Input> = Vec::new();
         let mut golist_origin_id: Option<String> = None;

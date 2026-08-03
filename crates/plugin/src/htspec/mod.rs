@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn parses_fields_and_applies_defaults() {
-        let spec = DemoSpec::from(HashMap::from([
+        let spec = DemoSpec::from(&HashMap::from([
             ("run".to_string(), Value::String("echo".to_string())),
             ("mode".to_string(), Value::String("on".to_string())),
         ]))
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn rename_maps_config_key_to_field() {
-        let spec = DemoSpec::from(HashMap::from([
+        let spec = DemoSpec::from(&HashMap::from([
             ("run".to_string(), Value::String("x".to_string())),
             ("mode".to_string(), Value::String("off".to_string())),
             (
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn unknown_key_is_rejected() {
-        let err = DemoSpec::from(HashMap::from([
+        let err = DemoSpec::from(&HashMap::from([
             ("run".to_string(), Value::String("x".to_string())),
             ("mode".to_string(), Value::String("off".to_string())),
             ("bogus".to_string(), Value::Bool(true)),
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn parse_error_carries_field_context() {
-        let err = DemoSpec::from(HashMap::from([
+        let err = DemoSpec::from(&HashMap::from([
             ("run".to_string(), Value::String("x".to_string())),
             ("mode".to_string(), Value::String("off".to_string())),
             ("count".to_string(), Value::Bool(true)),
@@ -272,12 +272,12 @@ mod tests {
     fn required_field_absent_is_an_error() {
         // A required field that is absent fails the parse and is flagged in the
         // schema; an optional one still defaults.
-        let err = ReqSpec::from(HashMap::new()).unwrap_err();
+        let err = ReqSpec::from(&HashMap::new()).unwrap_err();
         assert!(
             format!("{err:#}").contains("missing required `name`"),
             "{err:#}"
         );
-        let spec = ReqSpec::from(HashMap::from([(
+        let spec = ReqSpec::from(&HashMap::from([(
             "name".to_string(),
             Value::String("x".into()),
         )]))
@@ -288,6 +288,28 @@ mod tests {
         let by = by_name(&schema.fields);
         assert!(by["name"].required);
         assert!(!by["tags"].required);
+    }
+
+    /// `from` borrows: the caller keeps its config and may parse the same map
+    /// again. This is what lets every driver's `parse` decode straight out of
+    /// the shared `Arc<TargetSpec>` instead of deep-cloning the config first —
+    /// a clone that, for a `go_compile` target, copied one entry per transitive
+    /// lib on every target of every run. A signature that took the map by value
+    /// would fail to compile here.
+    #[test]
+    fn from_borrows_the_config_and_leaves_it_reusable() {
+        let config = HashMap::from([
+            ("run".to_string(), Value::String("echo".to_string())),
+            ("mode".to_string(), Value::String("on".to_string())),
+        ]);
+
+        let first = DemoSpec::from(&config).expect("first parse");
+        let second = DemoSpec::from(&config).expect("second parse from the same map");
+
+        assert_eq!(first.run, second.run);
+        assert_eq!(first.mode, second.mode);
+        // The source map is untouched — `from` never drains it.
+        assert_eq!(config.len(), 2);
     }
 
     #[test]
