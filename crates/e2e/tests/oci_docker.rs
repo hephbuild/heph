@@ -460,30 +460,41 @@ target(
     Ok(())
 }
 
-/// `format = "docker"` must produce an archive `docker load` can read. The
-/// producer and the consumer restate the format independently, so a mismatch
-/// here is the failure mode that costs a user a whole build.
+/// `format = "docker"` must produce an archive `docker load` can read — and it
+/// must reach it the same way an OCI build does. The producer and the consumer
+/// restate the format independently, so a mismatch there is the failure mode
+/// that costs a user a whole build.
+///
+/// The Dockerfile `COPY`s a cross-package dep through `SRC_BIN`, so this also
+/// pins what only shares a code path today: `format` selects the exporter and
+/// nothing else, and the build context is the workspace root under both formats.
+/// A package-rooted context would fail the build outright here.
 #[tokio::test]
 async fn test_real_docker_format_produces_a_docker_archive() -> anyhow::Result<()> {
     require_docker!();
     let builder = require_builder!();
     let ws = workspace();
     ws.write_build_file(
+        "cmd/server",
+        r#"
+target(name = "bin", driver = "bash", run = "echo server-binary > $OUT", out = "server")
+"#,
+    );
+    ws.write_build_file(
         "app",
         &format!(
             r#"
-target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
 target(
     name = "dockerfile",
     driver = "bash",
-    run = "printf 'FROM scratch\nCOPY app/payload.txt /payload.txt\n' > $OUT",
+    run = "printf 'FROM scratch\nARG SRC_BIN\nCOPY ${{SRC_BIN}} /usr/bin/server\n' > $OUT",
     out = "Dockerfile",
 )
 target(
     name = "img",
     driver = "oci_image",
     format = "docker",
-    context = [":dockerfile", ":payload"],
+    context = {{"": [":dockerfile"], "bin": ["//cmd/server:bin"]}},
     {builder}
 )
 "#,

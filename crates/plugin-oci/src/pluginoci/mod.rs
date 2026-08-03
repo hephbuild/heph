@@ -2031,6 +2031,10 @@ exit 0
             &BTreeMap::new(),
         );
         assert!(argv.join(" ").contains("type=docker,dest=/c/img.tar"));
+        // `format` selects the exporter and nothing else: the build context is
+        // the workspace root for a docker-format image exactly as for an OCI
+        // one, so `COPY` paths mean the same thing under both.
+        assert_eq!(argv.last().expect("last"), "/c");
     }
 
     #[test]
