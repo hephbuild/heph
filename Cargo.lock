@@ -991,7 +991,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "git+https://github.com/hephbuild/crossterm.git?branch=fixstderr#1ee8001cacd6b6a1dbf8eb0af1c47ec27dab9b84"
+source = "git+https://github.com/hephbuild/crossterm.git?branch=fix-eventstream-wake-loss#82a872c9db51c8956ecd0b1ef48a90275f796657"
 dependencies = [
  "bitflags 2.13.0",
  "crossterm_winapi",

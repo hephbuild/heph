@@ -204,5 +204,5 @@ tempfile = "3"
 # replies from key events — see crates/tui/src/tui/input.rs. Avoids the
 # DSR-query / EventStream two-reader race.
 [patch.crates-io]
-crossterm = { git = "https://github.com/hephbuild/crossterm.git", branch = "fixstderr" }
+crossterm = { git = "https://github.com/hephbuild/crossterm.git", branch = "fix-eventstream-wake-loss" }
 
