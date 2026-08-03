@@ -184,6 +184,58 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("sha256:{}", hex::encode(Sha256::digest(&bytes))))
 }
 
+/// CSI 6n — Device Status Report, "where is the cursor?".
+///
+/// A pty is a pipe: nothing on the master end answers queries. The inline
+/// viewport asks this while anchoring itself and **blocks until the terminal
+/// replies**, so a harness that only reads deadlocks the child. Every pty test
+/// therefore has to answer, and answer *every* occurrence — one missed query is
+/// a permanent hang of the run under test.
+pub const DSR_CURSOR: &[u8] = b"\x1b[6n";
+
+/// Reply a real terminal would give: cursor at row 1, column 1. The value only
+/// positions the inline viewport.
+pub const DSR_REPLY: &[u8] = b"\x1b[1;1R";
+
+/// Count the cursor-position queries in `tail`, and leave behind only what could
+/// still be the start of another.
+///
+/// `tail` carries bytes across pty reads because a query can straddle a chunk
+/// boundary. The rule both halves of that have to respect: consume through the
+/// end of the **last** complete query, then keep `DSR_CURSOR.len() - 1` trailing
+/// bytes so a straddling one is still assembled by the next read.
+///
+/// The earlier version cleared the whole tail whenever it matched, which is
+/// wrong precisely when two queries arrive close together — the viewport rebuild
+/// at resume and the one at teardown do exactly that. A chunk ending
+/// `…\x1b[6n…\x1b[6` answered the first query and then dropped the three bytes
+/// that begin the second, so the `n` opening the next chunk matched nothing, the
+/// second query was never answered, and heph blocked forever inside
+/// `Terminal::with_options` waiting for a reply that no longer had a sender.
+/// That surfaced as a `child did not exit within 180s` with the run's last byte
+/// being an unanswered `\x1b[6n` — a harness bug wearing the costume of a
+/// product hang.
+pub fn take_dsr_queries(tail: &mut Vec<u8>) -> usize {
+    let mut queries = 0;
+    let mut consumed = 0;
+    while let Some(pos) = tail
+        .get(consumed..)
+        .and_then(|rest| rest.windows(DSR_CURSOR.len()).position(|w| w == DSR_CURSOR))
+    {
+        consumed += pos + DSR_CURSOR.len();
+        queries += 1;
+    }
+    tail.drain(..consumed);
+    // Whatever is left held no complete query, so only a possible prefix of one
+    // is worth carrying.
+    let straddle = DSR_CURSOR.len() - 1;
+    if tail.len() > straddle {
+        let excess = tail.len() - straddle;
+        tail.drain(..excess);
+    }
+    queries
+}
+
 /// Host os/arch in the published-artifact spelling heph's manifest resolver
 /// matches on (`darwin`/`linux`, `amd64`/`arm64`).
 pub fn host_os_arch() -> (&'static str, &'static str) {
@@ -198,4 +250,49 @@ pub fn host_os_arch() -> (&'static str, &'static str) {
         "amd64"
     };
     (os, arch)
+}
+
+#[cfg(test)]
+mod dsr_tests {
+    use super::{DSR_CURSOR, take_dsr_queries};
+
+    /// The regression: a query that begins in the same chunk that ended a
+    /// previous one must survive into the next read.
+    #[test]
+    fn a_query_straddling_a_boundary_after_another_is_still_answered() {
+        let mut tail = b"\x1b[6nxx\x1b[6".to_vec();
+        assert_eq!(take_dsr_queries(&mut tail), 1, "the complete query");
+        tail.extend_from_slice(b"n");
+        assert_eq!(
+            take_dsr_queries(&mut tail),
+            1,
+            "the straddling query must be answered on the next read"
+        );
+    }
+
+    /// Several in one chunk are all counted, so all get answered.
+    #[test]
+    fn every_query_in_a_chunk_is_counted() {
+        let mut tail = b"a\x1b[6nb\x1b[6nc".to_vec();
+        assert_eq!(take_dsr_queries(&mut tail), 2);
+    }
+
+    /// A chunk with no query keeps only a possible prefix — the tail must not
+    /// grow without bound across a large transfer.
+    #[test]
+    fn a_miss_keeps_only_the_straddle_overlap() {
+        let mut tail = vec![b'x'; 100_000];
+        assert_eq!(take_dsr_queries(&mut tail), 0);
+        assert_eq!(tail.len(), DSR_CURSOR.len() - 1);
+    }
+
+    /// An answered query is never answered twice: replying to a stale one wakes
+    /// nothing and desynchronizes the next real reply.
+    #[test]
+    fn an_answered_query_is_not_seen_again() {
+        let mut tail = b"\x1b[6n".to_vec();
+        assert_eq!(take_dsr_queries(&mut tail), 1);
+        tail.extend_from_slice(b"plain output");
+        assert_eq!(take_dsr_queries(&mut tail), 0);
+    }
 }

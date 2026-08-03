@@ -28,8 +28,6 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const DSR_CURSOR: &[u8] = b"\x1b[6n";
-
 /// Generous: spawns a release binary plus an interactive bash child, on a
 /// shared CI runner.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -218,21 +216,11 @@ impl ShellSession {
                     Ok(n) => {
                         let Some(chunk) = buf.get(..n) else { break };
                         tail.extend_from_slice(chunk);
-                        let replies = tail
-                            .windows(DSR_CURSOR.len())
-                            .filter(|w| *w == DSR_CURSOR)
-                            .count();
-                        for _ in 0..replies {
+                        for _ in 0..common::take_dsr_queries(&mut tail) {
                             let mut w = dsr_writer.lock().expect("writer lock");
-                            if w.write_all(b"\x1b[1;1R").is_err() || w.flush().is_err() {
+                            if w.write_all(common::DSR_REPLY).is_err() || w.flush().is_err() {
                                 break;
                             }
-                        }
-                        if replies > 0 {
-                            tail.clear();
-                        } else if tail.len() > DSR_CURSOR.len() {
-                            let keep = tail.len() - (DSR_CURSOR.len() - 1);
-                            tail.drain(..keep);
                         }
                         sink.lock().expect("capture lock").extend_from_slice(chunk);
                     }
