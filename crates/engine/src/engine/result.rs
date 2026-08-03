@@ -749,6 +749,36 @@ fn is_passthrough(use_tmp_cache: bool, content: &outputartifact::Content) -> boo
     use_tmp_cache && matches!(content, outputartifact::Content::File(f) if f.passthrough)
 }
 
+/// The `@heph/fs` addrs covering every `codegen = in_place` output path.
+///
+/// Uses the same path→addr mapping as [`crate::engine::expand`]'s synthesized fs
+/// inputs, so a declared in_place output and the input that reads it resolve to
+/// the same addr — which is what lets
+/// [`Engine::check_in_place_inputs_unchanged`] match one against the other.
+/// Verified on a real target: an output `FilePath("go/large/alpha/alpha.go")`
+/// and the input `//@heph/fs:file@f=go/large/alpha/alpha.go` are the same addr.
+fn in_place_fs_addrs(
+    outputs: &[crate::engine::driver::targetdef::Output],
+) -> rustc_hash::FxHashSet<Addr> {
+    use crate::engine::driver::targetdef::path::{CodegenMode, Content};
+
+    let mut out = rustc_hash::FxHashSet::default();
+    for path in outputs
+        .iter()
+        .flat_map(|o| o.paths.iter())
+        .filter(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
+    {
+        out.insert(match &path.content {
+            Content::FilePath(p) => hbuiltins::pluginfs::file_addr(p),
+            Content::Glob(p) => hbuiltins::pluginfs::glob_addr(p, &[]),
+            Content::DirPath(p) => {
+                hbuiltins::pluginfs::glob_addr(&format!("{}/**/*", p.trim_end_matches('/')), &[])
+            }
+        });
+    }
+    out
+}
+
 /// Build an [`EResult`] from produced artifacts, filtering by output group and
 /// type, and attaching `guard` (the read lock for this target's cache entry) to
 /// each kept artifact. `guard` is `None` only for the non-cacheable (force/shell)
@@ -2145,7 +2175,9 @@ impl Engine {
 
         // Guard the write-back against a tree that moved under us — an in_place
         // target is about to overwrite the very files it hashed as inputs.
-        self.clone().check_in_place_inputs_unchanged(opts).await?;
+        self.clone()
+            .check_in_place_inputs_unchanged(&rs, opts)
+            .await?;
         // Codegen tree write-back: is_top-gated, idempotent, runs on every path
         // (a cache hit on an in_place fmt must still materialize). Uses this
         // caller's `cached`, so the is_top requester must have asked for the
@@ -3141,70 +3173,142 @@ impl Engine {
     /// held when the run hashed them. Everything between that hash and this
     /// write-back — resolving deps, staging, executing, reading the cache — is a
     /// window in which the tree can move: an editor save, a `git checkout`, a
-    /// concurrent run. `materialize_codegen` writes unconditionally, so without
-    /// this check the newer bytes are silently replaced by (stale bytes +
-    /// transform), with no error and no diff.
+    /// concurrent run, a *sibling* in_place target in this very run.
+    /// `materialize_codegen` writes unconditionally, so without this check the
+    /// newer bytes are silently replaced by (stale bytes + transform), with no
+    /// error and no diff.
     ///
-    /// Recomputing the target's `hashin` against the *current* tree on a fresh
-    /// request re-reads the `@heph/fs` inputs (cache-off, memoized per request),
-    /// so an unchanged tree reproduces this run's `hashin` exactly — the same
-    /// property [`Self::maybe_store_fixpoint`] relies on after the write. Any
-    /// difference means an input this target is about to overwrite is no longer
-    /// what it transformed.
+    /// # What is checked, and why it is this and not the whole `hashin`
+    ///
+    /// The contract is "the files this target is about to overwrite still hold
+    /// the bytes it hashed". That is a question about *this target's in_place
+    /// output paths*, and it is answered by re-reading exactly the `@heph/fs`
+    /// inputs covering them — `O(files written)`, not `O(transitive closure)`.
+    ///
+    /// It used to be answered by recomputing the whole `hashin` under a fresh
+    /// request. That worked, and it cost the entire graph: `hashin` folds every
+    /// dep's hashout, so reproducing it re-resolved every spec, def, package walk
+    /// and provider probe beneath the target, with all twelve request memoizers
+    /// empty. On a fully cached `run lint //go/large/...` over 2000 Go packages
+    /// that was 1831 such requests re-resolving 26,768 nodes each, and it took
+    /// the run from 8.8s to 45.5s — for a question about one file per target.
+    ///
+    /// The narrowed check is **more** sensitive where it applies, not less: a
+    /// change in a watched file now trips it directly, where before it had to
+    /// survive being folded into a digest alongside every other input, and a
+    /// def-level change could in principle compensate it back to the same value.
+    ///
+    /// It is **less** sensitive in one deliberate way: a *dependency's* hashout
+    /// moving mid-run no longer fails the write-back. That is the intended trade
+    /// — the target is not about to overwrite its dependency, so a moved dep is
+    /// a stale *output*, which the next run recomputes, and not the data loss
+    /// this guard exists to prevent. Only the files being overwritten are
+    /// irreplaceable.
     ///
     /// Gated exactly like the write-back it guards: top-level only (nothing else
     /// writes), in_place only (nothing else overwrites its own inputs), and never
     /// on a frozen run (which writes nothing at all).
     ///
-    /// A failure to recompute is *not* waved through: not being able to confirm
-    /// the tree is precisely the case where overwriting it is unsafe.
+    /// A failure to re-read is *not* waved through: not being able to confirm the
+    /// tree is precisely the case where overwriting it is unsafe.
     async fn check_in_place_inputs_unchanged(
         self: Arc<Self>,
+        rs: &Arc<RequestState>,
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<()> {
-        use crate::engine::driver::targetdef::path::CodegenMode;
-
         if opts.frozen || !opts.is_top {
             return Ok(());
         }
-        let is_in_place = opts.def.target.outputs.iter().any(|o| {
-            o.paths
-                .iter()
-                .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
-        });
-        if !is_in_place {
+        // The `@heph/fs` addrs covering the paths about to be overwritten. Same
+        // path→addr mapping `expand::synthesized_fs_inputs` uses, so a declared
+        // in_place output and the input that reads it land on the same addr.
+        let guarded = in_place_fs_addrs(&opts.def.target.outputs);
+        if guarded.is_empty() {
             return Ok(());
         }
 
         let addr = &opts.def.target.addr;
-        let current = Arc::clone(&self)
-            .meta(self.new_hash_only_state(addr.clone()), addr)
+        // Memoized on this request — the run already expanded these.
+        let inputs = Arc::clone(&self)
+            .expanded_inputs_for(rs.clone(), addr)
             .await
-            // Seal the chain: it may carry request-property markers
-            // (`HashUnknownError` from the nested hash-only request) that
-            // `classify_failure` deliberately refuses to record — correct for
-            // the marker itself, wrong once this guard turns it into a real
-            // target failure. Left unsealed, the failure shows in the event
-            // stream (the TUI's failed tab) but never lands in the failure
-            // registry, so the run exits non-zero with nothing printed.
-            .map_err(|e| anyhow::anyhow!("{e:#}"))
             .with_context(|| {
-                format!(
-                    "re-reading the sources of {addr} to confirm they still match what it \
-                     transformed, before writing its in-place output back over them"
-                )
-            })?
-            .hashin;
-        if current != *opts.hashin {
-            anyhow::bail!(
-                "{addr} rewrites its own sources in place, and they changed while it ran \
-                 (input hash {} → {current}). Its output was computed from the older bytes, \
-                 so writing it back would discard the newer ones — nothing was written. \
-                 Re-run once the tree is settled.",
-                opts.hashin,
-            );
+                format!("listing the inputs of {addr} to guard its in-place write-back")
+            })?;
+        // Only inputs that are *hashed* and that read a path being overwritten.
+        // An in_place output the target never read is not something it
+        // transformed, so there is no stale-transform hazard to guard — writing
+        // it is the declared behaviour.
+        let watched: Vec<Addr> = inputs
+            .iter()
+            .filter(|i| i.hashed && guarded.contains(&i.r#ref.r#ref))
+            .map(|i| i.r#ref.r#ref.clone())
+            .collect();
+        if watched.is_empty() {
+            return Ok(());
+        }
+
+        // One fresh request for the whole check. It exists only so the `@heph/fs`
+        // reads below re-stat the tree instead of answering from this run's
+        // snapshot: `cached_glob_walk` is keyed by `request_id`, and
+        // `CachedWalker::file_hash` revalidates. Nothing else is resolved under
+        // it, which is the entire difference from what this used to cost.
+        let fresh = self.new_hash_only_state(addr.clone());
+        for input_addr in watched {
+            let before = Arc::clone(&self)
+                .fs_input_hashout(rs.clone(), &input_addr)
+                .await
+                .with_context(|| format!("reading the hash {input_addr} had when {addr} ran"))?;
+            let after = Arc::clone(&self)
+                .fs_input_hashout(fresh.clone(), &input_addr)
+                .await
+                // Sealed for the same reason the whole-`hashin` recompute was:
+                // the chain may carry request-property markers that
+                // `classify_failure` refuses to record, which would leave a
+                // non-zero exit with nothing printed.
+                .map_err(|e| anyhow::anyhow!("{e:#}"))
+                .with_context(|| {
+                    format!(
+                        "re-reading {input_addr} to confirm it still matches what {addr} \
+                         transformed, before writing its in-place output back over it"
+                    )
+                })?;
+            if before != after {
+                // "changed while it ran" is asserted verbatim by
+                // `e2e::codegen_in_place::in_place_refuses_to_write_back_over_a_changed_source`
+                // — this is the sentence a user sees when their edit is what
+                // stopped the write-back, and it is pinned on purpose.
+                anyhow::bail!(
+                    "{addr} rewrites {input_addr} in place, and it changed while it ran \
+                     (hash {before} → {after}). Its output was computed from the older bytes, \
+                     so writing it back would discard the newer ones — nothing was written. \
+                     Re-run once the tree is settled."
+                );
+            }
         }
         Ok(())
+    }
+
+    /// The combined hashout of an `@heph/fs` input, as this request sees it.
+    ///
+    /// Sorted and joined rather than compared as a set: a file addr yields one
+    /// artifact and a glob addr yields one per matched file, and for a glob the
+    /// *set* of files is as much a change as any file's bytes.
+    async fn fs_input_hashout(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<String> {
+        let res = self
+            .result_addr(rs, addr, OutputMatcher::None, &ResultOptions::default())
+            .await?;
+        let mut hashouts: Vec<&str> = res
+            .artifacts_meta
+            .iter()
+            .map(|m| m.hashout.as_str())
+            .collect();
+        hashouts.sort_unstable();
+        Ok(hashouts.join(","))
     }
 
     /// Register the just-executed in_place target's cache entry under the key a
@@ -9505,15 +9609,24 @@ mod tests {
     /// A write-back-guard failure must land in the failure registry — not just
     /// the event stream.
     ///
-    /// The guard's nested hash-only recompute can fail with
-    /// `HashUnknownError` in its chain (a cacheable dep whose inputs moved
-    /// mid-run misses at its new hash). That marker is deliberately never
-    /// recorded by `classify_failure` — correct while it is a request
-    /// property, wrong once the guard converts it into a real target failure.
-    /// Unsealed, the run showed the failure in the TUI's failed tab (events)
-    /// but exited with an empty registry and nothing printed. The guard now
-    /// seals the chain; this pins both the recording and the refusal to
-    /// write back.
+    /// The bug this pins: a guard failure that showed in the TUI's failed tab
+    /// (events) while the run exited with an empty registry and nothing printed.
+    ///
+    /// The *trigger* changed with the guard's contract. It used to mutate a
+    /// cacheable **dependency's** input mid-run, which made the guard's whole-
+    /// `hashin` recompute fail with a `HashUnknownError` marker in its chain —
+    /// a marker `classify_failure` deliberately never records. The guard now
+    /// asks only about the files it is about to overwrite
+    /// ([`Engine::check_in_place_inputs_unchanged`]), so a moved *dep* no longer
+    /// fails it at all — see
+    /// `a_moved_dependency_no_longer_blocks_the_write_back`, which pins that
+    /// deliberate narrowing. So this mutates the in_place file itself, which is
+    /// what the guard is for, and still asserts the two things that were broken:
+    /// the failure is recorded, and the tree is not touched.
+    ///
+    /// The marker route is no longer reachable from here — the guard resolves
+    /// only cache-off `@heph/fs` targets now, and those never miss at a hash —
+    /// but the seal is kept in the guard as defence, not decoration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn in_place_guard_failure_is_recorded_not_just_evented() -> anyhow::Result<()> {
         let escape = tempdir()?;
@@ -9549,15 +9662,15 @@ mod tests {
                 .await
         }));
 
-        // The run is provably in flight; move the tree under the dep, then
-        // let the run finish. The guard's fresh recompute now hashes `probe`
-        // at inputs nothing has cached → HashUnknownError inside its chain.
+        // The run is provably in flight; move the very file the target is about
+        // to overwrite, then let it finish. The guard re-reads that file and
+        // sees a hash the run never transformed.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !started.exists() {
             assert!(std::time::Instant::now() < deadline, "run never started");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        std::fs::write(pkg_dir.join("other.txt"), b"v2")?;
+        std::fs::write(pkg_dir.join("in.txt"), b"edited by someone else")?;
         std::fs::write(&release, b"go")?;
 
         let res = tokio::time::timeout(Duration::from_secs(60), resolve)
@@ -9576,8 +9689,77 @@ mod tests {
         assert_eq!(failures[0].addr.format(), "//pkg:fmt");
         assert_eq!(
             std::fs::read(pkg_dir.join("in.txt"))?,
-            b"hello",
-            "an unconfirmed write-back must not touch the tree"
+            b"edited by someone else",
+            "a refused write-back must leave the newer bytes alone"
+        );
+        Ok(())
+    }
+
+    /// A moved **dependency** no longer blocks an in_place write-back.
+    ///
+    /// This is the one behaviour the narrowed guard gives up, and it is given up
+    /// on purpose, so it is pinned rather than left to be rediscovered. The guard
+    /// protects the files a target is about to *overwrite*; a target does not
+    /// overwrite its dependency. A dep that moved mid-run makes this target's
+    /// output stale, which the next run recomputes — it does not destroy
+    /// anything, which is what the guard is for.
+    ///
+    /// The old whole-`hashin` recompute failed here, and paid for that by
+    /// re-resolving the target's entire transitive closure under a fresh request
+    /// on *every* in_place target of *every* run, cache hits included: 45.5s
+    /// against 8.8s on a fully cached 2000-package run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_moved_dependency_no_longer_blocks_the_write_back() -> anyhow::Result<()> {
+        let escape = tempdir()?;
+        let started = escape.path().join("started");
+        let release = escape.path().join("release");
+        let src = hbuiltins::pluginfs::file_addr("pkg/other.txt").format();
+        let (engine, root) = engine_with_home_fs(vec![
+            bash_target("//pkg:probe", &[&src]),
+            codegen_run_target_with_deps(
+                "//pkg:fmt",
+                "in_place",
+                &["in.txt"],
+                &format!(
+                    "touch {started}; until [ -f {release} ]; do sleep 0.05; done; \
+                     printf '%s\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.tmp && mv in.txt.tmp in.txt",
+                    started = started.display(),
+                    release = release.display(),
+                ),
+                &["//pkg:probe"],
+            ),
+        ])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+        std::fs::write(pkg_dir.join("other.txt"), b"v1")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let rs = engine.new_state();
+        let resolve = tokio::spawn(enclose!((engine, rs) async move {
+            engine
+                .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+                .await
+        }));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !started.exists() {
+            assert!(std::time::Instant::now() < deadline, "run never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The dep's input moves — NOT the file being overwritten.
+        std::fs::write(pkg_dir.join("other.txt"), b"v2")?;
+        std::fs::write(&release, b"go")?;
+
+        let res = tokio::time::timeout(Duration::from_secs(60), resolve)
+            .await
+            .expect("run must finish")
+            .expect("join");
+        res.expect("a moved dep must not fail the write-back");
+        assert_eq!(
+            std::fs::read(pkg_dir.join("in.txt"))?,
+            b"HELLO\n",
+            "the write-back must land: nothing it overwrites has changed"
         );
         Ok(())
     }
