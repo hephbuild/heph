@@ -37,42 +37,68 @@ const SAMPLE_HZ: libc::c_int = 199;
 
 /// Libraries the sampler must not walk into.
 ///
-/// `pprof` resolves these names against the loaded shared objects, checks the
-/// interrupted PC *before* walking anything, and — because this build enables
-/// the `frame-pointer` tracer (see [`start`]) — checks every frame it reaches
-/// afterwards. A sample whose leaf lands in one of them is dropped whole; a walk
-/// that climbs into one stops there. That costs only frames attributable to the C
-/// library, which carry no information about heph's own hot loops.
+/// `pprof` resolves these names against the loaded shared objects and applies
+/// them twice: it drops a whole sample whose *interrupted PC* lands in one, and —
+/// because this build enables the `frame-pointer` tracer (see [`start`]) — it
+/// ends the walk at the first frame that reaches one. Both checks read this one
+/// list, so an entry here buys frame-level containment at the price of every
+/// sample that happened to be interrupted inside that library.
 ///
 /// This used to be the *entire* defence, back when the tracer was
 /// `_Unwind_Backtrace` and only the leaf PC could be tested — see [`start`] for
 /// why that was never sound and what replaced it.
 ///
+/// **The C library is deliberately not here**, and that is the difference
+/// between a profile and a fiction. heph is in libc constantly — `malloc`,
+/// `free`, `memcpy`, every syscall stub — so blocklisting it dropped roughly
+/// half of every profile with nothing in the output to say so: a warm 85k-target
+/// resolution spends ~15% of its CPU inside the allocator and ~10% in `memmove`,
+/// and `--pprof-cpu` reported *none* of it. Keeping those samples costs nothing
+/// in walk safety, because the frame-pointer walk never starts inside the
+/// interrupted function: it starts at the return address in the innermost frame
+/// record, which for a sample taken in `malloc` is heph's own code (see
+/// [`start`] — this is the same one-frame shift that makes `flat` read as "time
+/// in the callee"). The walk climbs heph frames from there and never enters libc
+/// at all. The `libc_only` half of
+/// [`tests::sampling_a_busy_process_yields_a_profile_without_crashing`] asserts
+/// exactly that, and goes to zero the moment the C library is re-added.
+///
+/// One caveat, and it is an **x86_64-only fidelity** one rather than a
+/// behavioural split (there is no `cfg` here; all three targets keep the sample
+/// and attribute it to the caller). The walk reads the frame-pointer register the
+/// interrupted function left behind. On both aarch64 targets the procedure call
+/// standard reserves `x29` for the frame record, so it is heph's frame and the
+/// stack is real. glibc on x86_64 is built `-fomit-frame-pointer` and `%rbp` is
+/// merely callee-saved, so a libc routine that is *using* `%rbp` as a scratch
+/// register when `SIGPROF` lands yields a stack that is fabricated rather than
+/// merely shifted. It cannot fault — every frame address is probed before it is
+/// dereferenced ([`start`]) — so the cost is a wrong name on some libc-leaf
+/// samples there, against the whole allocator/memcpy/syscall half of the profile
+/// being deleted on every target. Blocklisting the C library on x86_64 alone
+/// would trade that back; it is deliberately not done, because a profiler that
+/// silently omits half its subject is the worse failure of the two.
+///
+/// What remains are the libraries whose frames the walk must not *climb into*
+/// because their unwind state is hostile rather than merely uninteresting: the
+/// loader, the unwinder, and GCD.
+///
 /// Matched as substrings against shared-object paths, and `str::contains` is
 /// **case-sensitive**: macOS ships `/usr/lib/libSystem.B.dylib`, which lowercase
-/// `libsystem` does not match. Both spellings are listed for that reason, and
-/// [`tests::blocklist_covers_the_c_library_but_not_the_main_binary`] fails if any
-/// platform's C library stops being covered.
+/// `libsystem` does not match — so a name needing both spellings must list both.
 ///
-/// Entries are anchored (`libc.so`, not `libc`) because the match is a bare
-/// substring and over-blocking is the quieter failure of the two: an unanchored
-/// `libc` also swallows `libc++abi`, `libcharset`, `libcorecrypto` — and
-/// `libcrypto`/`libcurl` the day a dependency links them. Those samples would
-/// then vanish from every profile with nothing to indicate it, which for a
-/// profiler pointed at a network stall drops exactly the frames worth having.
+/// Entries are anchored (`ld-linux`, not `ld`) because the match is a bare
+/// substring and over-blocking is the quieter failure of the two: those samples
+/// vanish from every profile with nothing to indicate it, which for a profiler
+/// pointed at a stall drops exactly the frames worth having.
 const UNWIND_BLOCKLIST: &[&str] = &[
-    // Linux/glibc.
-    "libc.so",
+    // The unwinder itself: libgcc's `object_mutex` and libunwind's loader reads
+    // are the states that faulted the process being profiled.
     "libgcc_s",
     "libunwind",
-    "libpthread",
+    // The dynamic loader, on both platforms.
     "ld-linux",
-    "vdso",
-    // macOS. Both cases: `libSystem.B.dylib` and `libsystem_c.dylib` both exist.
-    "libsystem",
-    "libSystem",
-    "libc.dylib",
     "libdyld",
+    "vdso",
     // GCD frames are their own unwind hazard on Darwin.
     "libdispatch",
 ];
@@ -367,6 +393,47 @@ mod tests {
     /// depends on the optimization level (see [`cpu_only`]).
     const CPU_NEEDLE: &str = "cpu_only";
 
+    /// CPU burned with the leaf PC *inside the C library* for essentially the
+    /// whole call: a large `memcpy` per round, with no heph instruction between
+    /// the two ends of it.
+    ///
+    /// This is the shape [`UNWIND_BLOCKLIST`] used to erase. A sample landing here
+    /// is interrupted inside `memmove`, so the old list matched its PC and dropped
+    /// it before anything was walked. With the C library off the list the sample
+    /// survives, and the frame-pointer walk — which starts at the return address
+    /// in the innermost frame record, never inside the interrupted function —
+    /// attributes it to this function, in heph's own text.
+    ///
+    /// `#[inline(never)]` so there is a frame to name, and `black_box` on both
+    /// buffers so the copy is not elided or hoisted out of the loop.
+    #[inline(never)]
+    fn libc_only(src: &[u8], dst: &mut [u8]) {
+        for _ in 0..LIBC_COPIES_PER_ROUND {
+            dst.copy_from_slice(std::hint::black_box(src));
+            std::hint::black_box(&dst[0]);
+        }
+    }
+
+    /// Substring identifying the libc-leaf frame ([`libc_only`]).
+    const LIBC_NEEDLE: &str = "libc_only";
+
+    /// Bytes per copy, and copies per [`burn`] round.
+    ///
+    /// These exist to make the libc half a real *share of the window* rather
+    /// than merely present in it, and the first version got that wrong: one
+    /// 1 MiB copy per round is roughly 30k cycles against [`CPU_ROUNDS`]'s
+    /// ~500k instructions of `cpu_only` at `opt-level = 0`, so the libc half was
+    /// an order of magnitude smaller than the half it sits next to. It held up
+    /// on darwin/arm64 and produced **zero** stacks on the linux/amd64 runner,
+    /// where the whole profile is thinner (16 distinct stacks against 24, and
+    /// `cpu_only` down to 1 from 21) — a starved assertion, not a broken one,
+    /// but a red test either way.
+    ///
+    /// 8 x 4 MiB = 32 MiB per round puts the two halves within the same order,
+    /// so neither assertion depends on the runner having a good day.
+    const LIBC_COPY_BYTES: usize = 4 << 20;
+    const LIBC_COPIES_PER_ROUND: usize = 8;
+
     /// Keep `threads` threads busy for `at_least`, in two deliberately different
     /// places: **inside libc** (allocator churn, syscalls, thread create/join) and
     /// **inside this binary's own text** ([`cpu_only`]).
@@ -388,17 +455,23 @@ mod tests {
     ///   real fix was to stop calling the unwinder at all ([`start`]) rather than
     ///   to keep widening a blocklist against a fault no test here can summon.
     /// - [`cpu_only`] is what the *profile has heph frames in it* assertion needs,
-    ///   and it is not decoration. `pprof` drops a sample whose leaf PC is
-    ///   blocklisted **by design**, so a workload built only from the first half
-    ///   is one the sampler is meant to record almost nothing from. Measured on
-    ///   darwin/arm64: a libc-only burn produced 0-6 distinct stacks, against
-    ///   25-57 for the same burn with the blocklist switched off — the blocklist
-    ///   was legitimately dropping 95-99% of the samples, and whether the profile
-    ///   came out empty was decided by which straggler happened to land. It came
-    ///   out empty on 4 of 50 runs, and 8 of 30 under load, which is what turned
-    ///   this test red on master's own CI. The fix is not a longer burn or a
-    ///   retry: it is giving the sampler a leaf it is *supposed* to keep, present
-    ///   for the whole window, on every thread.
+    ///   and it is not decoration. It was added when the C library *was*
+    ///   blocklisted and `pprof` therefore dropped a libc-leaf sample by design,
+    ///   which made a libc-only workload one the sampler recorded almost nothing
+    ///   from. Measured on darwin/arm64 then: 0-6 distinct stacks, against 25-57
+    ///   for the same burn with the blocklist switched off — 95-99% of samples
+    ///   dropped, and whether the profile came out empty was decided by which
+    ///   straggler happened to land (empty on 4 of 50 runs, 8 of 30 under load,
+    ///   which turned this test red on master's own CI). The C library is off the
+    ///   list now, so that is no longer the reason to keep [`cpu_only`] — it stays
+    ///   because it is the one leaf whose attribution does not depend on the
+    ///   blocklist at all, and so distinguishes "the sampler stopped working" from
+    ///   "libc samples are being dropped again".
+    /// - [`libc_only`] is the converse, and it is the assertion this list's
+    ///   contents are actually load-bearing for: a leaf that lives inside libc for
+    ///   essentially its whole duration. Re-add the C library to
+    ///   [`UNWIND_BLOCKLIST`] and it disappears from the profile entirely, while
+    ///   [`cpu_only`] keeps the test green.
     ///
     /// Interleaved rather than run on a thread of its own, so it does not matter
     /// which thread the kernel picks to deliver `SIGPROF` to — a process-directed
@@ -409,7 +482,12 @@ mod tests {
             .map(|_| {
                 std::thread::spawn(move || {
                     let start = Instant::now();
+                    let src = vec![0xA5u8; LIBC_COPY_BYTES];
+                    let mut dst = vec![0u8; LIBC_COPY_BYTES];
                     while start.elapsed() < at_least {
+                        // The libc-leaf half — a leaf PC that stays inside
+                        // `memmove`. See this function's docs.
+                        libc_only(&src, &mut dst);
                         // Allocator churn across size classes: malloc/free, and
                         // large sizes push glibc into mmap/munmap.
                         let mut kept: Vec<Vec<u8>> = Vec::new();
@@ -531,33 +609,39 @@ mod tests {
         );
     }
 
-    /// The blocklist has to name the C library this process actually loaded, and
-    /// must not name the main binary.
+    /// The blocklist must name neither the C library nor the main binary.
     ///
-    /// Both halves are silent failures otherwise, which is what makes this the
-    /// load-bearing test. `pprof` resolves these substrings against loaded shared
-    /// objects **once**, at `start()`, and stores address ranges: match nothing
-    /// and `blocklist_segments` is empty, so every profile fills up with C library
-    /// frames that say nothing about heph's own loops. Match the main binary and
-    /// every heph frame is dropped instead, so `--pprof-cpu` writes empty profiles
-    /// forever — telling no one. `str::contains` is case-sensitive, which is how
-    /// `libSystem.B.dylib` slips past a lowercase entry.
+    /// Both halves are silent failures, which is what makes this the load-bearing
+    /// test. `pprof` applies these substrings to the *interrupted PC* as well as
+    /// to each walked frame, and a sample whose PC matches is discarded whole. So
+    /// naming the C library deletes every sample taken in `malloc`, `memcpy`, or a
+    /// syscall stub — on a warm 85k-target resolution that is roughly half the
+    /// profile, removed with nothing in the output to say so. Naming the main
+    /// binary deletes every heph frame instead, so `--pprof-cpu` writes empty
+    /// profiles forever — telling no one.
     ///
-    /// Since the walk moved off the unwinder ([`start`]) an empty blocklist is no
-    /// longer a crash, only a worthless profile — which is why this stayed a test
-    /// of the *names* and did not become a test of survival.
+    /// `str::contains` is case-sensitive, which is how `libSystem.B.dylib` used to
+    /// slip past a lowercase `libsystem` entry; the C library is now checked under
+    /// both spellings so a re-added entry cannot pass this in one case and fail in
+    /// the other.
     ///
-    /// A static build resolves `malloc` to the executable itself and fails here.
-    /// That is correct: the blocklist genuinely cannot distinguish the two in that
-    /// build.
+    /// Dropping the C library costs no walk safety — see [`UNWIND_BLOCKLIST`] for
+    /// why the frame-pointer walk never starts inside the interrupted function —
+    /// and [`sampling_a_busy_process_yields_a_profile_without_crashing`] asserts
+    /// the behaviour this name only constrains.
+    ///
+    /// A static build resolves `malloc` to the executable itself, which satisfies
+    /// both halves here for the wrong reason; that build has no separate C library
+    /// to distinguish.
     #[test]
-    fn blocklist_covers_the_c_library_but_not_the_main_binary() {
+    fn blocklist_spares_the_c_library_and_the_main_binary() {
         let libc_obj = owning_object(libc::malloc as *const std::ffi::c_void)
             .expect("dladdr must resolve malloc");
         assert!(
-            blocklisted(&libc_obj),
-            "UNWIND_BLOCKLIST does not cover the loaded C library ({libc_obj}); \
-             the blocklist resolves to no address ranges and the fix is a no-op"
+            !blocklisted(&libc_obj),
+            "UNWIND_BLOCKLIST covers the loaded C library ({libc_obj}); every sample \
+             interrupted in malloc/memcpy/a syscall stub — about half of a warm \
+             resolution's CPU — is discarded before it is ever walked"
         );
 
         let own_obj = owning_object(blocklisted as *const std::ffi::c_void)
@@ -668,7 +752,13 @@ mod tests {
         let path = dir.path().join("cpu.pb");
 
         let watcher = start(path.clone()).expect("start profiler");
-        burn(4, Duration::from_millis(500));
+        // 1.5s, not 500ms. `SIGPROF` is *process*-directed, so 199 Hz is 199
+        // deliveries per second for the whole process no matter how many threads
+        // burn — ~100 samples in 500ms, split across two halves and then deduped
+        // into distinct stacks. That was already thin enough to turn this test
+        // red on master's own CI once; it now carries a second assertion, so the
+        // sample budget has to cover both.
+        burn(4, Duration::from_millis(1500));
         request_dump();
 
         // The watcher wakes on a 200ms tick, then encodes and renames into place.
@@ -717,6 +807,24 @@ mod tests {
                     profile.sample.len()
                 )
             }
+        );
+
+        // The half that guards [`UNWIND_BLOCKLIST`]'s contents: a leaf that sits
+        // inside libc for essentially its whole duration must still be sampled,
+        // and attributed to the heph frame that called into libc. Re-add the C
+        // library to the blocklist and this goes to zero while `cpu_only` above
+        // stays green — which is exactly how the missing half of every profile
+        // went unnoticed.
+        let in_libc = stacks_naming(&profile, LIBC_NEEDLE);
+        assert!(
+            in_libc > 0,
+            "no stack named `{LIBC_NEEDLE}`, though every thread spent most of the \
+             sampling window inside {LIBC_COPIES_PER_ROUND} x {LIBC_COPY_BYTES}-byte \
+             memmoves per round. The profile has \
+             {} distinct stack(s) and {in_binary} naming `{CPU_NEEDLE}`, so the sampler \
+             is working: UNWIND_BLOCKLIST covers the C library again, and every sample \
+             interrupted in malloc/memcpy/a syscall is being discarded.",
+            profile.sample.len()
         );
 
         // `shutdown` writes the filtered exit-time report — the profile the flag
