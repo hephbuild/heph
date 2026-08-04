@@ -128,6 +128,51 @@ impl LocalCache for LocalCacheSpill {
         }))
     }
 
+    /// Adopt only what would have spilled anyway.
+    ///
+    /// The primary is sqlite — there is no file to rename into — so an adoption
+    /// can only land in the FS store, and routing a *small* artifact there
+    /// because it happened to arrive as a file would put it in a different
+    /// backend than the identical artifact packed from memory. Size decides,
+    /// against the same threshold and the same comparison [`SpillWriter`] uses,
+    /// so a blob's home does not depend on which way it was written.
+    fn adopt_file(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+        src: &std::path::Path,
+    ) -> Result<bool> {
+        // The manifest is the GC index and always lives in the primary.
+        if Self::is_manifest(name) {
+            return Ok(false);
+        }
+        let size = std::fs::metadata(src)
+            .with_context(|| format!("stat {src:?} for adoption into {addr} {name}"))?
+            .len();
+        if size <= self.spill_threshold as u64 {
+            return Ok(false);
+        }
+        if !self.blobs.adopt_file(addr, hashin, name, src)? {
+            return Ok(false);
+        }
+        // The key now lives in the FS store, so drop anything the primary still
+        // holds for it — the same "exactly one backend" invariant `writer`
+        // maintains from the other side, seen from this one. The probe runs only
+        // for a genuinely large artifact, and finds nothing for the fresh
+        // revision that is the normal case.
+        if self
+            .primary
+            .exists_committed(addr, hashin, name)
+            .with_context(|| format!("probe primary for superseded blob {addr} {name}"))?
+        {
+            self.primary
+                .delete(addr, hashin, name)
+                .with_context(|| format!("drop stale primary blob for {addr} {name}"))?;
+        }
+        Ok(true)
+    }
+
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
         Ok(self.primary.exists(addr, hashin, name)? || self.blobs.exists(addr, hashin, name)?)
     }
@@ -418,6 +463,88 @@ mod tests {
         assert_eq!(read(&cache, &a, "large"), large);
         assert!(cache.exists(&a, "h", "small").expect("ex"));
         assert!(cache.exists(&a, "h", "large").expect("ex"));
+    }
+
+    /// Adoption follows the same routing as `writer`, on the same threshold: a
+    /// file large enough to spill is taken by the FS store (and is gone from
+    /// where it was), a small one is declined so the caller copies it into
+    /// sqlite. A blob's home must not depend on which way it was written.
+    #[test]
+    fn adopt_routes_on_the_same_threshold_as_writer() {
+        let dir = tempdir().expect("tempdir");
+        let (cache, sqlite, fs) = spill(dir.path(), 64);
+        let a = addr();
+
+        let small_src = dir.path().join("small.tar");
+        let large_src = dir.path().join("large.tar");
+        std::fs::write(&small_src, vec![1u8; 32]).expect("write small");
+        std::fs::write(&large_src, vec![2u8; 256]).expect("write large");
+
+        // Under the threshold: declined, and the file is left for the caller.
+        assert!(
+            !cache
+                .adopt_file(&a, "h", "small", &small_src)
+                .expect("adopt small"),
+            "a blob that belongs in sqlite must not be adopted onto the fs"
+        );
+        assert!(small_src.exists(), "a declined adoption leaves the source");
+
+        // Over it: taken, into the same backend `writer` would have spilled to.
+        assert!(
+            cache
+                .adopt_file(&a, "h", "large", &large_src)
+                .expect("adopt large"),
+            "a blob over the threshold is the fs store's to take"
+        );
+        assert!(!large_src.exists(), "an adopted file is moved, not copied");
+        assert!(fs.exists(&a, "h", "large").expect("ex"));
+        assert!(!sqlite.exists(&a, "h", "large").expect("ex"));
+        assert_eq!(read(&cache, &a, "large"), vec![2u8; 256]);
+    }
+
+    /// A rewrite by adoption leaves the key in exactly one backend, the same
+    /// invariant `writer` maintains from the other side: the earlier copy in the
+    /// primary has to go, or `reader` (primary first) and `file_path` (fs only)
+    /// answer with different bytes for one key.
+    #[test]
+    fn adopt_drops_a_superseded_primary_copy() {
+        let dir = tempdir().expect("tempdir");
+        let (cache, sqlite, fs) = spill(dir.path(), 64);
+        let a = addr();
+
+        // Landed in sqlite under a smaller threshold / an earlier, smaller build.
+        write(&cache, &a, "blob", &[9u8; 16]);
+        assert!(sqlite.exists(&a, "h", "blob").expect("ex"));
+
+        let src = dir.path().join("blob.tar");
+        std::fs::write(&src, vec![7u8; 256]).expect("write");
+        assert!(cache.adopt_file(&a, "h", "blob", &src).expect("adopt"));
+
+        assert!(fs.exists(&a, "h", "blob").expect("ex"));
+        assert!(
+            !sqlite.exists(&a, "h", "blob").expect("ex"),
+            "the superseded primary copy must be dropped"
+        );
+        assert_eq!(read(&cache, &a, "blob"), vec![7u8; 256]);
+        assert!(cache.file_path(&a, "h", "blob").is_some());
+    }
+
+    /// The manifest is the GC index and lives in the primary unconditionally —
+    /// size does not enter into it, so it is never adopted onto the filesystem.
+    #[test]
+    fn adopt_never_takes_the_manifest() {
+        let dir = tempdir().expect("tempdir");
+        let (cache, _sqlite, _fs) = spill(dir.path(), 64);
+        let a = addr();
+
+        let src = dir.path().join("manifest.bin");
+        std::fs::write(&src, vec![3u8; 256]).expect("write");
+
+        assert!(
+            !cache.adopt_file(&a, "h", MANIFEST_V1, &src).expect("adopt"),
+            "the manifest must stay in the primary whatever its size"
+        );
+        assert!(src.exists());
     }
 
     /// The direct-open fast path tracks the routing: a spilled blob is a real

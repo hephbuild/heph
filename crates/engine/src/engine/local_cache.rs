@@ -268,6 +268,31 @@ pub trait LocalCache: Send + Sync {
     fn file_path(&self, _addr: &Addr, _hashin: &str, _name: &str) -> Option<std::path::PathBuf> {
         None
     }
+    /// Take `src` whole as the blob for `(addr, hashin, name)`, by moving the
+    /// file rather than reading it.
+    ///
+    /// `Ok(true)`: the blob is committed and `src` no longer exists. `Ok(false)`:
+    /// the backend declined and `src` is untouched — the caller streams it
+    /// through [`writer`](Self::writer) as it always did. Only a caller that owns
+    /// `src` outright may offer it (see
+    /// [`ContentPath::owned`](crate::engine::driver::outputartifact::ContentPath::owned)).
+    ///
+    /// **Defaults to declining, deliberately** — the opposite of
+    /// [`existence`](Self::existence). Declining costs a copy and nothing else,
+    /// so a backend that never overrides this is correct, just as fast as before,
+    /// and a decorator that forwards `writer` without forwarding this is
+    /// pessimal rather than wrong. Only a backend storing blobs as plain files
+    /// has anything to accept with, and even then only when `src` is on the same
+    /// filesystem — a cross-device rename is precisely what it declines on.
+    fn adopt_file(
+        &self,
+        _addr: &Addr,
+        _hashin: &str,
+        _name: &str,
+        _src: &std::path::Path,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -441,6 +466,54 @@ fn cache_entry_name(artifact: &outputartifact::OutputArtifact) -> String {
     }
 }
 
+/// Store a container (tar/cpio) the driver already wrote to disk, returning its
+/// size.
+///
+/// Packing an output wrote every collected byte once, into a file that is
+/// byte-for-byte the blob the cache is about to hold; streaming it in writes them
+/// all a second time, on the same filesystem, for the same content. When the
+/// producer hands the file over ([`ContentPath::owned`]) and the backend can take
+/// it whole, the file *becomes* the blob — one `rename(2)`, no bytes read, and
+/// nothing left for the sandbox teardown to delete.
+///
+/// Both halves are conditional on purpose: a container the producer still owns is
+/// copied (it must survive this call), and a backend that declines — sqlite,
+/// mem, or an FS store on the other side of an `EXDEV` — is copied into exactly
+/// as before. The size is read before either, so it is the file's own size on
+/// both paths.
+fn store_container(
+    cache: &dyn LocalCache,
+    addr: &Addr,
+    hashin: &str,
+    name: &str,
+    content: &outputartifact::ContentPath,
+    kind: &str,
+) -> anyhow::Result<u64> {
+    let src = std::path::Path::new(&content.path);
+    let size = std::fs::metadata(src)
+        .with_context(|| format!("stat {kind} artifact {}", content.path))?
+        .size();
+
+    if content.owned
+        && cache
+            .adopt_file(addr, hashin, name, src)
+            .with_context(|| format!("adopt {kind} artifact {} as {addr} {name}", content.path))?
+    {
+        return Ok(size);
+    }
+
+    let mut f =
+        File::open(src).with_context(|| format!("open {kind} artifact {}", content.path))?;
+    let mut w = cache
+        .writer(addr, hashin, name)
+        .with_context(|| format!("open cache writer for {addr} {name}"))?;
+    io::copy(&mut f, &mut w)
+        .with_context(|| format!("copy {kind} artifact {} into {addr} {name}", content.path))?;
+    w.commit()
+        .with_context(|| format!("commit {kind} artifact {addr} {name}"))?;
+    Ok(size)
+}
+
 impl Engine {
     pub async fn cache_artifact_locally(
         &self,
@@ -509,40 +582,14 @@ impl Engine {
                     })?;
                     (size, hartifactcontent::Type::Tar)
                 }
-                outputartifact::Content::TarPath(path) => {
-                    let mut f = File::open(path)
-                        .with_context(|| format!("open tar artifact {path}"))?;
-                    let size = f
-                        .metadata()
-                        .with_context(|| format!("stat tar artifact {path}"))?
-                        .size();
-                    let mut w = open_writer(&name)
-                        .with_context(|| format!("open cache writer for {addr} {name}"))?;
-                    io::copy(&mut f, &mut w).with_context(|| {
-                        format!("copy tar artifact {path} into {addr} {name}")
-                    })?;
-                    w.commit().with_context(|| {
-                        format!("commit tar artifact {addr} {name}")
-                    })?;
-                    (size, hartifactcontent::Type::Tar)
-                }
-                outputartifact::Content::CpioPath(path) => {
-                    let mut f = File::open(path)
-                        .with_context(|| format!("open cpio artifact {path}"))?;
-                    let size = f
-                        .metadata()
-                        .with_context(|| format!("stat cpio artifact {path}"))?
-                        .size();
-                    let mut w = open_writer(&name)
-                        .with_context(|| format!("open cache writer for {addr} {name}"))?;
-                    io::copy(&mut f, &mut w).with_context(|| {
-                        format!("copy cpio artifact {path} into {addr} {name}")
-                    })?;
-                    w.commit().with_context(|| {
-                        format!("commit cpio artifact {addr} {name}")
-                    })?;
-                    (size, hartifactcontent::Type::Cpio)
-                }
+                outputartifact::Content::TarPath(content) => (
+                    store_container(&*local_cache, &addr, &hashin, &name, content, "tar")?,
+                    hartifactcontent::Type::Tar,
+                ),
+                outputartifact::Content::CpioPath(content) => (
+                    store_container(&*local_cache, &addr, &hashin, &name, content, "cpio")?,
+                    hartifactcontent::Type::Cpio,
+                ),
             };
 
             let artifact_type = match artifact.r#type {
@@ -1102,6 +1149,22 @@ mod tests {
         (engine, dir)
     }
 
+    /// Engine whose durable cache spills to plain files above `threshold` bytes,
+    /// so a test can exercise the file-backed route (the only one that can adopt
+    /// an artifact file) without writing the 8 MiB the default would need.
+    fn test_engine_spilling_at(threshold: u64) -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            spill_threshold_bytes: threshold,
+            ..Default::default()
+        })
+        .expect("engine");
+        (engine, dir)
+    }
+
     /// Engine wired to the remote cache at `remote_uri` (a `file://` dir shared
     /// across engines). Returns an `Arc` so the `self: &Arc<Self>` upload helper
     /// can be called.
@@ -1549,7 +1612,9 @@ mod tests {
             group: "out".to_string(),
             name: name.to_string(),
             r#type: outputartifact::Type::Output,
-            content: outputartifact::Content::TarPath(format!("/nonexistent/heph-{name}")),
+            content: outputartifact::Content::TarPath(outputartifact::ContentPath::owned(format!(
+                "/nonexistent/heph-{name}"
+            ))),
             hashout: format!("hashout-{name}"),
         };
         let Err(err) = engine
@@ -1709,7 +1774,9 @@ mod tests {
             group: "out".to_string(),
             name: "gone".to_string(),
             r#type: outputartifact::Type::Output,
-            content: outputartifact::Content::TarPath("/nonexistent/heph-test-tar".to_string()),
+            content: outputartifact::Content::TarPath(outputartifact::ContentPath::owned(
+                "/nonexistent/heph-test-tar",
+            )),
             hashout: "hashout-gone".to_string(),
         };
         let Err(err) = engine
@@ -1773,6 +1840,156 @@ mod tests {
             }),
             hashout: format!("hashout-{name}"),
         }
+    }
+
+    /// A container artifact on disk, `owned` deciding whether the cache may
+    /// consume the file or has to copy out of it.
+    fn tar_artifact(
+        name: &str,
+        path: &std::path::Path,
+        owned: bool,
+    ) -> outputartifact::OutputArtifact {
+        let path = path.to_string_lossy().into_owned();
+        outputartifact::OutputArtifact {
+            group: "out".to_string(),
+            name: name.to_string(),
+            r#type: outputartifact::Type::Output,
+            content: outputartifact::Content::TarPath(if owned {
+                outputartifact::ContentPath::owned(path)
+            } else {
+                outputartifact::ContentPath::borrowed(path)
+            }),
+            hashout: format!("hashout-{name}"),
+        }
+    }
+
+    /// Collecting a target's outputs already wrote every byte once, into a tar
+    /// whose only purpose is this write — so the cache takes the file instead of
+    /// reading it back and writing a second, byte-identical copy. The revision
+    /// must be indistinguishable from the copied one: same bytes, same recorded
+    /// size, and no leftover in the sandbox for the teardown to sweep.
+    #[tokio::test]
+    async fn an_owned_container_is_moved_into_the_cache() {
+        let (engine, dir) = test_engine_spilling_at(64);
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let src = dir.path().join("sandbox-collect").join("out.tar");
+        std::fs::create_dir_all(src.parent().expect("parent")).expect("mkdir");
+        let bytes = vec![7u8; 256];
+        std::fs::write(&src, &bytes).expect("write tar");
+
+        let arts = engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHIN_ADOPT",
+                vec![tar_artifact("out.tar", &src, true)],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+
+        assert!(
+            !src.exists(),
+            "an owned container is handed over, not duplicated"
+        );
+        assert_eq!(arts[0].size, bytes.len() as u64);
+        assert_eq!(
+            drain_reader(
+                engine
+                    .local_cache
+                    .reader(&addr, "HASHIN_ADOPT", &arts[0].name)
+                    .expect("blob")
+                    .reader
+            ),
+            bytes,
+            "the adopted file is the blob"
+        );
+
+        let manifest = engine
+            .read_manifest(&addr, "HASHIN_ADOPT")
+            .expect("read manifest")
+            .expect("manifest committed");
+        assert_eq!(manifest.artifacts[0].size, bytes.len() as u64);
+    }
+
+    /// The move is gated on the producer handing the file over. A container it
+    /// still owns — anything reaching the engine across the plugin ABI, where
+    /// ownership does not travel — is copied and left exactly where it was.
+    #[tokio::test]
+    async fn a_borrowed_container_is_copied_and_left_alone() {
+        let (engine, dir) = test_engine_spilling_at(64);
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let src = dir.path().join("kept.tar");
+        let bytes = vec![5u8; 256];
+        std::fs::write(&src, &bytes).expect("write tar");
+
+        let arts = engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHIN_COPY",
+                vec![tar_artifact("out.tar", &src, false)],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+
+        assert_eq!(
+            std::fs::read(&src).expect("source survives"),
+            bytes,
+            "a borrowed container must outlive the write untouched"
+        );
+        assert_eq!(
+            drain_reader(
+                engine
+                    .local_cache
+                    .reader(&addr, "HASHIN_COPY", &arts[0].name)
+                    .expect("blob")
+                    .reader
+            ),
+            bytes
+        );
+    }
+
+    /// A container small enough to belong in sqlite is copied even when it is
+    /// offered: the backend declines, and declining must cost a copy rather than
+    /// the write. Same revision either way.
+    #[tokio::test]
+    async fn an_owned_container_below_the_spill_threshold_still_lands() {
+        let (engine, dir) = test_engine_spilling_at(64 * 1024);
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let src = dir.path().join("small.tar");
+        let bytes = vec![3u8; 128];
+        std::fs::write(&src, &bytes).expect("write tar");
+
+        let arts = engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHIN_SMALL",
+                vec![tar_artifact("out.tar", &src, true)],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+
+        assert_eq!(arts[0].size, bytes.len() as u64);
+        assert_eq!(
+            drain_reader(
+                engine
+                    .local_cache
+                    .reader(&addr, "HASHIN_SMALL", &arts[0].name)
+                    .expect("blob")
+                    .reader
+            ),
+            bytes
+        );
     }
 
     /// `duplicate_cache_revision` (the in_place fixpoint primitive) must copy both

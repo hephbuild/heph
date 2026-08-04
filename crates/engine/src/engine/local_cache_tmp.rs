@@ -126,6 +126,22 @@ impl LocalCache for LocalCacheTmp {
         }))
     }
 
+    /// Declines. This tier's whole point is to keep a throwaway entry in memory
+    /// and out of the durable store, and a file cannot be admitted to a map of
+    /// `Arc<[u8]>` without reading it — which is the copy adoption exists to
+    /// avoid. Forwarding to `durable` for the entries big enough to spill would
+    /// work, but it would put the admit/spill decision in a second place, free to
+    /// drift from [`TmpWriter`]'s. Uncacheable revisions keep the copy.
+    fn adopt_file(
+        &self,
+        _addr: &Addr,
+        _hashin: &str,
+        _name: &str,
+        _src: &std::path::Path,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
         let key = Self::key(addr, hashin, name);
         if self.store.map.read().contains_key(&key) {

@@ -93,6 +93,24 @@ impl LocalCache for LocalCacheMem {
         self.inner.writer(addr, hashin, name)
     }
 
+    /// Forwarded, so the tier below can still take the file — but only after the
+    /// same invalidation `writer` does, and at the same point: before the new
+    /// bytes land, so a reader arriving mid-adopt misses here and falls through
+    /// to the inner backend rather than being served the superseded copy. A
+    /// declined adoption evicted an entry the `writer` call right behind it would
+    /// have evicted anyway.
+    fn adopt_file(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+        src: &std::path::Path,
+    ) -> Result<bool> {
+        let key = Self::key(addr, hashin, name);
+        self.cache.remove(&key);
+        self.inner.adopt_file(addr, hashin, name, src)
+    }
+
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
         let key = Self::key(addr, hashin, name);
         // peek avoids bumping the cache recency for a presence check.
@@ -351,6 +369,39 @@ mod tests {
             .file_path(&addr, "h1", "out.tar")
             .expect("durable backend has a file for this blob");
         assert_eq!(std::fs::read(&path).expect("read"), b"blob bytes");
+    }
+
+    /// An adopted blob arrives without passing through `writer`, so this tier's
+    /// invalidation has to hang off `adopt_file` too. Miss it and a key that was
+    /// read once keeps serving the bytes it had before the rewrite, from memory,
+    /// for the life of the process.
+    #[test]
+    fn adopt_invalidates_the_resident_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Arc::new(
+            crate::engine::local_cache_fs::LocalCacheFS::new(dir.path().join("blobs")).expect("fs"),
+        );
+        let dec = LocalCacheMem::new(inner, 1024, 64 * 1024);
+        let addr = make_addr();
+
+        write_blob(&dec, &addr, "out.tar", b"before");
+        // Read it in, so the stale bytes are resident and would shadow.
+        assert_eq!(
+            drain(dec.reader(&addr, "h1", "out.tar").expect("read").reader),
+            b"before"
+        );
+
+        let src = dir.path().join("after.tar");
+        std::fs::write(&src, b"after").expect("write src");
+        assert!(
+            dec.adopt_file(&addr, "h1", "out.tar", &src).expect("adopt"),
+            "the fs backend below takes the file"
+        );
+
+        assert_eq!(
+            drain(dec.reader(&addr, "h1", "out.tar").expect("read").reader),
+            b"after"
+        );
     }
 
     #[test]
