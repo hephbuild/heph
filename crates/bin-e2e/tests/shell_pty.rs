@@ -396,6 +396,56 @@ fn shell_echoes_typed_input_and_exits_promptly() {
     );
 }
 
+/// Ctrl-D at the prompt must end the session as cleanly as typing `exit`.
+///
+/// It is not a signal and never becomes one: shell mode puts the outer terminal
+/// in raw mode for the pty relay, so the `0x04` is a byte handed to the inner
+/// pty, whose line discipline turns it into EOF for bash — which then exits, and
+/// heph exits with it. That whole chain is what this asserts, and none of it
+/// exists off a terminal: without a pty there is no line discipline to make EOF
+/// out of a byte, and `heph` never enters shell mode at all.
+///
+/// Distinct from `shell_echoes_typed_input_and_exits_promptly`, which types the
+/// word `exit` — an ordinary line of input that proves nothing about the EOF
+/// path. A regression that broke only Ctrl-D (a relay that swallows `0x04`, or
+/// a raw-mode window that lets the outer tty eat it) leaves that test green.
+#[test]
+fn ctrl_d_ends_the_session_like_exit() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"sh\", driver = \"bash\", run = \"true\", cache = False)\n",
+    )
+    .expect("write BUILD");
+
+    let mut session = ShellSession::spawn(&dist, ws.root(), &["run", "--shell", "//pkg:sh"]);
+    session.ready();
+
+    // EOT. At a prompt with no partial line pending, bash reads it as
+    // end-of-input and exits — the same terminal convention as `exit`.
+    session.send(&[0x04]);
+
+    let (exited, elapsed, success) = session.wait_exit(DEADLINE);
+    assert!(
+        exited,
+        "heph did not exit after ctrl-d\n{}",
+        session.output_lossy()
+    );
+    assert!(
+        success,
+        "a session ended by ctrl-d must exit zero, like `exit` does\n{}",
+        session.output_lossy()
+    );
+    // Same "did we hang" threshold, and the same reasoning, as the `exit` test
+    // above — not a precision timing check.
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "exit took {elapsed:?} after ctrl-d — should be prompt\n{}",
+        session.output_lossy()
+    );
+}
+
 /// Ctrl-C during an interactive shell must interrupt the foreground child
 /// (not the `heph` process, and not the whole session) and return control to
 /// the bash prompt — not hang, and not tear down the session. A second
