@@ -49,6 +49,11 @@ struct GoGolistSpec {
     /// staged into consumers' sandboxes.
     #[spec(ty = ParamType::String)]
     thirdparty_download_addr: Option<String>,
+    /// True for a package in the user's own module, whose `.go` sources are
+    /// staged into the sandbox as declared deps. Stdlib and thirdparty packages
+    /// read their sources from GOROOT / the module cache instead, so an empty
+    /// sandbox says nothing about them.
+    firstparty: bool,
     /// Source/mod dependencies, grouped by name → list of target addresses.
     deps: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths.
@@ -81,6 +86,8 @@ struct GoGolistDef {
     /// `resolve_package_addrs` emits download-filter refs instead of pluginfs
     /// file refs for per-file addresses.
     thirdparty_download_addr: Option<String>,
+    /// See [`GoGolistSpec::firstparty`].
+    firstparty: bool,
 }
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
@@ -90,7 +97,8 @@ struct GoGolistDef {
 /// `go_compile`; cached `_golist` artifacts from intermediate builds of that
 /// work could carry empty `EmbedFiles` for a now-resolvable embed, surfacing as
 /// `compute embedcfg: //go:embed pattern(s) matched no files` until evicted.
-const GO_GOLIST_FORMAT_VERSION: u32 = 16;
+/// v17: `firstparty` joined the def, changing every golist target's def hash.
+const GO_GOLIST_FORMAT_VERSION: u32 = 17;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -103,6 +111,7 @@ impl Hash for GoGolistDef {
         self.goexperiment.hash(state);
         self.dep_inputs.hash(state);
         self.thirdparty_download_addr.hash(state);
+        self.firstparty.hash(state);
         // The hermetic SDK arrives via dep_inputs (group `gosdk`); the engine
         // hashes its content, so no separate goroot/go_bin field is hashed here.
     }
@@ -178,6 +187,7 @@ impl ManagedDriver for GoGolistDriver {
             goexperiment: spec.goexperiment,
             dep_inputs: dep_inputs.clone(),
             thirdparty_download_addr: spec.thirdparty_download_addr,
+            firstparty: spec.firstparty,
         };
 
         let hash = {
@@ -307,6 +317,41 @@ impl ManagedDriver for GoGolistDriver {
         ) && let Ok(v) = std::env::var("PATH")
         {
             env.insert("PATH".to_string(), v);
+        }
+
+        // A first-party directory with no `.go` file staged into it cannot be a
+        // Go package — a Go package needs at least one `.go` file, and every
+        // source that could make it one (checked-in *and* codegen output, via
+        // the `srcfiles` deps) is already materialized here. So `go list` can
+        // only come back with the "no Go files" error the provider maps to
+        // NotFound, and spawning it to learn that is pure cost.
+        //
+        // This is not a small tail: heph emits go targets per *directory*, not
+        // per Go package, so on a 500-package corpus 1171 of the 1945 golist
+        // targets are directories that only hold subdirectories or assets.
+        //
+        // Deliberately decided from the *staged inputs* rather than the
+        // workspace: reading the real tree would be an undeclared input, and
+        // would miss generated sources that only exist in the sandbox. Gated on
+        // `firstparty` because stdlib/thirdparty packages stage no sources at
+        // all — their emptiness means nothing.
+        if def.firstparty && !has_go_file(&req.sandbox_pkg_dir)? {
+            let pkg = GoPackage {
+                import_path: def.import_path.clone(),
+                error: Some(crate::plugingo::pkg_analysis::GoPackageError {
+                    err: format!("no Go files in {}", def.import_path),
+                }),
+                ..Default::default()
+            };
+            let package_bin = encode_go_package(&pkg).context("encode package.bin")?;
+            std::fs::write(req.sandbox_pkg_dir.join("package.bin"), &package_bin)
+                .context("write package.bin")?;
+            let addrs_bin =
+                encode_package_addrs(&crate::plugingo::pkg_analysis::PackageAddrs::default())
+                    .context("encode package_addrs.bin")?;
+            std::fs::write(req.sandbox_pkg_dir.join("package_addrs.bin"), &addrs_bin)
+                .context("write package_addrs.bin")?;
+            return Ok(ManagedRunResponse { artifacts: vec![] });
         }
 
         let mut cmd_args = vec![
@@ -444,6 +489,34 @@ impl ManagedDriver for GoGolistDriver {
     }
 }
 
+/// Whether `dir` directly contains a file ending in `.go`.
+///
+/// Non-recursive on purpose: a Go package is exactly one directory, and the
+/// `srcfiles` glob that stages sources is `<pkg>/*.go` for the same reason. A
+/// subdirectory's sources belong to a different package with its own `_golist`.
+/// `*_test.go` counts — a directory holding only tests is still a package.
+///
+/// A missing directory reads as "no Go files": the sandbox only materializes
+/// directories that some input actually lands in.
+fn has_go_file(dir: &std::path::Path) -> anyhow::Result<bool> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("read staged package dir {dir:?}")),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read staged package dir {dir:?}"))?;
+        if std::path::Path::new(&entry.file_name())
+            .extension()
+            .is_some_and(|e| e == "go")
+            && !entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Strip every absolute path out of a `go list` package so the cached
 /// `package.bin` is byte-identical across machines (and sandboxes). go reports
 /// absolute paths in two places:
@@ -482,6 +555,82 @@ mod tests {
 
     fn driver() -> GoGolistDriver {
         GoGolistDriver::new()
+    }
+
+    mod has_go_file {
+        use super::super::has_go_file;
+
+        fn dir_with(names: &[&str]) -> tempfile::TempDir {
+            let d = tempfile::tempdir().expect("tempdir");
+            for n in names {
+                std::fs::write(d.path().join(n), b"").expect("write");
+            }
+            d
+        }
+
+        #[test]
+        fn plain_source_counts() {
+            let d = dir_with(&["lib.go"]);
+            assert!(has_go_file(d.path()).expect("scan"));
+        }
+
+        #[test]
+        fn tests_alone_still_make_it_a_package() {
+            // `go list -test` reports a synthetic entry for a directory holding
+            // only `_test.go` files, so skipping it would lose real targets.
+            for only in [&["pkg_test.go"][..], &["x_test.go"][..]] {
+                let d = dir_with(only);
+                assert!(
+                    has_go_file(d.path()).expect("scan"),
+                    "a test-only directory is still a Go package: {only:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn non_go_files_do_not_count() {
+            // The directories this exists to skip: assets, and the parent dirs
+            // that only hold subpackages.
+            let d = dir_with(&[
+                "README.md",
+                "logo.png",
+                "data.json",
+                "go.mod",
+                "gopher.gopher",
+            ]);
+            assert!(!has_go_file(d.path()).expect("scan"));
+        }
+
+        #[test]
+        fn empty_and_missing_directories_have_no_go_files() {
+            let d = dir_with(&[]);
+            assert!(!has_go_file(d.path()).expect("scan"));
+            assert!(
+                !has_go_file(&d.path().join("never-materialized")).expect("scan"),
+                "a directory no input landed in must read as empty, not error"
+            );
+        }
+
+        #[test]
+        fn a_directory_named_like_a_source_does_not_count() {
+            let d = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(d.path().join("weird.go")).expect("mkdir");
+            assert!(
+                !has_go_file(d.path()).expect("scan"),
+                "`go list` compiles files, not directories that happen to end in .go"
+            );
+        }
+
+        #[test]
+        fn a_subdirectorys_sources_do_not_count() {
+            let d = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(d.path().join("sub")).expect("mkdir");
+            std::fs::write(d.path().join("sub").join("lib.go"), b"").expect("write");
+            assert!(
+                !has_go_file(d.path()).expect("scan"),
+                "a Go package is one directory; the subpackage has its own _golist"
+            );
+        }
     }
 
     fn make_parse_request(
