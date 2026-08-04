@@ -3650,11 +3650,24 @@ impl Engine {
                             .await
                             .with_context(|| format!("get def for group: {:?}", input_ref))?;
                         dep_def.applied_transitive.clone()
+                    } else if spec.transitive.empty() {
+                        // Nothing to contribute. Checked before the clone because
+                        // `transitive` is an opt-in BUILD-file feature
+                        // (`target(..., transitive = {...})`) that most targets never
+                        // use — every Go target builds its spec with an empty one — so
+                        // this is the common case on every dependency edge in the
+                        // graph, which is the largest per-run count in the engine.
+                        // Merging an empty sandbox is a no-op, so skipping it here
+                        // reaches the same `sb` while dropping the clone and, below,
+                        // the `id` that only a merge would ever have read.
+                        None
                     } else {
                         Some(spec.transitive.clone())
                     };
 
                     if let Some(transitive) = transitive {
+                        // `hash_str` digests the whole addr and formats it, so build
+                        // the id only once something will actually merge under it.
                         let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
                         anyhow::Ok(Some((id, transitive)))
                     } else {
