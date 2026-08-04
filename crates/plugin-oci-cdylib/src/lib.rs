@@ -5,8 +5,11 @@
 //! this with `hplugin_stabby::load_stable::load`, which verifies ABI
 //! compatibility via stabby's type reports before use.
 //!
-//! A driver-only plugin: images are declared by whatever provider the workspace
-//! already uses (`BUILD` files), so there is no `oci` provider and no hooks.
+//! Images themselves are declared by whatever provider the workspace already
+//! uses (`BUILD` files). The one thing this plugin's own provider contributes is
+//! `//@heph/oci:platform` — the builder-platform probe an `oci_image` without
+//! explicit `platforms` depends on, so that platform reaches the cache key as an
+//! input hash rather than as a parse-time side effect. No hooks.
 //!
 //! Nothing crosses in [`CreateConfig`] that the drivers need — they take the
 //! `docker` / `skopeo` binaries from `PATH`, the same host capability the
@@ -15,7 +18,9 @@
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_oci::pluginoci;
 use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedDriver, PluginComponents};
-use plugin_sdk::stabby::{install_log_sink, install_supervisor, make_dyn_managed_driver};
+use plugin_sdk::stabby::{
+    install_log_sink, install_supervisor, make_dyn_managed_driver, make_dyn_provider,
+};
 use std::sync::Arc;
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
@@ -73,11 +78,19 @@ fn build() -> PluginComponents {
         name: pluginoci::load::DRIVER_NAME.into(),
         driver: make_dyn_managed_driver(load),
     });
+    // Asks buildx which platform it would build by default. Depended on, never
+    // named by a user.
+    let platform: Arc<dyn ManagedDriver> = Arc::new(pluginoci::platform::Driver::new());
+    drivers.push(NamedDriver {
+        name: pluginoci::platform::DRIVER_NAME.into(),
+        driver: make_dyn_managed_driver(platform),
+    });
+
+    let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(pluginoci::platform::Provider);
 
     PluginComponents {
-        // Driver-only: images are declared through the workspace's own provider.
-        provider_name: String::new().into(),
-        provider: stabby::option::Option::None(),
+        provider_name: "oci".into(),
+        provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
         hooks: stabby::vec::Vec::new(),
         meta: stabby::vec::Vec::new(),

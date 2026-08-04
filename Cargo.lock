@@ -4020,6 +4020,7 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
+ "futures",
  "model",
  "plugin",
  "proc",
@@ -4037,6 +4038,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "driver-support",
+ "plugin",
  "plugin-oci",
  "plugin-sdk",
  "stabby",

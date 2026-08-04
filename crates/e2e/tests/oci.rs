@@ -67,8 +67,16 @@ impl Fake {
         Fake { dir, bin }
     }
 
-    /// How many `buildx build` invocations happened. The probe is excluded: it
-    /// is memoized per driver instance and is not what cache behaviour is about.
+    /// How many builder probes ran. The probe is a locally-cached target, so a
+    /// warm run must not add to this.
+    fn probes(&self) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| c.contains("inspect"))
+            .count()
+    }
+
+    /// How many `buildx build` invocations happened.
     fn builds(&self) -> usize {
         self.calls()
             .iter()
@@ -97,7 +105,12 @@ fn workspace_with_fake(fake: &Fake) -> htestkit::Workspace {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::Driver::with_binary(bin)))
+        .with_managed_driver(Box::new(pluginoci::Driver::with_binary(bin.clone())))
+        // `oci_image` without explicit `platforms` depends on
+        // `//@heph/oci:platform`, so the probe's provider and driver have to be
+        // registered for the graph to resolve at all.
+        .with_provider(|_| Box::new(pluginoci::platform::Provider))
+        .with_managed_driver(Box::new(pluginoci::platform::Driver::with_binary(bin)))
         .build()
         .expect("build workspace")
 }
@@ -170,6 +183,39 @@ target(name = "img", driver = "oci_image", context = [":dockerfile"])
         fake.builds(),
         1,
         "an unchanged context must be a cache hit, not a second build"
+    );
+    Ok(())
+}
+
+/// The builder-platform probe is a locally-cached target, so it runs once and a
+/// warm run reuses the answer. That is the whole reason it is a cached target
+/// rather than an uncached one — an uncached dep must execute every invocation
+/// to produce the hashout its consumer needs.
+#[tokio::test]
+async fn test_oci_image_probes_the_builder_once_across_runs() -> anyhow::Result<()> {
+    let fake = Fake::new();
+    let ws = workspace_with_fake(&fake);
+    ws.write_build_file(
+        "app",
+        r#"
+target(
+    name = "dockerfile",
+    driver = "bash",
+    run = "echo 'FROM scratch' > $OUT",
+    out = "Dockerfile",
+)
+target(name = "img", driver = "oci_image", context = [":dockerfile"])
+"#,
+    );
+
+    ws.run("//app:img").await?;
+    assert_eq!(fake.probes(), 1, "the first run probes the builder");
+
+    ws.run("//app:img").await?;
+    assert_eq!(
+        fake.probes(),
+        1,
+        "a warm run must reuse the cached platform, not re-probe"
     );
     Ok(())
 }
@@ -357,6 +403,10 @@ async fn test_oci_image_build_failure_surfaces_the_builder_error() -> anyhow::Re
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginoci::Driver::with_binary(
+            bin.to_string_lossy().into_owned(),
+        )))
+        .with_provider(|_| Box::new(pluginoci::platform::Provider))
+        .with_managed_driver(Box::new(pluginoci::platform::Driver::with_binary(
             bin.to_string_lossy().into_owned(),
         )))
         .build()

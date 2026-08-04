@@ -166,6 +166,7 @@ impl<'io> ToolIo<'io> {
 pub const DRIVER_NAME: &str = "oci_image";
 
 pub mod load;
+pub mod platform;
 pub mod pull;
 pub mod push;
 
@@ -446,6 +447,10 @@ pub(crate) enum DockerfileSource {
 /// Origin id of the `dockerfile = ":target"` dep input.
 const DOCKERFILE_ORIGIN: &str = "dockerfile";
 
+/// Origin id of the builder-platform probe dep, present only when `platforms`
+/// is empty.
+const PLATFORM_ORIGIN: &str = "builder_platform";
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciImageDef {
     dockerfile: DockerfileSource,
@@ -458,19 +463,13 @@ struct OciImageDef {
     /// Sorted for a stable hash.
     build_args: BTreeMap<String, String>,
     stage: Option<String>,
-    /// Platforms as written by the user. Empty means "the builder's default",
-    /// which is what `builder_platform` records.
+    /// Platforms as written by the user. Empty means "whatever the builder
+    /// defaults to", which arrives at run time from the [`platform`] probe dep —
+    /// and reaches the cache key as that dep's content hash.
     platforms: Vec<String>,
     /// The buildx builder (`--builder`), as written by the user. `None` means
     /// buildx's current builder.
     builder: Option<String>,
-    /// The platform actually built when `platforms` is empty, resolved from the
-    /// selected builder at parse time. `None` only when `platforms` is explicit.
-    ///
-    /// This is the difference between a correct key and a silently wrong one: an
-    /// empty `platforms` produces an arm64 image on one host and an amd64 image
-    /// on another, and without this field both hash identically.
-    builder_platform: Option<String>,
     /// Sorted before hashing: `--secret a --secret b` and `--secret b --secret a`
     /// produce the same image, so they must produce the same key.
     secrets: Vec<String>,
@@ -518,7 +517,6 @@ impl Hash for OciImageDef {
         // `--platform b,a` order the manifest list's entries differently.
         self.platforms.hash(state);
         self.builder.hash(state);
-        self.builder_platform.hash(state);
         self.secrets.hash(state);
         self.ssh.hash(state);
         self.bases.hash(state);
@@ -575,6 +573,9 @@ fn build_argv(
     metadata_file: &Path,
     named_contexts: &BTreeMap<String, String>,
     src_args: &BTreeMap<String, String>,
+    // The builder's default platform, from the probe dep. `None` when
+    // `platforms` is explicit and no probe was needed.
+    probed_platform: Option<&str>,
 ) -> Vec<String> {
     let mut argv = vec![
         docker_bin.to_string(),
@@ -600,11 +601,11 @@ fn build_argv(
         argv.push("--target".to_string());
         argv.push(stage.clone());
     }
-    // An explicit `platforms` wins; otherwise pass the platform resolved from
-    // the builder at parse time, so the argv states what the hash promised
-    // rather than re-deriving it from whatever the builder defaults to now.
+    // An explicit `platforms` wins; otherwise the probe dep's answer, so the
+    // argv states exactly what the key hashed rather than re-deriving it from
+    // whatever the builder happens to default to now.
     let platform = if def.platforms.is_empty() {
-        def.builder_platform.clone()
+        probed_platform.map(str::to_string)
     } else {
         Some(def.platforms.join(","))
     };
@@ -799,14 +800,6 @@ fn ensure_no_src_source(kind: &str, specs: &[String]) -> anyhow::Result<()> {
 
 pub struct Driver {
     docker_bin: String,
-    /// Memoized `docker buildx inspect --bootstrap` result, per builder. `parse`
-    /// runs on the warm path too, so the probe must happen at most once per
-    /// builder per process rather than once per target.
-    ///
-    /// Keyed by the target's `builder` (`None` = whatever buildx defaults to):
-    /// two builders answer with two different default platforms, and that answer
-    /// goes straight into the cache key.
-    builder_platforms: tokio::sync::Mutex<HashMap<Option<String>, String>>,
 }
 
 impl Default for Driver {
@@ -825,66 +818,7 @@ impl Driver {
     pub fn with_binary(bin: impl Into<String>) -> Self {
         Driver {
             docker_bin: bin.into(),
-            builder_platforms: tokio::sync::Mutex::new(HashMap::new()),
         }
-    }
-
-    /// The platform a build with no `--platform` produces on `builder`, asked
-    /// once per builder per process and folded into the cache key by `parse`.
-    async fn resolve_builder_platform(
-        &self,
-        builder: Option<&str>,
-        ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<String> {
-        // The lock is held across the probe so concurrent `parse`s of targets
-        // sharing a builder wait for one answer instead of each spawning their
-        // own `docker buildx inspect`. Bootstrapping a container builder is
-        // seconds; doing it once per target in a large workspace is not.
-        let mut cache = self.builder_platforms.lock().await;
-        let key = builder.map(str::to_string);
-        if let Some(hit) = cache.get(&key) {
-            return Ok(hit.clone());
-        }
-
-        let mut argv = vec![
-            self.docker_bin.clone(),
-            "buildx".to_string(),
-            "inspect".to_string(),
-            "--bootstrap".to_string(),
-        ];
-        if let Some(builder) = builder {
-            argv.push(builder.to_string());
-        }
-        // The probe's own output is noise to the user; only its result matters,
-        // so no sinks are attached.
-        // The probe runs at parse time, where there is no sandbox and so no
-        // target log; its output is noise anyway — only its result matters.
-        let mut io = ToolIo {
-            stdout: None,
-            stderr: None,
-            log: None,
-        };
-        let out = run_tool(
-            argv,
-            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            "docker buildx inspect",
-            &mut io,
-            ctoken,
-        )
-        .await
-        .with_context(|| {
-            let which = builder.map_or_else(
-                || "the default builder".to_string(),
-                |b| format!("builder {b:?}"),
-            );
-            format!(
-                "resolving the default platform of {which} — `oci_image` needs it for the cache \
-                 key when `platforms` is not set. Set `platforms` explicitly to skip this probe."
-            )
-        })?;
-        let platform = parse_builder_platform(&out)?;
-        cache.insert(key, platform.clone());
-        Ok(platform)
     }
 }
 
@@ -903,7 +837,7 @@ impl ManagedDriver for Driver {
     async fn parse(
         &self,
         req: ParseRequest,
-        ctoken: &(dyn Cancellable + Send + Sync),
+        _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
         let spec = OciImageSpec::from(&req.target_spec.config).context("parse oci_image config")?;
@@ -964,14 +898,6 @@ impl ManagedDriver for Driver {
         // put the answer in the key — otherwise two hosts with different default
         // platforms compute the same key for different images.
         let builder = spec.builder.filter(|b| !b.is_empty());
-        let builder_platform = if spec.platforms.is_empty() {
-            Some(
-                self.resolve_builder_platform(builder.as_deref(), ctoken)
-                    .await?,
-            )
-        } else {
-            None
-        };
 
         // Build-context inputs: every file these targets produce lands in the
         // sandbox at its workspace-relative path, and the workspace root is the
@@ -990,6 +916,23 @@ impl ManagedDriver for Driver {
                 runtime: true,
             });
         }
+        // With no explicit `platforms` the builder picks, and nothing else in
+        // the key varies by platform — so depend on the probe target and let its
+        // content hash carry the answer. An explicit `platforms` needs no probe
+        // and declares no dep.
+        if spec.platforms.is_empty() {
+            let probe = platform::addr_for(builder.as_deref());
+            inputs.push(Input {
+                r#ref: TargetAddr::parse(&probe, &pkg)
+                    .with_context(|| format!("parse builder-platform probe addr {probe:?}"))?,
+                mode: InputMode::Standard,
+                origin_id: PLATFORM_ORIGIN.to_string(),
+                annotations: BTreeMap::new(),
+                hashed: true,
+                runtime: true,
+            });
+        }
+
         let mut context_groups: Vec<String> = spec.context.keys().cloned().collect();
         // HashMap iteration order varies per process; sort so the def and the
         // input ordering are byte-stable across runs.
@@ -1048,7 +991,6 @@ impl ManagedDriver for Driver {
             stage: spec.stage,
             platforms: spec.platforms,
             builder,
-            builder_platform,
             secrets,
             ssh,
             bases,
@@ -1144,6 +1086,18 @@ impl ManagedDriver for Driver {
         // output.
         let metadata_file = req.sandbox_dir.join("oci-metadata.json");
 
+        // The probe dep's file holds the platform the key was computed from.
+        let probed_platform = if def.platforms.is_empty() {
+            let path = dep_single_file(&req, PLATFORM_ORIGIN)
+                .context("oci_image: locating the builder-platform probe output")?;
+            let raw = tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("read builder platform {path:?}"))?;
+            Some(raw.trim().to_string())
+        } else {
+            None
+        };
+
         let named_contexts = resolve_named_contexts(&req, &def)?;
         let src_args = resolve_src_args(&req, &context_dir)?;
         let argv = build_argv(
@@ -1155,6 +1109,7 @@ impl ManagedDriver for Driver {
             &metadata_file,
             &named_contexts,
             &src_args,
+            probed_platform.as_deref(),
         );
 
         let addr = req.request.target.addr.format();
@@ -1696,6 +1651,10 @@ pub(crate) mod testfake {
 
     /// Build a `ManagedRunRequest` over `sandbox` for `def`, with one Dep input
     /// per (origin_id, materialized paths) pair.
+    /// What the seeded probe dep reports. Tests asserting on `--platform` match
+    /// this; a test that needs another platform passes its own probe dep.
+    pub(crate) const PROBED_PLATFORM: &str = "linux/arm64";
+
     pub(crate) fn run_request<'a>(
         request_id: &'a String,
         hashin: &'a str,
@@ -1706,8 +1665,20 @@ pub(crate) mod testfake {
         let list_dir = sandbox.dir.path().join("lists");
         std::fs::create_dir_all(&list_dir).expect("mkdir lists");
 
+        // Every `oci_image` without explicit `platforms` depends on the probe
+        // target, so a runnable request needs its output. Seeded here rather
+        // than in each test: it is a precondition of running at all, not
+        // something an individual test is making a statement about. A test that
+        // wants a specific platform passes its own.
+        let mut deps: Vec<(&str, Vec<PathBuf>)> = deps.to_vec();
+        if !deps.iter().any(|(id, _)| *id == super::PLATFORM_ORIGIN) {
+            let probe = sandbox.dir.path().join("probed-platform.txt");
+            std::fs::write(&probe, PROBED_PLATFORM).expect("write probe output");
+            deps.push((super::PLATFORM_ORIGIN, vec![probe]));
+        }
+
         let mut inputs = Vec::new();
-        for (origin_id, paths) in deps {
+        for (origin_id, paths) in &deps {
             let list_path = list_dir.join(format!("input_{origin_id}.list"));
             let body: String = paths
                 .iter()
@@ -1769,10 +1740,6 @@ mod tests {
     use hcore::htvalue::Value;
     use hmodel::htaddr::parse_addr;
     use hplugin::provider::TargetSpec;
-
-    /// What the fake `docker buildx inspect` reports, and therefore what `parse`
-    /// must fold into the cache key when `platforms` is unset.
-    const FAKE_BUILDER_PLATFORM: &str = "linux/arm64";
 
     /// A fake `docker` that answers the builder probe and, on `buildx build`,
     /// writes the metadata file and the output archive the driver expects.
@@ -1888,7 +1855,6 @@ exit 0
             stage: Some("runtime".to_string()),
             platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
             builder: None,
-            builder_platform: None,
             secrets: vec!["id=token,env=TOKEN".to_string()],
             ssh: vec!["default".to_string()],
             bases: vec![],
@@ -1904,6 +1870,7 @@ exit 0
             Path::new("/sbx/meta.json"),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            None,
         );
 
         assert_eq!(argv[0..3], ["docker", "buildx", "build"]);
@@ -1937,7 +1904,6 @@ exit 0
             stage: None,
             platforms: vec![],
             builder: None,
-            builder_platform: Some("linux/arm64".to_string()),
             secrets: vec![],
             ssh: vec![],
             bases: vec![],
@@ -1953,6 +1919,7 @@ exit 0
             Path::new("/m.json"),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            Some("linux/arm64"),
         );
         assert!(argv.join(" ").contains("--platform linux/arm64"));
     }
@@ -1968,7 +1935,6 @@ exit 0
             stage: None,
             platforms: vec!["linux/amd64".to_string()],
             builder: None,
-            builder_platform: None,
             secrets: vec![],
             ssh: vec![],
             bases: vec!["base".to_string()],
@@ -1989,6 +1955,7 @@ exit 0
             Path::new("/m.json"),
             &contexts,
             &src,
+            None,
         );
         let joined = argv.join(" ");
         assert!(
@@ -2012,7 +1979,6 @@ exit 0
             stage: None,
             platforms: vec![],
             builder: None,
-            builder_platform: Some("linux/amd64".to_string()),
             secrets: vec![],
             ssh: vec![],
             bases: vec![],
@@ -2028,6 +1994,7 @@ exit 0
             Path::new("/m.json"),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            None,
         );
         assert!(argv.join(" ").contains("type=docker,dest=/c/img.tar"));
         // `format` selects the exporter and nothing else: the build context is
@@ -2069,9 +2036,15 @@ exit 0
         let sbx = Sandbox::new("app");
         let resp = parse_in(&sbx, "//app:img", cfg(&[ctx()])).await;
 
-        assert_eq!(resp.target_def.inputs.len(), 1);
-        assert_eq!(resp.target_def.inputs[0].r#ref.r#ref.format(), "//app:srcs");
-        assert!(resp.target_def.inputs[0].hashed);
+        let ctx_inputs: Vec<&Input> = resp
+            .target_def
+            .inputs
+            .iter()
+            .filter(|i| i.origin_id.starts_with("context|"))
+            .collect();
+        assert_eq!(ctx_inputs.len(), 1);
+        assert_eq!(ctx_inputs[0].r#ref.r#ref.format(), "//app:srcs");
+        assert!(ctx_inputs[0].hashed);
 
         let groups: Vec<&str> = resp
             .target_def
@@ -2112,45 +2085,54 @@ exit 0
         assert_ne!(path(&a), path(&b));
     }
 
-    /// The resolved builder platform lands in the def, and therefore in the key —
-    /// this is what stops an arm64 host and an amd64 host sharing one entry.
+    /// With no explicit `platforms`, the image depends on the probe target, and
+    /// the platform reaches the key as that dep's content hash. Without the dep
+    /// an arm64 host and an amd64 host compute the same key for different image
+    /// bytes — the remote key carries no arch segment.
     #[tokio::test]
-    async fn empty_platforms_records_the_builder_platform() {
+    async fn empty_platforms_depends_on_the_probe() {
         let sbx = Sandbox::new("app");
         let resp = parse_in(&sbx, "//app:img", cfg(&[ctx()])).await;
-        let def = resp.target_def.def::<OciImageDef>();
-        assert_eq!(def.builder_platform.as_deref(), Some(FAKE_BUILDER_PLATFORM));
+        let probe = resp
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.origin_id == PLATFORM_ORIGIN)
+            .expect("a builder-platform probe input");
+        assert_eq!(probe.r#ref.r#ref.format(), "//@heph/oci:platform");
+        assert!(probe.hashed, "the probe must feed the key");
+        assert!(probe.runtime, "run() reads the platform out of it");
     }
 
+    /// A named `builder` gets its own probe: two builders answer with two
+    /// different default platforms, so they must not share one answer.
     #[tokio::test]
-    async fn hash_differs_when_the_builder_platform_differs() {
-        let sbx_arm = Sandbox::new("app");
-        let arm = parse_in(&sbx_arm, "//app:img", cfg(&[ctx()])).await;
-
-        let sbx_amd = Sandbox::new("app");
-        let bin = sbx_amd.fake(
-            "docker",
-            "case \"$2\" in inspect) echo 'Platforms: linux/amd64';; esac\nexit 0",
-        );
-        let amd = Driver::with_binary(bin)
-            .parse(
-                parse_req("//app:img", cfg(&[ctx()])),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .expect("parse");
-
-        assert_ne!(
-            arm.target_def.hash, amd.target_def.hash,
-            "an arm64 builder and an amd64 builder must not share a cache entry"
+    async fn a_named_builder_probes_its_own_platform() {
+        let sbx = Sandbox::new("app");
+        let resp = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[ctx(), ("builder", Value::String("multi".to_string()))]),
+        )
+        .await;
+        let probe = resp
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.origin_id == PLATFORM_ORIGIN)
+            .expect("a builder-platform probe input");
+        assert_eq!(
+            probe.r#ref.r#ref.format(),
+            "//@heph/oci:platform@builder=multi"
         );
     }
 
-    /// An explicit `platforms` needs no probe and is hashed as written.
+    /// An explicit `platforms` needs no probe: no dep, and nothing to run.
     #[tokio::test]
     async fn explicit_platforms_skips_the_probe() {
         let sbx = Sandbox::new("app");
-        // No fake installed under this name: a probe would fail to spawn.
+        // No fake installed under this name: were `parse` still shelling out,
+        // this would fail to spawn rather than pass.
         let d = Driver::with_binary(sbx.dir.path().join("absent-docker").to_string_lossy());
         let resp = d
             .parse(
@@ -2169,10 +2151,11 @@ exit 0
             .await
             .expect("explicit platforms must not need the builder");
         assert!(
-            resp.target_def
-                .def::<OciImageDef>()
-                .builder_platform
-                .is_none()
+            !resp
+                .target_def
+                .inputs
+                .iter()
+                .any(|i| i.origin_id == PLATFORM_ORIGIN)
         );
     }
 
@@ -2190,7 +2173,6 @@ exit 0
             stage: None,
             platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
             builder: Some("multi".to_string()),
-            builder_platform: None,
             secrets: vec![],
             ssh: vec![],
             bases: vec![],
@@ -2206,6 +2188,7 @@ exit 0
             Path::new("/m.json"),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            None,
         );
         assert!(argv.join(" ").contains("--builder multi"), "{argv:?}");
     }
@@ -2234,159 +2217,6 @@ exit 0
         )
         .await;
         assert_ne!(a.target_def.hash, b.target_def.hash);
-    }
-
-    /// The platform probe has to ask the *selected* builder: asking the default
-    /// one would put another builder's platform in this target's key.
-    #[tokio::test]
-    async fn empty_platforms_probes_the_selected_builder() {
-        let sbx = Sandbox::new("app");
-        let bin = sbx.fake("docker", FAKE_DOCKER_OK);
-        let d = Driver::with_binary(bin);
-        let resp = d
-            .parse(
-                parse_req(
-                    "//app:img",
-                    cfg(&[ctx(), ("builder", Value::String("multi".to_string()))]),
-                ),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .expect("parse");
-
-        assert_eq!(
-            resp.target_def.def::<OciImageDef>().builder.as_deref(),
-            Some("multi")
-        );
-        let probe = sbx
-            .calls()
-            .into_iter()
-            .find(|c| c.contains("inspect"))
-            .expect("a builder probe");
-        assert!(
-            probe.ends_with("--bootstrap multi"),
-            "the probe must name the builder, got: {probe}"
-        );
-    }
-
-    /// `dockerfile = ":target"` makes the producing target a dep in its own
-    /// right — no `context` entry and no path to spell. Getting this wrong
-    /// (treating the address as a path) fails at run time with a missing file,
-    /// long after parse said the target was fine.
-    #[tokio::test]
-    async fn parse_dockerfile_address_declares_a_dep() {
-        let sbx = Sandbox::new("app");
-        let resp = parse_in(
-            &sbx,
-            "//app:img",
-            cfg(&[ctx(), ("dockerfile", Value::String(":gen".to_string()))]),
-        )
-        .await;
-
-        let df = resp
-            .target_def
-            .inputs
-            .iter()
-            .find(|i| i.origin_id == DOCKERFILE_ORIGIN)
-            .expect("a dockerfile dep input");
-        assert_eq!(df.r#ref.r#ref.format(), "//app:gen");
-        assert!(df.hashed && df.runtime);
-        assert_eq!(
-            resp.target_def.def::<OciImageDef>().dockerfile,
-            DockerfileSource::Dep
-        );
-    }
-
-    /// A cross-package address resolves against this target's package, like
-    /// every other target-valued attribute.
-    #[tokio::test]
-    async fn parse_dockerfile_absolute_address_declares_a_dep() {
-        let sbx = Sandbox::new("app");
-        let resp = parse_in(
-            &sbx,
-            "//app:img",
-            cfg(&[
-                ctx(),
-                ("dockerfile", Value::String("//base:Dockerfile".to_string())),
-            ]),
-        )
-        .await;
-        let df = resp
-            .target_def
-            .inputs
-            .iter()
-            .find(|i| i.origin_id == DOCKERFILE_ORIGIN)
-            .expect("a dockerfile dep input");
-        assert_eq!(df.r#ref.r#ref.format(), "//base:Dockerfile");
-    }
-
-    /// A path stays a path: no dep input, and the workspace-relative form in the
-    /// def.
-    #[tokio::test]
-    async fn parse_dockerfile_path_declares_no_dep() {
-        let sbx = Sandbox::new("app");
-        let resp = parse_in(
-            &sbx,
-            "//app:img",
-            cfg(&[
-                ctx(),
-                ("dockerfile", Value::String("Dockerfile".to_string())),
-            ]),
-        )
-        .await;
-        assert!(
-            !resp
-                .target_def
-                .inputs
-                .iter()
-                .any(|i| i.origin_id == DOCKERFILE_ORIGIN)
-        );
-        assert_eq!(
-            resp.target_def.def::<OciImageDef>().dockerfile,
-            DockerfileSource::Path("app/Dockerfile".to_string())
-        );
-    }
-
-    /// A generated Dockerfile is read from where the dep staged it, not from a
-    /// guessed path under the package.
-    #[tokio::test]
-    async fn run_reads_the_dockerfile_from_its_dep() {
-        let sbx = Sandbox::new("app");
-        let resp = parse_in(
-            &sbx,
-            "//app:img",
-            cfg(&[ctx(), ("dockerfile", Value::String(":gen".to_string()))]),
-        )
-        .await;
-
-        // Deliberately not `app/Dockerfile`: a driver that ignored the dep and
-        // joined the package path would find nothing here.
-        let staged = sbx.pkg.join("generated.Dockerfile");
-        std::fs::write(&staged, "FROM scratch\n").expect("dockerfile");
-
-        let bin = sbx.fake("docker", FAKE_DOCKER_OK);
-        let rid = "req".to_string();
-        let req = run_request(
-            &rid,
-            "hashin",
-            &resp.target_def,
-            &sbx,
-            &[(DOCKERFILE_ORIGIN, vec![staged.clone()])],
-        );
-        Driver::with_binary(bin)
-            .run(req, &StdCancellationToken::new())
-            .await
-            .expect("run");
-
-        let build = sbx
-            .calls()
-            .into_iter()
-            .find(|c| c.contains("buildx build"))
-            .expect("a buildx build call");
-        assert!(
-            build.contains(&format!("--file {}", staged.to_string_lossy())),
-            "the build must read the staged Dockerfile, got: {build}"
-        );
     }
 
     /// Layer-cache refs are build optimizations: changing them must NOT change

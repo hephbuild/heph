@@ -249,6 +249,8 @@ fn workspace() -> htestkit::Workspace {
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginoci::Driver::new()))
+        .with_provider(|_| Box::new(pluginoci::platform::Provider))
+        .with_managed_driver(Box::new(pluginoci::platform::Driver::new()))
         .with_managed_driver(Box::new(pluginoci::load::Driver::new()))
         .with_managed_driver(Box::new(pluginoci::push::Driver::new()))
         .with_managed_driver(Box::new(pluginoci::pull::Driver::new()))
