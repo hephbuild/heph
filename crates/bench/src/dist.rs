@@ -111,11 +111,16 @@ fn write_go_config(corpus: &Path, dist: &Dist) -> Result<()> {
     // `tools/gorepogen`, so this stays offline and pays no extra hermetic-
     // SDK download — same choice `bin-e2e`'s own go-plugin fixture makes,
     // and for the same reason.
+    // `sh` is not optional: the go provider's stdlib `build_lib` targets are
+    // sh-driven, so without it every first-party compile fails at
+    // `//@heph/go/std/...: driver not found: sh`. It went unnoticed while this
+    // scenario matched zero targets and therefore never resolved a std dep.
     let config = format!(
         "plugins:\n  \
          - builtin: buildfile\n    options:\n      patterns:\n        - BUILD\n  \
          - builtin: exec\n  \
          - builtin: bash\n  \
+         - builtin: sh\n  \
          - path: {}\n    options:\n      gotool: \"host\"\n",
         manifest_path.display()
     );
@@ -151,11 +156,25 @@ fn wipe_cache(corpus: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The label carried by the go plugin's compile targets (`build_lib`,
+/// `build_test`, `build_xtest`). NOT `build` — that is a *target name* in the go
+/// provider, not a label, and the bare `//pkg:build` magic group only resolves
+/// for a `package main`, which this corpus has none of.
+const GO_BUILD_LABEL: &str = "go-build";
+
+/// Number of targets `heph` reported matching, parsed from its `matched N
+/// targets` line. `None` if no such line was emitted.
+fn matched_targets(stderr: &str) -> Option<u64> {
+    let rest = stderr.rsplit_once("matched ")?.1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 fn build_go_tree(dist: &Dist, corpus: &Path) -> Result<f64> {
     let home = tempfile::tempdir().context("create HOME tempdir")?;
     let start = Instant::now();
     let out = Command::new(dist.heph())
-        .args(["r", "build", "//go/..."])
+        .args(["r", GO_BUILD_LABEL, "//go/..."])
         .current_dir(corpus)
         .env("HOME", home.path())
         .env("HEPH_CWD", corpus)
@@ -163,14 +182,28 @@ fn build_go_tree(dist: &Dist, corpus: &Path) -> Result<f64> {
         .env("HEPH_DISABLE_TELEMETRY", "1")
         .stdin(Stdio::null())
         .output()
-        .context("spawn heph r build //go/...")?;
+        .context("spawn heph r go-build //go/...")?;
+    let stderr =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
         bail!(
-            "heph r build //go/... failed: status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            "heph r {GO_BUILD_LABEL} //go/... failed: status {}\n--- output ---\n{}",
             out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
+            stderr,
         );
+    }
+    // A selection that matches nothing still exits 0, so without this a broken
+    // corpus or a renamed label reads as a passing — and very fast — benchmark.
+    // That is not hypothetical: this scenario spent its whole life matching zero
+    // targets and timing only package discovery.
+    match matched_targets(&stderr) {
+        Some(0) | None => bail!(
+            "heph r {GO_BUILD_LABEL} //go/... matched no targets — the corpus built nothing, so \
+             this measures package discovery, not a build. Check that the corpus declares a go \
+             variant and that `{GO_BUILD_LABEL}` is still the compile targets' label.\n\
+             --- output ---\n{stderr}",
+        ),
+        Some(_) => {}
     }
     Ok(start.elapsed().as_secs_f64() * 1000.0)
 }
@@ -220,4 +253,28 @@ pub fn measure_once(
             .context("mutate go corpus for incremental scenario")?;
     }
     build_go_tree(&dist, corpus)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matched_targets;
+
+    #[test]
+    fn reads_the_match_count_heph_reports() {
+        assert_eq!(
+            matched_targets(" INFO matched 500 targets\n INFO matched 500 / 500, done 11713\n"),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn a_zero_match_is_reported_as_zero_not_as_absent() {
+        // The whole point of the guard: this run exits 0 and must still fail.
+        assert_eq!(matched_targets(" INFO matched 0 targets\n"), Some(0));
+    }
+
+    #[test]
+    fn absent_line_is_none() {
+        assert_eq!(matched_targets("no such line here\n"), None);
+    }
 }
