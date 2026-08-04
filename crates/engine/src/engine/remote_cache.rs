@@ -813,15 +813,14 @@ fn scan_precompressed(
             return false;
         }
     };
-    let verdict = match sniff::scan_tar(reader) {
+    let verdict = match sniff::scan_tar(reader, size) {
         Ok(v) => v,
         Err(e) => {
             debug!(error = ?e, blob = name, "content scan failed; assuming compressible");
             return false;
         }
     };
-    let precompressed = verdict.is_precompressed(size);
-    if precompressed {
+    if verdict.precompressed {
         debug!(
             blob = name,
             format = verdict.dominant.unwrap_or("unknown"),
@@ -830,7 +829,7 @@ fn scan_precompressed(
             "storing blob verbatim: payload is already compressed"
         );
     }
-    precompressed
+    verdict.precompressed
 }
 
 /// A revision *located* on one remote cache — the decision half of a remote hit.

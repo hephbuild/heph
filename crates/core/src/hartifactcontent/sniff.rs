@@ -79,41 +79,44 @@ const SIGNATURES: &[Signature] = &[
 /// signature (`WEBP` at offset 8).
 const PEEK_LEN: usize = 12;
 
+/// A tar block. Every member carries at least one as its header, and that
+/// framing is payload no compressor has to work for.
+const BLOCK_BYTES: u64 = 512;
+
 /// Members below this are not sniffed at all.
 ///
 /// A blob is called precompressed only when *most* of it is (see
-/// [`PRECOMPRESSED_FRACTION`]), so members too small to move that ratio cannot
+/// [`PRECOMPRESSED_PERCENT`]), so members too small to move that ratio cannot
 /// change the verdict — and skipping them bounds the read count on a tar of many
 /// tiny files. Skipping can only under-count incompressible bytes, i.e. it errs
 /// toward compressing, which is the safe direction.
 const MIN_MEMBER_BYTES: u64 = 4 * 1024;
 
-/// Share of a blob that must be already-compressed payload before the blob as a
-/// whole is treated as not worth compressing.
+/// Percentage of a blob that must be already-compressed payload before the blob
+/// as a whole is treated as not worth compressing.
 ///
 /// Measured against the *whole blob*, not the sum of member sizes, so tar
 /// headers and padding count against the verdict: an archive that is mostly
 /// framing (thousands of tiny files) can never reach this bar, which is right —
 /// that framing compresses away to nothing.
-const PRECOMPRESSED_FRACTION: f64 = 0.9;
+///
+/// Integer percent rather than a float fraction so both this comparison and the
+/// early-exit bound derived from it are exact.
+const PRECOMPRESSED_PERCENT: u64 = 90;
 
 /// What a scan concluded about a tar blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
+    /// Whether the blob is not worth compressing.
+    pub precompressed: bool,
     /// Total size of members whose magic identifies an already-compressed
-    /// format.
+    /// format. A *lower bound* rather than a census: the scan stops as soon as
+    /// the answer is settled (see [`scan_tar`]), so a blob that is not
+    /// precompressed reports only what it saw before giving up.
     pub incompressible_bytes: u64,
     /// The format holding the most of those bytes — the human-readable half of
     /// "why was this stored verbatim?". `None` when nothing matched.
     pub dominant: Option<&'static str>,
-}
-
-impl Verdict {
-    /// Whether a blob of `blob_size` bytes is not worth compressing.
-    pub fn is_precompressed(&self, blob_size: u64) -> bool {
-        blob_size > 0
-            && (self.incompressible_bytes as f64) >= (blob_size as f64) * PRECOMPRESSED_FRACTION
-    }
 }
 
 /// Match `head` against the signature table. A `head` too short for a given
@@ -144,16 +147,38 @@ fn peek(mut r: impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(n)
 }
 
-/// Scan a seekable tar, returning how many of its bytes are already-compressed
-/// payload.
+/// Scan a seekable tar of `blob_size` bytes and decide whether it is worth
+/// compressing.
 ///
 /// Header-only: each member's first [`PEEK_LEN`] bytes are read and the rest is
-/// seeked past, so cost scales with the member *count*, not the archive size.
-pub fn scan_tar<R: Read + Seek>(reader: R) -> anyhow::Result<Verdict> {
+/// seeked past, so cost scales with the member *count*, not the archive size —
+/// roughly 2µs per member.
+///
+/// **Stops as soon as the answer is settled.** Every byte that is not identified
+/// as compressed payload — a member that failed to match, one below
+/// [`MIN_MEMBER_BYTES`], and all the tar framing — is counted against the
+/// verdict, and once that total passes `100 - PRECOMPRESSED_PERCENT` of the blob
+/// the bar is unreachable and the walk gives up. This is an exact bound, not a
+/// heuristic: those bytes are definitively in the blob and definitively not
+/// known-compressed.
+///
+/// It matters because the pathological input for a per-member walk — an archive
+/// of tens of thousands of small files — is also one that can never be judged
+/// precompressed. Without the early exit that case pays the full walk to learn
+/// nothing (~6% on top of its compression); with it, the walk ends a few percent
+/// in. The cases that *do* pay off are unaffected: one big matching member
+/// settles the answer on the first iteration.
+pub fn scan_tar<R: Read + Seek>(reader: R, blob_size: u64) -> anyhow::Result<Verdict> {
     let mut archive = tar::Archive::new(reader);
     let entries = archive
         .entries_with_seek()
         .context("tar archive entries_with_seek")?;
+
+    // Bytes that cannot count toward the verdict. Seeded with the framing the
+    // archive must contain: the two 512-byte end-of-archive blocks, plus one
+    // header block per member as we go.
+    let mut rejected_bytes = 0u64;
+    let reject_budget = blob_size / 100 * (100 - PRECOMPRESSED_PERCENT);
 
     let mut incompressible_bytes = 0u64;
     // Bounded by SIGNATURES.len(); a Vec of pairs beats a map at this size.
@@ -162,26 +187,37 @@ pub fn scan_tar<R: Read + Seek>(reader: R) -> anyhow::Result<Verdict> {
     for entry in entries {
         let mut entry = entry.context("read tar entry header")?;
         let header = entry.header();
-        if !header.entry_type().is_file() {
-            continue;
-        }
         let size = header.size().context("read tar entry size")?;
-        if size < MIN_MEMBER_BYTES {
-            continue;
-        }
-        let mut head = [0u8; PEEK_LEN];
-        // Reading from the entry (rather than seeking by `raw_file_position`)
-        // keeps the read clamped to this member and lets the iterator do the
-        // seek to the next header itself.
-        let n = peek(&mut entry, &mut head).context("read tar entry head")?;
-        let Some(head) = head.get(..n) else {
-            continue;
+        // The member's own header block is framing, never payload.
+        rejected_bytes = rejected_bytes.saturating_add(BLOCK_BYTES);
+
+        let matched = if header.entry_type().is_file() && size >= MIN_MEMBER_BYTES {
+            let mut head = [0u8; PEEK_LEN];
+            // Reading from the entry (rather than seeking by
+            // `raw_file_position`) keeps the read clamped to this member and
+            // lets the iterator do the seek to the next header itself.
+            let n = peek(&mut entry, &mut head).context("read tar entry head")?;
+            head.get(..n).and_then(match_signature)
+        } else {
+            None
         };
-        if let Some(label) = match_signature(head) {
-            incompressible_bytes = incompressible_bytes.saturating_add(size);
-            match by_label.iter_mut().find(|(l, _)| *l == label) {
-                Some((_, bytes)) => *bytes = bytes.saturating_add(size),
-                None => by_label.push((label, size)),
+
+        match matched {
+            Some(label) => {
+                incompressible_bytes = incompressible_bytes.saturating_add(size);
+                match by_label.iter_mut().find(|(l, _)| *l == label) {
+                    Some((_, bytes)) => *bytes = bytes.saturating_add(size),
+                    None => by_label.push((label, size)),
+                }
+            }
+            None => {
+                rejected_bytes = rejected_bytes.saturating_add(size);
+                if rejected_bytes > reject_budget {
+                    // Unreachable bar: stop walking. `incompressible_bytes` is
+                    // left partial, which the `precompressed: false` verdict
+                    // already tells the caller.
+                    break;
+                }
             }
         }
     }
@@ -192,6 +228,9 @@ pub fn scan_tar<R: Read + Seek>(reader: R) -> anyhow::Result<Verdict> {
         .map(|(label, _)| *label);
 
     Ok(Verdict {
+        precompressed: blob_size > 0
+            && incompressible_bytes.saturating_mul(100)
+                >= blob_size.saturating_mul(PRECOMPRESSED_PERCENT),
         incompressible_bytes,
         dominant,
     })
@@ -226,7 +265,7 @@ mod tests {
     }
 
     fn scan(bytes: &[u8]) -> Verdict {
-        scan_tar(Cursor::new(bytes.to_vec())).expect("scan")
+        scan_tar(Cursor::new(bytes.to_vec()), bytes.len() as u64).expect("scan")
     }
 
     #[test]
@@ -238,7 +277,7 @@ mod tests {
         let v = scan(&tar);
         assert_eq!(v.incompressible_bytes, 0);
         assert_eq!(v.dominant, None);
-        assert!(!v.is_precompressed(tar.len() as u64));
+        assert!(!v.precompressed);
     }
 
     #[test]
@@ -247,7 +286,7 @@ mod tests {
         let v = scan(&tar);
         assert_eq!(v.incompressible_bytes, 512 * 1024);
         assert_eq!(v.dominant, Some("gzip"));
-        assert!(v.is_precompressed(tar.len() as u64));
+        assert!(v.precompressed);
     }
 
     /// The `docker save` layout: small JSON first, layer blobs after. A scan
@@ -263,7 +302,7 @@ mod tests {
         let v = scan(&tar);
         assert_eq!(v.incompressible_bytes, 4 * 1024 * 1024);
         assert_eq!(v.dominant, Some("gzip"));
-        assert!(v.is_precompressed(tar.len() as u64));
+        assert!(v.precompressed);
     }
 
     /// The converse: a couple of images inside an otherwise text artifact must
@@ -277,7 +316,7 @@ mod tests {
         let v = scan(&tar);
         assert_eq!(v.incompressible_bytes, 64 * 1024);
         assert_eq!(v.dominant, Some("png"));
-        assert!(!v.is_precompressed(tar.len() as u64));
+        assert!(!v.precompressed);
     }
 
     /// Framing counts against the verdict: measuring against the sum of member
@@ -298,7 +337,7 @@ mod tests {
         tar.resize(tar.len() * 3, 0);
         let v = scan(&tar);
         assert_eq!(v.incompressible_bytes, 64 * 8 * 1024);
-        assert!(!v.is_precompressed(tar.len() as u64));
+        assert!(!v.precompressed);
     }
 
     #[test]
@@ -348,7 +387,74 @@ mod tests {
         let tar = tar_of(&[("bin", elf), ("dylib", macho), ("mod.wasm", wasm)]);
         let v = scan(&tar);
         assert_eq!(v.incompressible_bytes, 0);
-        assert!(!v.is_precompressed(tar.len() as u64));
+        assert!(!v.precompressed);
+    }
+
+    /// Counts `read` calls so a test can see how far the walk got.
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for CountingReader {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// The cost guard. An archive of many small members can never clear the bar,
+    /// and walking all of it would be pure loss — the scan must give up once
+    /// enough rejected bytes have accumulated, not walk to the end.
+    #[test]
+    fn the_scan_gives_up_once_the_bar_is_unreachable() {
+        let members: Vec<(String, Vec<u8>)> = (0..2000)
+            .map(|i| (format!("f{i}.txt"), vec![b'x'; 32 * 1024]))
+            .collect();
+        let refs: Vec<(&str, Vec<u8>)> = members
+            .iter()
+            .map(|(p, d)| (p.as_str(), d.clone()))
+            .collect();
+        let tar = tar_of(&refs);
+
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let v = scan_tar(
+            CountingReader {
+                inner: Cursor::new(tar.clone()),
+                reads: std::rc::Rc::clone(&reads),
+            },
+            tar.len() as u64,
+        )
+        .expect("scan");
+
+        assert!(!v.precompressed);
+        // ~10% of the blob is all it takes to settle this; the walk must not
+        // have touched anything close to all 2000 members.
+        assert!(
+            reads.get() < 2000 / 4,
+            "scan read {} times for a 2000-member archive; the early exit is not firing",
+            reads.get()
+        );
+    }
+
+    /// The converse: the early exit must not fire on the case it exists to
+    /// serve. One big matching member settles the answer immediately.
+    #[test]
+    fn a_precompressed_archive_is_still_recognized_with_the_early_exit() {
+        let tar = tar_of(&[
+            ("layer0.tar.gz", blob(b"\x1f\x8b", 4 * 1024 * 1024)),
+            ("small.txt", vec![b'x'; 8 * 1024]),
+            ("layer1.tar.gz", blob(b"\x1f\x8b", 4 * 1024 * 1024)),
+        ]);
+        let v = scan(&tar);
+        assert!(v.precompressed);
+        assert_eq!(v.incompressible_bytes, 8 * 1024 * 1024);
     }
 
     #[test]
@@ -356,7 +462,11 @@ mod tests {
         let tar = tar_of(&[]);
         let v = scan(&tar);
         assert_eq!(v.incompressible_bytes, 0);
-        assert!(!v.is_precompressed(tar.len() as u64));
-        assert!(!v.is_precompressed(0));
+        assert!(!v.precompressed);
+        assert!(
+            !scan_tar(Cursor::new(tar_of(&[])), 0)
+                .expect("scan")
+                .precompressed
+        );
     }
 }
