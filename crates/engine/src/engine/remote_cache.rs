@@ -22,9 +22,13 @@
 //! **Separate manifest.** The remote uses its own [`RemoteManifest`], distinct
 //! from the local [`Manifest`], so the two layers can store artifacts
 //! differently. Each remote artifact records its `encoding` (`Gzip` or `None`):
-//! artifacts worth compressing are gzipped, small ones are stored verbatim (see
-//! [`compression_for`]). The engine converts remote↔local on upload/download;
-//! the local manifest always describes decoded bytes.
+//! artifacts worth compressing are gzipped, and ones that are not — too small
+//! for gzip's overhead to pay off, or already-compressed payload like an OCI
+//! image layer — are stored verbatim (see [`compression_for`] and
+//! [`scan_precompressed`]). Because the encoding is recorded per artifact, that
+//! policy can change without invalidating a single existing entry. The engine
+//! converts remote↔local on upload/download; the local manifest always
+//! describes decoded bytes.
 //!
 //! **Streaming.** No blob is ever held whole in memory. Each blob moves through a
 //! temp file: on upload the engine encodes the local blob into a temp file
@@ -58,8 +62,8 @@
 
 use crate::engine::Engine;
 use crate::engine::local_cache::{
-    MANIFEST_V1, Manifest, ManifestArtifact, ManifestArtifactContentType, ManifestArtifactEncoding,
-    ManifestArtifactType,
+    LocalCache, MANIFEST_V1, Manifest, ManifestArtifact, ManifestArtifactContentType,
+    ManifestArtifactEncoding, ManifestArtifactType,
 };
 use crate::engine::remote_cache_latency::{UNREACHABLE, load_order, store_order};
 use crate::engine::remote_cache_objstore::ObjStoreBackend;
@@ -69,6 +73,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use futures::future::join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use hcore::hartifactcontent::sniff;
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;
 use std::future::Future;
@@ -748,15 +753,84 @@ const REMOTE_MANIFEST_VERSION: &str = "1.0.0";
 /// can change without invalidating existing entries.
 const MIN_COMPRESS_BYTES: u64 = 1024;
 
+/// Below this size, a blob is gzipped without scanning its content first.
+///
+/// The scan ([`hartifactcontent::sniff`]) is cheap but not free, and what it
+/// saves scales with the blob: skipping compression of a 500 MB image saves
+/// seconds of CPU on the upload and again on every download, while getting a
+/// 200 KB blob wrong costs a millisecond nobody will measure. Gating on size
+/// keeps the scan off the path of the thousands of small artifacts a build
+/// produces and spends it only where it pays.
+const MIN_SNIFF_BYTES: u64 = 1024 * 1024;
+
 /// Whether an artifact of `size` decoded bytes is worth compressing for the
 /// remote. Per-artifact so "some artifacts aren't worth compressing" is a policy
 /// knob, not a global on/off.
-fn compression_for(size: u64) -> ManifestArtifactEncoding {
-    if size >= MIN_COMPRESS_BYTES {
+///
+/// Two independent reasons not to compress, and `precompressed` is the one that
+/// scales: a blob whose payload is already compressed (an OCI image, a
+/// `.tar.gz`, a jar) gains nothing from a second pass and pays for it twice —
+/// once here, and again in every consumer's decode.
+fn compression_for(size: u64, precompressed: bool) -> ManifestArtifactEncoding {
+    if size >= MIN_COMPRESS_BYTES && !precompressed {
         ManifestArtifactEncoding::Gzip
     } else {
         ManifestArtifactEncoding::None
     }
+}
+
+/// Ask the content whether it is already compressed.
+///
+/// Best-effort in every direction — a backend that cannot seek, a content type
+/// with no scanner, or an archive that will not parse all answer "no", which is
+/// exactly the behavior that predates this scan. A blob is never *not* uploaded
+/// because the scan failed.
+///
+/// Runs on the caller's blocking thread (it is called from inside `run_codec`),
+/// never on a runtime worker: it does synchronous seeks and reads.
+fn scan_precompressed(
+    local_cache: &Arc<dyn LocalCache>,
+    addr: &Addr,
+    hashin: &str,
+    name: &str,
+    size: u64,
+    content_type: &ManifestArtifactContentType,
+) -> bool {
+    if size < MIN_SNIFF_BYTES {
+        return false;
+    }
+    // Only tar has a scanner. Cpio artifacts fall through to the size policy.
+    if !matches!(content_type, ManifestArtifactContentType::Tar) {
+        return false;
+    }
+    let reader = match local_cache.seekable_reader(addr, hashin, name) {
+        Ok(Some(r)) => r,
+        // A backend with no O(1) pread would have to stream the whole blob to
+        // answer, which costs more than the compression the answer would save.
+        Ok(None) => return false,
+        Err(e) => {
+            debug!(error = ?e, blob = name, "content scan: no seekable reader; assuming compressible");
+            return false;
+        }
+    };
+    let verdict = match sniff::scan_tar(reader) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(error = ?e, blob = name, "content scan failed; assuming compressible");
+            return false;
+        }
+    };
+    let precompressed = verdict.is_precompressed(size);
+    if precompressed {
+        debug!(
+            blob = name,
+            format = verdict.dominant.unwrap_or("unknown"),
+            incompressible_bytes = verdict.incompressible_bytes,
+            size,
+            "storing blob verbatim: payload is already compressed"
+        );
+    }
+    precompressed
 }
 
 /// A revision *located* on one remote cache — the decision half of a remote hit.
@@ -1700,14 +1774,27 @@ impl Engine {
                     hashin.to_string(),
                     tmp_dir.to_path_buf(),
                 );
-                let (name, size) = (a.name.clone(), a.size);
+                let (name, size, content_type) = (a.name.clone(), a.size, a.content_type.clone());
                 async move {
                     run_codec("upload encode", move || {
                         use std::io::Read;
+                        // Before opening the streaming reader: the scan wants a
+                        // seekable handle of its own, and deciding first keeps
+                        // the two reads from interleaving on one cursor.
+                        let encoding = compression_for(
+                            size,
+                            scan_precompressed(
+                                &local_cache,
+                                &addr,
+                                &hashin,
+                                &name,
+                                size,
+                                &content_type,
+                            ),
+                        );
                         let sized = local_cache
                             .reader(&addr, &hashin, &name)
                             .with_context(|| format!("open local blob {name}"))?;
-                        let encoding = compression_for(size);
                         // Guarded from the moment the path exists: this closure
                         // runs to completion on the blocking pool even when the
                         // awaiting future is long gone, and the `TempBlob` it
@@ -1976,6 +2063,7 @@ fn local_manifest_from_remote(remote: &RemoteManifest, hashin: &str) -> Manifest
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::local_cache::{EntryWriter, Existence, SizedReader};
     use hconfig::DEFAULT_CACHE_CONCURRENCY;
 
     fn def(name: &str, uri: &str, read: bool, write: bool) -> RemoteCacheDef {
@@ -3430,15 +3518,162 @@ mod tests {
 
     #[test]
     fn compression_for_respects_threshold() {
-        assert_eq!(compression_for(0), ManifestArtifactEncoding::None);
+        assert_eq!(compression_for(0, false), ManifestArtifactEncoding::None);
         assert_eq!(
-            compression_for(MIN_COMPRESS_BYTES - 1),
+            compression_for(MIN_COMPRESS_BYTES - 1, false),
             ManifestArtifactEncoding::None
         );
         assert_eq!(
-            compression_for(MIN_COMPRESS_BYTES),
+            compression_for(MIN_COMPRESS_BYTES, false),
             ManifestArtifactEncoding::Gzip
         );
+    }
+
+    /// The content verdict overrides the size policy in one direction only: it
+    /// can stop a big blob being compressed, never force a small one to be.
+    #[test]
+    fn compression_for_skips_precompressed_content() {
+        assert_eq!(
+            compression_for(MIN_COMPRESS_BYTES, true),
+            ManifestArtifactEncoding::None
+        );
+        assert_eq!(
+            compression_for(100 * 1024 * 1024, true),
+            ManifestArtifactEncoding::None
+        );
+    }
+
+    const SCAN_BLOB: &str = "out_x.tar";
+
+    /// A tar whose single member opens with `magic` and runs to `payload` bytes
+    /// — the shape of a cached OCI layer (one big blob, negligible framing).
+    fn tar_of_one(magic: &[u8], payload: usize) -> Vec<u8> {
+        let mut data = magic.to_vec();
+        data.resize(payload, 0xA5);
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "member.bin", data.as_slice())
+            .expect("append");
+        builder.into_inner().expect("tar")
+    }
+
+    /// Minimal single-blob `LocalCache`. `seekable` is the axis under test:
+    /// backends with O(1) pread (on-disk, sqlite) can be scanned, the rest fall
+    /// back to the size policy.
+    struct OneBlobCache {
+        bytes: Vec<u8>,
+        seekable: bool,
+    }
+
+    impl LocalCache for OneBlobCache {
+        fn reader(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<SizedReader> {
+            Ok(SizedReader {
+                size: self.bytes.len() as u64,
+                reader: Box::new(std::io::Cursor::new(self.bytes.clone())),
+                bytes: None,
+            })
+        }
+        fn writer(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<Box<dyn EntryWriter>> {
+            anyhow::bail!("OneBlobCache is read-only")
+        }
+        fn exists(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn existence(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<Existence> {
+            Ok(Existence::Committed(true))
+        }
+        fn exists_committed(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn delete(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn seekable_reader(
+            &self,
+            _a: &Addr,
+            _h: &str,
+            _n: &str,
+        ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>> {
+            if !self.seekable {
+                return Ok(None);
+            }
+            Ok(Some(Box::new(std::io::Cursor::new(self.bytes.clone()))))
+        }
+    }
+
+    /// `(cache, blob_size)` for a tar of one `magic`-prefixed member.
+    fn scan_fixture(magic: &[u8], payload: usize, seekable: bool) -> (Arc<dyn LocalCache>, u64) {
+        let bytes = tar_of_one(magic, payload);
+        let size = bytes.len() as u64;
+        (Arc::new(OneBlobCache { bytes, seekable }), size)
+    }
+
+    fn scan(cache: &Arc<dyn LocalCache>, size: u64, ct: ManifestArtifactContentType) -> bool {
+        scan_precompressed(cache, &addr(), "h1", SCAN_BLOB, size, &ct)
+    }
+
+    /// The case this exists for: a big blob whose payload is already gzipped is
+    /// stored verbatim rather than gzipped a second time.
+    #[test]
+    fn a_large_gzip_payload_is_recognized_as_precompressed() {
+        let (cache, size) = scan_fixture(b"\x1f\x8b", 4 * 1024 * 1024, true);
+        assert!(scan(&cache, size, ManifestArtifactContentType::Tar));
+        assert_eq!(
+            compression_for(size, scan(&cache, size, ManifestArtifactContentType::Tar)),
+            ManifestArtifactEncoding::None
+        );
+    }
+
+    /// The common case must be untouched: an ordinary large output still gzips.
+    #[test]
+    fn a_large_plain_payload_still_compresses() {
+        let (cache, size) = scan_fixture(b"\x7fELF", 4 * 1024 * 1024, true);
+        assert!(!scan(&cache, size, ManifestArtifactContentType::Tar));
+        assert_eq!(compression_for(size, false), ManifestArtifactEncoding::Gzip);
+    }
+
+    /// The scan is gated on size, so a small blob is never scanned even when it
+    /// is entirely already-compressed payload — the gzip is cheaper than the
+    /// answer. Guards the gate itself: dropping it would put a tar walk on the
+    /// path of every artifact a build produces.
+    #[test]
+    fn small_blobs_are_not_scanned() {
+        let (cache, size) = scan_fixture(b"\x1f\x8b", 64 * 1024, true);
+        assert!(size < MIN_SNIFF_BYTES, "fixture must be under the gate");
+        assert!(!scan(&cache, size, ManifestArtifactContentType::Tar));
+    }
+
+    /// A backend with no `seekable_reader` (the trait default) degrades to the
+    /// size policy rather than streaming the whole blob to decide — answering
+    /// would cost more than the compression it would save.
+    #[test]
+    fn a_non_seekable_backend_degrades_to_the_size_policy() {
+        let (cache, size) = scan_fixture(b"\x1f\x8b", 4 * 1024 * 1024, false);
+        assert!(!scan(&cache, size, ManifestArtifactContentType::Tar));
+    }
+
+    /// Cpio has no scanner; it must not be handed to the tar walker.
+    #[test]
+    fn cpio_artifacts_are_not_scanned() {
+        let (cache, size) = scan_fixture(b"\x1f\x8b", 4 * 1024 * 1024, true);
+        assert!(!scan(&cache, size, ManifestArtifactContentType::Cpio));
+    }
+
+    /// A blob that is not a tar at all (truncated, corrupt) must fall back to
+    /// the size policy, not fail the upload.
+    #[test]
+    fn an_unparseable_blob_falls_back_to_the_size_policy() {
+        let bytes = vec![0x7f; 4 * 1024 * 1024];
+        let size = bytes.len() as u64;
+        let cache: Arc<dyn LocalCache> = Arc::new(OneBlobCache {
+            bytes,
+            seekable: true,
+        });
+        assert!(!scan(&cache, size, ManifestArtifactContentType::Tar));
     }
 
     /// Backend whose blob writes block on a shared barrier, so the upload only
