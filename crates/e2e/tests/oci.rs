@@ -259,6 +259,15 @@ target(
         listing.contains("./cmd/server/server"),
         "the cross-package dep must be inside the build context, got: {listing}"
     );
+    // …and nothing heph needed for itself is. The builder-platform probe is a
+    // dep like any other, so without an unpack root it would materialize in the
+    // context and a `COPY . /app` would ship it inside the user's image — and
+    // setting `platforms` explicitly would then change the image's contents with
+    // nothing to point at.
+    assert!(
+        !listing.contains("platform.txt"),
+        "heph's own plumbing must stay out of the build context, got: {listing}"
+    );
 
     // …and the Dockerfile can find it without hardcoding the layout.
     let build = fake

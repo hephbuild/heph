@@ -451,6 +451,26 @@ const DOCKERFILE_ORIGIN: &str = "dockerfile";
 /// is empty.
 const PLATFORM_ORIGIN: &str = "builder_platform";
 
+/// Unpack root for every dep that must **not** be part of the build context.
+///
+/// A dep with no `unpack_root` annotation materializes at the sandbox workspace
+/// dir — which is exactly what `run` hands buildx as the build context. That is
+/// right for `context` groups, whose whole purpose is to be in it, and wrong for
+/// everything else: heph's own plumbing would ship inside the user's image on a
+/// `COPY . /app`, and a `bases` layout (hundreds of MB) would be transferred to
+/// BuildKit as context bytes *on top of* being read through `--build-context`.
+///
+/// Worse than either, silently: whether the probe file exists at all depends on
+/// whether `platforms` is set, so adding `platforms = [...]` would change the
+/// built image's contents with no error and nothing to point at.
+///
+/// These land in `<sandbox>/exec_<root>` instead. Both consumers read absolute
+/// paths out of the dep's list file ([`dep_single_file`],
+/// [`resolve_named_contexts`]), so where they land is immaterial to them.
+fn out_of_context_root(origin: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([("unpack_root".to_string(), format!("oci_{origin}"))])
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciImageDef {
     dockerfile: DockerfileSource,
@@ -927,7 +947,7 @@ impl ManagedDriver for Driver {
                     .with_context(|| format!("parse builder-platform probe addr {probe:?}"))?,
                 mode: InputMode::Standard,
                 origin_id: PLATFORM_ORIGIN.to_string(),
-                annotations: BTreeMap::new(),
+                annotations: out_of_context_root(PLATFORM_ORIGIN),
                 hashed: true,
                 runtime: true,
             });
@@ -971,7 +991,7 @@ impl ManagedDriver for Driver {
                 r#ref: TargetAddr::parse(image, &pkg)?,
                 mode: InputMode::Standard,
                 origin_id: format!("base|{name}"),
-                annotations: BTreeMap::new(),
+                annotations: out_of_context_root(&format!("base_{}", arg_key_segment(name))),
                 hashed: true,
                 runtime: true,
             });
@@ -2102,6 +2122,40 @@ exit 0
         assert_eq!(probe.r#ref.r#ref.format(), "//@heph/oci:platform");
         assert!(probe.hashed, "the probe must feed the key");
         assert!(probe.runtime, "run() reads the platform out of it");
+    }
+
+    /// Deps that are not `context` must land outside the build context. Without
+    /// an unpack root they materialize at the sandbox ws dir, which is what
+    /// buildx is handed as the context — so heph's probe file and a base layout
+    /// (hundreds of MB) would both ride into the user's build.
+    #[tokio::test]
+    async fn non_context_deps_stay_out_of_the_build_context() {
+        let sbx = Sandbox::new("app");
+        let resp = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                (
+                    "bases",
+                    Value::Map(HashMap::from([(
+                        "base".to_string(),
+                        Value::String(":alpine".to_string()),
+                    )])),
+                ),
+            ]),
+        )
+        .await;
+
+        for input in &resp.target_def.inputs {
+            let in_context = input.origin_id.starts_with("context|");
+            let annotated = input.annotations.contains_key("unpack_root");
+            assert_eq!(
+                annotated, !in_context,
+                "{}: a context dep belongs in the context and nothing else does",
+                input.origin_id
+            );
+        }
     }
 
     /// A named `builder` gets its own probe: two builders answer with two
