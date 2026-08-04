@@ -449,6 +449,18 @@ pub fn find_nearest_test_runner_config(
     find_nearest_file(workspace_root, pkg_dir, candidates)
 }
 
+/// Same ancestor walk, generalized once more to `js_lint`'s linter config
+/// files (e.g. `[".oxlintrc.json"]` for oxlint, the flat/legacy `eslint.
+/// config.*`/`.eslintrc.*` candidate list for eslint) — see `driver_lint.rs`
+/// module docs.
+pub fn find_nearest_lint_config(
+    workspace_root: &Path,
+    pkg_dir: &Path,
+    candidates: &[&str],
+) -> Option<PathBuf> {
+    find_nearest_file(workspace_root, pkg_dir, candidates)
+}
+
 /// Walk up from `pkg_dir` (inclusive) to `workspace_root` looking for the
 /// nearest `package.json` whose own `"jest"` field is present — jest's other
 /// documented config location, alongside the dedicated `jest.config.*`
@@ -464,13 +476,42 @@ pub fn find_nearest_jest_package_json_config(
     workspace_root: &Path,
     pkg_dir: &Path,
 ) -> Option<PathBuf> {
+    find_nearest_package_json_field_config(workspace_root, pkg_dir, "jest")
+}
+
+/// **Deliberately no `js_lint` analog of this fallback for oxlint/eslint**:
+/// an earlier version of this module also walked up for a `package.json`
+/// `"oxlint"`/`"eslintConfig"` field the same way, on the theory that it
+/// mirrored jest's own `package.json`-field config location above. It didn't
+/// — a feature-quality M5 review caught that neither tool actually reads a
+/// `package.json` this way when invoked with `-c <that package.json>`:
+/// oxlint's documented auto-discovery is exactly `.oxlintrc.json` /
+/// `.oxlintrc.jsonc` / `oxlint.config.{ts,mts}`, nothing about a
+/// `package.json` field; eslint's `--config`/`-c` flag only accepts a real
+/// `eslint.config.*`/`.eslintrc.*` file; ESLint's real legacy
+/// `"eslintConfig"` field is picked up only by its own automatic cascading
+/// discovery when `--config` is *not* passed, which `js_lint`'s `-c`-always
+/// invocation shape (`driver_lint.rs::run`) never leaves room for. Passing
+/// `-c <package.json>` handed either tool a file shape it doesn't parse as
+/// config, so the fallback was removed rather than kept and made to somehow
+/// work — jest's own `package.json`-field fallback below is unaffected
+/// (jest's test-runner CLI has no equivalent single-`-c`-flag constraint).
+///
+/// Shared ancestor walk behind [`find_nearest_jest_package_json_config`]:
+/// walk up from `pkg_dir` (inclusive) to `workspace_root` for the nearest
+/// `package.json` that carries a top-level `field` key.
+fn find_nearest_package_json_field_config(
+    workspace_root: &Path,
+    pkg_dir: &Path,
+    field: &str,
+) -> Option<PathBuf> {
     let mut dir = pkg_dir;
     loop {
         let candidate = dir.join(PACKAGE_JSON);
         if candidate.is_file()
             && let Ok(text) = std::fs::read_to_string(&candidate)
             && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
-            && value.get("jest").is_some()
+            && value.get(field).is_some()
         {
             return Some(candidate);
         }
@@ -713,6 +754,581 @@ fn enqueue_referenced_config_file(
         if let Ok(next_content) = std::fs::read_to_string(&resolved) {
             queue.push_back((resolved, next_content, depth + 1));
         }
+    }
+}
+
+/// Object property key naming `@typescript-eslint/parser`'s `project`
+/// option — present (under `parserOptions` in a legacy `.eslintrc.*`, or
+/// nested under `languageOptions.parserOptions` in a modern flat config)
+/// exactly when an eslint config turns on type-aware ("type-checked") rules.
+/// Scanned the same broadly-over-precisely way [`RUNNER_CONFIG_FILE_KEYS`] is
+/// (see that constant's doc for the rationale): a same-named key elsewhere in
+/// the file costs one extra declared/hashed Input (the tsconfig this function
+/// doesn't actually need), while missing a real one would silently drop the
+/// tsconfig extends chain from `js_lint`'s cache key for an eslint config
+/// that *does* type-check — see `driver_lint.rs` module docs for why this
+/// gap matters (an M3/M4-review-class mistake, called out again for this
+/// driver in the M5 task).
+const ESLINT_PROJECT_KEY: &str = "project";
+
+/// One `parserOptions.project` value found by [`detect_eslint_type_aware`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EslintProjectOption {
+    /// `project: true` (or any value that isn't a string/array of strings,
+    /// e.g. a computed expression this static scan can't evaluate) —
+    /// `@typescript-eslint/parser`'s own documented "figure out the nearest
+    /// tsconfig yourself" shorthand. Carries no explicit path; the caller
+    /// falls back to [`find_nearest_tsconfig`].
+    AutoDetect,
+    /// One or more explicit tsconfig paths (relative to the config file's own
+    /// directory) — a bare string, or an array of strings
+    /// (`typescript-eslint` accepts either).
+    Paths(Vec<String>),
+}
+
+/// Whether `config_path`'s content configures eslint type-aware rules (one or
+/// more `parserOptions.project` entries — see [`ESLINT_PROJECT_KEY`]'s doc),
+/// and if so, which tsconfig(s) each names. An empty `Vec` means no `project`
+/// key was found anywhere in the file — not type-aware, so no
+/// tsconfig/extends-chain Input is needed for this `js_lint` target.
+///
+/// **Every** occurrence in the file is collected, not just the first: a flat
+/// config commonly has more than one — e.g. separate override blocks for
+/// `src/**` and `test/**`, each with its own `parserOptions.project` naming a
+/// different tsconfig (`tsconfig.json` vs `tsconfig.test.json`). Stopping at
+/// the first match (an earlier version of this function did) silently
+/// dropped every tsconfig named by a later entry from the declared Input
+/// set/cache key — a code-quality M5 review finding, the exact
+/// declared-Input-vs-real-tool-read mismatch class this crate's M3/M4
+/// reviews already caught twice for other drivers.
+///
+/// JSON/YAML (`.eslintrc.json`/`.yml`/`.yaml`, or the extensionless
+/// `.eslintrc`, itself JSON per eslint's own convention) is parsed as data
+/// and walked recursively for every `"project"` key at any depth. A JS/TS/mjs/cjs
+/// config (modern flat `eslint.config.*`, or a legacy `.eslintrc.js`) is
+/// parsed with `oxc_parser` and scanned for every object property named
+/// `project`, mirroring [`RunnerConfigRefVisitor`]'s shape. Either parse
+/// failing yields `Ok(vec![])` — the leaf config's own raw bytes are already a
+/// declared/hashed Input regardless (`lint_deps_config`), so a parse failure
+/// here only means a real type-aware config goes undetected, not that the
+/// whole `js_lint` target becomes unbuildable.
+pub fn detect_eslint_type_aware(
+    config_path: &Path,
+    content: &str,
+) -> anyhow::Result<Vec<EslintProjectOption>> {
+    let ext = config_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "json" | "yml" | "yaml" | "" => {
+            let value: serde_json::Value = if ext == "yml" || ext == "yaml" {
+                match serde_yaml::from_str(content) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(Vec::new()),
+                }
+            } else {
+                match serde_json::from_str(content) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(Vec::new()),
+                }
+            };
+            let mut found = Vec::new();
+            collect_project_keys(&value, &mut found);
+            Ok(found)
+        }
+        _ => {
+            let Ok(source_type) = SourceType::from_path(config_path) else {
+                return Ok(Vec::new());
+            };
+            let allocator = Allocator::default();
+            let ret = Parser::new(&allocator, content, source_type).parse();
+            if ret.panicked {
+                return Ok(Vec::new());
+            }
+            let mut visitor = EslintProjectVisitor::default();
+            visitor.visit_program(&ret.program);
+            Ok(visitor.found)
+        }
+    }
+}
+
+/// Recursively collect every `"project"` key found in a parsed JSON/YAML
+/// config value, at any depth — see [`detect_eslint_type_aware`]'s doc for
+/// why this is intentionally not scoped to exactly `parserOptions.project`,
+/// and for why every occurrence (not just the first) is collected.
+fn collect_project_keys(value: &serde_json::Value, out: &mut Vec<EslintProjectOption>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(v) = map.get(ESLINT_PROJECT_KEY) {
+                out.push(json_value_to_project_option(v));
+            }
+            for v in map.values() {
+                collect_project_keys(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_project_keys(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_value_to_project_option(v: &serde_json::Value) -> EslintProjectOption {
+    match v {
+        serde_json::Value::String(s) => EslintProjectOption::Paths(vec![s.clone()]),
+        serde_json::Value::Array(items) => {
+            let paths: Vec<String> = items
+                .iter()
+                .filter_map(|i| i.as_str().map(str::to_string))
+                .collect();
+            if paths.is_empty() {
+                EslintProjectOption::AutoDetect
+            } else {
+                EslintProjectOption::Paths(paths)
+            }
+        }
+        _ => EslintProjectOption::AutoDetect,
+    }
+}
+
+/// Scans a parsed JS/TS eslint config's AST for every object property named
+/// [`ESLINT_PROJECT_KEY`] — the flat-config/legacy-JS-config counterpart to
+/// [`collect_project_keys`]'s JSON/YAML walk. Mirrors [`RunnerConfigRefVisitor`]'s
+/// shape (see that type's doc). Collects **every** occurrence, not just the
+/// first — see [`detect_eslint_type_aware`]'s doc for why a multi-entry flat
+/// config (separate `parserOptions.project` per override block) needs all of
+/// them.
+#[derive(Default)]
+struct EslintProjectVisitor {
+    found: Vec<EslintProjectOption>,
+}
+
+impl EslintProjectVisitor {
+    fn note(&mut self, value: &Expression<'_>) {
+        let option = match value {
+            Expression::StringLiteral(s) => {
+                EslintProjectOption::Paths(vec![s.value.as_str().to_string()])
+            }
+            Expression::ArrayExpression(arr) => {
+                let paths: Vec<String> = arr
+                    .elements
+                    .iter()
+                    .filter_map(|el| match el {
+                        ArrayExpressionElement::StringLiteral(s) => {
+                            Some(s.value.as_str().to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if paths.is_empty() {
+                    EslintProjectOption::AutoDetect
+                } else {
+                    EslintProjectOption::Paths(paths)
+                }
+            }
+            _ => EslintProjectOption::AutoDetect,
+        };
+        self.found.push(option);
+    }
+}
+
+impl<'a> Visit<'a> for EslintProjectVisitor {
+    fn visit_object_property(&mut self, it: &oxc_ast::ast::ObjectProperty<'a>) {
+        let key_name = match &it.key {
+            PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
+            PropertyKey::StringLiteral(s) => Some(s.value.as_str()),
+            _ => None,
+        };
+        if key_name == Some(ESLINT_PROJECT_KEY) {
+            self.note(&it.value);
+        }
+        walk::walk_object_property(self, it);
+    }
+}
+
+/// Which `package.json` naming convention applies to a legacy eslint config's
+/// `extends`/`plugins` string entry — see [`eslint_module_name`]'s doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EslintRefKind {
+    Extends,
+    Plugin,
+}
+
+const ESLINT_REF_KEYS: &[&str] = &["extends", "plugins"];
+
+/// Extract every npm package name a dedicated eslint config file's
+/// `extends`/`plugins` (legacy `.eslintrc.*`) or top-level bare
+/// `import`/`require` (modern flat `eslint.config.*`) references. See
+/// `driver_lint.rs`'s "Inputs / cache key" section for why these must be
+/// resolved via the lockfile (`deps::resolve_one_dependency`), never treated
+/// as raw filesystem paths — the exact M3/M4-review-class mistake named
+/// again for this driver.
+///
+/// The two config shapes are **not** interchangeable, and are dispatched by
+/// `config_path`'s own basename, not merely its extension (both can be a
+/// plain `.js` file): legacy config's `extends`/`plugins` are string/
+/// array-of-string values naming a package by eslint's own documented
+/// shorthand convention (`"airbnb"` → `eslint-config-airbnb`, `"react"` in
+/// `plugins` → `eslint-plugin-react`) — see [`eslint_module_name`], applied
+/// here. Modern flat config has no `extends` key at all (a shared config is
+/// spread into the exported array, e.g. `...tseslint.configs.recommended`)
+/// and its own `plugins` is an *object* mapping a plugin key to an
+/// already-`import`-ed module, not a string array — so for a flat config
+/// (`eslint.config.*`, detected by filename), this instead collects the
+/// file's own bare `import`/`require` specifiers verbatim: no naming-guess
+/// needed, since in that shape the specifier already *is* the real package
+/// name (`import reactHooks from 'eslint-plugin-react-hooks'`).
+///
+/// A relative-path `extends`/`plugins` entry (`"extends":
+/// "./base.eslintrc.json"`) names a local sibling config file, not an npm
+/// package — filtered out of this function's own result (below) and instead
+/// resolved as a declared first-party Input by
+/// [`resolve_eslint_config_referenced_files`], which also follows a modern
+/// flat config's own relative `import`/`require` of a shared base config.
+/// See that function's doc — this is `lint_deps_config`'s actual mechanism
+/// for both shapes; a hermeticity M5 review caught this doc previously
+/// claiming that mechanism already ran over the leaf config when it did not.
+pub fn extract_eslint_module_refs(
+    config_path: &Path,
+    content: &str,
+) -> anyhow::Result<Vec<String>> {
+    let basename = config_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if basename.starts_with("eslint.config") {
+        return extract_flat_config_bare_imports(config_path, content);
+    }
+
+    let ext = config_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let raw_values: Vec<(&'static str, String)> = match ext {
+        "json" | "yml" | "yaml" | "" => {
+            let value: serde_json::Value = if ext == "yml" || ext == "yaml" {
+                match serde_yaml::from_str(content) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(Vec::new()),
+                }
+            } else {
+                match serde_json::from_str(content) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(Vec::new()),
+                }
+            };
+            let mut out = Vec::new();
+            collect_eslint_ref_values(&value, &mut out);
+            out
+        }
+        _ => {
+            let Ok(source_type) = SourceType::from_path(config_path) else {
+                return Ok(Vec::new());
+            };
+            let allocator = Allocator::default();
+            let ret = Parser::new(&allocator, content, source_type).parse();
+            if ret.panicked {
+                return Ok(Vec::new());
+            }
+            let mut visitor = EslintRefVisitor::default();
+            visitor.visit_program(&ret.program);
+            visitor.values
+        }
+    };
+
+    Ok(raw_values
+        .into_iter()
+        .filter_map(|(key, raw)| {
+            if raw.starts_with('.') || Path::new(&raw).is_absolute() {
+                return None;
+            }
+            if raw == "eslint:recommended" || raw == "eslint:all" {
+                return None;
+            }
+            let kind = if key == "plugins" {
+                EslintRefKind::Plugin
+            } else {
+                EslintRefKind::Extends
+            };
+            Some(eslint_module_name(&raw, kind))
+        })
+        .collect())
+}
+
+/// Recursively resolve every additional first-party file an eslint config's
+/// own content references beyond its own leaf bytes — the file-based
+/// counterpart to [`extract_eslint_module_refs`]'s npm-package resolution.
+/// Two shapes, both followed:
+///
+/// - A modern flat config's own relative `import`/`require` of a shared base
+///   config (`import base from './eslint-base.js'`) — reuses
+///   [`resolve_runner_config_referenced_files`]'s generic relative-import
+///   walk (recursive: a base config's own further relative imports are
+///   followed too).
+/// - A legacy config's relative `extends`/`plugins` string value
+///   (`"extends": "./base.eslintrc.json"`) — names a local sibling file, not
+///   an npm package (that half is [`extract_eslint_module_refs`]'s job), and
+///   is followed here the same recursive way, bounded by `MAX_DEPTH` and a
+///   `seen` set against a cyclic/self-extending config.
+///
+/// This closes the M5 hermeticity gap named in this crate's review history:
+/// editing only a shared base config (relative `extends`, or a flat config's
+/// relative import) previously left `js_lint`'s declared Input set/cache key
+/// unchanged, serving a stale cached result even though a fresh run of the
+/// real linter would pick up the edit. See `lint_deps_config`'s doc for how
+/// the result is declared/hashed.
+pub fn resolve_eslint_config_referenced_files(
+    config_path: &Path,
+    config_content: &str,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    seen.insert(config_path.to_path_buf());
+
+    // Modern flat config's own relative `import`/`require` chain (recursive
+    // — `resolve_runner_config_referenced_files` already walks depth).
+    for f in resolve_runner_config_referenced_files(config_path, config_content)? {
+        if seen.insert(f.clone()) {
+            found.insert(f);
+        }
+    }
+
+    // Legacy config's relative `extends`/`plugins` string values, followed
+    // recursively (a base config can itself `extend` another).
+    const MAX_DEPTH: usize = 4;
+    let mut queue: VecDeque<(PathBuf, String, usize)> = VecDeque::new();
+    queue.push_back((config_path.to_path_buf(), config_content.to_string(), 0));
+    while let Some((path, content, depth)) = queue.pop_front() {
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        let dir = path.parent().unwrap_or(Path::new(""));
+        for raw in extract_eslint_relative_ref_values(&path, &content) {
+            let Some(resolved) = probe_first_party_path(&dir.join(&raw)) else {
+                continue;
+            };
+            if seen.insert(resolved.clone()) {
+                found.insert(resolved.clone());
+                if let Ok(next_content) = std::fs::read_to_string(&resolved) {
+                    queue.push_back((resolved, next_content, depth + 1));
+                }
+            }
+        }
+    }
+
+    Ok(found.into_iter().collect())
+}
+
+/// The legacy-config half of [`resolve_eslint_config_referenced_files`]:
+/// every raw `extends`/`plugins` value that looks like a relative filesystem
+/// path (starts with `.`), unfiltered otherwise — mirrors
+/// [`extract_eslint_module_refs`]'s own raw-value extraction (via the same
+/// [`collect_eslint_ref_values`]/[`EslintRefVisitor`]), just keeping the
+/// opposite half of that function's `raw.starts_with('.')` filter. Flat
+/// configs (`eslint.config.*`) have no `extends`/`plugins` string key at all
+/// (see `extract_eslint_module_refs`'s doc) — the relative-import chain
+/// [`resolve_runner_config_referenced_files`] already walks is that shape's
+/// equivalent, so this returns nothing for a flat config's own basename.
+fn extract_eslint_relative_ref_values(config_path: &Path, content: &str) -> Vec<String> {
+    let basename = config_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if basename.starts_with("eslint.config") {
+        return Vec::new();
+    }
+
+    let ext = config_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let raw_values: Vec<(&'static str, String)> = match ext {
+        "json" | "yml" | "yaml" | "" => {
+            let value: serde_json::Value = if ext == "yml" || ext == "yaml" {
+                match serde_yaml::from_str(content) {
+                    Ok(v) => v,
+                    Err(_) => return Vec::new(),
+                }
+            } else {
+                match serde_json::from_str(content) {
+                    Ok(v) => v,
+                    Err(_) => return Vec::new(),
+                }
+            };
+            let mut out = Vec::new();
+            collect_eslint_ref_values(&value, &mut out);
+            out
+        }
+        _ => {
+            let Ok(source_type) = SourceType::from_path(config_path) else {
+                return Vec::new();
+            };
+            let allocator = Allocator::default();
+            let ret = Parser::new(&allocator, content, source_type).parse();
+            if ret.panicked {
+                return Vec::new();
+            }
+            let mut visitor = EslintRefVisitor::default();
+            visitor.visit_program(&ret.program);
+            visitor.values
+        }
+    };
+
+    raw_values
+        .into_iter()
+        .filter_map(|(_key, raw)| raw.starts_with('.').then_some(raw))
+        .collect()
+}
+
+/// The flat-config half of [`extract_eslint_module_refs`]: every bare (not
+/// relative, not absolute, not a Node builtin) `import`/`require` specifier
+/// the config file's own top level names, verbatim — see that function's
+/// doc for why no naming-convention guess is needed here. Reuses
+/// [`bare_specifier_package_name`] (the same bare-specifier→package-name
+/// extraction the hermetic phantom-dependency check uses) so a subpath
+/// import (`import foo from 'eslint-plugin-foo/configs/recommended'`) is
+/// correctly attributed to the `eslint-plugin-foo` package, not its full
+/// subpath.
+fn extract_flat_config_bare_imports(
+    config_path: &Path,
+    content: &str,
+) -> anyhow::Result<Vec<String>> {
+    let Ok(parsed) = importparse::parse_file_imports(config_path, content) else {
+        // A parse failure here only means these references go undetected —
+        // see `extract_eslint_module_refs`'s doc for the same "declared
+        // leaf-config bytes are hashed regardless" reasoning
+        // `detect_eslint_type_aware` already documents.
+        return Ok(Vec::new());
+    };
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for site in parsed.sites {
+        if let Some(name) = bare_specifier_package_name(&site.specifier) {
+            names.insert(name);
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+fn collect_eslint_ref_values(value: &serde_json::Value, out: &mut Vec<(&'static str, String)>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ESLINT_REF_KEYS {
+                if let Some(v) = map.get(*key) {
+                    push_string_or_array(key, v, out);
+                }
+            }
+            for v in map.values() {
+                collect_eslint_ref_values(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_eslint_ref_values(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_string_or_array(
+    key: &'static str,
+    value: &serde_json::Value,
+    out: &mut Vec<(&'static str, String)>,
+) {
+    match value {
+        serde_json::Value::String(s) => out.push((key, s.clone())),
+        serde_json::Value::Array(items) => {
+            for i in items {
+                if let Some(s) = i.as_str() {
+                    out.push((key, s.to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scans a parsed JS/TS eslint config's AST for an object property named
+/// `"extends"` or `"plugins"` — the flat-config/legacy-JS-config counterpart
+/// to [`collect_eslint_ref_values`]'s JSON/YAML walk. Mirrors
+/// [`RunnerConfigRefVisitor`]'s/[`EslintProjectVisitor`]'s shape.
+#[derive(Default)]
+struct EslintRefVisitor {
+    values: Vec<(&'static str, String)>,
+}
+
+impl EslintRefVisitor {
+    fn push_value(&mut self, key: &'static str, value: &Expression<'_>) {
+        match value {
+            Expression::StringLiteral(s) => self.values.push((key, s.value.as_str().to_string())),
+            Expression::ArrayExpression(arr) => {
+                for el in &arr.elements {
+                    if let ArrayExpressionElement::StringLiteral(s) = el {
+                        self.values.push((key, s.value.as_str().to_string()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'a> Visit<'a> for EslintRefVisitor {
+    fn visit_object_property(&mut self, it: &oxc_ast::ast::ObjectProperty<'a>) {
+        let key_name = match &it.key {
+            PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
+            PropertyKey::StringLiteral(s) => Some(s.value.as_str()),
+            _ => None,
+        };
+        let key = match key_name {
+            Some("extends") => Some("extends"),
+            Some("plugins") => Some("plugins"),
+            _ => None,
+        };
+        if let Some(key) = key {
+            self.push_value(key, &it.value);
+        }
+        walk::walk_object_property(self, it);
+    }
+}
+
+/// Map a raw `extends`/`plugins` string (already filtered to "names an npm
+/// package" by [`extract_eslint_module_refs`]) to the actual npm package
+/// name, per eslint's own documented shorthand-naming convention (a
+/// `"plugin:react/recommended"` `extends` entry names the `plugins` package
+/// `react` refers to, resolved recursively as [`EslintRefKind::Plugin`]).
+///
+/// Best-effort, not exhaustive: eslint itself resolves a shorthand name via
+/// `require.resolve` against a handful of candidate names in order; this
+/// picks the single most common one rather than replicating that whole
+/// fallback chain. A package published under a genuinely unconventional name
+/// would not be found this way — `deps::resolve_one_dependency`'s own "no
+/// lockfile resolution" error then names the *guessed* package, not the
+/// original config string, so this is a disclosed rough edge, not a silent
+/// one.
+pub fn eslint_module_name(raw: &str, kind: EslintRefKind) -> String {
+    if let Some(plugin_part) = raw.strip_prefix("plugin:") {
+        let name = plugin_part.split('/').next().unwrap_or(plugin_part);
+        return eslint_module_name(name, EslintRefKind::Plugin);
+    }
+    let (scoped_infix, bare_prefix) = match kind {
+        EslintRefKind::Extends => ("eslint-config", "eslint-config-"),
+        EslintRefKind::Plugin => ("eslint-plugin", "eslint-plugin-"),
+    };
+    if let Some(rest) = raw.strip_prefix('@') {
+        return match rest.split_once('/') {
+            None => format!("@{rest}/{scoped_infix}"),
+            Some((_scope, name)) if name.starts_with(scoped_infix) => raw.to_string(),
+            Some((scope, name)) => format!("@{scope}/{scoped_infix}-{name}"),
+        };
+    }
+    if raw.starts_with(bare_prefix) {
+        raw.to_string()
+    } else {
+        format!("{bare_prefix}{raw}")
     }
 }
 
@@ -2482,5 +3098,298 @@ mod tests {
             closure.files,
             closure.external_files
         );
+    }
+
+    // ---- find_nearest_lint_config ----
+
+    #[test]
+    fn find_nearest_lint_config_finds_dot_oxlintrc_at_package_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(dir.path(), "packages/a/.oxlintrc.json", "{}");
+        let found = find_nearest_lint_config(
+            dir.path(),
+            &dir.path().join("packages/a"),
+            &[".oxlintrc.json"],
+        )
+        .expect("find config");
+        assert_eq!(found, dir.path().join("packages/a/.oxlintrc.json"));
+    }
+
+    #[test]
+    fn find_nearest_lint_config_walks_up_to_workspace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(dir.path(), ".oxlintrc.json", "{}");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        let found = find_nearest_lint_config(
+            dir.path(),
+            &dir.path().join("packages/a"),
+            &[".oxlintrc.json"],
+        )
+        .expect("find ancestor config");
+        assert_eq!(found, dir.path().join(".oxlintrc.json"));
+    }
+
+    // ---- detect_eslint_type_aware ----
+
+    #[test]
+    fn detect_eslint_type_aware_none_when_no_project_key() {
+        let result = detect_eslint_type_aware(
+            Path::new("eslint.config.js"),
+            "export default [{ rules: { semi: 'error' } }];",
+        )
+        .expect("scan config");
+        assert_eq!(result, Vec::new());
+    }
+
+    #[test]
+    fn detect_eslint_type_aware_flat_config_string_project() {
+        let content = r#"
+            export default [
+              {
+                languageOptions: {
+                  parserOptions: {
+                    project: './tsconfig.json',
+                  },
+                },
+              },
+            ];
+        "#;
+        let result =
+            detect_eslint_type_aware(Path::new("eslint.config.js"), content).expect("scan config");
+        assert_eq!(
+            result,
+            vec![EslintProjectOption::Paths(vec![
+                "./tsconfig.json".to_string()
+            ])]
+        );
+    }
+
+    #[test]
+    fn detect_eslint_type_aware_flat_config_boolean_project_is_auto_detect() {
+        let content = r#"
+            export default [
+              { languageOptions: { parserOptions: { project: true } } },
+            ];
+        "#;
+        let result =
+            detect_eslint_type_aware(Path::new("eslint.config.js"), content).expect("scan config");
+        assert_eq!(result, vec![EslintProjectOption::AutoDetect]);
+    }
+
+    #[test]
+    fn detect_eslint_type_aware_flat_config_array_of_projects() {
+        let content = r#"
+            export default [
+              {
+                languageOptions: {
+                  parserOptions: { project: ['./tsconfig.json', './tsconfig.test.json'] },
+                },
+              },
+            ];
+        "#;
+        let result =
+            detect_eslint_type_aware(Path::new("eslint.config.js"), content).expect("scan config");
+        assert_eq!(
+            result,
+            vec![EslintProjectOption::Paths(vec![
+                "./tsconfig.json".to_string(),
+                "./tsconfig.test.json".to_string()
+            ])]
+        );
+    }
+
+    /// **The specific code-quality M5 gap**: a multi-entry flat config
+    /// (separate override blocks, each with its own `parserOptions.project`)
+    /// must have every occurrence collected, not just the first.
+    #[test]
+    fn detect_eslint_type_aware_flat_config_multiple_entries_all_collected() {
+        let content = r#"
+            export default [
+              { files: ['src/**/*.ts'], languageOptions: { parserOptions: { project: './tsconfig.json' } } },
+              { files: ['test/**/*.ts'], languageOptions: { parserOptions: { project: './tsconfig.test.json' } } },
+            ];
+        "#;
+        let result =
+            detect_eslint_type_aware(Path::new("eslint.config.js"), content).expect("scan config");
+        assert_eq!(
+            result,
+            vec![
+                EslintProjectOption::Paths(vec!["./tsconfig.json".to_string()]),
+                EslintProjectOption::Paths(vec!["./tsconfig.test.json".to_string()]),
+            ],
+            "both override blocks' own `parserOptions.project` must be collected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn detect_eslint_type_aware_legacy_json_config() {
+        let content = r#"{
+            "parserOptions": { "project": "./tsconfig.json" },
+            "extends": ["eslint:recommended"]
+        }"#;
+        let result =
+            detect_eslint_type_aware(Path::new(".eslintrc.json"), content).expect("scan config");
+        assert_eq!(
+            result,
+            vec![EslintProjectOption::Paths(vec![
+                "./tsconfig.json".to_string()
+            ])]
+        );
+    }
+
+    #[test]
+    fn detect_eslint_type_aware_legacy_yaml_config() {
+        let content = "parserOptions:\n  project: ./tsconfig.json\n";
+        let result =
+            detect_eslint_type_aware(Path::new(".eslintrc.yaml"), content).expect("scan config");
+        assert_eq!(
+            result,
+            vec![EslintProjectOption::Paths(vec![
+                "./tsconfig.json".to_string()
+            ])]
+        );
+    }
+
+    #[test]
+    fn detect_eslint_type_aware_legacy_json_no_project_is_none() {
+        let content = r#"{ "extends": ["eslint:recommended"] }"#;
+        let result =
+            detect_eslint_type_aware(Path::new(".eslintrc.json"), content).expect("scan config");
+        assert_eq!(result, Vec::new());
+    }
+
+    // ---- eslint_module_name ----
+
+    #[test]
+    fn eslint_module_name_maps_bare_extends_to_eslint_config_prefix() {
+        assert_eq!(
+            eslint_module_name("airbnb", EslintRefKind::Extends),
+            "eslint-config-airbnb"
+        );
+    }
+
+    #[test]
+    fn eslint_module_name_leaves_already_prefixed_extends_alone() {
+        assert_eq!(
+            eslint_module_name("eslint-config-airbnb", EslintRefKind::Extends),
+            "eslint-config-airbnb"
+        );
+    }
+
+    #[test]
+    fn eslint_module_name_maps_bare_plugin_to_eslint_plugin_prefix() {
+        assert_eq!(
+            eslint_module_name("react", EslintRefKind::Plugin),
+            "eslint-plugin-react"
+        );
+    }
+
+    #[test]
+    fn eslint_module_name_resolves_plugin_colon_extends_shorthand() {
+        assert_eq!(
+            eslint_module_name("plugin:react/recommended", EslintRefKind::Extends),
+            "eslint-plugin-react"
+        );
+    }
+
+    #[test]
+    fn eslint_module_name_maps_scoped_extends_and_plugins() {
+        assert_eq!(
+            eslint_module_name("@myorg/foo", EslintRefKind::Extends),
+            "@myorg/eslint-config-foo"
+        );
+        assert_eq!(
+            eslint_module_name("@myorg", EslintRefKind::Extends),
+            "@myorg/eslint-config"
+        );
+        assert_eq!(
+            eslint_module_name("@myorg/eslint-config-foo", EslintRefKind::Extends),
+            "@myorg/eslint-config-foo"
+        );
+        assert_eq!(
+            eslint_module_name("@myorg/foo", EslintRefKind::Plugin),
+            "@myorg/eslint-plugin-foo"
+        );
+    }
+
+    // ---- extract_eslint_module_refs ----
+
+    #[test]
+    fn extract_eslint_module_refs_flat_config_scans_bare_imports() {
+        // Real flat config has no `extends` key at all (a shared config is
+        // spread in) and `plugins` is an object of already-imported modules
+        // — the package names come from the file's own `import` specifiers.
+        let content = r#"
+            import js from '@eslint/js';
+            import reactHooks from 'eslint-plugin-react-hooks';
+            import './local-helper.js';
+            export default [
+              js.configs.recommended,
+              { plugins: { 'react-hooks': reactHooks } },
+            ];
+        "#;
+        let mut refs = extract_eslint_module_refs(Path::new("eslint.config.js"), content)
+            .expect("scan config");
+        refs.sort();
+        assert_eq!(
+            refs,
+            vec![
+                "@eslint/js".to_string(),
+                "eslint-plugin-react-hooks".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_eslint_module_refs_legacy_json_config() {
+        let content = r#"{
+            "extends": ["eslint:recommended", "airbnb"],
+            "plugins": ["react-hooks"]
+        }"#;
+        let mut refs =
+            extract_eslint_module_refs(Path::new(".eslintrc.json"), content).expect("scan config");
+        refs.sort();
+        // "eslint:recommended" is a built-in sentinel, filtered out; the
+        // rest are mapped through eslint's own naming convention.
+        assert_eq!(
+            refs,
+            vec![
+                "eslint-config-airbnb".to_string(),
+                "eslint-plugin-react-hooks".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_eslint_module_refs_legacy_js_config_scans_extends_plugins_keys() {
+        // A legacy `.eslintrc.js`/`.cjs` is still JS-shaped, but (unlike flat
+        // config) genuinely does use `extends`/`plugins` string arrays —
+        // dispatched by basename, not extension.
+        let content = r#"
+            module.exports = {
+              extends: ['plugin:react/recommended'],
+              plugins: ['react-hooks'],
+            };
+        "#;
+        let mut refs =
+            extract_eslint_module_refs(Path::new(".eslintrc.js"), content).expect("scan config");
+        refs.sort();
+        assert_eq!(
+            refs,
+            vec![
+                "eslint-plugin-react".to_string(),
+                "eslint-plugin-react-hooks".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_eslint_module_refs_skips_relative_paths() {
+        let content = r#"{ "extends": ["./base.eslintrc.json"] }"#;
+        let refs =
+            extract_eslint_module_refs(Path::new(".eslintrc.json"), content).expect("scan config");
+        assert!(refs.is_empty(), "{refs:?}");
     }
 }
