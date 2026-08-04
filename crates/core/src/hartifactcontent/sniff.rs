@@ -15,12 +15,22 @@
 //! `docker save` tar that opens with `manifest.json` and a config blob before
 //! the layers is still judged on where its bytes actually are.
 //!
+//! One level of nesting is followed, because one level is where the payload
+//! keeps turning up: an artifact that wraps another tar — an OCI bundle, a
+//! collected archive, a `.tar` a rule produced — shows nothing but a tar header
+//! at its member's head, so a scan that stops there judges the blob on its
+//! framing and gzips the payload anyway. A member already past the size floor is
+//! therefore also checked for the `ustar` magic at offset 257 (which is what
+//! widens the peek from 12 bytes to 265) and, when it is a tar, walked. No
+//! deeper: a tar inside a tar inside a tar is not a shape worth the seeks.
+//!
 //! This is a *hint about the bytes*, consulted by transports that compress. It
 //! never feeds a hash: the same artifact compressed or not is the same artifact,
 //! so the verdict must not move a cache key.
 
 use anyhow::Context;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
+use tracing::trace;
 
 /// A magic number identifying a format whose payload is already compressed.
 struct Signature {
@@ -75,9 +85,23 @@ const SIGNATURES: &[Signature] = &[
     sig(0, b"wOF2", "woff2"),
 ];
 
+/// Offset of the `magic` field in a tar header block, and the magic itself.
+///
+/// POSIX writes `ustar\0` there and GNU writes `ustar `, both followed by a
+/// two-byte version — so five bytes is the whole of what the two formats agree
+/// on, and matching them is what tells a nested archive from ordinary payload.
+/// The pre-POSIX v7 format has no magic at all and is simply not recursed into,
+/// which costs a wasted gzip at worst.
+const TAR_MAGIC_OFFSET: usize = 257;
+const TAR_MAGIC: &[u8] = b"ustar";
+
 /// Bytes read from the head of each sniffed member. Covers the furthest
-/// signature (`WEBP` at offset 8).
-const PEEK_LEN: usize = 12;
+/// signature (`WEBP` at offset 8) and a tar header's magic-and-version fields,
+/// which end at 265.
+///
+/// Only members past [`MIN_MEMBER_BYTES`] are peeked at all, so the window is
+/// always shorter than the member it is read from.
+const PEEK_LEN: usize = TAR_MAGIC_OFFSET + 8;
 
 /// A tar block. Every member carries at least one as its header, and that
 /// framing is payload no compressor has to work for.
@@ -131,6 +155,12 @@ fn match_signature(head: &[u8]) -> Option<&'static str> {
         .map(|s| s.label)
 }
 
+/// Whether `head` is the first block of a tar — i.e. whether this member is
+/// itself an archive worth looking inside.
+fn is_tar_header(head: &[u8]) -> bool {
+    head.get(TAR_MAGIC_OFFSET..TAR_MAGIC_OFFSET + TAR_MAGIC.len()) == Some(TAR_MAGIC)
+}
+
 /// Read up to `buf.len()` bytes, tolerating short reads. A member shorter than
 /// the peek window fills only its prefix; the rest stays zeroed and simply fails
 /// to match, which is the correct answer for a member that small anyway.
@@ -145,6 +175,190 @@ fn peek(mut r: impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
         }
     }
     Ok(n)
+}
+
+/// Running totals of one scan, threaded through the outer walk and the nested
+/// level below it so both contribute to the same verdict.
+struct Tally {
+    blob_size: u64,
+    /// Bytes that cannot count toward the verdict: every member that failed to
+    /// match, plus one header block of framing per member walked.
+    rejected_bytes: u64,
+    /// Once `rejected_bytes` passes this, the bar is out of reach.
+    reject_budget: u64,
+    incompressible_bytes: u64,
+    /// Bounded by SIGNATURES.len(); a Vec of pairs beats a map at this size.
+    by_label: Vec<(&'static str, u64)>,
+}
+
+impl Tally {
+    fn new(blob_size: u64) -> Self {
+        Self {
+            blob_size,
+            rejected_bytes: 0,
+            reject_budget: blob_size / 100 * (100 - PRECOMPRESSED_PERCENT),
+            incompressible_bytes: 0,
+            by_label: Vec::new(),
+        }
+    }
+
+    fn credit(&mut self, label: &'static str, size: u64) {
+        self.incompressible_bytes = self.incompressible_bytes.saturating_add(size);
+        match self.by_label.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, bytes)) => *bytes = bytes.saturating_add(size),
+            None => self.by_label.push((label, size)),
+        }
+    }
+
+    fn reject(&mut self, bytes: u64) {
+        self.rejected_bytes = self.rejected_bytes.saturating_add(bytes);
+    }
+
+    /// The bar is unreachable — the rejected bytes alone already deny it.
+    fn hopeless(&self) -> bool {
+        self.rejected_bytes > self.reject_budget
+    }
+
+    fn meets_bar(&self) -> bool {
+        self.blob_size > 0
+            && self.incompressible_bytes.saturating_mul(100)
+                >= self.blob_size.saturating_mul(PRECOMPRESSED_PERCENT)
+    }
+
+    /// Nothing further to learn: the answer is either already reached or
+    /// already out of reach.
+    fn settled(&self) -> bool {
+        self.hopeless() || self.meets_bar()
+    }
+
+    fn verdict(self) -> Verdict {
+        let precompressed = self.meets_bar();
+        Verdict {
+            precompressed,
+            incompressible_bytes: self.incompressible_bytes,
+            dominant: self
+                .by_label
+                .iter()
+                .max_by_key(|(_, bytes)| *bytes)
+                .map(|(label, _)| *label),
+        }
+    }
+}
+
+/// A member that is itself a tar: where its data starts in the reader the outer
+/// archive was built on, and how long it is.
+struct NestedTar {
+    offset: u64,
+    size: u64,
+}
+
+/// A seekable view of one member's data, as if it were a file of its own.
+///
+/// It exists so the nested archive can skip over its members by seeking, the
+/// way the outer one does. Handing `tar` the member as a plain `Read` instead
+/// makes it skip by *reading*, which would pull the entire member through the
+/// reader just to reach the next header — the one thing this scan is built not
+/// to do.
+struct Window<'a, R> {
+    inner: &'a mut R,
+    /// Offset of the member's data within `inner`.
+    start: u64,
+    len: u64,
+    /// Read cursor, relative to `start`. May sit past `len`, as on a file.
+    pos: u64,
+}
+
+impl<R: Read + Seek> Read for Window<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.len.saturating_sub(self.pos);
+        let want = buf.len().min(remaining.try_into().unwrap_or(usize::MAX));
+        let Some(buf) = buf.get_mut(..want).filter(|b| !b.is_empty()) else {
+            return Ok(0);
+        };
+        // The inner cursor is shared with nothing else, but seeking every time
+        // keeps this correct without tracking where the last read left it — and
+        // reads here are one short peek per member, not a byte stream.
+        self.inner.seek(SeekFrom::Start(self.start + self.pos))?;
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for Window<'_, R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+        };
+        self.pos = target.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek outside the tar member",
+            )
+        })?;
+        Ok(self.pos)
+    }
+}
+
+/// Walk one archive's members into `tally`.
+///
+/// Returns the members that are themselves tars. They are handed back rather
+/// than descended into on the spot because `tar`'s iterator borrows the archive
+/// — and so the reader — for as long as it lives; the caller scans them once it
+/// has the reader back. `recurse` is false for that second pass, which is what
+/// holds the recursion to a single level.
+///
+/// Members deferred this way are left out of the tally entirely: the caller
+/// settles them, byte for byte, after their nested walk.
+fn walk<R: Read + Seek>(
+    archive: &mut tar::Archive<R>,
+    tally: &mut Tally,
+    recurse: bool,
+) -> anyhow::Result<Vec<NestedTar>> {
+    let entries = archive
+        .entries_with_seek()
+        .context("tar archive entries_with_seek")?;
+
+    let mut nested = Vec::new();
+
+    for entry in entries {
+        let mut entry = entry.context("read tar entry header")?;
+        let header = entry.header();
+        let size = header.size().context("read tar entry size")?;
+        let is_file = header.entry_type().is_file();
+        let offset = entry.raw_file_position();
+        // The member's own header block is framing, never payload.
+        tally.reject(BLOCK_BYTES);
+
+        let mut buf = [0u8; PEEK_LEN];
+        let head = if is_file && size >= MIN_MEMBER_BYTES {
+            // Reading from the entry (rather than seeking by
+            // `raw_file_position`) keeps the read clamped to this member and
+            // lets the iterator do the seek to the next header itself.
+            let n = peek(&mut entry, &mut buf).context("read tar entry head")?;
+            buf.get(..n).unwrap_or(&[])
+        } else {
+            &[]
+        };
+
+        match match_signature(head) {
+            Some(label) => tally.credit(label, size),
+            None if recurse && is_tar_header(head) => nested.push(NestedTar { offset, size }),
+            None => {
+                tally.reject(size);
+                if tally.hopeless() {
+                    // Unreachable bar: stop walking. `incompressible_bytes` is
+                    // left partial, which the `precompressed: false` verdict
+                    // already tells the caller.
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(nested)
 }
 
 /// Scan a seekable tar of `blob_size` bytes and decide whether it is worth
@@ -168,72 +382,58 @@ fn peek(mut r: impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
 /// nothing (~6% on top of its compression); with it, the walk ends a few percent
 /// in. The cases that *do* pay off are unaffected: one big matching member
 /// settles the answer on the first iteration.
+///
+/// A member that is itself a tar is walked one level down (see the module
+/// docs), on the same reader and with the same accounting — including the early
+/// exit, since whatever the nested walk could not identify is charged back
+/// against the member's size before the next one is opened.
+///
+/// Such a member does escape the *outer* walk's early exit, because its bytes
+/// are unknown until it has been walked and charging them beforehand would give
+/// up on precisely the archives this recursion exists to catch. The exposure is
+/// bounded by the size floor: only members past [`MIN_MEMBER_BYTES`] are ever
+/// deferred, so even an archive of nothing but tar-looking members costs a walk
+/// proportional to `blob_size / MIN_MEMBER_BYTES` — the tiny-member case the
+/// early exit was built for cannot reach this path at all.
 pub fn scan_tar<R: Read + Seek>(reader: R, blob_size: u64) -> anyhow::Result<Verdict> {
+    let mut tally = Tally::new(blob_size);
     let mut archive = tar::Archive::new(reader);
-    let entries = archive
-        .entries_with_seek()
-        .context("tar archive entries_with_seek")?;
+    let nested = walk(&mut archive, &mut tally, true)?;
 
-    // Bytes that cannot count toward the verdict. Seeded with the framing the
-    // archive must contain: the two 512-byte end-of-archive blocks, plus one
-    // header block per member as we go.
-    let mut rejected_bytes = 0u64;
-    let reject_budget = blob_size / 100 * (100 - PRECOMPRESSED_PERCENT);
-
-    let mut incompressible_bytes = 0u64;
-    // Bounded by SIGNATURES.len(); a Vec of pairs beats a map at this size.
-    let mut by_label: Vec<(&'static str, u64)> = Vec::new();
-
-    for entry in entries {
-        let mut entry = entry.context("read tar entry header")?;
-        let header = entry.header();
-        let size = header.size().context("read tar entry size")?;
-        // The member's own header block is framing, never payload.
-        rejected_bytes = rejected_bytes.saturating_add(BLOCK_BYTES);
-
-        let matched = if header.entry_type().is_file() && size >= MIN_MEMBER_BYTES {
-            let mut head = [0u8; PEEK_LEN];
-            // Reading from the entry (rather than seeking by
-            // `raw_file_position`) keeps the read clamped to this member and
-            // lets the iterator do the seek to the next header itself.
-            let n = peek(&mut entry, &mut head).context("read tar entry head")?;
-            head.get(..n).and_then(match_signature)
-        } else {
-            None
-        };
-
-        match matched {
-            Some(label) => {
-                incompressible_bytes = incompressible_bytes.saturating_add(size);
-                match by_label.iter_mut().find(|(l, _)| *l == label) {
-                    Some((_, bytes)) => *bytes = bytes.saturating_add(size),
-                    None => by_label.push((label, size)),
-                }
+    if !nested.is_empty() && !tally.settled() {
+        let mut reader = archive.into_inner();
+        for member in nested {
+            let (credited, rejected) = (tally.incompressible_bytes, tally.rejected_bytes);
+            let window = Window {
+                inner: &mut reader,
+                start: member.offset,
+                len: member.size,
+                pos: 0,
+            };
+            // Best-effort. A member whose head merely *looks* like a tar header
+            // is ordinary payload that will not parse, and a real archive can
+            // still be truncated — either way the member is charged in full
+            // below and the scan carries on.
+            if let Err(e) = walk(&mut tar::Archive::new(window), &mut tally, false) {
+                trace!(error = ?e, offset = member.offset, "content scan: nested member is not a readable tar");
             }
-            None => {
-                rejected_bytes = rejected_bytes.saturating_add(size);
-                if rejected_bytes > reject_budget {
-                    // Unreachable bar: stop walking. `incompressible_bytes` is
-                    // left partial, which the `precompressed: false` verdict
-                    // already tells the caller.
-                    break;
-                }
+            // Whatever the nested walk neither credited nor rejected is still
+            // part of this member, and still not known-compressed. Charging it
+            // keeps the early-exit bound exact: an archive of archives that is
+            // not precompressed gives up as promptly as any other.
+            tally.reject(
+                member
+                    .size
+                    .saturating_sub(tally.incompressible_bytes - credited)
+                    .saturating_sub(tally.rejected_bytes - rejected),
+            );
+            if tally.settled() {
+                break;
             }
         }
     }
 
-    let dominant = by_label
-        .iter()
-        .max_by_key(|(_, bytes)| *bytes)
-        .map(|(label, _)| *label);
-
-    Ok(Verdict {
-        precompressed: blob_size > 0
-            && incompressible_bytes.saturating_mul(100)
-                >= blob_size.saturating_mul(PRECOMPRESSED_PERCENT),
-        incompressible_bytes,
-        dominant,
-    })
+    Ok(tally.verdict())
 }
 
 #[cfg(test)]
@@ -455,6 +655,92 @@ mod tests {
         let v = scan(&tar);
         assert!(v.precompressed);
         assert_eq!(v.incompressible_bytes, 8 * 1024 * 1024);
+    }
+
+    /// The shape the recursion exists for: the artifact wraps another tar, so
+    /// every byte that matters sits two levels in and the member's own head is
+    /// nothing but a tar header.
+    #[test]
+    fn a_member_that_is_itself_a_tar_is_scanned_one_level_down() {
+        let inner = tar_of(&[("layer.tar.gz", blob(b"\x1f\x8b", 4 * 1024 * 1024))]);
+        let tar = tar_of(&[("image.tar", inner)]);
+        let v = scan(&tar);
+        assert_eq!(v.incompressible_bytes, 4 * 1024 * 1024);
+        assert_eq!(v.dominant, Some("gzip"));
+        assert!(v.precompressed);
+    }
+
+    /// The converse: descending must not turn a compressible archive into an
+    /// incompressible one.
+    #[test]
+    fn a_nested_tar_of_text_is_still_worth_compressing() {
+        let inner = tar_of(&[("src.txt", vec![b's'; 4 * 1024 * 1024])]);
+        let tar = tar_of(&[("bundle.tar", inner)]);
+        let v = scan(&tar);
+        assert_eq!(v.incompressible_bytes, 0);
+        assert!(!v.precompressed);
+    }
+
+    /// One level, not arbitrarily many. A third level would cost a seek per
+    /// member of every nested archive to serve a shape nothing produces.
+    #[test]
+    fn the_recursion_stops_one_level_down() {
+        let innermost = tar_of(&[("layer.tar.gz", blob(b"\x1f\x8b", 4 * 1024 * 1024))]);
+        let middle = tar_of(&[("image.tar", innermost)]);
+        let tar = tar_of(&[("bundle.tar", middle)]);
+        let v = scan(&tar);
+        assert_eq!(v.incompressible_bytes, 0);
+        assert!(!v.precompressed);
+    }
+
+    /// A 265-byte window over arbitrary payload will eventually carry `ustar`
+    /// at offset 257 by coincidence. The nested walk then fails to parse, and
+    /// the member must be charged as ordinary payload rather than fail the scan
+    /// or — worse — be silently forgiven.
+    #[test]
+    fn a_member_that_only_looks_like_a_tar_is_charged_in_full() {
+        let mut fake = vec![0xA5u8; 64 * 1024];
+        fake[TAR_MAGIC_OFFSET..TAR_MAGIC_OFFSET + TAR_MAGIC.len()].copy_from_slice(TAR_MAGIC);
+        let tar = tar_of(&[("not-a.tar", fake)]);
+        let v = scan(&tar);
+        assert_eq!(v.incompressible_bytes, 0);
+        assert!(!v.precompressed);
+    }
+
+    /// The cost guard, applied to the new path. Recursing must not buy an
+    /// exemption from it: the nested walk carries the same budget, and whatever
+    /// it could not identify is charged back before the next member is opened,
+    /// so a second nested archive is never even entered.
+    #[test]
+    fn the_nested_walk_gives_up_once_the_bar_is_unreachable() {
+        let inner_members: Vec<(String, Vec<u8>)> = (0..1000)
+            .map(|i| (format!("f{i}.txt"), vec![b'x'; 32 * 1024]))
+            .collect();
+        let refs: Vec<(&str, Vec<u8>)> = inner_members
+            .iter()
+            .map(|(p, d)| (p.as_str(), d.clone()))
+            .collect();
+        let inner = tar_of(&refs);
+        let tar = tar_of(&[("a.tar", inner.clone()), ("b.tar", inner)]);
+
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let v = scan_tar(
+            CountingReader {
+                inner: Cursor::new(tar.clone()),
+                reads: std::rc::Rc::clone(&reads),
+            },
+            tar.len() as u64,
+        )
+        .expect("scan");
+
+        assert!(!v.precompressed);
+        // 2000 members across the two nested archives, and ~10% of the blob is
+        // all it takes to settle this.
+        assert!(
+            reads.get() < 2000 / 4,
+            "scan read {} times for two 1000-member nested archives; the early exit is not firing",
+            reads.get()
+        );
     }
 
     #[test]
