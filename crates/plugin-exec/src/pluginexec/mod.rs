@@ -4078,7 +4078,9 @@ mod tests {
                         name: format!("{name}.tar"),
                         r#type: outputartifact::Type::Output,
                         content: outputartifact::Content::TarPath(
-                            tar_path.to_string_lossy().into_owned(),
+                            outputartifact::ContentPath::borrowed(
+                                tar_path.to_string_lossy().into_owned(),
+                            ),
                         ),
                         hashout: format!("h_{name}"),
                     }),

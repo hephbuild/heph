@@ -5,6 +5,7 @@ use hcore::hasync::{self, Cancellable};
 use hmodel::htaddr::Addr;
 use hplugin::driver::inputartifact;
 use hplugin::driver::outputartifact::Content::TarPath;
+use hplugin::driver::outputartifact::ContentPath;
 use hplugin::driver::targetdef::path::{self, Content};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
@@ -287,7 +288,9 @@ fn collect_outputs_inner(
             group: output.group.clone(),
             name: format!("{}.tar", output.group),
             r#type: outputartifact::Type::Output,
-            content: TarPath(tarpath.0),
+            // Owned: this tar exists only to be handed to the local cache, and
+            // the sandbox it lives in is torn down right after that write.
+            content: TarPath(ContentPath::owned(tarpath.0)),
             hashout: tarpath.1,
         });
     }
@@ -301,7 +304,7 @@ fn collect_outputs_inner(
             group: String::new(),
             name: "support.tar".to_string(),
             r#type: outputartifact::Type::SupportFile,
-            content: TarPath(tarpath),
+            content: TarPath(ContentPath::owned(tarpath)),
             hashout,
         });
     }

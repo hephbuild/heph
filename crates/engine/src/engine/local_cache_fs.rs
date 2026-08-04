@@ -163,6 +163,36 @@ impl LocalCache for LocalCacheFS {
         }))
     }
 
+    /// Rename `src` over the destination — the same `rename(2)`, over the same
+    /// path, that [`AtomicFileWriter::commit`] ends every write with, minus the
+    /// byte copy that filled the temp file first. Same atomicity for a concurrent
+    /// reader, for the same reason.
+    ///
+    /// Declines rather than fails when the rename does not go through. The
+    /// ordinary case is `EXDEV` — `src` on another filesystem, which a sandbox
+    /// redirected through a FUSE mount always is — and there the copy the caller
+    /// falls back to is the only way to move the bytes at all. Anything else
+    /// (a vanished `src`, `EACCES`) fails the copy too, with an error that says
+    /// what it was doing; swallowing it here would only make the write succeed
+    /// where it should not.
+    fn adopt_file(&self, addr: &Addr, hashin: &str, name: &str, src: &Path) -> Result<bool> {
+        let dest = self.get_path(addr, hashin, name);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create parent directories for: {:?}", dest))?;
+        }
+        match fs::rename(src, &dest) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                tracing::debug!(
+                    ?src, ?dest, error = %e,
+                    "cannot adopt cache blob by rename; falling back to a copy"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
         let path = self.get_path(addr, hashin, name);
         Ok(path.exists())
@@ -415,6 +445,93 @@ mod tests {
             cache.file_path(&addr, "h", "out.tar").is_none(),
             "deleted blob must not keep answering with a path"
         );
+        Ok(())
+    }
+
+    /// Adoption is the write, minus the copy: the file *becomes* the blob. It
+    /// reads back as any other entry, it is where `file_path` says it is, and it
+    /// is gone from where it came — a caller that offers a file has handed it
+    /// over, and must not find it still sitting in its sandbox.
+    #[test]
+    fn adopt_file_moves_the_source_into_place() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheFS::new(dir.path().join("cache"))?;
+        let addr = Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "t".to_string(),
+            Default::default(),
+        );
+
+        let src = dir.path().join("collected.tar");
+        std::fs::write(&src, b"packed bytes")?;
+
+        assert!(cache.adopt_file(&addr, "h", "out.tar", &src)?);
+        assert!(!src.exists(), "the adopted file is moved, not copied");
+
+        let mut got = String::new();
+        cache
+            .reader(&addr, "h", "out.tar")?
+            .reader
+            .read_to_string(&mut got)?;
+        assert_eq!(got, "packed bytes");
+        assert_eq!(
+            std::fs::read(cache.file_path(&addr, "h", "out.tar").expect("path"))?,
+            b"packed bytes",
+            "an adopted blob is a blob like any other"
+        );
+        Ok(())
+    }
+
+    /// A rename that cannot go through is a decline, not an error: the caller
+    /// still has the file and copies it instead. `EXDEV` is the real-world case
+    /// (a sandbox behind a FUSE mount); a vanished source stands in for it here,
+    /// since both arrive as a failed `rename(2)`.
+    #[test]
+    fn adopt_file_declines_when_the_rename_fails() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheFS::new(dir.path().join("cache"))?;
+        let addr = Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "t".to_string(),
+            Default::default(),
+        );
+
+        assert!(!cache.adopt_file(&addr, "h", "out.tar", &dir.path().join("gone.tar"))?);
+        assert!(
+            !cache.exists(&addr, "h", "out.tar")?,
+            "a declined adoption commits nothing"
+        );
+        Ok(())
+    }
+
+    /// A blob written twice under one key resolves to the last write, adoption
+    /// included — the destination may already hold a complete file, and
+    /// `rename(2)` replacing it is what makes that atomic for a concurrent
+    /// reader.
+    #[test]
+    fn adopt_file_replaces_an_existing_blob() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheFS::new(dir.path().join("cache"))?;
+        let addr = Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "t".to_string(),
+            Default::default(),
+        );
+
+        let mut w = cache.writer(&addr, "h", "out.tar")?;
+        w.write_all(b"first")?;
+        w.commit()?;
+
+        let src = dir.path().join("second.tar");
+        std::fs::write(&src, b"second")?;
+        assert!(cache.adopt_file(&addr, "h", "out.tar", &src)?);
+
+        let mut got = String::new();
+        cache
+            .reader(&addr, "h", "out.tar")?
+            .reader
+            .read_to_string(&mut got)?;
+        assert_eq!(got, "second");
         Ok(())
     }
 

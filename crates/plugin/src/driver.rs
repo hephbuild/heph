@@ -816,12 +816,48 @@ pub mod outputartifact {
         pub passthrough: bool,
     }
 
+    /// A container (tar/cpio) the driver already wrote to disk.
+    #[derive(Clone, Debug)]
+    pub struct ContentPath {
+        pub path: String,
+        /// True when `path` is a temp file the driver produced *for* the local
+        /// cache and will never read again — a sandbox-collected output tar. The
+        /// cache write may then hand the file over whole (a rename, no bytes
+        /// copied) instead of streaming it, and `path` is gone once the write
+        /// returns.
+        ///
+        /// Leave false for anything the producer still owns: the engine copies
+        /// out of it and the file is untouched. Like
+        /// [`ContentFile::passthrough`], this does not cross the plugin ABI (no
+        /// proto field), so an out-of-process driver's containers are always
+        /// copied.
+        pub owned: bool,
+    }
+
+    impl ContentPath {
+        /// A file the engine may consume — see [`ContentPath::owned`].
+        pub fn owned(path: impl Into<String>) -> Self {
+            Self {
+                path: path.into(),
+                owned: true,
+            }
+        }
+
+        /// A file the producer keeps: the engine reads it and leaves it alone.
+        pub fn borrowed(path: impl Into<String>) -> Self {
+            Self {
+                path: path.into(),
+                owned: false,
+            }
+        }
+    }
+
     #[derive(Clone)]
     pub enum Content {
         File(ContentFile),
         Raw(ContentRaw),
-        TarPath(String),
-        CpioPath(String),
+        TarPath(ContentPath),
+        CpioPath(ContentPath),
     }
 
     #[derive(Clone)]
@@ -838,8 +874,8 @@ pub mod outputartifact {
             Ok(match &self.content {
                 Content::Raw(raw) => Box::new(io::Cursor::new(raw.data.clone())),
                 Content::File(file) => Box::new(File::open(&file.source_path)?),
-                Content::TarPath(path) => Box::new(File::open(path)?),
-                Content::CpioPath(path) => Box::new(File::open(path)?),
+                Content::TarPath(p) => Box::new(File::open(&p.path)?),
+                Content::CpioPath(p) => Box::new(File::open(&p.path)?),
             })
         }
 
@@ -859,8 +895,8 @@ pub mod outputartifact {
                         x: file.x,
                     },
                 }))),
-                Content::TarPath(path) => Box::new(hcore::hartifactcontent::tar::TarWalker::new(
-                    File::open(path)?,
+                Content::TarPath(p) => Box::new(hcore::hartifactcontent::tar::TarWalker::new(
+                    File::open(&p.path)?,
                 )?),
                 #[expect(clippy::unimplemented, reason = "cpio format is not yet implemented")]
                 Content::CpioPath(_) => unimplemented!("cpio is not implemented"),

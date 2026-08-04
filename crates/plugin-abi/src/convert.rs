@@ -722,7 +722,7 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
 // ---- OutputArtifact (driver run outputs) ----
 
 use hplugin::driver::outputartifact::{
-    Content as OaContent, ContentFile, ContentRaw, OutputArtifact, Type as OaType,
+    Content as OaContent, ContentFile, ContentPath, ContentRaw, OutputArtifact, Type as OaType,
 };
 
 fn oa_type_to_pb(t: &OaType) -> pb::ArtifactType {
@@ -753,8 +753,8 @@ pub fn output_artifact_to_pb(oa: &OutputArtifact) -> pb::OutputArtifactRef {
             path: r.path.clone(),
             x: r.x,
         }),
-        OaContent::TarPath(p) => pb::output_artifact_ref::Content::TarPath(p.clone()),
-        OaContent::CpioPath(p) => pb::output_artifact_ref::Content::CpioPath(p.clone()),
+        OaContent::TarPath(p) => pb::output_artifact_ref::Content::TarPath(p.path.clone()),
+        OaContent::CpioPath(p) => pb::output_artifact_ref::Content::CpioPath(p.path.clone()),
     };
     pb::OutputArtifactRef {
         group: oa.group.clone(),
@@ -780,8 +780,15 @@ pub fn output_artifact_from_pb(oa: pb::OutputArtifactRef) -> OutputArtifact {
             path: r.path,
             x: r.x,
         }),
-        Some(pb::output_artifact_ref::Content::TarPath(p)) => OaContent::TarPath(p),
-        Some(pb::output_artifact_ref::Content::CpioPath(p)) => OaContent::CpioPath(p),
+        // Ownership does not cross the plugin ABI either (no proto field): the
+        // host copies an out-of-process driver's container and leaves the file
+        // where the driver put it. Safe default.
+        Some(pb::output_artifact_ref::Content::TarPath(p)) => {
+            OaContent::TarPath(ContentPath::borrowed(p))
+        }
+        Some(pb::output_artifact_ref::Content::CpioPath(p)) => {
+            OaContent::CpioPath(ContentPath::borrowed(p))
+        }
         None => OaContent::Raw(ContentRaw {
             data: vec![],
             path: String::new(),
