@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
 use std::ops::Deref;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -267,6 +268,9 @@ pub struct RequestStateData {
     pub request_id: String,
     pub ctoken: StdCancellationToken,
     pub dep_dag: Mutex<DepDag>,
+    /// Speculative `RequestState`s alive on this request — see
+    /// [`RequestState::speculative_live`].
+    speculative_live: std::sync::atomic::AtomicUsize,
     // Key includes `is_top`: top-level vs dependency resolution of the same
     // (addr, outputs) must not share a cell, because only the top-level frame
     // writes a codegen target's tree back / stores its fixpoint.
@@ -790,6 +794,7 @@ impl RequestState {
     ///
     /// [`track_dep`]: RequestState::track_dep
     pub fn speculative(&self) -> Arc<RequestState> {
+        self.data.speculative_live.fetch_add(1, Ordering::AcqRel);
         Arc::new(RequestState {
             data: Arc::clone(&self.data),
             parent: self.parent.clone(),
@@ -797,6 +802,18 @@ impl RequestState {
             crumbs: self.crumbs.clone(),
             speculative: true,
         })
+    }
+
+    /// How many speculative states are alive on this request right now.
+    ///
+    /// The invariant `Engine::query`'s `MatchShrug` arm depends on is "at most
+    /// one speculative chain at a time", and until this counter it was enforced
+    /// only by the shape of the code — a walk's arm sits in the consumer of its
+    /// own fan-out, so *that* walk cannot overlap itself. Nothing stopped two
+    /// walks on one request from overlapping each other, and nothing could
+    /// observe it when they did. Now a test can.
+    pub fn speculative_live(&self) -> usize {
+        self.data.speculative_live.load(Ordering::Acquire)
     }
 
     /// Record that the current `parent` depends on `addr`, returning a
@@ -843,6 +860,17 @@ impl RequestStateData {
             // A closed receiver (consumer gone) is expected; events are
             // best-effort, so dropping the send result is intentional.
             drop(tx.send(event));
+        }
+    }
+}
+
+impl Drop for RequestState {
+    fn drop(&mut self) {
+        // Only speculative states counted up, so only they count down. A
+        // non-speculative state pays one predictable branch here; there is no
+        // atomic on that path.
+        if self.speculative {
+            self.data.speculative_live.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -957,6 +985,7 @@ impl Engine {
             request_id: request_id.clone(),
             ctoken: StdCancellationToken::new(),
             dep_dag: Mutex::new(DepDag::new()),
+            speculative_live: std::sync::atomic::AtomicUsize::new(0),
             mem_execute_cache: Memoizer::with_tag_task("execute_cache", self.runtime.clone()),
             mem_locked_result: Memoizer::with_tag_task("locked_result", self.runtime.clone()),
             mem_remote_blob: Memoizer::with_tag_task("remote_blob", self.runtime.clone()),
@@ -1213,6 +1242,54 @@ mod tests {
             0,
             "no slot may be left outstanding when the engine is gone"
         );
+        Ok(())
+    }
+
+    /// Speculative states are counted while alive, so "at most one speculative
+    /// chain at a time" is observable rather than merely structural.
+    ///
+    /// `Engine::query`'s `MatchShrug` arm resolves candidates on a speculative
+    /// state whose cycle check walks per-chain breadcrumbs instead of the shared
+    /// `DepDag` — sound only one chain at a time. A walk guarantees that against
+    /// itself; nothing guaranteed it *between* walks on one request, and nothing
+    /// could see it. `heph validate` awaits its three walks one at a time for
+    /// exactly this reason (`src/commands/validate.rs`).
+    #[test]
+    fn speculative_states_are_counted_while_alive() -> anyhow::Result<()> {
+        let (_dir, engine) = test_engine()?;
+        let root = engine.new_state();
+        assert_eq!(root.speculative_live(), 0, "no chain to begin with");
+
+        {
+            let a = root.speculative();
+            assert_eq!(root.speculative_live(), 1);
+            {
+                // Two at once is the hazard the counter exists to expose.
+                let b = root.speculative();
+                assert_eq!(
+                    root.speculative_live(),
+                    2,
+                    "overlapping chains must be visible, not silent"
+                );
+                drop(b);
+            }
+            assert_eq!(root.speculative_live(), 1, "the inner chain released");
+            drop(a);
+        }
+        assert_eq!(root.speculative_live(), 0, "every chain released");
+
+        // Sequential use — what `validate` now does — never exceeds one.
+        for _ in 0..3 {
+            let s = root.speculative();
+            assert_eq!(root.speculative_live(), 1);
+            drop(s);
+        }
+        assert_eq!(root.speculative_live(), 0);
+
+        // A non-speculative child is not counted; only the shrug arm's states are.
+        let child = root.with_parent(addr("a"));
+        assert_eq!(root.speculative_live(), 0, "ordinary states are not chains");
+        drop(child);
         Ok(())
     }
 
