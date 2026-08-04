@@ -289,8 +289,7 @@ impl ManagedDriver for Driver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
-        let spec =
-            OciPullSpec::from(req.target_spec.config.clone()).context("parse oci_pull config")?;
+        let spec = OciPullSpec::from(&req.target_spec.config).context("parse oci_pull config")?;
         let format = ImageFormat::parse(spec.format.as_deref().unwrap_or("oci"))?;
         let tool = Tool::parse_opt(spec.tool.as_deref(), format)?;
         ensure_tool_supports_format(tool, format)?;
