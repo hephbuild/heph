@@ -64,10 +64,42 @@ pub fn resolves_into_heph_dir(path: &std::path::Path) -> bool {
     let Ok(resolved) = std::fs::canonicalize(path) else {
         return false;
     };
+    has_heph_component(&resolved)
+}
+
+/// Whether any component of an already-resolved path names a `.heph*` directory.
+fn has_heph_component(resolved: &std::path::Path) -> bool {
     resolved.components().any(|c| {
         matches!(c, std::path::Component::Normal(name)
             if name.to_str().is_some_and(|n| n.starts_with(".heph")))
     })
+}
+
+/// [`resolves_into_heph_dir`] for a directory entry, given the answer already
+/// computed for its parent directory.
+///
+/// `canonicalize` resolves every component, so calling it per file re-walks the
+/// same ancestor chain once per entry. A glob over a package subtree visits many
+/// files per directory — on a 500-package Go corpus the walk makes ~6.4k file
+/// visits over 1.2k distinct files — and `canonicalize` showed up at 1.9% of a
+/// fully-cached run's CPU.
+///
+/// The parent's answer settles a **non-symlink** entry outright: when `name` is
+/// not itself a link, `canonicalize(dir/name)` is exactly
+/// `canonicalize(dir).join(name)`, so its components are the parent's plus
+/// `name`. Both are still checked. A symlink entry may point anywhere, so it
+/// falls back to resolving the full path — which is the case the check exists
+/// for (`gen -> .heph3/…`).
+fn entry_resolves_into_heph_dir(
+    abs: &std::path::Path,
+    name: &str,
+    is_symlink: bool,
+    parent_in_heph: bool,
+) -> bool {
+    if is_symlink {
+        return resolves_into_heph_dir(abs);
+    }
+    parent_in_heph || name.starts_with(".heph")
 }
 
 /// Returns the `Addr` for a single-file fs target.
@@ -724,8 +756,20 @@ fn walk_glob(
     // which case the walk root is that single file, not a directory to descend.
     match std::fs::metadata(&walk_root) {
         Ok(m) if m.is_dir() => {
-            let mut stack = vec![walk_root];
-            while let Some(dir) = stack.pop() {
+            // "Does this path resolve inside a `.heph*` dir" is carried down the
+            // walk instead of being re-derived per entry. `canonicalize` resolves
+            // every component, so asking it per file re-walks the same ancestor
+            // chain once per entry; carried, the whole walk pays one call for the
+            // root plus one per symlink it meets.
+            //
+            // Sound because `read_dir` reports a symlink as `Symlink`, never as
+            // `Dir` — so every directory pushed here is a real one, and for a real
+            // directory `canonicalize(dir/name)` is `canonicalize(dir).join(name)`.
+            // Its components are therefore the parent's plus `name`, which is
+            // exactly what the two operands below test.
+            let root_in_heph = resolves_into_heph_dir(&walk_root);
+            let mut stack = vec![(walk_root, root_in_heph)];
+            while let Some((dir, dir_in_heph)) = stack.pop() {
                 let listing = walker.read_dir(&dir)?;
                 for entry in &listing.entries {
                     let abs = dir.join(&entry.name);
@@ -733,7 +777,8 @@ fn walk_glob(
                         // Never descend into skip dirs or skip-glob subtrees.
                         let rel = abs.strip_prefix(root).unwrap_or(&abs);
                         if !compiled.skip.prune_dir(&abs, rel) {
-                            stack.push(abs);
+                            let child_in_heph = dir_in_heph || entry.name.starts_with(".heph");
+                            stack.push((abs, child_in_heph));
                         }
                     } else if matches!(
                         entry.kind,
@@ -741,12 +786,30 @@ fn walk_glob(
                     ) {
                         // A symlink-to-dir is rejected by `file_hash` (which follows
                         // and errors on a dir), matching the old walk.
-                        emit_glob_file(walker, root, compiled, &abs, &mut artifacts)?;
+                        emit_glob_file(
+                            walker,
+                            root,
+                            compiled,
+                            &abs,
+                            entry.kind == hwalk::EntryKind::Symlink,
+                            dir_in_heph,
+                            &mut artifacts,
+                        )?;
                     }
                 }
             }
         }
-        Ok(_) => emit_glob_file(walker, root, compiled, &walk_root, &mut artifacts)?,
+        // A fully-literal pattern names one path with no walk above it, so there
+        // is no parent answer to carry: resolve it in full.
+        Ok(_) => emit_glob_file(
+            walker,
+            root,
+            compiled,
+            &walk_root,
+            true,
+            false,
+            &mut artifacts,
+        )?,
         Err(_) => {} // missing walk root ⇒ empty match
     }
 
@@ -760,6 +823,8 @@ fn emit_glob_file(
     root: &std::path::Path,
     compiled: &CompiledGlob,
     abs: &std::path::Path,
+    is_symlink: bool,
+    parent_in_heph: bool,
     out: &mut Vec<OutputArtifact>,
 ) -> anyhow::Result<()> {
     use wax::Program as _;
@@ -774,7 +839,9 @@ fn emit_glob_file(
     // Skip net-new codegen outputs stamped back into the tree — sourcing them
     // here would double-source the generated content. Same for paths resolving
     // into a `.heph*` dir: they are engine-internal artifacts, not raw source.
-    if has_codegen_xattr(abs) || resolves_into_heph_dir(abs) {
+    let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if has_codegen_xattr(abs) || entry_resolves_into_heph_dir(abs, name, is_symlink, parent_in_heph)
+    {
         return Ok(());
     }
     let Some(rel_str) = rel.to_str() else {
@@ -1723,6 +1790,72 @@ mod tests {
             let arts = walk_glob(&walker, root, &compiled).unwrap();
             assert_eq!(arts.len(), 1, "codegen-stamped a.rs is excluded");
         }
+    }
+
+    /// The walk carries "resolves into a `.heph*` dir" down from each directory
+    /// rather than re-deriving it per entry, so a symlink pointing into the cache
+    /// must still be caught: it is the one entry kind the carried answer cannot
+    /// settle, and the whole check exists for it.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_glob_skips_a_symlink_into_the_cache_beside_plain_files() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        // The cache lives outside the walked tree so the walk cannot reach it by
+        // descent — only by following the link.
+        let cache = tempdir().unwrap();
+        let cache_dir = cache.path().join(".heph3");
+        fs::create_dir(&cache_dir).unwrap();
+        fs::write(cache_dir.join("generated.rs"), b"generated").unwrap();
+
+        fs::create_dir(root.join("sub")).unwrap();
+        // Plain files either side of the link: these take the carried answer.
+        fs::write(root.join("sub").join("a.rs"), b"aaa").unwrap();
+        fs::write(root.join("sub").join("z.rs"), b"zzz").unwrap();
+        std::os::unix::fs::symlink(
+            cache_dir.join("generated.rs"),
+            root.join("sub").join("linked.rs"),
+        )
+        .unwrap();
+
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
+        let walker = CachedWalker::disabled();
+
+        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let mut names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["sub_a.rs".to_string(), "sub_z.rs".to_string()],
+            "a symlink resolving into a .heph dir must be excluded while its \
+             plain siblings are kept"
+        );
+    }
+
+    /// A directory literally named `.heph*` inside the walked tree excludes its
+    /// contents too — the carried answer has to pick that up when the directory
+    /// is pushed, not only at the walk root.
+    #[test]
+    fn test_walk_glob_skips_files_under_a_nested_heph_dir() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join("keep.rs"), b"keep").unwrap();
+        fs::create_dir(root.join("sub").join(".heph3")).unwrap();
+        fs::write(root.join("sub").join(".heph3").join("drop.rs"), b"drop").unwrap();
+
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
+        let walker = CachedWalker::disabled();
+
+        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["sub_keep.rs".to_string()],
+            "files under a nested .heph* dir must be excluded"
+        );
     }
 
     /// Cross-run via the shared walker: a first driver populates the fswalk db; a
