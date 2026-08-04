@@ -24,7 +24,7 @@ pub fn build_spec_firstparty(
         srcfiles.push(q.format());
     }
     srcfiles.extend_from_slice(non_go_src_addrs);
-    build_spec_inner(
+    let mut spec = build_spec_inner(
         addr,
         import_path,
         factors,
@@ -33,7 +33,13 @@ pub fn build_spec_firstparty(
             ("modfiles", &[go_mod_addr.format()][..]),
             ("srcfiles", &srcfiles),
         ],
-    )
+    )?;
+    // Only a first-party package has its `.go` sources staged into the sandbox
+    // (as `srcfiles` deps, codegen included). That is what lets the driver
+    // decide "this directory has no Go package" from the staged inputs alone.
+    spec.config
+        .insert("firstparty".to_string(), Value::Bool(true));
+    Ok(spec)
 }
 
 pub fn build_spec_stdlib(
