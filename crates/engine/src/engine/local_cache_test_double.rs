@@ -24,12 +24,14 @@ type ReaderHook = Box<dyn Fn(&Addr, &str, &str) + Send + Sync>;
 type ExistsHook = Box<dyn Fn(&Addr, &str, &str) + Send + Sync>;
 type ListTargetEntriesHook = Box<dyn Fn(&Addr) + Send + Sync>;
 type WriterHook = Arc<dyn Fn(&Addr, &str, &str) + Send + Sync>;
+type ListTargetsItemHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub(crate) struct ForwardingCache {
     inner: Arc<dyn LocalCache>,
     on_reader: ReaderHook,
     on_exists: ExistsHook,
     on_list_target_entries: ListTargetEntriesHook,
+    on_list_targets_item: Option<ListTargetsItemHook>,
     on_writer: WriterHook,
     on_writer_done: Option<WriterHook>,
 }
@@ -41,6 +43,7 @@ impl ForwardingCache {
             on_reader: Box::new(|_, _, _| {}),
             on_exists: Box::new(|_, _, _| {}),
             on_list_target_entries: Box::new(|_| {}),
+            on_list_targets_item: None,
             on_writer: Arc::new(|_, _, _| {}),
             on_writer_done: None,
         }
@@ -73,6 +76,19 @@ impl ForwardingCache {
         f: impl Fn(&Addr) + Send + Sync + 'static,
     ) -> Self {
         self.on_list_target_entries = Box::new(f);
+        self
+    }
+
+    /// Run `f` as each target key is *pulled* from the `list_targets` iterator,
+    /// not when the iterator is handed out.
+    ///
+    /// The distinction is the point: it makes the enumeration's laziness
+    /// observable, so a consumer that is supposed to interleave enumeration with
+    /// work — rather than drain the whole list up front — can be held to it. A
+    /// hook that fired once, at `list_targets` time, could not tell the two
+    /// apart.
+    pub(crate) fn on_list_targets_item(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.on_list_targets_item = Some(Arc::new(f));
         self
     }
 
@@ -192,7 +208,17 @@ impl LocalCache for ForwardingCache {
     }
 
     fn list_targets(&self) -> anyhow::Result<TargetStream> {
-        self.inner.list_targets()
+        let inner = self.inner.list_targets()?;
+        let Some(hook) = self.on_list_targets_item.as_ref().map(Arc::clone) else {
+            return Ok(inner);
+        };
+        // Wrapped lazily so the hook fires per `next()`, preserving whatever
+        // laziness the inner stream has.
+        Ok(Box::new(inner.inspect(move |item| {
+            if let Ok(key) = item {
+                hook(key);
+            }
+        })))
     }
 
     fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {

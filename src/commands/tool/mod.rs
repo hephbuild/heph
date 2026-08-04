@@ -1,6 +1,7 @@
 mod build_fmt;
 mod build_lsp;
 mod cache;
+mod clean;
 mod completions;
 pub mod gc;
 mod gen_gitignore;
@@ -28,6 +29,31 @@ pub enum ToolCommands {
     ///
     /// Example: `heph tool gc`
     Gc(gc::GcArgs),
+    /// Remove the selected targets' entries from the local cache
+    ///
+    /// Deletes every locally cached revision of the selected target(s) — all of
+    /// them, whatever their `cache.history` budget and whether or not the target
+    /// still exists. `gc` is the sweep that reclaims space without being told
+    /// what; this is the one you point at something.
+    ///
+    /// Targets are selected exactly as for `run`: an address, a label followed
+    /// by a package matcher, or `-e '<expr>'` (see `--help`). The selection is
+    /// required — there is no whole-cache default, since this command deletes.
+    /// A selection that needs no resolution — an address, or `all <package
+    /// matcher>` — is answered from the cache alone: no BUILD files are read, so
+    /// an entry whose target has since been deleted is still cleanable.
+    /// `label(...)` resolves the graph.
+    ///
+    /// Examples:
+    ///
+    /// `heph tool clean //cmd/server:bin` — one target (that exact variant)
+    ///
+    /// `heph tool clean all //cmd/...` — every cached target under a subtree
+    ///
+    /// `heph tool clean test //cmd/...` — every target labelled `test`
+    ///
+    /// `heph tool clean all //...` — clear the entire local cache
+    Clean(clean::CleanArgs),
     /// Manage the heph-generated section of the root .gitignore
     ///
     /// Computes the ignore patterns for codegen-copy outputs and writes them
@@ -89,6 +115,7 @@ impl ToolCommands {
     pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match self {
             ToolCommands::Gc(args) => gc::execute(args, sink, global),
+            ToolCommands::Clean(args) => clean::execute(args, sink, global),
             ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
             ToolCommands::Cache(args) => args.execute(sink, global),
             ToolCommands::Completions(args) => completions::execute(args),

@@ -2242,7 +2242,7 @@ impl CIAppView for CiProgressView {
     }
 }
 
-/// CI (non-TUI) view for a cache sweep (`heph tool gc`, `heph clean`): folds it
+/// CI (non-TUI) view for a cache sweep (`heph tool gc`, `heph tool clean`): folds it
 /// into a [`GcHeader`] and logs a single summary line at the end, prefixed with
 /// the header's label so two commands sharing this view stay distinguishable in
 /// a log. Per-target progress is silent.

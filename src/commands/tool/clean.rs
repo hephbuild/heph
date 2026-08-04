@@ -16,11 +16,12 @@ use crate::tui::{self, App, AppContext, LogSink, human_bytes};
 
 #[derive(clap::Args, Clone)]
 #[command(
-    override_usage = "heph clean\n       heph clean <TARGET_ADDRESS>\n       heph clean <LABEL> <PACKAGE_MATCHER>\n       heph clean -e <EXPR>",
+    arg_required_else_help = true,
+    override_usage = "heph tool clean <TARGET_ADDRESS>\n       heph tool clean <LABEL> <PACKAGE_MATCHER>\n       heph tool clean -e <EXPR>",
     after_long_help = QUERY_LANG_HELP
 )]
 pub struct CleanArgs {
-    /// Target address (e.g., //pkg:name) OR Label. Omit to clean everything.
+    /// Target address (e.g., //pkg:name) OR Label
     #[arg(value_name = "TARGET_ADDRESS/LABEL", add = ArgValueCompleter::new(complete_target_addr))]
     pub arg1: Option<String>,
     /// Package matcher (only if first argument is a Label)
@@ -38,18 +39,21 @@ pub struct CleanArgs {
     pub expr: Option<String>,
 }
 
-/// Resolve the selection, which is `run`'s and `query`'s — with one difference:
-/// omitting it entirely is legal and means `//...`, the whole local cache.
+/// Resolve the selection — `run`'s and `query`'s, with **no default**.
+///
+/// A bare `heph tool clean` deliberately does not mean `//...`: this command
+/// deletes, and a whole-cache wipe must not be the cheapest thing to type, where
+/// one slipped Enter costs every warm entry on the machine. Clearing everything
+/// is still one command, but it has to be asked for — `heph tool clean all
+/// //...`. `arg_required_else_help` catches the bare invocation before it
+/// reaches here; this covers the rest (e.g. flags but no selection), where clap
+/// sees arguments and does not fire.
 ///
 /// `allow_all` is on, as it is for `query` and not for `run`. `all //some/dir` is
 /// how you name a package without naming a label, and it is the form that keeps
 /// `clean` off the graph entirely (`run` has no such stake — it must resolve
 /// whatever it selects, so the shorthand buys it nothing).
 fn selection(args: &CleanArgs, cwp: &PkgBuf) -> anyhow::Result<Matcher> {
-    if args.arg1.is_none() && args.expr.is_none() {
-        // `//...` — every package, so every cached addr.
-        return Ok(Matcher::PackagePrefix(PkgBuf::from("")));
-    }
     resolve_matcher(&args.expr, &args.arg1, &args.arg2, cwp, true)
 }
 
@@ -103,7 +107,7 @@ impl App for CleanApp {
 /// explicitly instead of reporting a `0`-shaped success that reads identically to
 /// having freed nothing.
 fn print_summary(stats: &CleanStats, selection: &str) {
-    if stats.targets_matched == 0 {
+    if stats.targets_cleaned == 0 && stats.errored == 0 {
         println!("Nothing to clean: no cached entries match {selection}");
         return;
     }
@@ -162,11 +166,40 @@ mod tests {
         }
     }
 
+    /// Parse a full `heph <args>` command line the way `main` does.
+    fn parse(argv: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
+        crate::commands::Commands::augment_subcommands(clap::Command::new("heph"))
+            .try_get_matches_from(argv)
+    }
+
     #[test]
-    fn no_argument_selects_the_whole_cache() {
-        // The one place `clean` departs from `run`: an omitted selection is legal
-        // and means everything.
-        let m = selection(&args(None, None), &PkgBuf::from("some/pkg")).unwrap();
+    fn a_bare_clean_is_refused_rather_than_wiping_the_cache() {
+        // There is no whole-cache default. This command deletes, and the wipe
+        // must not be the cheapest thing to type — clap sends the bare
+        // invocation to the help text instead.
+        let err = parse(&["heph", "tool", "clean"]).expect_err("a bare clean must not run");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+    }
+
+    #[test]
+    fn flags_without_a_selection_are_refused_too() {
+        // `arg_required_else_help` only fires on a *completely* empty invocation,
+        // so the flags-only case is the one that reaches `selection` — and it has
+        // to fail there rather than fall back to a default.
+        let err = selection(&args(None, None), &PkgBuf::from("some/pkg")).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("missing TARGET_ADDRESS/LABEL"), "{chain}");
+    }
+
+    #[test]
+    fn the_whole_cache_is_still_reachable_explicitly() {
+        // Refusing the bare form must remove the accident, not the capability.
+        // Asserted through `-e` because the equivalent `all //...` resolves its
+        // package against the *process* cwd (see `args`); e2e covers that one.
+        let m = selection(&args(None, Some("//...")), &PkgBuf::from("")).unwrap();
         assert_eq!(m, Matcher::PackagePrefix(PkgBuf::from("")));
     }
 
@@ -239,9 +272,8 @@ mod tests {
     fn positional_and_expr_are_mutually_exclusive() {
         // Enforced by clap, the same `conflicts_with` `run` and `query` use, so
         // the two selections can never both be live.
-        let err = crate::commands::Commands::augment_subcommands(clap::Command::new("heph"))
-            .try_get_matches_from(["heph", "clean", "//a:b", "-e", "//c/..."])
-            .expect_err("must conflict");
+        let err =
+            parse(&["heph", "tool", "clean", "//a:b", "-e", "//c/..."]).expect_err("must conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 

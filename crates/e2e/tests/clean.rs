@@ -2,7 +2,7 @@
     clippy::panic_in_result_fn,
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
-//! `heph clean` against a real cache, written by a real run.
+//! `heph tool clean` against a real cache, written by a real run.
 //!
 //! The unit tests in `engine::clean` plant revisions directly; these drive the
 //! whole path — build a target, let its cache write land, then evict it and
@@ -70,7 +70,7 @@ async fn run_and_settle(ws: &Workspace, addr_str: &str) -> anyhow::Result<String
     Ok(out)
 }
 
-/// `heph clean <selection>` over a fresh engine, as a separate invocation would.
+/// `heph tool clean <selection>` over a fresh engine, as a separate invocation would.
 async fn clean(ws: &Workspace, m: &Matcher) -> anyhow::Result<heph::engine::CleanStats> {
     let engine = ws.reopen()?;
     engine.clone().clean(engine.new_state(), m).await
@@ -87,7 +87,6 @@ async fn clean_evicts_a_run_s_cache_entry_and_the_next_run_repopulates_it() -> a
 
     let addr = Matcher::Addr(parse_addr("//c:t")?);
     let stats = clean(&ws, &addr).await?;
-    assert_eq!(stats.targets_matched, 1, "{stats:?}");
     assert_eq!(stats.targets_cleaned, 1, "{stats:?}");
     assert_eq!(stats.revisions_removed, 1, "{stats:?}");
     assert_eq!(stats.errored, 0, "{stats:?}");
@@ -152,7 +151,7 @@ async fn a_package_matcher_cleans_its_subtree_and_nothing_else() -> anyhow::Resu
     }
 
     let stats = clean(&ws, &Matcher::PackagePrefix(PkgBuf::from("app"))).await?;
-    assert_eq!(stats.targets_matched, 2, "{stats:?}");
+    assert_eq!(stats.targets_cleaned, 2, "{stats:?}");
     assert_eq!(stats.revisions_removed, 2, "{stats:?}");
 
     // `//lib:t` was not selected, so its entry is still there to be cleaned.
@@ -166,7 +165,7 @@ async fn a_package_matcher_cleans_its_subtree_and_nothing_else() -> anyhow::Resu
 
 #[tokio::test]
 async fn a_label_selection_cleans_what_run_would_have_selected() -> anyhow::Result<()> {
-    // `heph clean test //...` — the form that cannot be answered from cache keys,
+    // `heph tool clean test //...` — the form that cannot be answered from cache keys,
     // because a label set only exists after the target is resolved. It must select
     // the same targets `heph run test //...` would.
     let ws = Workspace::new();
@@ -185,7 +184,7 @@ target(name = "plain", driver = "bash", run = "printf 'b' > $OUT", out = "out.tx
         Matcher::PackagePrefix(PkgBuf::from("")),
     ]);
     let stats = clean(&ws, &by_label).await?;
-    assert_eq!(stats.targets_matched, 1, "only the labelled one: {stats:?}");
+    assert_eq!(stats.targets_cleaned, 1, "only the labelled one: {stats:?}");
     assert_eq!(stats.revisions_removed, 1, "{stats:?}");
 
     // `//lbl:plain` carries no `test` label, so its entry is still there.
@@ -217,7 +216,7 @@ async fn a_label_selection_cannot_reach_an_entry_the_graph_no_longer_defines() -
         Matcher::PackagePrefix(PkgBuf::from("")),
     ]);
     let missed = clean(&ws, &by_label).await?;
-    assert_eq!(missed.targets_matched, 0, "{missed:?}");
+    assert_eq!(missed, heph::engine::CleanStats::default(), "{missed:?}");
 
     let got = clean(&ws, &Matcher::PackagePrefix(PkgBuf::from("orphan"))).await?;
     assert_eq!(got.revisions_removed, 1, "{got:?}");
@@ -239,7 +238,7 @@ async fn clean_evicts_an_entry_whose_target_no_longer_exists() -> anyhow::Result
     std::fs::remove_file(ws.dir.path().join("gone/BUILD"))?;
 
     let stats = clean(&ws, &Matcher::PackagePrefix(PkgBuf::from("gone"))).await?;
-    assert_eq!(stats.targets_matched, 1, "{stats:?}");
+    assert_eq!(stats.targets_cleaned, 1, "{stats:?}");
     assert_eq!(stats.revisions_removed, 1, "{stats:?}");
     assert_eq!(
         stats.errored, 0,

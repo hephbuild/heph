@@ -1,4 +1,4 @@
-//! Targeted cache eviction — the `heph clean` command.
+//! Targeted cache eviction — the `heph tool clean` command.
 //!
 //! Where [`Engine::gc_all`](crate::engine::Engine::gc_all) decides *for* the
 //! user (drop what no longer resolves, trim the rest to `cache.history`),
@@ -20,13 +20,20 @@
 //!   reach an entry whose `BUILD` file has since been deleted — precisely the
 //!   state a rename leaves behind, and precisely when you want the entry gone.
 //! - **`label()` / `tree_output()` need the graph**, because a label set and a
-//!   target's output paths exist only after resolution. There, `clean` asks
-//!   [`Engine::query`] for the matching addrs — the same walk `heph run <label>
-//!   <pkg>` performs, so the selection means exactly what it means there — and
-//!   intersects the result with what is actually cached. A target the graph no
-//!   longer defines cannot be selected this way; that is inherent to asking a
-//!   question only its definition can answer, and the addr-only forms remain the
-//!   way to reach it.
+//!   target's output paths exist only after resolution. There, `clean` walks
+//!   [`Engine::query`] — the same walk `heph run <label> <pkg>` performs, so the
+//!   selection means exactly what it means there — and feeds each addr it yields
+//!   straight into the delete loop; one with nothing cached costs a single
+//!   unlocked entry-list lookup and is dropped. A target the graph no longer
+//!   defines cannot be selected this way; that is inherent to asking a question
+//!   only its definition can answer, and the addr-only forms remain the way to
+//!   reach it.
+//!
+//! Both paths are *streams*, never materialized sets: the live footprint of a
+//! run is the bounded set of in-flight delete tasks, whatever the size of the
+//! cache or the graph. This is why the graph path pushes from the query rather
+//! than collecting it and intersecting with the cache — an intersection has to
+//! hold one of its two sides, and both sides here scale with the workspace.
 //!
 //! Either way the deletion itself is serialized through each addr's
 //! [`ResultLock`](crate::engine::result_lock::ResultLock) write lock, exactly as
@@ -39,27 +46,40 @@ use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use hmodel::htaddr::{Addr, parse_addr};
 use hmodel::htmatcher::{MatchResult, Matcher};
-use rustc_hash::FxHashSet;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
 /// Outcome of an [`Engine::clean`] run.
+///
+/// Deliberately carries no "targets matched" count. The two selection paths
+/// enumerate opposite sides — cache keys vs graph addrs — so such a count would
+/// mean a different population on each, and the only question a caller actually
+/// asks of it ("did my selection hit anything?") is answered by
+/// `targets_cleaned == 0 && errored == 0`. Keeping it out is also what lets both
+/// paths stream: a matched-but-uncached target is dropped the moment its entry
+/// list comes back empty, never tallied and never retained.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CleanStats {
-    /// Cached targets the matcher selected. Counts the targets *considered*,
-    /// including any that turned out to have no revisions left to delete — a
-    /// zero here is the "your matcher selected nothing" signal, which a caller
-    /// wants to distinguish from "it matched, and there was nothing to free".
-    pub targets_matched: usize,
-    /// Matched targets that actually lost at least one revision.
+    /// Targets that lost at least one revision.
     pub targets_cleaned: usize,
     /// Cache revisions deleted.
     pub revisions_removed: usize,
     /// Total bytes freed (summed from the manifests of the deleted revisions).
     pub bytes_removed: u64,
-    /// Matched targets whose deletion failed. Each is logged and the run keeps
+    /// Selected targets whose deletion failed. Each is logged and the run keeps
     /// going — one unwritable entry never aborts the rest.
     pub errored: usize,
+}
+
+/// The in-flight state of one [`Engine::clean`] run: the bounded set of delete
+/// tasks and the stats they fold into. Bundled so a single `submit` can serve
+/// both selection paths without either one re-implementing the backpressure.
+struct CleanRun {
+    set: JoinSet<(Addr, Result<TargetOutcome>)>,
+    /// Maximum delete tasks in flight — the run's whole memory footprint, and
+    /// the reason neither selection is ever materialized.
+    limit: usize,
+    stats: CleanStats,
 }
 
 /// What cleaning one target did.
@@ -99,6 +119,15 @@ impl Engine {
     /// `MatchShrug` is unreachable there today, and skipping rather than guessing
     /// keeps that safe if a new matcher variant lands, since this code deletes.
     ///
+    /// **Neither path holds the selection in memory.** Each is a stream fed
+    /// straight into the delete loop, whose live set is bounded by `max_workers`
+    /// — so `all //...` over a large cache, and `label(x) && //...` over a large
+    /// graph, both cost a fixed number of in-flight addrs rather than one
+    /// `Addr` per match. That is the whole reason the graph path pushes *from*
+    /// the query rather than collecting it and intersecting: an intersection has
+    /// to materialize one of its two sides, and on this command the side it would
+    /// materialize is the unbounded one.
+    ///
     /// Per-target failures are logged and counted in
     /// [`CleanStats::errored`] — the run never aborts partway and leaves the user
     /// wondering which half of their cache is gone.
@@ -107,98 +136,85 @@ impl Engine {
         rs: Arc<RequestState>,
         matcher: &Matcher,
     ) -> Result<CleanStats> {
-        // `None` — decide per cache key, no resolution. `Some(set)` — the graph
-        // was walked and this is what it matched.
-        let resolved = if is_addr_only(matcher) {
-            None
-        } else {
-            Some(Arc::clone(&self).resolve_selection(&rs, matcher).await?)
+        let mut run = CleanRun {
+            set: JoinSet::new(),
+            limit: self.max_workers.max(1),
+            stats: CleanStats::default(),
         };
 
-        let targets = self
-            .local_cache
-            .list_targets()
-            .context("clean: listing cache targets")?;
-
-        let limit = self.max_workers.max(1);
-        let mut set: JoinSet<(Addr, Result<TargetOutcome>)> = JoinSet::new();
-        let mut stats = CleanStats::default();
-
-        for target in targets {
-            let addr_key = match target {
-                Ok(k) => k,
-                Err(e) => {
-                    // The stream failed mid-way. Clean what was already seen
-                    // rather than throwing it away — a partial clean is still a
-                    // clean, and the error is surfaced.
-                    tracing::warn!(error = %format!("{e:#}"), "clean: listing targets failed mid-stream, cleaning what was seen");
-                    break;
-                }
-            };
-            let addr = match parse_addr(&addr_key) {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!(addr = %addr_key, error = %format!("{e:#}"), "clean: skip unparseable cache addr");
+        if is_addr_only(matcher) {
+            // Drive off the cache's own enumeration: the only targets that can
+            // possibly be cleaned are the ones it names, and the matcher decides
+            // each from its addr.
+            let targets = self
+                .local_cache
+                .list_targets()
+                .context("clean: listing cache targets")?;
+            for target in targets {
+                let addr_key = match target {
+                    Ok(k) => k,
+                    Err(e) => {
+                        // The stream failed mid-way. Clean what was already seen
+                        // rather than throwing it away — a partial clean is still
+                        // a clean, and the error is surfaced.
+                        tracing::warn!(error = %format!("{e:#}"), "clean: listing targets failed mid-stream, cleaning what was seen");
+                        break;
+                    }
+                };
+                let addr = match parse_addr(&addr_key) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!(addr = %addr_key, error = %format!("{e:#}"), "clean: skip unparseable cache addr");
+                        continue;
+                    }
+                };
+                if matcher.matches_addr(&addr) != MatchResult::MatchYes {
                     continue;
                 }
-            };
-            let selected = match &resolved {
-                Some(addrs) => addrs.contains(&addr),
-                None => matcher.matches_addr(&addr) == MatchResult::MatchYes,
-            };
-            if !selected {
-                continue;
+                Arc::clone(&self).submit(&mut run, &rs, addr).await;
             }
-            stats.targets_matched += 1;
-
-            while set.len() >= limit {
-                Self::drain_one_clean(&mut set, &rs, &mut stats).await;
+        } else {
+            // Drive off the graph instead — the cache cannot answer `label(...)`.
+            // Each addr goes straight to a delete task; one that has nothing
+            // cached costs a single unlocked `list_target_entries` and is
+            // dropped. Deliberately *not* collected into a set first: see the
+            // note on memory above.
+            //
+            // An error ends the run rather than cleaning the prefix that
+            // resolved. A half-walked selection can only *under*-delete, which is
+            // safe but silent — and "I ran clean and it kept some entries" is a
+            // far worse thing to debug than a run that says it failed.
+            let stream = Arc::clone(&self).query(rs.clone(), matcher);
+            tokio::pin!(stream);
+            while let Some(addr) = stream
+                .try_next()
+                .await
+                .context("clean: resolving the selection")?
+            {
+                Arc::clone(&self).submit(&mut run, &rs, addr).await;
             }
-            let engine = Arc::clone(&self);
-            let crs = rs.clone();
-            set.spawn(async move {
-                let out = engine.clean_addr(crs, &addr).await;
-                (addr, out)
-            });
-        }
-        while !set.is_empty() {
-            Self::drain_one_clean(&mut set, &rs, &mut stats).await;
         }
 
-        Ok(stats)
+        while !run.set.is_empty() {
+            Self::drain_one_clean(&mut run.set, &rs, &mut run.stats).await;
+        }
+        Ok(run.stats)
     }
 
-    /// Walk the graph for a selection the cache keys cannot decide, returning the
-    /// addrs it matched.
+    /// Queue one target for cleaning, first draining down to `limit` in flight.
     ///
-    /// This is [`Engine::query`] — the same walk `heph query` and `heph run
-    /// <label> <pkg>` drive — so `label(...)` selects here exactly what it
-    /// selects there. Collected in full rather than streamed into the delete
-    /// loop: the cache enumeration is the other half of the intersection and it
-    /// is a synchronous iterator, so one of the two has to be materialized, and
-    /// the graph side is the one that must complete anyway before a partial
-    /// selection could be trusted.
-    ///
-    /// An error propagates instead of cleaning the prefix that resolved. A
-    /// half-computed selection can only *under*-delete, which is safe but silent
-    /// — and "I ran clean and it kept some entries" is a much worse thing to
-    /// debug than a run that says it failed.
-    async fn resolve_selection(
-        self: Arc<Self>,
-        rs: &Arc<RequestState>,
-        matcher: &Matcher,
-    ) -> Result<FxHashSet<Addr>> {
-        let stream = self.query(rs.clone(), matcher);
-        tokio::pin!(stream);
-        let mut addrs = FxHashSet::default();
-        while let Some(addr) = stream
-            .try_next()
-            .await
-            .context("clean: resolving the selection")?
-        {
-            addrs.insert(addr);
+    /// The await is the backpressure: it is what keeps a source that can yield
+    /// far faster than the deletes complete — either enumeration, on a big cache
+    /// or a big graph — from queueing the whole selection.
+    async fn submit(self: Arc<Self>, run: &mut CleanRun, rs: &Arc<RequestState>, addr: Addr) {
+        while run.set.len() >= run.limit {
+            Self::drain_one_clean(&mut run.set, rs, &mut run.stats).await;
         }
-        Ok(addrs)
+        let crs = rs.clone();
+        run.set.spawn(async move {
+            let out = self.clean_addr(crs, &addr).await;
+            (addr, out)
+        });
     }
 
     /// Delete every revision of one target, under its write lock.
@@ -300,8 +316,12 @@ fn emit_clean_target_swept(rs: &RequestState, revisions_removed: usize, bytes_re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Config;
     use crate::engine::cache_test_support::{addr, addr_in, present, test_engine, write_revision};
+    use crate::engine::local_cache_test_double::ForwardingCache;
     use hmodel::htpkg::PkgBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// `//...` — the no-argument selection.
@@ -325,7 +345,6 @@ mod tests {
             .await
             .expect("clean");
 
-        assert_eq!(stats.targets_matched, 1);
         assert_eq!(stats.targets_cleaned, 1);
         assert_eq!(stats.revisions_removed, 3);
         assert_eq!(stats.errored, 0);
@@ -357,7 +376,7 @@ mod tests {
             .await
             .expect("clean");
 
-        assert_eq!(stats.targets_matched, 1, "exactly one addr selected");
+        assert_eq!(stats.targets_cleaned, 1, "exactly one addr selected");
         assert_eq!(stats.revisions_removed, 1);
         assert!(!present(&engine, &victim, "h1"));
         assert!(present(&engine, &bystander, "h1"), "bystander survives");
@@ -379,7 +398,7 @@ mod tests {
             .await
             .expect("clean");
 
-        assert_eq!(stats.targets_matched, 2);
+        assert_eq!(stats.targets_cleaned, 2);
         assert_eq!(stats.revisions_removed, 2);
         assert!(!present(&engine, &inside, "h1"));
         assert!(!present(&engine, &deeper, "h1"));
@@ -445,7 +464,7 @@ mod tests {
             .await
             .expect("clean");
 
-        assert_eq!(stats.targets_matched, 2);
+        assert_eq!(stats.targets_cleaned, 2);
         assert_eq!(stats.revisions_removed, 3);
         assert!(!present(&engine, &a, "h1"));
         assert!(!present(&engine, &a, "h2"));
@@ -456,7 +475,7 @@ mod tests {
     async fn is_idempotent() {
         // Cleaning an already-clean selection is a success that removed nothing
         // — the postcondition holds either way. It must not error, or every
-        // scripted `heph clean` would have to special-case its second run.
+        // scripted `heph tool clean` would have to special-case its second run.
         let (engine, _dir) = test_engine();
         let a = addr("t");
         write_revision(&engine, &a, "h1", 100, &["out.tar"]);
@@ -472,9 +491,6 @@ mod tests {
             .await
             .expect("second clean");
 
-        // The addr is still a known cache target (its rows are gone, the key is
-        // not necessarily), so `targets_matched` may or may not count it — what
-        // must hold is that nothing was deleted and nothing failed.
         assert_eq!(stats.revisions_removed, 0);
         assert_eq!(stats.targets_cleaned, 0);
         assert_eq!(stats.errored, 0);
@@ -482,9 +498,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_matcher_selecting_nothing_is_not_an_error() {
-        // Distinguishable from "matched, freed nothing" by `targets_matched`,
-        // which is what lets the CLI say "no cached entries match …" instead of
-        // printing a zero-shaped success.
+        // An all-zero `CleanStats` is what the CLI turns into "no cached entries
+        // match …" rather than a zero-shaped success.
         let (engine, _dir) = test_engine();
         write_revision(&engine, &addr("t"), "h1", 100, &["out.tar"]);
 
@@ -494,8 +509,7 @@ mod tests {
             .await
             .expect("clean");
 
-        assert_eq!(stats.targets_matched, 0);
-        assert_eq!(stats.revisions_removed, 0);
+        assert_eq!(stats, CleanStats::default());
         assert!(present(&engine, &addr("t"), "h1"), "nothing was touched");
     }
 
@@ -538,7 +552,7 @@ mod tests {
             .clean(rs, &Matcher::Label("test".to_string()))
             .await
             .expect("clean by label");
-        assert_eq!(by_label.targets_matched, 0, "{by_label:?}");
+        assert_eq!(by_label, CleanStats::default(), "{by_label:?}");
         assert!(present(&engine, &a, "h1"), "nothing was deleted");
 
         let rs = engine.new_state();
@@ -570,6 +584,86 @@ mod tests {
         assert_eq!(stats.revisions_removed, 1);
         assert!(present(&engine, &keep, "h1"));
         assert!(!present(&engine, &drop, "h1"));
+    }
+
+    /// An engine with `max_workers == 2` whose cache records, at each step of the
+    /// `list_targets` enumeration, how many clean tasks have started by then.
+    ///
+    /// A clean task announces itself by its `list_target_entries` call, which is
+    /// the first thing `clean_addr` does — so the log is a direct read of
+    /// "enumeration progress vs work started".
+    fn test_engine_watching_enumeration() -> (Arc<Engine>, Arc<Mutex<Vec<usize>>>, tempfile::TempDir)
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let mut engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            // `max_workers` is `2 * parallelism`, so this pins the in-flight cap
+            // at 2 and keeps the corpus the test needs small.
+            parallelism: Some(1),
+            ..Default::default()
+        })
+        .expect("engine");
+        let started = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        engine.local_cache = Arc::new(
+            ForwardingCache::new(Arc::clone(&engine.local_cache))
+                .on_list_target_entries({
+                    let started = Arc::clone(&started);
+                    move |_| {
+                        started.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .on_list_targets_item({
+                    let (started, observed) = (Arc::clone(&started), Arc::clone(&observed));
+                    move |_| {
+                        observed
+                            .lock()
+                            .expect("observed")
+                            .push(started.load(Ordering::SeqCst));
+                    }
+                }),
+        );
+        (Arc::new(engine), observed, dir)
+    }
+
+    #[tokio::test]
+    async fn the_selection_is_never_materialized() {
+        // The property: `clean` streams its selection into a delete loop bounded
+        // by `max_workers`, instead of building the matched set and then acting
+        // on it. It is observable because a bounded loop must *complete* work to
+        // free a slot before it can pull the next target — so the enumeration
+        // sees started deletes partway through its own run.
+        //
+        // A `collect()`-then-delete implementation passes every other test in
+        // this module and fails this one: it would drain all 12 steps with the
+        // counter still at 0. That is the regression this exists to catch, since
+        // the two are otherwise indistinguishable from the outside.
+        let (engine, observed, _dir) = test_engine_watching_enumeration();
+        // Comfortably more than the in-flight cap of 2.
+        for i in 0..12 {
+            write_revision(&engine, &addr(&format!("t{i}")), "h1", 100, &["out.tar"]);
+        }
+
+        let rs = engine.new_state();
+        let stats = Arc::clone(&engine)
+            .clean(rs, &everything())
+            .await
+            .expect("clean");
+        assert_eq!(stats.targets_cleaned, 12, "{stats:?}");
+
+        let observed = observed.lock().expect("observed").clone();
+        assert_eq!(
+            observed.len(),
+            12,
+            "every target was enumerated: {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|&n| n > 0),
+            "the whole enumeration ran before any delete started, so the \
+             selection was materialized: {observed:?}"
+        );
     }
 
     #[tokio::test]

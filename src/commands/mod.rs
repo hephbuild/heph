@@ -1,6 +1,5 @@
 pub mod approval;
 pub mod bootstrap;
-pub mod clean;
 pub mod completion;
 pub mod errors;
 pub mod gendocs;
@@ -79,31 +78,6 @@ pub enum Commands {
     /// Validate all targets (link graph + check codegen outputs)
     #[command(visible_alias = "v")]
     Validate(validate::ValidateArgs),
-    /// Remove entries from the local cache
-    ///
-    /// Deletes every locally cached revision of the selected target(s) — all of
-    /// them, whatever their `cache.history` budget and whether or not the target
-    /// still exists. Use `heph tool gc` for the reachability-driven sweep that
-    /// reclaims space without being told what.
-    ///
-    /// Targets are selected exactly as for `run`: an address, a label followed
-    /// by a package matcher, or `-e '<expr>'` (see `--help`). Omit the selection
-    /// entirely to clear the whole local cache. A selection that needs no
-    /// resolution — an address, or `all <package matcher>` — is answered from
-    /// the cache alone: no BUILD files are read, so an entry whose target has
-    /// since been deleted is still cleanable. `label(...)` resolves the graph.
-    ///
-    /// Examples:
-    ///
-    /// `heph clean` — clear the entire local cache
-    ///
-    /// `heph clean //cmd/server:bin` — one target (that exact variant)
-    ///
-    /// `heph clean all //cmd/...` — every cached target under a subtree
-    ///
-    /// `heph clean test //cmd/...` — every target labelled `test`
-    #[command(visible_alias = "c")]
-    Clean(clean::CleanArgs),
     /// Prints version
     ///
     /// Prints the heph version string and exits.
@@ -125,7 +99,6 @@ impl Commands {
             Commands::Inspect(args) => args.execute(sink, global),
             Commands::Query(args) => query::execute(args, sink, global),
             Commands::Validate(args) => validate::execute(args, sink, global),
-            Commands::Clean(args) => clean::execute(args, sink, global),
             Commands::Version(args) => version::execute(args),
             Commands::Tool(args) => args.execute(sink, global),
             Commands::GenDocs(args) => gendocs::execute(args),

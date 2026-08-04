@@ -115,7 +115,7 @@ pub enum BuildEventKind {
     /// One target finished a cache sweep: how many cache revisions it dropped
     /// and how many bytes those revisions freed (summed from manifest artifact
     /// sizes). Emitted once per target visited by `heph tool gc` or by
-    /// `heph clean` — including targets that dropped nothing — so a consumer can
+    /// `heph tool clean` — including targets that dropped nothing — so a consumer can
     /// show both the count of targets explored and the total data reclaimed.
     GcTargetSwept {
         revisions_removed: usize,
