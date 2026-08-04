@@ -22,18 +22,18 @@
 //! - **`label()` / `tree_output()` need the graph**, because a label set and a
 //!   target's output paths exist only after resolution. There, `clean` walks
 //!   [`Engine::query`] — the same walk `heph run <label> <pkg>` performs, so the
-//!   selection means exactly what it means there — and feeds each addr it yields
-//!   straight into the delete loop; one with nothing cached costs a single
-//!   unlocked entry-list lookup and is dropped. A target the graph no longer
+//!   selection means exactly what it means there. A target the graph no longer
 //!   defines cannot be selected this way; that is inherent to asking a question
 //!   only its definition can answer, and the addr-only forms remain the way to
 //!   reach it.
 //!
-//! Both paths are *streams*, never materialized sets: the live footprint of a
-//! run is the bounded set of in-flight delete tasks, whatever the size of the
-//! cache or the graph. This is why the graph path pushes from the query rather
-//! than collecting it and intersecting with the cache — an intersection has to
-//! hold one of its two sides, and both sides here scale with the workspace.
+//! The addr-only path never materializes its selection: the cache enumeration is
+//! streamed straight into a delete loop bounded by `max_workers`, so `all //...`
+//! over a cache of any size costs a fixed number of in-flight addrs rather than
+//! one `Addr` per match. The graph path cannot do the same, and the reason is a
+//! deadlock rather than a convenience — see [`Engine::resolve_selection`]. It
+//! holds the matched addrs, which is bounded by the *selection*, never by the
+//! cache.
 //!
 //! Either way the deletion itself is serialized through each addr's
 //! [`ResultLock`](crate::engine::result_lock::ResultLock) write lock, exactly as
@@ -55,9 +55,9 @@ use tokio::task::JoinSet;
 /// enumerate opposite sides — cache keys vs graph addrs — so such a count would
 /// mean a different population on each, and the only question a caller actually
 /// asks of it ("did my selection hit anything?") is answered by
-/// `targets_cleaned == 0 && errored == 0`. Keeping it out is also what lets both
-/// paths stream: a matched-but-uncached target is dropped the moment its entry
-/// list comes back empty, never tallied and never retained.
+/// `targets_cleaned == 0 && errored == 0`. Keeping it out is also what lets the
+/// addr-only path stream: a matched-but-uncached target is dropped the moment its
+/// entry list comes back empty, never tallied and never retained.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CleanStats {
     /// Targets that lost at least one revision.
@@ -76,8 +76,8 @@ pub struct CleanStats {
 /// both selection paths without either one re-implementing the backpressure.
 struct CleanRun {
     set: JoinSet<(Addr, Result<TargetOutcome>)>,
-    /// Maximum delete tasks in flight — the run's whole memory footprint, and
-    /// the reason neither selection is ever materialized.
+    /// Maximum delete tasks in flight — and, on the addr-only path, the run's
+    /// whole memory footprint.
     limit: usize,
     stats: CleanStats,
 }
@@ -119,14 +119,11 @@ impl Engine {
     /// `MatchShrug` is unreachable there today, and skipping rather than guessing
     /// keeps that safe if a new matcher variant lands, since this code deletes.
     ///
-    /// **Neither path holds the selection in memory.** Each is a stream fed
-    /// straight into the delete loop, whose live set is bounded by `max_workers`
-    /// — so `all //...` over a large cache, and `label(x) && //...` over a large
-    /// graph, both cost a fixed number of in-flight addrs rather than one
-    /// `Addr` per match. That is the whole reason the graph path pushes *from*
-    /// the query rather than collecting it and intersecting: an intersection has
-    /// to materialize one of its two sides, and on this command the side it would
-    /// materialize is the unbounded one.
+    /// The addr-only path streams: the cache enumeration is fed straight into a
+    /// delete loop bounded by `max_workers`, so `all //...` costs a fixed number
+    /// of in-flight addrs whatever the cache's size. The graph path must finish
+    /// resolving before it deletes — [`Engine::resolve_selection`] explains why
+    /// that is forced — and so holds its matched addrs.
     ///
     /// Per-target failures are logged and counted in
     /// [`CleanStats::errored`] — the run never aborts partway and leaves the user
@@ -174,23 +171,11 @@ impl Engine {
                 Arc::clone(&self).submit(&mut run, &rs, addr).await;
             }
         } else {
-            // Drive off the graph instead — the cache cannot answer `label(...)`.
-            // Each addr goes straight to a delete task; one that has nothing
-            // cached costs a single unlocked `list_target_entries` and is
-            // dropped. Deliberately *not* collected into a set first: see the
-            // note on memory above.
-            //
-            // An error ends the run rather than cleaning the prefix that
-            // resolved. A half-walked selection can only *under*-delete, which is
-            // safe but silent — and "I ran clean and it kept some entries" is a
-            // far worse thing to debug than a run that says it failed.
-            let stream = Arc::clone(&self).query(rs.clone(), matcher);
-            tokio::pin!(stream);
-            while let Some(addr) = stream
-                .try_next()
-                .await
-                .context("clean: resolving the selection")?
-            {
+            // The cache cannot answer `label(...)`, so the graph does — and that
+            // has to finish before a single delete starts. See
+            // `resolve_selection`: the walk holds read locks that the deletes
+            // would deadlock against.
+            for addr in Arc::clone(&self).resolve_selection(&rs, matcher).await? {
                 Arc::clone(&self).submit(&mut run, &rs, addr).await;
             }
         }
@@ -199,6 +184,70 @@ impl Engine {
             Self::drain_one_clean(&mut run.set, &rs, &mut run.stats).await;
         }
         Ok(run.stats)
+    }
+
+    /// Walk the graph for a selection the cache keys cannot decide, returning
+    /// every addr it matched.
+    ///
+    /// This is [`Engine::query`] — the same walk `heph query` and `heph run
+    /// <label> <pkg>` drive — so `label(...)` selects here exactly what it
+    /// selects there.
+    ///
+    /// **It must complete before the first delete, and that is why this one path
+    /// materializes.** Resolution executes shared uncacheable deps, and each such
+    /// execution leaves a riding *read* lock in the request state that performed
+    /// it, released only when that state drops. A delete takes the addr's *write*
+    /// lock. Interleave the two on one request state and a selected target whose
+    /// read the walk is still holding deadlocks against its own write — the same
+    /// inversion [`Engine::gc_all`] splits into two phases to avoid, and the
+    /// reason this borrows gc's shape: resolve under a dedicated state, let it
+    /// drop, then delete. The addr-only path has no such constraint (it resolves
+    /// nothing) and streams.
+    ///
+    /// The dedicated state also suppresses deferred trims, for gc's reason: the
+    /// executions the walk performs would otherwise queue post-write trims that
+    /// fire when it drops — concurrently with the write locks the deletes are
+    /// taking.
+    ///
+    /// An error propagates instead of cleaning the prefix that resolved. A
+    /// half-walked selection can only *under*-delete, which is safe but silent —
+    /// and "I ran clean and it kept some entries" is a far worse thing to debug
+    /// than a run that says it failed.
+    async fn resolve_selection(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        matcher: &Matcher,
+    ) -> Result<Vec<Addr>> {
+        let resolve_rs = self.new_state_full(
+            false,
+            rs.events_sender(),
+            rs.bg_pending(),
+            Self::DEFAULT_LOG_TAIL_LINES,
+            None,
+        );
+        resolve_rs.suppress_deferred_trims();
+
+        let mut addrs = Vec::new();
+        {
+            // Scoped so the stream — which holds its own `resolve_rs` handle —
+            // is dropped before the explicit release below, rather than at the
+            // end of the function.
+            let stream = Arc::clone(&self).query(resolve_rs.clone(), matcher);
+            tokio::pin!(stream);
+            while let Some(addr) = stream
+                .try_next()
+                .await
+                .context("clean: resolving the selection")?
+            {
+                addrs.push(addr);
+            }
+        }
+        // The release point every write lock the caller takes depends on. Explicit
+        // rather than left to end-of-scope: it is the ordering constraint this
+        // whole function exists to satisfy, and an implicit drop is exactly the
+        // kind of thing a later edit reorders without noticing.
+        drop(resolve_rs);
+        Ok(addrs)
     }
 
     /// Queue one target for cleaning, first draining down to `limit` in flight.
@@ -629,17 +678,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_selection_is_never_materialized() {
-        // The property: `clean` streams its selection into a delete loop bounded
-        // by `max_workers`, instead of building the matched set and then acting
-        // on it. It is observable because a bounded loop must *complete* work to
-        // free a slot before it can pull the next target — so the enumeration
-        // sees started deletes partway through its own run.
+    async fn the_cache_selection_is_never_materialized() {
+        // The property, for the addr-only path — the one `all //...` takes, where
+        // the selection is as large as the cache: it streams into a delete loop
+        // bounded by `max_workers` instead of building the matched set first.
+        // (The graph path deliberately does not; see `resolve_selection`.)
         //
-        // A `collect()`-then-delete implementation passes every other test in
-        // this module and fails this one: it would drain all 12 steps with the
-        // counter still at 0. That is the regression this exists to catch, since
-        // the two are otherwise indistinguishable from the outside.
+        // Observable because a bounded loop must *complete* work to free a slot
+        // before it can pull the next target — so the enumeration sees started
+        // deletes partway through its own run. A `collect()`-then-delete
+        // implementation passes every other test in this module and fails this
+        // one: it would drain all 12 steps with the counter still at 0. That is
+        // the regression this exists to catch, since the two are otherwise
+        // indistinguishable from the outside.
         let (engine, observed, _dir) = test_engine_watching_enumeration();
         // Comfortably more than the in-flight cap of 2.
         for i in 0..12 {
