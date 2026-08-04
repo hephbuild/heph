@@ -140,10 +140,21 @@ impl App for RunApp {
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
         let interactive: Option<InteractiveWrapper> = if ctx.interactive() {
             let pauser = ctx.pauser();
+            // Who owns Ctrl-C while the target holds the terminal. `--shell` puts
+            // the user at a live shell inside the sandbox, and its keystrokes —
+            // Ctrl-C first among them — are for that session, so the trigger stays
+            // suppressed for its duration. A plain run is the opposite: nothing is
+            // reading the keyboard, the terminal is merely on loan for the target's
+            // output, and Ctrl-C must still cancel the run.
+            let pause_for = if self.args.shell.is_some() {
+                tui::PauseFor::Input
+            } else {
+                tui::PauseFor::Output
+            };
             Some(Arc::new(move |inner| {
                 let pauser = pauser.clone();
                 Box::pin(async move {
-                    let _guard = pauser.pause().await;
+                    let _guard = pauser.pause_for(pause_for).await;
                     // Source stdin from the client's /dev/tty via a TtyReader
                     // rather than tokio::io::stdin(): tokio's stdin spawns a
                     // global blocking thread parked on read(0, …) that cannot

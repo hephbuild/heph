@@ -10,8 +10,13 @@ use tokio::sync::mpsc;
 /// listener and the TUI's Ctrl+C key handler call `trigger()` on this; a single
 /// consumer drives the shutdown state machine from the paired receiver.
 ///
-/// While `SuppressionHandle::set(true)` is in effect (e.g. the TUI is paused for
-/// an interactive prompt), `trigger()` silently drops presses.
+/// While `SuppressionHandle::set(true)` is in effect, `trigger()` silently drops
+/// presses — every press, including the second one that would otherwise abort.
+/// It is therefore for one situation only: the user is typing at something heph
+/// is hosting (`heph run --shell`) and the keystrokes are that session's, not
+/// heph's. Anything broader is a Ctrl-C that does nothing at all, since a TUI
+/// that has stepped aside is in cooked mode and the kernel SIGINT is then the
+/// only producer left.
 #[derive(Clone)]
 pub struct ShutdownTrigger {
     tx: mpsc::UnboundedSender<()>,
