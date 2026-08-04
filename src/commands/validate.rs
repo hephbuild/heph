@@ -68,9 +68,41 @@ impl App for ValidateApp {
 
         let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
+            // Each check runs to completion before the next begins, and that is
+            // a correctness requirement rather than a style choice.
+            //
+            // Each drives its own `Engine::query` walk, and a walk's
+            // `MatchShrug` arm resolves candidates on a *speculative*
+            // `RequestState` whose cycle check walks per-chain breadcrumbs
+            // instead of the shared `DepDag`. That is sound only while one such
+            // chain exists at a time — a guarantee `Engine::query` makes *per
+            // walk* (its arm sits in the consumer of its own fan-out) and
+            // therefore cannot make across walks. `Engine::query`'s own comment
+            // names this command as the way the guarantee gets broken.
+            //
+            // Two chains at once are mutually invisible, and both consequences
+            // reach a build definition: `mem_spec`/`mem_def` are shared and keyed
+            // by addr, so whichever chain creates the cell decides which provider
+            // resolved the addr — and `hashin` folds `def.driver`, so the race
+            // picks the cache key. And two chains that resolve each other close a
+            // cycle neither can see, which hangs where the serial path reported an
+            // error. Both are reachable here: unscoped, checks 2 and 3 run the
+            // *same* `TreeOutputTo("")` matcher, which shrugs at the addr *and*
+            // the spec level, so both walks drive `get_spec` and `get_def`
+            // speculatively over the whole workspace.
+            //
+            // Serialising costs much less than three times one walk: the three
+            // share this request's memoizers, so the second and third walk hit
+            // cells the first already filled. It is the *speculative chains* that
+            // must not overlap, not the work they memoize.
+            //
+            // Every result is bound rather than `?`-propagated, so a failing
+            // check never short-circuits the others and `finish` reports all of
+            // them at once.
+
             // 1. Link every in-scope target: parse + resolve its runtime inputs.
             //    No execution — proves the graph is well-formed.
-            let link_fut = enclose!((engine, rs, matcher) async move {
+            let link_res: anyhow::Result<()> = async {
                 let addrs: Vec<Addr> = Arc::clone(&engine)
                     .query(rs.clone(), &matcher)
                     .try_collect()
@@ -100,22 +132,23 @@ impl App for ValidateApp {
                     })
                 });
                 // Always aggregate: validate reports every broken target, not
-                // just the first one to fail.
+                // just the first one to fail. This fan-out is genuinely
+                // concurrent and stays so — it resolves real deps on `rs`, not
+                // speculative candidates, so it starts no chain.
                 crate::engine::fanout::join_all_failable(futs, false).await?;
-                Ok::<(), anyhow::Error>(())
-            });
+                Ok(())
+            }
+            .await;
 
             // 2. Detect overlapping `codegen = copy` outputs.
-            let overlap_fut = enclose!((engine, rs) async move {
-                Arc::clone(&engine)
-                    .codegen_copy_overlaps(rs.clone(), &overlap_matcher)
-                    .await
-            });
+            let overlap_res = Arc::clone(&engine)
+                .codegen_copy_overlaps(rs.clone(), &overlap_matcher)
+                .await;
 
             // 3. Verify `.gitignore` is up to date (whole-workspace runs only).
-            let gitignore_fut = enclose!((engine, rs) async move {
+            let gitignore_res: anyhow::Result<bool> = async {
                 if scoped {
-                    return Ok::<bool, anyhow::Error>(false);
+                    return Ok(false);
                 }
                 let entries = Arc::clone(&engine)
                     .codegen_copy_gitignore_patterns(
@@ -131,13 +164,8 @@ impl App for ValidateApp {
                 };
                 let want = gitignore::render(&existing, &entries);
                 Ok(want != existing) // true = stale
-            });
-
-            // `join!` (not `try_join!`) so a failing check never short-circuits
-            // the others — every check runs to completion and `finish` reports
-            // all of their failures at once.
-            let (link_res, overlap_res, gitignore_res) =
-                tokio::join!(link_fut, overlap_fut, gitignore_fut);
+            }
+            .await;
 
             let overlap_res = overlap_res.map(|overlaps| {
                 overlaps
