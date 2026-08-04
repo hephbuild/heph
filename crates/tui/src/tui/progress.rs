@@ -1071,18 +1071,39 @@ impl BuildState {
         ))
     }
 
+    /// Whether the [`CountScope::All`] total can still grow — i.e. whether it is
+    /// rendered with a `~`. True while the matcher is still streaming (more
+    /// top-level targets to come) or anything is in flight (that target can still
+    /// pull in deps not yet observed). `O(1)`; runs on every frame.
+    ///
+    /// A walk that never completed (failed or cancelled) leaves `matched_seen`
+    /// set and `matched_complete` clear, so the `~` persists into the final
+    /// summary — deliberately, and matching [`CountScope::Matched`]: the set
+    /// never became final, so the denominator never became exact.
+    fn all_total_provisional(&self) -> bool {
+        !self.in_flight_results.is_empty() || (self.matched_seen && !self.matched_complete)
+    }
+
     /// The count fields for one frame — see [`Counts`]. `O(1)`: every field is
     /// either a `len()` or a counter folded in [`BuildState::apply`], so this is
     /// four reads and the `format!`s, with no walk of any target set.
     pub fn counts(&self, scope: CountScope) -> Counts {
         let (done, total) = match scope {
             // All-targets scope: every observed target (`finished ∪ in_flight`),
-            // with the finished count over that running total. No `~` — the total
-            // grows as deps stream rather than resolving to a fixed matched set.
+            // with the finished count over that running total. The `~` means the
+            // same thing here as in the matched scope — this denominator is not
+            // final — and it is if anything *more* provisional: it grows both
+            // while the matcher streams and as deps are discovered under a
+            // running target.
             CountScope::All => {
                 let done = self.finished.len();
                 let total = done + self.in_flight_results.len();
-                (done.to_string(), Some(total.to_string()))
+                let tilde = if self.all_total_provisional() {
+                    "~"
+                } else {
+                    ""
+                };
+                (done.to_string(), Some(format!("{tilde}{total}")))
             }
             CountScope::Matched => match self.matched_progress() {
                 Some((done, total, complete)) => {
@@ -3140,10 +3161,72 @@ mod tests {
         assert_eq!(cached, "1 cached", "matched cached");
 
         // All scope: every observed target — both finished deps over the running
-        // total (incl. the in-flight one), and both cache hits.
+        // total (incl. the in-flight one), and both cache hits. The total is
+        // provisional while `//run:y` runs (it can still pull in deps), so `~`.
         let (done, cached, _) = s.count_fields(CountScope::All);
-        assert_eq!(done, "2 / 3 done", "all done");
+        assert_eq!(done, "2 / ~3 done", "all done");
         assert_eq!(cached, "2 cached", "all cached");
+    }
+
+    #[test]
+    fn all_scope_total_carries_a_tilde_until_nothing_more_can_arrive() {
+        let mut s = BuildState::new();
+
+        // Query still streaming: the matched set is provisional, and so is the
+        // all-targets total that grows out of it.
+        s.apply(&ev(0, matched(&["//a:b"], false)));
+        assert_eq!(
+            s.count_fields(CountScope::All).0,
+            "0 / ~0 done",
+            "streaming"
+        );
+
+        // Matcher resolved, but a target is still running — it can still pull in
+        // deps that have not been observed yet, so the total stays provisional.
+        s.apply(&ev(1, matched(&[], true)));
+        s.apply(&ev(2, result_start("//a:b")));
+        assert_eq!(
+            s.count_fields(CountScope::All).0,
+            "0 / ~1 done",
+            "in flight"
+        );
+
+        // Everything finished: no further target can appear, so the `~` drops.
+        s.apply(&ev(3, result_end("//a:b", None)));
+        assert_eq!(s.count_fields(CountScope::All).0, "1 / 1 done", "settled");
+    }
+
+    #[test]
+    fn all_scope_tilde_survives_a_walk_that_never_completed() {
+        // A failed/cancelled matcher walk never emits `complete: true`, so the
+        // set never became final — the denominator must not read as exact once
+        // the run stops, in either scope.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, matched(&["//a:b"], false)));
+        s.apply(&ev(1, result_start("//a:b")));
+        s.apply(&ev(2, result_end("//a:b", Some("boom".into()))));
+
+        assert_eq!(s.count_fields(CountScope::All).0, "1 / ~1 done", "all");
+        assert_eq!(
+            s.count_fields(CountScope::Matched).0,
+            "1 / ~1 done",
+            "matched"
+        );
+    }
+
+    #[test]
+    fn all_scope_has_no_tilde_when_no_matched_event_ever_arrives() {
+        // Some entry points emit no `Matched` at all. Nothing is in flight at the
+        // end, and no matched stream was ever claimed, so the total is exact.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, result_start("//a:b")));
+        assert_eq!(
+            s.count_fields(CountScope::All).0,
+            "0 / ~1 done",
+            "in flight"
+        );
+        s.apply(&ev(1, result_end("//a:b", None)));
+        assert_eq!(s.count_fields(CountScope::All).0, "1 / 1 done", "settled");
     }
 
     /// The three count fields as the split header renders them, in header order.
