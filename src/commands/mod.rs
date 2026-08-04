@@ -1,5 +1,6 @@
 pub mod approval;
 pub mod bootstrap;
+pub mod clean;
 pub mod completion;
 pub mod errors;
 pub mod gendocs;
@@ -78,6 +79,24 @@ pub enum Commands {
     /// Validate all targets (link graph + check codegen outputs)
     #[command(visible_alias = "v")]
     Validate(validate::ValidateArgs),
+    /// Remove entries from the local cache
+    ///
+    /// Deletes every locally cached revision of the selected target(s) — all of
+    /// them, whatever their `cache.history` budget and whether or not the target
+    /// still exists. Nothing is resolved, so an entry whose BUILD file is already
+    /// gone is cleanable too. With no argument, the whole local cache is cleared.
+    ///
+    /// Selection is by address or package only; use `heph tool gc` for the
+    /// reachability-driven sweep that reclaims space without being told what.
+    ///
+    /// Examples:
+    ///
+    /// `heph clean` — clear the entire local cache
+    ///
+    /// `heph clean //cmd/server:bin` — one target (that exact variant)
+    ///
+    /// `heph clean //cmd/...` — every cached target under a subtree
+    Clean(clean::CleanArgs),
     /// Prints version
     ///
     /// Prints the heph version string and exits.
@@ -99,6 +118,7 @@ impl Commands {
             Commands::Inspect(args) => args.execute(sink, global),
             Commands::Query(args) => query::execute(args, sink, global),
             Commands::Validate(args) => validate::execute(args, sink, global),
+            Commands::Clean(args) => clean::execute(args, sink, global),
             Commands::Version(args) => version::execute(args),
             Commands::Tool(args) => args.execute(sink, global),
             Commands::GenDocs(args) => gendocs::execute(args),

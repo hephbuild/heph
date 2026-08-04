@@ -2242,9 +2242,10 @@ impl CIAppView for CiProgressView {
     }
 }
 
-/// CI (non-TUI) view for `heph gc`: folds the gc sweep into a [`GcHeader`] and
-/// logs a single summary line at the end. Per-target progress is silent (the
-/// command also prints its `GcStats` on completion).
+/// CI (non-TUI) view for a cache sweep (`heph tool gc`, `heph clean`): folds it
+/// into a [`GcHeader`] and logs a single summary line at the end, prefixed with
+/// the header's label so two commands sharing this view stay distinguishable in
+/// a log. Per-target progress is silent.
 pub struct GcCiView {
     header: GcHeader,
 }
@@ -2267,7 +2268,7 @@ impl CIAppView for GcCiView {
     }
 
     fn finish(&self) {
-        tracing::info!("gc: {}", self.header.segment());
+        tracing::info!("{}: {}", self.header.label(), self.header.segment());
     }
 }
 
