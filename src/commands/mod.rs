@@ -83,11 +83,15 @@ pub enum Commands {
     ///
     /// Deletes every locally cached revision of the selected target(s) — all of
     /// them, whatever their `cache.history` budget and whether or not the target
-    /// still exists. Nothing is resolved, so an entry whose BUILD file is already
-    /// gone is cleanable too. With no argument, the whole local cache is cleared.
+    /// still exists. Use `heph tool gc` for the reachability-driven sweep that
+    /// reclaims space without being told what.
     ///
-    /// Selection is by address or package only; use `heph tool gc` for the
-    /// reachability-driven sweep that reclaims space without being told what.
+    /// Targets are selected exactly as for `run`: an address, a label followed
+    /// by a package matcher, or `-e '<expr>'` (see `--help`). Omit the selection
+    /// entirely to clear the whole local cache. A selection that needs no
+    /// resolution — an address, or `all <package matcher>` — is answered from
+    /// the cache alone: no BUILD files are read, so an entry whose target has
+    /// since been deleted is still cleanable. `label(...)` resolves the graph.
     ///
     /// Examples:
     ///
@@ -95,7 +99,10 @@ pub enum Commands {
     ///
     /// `heph clean //cmd/server:bin` — one target (that exact variant)
     ///
-    /// `heph clean //cmd/...` — every cached target under a subtree
+    /// `heph clean all //cmd/...` — every cached target under a subtree
+    ///
+    /// `heph clean test //cmd/...` — every target labelled `test`
+    #[command(visible_alias = "c")]
     Clean(clean::CleanArgs),
     /// Prints version
     ///

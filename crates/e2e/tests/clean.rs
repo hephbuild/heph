@@ -165,6 +165,66 @@ async fn a_package_matcher_cleans_its_subtree_and_nothing_else() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn a_label_selection_cleans_what_run_would_have_selected() -> anyhow::Result<()> {
+    // `heph clean test //...` — the form that cannot be answered from cache keys,
+    // because a label set only exists after the target is resolved. It must select
+    // the same targets `heph run test //...` would.
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "lbl",
+        r#"
+target(name = "tested", driver = "bash", run = "printf 'a' > $OUT", out = "out.txt", labels = ["test"])
+target(name = "plain", driver = "bash", run = "printf 'b' > $OUT", out = "out.txt")
+"#,
+    );
+    run_and_settle(&ws, "//lbl:tested").await?;
+    run_and_settle(&ws, "//lbl:plain").await?;
+
+    let by_label = Matcher::And(vec![
+        Matcher::Label("test".to_string()),
+        Matcher::PackagePrefix(PkgBuf::from("")),
+    ]);
+    let stats = clean(&ws, &by_label).await?;
+    assert_eq!(stats.targets_matched, 1, "only the labelled one: {stats:?}");
+    assert_eq!(stats.revisions_removed, 1, "{stats:?}");
+
+    // `//lbl:plain` carries no `test` label, so its entry is still there.
+    let rest = clean(&ws, &Matcher::PackagePrefix(PkgBuf::from(""))).await?;
+    assert_eq!(
+        rest.revisions_removed, 1,
+        "exactly the unlabelled target's entry survived: {rest:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_label_selection_cannot_reach_an_entry_the_graph_no_longer_defines() -> anyhow::Result<()>
+{
+    // The cost of asking a question only a definition can answer: with the BUILD
+    // file gone there is no label set to test, so the entry is unreachable by
+    // label — and reachable by the addr-only forms, which is the documented way
+    // out. Pinned because it is the one place the two paths genuinely differ.
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "orphan",
+        r#"target(name = "t", driver = "bash", run = "printf 'c' > $OUT", out = "out.txt", labels = ["test"])"#,
+    );
+    run_and_settle(&ws, "//orphan:t").await?;
+    std::fs::remove_file(ws.dir.path().join("orphan/BUILD"))?;
+
+    let by_label = Matcher::And(vec![
+        Matcher::Label("test".to_string()),
+        Matcher::PackagePrefix(PkgBuf::from("")),
+    ]);
+    let missed = clean(&ws, &by_label).await?;
+    assert_eq!(missed.targets_matched, 0, "{missed:?}");
+
+    let got = clean(&ws, &Matcher::PackagePrefix(PkgBuf::from("orphan"))).await?;
+    assert_eq!(got.revisions_removed, 1, "{got:?}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn clean_evicts_an_entry_whose_target_no_longer_exists() -> anyhow::Result<()> {
     // `clean` resolves nothing, so a cached entry outlives its BUILD file and is
     // still cleanable — which is exactly the state a user reaches by deleting or

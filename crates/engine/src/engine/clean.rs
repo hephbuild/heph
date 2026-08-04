@@ -7,22 +7,28 @@
 //! regardless of its history budget. It is the "I don't trust this cache entry,
 //! throw it away" lever.
 //!
-//! Two consequences follow, and they are what make `clean` cheap where GC is
-//! not:
+//! The selection surface is `run`'s and `query`'s — an address, a
+//! `<label> <package matcher>` pair, or a `-e` expression — so a target set is
+//! written the same way whichever verb consumes it. What differs is how the
+//! selection is *evaluated*, and the difference is worth a paragraph:
 //!
-//! - **Nothing is resolved.** GC has to ask each provider whether a target still
-//!   exists and each driver what its `cache.history` is — a full spec/def walk
-//!   that can run Starlark and execute uncacheable deps. `clean` deletes
-//!   everything it matches, so it needs neither answer and never leaves the
-//!   cache. A cache entry for a target whose `BUILD` file has since been deleted
-//!   is therefore still cleanable, which is precisely when it is wanted.
-//! - **Selection is addr-only.** With no def in hand there is no label set and no
-//!   output paths, so `label()` / `tree_output()` cannot be evaluated. Those are
-//!   rejected up front by [`ensure_addr_only`] rather than silently matching
-//!   nothing — a `clean` that quietly deleted zero entries is the worst possible
-//!   outcome for a command whose whole job is to make a stale entry go away.
+//! - **An addr-only selection resolves nothing.** `//pkg:name`, `all //pkg/...`,
+//!   `-e '//a/... && !//vendor/...'` — every one of these is decidable from an
+//!   address alone, so `clean` evaluates the matcher straight against the cache's
+//!   own keys. No provider walk, no `Driver::parse`, no Starlark. This is the
+//!   common case and it is the fast one. It is also the *only* path that can
+//!   reach an entry whose `BUILD` file has since been deleted — precisely the
+//!   state a rename leaves behind, and precisely when you want the entry gone.
+//! - **`label()` / `tree_output()` need the graph**, because a label set and a
+//!   target's output paths exist only after resolution. There, `clean` asks
+//!   [`Engine::query`] for the matching addrs — the same walk `heph run <label>
+//!   <pkg>` performs, so the selection means exactly what it means there — and
+//!   intersects the result with what is actually cached. A target the graph no
+//!   longer defines cannot be selected this way; that is inherent to asking a
+//!   question only its definition can answer, and the addr-only forms remain the
+//!   way to reach it.
 //!
-//! Deletion is serialized through each addr's
+//! Either way the deletion itself is serialized through each addr's
 //! [`ResultLock`](crate::engine::result_lock::ResultLock) write lock, exactly as
 //! GC's phase 2 is, so `clean` can never pull a revision out from under a
 //! concurrent reader or builder in this or another process.
@@ -30,8 +36,10 @@
 use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
 use anyhow::{Context, Result};
+use futures::TryStreamExt;
 use hmodel::htaddr::{Addr, parse_addr};
 use hmodel::htmatcher::{MatchResult, Matcher};
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -61,38 +69,35 @@ struct TargetOutcome {
     bytes: u64,
 }
 
-/// Reject a matcher whose evaluation would need a target's spec or def.
+/// Whether every node of `m` can be decided from an address alone — i.e. whether
+/// the cache's own keys are enough and the graph need not be walked.
 ///
-/// `clean` sees only the addrs the local cache knows about, so
-/// [`Matcher::Label`] and [`Matcher::TreeOutputTo`] — both of which answer
-/// [`MatchResult::MatchShrug`] on an addr alone — cannot be decided here. They
-/// are an error, not a silent non-match: the user asked for entries to be
-/// deleted, and "0 removed" would read as "there was nothing to clean".
-fn ensure_addr_only(m: &Matcher) -> Result<()> {
+/// [`Matcher::Label`] and [`Matcher::TreeOutputTo`] are the two that cannot:
+/// both answer [`MatchResult::MatchShrug`] on an addr, because a label set and a
+/// target's output paths only exist after `Driver::parse`. Decided by node kind
+/// on the whole tree, so a composite of allowed kinds (`//a/... && !//b/...`)
+/// still takes the fast path.
+fn is_addr_only(m: &Matcher) -> bool {
     match m {
-        Matcher::Label(_) => anyhow::bail!(
-            "`clean` selects by address or package only; `label(...)` needs each target's definition, which a cached entry does not carry"
-        ),
-        Matcher::TreeOutputTo(_) => anyhow::bail!(
-            "`clean` selects by address or package only; `tree_output(...)` needs each target's definition, which a cached entry does not carry"
-        ),
-        Matcher::Or(terms) | Matcher::And(terms) => terms.iter().try_for_each(ensure_addr_only),
-        Matcher::Not(inner) => ensure_addr_only(inner),
-        Matcher::Addr(_) | Matcher::Package(_) | Matcher::PackagePrefix(_) => Ok(()),
+        Matcher::Label(_) | Matcher::TreeOutputTo(_) => false,
+        Matcher::Or(terms) | Matcher::And(terms) => terms.iter().all(is_addr_only),
+        Matcher::Not(inner) => is_addr_only(inner),
+        Matcher::Addr(_) | Matcher::Package(_) | Matcher::PackagePrefix(_) => true,
     }
 }
 
 impl Engine {
     /// Delete every locally cached revision of every target `matcher` selects.
     ///
-    /// `matcher` is evaluated against the addr alone (see [`ensure_addr_only`]);
-    /// pass `//...` ([`Matcher::PackagePrefix`] of the root package) to clean the
+    /// Pass `//...` ([`Matcher::PackagePrefix`] of the root package) to clean the
     /// whole local cache.
     ///
-    /// Only [`MatchResult::MatchYes`] selects. A `MatchShrug` is unreachable once
-    /// `ensure_addr_only` has passed, and treating it as a non-match keeps this
-    /// side of the invariant safe even if a new matcher variant lands: `clean`
-    /// deletes, so an undecidable predicate must skip, never guess.
+    /// The selection is evaluated against the cache's own keys when the matcher
+    /// is decidable from an address ([`is_addr_only`]), and against the resolved
+    /// graph otherwise — see the module docs for why, and for what each path can
+    /// reach. Only [`MatchResult::MatchYes`] selects on the addr-only path: a
+    /// `MatchShrug` is unreachable there today, and skipping rather than guessing
+    /// keeps that safe if a new matcher variant lands, since this code deletes.
     ///
     /// Per-target failures are logged and counted in
     /// [`CleanStats::errored`] — the run never aborts partway and leaves the user
@@ -102,7 +107,13 @@ impl Engine {
         rs: Arc<RequestState>,
         matcher: &Matcher,
     ) -> Result<CleanStats> {
-        ensure_addr_only(matcher)?;
+        // `None` — decide per cache key, no resolution. `Some(set)` — the graph
+        // was walked and this is what it matched.
+        let resolved = if is_addr_only(matcher) {
+            None
+        } else {
+            Some(Arc::clone(&self).resolve_selection(&rs, matcher).await?)
+        };
 
         let targets = self
             .local_cache
@@ -131,7 +142,11 @@ impl Engine {
                     continue;
                 }
             };
-            if matcher.matches_addr(&addr) != MatchResult::MatchYes {
+            let selected = match &resolved {
+                Some(addrs) => addrs.contains(&addr),
+                None => matcher.matches_addr(&addr) == MatchResult::MatchYes,
+            };
+            if !selected {
                 continue;
             }
             stats.targets_matched += 1;
@@ -151,6 +166,39 @@ impl Engine {
         }
 
         Ok(stats)
+    }
+
+    /// Walk the graph for a selection the cache keys cannot decide, returning the
+    /// addrs it matched.
+    ///
+    /// This is [`Engine::query`] — the same walk `heph query` and `heph run
+    /// <label> <pkg>` drive — so `label(...)` selects here exactly what it
+    /// selects there. Collected in full rather than streamed into the delete
+    /// loop: the cache enumeration is the other half of the intersection and it
+    /// is a synchronous iterator, so one of the two has to be materialized, and
+    /// the graph side is the one that must complete anyway before a partial
+    /// selection could be trusted.
+    ///
+    /// An error propagates instead of cleaning the prefix that resolved. A
+    /// half-computed selection can only *under*-delete, which is safe but silent
+    /// — and "I ran clean and it kept some entries" is a much worse thing to
+    /// debug than a run that says it failed.
+    async fn resolve_selection(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        matcher: &Matcher,
+    ) -> Result<FxHashSet<Addr>> {
+        let stream = self.query(rs.clone(), matcher);
+        tokio::pin!(stream);
+        let mut addrs = FxHashSet::default();
+        while let Some(addr) = stream
+            .try_next()
+            .await
+            .context("clean: resolving the selection")?
+        {
+            addrs.insert(addr);
+        }
+        Ok(addrs)
     }
 
     /// Delete every revision of one target, under its write lock.
@@ -451,36 +499,61 @@ mod tests {
         assert!(present(&engine, &addr("t"), "h1"), "nothing was touched");
     }
 
-    #[tokio::test]
-    async fn a_matcher_needing_a_def_is_rejected_rather_than_matching_nothing() {
-        let (engine, _dir) = test_engine();
-        write_revision(&engine, &addr("t"), "h1", 100, &["out.tar"]);
+    #[test]
+    fn only_label_and_tree_output_need_the_graph() {
+        // Which path a selection takes is decided by node kind over the whole
+        // tree — the property `clean` relies on to skip resolution for every
+        // form a user can write without naming a label.
+        assert!(is_addr_only(&everything()));
+        assert!(is_addr_only(&Matcher::Addr(addr("t"))));
+        assert!(is_addr_only(&Matcher::And(vec![
+            everything(),
+            Matcher::Not(Box::new(Matcher::PackagePrefix(PkgBuf::from("vendor")))),
+        ])));
 
-        for m in [
+        assert!(!is_addr_only(&Matcher::Label("test".to_string())));
+        assert!(!is_addr_only(&Matcher::TreeOutputTo(PkgBuf::from("gen"))));
+        // Nested under any combinator, it still forces the graph walk.
+        assert!(!is_addr_only(&Matcher::Not(Box::new(Matcher::Label(
+            "test".to_string()
+        )))));
+        assert!(!is_addr_only(&Matcher::And(vec![
+            everything(),
             Matcher::Label("test".to_string()),
-            Matcher::Not(Box::new(Matcher::Label("test".to_string()))),
-            Matcher::And(vec![everything(), Matcher::TreeOutputTo(PkgBuf::from("g"))]),
-        ] {
-            let rs = engine.new_state();
-            let err = Arc::clone(&engine)
-                .clean(rs, &m)
-                .await
-                .expect_err("must be rejected");
-            let chain = format!("{err:#}");
-            assert!(
-                chain.contains("address or package only"),
-                "expected a selection error, got: {chain}"
-            );
-        }
-        // Rejected before anything was deleted.
-        assert!(present(&engine, &addr("t"), "h1"));
+        ])));
     }
 
     #[tokio::test]
-    async fn a_nested_addr_only_matcher_is_accepted() {
-        // The guard rejects by *node kind*, so a composite of allowed kinds must
-        // still pass — otherwise `!//vendor/...`-shaped selections would be
-        // rejected along with the label ones.
+    async fn a_selection_needing_the_graph_is_answered_by_the_graph() {
+        // This engine has no providers, so the graph is empty while the cache is
+        // not. A `label(...)` selection must therefore match nothing — and the
+        // package matcher over the very same cache must still clean, which is
+        // what proves the addr-only path never consults the graph at all.
+        let (engine, _dir) = test_engine();
+        let a = addr("t");
+        write_revision(&engine, &a, "h1", 100, &["out.tar"]);
+
+        let rs = engine.new_state();
+        let by_label = Arc::clone(&engine)
+            .clean(rs, &Matcher::Label("test".to_string()))
+            .await
+            .expect("clean by label");
+        assert_eq!(by_label.targets_matched, 0, "{by_label:?}");
+        assert!(present(&engine, &a, "h1"), "nothing was deleted");
+
+        let rs = engine.new_state();
+        let by_pkg = Arc::clone(&engine)
+            .clean(rs, &Matcher::Package(PkgBuf::from("pkg")))
+            .await
+            .expect("clean by package");
+        assert_eq!(by_pkg.revisions_removed, 1, "{by_pkg:?}");
+        assert!(!present(&engine, &a, "h1"));
+    }
+
+    #[tokio::test]
+    async fn a_nested_addr_only_matcher_still_skips_the_graph() {
+        // Same reasoning as above: this engine's graph is empty, so a selection
+        // that cleaned anything here provably never asked it.
         let (engine, _dir) = test_engine();
         let keep = addr_in("vendor/x", "t");
         let drop = addr_in("app", "t");

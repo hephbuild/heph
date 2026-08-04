@@ -1,49 +1,56 @@
 use std::sync::Arc;
 
-use anyhow::Context;
 use async_trait::async_trait;
 use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
+use crate::commands::run::QUERY_LANG_HELP;
+use crate::commands::utils::resolve_matcher;
 use crate::engine::{CleanStats, Engine, get_cwp};
 use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
+use crate::htquery;
 use crate::tui::{self, App, AppContext, LogSink, human_bytes};
-use crate::{htaddr, htpkg, htquery};
 
 #[derive(clap::Args, Clone)]
-#[command(override_usage = "heph clean [<PACKAGE_MATCHER>|<TARGET_ADDRESS>]")]
+#[command(
+    override_usage = "heph clean\n       heph clean <TARGET_ADDRESS>\n       heph clean <LABEL> <PACKAGE_MATCHER>\n       heph clean -e <EXPR>",
+    after_long_help = QUERY_LANG_HELP
+)]
 pub struct CleanArgs {
-    /// Package matcher (`//pkg`, `//pkg/...`, `./...`) or target address
-    /// (`//pkg:name`, `:name`). Defaults to `//...` — the whole local cache.
-    #[arg(value_name = "PACKAGE_MATCHER/TARGET_ADDRESS", add = ArgValueCompleter::new(complete_target_addr))]
-    pub target: Option<String>,
+    /// Target address (e.g., //pkg:name) OR Label. Omit to clean everything.
+    #[arg(value_name = "TARGET_ADDRESS/LABEL", add = ArgValueCompleter::new(complete_target_addr))]
+    pub arg1: Option<String>,
+    /// Package matcher (only if first argument is a Label)
+    #[arg(value_name = "PACKAGE_MATCHER")]
+    pub arg2: Option<String>,
+    /// Select targets with a query expression, e.g. -e '//pkg/... && !//vendor/...'.
+    /// Supports &&, ||, !, parentheses, and the label()/tree_output() functions.
+    /// Mutually exclusive with the positional TARGET arguments.
+    #[arg(
+        short = 'e',
+        long = "expr",
+        value_name = "EXPR",
+        conflicts_with = "arg1"
+    )]
+    pub expr: Option<String>,
 }
 
-/// Resolve the positional argument into the addr-only matcher `Engine::clean`
-/// takes. Absent, it is `//...`: the whole local cache.
+/// Resolve the selection, which is `run`'s and `query`'s — with one difference:
+/// omitting it entirely is legal and means `//...`, the whole local cache.
 ///
-/// The two forms are told apart by the `:` an address requires — see
-/// `parse_addr_with_base`, where every accepted form (`//pkg:name`, `:name`,
-/// `./sub:name`) carries one and a bare path deliberately does not. Picking the
-/// parser up front rather than trying both means a malformed input gets the
-/// diagnostic for the form the user was evidently writing, instead of whichever
-/// of two parsers happened to fail last.
-fn resolve_selection(target: Option<&str>, cwp: &PkgBuf) -> anyhow::Result<Matcher> {
-    let Some(target) = target else {
+/// `allow_all` is on, as it is for `query` and not for `run`. `all //some/dir` is
+/// how you name a package without naming a label, and it is the form that keeps
+/// `clean` off the graph entirely (`run` has no such stake — it must resolve
+/// whatever it selects, so the shorthand buys it nothing).
+fn selection(args: &CleanArgs, cwp: &PkgBuf) -> anyhow::Result<Matcher> {
+    if args.arg1.is_none() && args.expr.is_none() {
         // `//...` — every package, so every cached addr.
         return Ok(Matcher::PackagePrefix(PkgBuf::from("")));
-    };
-    if target.contains(':') {
-        let addr = htaddr::parse_addr_with_base(target, cwp)
-            .with_context(|| format!("parse {target} as a target address"))?;
-        return Ok(Matcher::Addr(addr));
     }
-    htpkg::parse(target, cwp).with_context(|| {
-        format!("parse {target} as a package matcher (a target address must name a target, e.g. {target}:name)")
-    })
+    resolve_matcher(&args.expr, &args.arg1, &args.arg2, cwp, true)
 }
 
 struct CleanApp {
@@ -127,7 +134,7 @@ async fn execute_async(
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
-    let matcher = resolve_selection(args.target.as_deref(), &cwp)?;
+    let matcher = selection(&args, &cwp)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = CleanApp {
         engine,
@@ -141,16 +148,31 @@ async fn execute_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Subcommand as _;
+
+    /// The positional/expr forms, as clap would fill them. The `<LABEL>
+    /// <PACKAGE_MATCHER>` pair is deliberately absent: `matcher_from_args`
+    /// resolves that one against the *process* cwd via `engine::get_cwp()`, so it
+    /// needs a real workspace and is covered by the e2e suite instead.
+    fn args(arg1: Option<&str>, expr: Option<&str>) -> CleanArgs {
+        CleanArgs {
+            arg1: arg1.map(str::to_string),
+            arg2: None,
+            expr: expr.map(str::to_string),
+        }
+    }
 
     #[test]
     fn no_argument_selects_the_whole_cache() {
-        let m = resolve_selection(None, &PkgBuf::from("some/pkg")).unwrap();
+        // The one place `clean` departs from `run`: an omitted selection is legal
+        // and means everything.
+        let m = selection(&args(None, None), &PkgBuf::from("some/pkg")).unwrap();
         assert_eq!(m, Matcher::PackagePrefix(PkgBuf::from("")));
     }
 
     #[test]
     fn absolute_address_selects_exactly_that_target() {
-        let m = resolve_selection(Some("//foo/bar:baz"), &PkgBuf::from("")).unwrap();
+        let m = selection(&args(Some("//foo/bar:baz"), None), &PkgBuf::from("")).unwrap();
         match m {
             Matcher::Addr(a) => {
                 assert_eq!(a.package.as_str(), "foo/bar");
@@ -162,7 +184,7 @@ mod tests {
 
     #[test]
     fn colon_name_resolves_against_the_current_package() {
-        let m = resolve_selection(Some(":build"), &PkgBuf::from("cmd/server")).unwrap();
+        let m = selection(&args(Some(":build"), None), &PkgBuf::from("cmd/server")).unwrap();
         match m {
             Matcher::Addr(a) => {
                 assert_eq!(a.package.as_str(), "cmd/server");
@@ -173,10 +195,12 @@ mod tests {
     }
 
     #[test]
-    fn an_addr_with_args_is_still_an_address() {
-        // Variant args carry no `:`, but the target reference does — the form is
-        // decided by the address's colon, not by what follows it.
-        let m = resolve_selection(Some("//go/std:build@variant=race"), &PkgBuf::from("")).unwrap();
+    fn a_variant_is_part_of_the_address() {
+        let m = selection(
+            &args(Some("//go/std:build@variant=race"), None),
+            &PkgBuf::from(""),
+        )
+        .unwrap();
         match m {
             Matcher::Addr(a) => {
                 assert_eq!(a.name, "build");
@@ -187,40 +211,46 @@ mod tests {
     }
 
     #[test]
-    fn package_matcher_forms_are_packages_not_addresses() {
-        let base = PkgBuf::from("cmd/server");
-        assert_eq!(
-            resolve_selection(Some("//foo/bar"), &base).unwrap(),
-            Matcher::Package(PkgBuf::from("foo/bar"))
-        );
-        assert_eq!(
-            resolve_selection(Some("//foo/..."), &base).unwrap(),
-            Matcher::PackagePrefix(PkgBuf::from("foo"))
-        );
-        assert_eq!(
-            resolve_selection(Some("//..."), &base).unwrap(),
-            Matcher::PackagePrefix(PkgBuf::from(""))
-        );
-        assert_eq!(
-            resolve_selection(Some("./..."), &base).unwrap(),
-            Matcher::PackagePrefix(PkgBuf::from("cmd/server"))
-        );
+    fn an_expression_selects_the_same_way_it_does_for_run() {
+        let m = selection(
+            &args(None, Some("//foo/... && !//foo/vendor/...")),
+            &PkgBuf::from(""),
+        )
+        .unwrap();
+        match m {
+            Matcher::And(terms) => {
+                assert_eq!(terms.len(), 2);
+                assert!(matches!(terms[0], Matcher::PackagePrefix(_)));
+                assert!(matches!(terms[1], Matcher::Not(_)));
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
     }
 
     #[test]
-    fn a_bare_word_is_reported_as_a_package_matcher_failure() {
-        // No `:`, so it is read as a package reference — and the error points at
-        // both forms rather than leaving the user to guess which parser spoke.
-        let err = resolve_selection(Some("foo"), &PkgBuf::from("")).unwrap_err();
-        let chain = format!("{err:#}");
-        assert!(chain.contains("package matcher"), "{chain}");
-        assert!(chain.contains("foo:name"), "{chain}");
+    fn a_label_expression_is_accepted_and_left_for_the_engine_to_resolve() {
+        // Not rejected at the CLI: `Engine::clean` answers this one from the
+        // graph. All the CLI owes is the parse.
+        let m = selection(&args(None, Some("label(test)")), &PkgBuf::from("")).unwrap();
+        assert!(matches!(m, Matcher::Label(_)), "got {m:?}");
     }
 
     #[test]
-    fn a_malformed_address_gets_the_address_diagnostic() {
-        let err = resolve_selection(Some("nope:thing"), &PkgBuf::from("")).unwrap_err();
+    fn positional_and_expr_are_mutually_exclusive() {
+        // Enforced by clap, the same `conflicts_with` `run` and `query` use, so
+        // the two selections can never both be live.
+        let err = crate::commands::Commands::augment_subcommands(clap::Command::new("heph"))
+            .try_get_matches_from(["heph", "clean", "//a:b", "-e", "//c/..."])
+            .expect_err("must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn a_bare_word_is_not_an_address() {
+        // Same diagnostic `run` gives: a relative reference has to be
+        // unmistakable.
+        let err = selection(&args(Some("foo"), None), &PkgBuf::from("")).unwrap_err();
         let chain = format!("{err:#}");
-        assert!(chain.contains("target address"), "{chain}");
+        assert!(chain.contains("relative references must start"), "{chain}");
     }
 }
