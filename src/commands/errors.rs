@@ -221,6 +221,30 @@ pub fn fold_batch(
     .into())
 }
 
+/// Reject a run whose selector chose nothing.
+///
+/// `heph run //pkg:gone` already exits 1 — the addr arm resolves the addr and
+/// gets `TargetNotFound`. Only the *selector* arm was silent: a label no target
+/// carries, an unbuilt variant, or a scope that misses the tree produced an
+/// empty batch with no errors, which folded to `Ok` and exited 0. A run that
+/// built nothing is indistinguishable from a run that had nothing to do, which
+/// is how a CI job goes green having done no work.
+///
+/// Scoped to `run`. A `query` that matches nothing is a legitimate answer, and
+/// `validate` over an empty scope has nothing to prove.
+pub fn require_non_empty(
+    results: Vec<Arc<crate::engine::EResult>>,
+) -> anyhow::Result<Vec<Arc<crate::engine::EResult>>> {
+    if results.is_empty() {
+        anyhow::bail!(
+            "no targets matched — nothing was run.\n\
+             Check the selector with `heph query -e '<expr>'`; a label that no target \
+             carries, or a package matcher outside the workspace, matches nothing."
+        );
+    }
+    Ok(results)
+}
+
 macro_rules! finalize {
     ($ctx:expr, $rs:expr, $res:expr $(,)?) => {
         $crate::commands::errors::finalize!($ctx, $rs, $res, _ => { Ok(()) })
@@ -592,6 +616,39 @@ mod tests {
     /// Keep-going failures inside an `Ok` batch must fold into `res` — the
     /// registry normally duplicates them, but an unrecorded class (the
     /// silent-exit-0 lint incident) must still fail the run.
+    #[test]
+    fn empty_result_set_is_a_failed_run() {
+        // The bug: a selector matching nothing folded to `Ok(vec![])` and exited
+        // 0, so a typo'd label or an out-of-scope matcher "succeeded" having
+        // built nothing.
+        let err = require_non_empty(vec![]).err().expect("empty must fail");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("no targets matched"),
+            "the message must say nothing ran, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("heph query"),
+            "and point at how to debug the selector, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_non_empty_result_set_passes_through_untouched() {
+        let batch = crate::engine::BatchResult {
+            ok: vec![],
+            errors: vec![],
+        };
+        // Guard the shape rather than the emptiness: `fold_batch` on a clean
+        // batch is `Ok`, and only `require_non_empty` decides emptiness — so a
+        // future change that makes `fold_batch` itself reject empty would be
+        // caught here as a double rejection.
+        assert!(
+            fold_batch(batch).is_ok(),
+            "fold_batch must not judge emptiness"
+        );
+    }
+
     #[test]
     fn fold_batch_surfaces_keep_going_errors() {
         let batch = crate::engine::BatchResult {

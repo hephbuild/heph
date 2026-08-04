@@ -220,7 +220,10 @@ impl App for RunApp {
                 // NOT `.map(|batch| batch.ok)`: keep-going failures ride
                 // inside the Ok and must fold into `res`, or an error the
                 // registry didn't record exits 0 in silence. See `fold_batch`.
-                .and_then(crate::commands::errors::fold_batch),
+                .and_then(crate::commands::errors::fold_batch)
+                // A selector that chose nothing is a failed run, not a
+                // successful empty one — see `require_non_empty`.
+                .and_then(crate::commands::errors::require_non_empty),
         };
 
         // On success print `--cat-out` / `--list-out`; failures/cancellation are
