@@ -906,8 +906,7 @@ impl ManagedDriver for Driver {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
-        let spec =
-            OciImageSpec::from(req.target_spec.config.clone()).context("parse oci_image config")?;
+        let spec = OciImageSpec::from(&req.target_spec.config).context("parse oci_image config")?;
         let pkg = addr.package.clone();
         let pkg_str = addr.package.as_str();
 
