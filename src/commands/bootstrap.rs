@@ -52,9 +52,13 @@ pub fn block_on<F: Future>(fut: F) -> anyhow::Result<F::Output> {
 /// listener and the TUI's Ctrl+C key handler call `trigger()` on this; the
 /// state machine in `spawn_shutdown_handler` is the single consumer.
 ///
-/// While `SuppressionHandle::set(true)` is in effect (e.g. the TUI is paused
-/// for an interactive prompt), `trigger()` silently drops presses — neither
-/// kernel SIGINT nor TUI Ctrl+C cancels engine work in that window.
+/// While `SuppressionHandle::set(true)` is in effect — only while the TUI has
+/// handed the keyboard to a `--shell` session (`tui::PauseFor::Input`) —
+/// `trigger()` silently drops presses, so neither kernel SIGINT nor TUI Ctrl+C
+/// cancels engine work in that window. A pause that merely borrows the terminal
+/// for *output* (a diagnostic, a stdout flush, a target running with the
+/// terminal attached) must not suppress: the key handler is not reading while
+/// paused, so dropping the SIGINT too leaves the run with no Ctrl-C at all.
 // The shutdown signal types moved to `heph-core::shutdown` so the TUI can hold a
 // trigger without depending on this bin module; re-exported for existing callers.
 pub use hcore::shutdown::{ShutdownTrigger, SuppressionHandle};

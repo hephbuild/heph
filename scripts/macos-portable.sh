@@ -38,7 +38,13 @@ for dep in $nix_deps; do
   sys="/usr/lib/$base"
   # /usr/lib dylibs live in the dyld shared cache and may not exist as files,
   # so we can't stat them. dlopen is the reliable presence check.
-  if ! /usr/bin/python3 - "$sys" <<'PY'
+  #
+  # `env -u DEVELOPER_DIR`: /usr/bin/python3 is an xcrun shim that resolves the
+  # real tool under $DEVELOPER_DIR, and the devenv shell — the documented way to
+  # work in this repo — points that at the nix apple-sdk, which ships no python.
+  # Without this, `e2e` dies with a bare "error: tool 'python3' not found" on
+  # every macOS dev machine, at the staging step, after a full release build.
+  if ! env -u DEVELOPER_DIR /usr/bin/python3 - "$sys" <<'PY'
 import ctypes, sys
 try:
     ctypes.CDLL(sys.argv[1])

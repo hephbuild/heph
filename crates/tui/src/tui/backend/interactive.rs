@@ -149,12 +149,23 @@ pub async fn run<A: App + 'static>(
             }
             ctrl = control_rx.recv() => {
                 match ctrl {
-                    Some(Control::Pause(ack)) => {
+                    Some(Control::Pause(ack, kind)) => {
                         if !paused {
-                            // Suppress shutdown trigger before releasing raw mode so
-                            // a Ctrl+C delivered to the cooked-mode prompt can't
-                            // race past us and cancel engine work.
-                            suppression.set(true);
+                            // Leaving raw mode below re-arms the terminal's ISIG,
+                            // so from here until resume a Ctrl-C arrives as a real
+                            // SIGINT instead of a key event. Suppress the trigger
+                            // only when the pause is handing the keyboard to
+                            // something else (`--shell`) — that session's Ctrl-C is
+                            // not a request to cancel the build. For a plain pause
+                            // (a diagnostic, a stdout flush, a target running with
+                            // the terminal attached) the press is still heph's, and
+                            // suppressing it left `heph run //pkg:target` with no
+                            // working Ctrl-C at all for the whole of that target's
+                            // run: the key handler is not reading (the event stream
+                            // is dropped just below), so the kernel SIGINT was the
+                            // only surviving producer, and dropping it also put the
+                            // second-press abort out of reach.
+                            suppression.set(kind.owns_input());
                             // Drop the EventStream *before* `clear()`. `clear()`
                             // issues a cursor DSR query (`get_cursor_position`),
                             // which reads its reply through crossterm's single

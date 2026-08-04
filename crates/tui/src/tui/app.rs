@@ -9,8 +9,32 @@ use hcore::events::{BuildEvent, EventSender};
 type PendingCounter = std::sync::Arc<std::sync::atomic::AtomicUsize>;
 
 pub(crate) enum Control {
-    Pause(oneshot::Sender<()>),
+    Pause(oneshot::Sender<()>, PauseFor),
     Resume,
+}
+
+/// Why the TUI is stepping aside — which decides who owns Ctrl-C while it is
+/// down. The renderer leaves raw mode to pause, so the terminal starts
+/// generating SIGINT again the moment it does; this says what should happen to
+/// that press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseFor {
+    /// Something is *writing* to the cooked terminal — a diagnostic, a stdout
+    /// flush, or a target running with the terminal attached. Nobody is typing
+    /// at anything, so Ctrl-C still belongs to heph and must cancel the run.
+    Output,
+    /// The user is *typing* at something heph is hosting (`heph run --shell`).
+    /// Every keystroke, Ctrl-C included, belongs to that session — heph must
+    /// not read it as "cancel the build".
+    Input,
+}
+
+impl PauseFor {
+    /// Whether this pause hands keyboard input to something other than heph,
+    /// and so must suppress the shutdown trigger for its duration.
+    pub(crate) fn owns_input(self) -> bool {
+        matches!(self, Self::Input)
+    }
 }
 
 pub struct AppContext {
@@ -79,8 +103,11 @@ impl AppContext {
     /// drains pending log lines, restores the terminal, and switches the
     /// log sink to direct passthrough. On guard drop the renderer resumes.
     /// In CI mode this is a no-op.
+    ///
+    /// Pauses as [`PauseFor::Output`] — Ctrl-C stays heph's. Use
+    /// [`Pauser::pause_for`] to hand the keyboard over instead.
     pub async fn pause(&self) -> PauseGuard<'_> {
-        pause_inner(&self.control).await;
+        pause_inner(&self.control, PauseFor::Output).await;
         PauseGuard { ctx: self }
     }
 
@@ -110,8 +137,18 @@ pub struct Pauser {
 }
 
 impl Pauser {
+    /// Pause as [`PauseFor::Output`] — heph keeps Ctrl-C.
     pub async fn pause(&self) -> OwnedPauseGuard {
-        pause_inner(&self.control).await;
+        self.pause_for(PauseFor::Output).await
+    }
+
+    /// Pause, saying who owns the keyboard while the TUI is down. Only
+    /// [`PauseFor::Input`] suppresses the shutdown trigger, and only a caller
+    /// that is genuinely handing the user's keystrokes to something else
+    /// (`--shell`) may ask for it: a paused TUI is in cooked mode, so anything
+    /// else would silently eat the run's only Ctrl-C.
+    pub async fn pause_for(&self, kind: PauseFor) -> OwnedPauseGuard {
+        pause_inner(&self.control, kind).await;
         OwnedPauseGuard {
             control: self.control.clone(),
         }
@@ -128,10 +165,10 @@ impl Drop for OwnedPauseGuard {
     }
 }
 
-async fn pause_inner(control: &Option<mpsc::UnboundedSender<Control>>) {
+async fn pause_inner(control: &Option<mpsc::UnboundedSender<Control>>, kind: PauseFor) {
     if let Some(tx) = control {
         let (ack_tx, ack_rx) = oneshot::channel();
-        if tx.send(Control::Pause(ack_tx)).is_ok() {
+        if tx.send(Control::Pause(ack_tx, kind)).is_ok() {
             drop(ack_rx.await);
         }
     }

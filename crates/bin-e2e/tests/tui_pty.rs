@@ -135,8 +135,86 @@ fn no_tui_flag_wins_over_an_attached_terminal() {
     );
 }
 
+/// The named target announces itself, then sleeps far longer than the test can
+/// wait — so "the run ended" can only mean the Ctrl-C ended it. `cache = False`
+/// keeps a second run from short-circuiting to a cache hit.
+const SLEEPS_FOREVER: &str = concat!(
+    "target(name = \"slow\", driver = \"bash\", cache = False,",
+    " run = [\"echo e2e-running\", \"sleep 600\"])\n",
+);
+
+/// Ctrl-C must cancel a run whose *named* target holds the terminal.
+///
+/// Naming a single target hands it the terminal, which pauses the TUI for that
+/// target's entire runtime (see the `BUILD` const at the top of this file, which
+/// leans on the same behaviour for the opposite reason). That pause used to suppress the
+/// shutdown trigger wholesale, and the two producers fail in opposite
+/// directions: the TUI's key handler cannot see the press (the event stream is
+/// dropped while paused) and the kernel SIGINT — which the cooked-mode terminal
+/// does deliver — was thrown away by the suppression. So Ctrl-C was inert for
+/// the whole run, and so was the second-press abort behind it. Suppression is
+/// now scoped to a pause that hands the *keyboard* over (`--shell`,
+/// `PauseFor::Input`), and `shell_pty.rs` owns that side.
+///
+/// PTY-only by construction, twice over: the interactive backend engages only
+/// on a tty, and a Ctrl-C is only a SIGINT when it comes from a controlling
+/// terminal with a foreground process group. A linked test has neither, so it
+/// would pass on the broken code without executing any of it.
+#[test]
+fn ctrl_c_cancels_a_run_whose_target_holds_the_terminal() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", SLEEPS_FOREVER).expect("write BUILD");
+
+    // 90s: long enough for a release binary to reach the target on a cold, busy
+    // runner, short enough that an ignored Ctrl-C fails the job rather than
+    // sitting on it for the full 600s sleep.
+    let session = run_in_pty_typing(
+        &dist,
+        ws.root(),
+        &["run", "//pkg:slow"],
+        Some(Interact {
+            marker: "e2e-running".to_string(),
+            send: vec![0x03],
+        }),
+        Duration::from_secs(90),
+    );
+
+    // Without this the test could pass on a run that died before it ever
+    // executed the target — no Ctrl-C sent, nothing about cancellation proved.
+    assert!(
+        session.sent_input,
+        "the target never reached its sleep, so no ctrl-c was ever sent\n{}",
+        session.report()
+    );
+    assert!(
+        !session.status_success,
+        "a cancelled run reported success\n{}",
+        session.report()
+    );
+
+    // Cancelling is not licence to wreck the terminal: the TUI resumes out of
+    // the pause on its way out, and must still hand the cursor back.
+    let hid = last_index(&session.raw, CURSOR_HIDE);
+    let shown = last_index(&session.raw, CURSOR_SHOW);
+    assert!(
+        hid.is_some(),
+        "TUI never hid the cursor\n{}",
+        session.report()
+    );
+    assert!(
+        shown > hid,
+        "cancelled run exited with the cursor still hidden\n{}",
+        session.report()
+    );
+}
+
 struct Session {
     status_success: bool,
+    /// Whether the [`Interact`] marker was ever seen, and so the keystroke sent.
+    /// Distinguishes "the run ignored Ctrl-C" from "the run never got far
+    /// enough to be sent one".
+    sent_input: bool,
     /// Every byte the child wrote to the pty.
     raw: Vec<u8>,
     /// Concatenation of the screen as rendered after each read — so an
@@ -156,6 +234,30 @@ impl Session {
 }
 
 fn run_in_pty(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
+    run_in_pty_typing(dist, cwd, args, None, DEADLINE)
+}
+
+/// Type something at the running child: once `marker` shows up in its output,
+/// `send` goes down the pty, once. The marker is what makes it a synchronisation
+/// point rather than a sleep — the keystroke lands when the run has actually
+/// reached the state under test.
+struct Interact {
+    marker: String,
+    send: Vec<u8>,
+}
+
+/// `run_in_pty`, plus the ability to type at the child and its own deadline.
+///
+/// The keystroke is written from the reader thread, which already owns the pty
+/// writer (it answers the TUI's cursor queries there) — a second handle would
+/// have to be split off `take_writer`, which hands out exactly one.
+fn run_in_pty_typing(
+    dist: &Dist,
+    cwd: &std::path::Path,
+    args: &[&str],
+    interact: Option<Interact>,
+    deadline: Duration,
+) -> Session {
     const ROWS: u16 = 40;
     const COLS: u16 = 140;
 
@@ -192,6 +294,8 @@ fn run_in_pty(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
     let mut writer = pair.master.take_writer().expect("take pty writer");
     let captured = Arc::new(Mutex::new((Vec::<u8>::new(), String::new())));
     let sink = Arc::clone(&captured);
+    let sent_input = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent_flag = Arc::clone(&sent_input);
     let pump = std::thread::spawn(move || {
         let mut parser = vt100::Parser::new(ROWS, COLS, 0);
         let mut buf = [0u8; 8192];
@@ -221,6 +325,16 @@ fn run_in_pty(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
                     guard.0.extend_from_slice(chunk);
                     guard.1.push_str(&screen);
                     guard.1.push('\n');
+
+                    // Marker matched against everything captured so far, not just
+                    // this chunk: a read boundary can land in the middle of it.
+                    if let Some(it) = interact.as_ref()
+                        && !sent_flag.load(std::sync::atomic::Ordering::Relaxed)
+                        && contains(&guard.0, it.marker.as_bytes())
+                    {
+                        sent_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        drop(writer.write_all(&it.send).and_then(|()| writer.flush()));
+                    }
                 }
             }
         }
@@ -231,7 +345,7 @@ fn run_in_pty(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
         match child.try_wait().expect("wait on pty child") {
             Some(status) => break Some(status),
             None => {
-                if started.elapsed() > DEADLINE {
+                if started.elapsed() > deadline {
                     child.kill().expect("kill timed-out pty child");
                     break None;
                 }
@@ -249,12 +363,18 @@ fn run_in_pty(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
     let guard = captured.lock().expect("capture lock");
     let session = Session {
         status_success: status.is_some_and(|s| s.success()),
+        sent_input: sent_input.load(std::sync::atomic::Ordering::Relaxed),
         raw: guard.0.clone(),
         rendered: guard.1.clone(),
     };
     assert!(
         exited,
-        "child did not exit within {DEADLINE:?}\n{}",
+        "child did not exit within {deadline:?}{}\n{}",
+        if session.sent_input {
+            " — the input this test typed was delivered and ignored"
+        } else {
+            ""
+        },
         session.report()
     );
     session
