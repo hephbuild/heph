@@ -83,7 +83,13 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     )?);
 
     let mut drivers = stabby::vec::Vec::new();
-    let golist: Arc<dyn ManagedDriver> = Arc::new(GoGolistDriver::new());
+    // The shared golist GOCACHE lives in the engine's home dir, next to the
+    // walker db and for the same reason: it is heph-owned scratch, not repo
+    // content, and a plugin is handed its writable locations rather than
+    // discovering them.
+    let golist: Arc<dyn ManagedDriver> = Arc::new(GoGolistDriver::with_gocache_root(
+        home.join("go-golist-gocache"),
+    ));
     drivers.push(NamedDriver {
         name: "go_golist".into(),
         driver: make_dyn_managed_driver(golist),

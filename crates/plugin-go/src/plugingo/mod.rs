@@ -8,6 +8,7 @@ mod embed;
 pub(crate) mod errors;
 mod factors;
 mod gen_testmain;
+mod golist_gocache;
 mod govet;
 mod pkg_analysis;
 mod provider;
