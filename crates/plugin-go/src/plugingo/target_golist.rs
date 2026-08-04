@@ -18,6 +18,7 @@ pub fn build_spec_firstparty(
     go_src_addr: &Addr,
     go_src_query_addr: Option<&Addr>,
     non_go_src_addrs: &[String],
+    has_test_files: bool,
 ) -> anyhow::Result<TargetSpec> {
     let mut srcfiles: Vec<String> = vec![go_src_addr.format()];
     if let Some(q) = go_src_query_addr {
@@ -33,6 +34,11 @@ pub fn build_spec_firstparty(
             ("modfiles", &[go_mod_addr.format()][..]),
             ("srcfiles", &srcfiles),
         ],
+        // `-test` is what resolves TestEmbedFiles/XTestEmbedFiles and the test
+        // import sets. A package with no `_test.go` on disk has none of those,
+        // so the flag would only buy `go list` a second (test-variant) package
+        // load for fields that come back empty either way.
+        has_test_files,
     )?;
     // Only a first-party package has its `.go` sources staged into the sandbox
     // (as `srcfiles` deps, codegen included). That is what lets the driver
@@ -48,7 +54,10 @@ pub fn build_spec_stdlib(
     factors: &Factors,
     go_version: &str,
 ) -> anyhow::Result<TargetSpec> {
-    build_spec_inner(addr, import_path, factors, go_version, &[])
+    // std ships `_test.go` files, but heph never builds std's tests: `list`
+    // emits only `_golist`/`build_lib` for a Stdlib package. Loading the test
+    // variants is pure cost.
+    build_spec_inner(addr, import_path, factors, go_version, &[], false)
 }
 
 pub fn build_spec_thirdparty(
@@ -65,6 +74,9 @@ pub fn build_spec_thirdparty(
         factors,
         go_version,
         &[("modfiles", &[go_mod_addr.format()][..])],
+        // Same as stdlib: `list` emits no test targets for a ThirdParty
+        // package, so nothing downstream can read a test field.
+        false,
     )?;
     // Threaded through to the driver so `resolve_package_addrs` can emit
     // `download`-filter refs for thirdparty per-file addresses. NOT a runtime
@@ -82,6 +94,7 @@ fn build_spec_inner(
     factors: &Factors,
     go_version: &str,
     extra_deps: &[(&str, &[String])],
+    with_test: bool,
 ) -> anyhow::Result<TargetSpec> {
     let mut deps: HashMap<String, Value> = HashMap::new();
     for (group, dep_addrs) in extra_deps {
@@ -112,6 +125,9 @@ fn build_spec_inner(
         "go_version".to_string(),
         Value::String(go_version.to_string()),
     );
+    // Whether `go list` gets `-test`. Carried in the config (not inferred in the
+    // driver) so it reaches the def hash — flipping it changes the artifact.
+    config.insert("with_test".to_string(), Value::Bool(with_test));
     if !factors.build_tags.is_empty() {
         config.insert(
             "build_tags".to_string(),
@@ -209,6 +225,7 @@ mod tests {
             &go_src_addr(),
             None,
             &[],
+            true,
         )
         .unwrap();
         assert_eq!(spec.driver, "go_golist");
@@ -225,6 +242,7 @@ mod tests {
             &go_src_addr(),
             None,
             &[],
+            true,
         )
         .unwrap();
         let out = match spec.config.get("out").unwrap() {
@@ -246,6 +264,7 @@ mod tests {
             &go_src_addr(),
             None,
             &[],
+            true,
         )
         .unwrap();
         assert!(
@@ -268,6 +287,7 @@ mod tests {
             &go_src_addr(),
             None,
             &[],
+            true,
         )
         .unwrap();
         assert!(matches!(
@@ -306,6 +326,62 @@ mod tests {
         );
     }
 
+    /// `-test` makes `go list` load the package a second time in its test
+    /// configuration (~31% of the call's CPU on a shared `GOCACHE`; see
+    /// `driver_golist::golist_args`). std and thirdparty never build tests under
+    /// heph — `Provider::list` emits no test target for either — so nothing can
+    /// read a test field back and the flag must stay off.
+    #[test]
+    fn test_stdlib_and_thirdparty_never_ask_for_test_metadata() {
+        let std = build_spec_stdlib(test_addr(), "fmt", &test_factors(), V).unwrap();
+        assert_eq!(
+            std.config.get("with_test"),
+            Some(&Value::Bool(false)),
+            "stdlib _golist must not pay for -test"
+        );
+
+        let tp = build_spec_thirdparty(
+            test_addr(),
+            "github.com/foo/bar",
+            &test_factors(),
+            V,
+            &go_mod_addr(),
+            &tp_download_addr(),
+        )
+        .unwrap();
+        assert_eq!(
+            tp.config.get("with_test"),
+            Some(&Value::Bool(false)),
+            "thirdparty _golist must not pay for -test"
+        );
+    }
+
+    /// First-party carries the caller's on-disk verdict through verbatim: a
+    /// package with `_test.go` files still needs `-test` to resolve
+    /// TestEmbedFiles/XTestEmbedFiles, one without has nothing to resolve.
+    #[test]
+    fn test_firstparty_with_test_follows_has_test_files() {
+        for has_tests in [true, false] {
+            let spec = build_spec_firstparty(
+                test_addr(),
+                "example.com/mylib",
+                &test_factors(),
+                V,
+                &go_mod_addr(),
+                &go_src_addr(),
+                None,
+                &[],
+                has_tests,
+            )
+            .unwrap();
+            assert_eq!(
+                spec.config.get("with_test"),
+                Some(&Value::Bool(has_tests)),
+                "with_test must mirror has_test_files ({has_tests})"
+            );
+        }
+    }
+
     #[test]
     fn test_config_no_run_key() {
         let spec = build_spec_firstparty(
@@ -317,6 +393,7 @@ mod tests {
             &go_src_addr(),
             None,
             &[],
+            true,
         )
         .unwrap();
         assert!(!spec.config.contains_key("run"), "spec must not have 'run'");
@@ -341,6 +418,7 @@ mod tests {
             &go_src_addr(),
             None,
             &[],
+            true,
         )
         .unwrap();
         if let Some(Value::Map(deps)) = spec.config.get("deps") {
@@ -359,6 +437,7 @@ mod tests {
             &go_src_addr(),
             None,
             &[],
+            true,
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {

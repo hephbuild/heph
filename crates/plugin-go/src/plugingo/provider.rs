@@ -2485,6 +2485,13 @@ impl ProviderInner {
                 // so `go list` can resolve //go:embed patterns into EmbedFiles, and
                 // shared with the downstream `embed` target.
                 let extra_src_addrs = compute_pkg_src_addrs(pkg, states)?;
+                // `-test` is only worth its cost where a test field can be read
+                // back. Codegen can produce a `_test.go` that isn't on disk when
+                // the spec is built, so any package with a codegen/extra source
+                // lane keeps the flag unconditionally — the on-disk scan is
+                // authoritative only for a package whose sources are all static.
+                let has_test_files =
+                    !extra_src_addrs.is_empty() || self.package_has_test_files_on_disk(pkg);
                 target_golist::build_spec_firstparty(
                     addr,
                     import_path,
@@ -2494,6 +2501,7 @@ impl ProviderInner {
                     &go_src_glob_addr,
                     None,
                     &extra_src_addrs,
+                    has_test_files,
                 )?
             }
             GoPackageKind::ThirdParty {
@@ -2794,6 +2802,30 @@ impl ProviderInner {
     /// own output. Files reached through a `.heph*` cache dir are skipped for the
     /// same reason they are in the fs provider — they are engine artifacts, not
     /// source.
+    /// Whether the package directory holds any `_test.go` file, read through the
+    /// shared walk cache so an unchanged tree costs no `readdir`. Drives the
+    /// `-test` decision for a first-party `_golist` (see
+    /// [`target_golist::build_spec_firstparty`]).
+    ///
+    /// Errors are absorbed as `true`: a directory we cannot list is the case
+    /// where guessing wrong is expensive (an unresolved test embed is a build
+    /// failure, a redundant `-test` is only slow), and the read that matters —
+    /// `go list`'s own — reports the real error a moment later.
+    fn package_has_test_files_on_disk(&self, pkg: &str) -> bool {
+        let dir = if pkg.is_empty() {
+            self.workspace_root.clone()
+        } else {
+            self.workspace_root.join(pkg)
+        };
+        match self.walker.read_dir(&dir) {
+            Ok(listing) => listing
+                .entries
+                .iter()
+                .any(|e| e.kind == EntryKind::File && e.name.ends_with("_test.go")),
+            Err(_) => true,
+        }
+    }
+
     fn package_go_files_on_disk(&self, pkg: &str) -> anyhow::Result<Vec<String>> {
         let dir = if pkg.is_empty() {
             self.workspace_root.clone()
@@ -3167,6 +3199,9 @@ impl ProviderInner {
                             &go_mod.requires,
                             &go_mod.module_path,
                             &module_root,
+                            // The transitive walk recurses on the sub-imports —
+                            // this is the one caller that needs them.
+                            true,
                         )
                         .await?;
 
@@ -3274,6 +3309,9 @@ impl ProviderInner {
                 go_mod_requires,
                 workspace_module_path,
                 module_root,
+                // Direct-libs lane: `_sub` is dropped below, so don't pay to
+                // produce it (see `resolve_import`).
+                false,
             )
         }))
         .await?;
@@ -3287,6 +3325,22 @@ impl ProviderInner {
     }
 
     /// Resolve one import path: returns `(import_path, Option<lib Addr>, sub_imports)`.
+    ///
+    /// `need_sub_imports` is the caller's declaration that it will actually read
+    /// the third element. Only the transitive walk ([`Self::import_closure`])
+    /// does; the direct-libs lane drops it on the floor. For a **stdlib** import
+    /// the sub-imports are the *sole* reason to touch `_golist` — the lib addr is
+    /// derived syntactically by [`encode_stdlib`] — so resolving one there costs a
+    /// full `executor.result()` (and, cold, a sandboxed `go list`) per std package
+    /// per importer for a value that is then discarded. First-party/thirdparty
+    /// still read it unconditionally: the read doubles as the
+    /// no-buildable-files probe that decides whether the dep is emitted at all
+    /// (see the `NoGoFilesError` arm below), and their `_golist` is needed by the
+    /// dep's own `build_lib` regardless, so it is shared rather than extra.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "all parameters are required, no natural grouping"
+    )]
     async fn resolve_import(
         &self,
         executor: Arc<dyn ProviderExecutor>,
@@ -3295,12 +3349,16 @@ impl ProviderInner {
         go_mod_requires: &[(String, String)],
         workspace_module_path: &str,
         module_root: &Path,
+        need_sub_imports: bool,
     ) -> anyhow::Result<(String, Option<Addr>, Vec<String>)> {
         let is_workspace_module = !workspace_module_path.is_empty()
             && (import_path == workspace_module_path
                 || import_path.starts_with(&format!("{}/", workspace_module_path)));
         if !is_workspace_module && is_stdlib_import_path(import_path) {
             let addr = encode_stdlib(import_path, vref);
+            if !need_sub_imports {
+                return Ok((import_path.to_string(), Some(addr), vec![]));
+            }
             let golist_addr = Addr::new(
                 hmodel::htpkg::PkgBuf::from(format!("@heph/go/std/{}", import_path)),
                 "_golist".to_string(),
@@ -4439,6 +4497,121 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             .await
             .unwrap();
         assert_eq!(resp.target_spec.driver, "go_compile");
+    }
+
+    /// Records every addr handed to `ProviderExecutor::result`.
+    struct RecordingExecutor {
+        inner: Arc<dyn ProviderExecutor>,
+        seen: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl ProviderExecutor for RecordingExecutor {
+        fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+            self.seen.lock().push(addr.format());
+            self.inner.result(addr)
+        }
+        fn states_under<'a>(
+            &'a self,
+            prefix: &'a hmodel::htpkg::PkgBuf,
+        ) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
+            self.inner.states_under(prefix)
+        }
+        fn query<'a>(
+            &'a self,
+            m: &'a hmodel::htmatcher::Matcher,
+            extra_skip: &'a [String],
+        ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+            self.inner.query(m, extra_skip)
+        }
+    }
+
+    fn recording_get(
+        p: &Provider,
+        addr: Addr,
+    ) -> (
+        impl std::future::Future<Output = Result<GetResponse, GetError>> + use<'_>,
+        Arc<parking_lot::Mutex<Vec<String>>>,
+    ) {
+        let workspace = p.inner.workspace_root.clone();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let executor: Arc<dyn ProviderExecutor> = Arc::new(RecordingExecutor {
+            inner: test_executor(&workspace),
+            seen: Arc::clone(&seen),
+        });
+        let req = GetRequest {
+            request_id: "test".to_string(),
+            addr,
+            states: vec![host_variant_state()],
+            executor,
+        };
+        (
+            async move {
+                let ctoken = StdCancellationToken::new();
+                p.get(req, &ctoken).await
+            },
+            seen,
+        )
+    }
+
+    fn std_golist_reads(seen: &Arc<parking_lot::Mutex<Vec<String>>>) -> Vec<String> {
+        seen.lock()
+            .iter()
+            .filter(|a| a.starts_with("//@heph/go/std/") && a.contains(":_golist"))
+            .cloned()
+            .collect()
+    }
+
+    /// A stdlib import's `build_lib` addr is derived syntactically
+    /// (`encode_stdlib`), so on the direct-libs lane its `_golist` is read for
+    /// exactly one thing — the sub-imports — which `collect_libs_inner` then
+    /// discards. That made every `build_lib` in the tree force an
+    /// `executor.result()` (cold: a sandboxed `go list`) per std package it
+    /// directly imports, for a value nobody reads.
+    #[tokio::test]
+    async fn build_lib_does_not_resolve_stdlib_golist_for_direct_deps() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+
+        // `lib` imports `fmt` and nothing else.
+        let (fut, seen) = recording_get(&p, make_addr("lib", "build_lib"));
+        let resp = fut.await.unwrap();
+        assert_eq!(resp.target_spec.driver, "go_compile");
+
+        assert!(
+            std_golist_reads(&seen).is_empty(),
+            "build_lib must not resolve a stdlib _golist: {:?}",
+            std_golist_reads(&seen)
+        );
+
+        // ...and the dep is still wired, so this isn't passing by resolving nothing.
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        assert!(
+            deps.keys().any(|k| k.contains("fmt")),
+            "lib build_lib must still link against fmt: {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The counterpart: the transitive walk really does need the sub-imports to
+    /// recurse, so `build` must still read them. Guards against "optimizing" the
+    /// read away wholesale and silently truncating the link closure.
+    #[tokio::test]
+    async fn build_still_resolves_stdlib_golist_for_the_transitive_closure() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+
+        let (fut, seen) = recording_get(&p, make_addr("cmd", "build"));
+        fut.await.unwrap();
+
+        assert!(
+            !std_golist_reads(&seen).is_empty(),
+            "build's transitive closure must still walk stdlib _golist"
+        );
     }
 
     #[tokio::test]

@@ -57,6 +57,10 @@ struct GoGolistSpec {
     build_tags: Vec<String>,
     /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
     goexperiment: Vec<String>,
+    /// Pass `-test` to `go list` — needed only when the package has `_test.go`
+    /// files whose imports and embed patterns must be resolved. See
+    /// [`crate::plugingo::target_golist`] for who sets it.
+    with_test: bool,
     /// For thirdparty packages: the `download` target whose filtered outputs are
     /// staged into consumers' sandboxes.
     #[spec(ty = ParamType::String)]
@@ -107,6 +111,7 @@ struct GoGolistDef {
     go_version: String,
     build_tags: Vec<String>,
     goexperiment: Vec<String>,
+    with_test: bool,
     dep_inputs: Vec<Input>,
     /// For thirdparty packages: the `download` target whose filtered outputs
     /// will be staged into consumers' sandboxes. Threaded through so
@@ -136,6 +141,9 @@ impl Hash for GoGolistDef {
         self.go_version.hash(state);
         self.build_tags.hash(state);
         self.goexperiment.hash(state);
+        // Flips the `go list` command line, and with it which fields come back
+        // populated — so it must key the cache.
+        self.with_test.hash(state);
         self.dep_inputs.hash(state);
         self.thirdparty_download_addr.hash(state);
         self.firstparty.hash(state);
@@ -211,6 +219,7 @@ impl ManagedDriver for GoGolistDriver {
             go_version: spec.go_version,
             build_tags: spec.build_tags,
             goexperiment: spec.goexperiment,
+            with_test: spec.with_test,
             dep_inputs: dep_inputs.clone(),
             thirdparty_download_addr: spec.thirdparty_download_addr,
             firstparty: spec.firstparty,
@@ -391,26 +400,7 @@ impl ManagedDriver for GoGolistDriver {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }
 
-        let mut cmd_args = vec![
-            "list".to_string(),
-            GOLIST_JSON_FIELDS.to_string(),
-            "-e".to_string(),
-            // -test populates TestEmbedFiles / XTestEmbedFiles (and resolves test
-            // imports). Without it go list reports test embed patterns but never
-            // resolves them, so the test embedcfg path globs against an empty
-            // staged-file set. The flag also adds synthetic `pkg.test` / `pkg
-            // [pkg.test]` / `pkg_test [pkg.test]` entries — we discard them
-            // below and keep only the plain `pkg` entry.
-            "-test".to_string(),
-        ];
-
-        if !def.build_tags.is_empty() {
-            cmd_args.push(format!("-tags={}", def.build_tags.join(",")));
-        }
-
-        cmd_args.push(def.import_path.clone());
-
-        let args: Vec<OsString> = cmd_args.iter().map(OsString::from).collect();
+        let args: Vec<OsString> = golist_args(def).iter().map(OsString::from).collect();
         let env_pairs: Vec<(OsString, OsString)> = env
             .iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
@@ -552,6 +542,44 @@ fn has_go_file(dir: &std::path::Path) -> anyhow::Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// The `go list` command line for one package.
+///
+/// `-test` populates TestEmbedFiles / XTestEmbedFiles and resolves test imports.
+/// Without it `go list` reports test embed *patterns* but never resolves them,
+/// so the test embedcfg path would glob against an empty staged-file set. The
+/// flag also adds synthetic `pkg.test` / `pkg [pkg.test]` / `pkg_test [pkg.test]`
+/// entries, which `run` discards in favour of the plain `pkg` entry.
+///
+/// It is not free: it makes `go list` load the package a second time in its test
+/// configuration, pulling the test imports' own closure. Measured over 60 std
+/// packages listed one at a time against a *fresh shared* `GOCACHE` — i.e. what
+/// [`crate::plugingo::golist_gocache`] gives a cold run today — dropping `-test`
+/// took CPU from 3.72s to 2.58s (-31%) and wall from 1.89s to 1.69s (-11%).
+///
+/// The gap used to be far wider: before the shared `GOCACHE`, every sandbox
+/// re-warmed its own, and `-test` was ~3x the call. Sharing the cache absorbed
+/// most of that, so this is now a modest trim on the cold path and nothing at
+/// all on a full cache hit — do not quote it as a headline.
+///
+/// So the provider asks for it only where a test field can actually be read
+/// back — a first-party package with `_test.go` files on disk. std and
+/// thirdparty build no tests under heph and never pay it.
+fn golist_args(def: &GoGolistDef) -> Vec<String> {
+    let mut args = vec![
+        "list".to_string(),
+        GOLIST_JSON_FIELDS.to_string(),
+        "-e".to_string(),
+    ];
+    if def.with_test {
+        args.push("-test".to_string());
+    }
+    if !def.build_tags.is_empty() {
+        args.push(format!("-tags={}", def.build_tags.join(",")));
+    }
+    args.push(def.import_path.clone());
+    args
 }
 
 /// Strip every absolute path out of a `go list` package so the cached
@@ -924,6 +952,58 @@ mod tests {
             &p.content,
             Content::FilePath(s) if s == "package.bin"
         )));
+    }
+
+    fn def_with(with_test: bool, build_tags: Vec<String>) -> GoGolistDef {
+        GoGolistDef {
+            import_path: "example.com/mylib".to_string(),
+            goos: "linux".to_string(),
+            goarch: "amd64".to_string(),
+            go_version: crate::plugingo::toolchain::DEFAULT_GO_VERSION.to_string(),
+            build_tags,
+            goexperiment: vec![],
+            with_test,
+            dep_inputs: vec![],
+            thirdparty_download_addr: None,
+            firstparty: true,
+        }
+    }
+
+    #[test]
+    fn test_golist_args_omit_test_when_the_package_has_no_tests() {
+        let args = golist_args(&def_with(false, vec![]));
+        assert!(
+            !args.iter().any(|a| a == "-test"),
+            "a package with no test files must not pay for the test-config load: {args:?}"
+        );
+        // The rest of the command is unchanged — same field set, still -e, and
+        // the import path stays last.
+        assert!(args.iter().any(|a| a == "-e"));
+        assert_eq!(args.last().map(String::as_str), Some("example.com/mylib"));
+    }
+
+    #[test]
+    fn test_golist_args_keep_test_and_tags_together() {
+        let args = golist_args(&def_with(true, vec!["integration".to_string()]));
+        assert!(args.iter().any(|a| a == "-test"), "{args:?}");
+        assert!(args.iter().any(|a| a == "-tags=integration"), "{args:?}");
+        assert_eq!(args.last().map(String::as_str), Some("example.com/mylib"));
+    }
+
+    /// `with_test` changes which fields come back populated, so two otherwise
+    /// identical defs must not share a cache entry.
+    #[test]
+    fn test_with_test_keys_the_def_hash() {
+        let h = |d: &GoGolistDef| {
+            let mut hasher = Xxh3Default::new();
+            d.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(
+            h(&def_with(true, vec![])),
+            h(&def_with(false, vec![])),
+            "-test must key the golist cache"
+        );
     }
 
     #[test]
