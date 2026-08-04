@@ -1,4 +1,5 @@
 pub mod file;
+pub mod sniff;
 pub mod tar;
 pub mod tar_index;
 pub mod unpack;
