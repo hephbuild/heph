@@ -1,20 +1,23 @@
 //! The JS/TS plugin as a loadable cdylib behind the stable ABI.
 //!
-//! **M0-M4 scope**: exports the `js` provider (package discovery + pnpm/npm
+//! **M0-M5 scope**: exports the `js` provider (package discovery + pnpm/npm
 //! workspace-member resolution + lockfile-driven dependency wiring + oxc-based
 //! import-graph resolution), its `js_package_info` dependency-wiring driver,
 //! the hermetic `js_install` third-party fetch driver, the `js_typecheck`
 //! driver (M3 — `tsc --noEmit` per package, via a disclosed non-hermetic
 //! `tstool = "host"` toolchain; see `hplugin_js::pluginjs::driver_typecheck`
-//! module docs), and the `js_test` driver (M4 — one target per test file, via
+//! module docs), the `js_test` driver (M4 — one target per test file, via
 //! the configured `testrunner` (`vitest`/`jest`), same disclosed non-hermetic
 //! host-toolchain shape; see `hplugin_js::pluginjs::driver_test` module
+//! docs), and the `js_lint` driver (M5 — one target per package, via the
+//! configured `linter` (`oxlint`/`eslint`), same disclosed non-hermetic
+//! host-toolchain shape; see `hplugin_js::pluginjs::driver_lint` module
 //! docs). The host loads this with `hplugin_stabby::load_stable::load`,
 //! which verifies ABI compatibility via stabby's type reports before use.
 //! Calls then run in-process at native speed — no serialization on the hot
 //! path, no IPC.
 //!
-//! Linting, formatting, and bundling drivers are later milestones (see
+//! Formatting and bundling drivers are later milestones (see
 //! `ai-docs/js-plugin-plan.md`) and are not wired up here yet.
 //!
 //! Plugin-specific settings are read from the environment; only the
@@ -22,7 +25,7 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_js::pluginjs::{
-    JsInstallDriver, JsPackageInfoDriver, JsTestDriver, JsTypecheckDriver, Provider,
+    JsInstallDriver, JsLintDriver, JsPackageInfoDriver, JsTestDriver, JsTypecheckDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
@@ -118,6 +121,15 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     drivers.push(NamedDriver {
         name: "js_test".into(),
         driver: make_dyn_managed_driver(test),
+    });
+    // `js_lint` (M5): runs the configured linter (`oxlint` default, `eslint`
+    // alt) against one package at a time — see
+    // `hplugin_js::pluginjs::driver_lint` module docs, including its
+    // disclosed non-hermetic host-toolchain gap.
+    let lint: Arc<dyn ManagedDriver> = Arc::new(JsLintDriver::new());
+    drivers.push(NamedDriver {
+        name: "js_lint".into(),
+        driver: make_dyn_managed_driver(lint),
     });
 
     Ok(PluginComponents {

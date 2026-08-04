@@ -2,6 +2,7 @@
 mod conformance;
 mod deps;
 mod driver_install;
+mod driver_lint;
 mod driver_package_info;
 mod driver_test;
 mod driver_typecheck;
@@ -17,6 +18,7 @@ mod toolchain;
 mod workspace;
 
 pub use driver_install::JsInstallDriver;
+pub use driver_lint::JsLintDriver;
 pub use driver_package_info::JsPackageInfoDriver;
 pub use driver_test::JsTestDriver;
 pub use driver_typecheck::JsTypecheckDriver;
@@ -47,6 +49,12 @@ pub const TYPECHECK_TARGET: &str = "js_typecheck";
 /// target address per matched test file (distinguished by a `file` addr
 /// arg), never one per package. See `driver_test.rs` module docs.
 pub const TEST_TARGET: &str = "js_test";
+
+/// Target name of the M5 `js_lint` target: runs the configured linter
+/// (`oxlint` default, `eslint` alt) over one package at a time — per-package
+/// granularity, the same as `js_typecheck` (see `driver_lint.rs` module docs
+/// for why per-file caching isn't worth the bookkeeping here either).
+pub const LINT_TARGET: &str = "js_lint";
 
 /// Directory names that are never a package boundary or workspace member,
 /// however deep they appear: `node_modules` is third-party/manager-owned

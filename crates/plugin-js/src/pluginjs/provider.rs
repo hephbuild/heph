@@ -1,8 +1,8 @@
 use crate::pluginjs::lockfile::{self, Lockfile, ResolvedGraph};
 use crate::pluginjs::workspace::{self, PkgManager, WorkspaceMember};
 use crate::pluginjs::{
-    PACKAGE_INFO_TARGET, PACKAGE_JSON, TEST_TARGET, TYPECHECK_TARGET, deps, importgraph,
-    is_skipped_dir_name, package_json, platform, resolvers, thirdparty, toolchain,
+    LINT_TARGET, PACKAGE_INFO_TARGET, PACKAGE_JSON, TEST_TARGET, TYPECHECK_TARGET, deps,
+    importgraph, is_skipped_dir_name, package_json, platform, resolvers, thirdparty, toolchain,
 };
 use anyhow::Context;
 use enclose::enclose;
@@ -67,6 +67,11 @@ pub struct Config {
     /// are matched against to discover `js_test` targets. Defaults to
     /// [`DEFAULT_TEST_GLOBS`] when unset — see that constant's doc for why.
     pub test_glob: Vec<String>,
+    /// Which linter `js_lint` invokes — `"oxlint"` (default) or `"eslint"`,
+    /// per `ai-docs/js-plugin-plan.md`'s `js_lint` row. Same provider-level,
+    /// host-toolchain shape as `tstool`/`testrunner` — see
+    /// `toolchain::resolve_host_linter`.
+    pub linter: String,
 }
 
 impl Config {
@@ -82,6 +87,7 @@ impl Config {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            linter: toolchain::OXLINT.to_string(),
         }
     }
 }
@@ -119,6 +125,58 @@ pub struct Provider {
     /// scale a real subprocess cost with the number of test files, not just
     /// packages.
     testrunner_cache: OnceCell<Arc<(PathBuf, String)>>,
+    /// Which linter `js_lint` invokes — see [`Config::linter`]'s doc.
+    linter: String,
+    /// Lazily resolved host linter binary path + queried `--version`, cached
+    /// once for the `Provider`'s lifetime — same rationale as
+    /// `tsc_cache`/`testrunner_cache`: `lint_config` runs once per `js_lint`
+    /// target (one per package) per `Provider::get`, so re-resolving and
+    /// re-spawning `<linter> --version` per package would scale a real
+    /// subprocess cost with package count, including a 100%-cache-hit run
+    /// (the same M3/M4-review-flagged mistake this milestone's task
+    /// explicitly calls out not to repeat).
+    linter_cache: OnceCell<Arc<(PathBuf, String)>>,
+    /// Workspace-member `{name -> addr}` map, resolved once and cached for
+    /// the `Provider`'s lifetime — same rationale as `tsc_cache`/
+    /// `testrunner_cache`/`linter_cache`: `deps_config`/`typecheck_config`/
+    /// `test_config`/`lint_config` each independently called
+    /// `member_addrs_by_name_blocking` (a full recursive workspace walk +
+    /// `package.json` parse of every package, plus a glob-match) from
+    /// scratch on every single call — for `test_config` that meant once
+    /// *per test file*. This is the identical "recompute-on-every-call"
+    /// shape `graph_cache` fixes for the import graph above, applied to
+    /// workspace-member discovery (feature-quality/code-quality M5 review
+    /// finding: fixing it for one O(P) walk while leaving an identically-
+    /// shaped one right next to it unfixed left O(P²) work on the table at
+    /// scale). Workspace membership can't change mid-`Provider`-lifetime any
+    /// more than the lockfile can, so a single cached value is correct for
+    /// every caller.
+    member_addrs_cache: OnceCell<Arc<BTreeMap<String, String>>>,
+    /// Per-package [`importgraph::ImportGraph`], parsed+resolved once per
+    /// package and cached for the `Provider`'s lifetime — see
+    /// [`Provider::import_graph`]'s doc for the M2/M4-review-flagged perf
+    /// issue this fixes: each of `deps_config`/`typecheck_config`/
+    /// `test_config` independently called
+    /// `importgraph::build_package_import_graph` (a full oxc_parser parse +
+    /// oxc_resolver resolve of every first-party file in the package) from
+    /// scratch on every single `Provider::get` call — for `js_test` this
+    /// meant once *per test file*, so a package with N source files and T
+    /// test files paid `2+T` full-package graph builds where 1 would do.
+    ///
+    /// Keyed per-package with an `Arc<OnceCell<_>>` per key rather than one
+    /// `Mutex` held across the build itself, so unrelated packages' builds
+    /// never serialize behind one lock — only concurrent `Provider::get`
+    /// calls for the *same* package coalesce onto one build, which is the
+    /// point.
+    graph_cache: tokio::sync::Mutex<HashMap<PkgBuf, Arc<OnceCell<Arc<importgraph::ImportGraph>>>>>,
+    /// Test-only: counts real `importgraph::build_package_import_graph`
+    /// invocations (cache misses), so a test can prove `graph_cache` actually
+    /// memoizes across independent callers rather than merely being
+    /// structurally present — see
+    /// `import_graph_is_shared_across_independent_callers` in this module's
+    /// tests.
+    #[cfg(test)]
+    graph_build_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Provider {
@@ -147,6 +205,7 @@ impl Provider {
                 "tstool",
                 "testrunner",
                 "test_glob",
+                "linter",
             ],
         )?;
         let pkgmanager_str: String =
@@ -192,6 +251,16 @@ impl Provider {
                     .collect()
             });
 
+        // See `Config::linter`'s doc: defaults to the design doc's
+        // recommended default (`oxlint`, the fast oxc-family syntactic
+        // linter; `eslint` is the alt for type-aware rules).
+        let linter: String = hplugin::config::decode_opt(opts, "js provider", "linter")?
+            .unwrap_or_else(|| toolchain::OXLINT.to_string());
+        anyhow::ensure!(
+            toolchain::is_supported_linter(&linter),
+            "js provider: unsupported `linter` {linter:?} — expected \"oxlint\" or \"eslint\""
+        );
+
         Ok(Self::with_config(
             workspace_root,
             Config {
@@ -202,6 +271,7 @@ impl Provider {
                 tstool,
                 testrunner,
                 test_glob,
+                linter,
             },
         ))
     }
@@ -220,6 +290,12 @@ impl Provider {
             resolved_graph_cache: OnceCell::new(),
             tsc_cache: OnceCell::new(),
             testrunner_cache: OnceCell::new(),
+            linter: config.linter,
+            linter_cache: OnceCell::new(),
+            member_addrs_cache: OnceCell::new(),
+            graph_cache: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            graph_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -365,6 +441,188 @@ impl Provider {
         Ok(Arc::clone(result))
     }
 
+    /// The host linter binary path and its queried `--version`, resolved once
+    /// and cached for the `Provider`'s lifetime — see
+    /// [`Provider::linter_cache`]'s doc for why this matters.
+    async fn resolved_host_linter(&self) -> anyhow::Result<Arc<(PathBuf, String)>> {
+        let workspace_root = self.workspace_root.clone();
+        let linter = self.linter.clone();
+        let result = self
+            .linter_cache
+            .get_or_try_init(|| async move {
+                anyhow::ensure!(
+                    toolchain::is_supported_linter(&linter),
+                    "js provider: unsupported linter {linter:?} — only \"oxlint\" or \"eslint\" \
+                     is supported in this milestone; see pluginjs::toolchain module docs"
+                );
+                hcore::blocking::run(move || -> anyhow::Result<Arc<(PathBuf, String)>> {
+                    let linter_bin = toolchain::resolve_host_linter(&workspace_root, &linter)
+                        .context("resolving the js_lint linter toolchain")?;
+                    let linter_version = toolchain::query_linter_version(&linter_bin)
+                        .with_context(|| format!("querying {linter_bin:?} --version"))?;
+                    Ok(Arc::new((linter_bin, linter_version)))
+                })
+                .await
+            })
+            .await?;
+        Ok(Arc::clone(result))
+    }
+
+    /// Workspace-member `{name -> addr}` map, resolved once and cached for
+    /// the `Provider`'s lifetime — see [`Provider::member_addrs_cache`]'s doc
+    /// for why this matters. Every one of `deps_config`/`typecheck_config`/
+    /// `test_config`/`lint_config` calls this instead of redoing the
+    /// discovery walk inside its own blocking closure.
+    async fn member_addrs_by_name(&self) -> anyhow::Result<Arc<BTreeMap<String, String>>> {
+        let workspace_root = self.workspace_root.clone();
+        let walker = Arc::clone(&self.walker);
+        let skip = Arc::clone(&self.skip);
+        let pkgmanager = self.pkgmanager;
+        let result = self
+            .member_addrs_cache
+            .get_or_try_init(|| async move {
+                hcore::blocking::run(move || -> anyhow::Result<Arc<BTreeMap<String, String>>> {
+                    member_addrs_by_name_blocking(&walker, &workspace_root, &skip, pkgmanager)
+                        .map(Arc::new)
+                })
+                .await
+            })
+            .await?;
+        Ok(Arc::clone(result))
+    }
+
+    /// Build the config for one `js_lint` target (one package): the host
+    /// linter toolchain resolution/version-query this milestone's disclosed
+    /// `linter`-is-host-resolved escape hatch requires (same shape as
+    /// `resolved_host_tsc`/`resolved_host_test_runner`) plus
+    /// `lint_deps_config`'s pure, linter-binary-free Input-scoping.
+    ///
+    /// Deliberately does **not** go through `Provider::import_graph`: unlike
+    /// `deps_config`/`typecheck_config`/`test_config`, a `js_lint` target's
+    /// Inputs are just the package's own first-party source files plus its
+    /// resolved linter config (and, for eslint type-aware rules, the
+    /// tsconfig/extends chain) — no cross-package import-graph edges are
+    /// needed to scope it (see `driver_lint.rs` module docs' "Inputs / cache
+    /// key" section). Skipping it here keeps `js_lint` from becoming a fifth
+    /// caller of the expensive parse+resolve path for no reason, on top of
+    /// the fix already applied to the other three.
+    async fn lint_config(&self, pkg: &PkgBuf) -> anyhow::Result<HashMap<String, Value>> {
+        let resolved_linter = self.resolved_host_linter().await?;
+        let linter_bin = resolved_linter.0.to_string_lossy().into_owned();
+        let linter_version = resolved_linter.1.clone();
+        let lockfile = self.lockfile().await?;
+        let resolved_graph = self.resolved_graph().await?;
+        let member_addrs_by_name = self.member_addrs_by_name().await?;
+        let workspace_root = self.workspace_root.clone();
+        let walker = Arc::clone(&self.walker);
+        let linter = self.linter.clone();
+        let pkg_str = pkg.as_str().to_string();
+        let goos = platform::current_goos();
+        let goarch = platform::current_goarch();
+
+        hcore::blocking::run(move || -> anyhow::Result<HashMap<String, Value>> {
+            let lint_deps = lint_deps_config(
+                &walker,
+                &workspace_root,
+                &pkg_str,
+                &linter,
+                lockfile.as_deref(),
+                resolved_graph.as_deref(),
+                &member_addrs_by_name,
+                &goos,
+                &goarch,
+            )
+            .with_context(|| format!("building js_lint inputs for {pkg_str:?}"))?;
+
+            let mut config: HashMap<String, Value> = HashMap::new();
+            config.insert("linter".to_string(), Value::String(linter));
+            config.insert("linter_bin".to_string(), Value::String(linter_bin));
+            config.insert("linter_version".to_string(), Value::String(linter_version));
+            config.insert(
+                "config_path".to_string(),
+                Value::String(lint_deps.config_path),
+            );
+            config.insert(
+                "config_content".to_string(),
+                Value::String(lint_deps.config_content),
+            );
+            config.insert(
+                "tsconfig_path".to_string(),
+                Value::String(lint_deps.tsconfig_path),
+            );
+            config.insert(
+                "tsconfig_content".to_string(),
+                Value::String(lint_deps.tsconfig_content),
+            );
+            config.insert("deps".to_string(), Value::Map(lint_deps.deps));
+            Ok(config)
+        })
+        .await
+    }
+
+    /// The package's [`importgraph::ImportGraph`], built once and cached for
+    /// the `Provider`'s lifetime — see [`Provider::graph_cache`]'s doc for why
+    /// this exists. `deps_config`, `typecheck_config` (via
+    /// `typecheck_deps_config`), and `test_config` (via `test_deps_config`,
+    /// once per test *file*) all go through this single entry point so a
+    /// package with N source files and T test files pays one full-package
+    /// graph build, not `2+T`.
+    ///
+    /// Locking: the outer `graph_cache` mutex is only held long enough to
+    /// get-or-insert this package's own `OnceCell` — the actual parse+resolve
+    /// work runs after it's released, inside that per-package cell's
+    /// `get_or_try_init`. Concurrent `Provider::get` calls for *different*
+    /// packages therefore never serialize behind one lock; concurrent calls
+    /// for the *same* package correctly coalesce onto one build via the cell,
+    /// the same shape `tsc_cache`/`testrunner_cache` already use for a single
+    /// (not per-key) value.
+    async fn import_graph(&self, pkg: &PkgBuf) -> anyhow::Result<Arc<importgraph::ImportGraph>> {
+        let cell = {
+            let mut cache = self.graph_cache.lock().await;
+            Arc::clone(
+                cache
+                    .entry(pkg.clone())
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+
+        let workspace_root = self.workspace_root.clone();
+        let walker = Arc::clone(&self.walker);
+        let pkg_str = pkg.as_str().to_string();
+        #[cfg(test)]
+        let build_count = Arc::clone(&self.graph_build_count);
+
+        let graph = cell
+            .get_or_try_init(|| async move {
+                hcore::blocking::run(move || -> anyhow::Result<Arc<importgraph::ImportGraph>> {
+                    #[cfg(test)]
+                    build_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                    let pkg_dir = if pkg_str.is_empty() {
+                        workspace_root.clone()
+                    } else {
+                        workspace_root.join(&pkg_str)
+                    };
+                    let tsconfig = importgraph::find_nearest_tsconfig(&workspace_root, &pkg_dir);
+                    let import_resolvers = resolvers::Resolvers::new(tsconfig.as_deref());
+                    let resolve_cache = importgraph::ResolveCache::new();
+                    let graph = importgraph::build_package_import_graph(
+                        &walker,
+                        &workspace_root,
+                        &pkg_str,
+                        &import_resolvers,
+                        &resolve_cache,
+                        tsconfig.as_deref(),
+                    )
+                    .with_context(|| format!("building import graph for {pkg_str:?}"))?;
+                    Ok(Arc::new(graph))
+                })
+                .await
+            })
+            .await?;
+        Ok(Arc::clone(graph))
+    }
+
     /// Whether the provider's `allow_scripts` option permits `name@version`
     /// (or a bare `name` allowlist entry) to run lifecycle scripts.
     fn scripts_allowed_for(&self, name: &str, version: &str) -> bool {
@@ -392,10 +650,9 @@ impl Provider {
     async fn deps_config(&self, pkg: &PkgBuf) -> anyhow::Result<Value> {
         let lockfile = self.lockfile().await?;
         let resolved_graph = self.resolved_graph().await?;
+        let graph = self.import_graph(pkg).await?;
+        let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
-        let walker = Arc::clone(&self.walker);
-        let skip = Arc::clone(&self.skip);
-        let pkgmanager = self.pkgmanager;
         let pkg_str = pkg.as_str().to_string();
         let goos = platform::current_goos();
         let goarch = platform::current_goarch();
@@ -404,33 +661,6 @@ impl Provider {
             let package_json_path = workspace_root.join(&pkg_str).join(PACKAGE_JSON);
             let manifest = package_json::read_package_manifest(&package_json_path)
                 .with_context(|| format!("reading dependencies of {pkg_str:?}"))?;
-
-            // Workspace-member discovery, redone here rather than reusing
-            // `Provider::workspace_members` — this whole closure already
-            // runs on the blocking pool, so it calls the same free functions
-            // `workspace_members` itself calls rather than the `&self`
-            // method (which can't be moved into a `'static` blocking job).
-            let patterns = match pkgmanager {
-                PkgManager::Npm => workspace::read_npm_workspace_globs(&workspace_root)?,
-                PkgManager::Pnpm => workspace::read_pnpm_workspace_globs(&workspace_root)?,
-            };
-            let member_addrs_by_name: BTreeMap<String, String> = if patterns.is_empty() {
-                BTreeMap::new()
-            } else {
-                let mut packages = Vec::new();
-                collect_js_packages(
-                    &walker,
-                    &workspace_root,
-                    &workspace_root,
-                    &skip,
-                    &mut packages,
-                );
-                let packages: Vec<PkgBuf> = packages.into_iter().collect::<anyhow::Result<_>>()?;
-                workspace::resolve_members(&workspace_root, &packages, &patterns)?
-                    .into_iter()
-                    .map(|m| (m.name, m.addr.format()))
-                    .collect()
-            };
 
             let resolved = deps::resolve_package_deps(
                 &pkg_str,
@@ -444,20 +674,9 @@ impl Provider {
 
             // M2: cross-validate the declared-dependency wiring above against
             // the package's real import graph — see this method's doc
-            // comment and `importgraph.rs` module docs.
-            let tsconfig =
-                importgraph::find_nearest_tsconfig(&workspace_root, &workspace_root.join(&pkg_str));
-            let import_resolvers = resolvers::Resolvers::new(tsconfig.as_deref());
-            let resolve_cache = importgraph::ResolveCache::new();
-            let graph = importgraph::build_package_import_graph(
-                &walker,
-                &workspace_root,
-                &pkg_str,
-                &import_resolvers,
-                &resolve_cache,
-                tsconfig.as_deref(),
-            )
-            .with_context(|| format!("building import graph for {pkg_str:?}"))?;
+            // comment and `importgraph.rs` module docs. `graph` was already
+            // built (and cached) by `Provider::import_graph` before this
+            // closure was spawned.
             let declared_closure = importgraph::declared_closure(&manifest);
             importgraph::check_phantom_dependencies(
                 &workspace_root,
@@ -505,46 +724,20 @@ impl Provider {
         let tsc_version = resolved_tsc.1.clone();
         let lockfile = self.lockfile().await?;
         let resolved_graph = self.resolved_graph().await?;
+        let graph = self.import_graph(pkg).await?;
+        let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
         let walker = Arc::clone(&self.walker);
-        let skip = Arc::clone(&self.skip);
-        let pkgmanager = self.pkgmanager;
         let pkg_str = pkg.as_str().to_string();
         let goos = platform::current_goos();
         let goarch = platform::current_goarch();
 
         hcore::blocking::run(move || -> anyhow::Result<HashMap<String, Value>> {
-            // Same workspace-member discovery `Provider::deps_config` does
-            // in its own blocking closure — needed here too so an import
-            // that never resolved on disk (no ambient `node_modules`) can
-            // still be attributed to a workspace sibling by name (see
-            // `typecheck_deps_config`'s doc).
-            let patterns = match pkgmanager {
-                PkgManager::Npm => workspace::read_npm_workspace_globs(&workspace_root)?,
-                PkgManager::Pnpm => workspace::read_pnpm_workspace_globs(&workspace_root)?,
-            };
-            let member_addrs_by_name: BTreeMap<String, String> = if patterns.is_empty() {
-                BTreeMap::new()
-            } else {
-                let mut packages = Vec::new();
-                collect_js_packages(
-                    &walker,
-                    &workspace_root,
-                    &workspace_root,
-                    &skip,
-                    &mut packages,
-                );
-                let packages: Vec<PkgBuf> = packages.into_iter().collect::<anyhow::Result<_>>()?;
-                workspace::resolve_members(&workspace_root, &packages, &patterns)?
-                    .into_iter()
-                    .map(|m| (m.name, m.addr.format()))
-                    .collect()
-            };
-
             let (deps, tsconfig_path, tsconfig_content) = typecheck_deps_config(
                 &walker,
                 &workspace_root,
                 &pkg_str,
+                &graph,
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
                 &member_addrs_by_name,
@@ -601,10 +794,9 @@ impl Provider {
         let runner_version = resolved_test_runner.1.clone();
         let lockfile = self.lockfile().await?;
         let resolved_graph = self.resolved_graph().await?;
+        let graph = self.import_graph(pkg).await?;
+        let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
-        let walker = Arc::clone(&self.walker);
-        let skip = Arc::clone(&self.skip);
-        let pkgmanager = self.pkgmanager;
         let testrunner = self.testrunner.clone();
         let pkg_str = pkg.as_str().to_string();
         let test_file_rel = test_file_rel.to_string();
@@ -612,37 +804,11 @@ impl Provider {
         let goarch = platform::current_goarch();
 
         hcore::blocking::run(move || -> anyhow::Result<HashMap<String, Value>> {
-            // Same workspace-member discovery `Provider::typecheck_config`
-            // does in its own blocking closure — needed here too so an
-            // import that never resolved on disk can still be attributed to
-            // a workspace sibling by name.
-            let patterns = match pkgmanager {
-                PkgManager::Npm => workspace::read_npm_workspace_globs(&workspace_root)?,
-                PkgManager::Pnpm => workspace::read_pnpm_workspace_globs(&workspace_root)?,
-            };
-            let member_addrs_by_name: BTreeMap<String, String> = if patterns.is_empty() {
-                BTreeMap::new()
-            } else {
-                let mut packages = Vec::new();
-                collect_js_packages(
-                    &walker,
-                    &workspace_root,
-                    &workspace_root,
-                    &skip,
-                    &mut packages,
-                );
-                let packages: Vec<PkgBuf> = packages.into_iter().collect::<anyhow::Result<_>>()?;
-                workspace::resolve_members(&workspace_root, &packages, &patterns)?
-                    .into_iter()
-                    .map(|m| (m.name, m.addr.format()))
-                    .collect()
-            };
-
             let (deps, runner_config_path, runner_config_content) = test_deps_config(
-                &walker,
                 &workspace_root,
                 &pkg_str,
                 &test_file_rel,
+                &graph,
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
                 &member_addrs_by_name,
@@ -778,6 +944,9 @@ impl Provider {
 /// an Input set that might not match what `tsc --project` actually reads.
 ///
 /// `pkg` is the package's workspace-relative path (`""` for the root).
+/// `graph` is `pkg`'s [`importgraph::ImportGraph`] — built once by
+/// `Provider::import_graph` and shared with `deps_config`/`test_deps_config`
+/// rather than rebuilt here; see that method's doc for why.
 /// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`goos`/`goarch` are
 /// only consulted when an import names a package that never resolved on
 /// disk — see above — and mirror the identically-named parameters
@@ -791,6 +960,7 @@ fn typecheck_deps_config(
     walker: &CachedWalker,
     workspace_root: &Path,
     pkg: &str,
+    graph: &importgraph::ImportGraph,
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
@@ -869,26 +1039,15 @@ fn typecheck_deps_config(
         }
     }
 
-    let import_resolvers = resolvers::Resolvers::new(tsconfig.as_deref());
-    let resolve_cache = importgraph::ResolveCache::new();
-    let graph = importgraph::build_package_import_graph(
-        walker,
-        workspace_root,
-        pkg,
-        &import_resolvers,
-        &resolve_cache,
-        tsconfig.as_deref(),
-    )
-    .with_context(|| format!("building import graph for {pkg:?}"))?;
-
     // Phantom-dependency check: `Provider::deps_config` (the `js_package_info`
     // target) already runs this, but a workspace member requesting only
     // `js_typecheck` (never `js_package_info`) must not skip it — this is
     // also what justifies treating every name reached below via
     // `member_addrs_by_name`/the lockfile as genuinely declared, rather than
-    // re-deriving that from scratch.
+    // re-deriving that from scratch. `graph` is the caller-supplied,
+    // `Provider::import_graph`-cached graph — see this function's doc.
     let declared_closure = importgraph::declared_closure(&manifest);
-    importgraph::check_phantom_dependencies(workspace_root, pkg, &graph, &declared_closure)
+    importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
         })?;
@@ -1122,20 +1281,23 @@ fn test_file_under_package(package: &str, test_file: &str) -> bool {
 /// see this module's tests.
 ///
 /// `pkg` is the package's workspace-relative path (`""` for the root);
-/// `test_file_rel` is the one test file's workspace-relative path.
+/// `test_file_rel` is the one test file's workspace-relative path. `graph` is
+/// `pkg`'s [`importgraph::ImportGraph`] — built once by
+/// `Provider::import_graph` and shared with `deps_config`/`typecheck_config`
+/// rather than rebuilt here; see that method's doc for why.
 /// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`goos`/`goarch` mirror
 /// `typecheck_deps_config`'s identically-named parameters.
 ///
 /// **Known scope trim, disclosed rather than silent — and a real gap, not
-/// merely a narrower one**: the resolved tsconfig (used here only to
-/// configure `Resolvers`' `paths`/`baseUrl`/`extends` support so the import
-/// graph itself is built correctly) is not declared as its own `js_test`
-/// Input, nor hashed, the way `js_typecheck`'s `"tsconfig"`/`tsconfig_content`
-/// pair is. It is tempting to reason that `js_test` runs source directly
-/// (not through `tsc`) so this only affects import *resolution*, not
-/// behavior — but that reasoning is wrong: the recommended default runner,
-/// vitest, transforms TS via Vite's esbuild-based transform, which reads the
-/// nearest `tsconfig.json` itself at transform time for options
+/// merely a narrower one**: the tsconfig that shaped how `graph` resolved
+/// `paths`/`baseUrl`/`extends`-aware specifiers is not declared as its own
+/// `js_test` Input, nor hashed, the way `js_typecheck`'s
+/// `"tsconfig"`/`tsconfig_content` pair is. It is tempting to reason that
+/// `js_test` runs source directly (not through `tsc`) so this only affects
+/// import *resolution*, not behavior — but that reasoning is wrong: the
+/// recommended default runner, vitest, transforms TS via Vite's
+/// esbuild-based transform, which reads the nearest `tsconfig.json` itself at
+/// transform time for options
 /// (`jsx`/`jsxFactory`/`target`/`useDefineForClassFields`/
 /// `experimentalDecorators`) that change the *emitted, executed* JS — not
 /// just which file a specifier resolves to. Toggling one of those between
@@ -1151,10 +1313,10 @@ fn test_file_under_package(package: &str, test_file: &str) -> bool {
               `testrunner` for the jest-package.json-field config fallback"
 )]
 fn test_deps_config(
-    walker: &CachedWalker,
     workspace_root: &Path,
     pkg: &str,
     test_file_rel: &str,
+    graph: &importgraph::ImportGraph,
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
@@ -1238,29 +1400,18 @@ fn test_deps_config(
         }
     }
 
-    let tsconfig = importgraph::find_nearest_tsconfig(workspace_root, &pkg_dir);
-    let import_resolvers = resolvers::Resolvers::new(tsconfig.as_deref());
-    let resolve_cache = importgraph::ResolveCache::new();
-    let graph = importgraph::build_package_import_graph(
-        walker,
-        workspace_root,
-        pkg,
-        &import_resolvers,
-        &resolve_cache,
-        tsconfig.as_deref(),
-    )
-    .with_context(|| format!("building import graph for {pkg:?}"))?;
-
     // Phantom-dependency check: a workspace member requesting only `js_test`
     // (never `js_package_info`/`js_typecheck`) must not skip it — same
     // rationale `typecheck_deps_config` documents for its own identical call.
+    // `graph` is the caller-supplied, `Provider::import_graph`-cached graph —
+    // see this function's doc.
     let declared_closure = importgraph::declared_closure(&manifest);
-    importgraph::check_phantom_dependencies(workspace_root, pkg, &graph, &declared_closure)
+    importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
         })?;
 
-    let closure = importgraph::build_test_closure(&graph, &canonical_root, pkg, test_file_rel)
+    let closure = importgraph::build_test_closure(graph, &canonical_root, pkg, test_file_rel)
         .with_context(|| {
             format!("building test closure for {pkg:?}'s test file {test_file_rel:?}")
         })?;
@@ -1326,6 +1477,403 @@ fn test_deps_config(
     }
 
     Ok((deps, runner_config_path_rel, runner_config_content))
+}
+
+/// Candidate config filenames for `linter`'s ancestor-chain walk (see
+/// `importgraph::find_nearest_lint_config`). oxlint has exactly one
+/// dedicated config filename; eslint's list checks the modern flat-config
+/// filenames first (eslint 9's own default resolution order — a project
+/// with both a flat and a legacy config uses the flat one), falling back to
+/// every legacy `.eslintrc.*` extension eslint itself accepts. Errors on an
+/// unsupported `linter` rather than guessing — callers only ever reach this
+/// after `toolchain::is_supported_linter` has already validated it (see
+/// `Provider::resolved_host_linter`), so this should never actually trigger
+/// in practice, but a fallible return keeps that an enforced invariant
+/// rather than an assumed one.
+fn lint_config_candidates(linter: &str) -> anyhow::Result<&'static [&'static str]> {
+    match linter {
+        toolchain::OXLINT => Ok(&[".oxlintrc.json"]),
+        toolchain::ESLINT => Ok(&[
+            "eslint.config.js",
+            "eslint.config.mjs",
+            "eslint.config.cjs",
+            "eslint.config.ts",
+            "eslint.config.mts",
+            "eslint.config.cts",
+            ".eslintrc.js",
+            ".eslintrc.cjs",
+            ".eslintrc.yaml",
+            ".eslintrc.yml",
+            ".eslintrc.json",
+            ".eslintrc",
+        ]),
+        other => anyhow::bail!(
+            "js_lint: unsupported linter {other:?} — expected \"oxlint\" or \"eslint\" (should \
+             have been rejected earlier by toolchain::is_supported_linter)"
+        ),
+    }
+}
+
+/// Result of [`lint_deps_config`]: the `deps` map (see that function's doc)
+/// plus the resolved linter config's/tsconfig's own workspace-relative path
+/// and raw content, for a `js_lint` target. A plain tuple would work but
+/// clippy (rightly) flags a 5-element one as too easy to mis-order at the
+/// call site; a named struct makes each field self-documenting instead.
+///
+/// `Debug` is derived (code-quality M5 review NIT: most sibling internal
+/// state in this file derives it, and its absence made `{:?}`/`expect_err`
+/// in a test fail to compile) — private type, so this isn't a `rust.md`
+/// violation either way, just consistency.
+#[derive(Debug)]
+struct LintDepsConfig {
+    deps: HashMap<String, Value>,
+    config_path: String,
+    config_content: String,
+    tsconfig_path: String,
+    tsconfig_content: String,
+}
+
+/// Build the `deps` map (`""` = the package's own first-party source files
+/// (no tsconfig-`include`/`exclude` filtering — a linter operates on raw
+/// source files directly, unlike `tsc`'s project-scoped compilation);
+/// `"config"` = the resolved linter config file, if any; `"tsconfig"` =
+/// (eslint type-aware rules only) the tsconfig(s) named by
+/// `parserOptions.project` plus their whole `extends` chain, exactly the
+/// same Input/hash treatment `js_typecheck` gives its own tsconfig — see
+/// `driver_lint.rs` module docs' "Inputs / cache key" section, and this is
+/// the specific gap the M5 task calls out by name: a type-aware eslint
+/// config's type information comes from that tsconfig the same way `tsc`'s
+/// does, so a change to it (or anywhere in its `extends` chain) must bust
+/// this target's cache the same way it busts `js_typecheck`'s;
+/// `"eslint_plugins"` = (eslint only) every `extends`/`plugins` entry that
+/// names an npm package, resolved through the lockfile
+/// (`deps::resolve_one_dependency`) — never treated as a raw filesystem
+/// path, the exact M3/M4-review-class mistake this milestone's task named
+/// again for this driver) plus that config's own workspace-relative path and
+/// raw content, for one `js_lint` target.
+///
+/// Deliberately split out from [`Provider::lint_config`] so it never touches
+/// the host linter binary — unit-testable without a real `oxlint`/`eslint`
+/// installed, mirroring `typecheck_deps_config`/`test_deps_config`'s
+/// identical split for the identical reason.
+///
+/// `pkg` is the package's workspace-relative path (`""` for the root).
+/// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`goos`/`goarch` mirror
+/// `typecheck_deps_config`'s identically-named parameters (only consulted
+/// for eslint's `extends`/`plugins` package resolution).
+///
+/// **Known scope trim, disclosed rather than silent**: a package's own
+/// ignore rules (`.eslintignore`, `.oxlintignore`, an `ignorePatterns` config
+/// field) are not applied when collecting the `""` source-file group — every
+/// first-party source file `importgraph::package_source_files` finds is
+/// declared, so an ignored file still costs a declared Input (over-inclusion,
+/// never a missed one). TODO M5+: fold ignore-pattern filtering in, mirroring
+/// `typecheck_deps_config`'s tsconfig-`include`/`exclude` treatment.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors typecheck_deps_config's/test_deps_config's own lockfile/member/platform \
+              parameter set, needed here too for the same on-demand third-party-input \
+              resolution, plus `linter` to select the config-file search + eslint-only \
+              type-aware/extends handling"
+)]
+fn lint_deps_config(
+    walker: &CachedWalker,
+    workspace_root: &Path,
+    pkg: &str,
+    linter: &str,
+    lockfile: Option<&Lockfile>,
+    resolved_graph: Option<&ResolvedGraph>,
+    member_addrs_by_name: &BTreeMap<String, String>,
+    goos: &str,
+    goarch: &str,
+) -> anyhow::Result<LintDepsConfig> {
+    let pkg_dir = if pkg.is_empty() {
+        workspace_root.to_path_buf()
+    } else {
+        workspace_root.join(pkg)
+    };
+
+    let manifest = package_json::read_package_manifest(&pkg_dir.join(PACKAGE_JSON))
+        .with_context(|| format!("reading {pkg:?}'s package.json for js_lint Input scoping"))?;
+
+    // See `typecheck_deps_config`'s identical canonicalization requirement:
+    // `extends`-chain targets are realpath'd, so every containment check
+    // must compare against a canonicalized `workspace_root`.
+    let canonical_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize workspace root {workspace_root:?}"))?;
+
+    let src_files = importgraph::package_source_files(walker, workspace_root, pkg)
+        .with_context(|| format!("collecting first-party source files for {pkg:?}"))?;
+    let mut src_rel: BTreeSet<String> = BTreeSet::new();
+    for f in &src_files {
+        let rel = f
+            .strip_prefix(workspace_root)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .replace('\\', "/");
+        src_rel.insert(rel);
+    }
+
+    // Deliberately no `package.json`-field config fallback here: see
+    // `importgraph::find_nearest_package_json_field_config`'s doc for why an
+    // earlier version's oxlint/eslint fallback was removed rather than kept
+    // (a feature-quality M5 review finding — neither tool actually reads a
+    // `package.json` field when invoked with `-c <that package.json>`, the
+    // way `driver_lint.rs::run` always invokes them).
+    let candidates = lint_config_candidates(linter)?;
+    let config_path = importgraph::find_nearest_lint_config(workspace_root, &pkg_dir, candidates);
+
+    let mut deps: HashMap<String, Value> = HashMap::new();
+    deps.insert(
+        String::new(),
+        Value::List(
+            src_rel
+                .iter()
+                .map(|p| Value::String(hbuiltins::pluginfs::file_addr(p).format()))
+                .collect(),
+        ),
+    );
+
+    let (config_path_rel, config_content) = match &config_path {
+        Some(p) => {
+            let rel = p
+                .strip_prefix(workspace_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content =
+                std::fs::read_to_string(p).with_context(|| format!("reading lint config {p:?}"))?;
+            (rel, content)
+        }
+        None => (String::new(), String::new()),
+    };
+
+    let mut tsconfig_rel: BTreeSet<String> = BTreeSet::new();
+    let mut tsconfig_path_rel = String::new();
+    let mut tsconfig_content = String::new();
+
+    if let Some(config_path) = &config_path {
+        // Invariant: `config_path_rel` is the relative path of a file that
+        // `find_nearest_lint_config` confirmed exists (see the `config_path`
+        // match above), so it is never empty here — no need to guard the
+        // insert (code-quality/feature-quality M5 review finding: an earlier
+        // `!config_path_rel.is_empty()` check was dead code with no test
+        // exercising the branch it guarded against).
+        debug_assert!(
+            !config_path_rel.is_empty(),
+            "config_path is Some, so config_path_rel must be a non-empty relative path"
+        );
+        deps.insert(
+            "config".to_string(),
+            Value::List(vec![Value::String(
+                hbuiltins::pluginfs::file_addr(&config_path_rel).format(),
+            )]),
+        );
+
+        if linter == toolchain::ESLINT {
+            // Type-aware rules: fold the tsconfig(s) named by every
+            // `parserOptions.project` occurrence plus their whole `extends`
+            // chain into the Input set/hash the same way `js_typecheck` does
+            // — see this function's doc. Every occurrence, not just the
+            // first, is resolved (code-quality M5 review finding): a
+            // multi-entry flat config (e.g. a separate override block per
+            // `src/**`/`test/**`, each with its own `parserOptions.project`)
+            // would otherwise have every tsconfig but the first silently
+            // invisible to the declared Input set/cache key.
+            let projects = importgraph::detect_eslint_type_aware(config_path, &config_content)
+                .with_context(|| format!("scanning {config_path:?} for parserOptions.project"))?;
+            if !projects.is_empty() {
+                let config_dir = config_path.parent().unwrap_or(config_path);
+                let mut project_paths: Vec<PathBuf> = Vec::new();
+                for project in &projects {
+                    match project {
+                        importgraph::EslintProjectOption::AutoDetect => {
+                            project_paths.extend(importgraph::find_nearest_tsconfig(
+                                workspace_root,
+                                &pkg_dir,
+                            ));
+                        }
+                        importgraph::EslintProjectOption::Paths(paths) => {
+                            project_paths.extend(paths.iter().map(|p| config_dir.join(p)));
+                        }
+                    }
+                }
+                anyhow::ensure!(
+                    !project_paths.is_empty(),
+                    "js_lint: {config_path:?} configures a type-aware `parserOptions.project`, \
+                     but no tsconfig could be found — `project: true` requires a tsconfig.json \
+                     somewhere on {pkg:?}'s ancestor chain"
+                );
+                for leaf in &project_paths {
+                    anyhow::ensure!(
+                        leaf.is_file(),
+                        "js_lint: {config_path:?} names tsconfig {leaf:?} via \
+                         `parserOptions.project`, but it does not exist"
+                    );
+                    // Canonicalize: `parserOptions.project` values commonly
+                    // carry a `./` prefix (`config_dir.join(p)` doesn't
+                    // normalize that away), and `resolve_tsconfig_extends_chain`'s
+                    // own ancestor paths are already realpath'd (see that
+                    // function's doc) — comparing/stripping against a
+                    // non-canonical leaf would otherwise produce a
+                    // `packages/a/./tsconfig.json`-shaped rel path instead of
+                    // the clean one `js_typecheck`'s identical treatment
+                    // produces.
+                    let leaf = leaf
+                        .canonicalize()
+                        .with_context(|| format!("canonicalize tsconfig {leaf:?}"))?;
+                    // Hard error (never a silent same-path fallback) on
+                    // workspace-root escape — a hermeticity + code-quality M5
+                    // review finding: an eslint config with
+                    // `parserOptions: { project: "/etc/hostname" }` (or any
+                    // `../`-heavy path) previously canonicalized successfully
+                    // and then had `strip_prefix(...).unwrap_or(&leaf)` fall
+                    // back to the raw absolute host path instead of erroring,
+                    // reading and hashing an arbitrary host file into
+                    // `js_lint`'s cache key. Mirrors this same file's
+                    // `types_addrs` cross-package-edge check just above and
+                    // `resolve_extends_specifier`'s `canonicalize_within` in
+                    // `importgraph.rs`, both of which hard-error rather than
+                    // fall back.
+                    let leaf_rel = leaf
+                        .strip_prefix(&canonical_root)
+                        .with_context(|| {
+                            format!(
+                                "js_lint: {config_path:?} names tsconfig {leaf:?} via \
+                                 `parserOptions.project`, which resolved outside the workspace \
+                                 root ({canonical_root:?}) — cannot express it as a declared \
+                                 js_lint input"
+                            )
+                        })?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if tsconfig_path_rel.is_empty() {
+                        tsconfig_path_rel.clone_from(&leaf_rel);
+                    }
+                    if tsconfig_rel.insert(leaf_rel) {
+                        let content = std::fs::read_to_string(&leaf)
+                            .with_context(|| format!("reading tsconfig {leaf:?}"))?;
+                        tsconfig_content.push('\n');
+                        tsconfig_content.push_str(&content);
+                    }
+                    let chain = importgraph::resolve_tsconfig_extends_chain(&canonical_root, &leaf)
+                        .with_context(|| {
+                            format!(
+                                "resolving tsconfig extends chain for {pkg:?}'s js_lint (via \
+                                 {config_path:?})"
+                            )
+                        })?;
+                    for ancestor in &chain {
+                        let rel = ancestor
+                            .strip_prefix(&canonical_root)
+                            .unwrap_or(ancestor)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        if tsconfig_rel.insert(rel) {
+                            let content = std::fs::read_to_string(ancestor).with_context(|| {
+                                format!("reading extended tsconfig {ancestor:?}")
+                            })?;
+                            tsconfig_content.push('\n');
+                            tsconfig_content.push_str(&content);
+                        }
+                    }
+                }
+            }
+
+            // `extends`/`plugins` npm packages — resolved via the lockfile,
+            // never treated as raw filesystem paths (see
+            // `importgraph::extract_eslint_module_refs`'s doc).
+            let names = importgraph::extract_eslint_module_refs(config_path, &config_content)
+                .with_context(|| format!("scanning {config_path:?} for extends/plugins"))?;
+            let mut plugin_addrs: BTreeSet<String> = BTreeSet::new();
+            for name in names {
+                if let Some(addr) = deps::resolve_one_dependency(
+                    pkg,
+                    &name,
+                    &manifest,
+                    lockfile,
+                    resolved_graph,
+                    member_addrs_by_name,
+                    goos,
+                    goarch,
+                )
+                .with_context(|| format!("resolving eslint config package `{name}` for js_lint"))?
+                {
+                    plugin_addrs.insert(addr);
+                }
+            }
+            if !plugin_addrs.is_empty() {
+                deps.insert(
+                    "eslint_plugins".to_string(),
+                    Value::List(plugin_addrs.into_iter().map(Value::String).collect()),
+                );
+            }
+
+            // Relative-path shared eslint config files: a legacy config's own
+            // relative `extends`/`plugins` entry, or a modern flat config's
+            // relative `import`/`require` of a shared base config — both
+            // name a local sibling file rather than an npm package, and must
+            // be declared as Inputs the same way `test_deps_config` already
+            // does for a shared test-runner config (a hermeticity M5 review
+            // finding: editing only the referenced base config previously
+            // left `js_lint`'s cache key unchanged). See
+            // `importgraph::resolve_eslint_config_referenced_files`'s doc.
+            let referenced_configs =
+                importgraph::resolve_eslint_config_referenced_files(config_path, &config_content)
+                    .with_context(|| {
+                    format!("scanning {config_path:?} for referenced eslint config files")
+                })?;
+            let mut config_ref_addrs: BTreeSet<String> = BTreeSet::new();
+            for file in referenced_configs {
+                // Same hard-error-not-fallback containment discipline as the
+                // `parserOptions.project` leaf just above: a referenced
+                // config file that resolves outside the workspace root must
+                // never be silently read/hashed as an arbitrary host file.
+                let canonical_file = file
+                    .canonicalize()
+                    .with_context(|| format!("canonicalize referenced eslint config {file:?}"))?;
+                let rel = canonical_file
+                    .strip_prefix(&canonical_root)
+                    .with_context(|| {
+                        format!(
+                            "js_lint: {config_path:?} references {file:?}, which resolved \
+                             outside the workspace root ({canonical_root:?}) — cannot express \
+                             it as a declared js_lint input"
+                        )
+                    })?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                config_ref_addrs.insert(hbuiltins::pluginfs::file_addr(&rel).format());
+            }
+            if !config_ref_addrs.is_empty() {
+                deps.insert(
+                    "config_refs".to_string(),
+                    Value::List(config_ref_addrs.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+    }
+
+    if !tsconfig_rel.is_empty() {
+        deps.insert(
+            "tsconfig".to_string(),
+            Value::List(
+                tsconfig_rel
+                    .iter()
+                    .map(|p| Value::String(hbuiltins::pluginfs::file_addr(p).format()))
+                    .collect(),
+            ),
+        );
+    }
+
+    Ok(LintDepsConfig {
+        deps,
+        config_path: config_path_rel,
+        config_content,
+        tsconfig_path: tsconfig_path_rel,
+        tsconfig_content,
+    })
 }
 
 /// The default npm registry tarball URL for a `(name, version)` — used when
@@ -1415,6 +1963,40 @@ fn read_package_name_blocking(package_json: &Path) -> anyhow::Result<String> {
     workspace::read_package_name(package_json)
 }
 
+/// Resolve `member_addrs_by_name` (workspace-member package name →
+/// `package_info` target addr string) — the identical workspace-member
+/// discovery `Provider::deps_config`/`typecheck_config`/`test_config`/
+/// `lint_config` each need inside their own `hcore::blocking::run` closure,
+/// so an import that never resolved on disk can still be attributed to a
+/// workspace sibling by name. Factored out to a free function (not `&self`)
+/// for the same reason those closures already redo this discovery rather
+/// than call `Provider::workspace_members` directly: every call site already
+/// runs on the blocking pool, and `&self` can't be moved into a `'static`
+/// blocking job.
+fn member_addrs_by_name_blocking(
+    walker: &CachedWalker,
+    workspace_root: &Path,
+    skip: &Ignore,
+    pkgmanager: PkgManager,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let patterns = match pkgmanager {
+        PkgManager::Npm => workspace::read_npm_workspace_globs(workspace_root)?,
+        PkgManager::Pnpm => workspace::read_pnpm_workspace_globs(workspace_root)?,
+    };
+    if patterns.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut packages = Vec::new();
+    collect_js_packages(walker, workspace_root, workspace_root, skip, &mut packages);
+    let packages: Vec<PkgBuf> = packages.into_iter().collect::<anyhow::Result<_>>()?;
+    Ok(
+        workspace::resolve_members(workspace_root, &packages, &patterns)?
+            .into_iter()
+            .map(|m| (m.name, m.addr.format()))
+            .collect(),
+    )
+}
+
 fn empty_list_responses() -> Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send> {
     Box::new(std::iter::empty())
 }
@@ -1461,6 +2043,19 @@ impl ProviderTrait for Provider {
                 Default::default(),
             );
             let mut responses: Vec<anyhow::Result<ListResponse>> = vec![Ok(ListResponse { addr })];
+
+            // `js_lint` is a second per-package target kind alongside
+            // `package_info` — always present once the package exists (no
+            // additional discovery needed, unlike `js_test`'s per-file
+            // globbing), same as `js_typecheck` would be if it were listed
+            // here too.
+            responses.push(Ok(ListResponse {
+                addr: Addr::new(
+                    req.package.clone(),
+                    LINT_TARGET.to_string(),
+                    Default::default(),
+                ),
+            }));
 
             // One `js_test` target per matched test file — the milestone's
             // stated per-test-file (not per-package) granularity; see
@@ -1598,7 +2193,42 @@ impl ProviderTrait for Provider {
                 });
             }
 
-            // `js_test` is a third per-package-*file* target kind: one addr
+            // `js_lint` is a third per-package target kind alongside
+            // `package_info`/`js_typecheck`, checked before the
+            // `PACKAGE_INFO_TARGET` gate below for the same reason
+            // `TYPECHECK_TARGET` is.
+            if req.addr.name == LINT_TARGET {
+                if self
+                    .skip
+                    .prunes_package(&self.workspace_root, Path::new(req.addr.package.as_str()))
+                {
+                    return Err(GetError::NotFound);
+                }
+                let package_json = self
+                    .workspace_root
+                    .join(req.addr.package.as_str())
+                    .join(PACKAGE_JSON);
+                if !package_json.is_file() {
+                    return Err(GetError::NotFound);
+                }
+                let config = self
+                    .lint_config(&req.addr.package)
+                    .await
+                    .with_context(|| format!("resolving js_lint config for {}", req.addr.format()))
+                    .map_err(GetError::Other)?;
+                return Ok(GetResponse {
+                    target_spec: TargetSpec {
+                        addr: req.addr.clone(),
+                        driver: "js_lint".to_string(),
+                        config,
+                        labels: vec![],
+                        transitive: Default::default(),
+                        approval: Default::default(),
+                    },
+                });
+            }
+
+            // `js_test` is a fourth per-package-*file* target kind: one addr
             // per matched test file, distinguished by the `file` addr arg —
             // see `driver_test.rs` module docs. Checked before the
             // `PACKAGE_INFO_TARGET` gate below for the same reason
@@ -1781,6 +2411,187 @@ mod tests {
         dir
     }
 
+    // ---- graph_cache: Provider::import_graph memoization ----
+    //
+    // M2/M4 review-flagged perf issue: `deps_config`/`typecheck_config`/
+    // `test_config` each independently called
+    // `importgraph::build_package_import_graph` — a full oxc_parser parse +
+    // oxc_resolver resolve of every first-party file in the package — from
+    // scratch, on every single `Provider::get` call. `Provider::import_graph`
+    // fixes this with a per-package cache; these tests prove it actually
+    // memoizes (the same "prove it, don't just structurally add it" gap the
+    // M2 review flagged for `ResolveCache`), not merely that the type exists.
+
+    /// `deps_config` (the real, public, tsc/vitest-free entry point) followed
+    /// by a direct `Provider::import_graph` call — standing in for what
+    /// `typecheck_config`/`test_config` each do internally as the very first
+    /// thing they reach for the same package (see both methods' bodies) —
+    /// must build the underlying import graph exactly once between them.
+    ///
+    /// `typecheck_config`/`test_config` are not driven directly here because
+    /// both require a real host `tsc`/`vitest`/`jest` binary this environment
+    /// does not provision (see `get_resolves_js_typecheck_target_end_to_end`'s
+    /// `#[ignore]` for the identical reason); since both route through this
+    /// exact `import_graph` method before ever touching their own
+    /// tool-specific logic, proving the cache is shared here proves the fix
+    /// for all three real callers.
+    #[tokio::test]
+    async fn import_graph_is_shared_across_independent_callers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let pkg = PkgBuf::from("packages/a");
+
+        provider
+            .deps_config(&pkg)
+            .await
+            .expect("deps_config for packages/a");
+        assert_eq!(
+            provider
+                .graph_build_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "deps_config's own import_graph call must have built the graph exactly once"
+        );
+
+        provider
+            .import_graph(&pkg)
+            .await
+            .expect("import_graph for packages/a");
+        assert_eq!(
+            provider
+                .graph_build_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second caller for the SAME package must hit the cache, not rebuild"
+        );
+    }
+
+    /// Different packages must not share one build slot — proving the cache
+    /// is keyed per-package rather than a single memo that would happen to
+    /// look "correct" for one caller. Also exercises that re-fetching an
+    /// already-cached package doesn't rebuild, independent of insertion order.
+    #[tokio::test]
+    async fn import_graph_is_not_shared_across_different_packages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(dir.path(), "packages/b/package.json", r#"{"name": "b"}"#);
+        write(
+            dir.path(),
+            "packages/b/src/index.ts",
+            "export const y = 2;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+
+        provider
+            .import_graph(&PkgBuf::from("packages/a"))
+            .await
+            .expect("import_graph for packages/a");
+        provider
+            .import_graph(&PkgBuf::from("packages/b"))
+            .await
+            .expect("import_graph for packages/b");
+        assert_eq!(
+            provider
+                .graph_build_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "two different packages must each get their own build"
+        );
+
+        provider
+            .import_graph(&PkgBuf::from("packages/a"))
+            .await
+            .expect("import_graph for packages/a again");
+        assert_eq!(
+            provider
+                .graph_build_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "re-fetching an already-cached package must not rebuild"
+        );
+    }
+
+    /// The two tests above only ever `.await` one call before issuing the
+    /// next — they prove "a second *sequential* call for the same package
+    /// hits the cache," not "two *simultaneously racing* callers for the
+    /// same package coalesce onto one build," which is the actual property
+    /// `graph_cache`'s doc comment claims and every one of this crate's three
+    /// M5 reviews flagged as asserted-but-untested. Drive many concurrent
+    /// `import_graph` calls for the identical package via `join_all` and
+    /// assert exactly one build happened.
+    #[tokio::test]
+    async fn import_graph_concurrent_callers_for_the_same_package_coalesce_onto_one_build() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let pkg = PkgBuf::from("packages/a");
+
+        let futures = (0..16).map(|_| provider.import_graph(&pkg));
+        let results = futures::future::join_all(futures).await;
+        for r in results {
+            r.expect("concurrent import_graph call for packages/a");
+        }
+
+        assert_eq!(
+            provider
+                .graph_build_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "many callers racing the SAME package must single-flight onto exactly one build"
+        );
+    }
+
+    /// code-quality/feature-quality M5 review finding: `member_addrs_by_name_blocking`
+    /// (a full recursive workspace walk + `package.json` parse of every
+    /// package, plus a glob-match) was previously redone from scratch inside
+    /// each of `deps_config`/`typecheck_config`/`test_config`/`lint_config`'s
+    /// own blocking closure on every single call — the identical
+    /// "recompute-on-every-call" shape `graph_cache` fixes for the import
+    /// graph, left unfixed for workspace-member discovery. `member_addrs_cache`
+    /// backs `Provider::member_addrs_by_name` with a `tokio::sync::OnceCell`
+    /// exactly like `tsc_cache`/`testrunner_cache`/`linter_cache`; two calls
+    /// on the same `Provider` must return the identical cached `Arc`, not two
+    /// independently-built maps.
+    #[tokio::test]
+    async fn member_addrs_by_name_is_cached_across_calls_on_the_same_provider() {
+        let dir = pnpm_fixture();
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+
+        let first = provider
+            .member_addrs_by_name()
+            .await
+            .expect("member_addrs_by_name first call");
+        let second = provider
+            .member_addrs_by_name()
+            .await
+            .expect("member_addrs_by_name second call");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second call must reuse the cached Arc, not rebuild the workspace-member map"
+        );
+        assert!(!first.is_empty(), "sanity: the pnpm fixture has members");
+    }
+
     #[test]
     fn pnpm_workspace_members_excludes_node_modules() {
         let dir = pnpm_fixture();
@@ -1872,9 +2683,16 @@ mod tests {
             .await
             .expect("list");
         let addrs: Vec<Addr> = iter.map(|r| r.expect("no per-entry error").addr).collect();
-        assert_eq!(addrs.len(), 1);
+        // `package_info` + `js_lint` — see `Provider::list`'s doc for why
+        // `js_lint` is listed unconditionally alongside `package_info` (no
+        // `js_test`-style per-file discovery needed for it).
+        assert_eq!(addrs.len(), 2);
         assert_eq!(addrs[0].name, PACKAGE_INFO_TARGET);
         assert_eq!(addrs[0].package.as_str(), "packages/a");
+        assert!(
+            addrs.iter().any(|a| a.name == LINT_TARGET),
+            "js_lint must be listed alongside package_info: {addrs:?}"
+        );
     }
 
     #[tokio::test]
@@ -2316,6 +3134,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
             },
         );
 
@@ -2620,6 +3439,36 @@ mod tests {
         }
     }
 
+    /// Build the same [`importgraph::ImportGraph`] `Provider::import_graph`
+    /// would, for tests that call `typecheck_deps_config`/`test_deps_config`
+    /// directly against a bare fixture rather than through a `Provider` (and
+    /// therefore without its per-package cache — these tests exercise the
+    /// pure Input-scoping logic, not the cache itself; the cache has its own
+    /// dedicated tests, see `import_graph_is_shared_across_independent_callers`).
+    fn build_graph_for_test(
+        walker: &CachedWalker,
+        workspace_root: &Path,
+        pkg: &str,
+    ) -> importgraph::ImportGraph {
+        let pkg_dir = if pkg.is_empty() {
+            workspace_root.to_path_buf()
+        } else {
+            workspace_root.join(pkg)
+        };
+        let tsconfig = importgraph::find_nearest_tsconfig(workspace_root, &pkg_dir);
+        let import_resolvers = resolvers::Resolvers::new(tsconfig.as_deref());
+        let resolve_cache = importgraph::ResolveCache::new();
+        importgraph::build_package_import_graph(
+            walker,
+            workspace_root,
+            pkg,
+            &import_resolvers,
+            &resolve_cache,
+            tsconfig.as_deref(),
+        )
+        .expect("build import graph for test")
+    }
+
     /// `typecheck_deps_config` with no lockfile/workspace-member context —
     /// what most of these tests need, since they exercise scoping behavior
     /// that doesn't touch an unresolved third-party/sibling import.
@@ -2628,10 +3477,12 @@ mod tests {
         workspace_root: &Path,
         pkg: &str,
     ) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
+        let graph = build_graph_for_test(walker, workspace_root, pkg);
         typecheck_deps_config(
             walker,
             workspace_root,
             pkg,
+            &graph,
             None,
             None,
             &BTreeMap::new(),
@@ -2917,10 +3768,12 @@ mod tests {
         let resolved_graph = lockfile.resolved_graph();
 
         let walker = CachedWalker::disabled();
+        let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
         let (deps, _tsconfig_path, _tsconfig_content) = typecheck_deps_config(
             &walker,
             dir.path(),
             "packages/a",
+            &graph,
             Some(&lockfile),
             Some(&resolved_graph),
             &BTreeMap::new(),
@@ -3116,11 +3969,12 @@ mod tests {
         pkg: &str,
         test_file_rel: &str,
     ) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
+        let graph = build_graph_for_test(walker, workspace_root, pkg);
         test_deps_config(
-            walker,
             workspace_root,
             pkg,
             test_file_rel,
+            &graph,
             None,
             None,
             &BTreeMap::new(),
@@ -3341,11 +4195,12 @@ mod tests {
         let resolved_graph = lockfile.resolved_graph();
 
         let walker = CachedWalker::disabled();
+        let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
         let (deps, _, _) = test_deps_config(
-            &walker,
             dir.path(),
             "packages/a",
             "packages/a/src/a.test.ts",
+            &graph,
             Some(&lockfile),
             Some(&resolved_graph),
             &BTreeMap::new(),
@@ -3681,11 +4536,12 @@ mod tests {
         );
 
         let walker = CachedWalker::disabled();
+        let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
         let (deps, runner_config_path, runner_config_content) = test_deps_config(
-            &walker,
             dir.path(),
             "packages/a",
             "packages/a/src/a.test.ts",
+            &graph,
             None,
             None,
             &BTreeMap::new(),
@@ -3785,6 +4641,560 @@ mod tests {
             "a shared base config reached via a relative import inside the leaf config must be \
              declared too: {runner_config_addrs:?}"
         );
+    }
+
+    // ---- js_lint: lint_deps_config Input scoping (no real oxlint/eslint
+    // needed) ----
+
+    /// `lint_deps_config` with no lockfile/workspace-member context — what
+    /// most of these tests need, since they exercise scoping behavior that
+    /// doesn't touch an unresolved eslint `extends`/`plugins` package.
+    fn call_lint_deps_config(
+        walker: &CachedWalker,
+        workspace_root: &Path,
+        pkg: &str,
+        linter: &str,
+    ) -> anyhow::Result<LintDepsConfig> {
+        lint_deps_config(
+            walker,
+            workspace_root,
+            pkg,
+            linter,
+            None,
+            None,
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+    }
+
+    #[test]
+    fn lint_deps_config_declares_first_party_source_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        // An unrelated file elsewhere in the workspace must NOT appear —
+        // proving per-package, not workspace-wide, scoping.
+        write(
+            dir.path(),
+            "packages/b/unrelated.ts",
+            "export const unrelated = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::OXLINT)
+            .expect("build lint deps config");
+
+        let src_addrs = dep_addrs(&result.deps, "");
+        assert_eq!(src_addrs.len(), 1, "{src_addrs:?}");
+        assert!(src_addrs[0].contains("packages/a/src/index.ts"));
+        assert!(!src_addrs.iter().any(|a| a.contains("unrelated")));
+    }
+
+    #[test]
+    fn lint_deps_config_oxlint_includes_config_group_and_content_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/.oxlintrc.json",
+            r#"{"rules":{"no-console":"error"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::OXLINT)
+            .expect("build lint deps config");
+
+        assert_eq!(result.config_path, "packages/a/.oxlintrc.json");
+        assert_eq!(result.config_content, r#"{"rules":{"no-console":"error"}}"#);
+        let config_addrs = dep_addrs(&result.deps, "config");
+        assert_eq!(config_addrs.len(), 1);
+        assert!(config_addrs[0].contains("packages/a/.oxlintrc.json"));
+        // oxlint has no type-aware rules — no tsconfig group at all.
+        assert!(!result.deps.contains_key("tsconfig"));
+        assert!(result.tsconfig_path.is_empty());
+    }
+
+    #[test]
+    fn lint_deps_config_oxlint_no_config_group_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::OXLINT)
+            .expect("build lint deps config");
+
+        assert!(result.config_path.is_empty());
+        assert!(result.config_content.is_empty());
+        assert!(!result.deps.contains_key("config"));
+    }
+
+    /// Feature-quality M5 review finding: an earlier version fell back to a
+    /// `package.json`'s own `"oxlint"`/`"eslintConfig"` field when no
+    /// dedicated config file was found, then passed that `package.json`
+    /// straight to `-c` — a shape neither tool actually reads that way (see
+    /// `importgraph::find_nearest_package_json_field_config`'s doc). No
+    /// dedicated `.oxlintrc.json` here, so `js_lint` must run with no config
+    /// at all rather than fabricating one from the `"oxlint"` field.
+    #[test]
+    fn lint_deps_config_oxlint_has_no_package_json_field_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "oxlint": {"rules": {"no-console": "error"}}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::OXLINT)
+            .expect("build lint deps config");
+
+        assert!(result.config_path.is_empty());
+        assert!(result.config_content.is_empty());
+        assert!(!result.deps.contains_key("config"));
+    }
+
+    /// Same as above, for eslint's `"eslintConfig"` field.
+    #[test]
+    fn lint_deps_config_eslint_has_no_package_json_field_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "eslintConfig": {"rules": {"no-console": "error"}}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::ESLINT)
+            .expect("build lint deps config");
+
+        assert!(result.config_path.is_empty());
+        assert!(result.config_content.is_empty());
+        assert!(!result.deps.contains_key("config"));
+    }
+
+    /// **The specific M5 gap**: an eslint config with type-aware rules
+    /// configured (`parserOptions.project`) must declare/hash the tsconfig
+    /// AND its whole `extends` chain, exactly like `js_typecheck` — proven
+    /// the same way `typecheck_deps_config_declares_and_hashes_tsconfig_extends_chain`
+    /// proves it for `js_typecheck`: editing only the extends-chain
+    /// ancestor (leaf byte-identical) must change the hashed content.
+    #[test]
+    fn lint_deps_config_eslint_type_aware_declares_and_hashes_tsconfig_extends_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"strict":false}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/tsconfig.json",
+            r#"{"extends":"../../tsconfig.base.json"}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/eslint.config.js",
+            "export default [{ languageOptions: { parserOptions: { project: \
+             './tsconfig.json' } } }];\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::ESLINT)
+            .expect("build lint deps config");
+
+        assert_eq!(result.tsconfig_path, "packages/a/tsconfig.json");
+        let tsconfig_addrs = dep_addrs(&result.deps, "tsconfig");
+        assert_eq!(tsconfig_addrs.len(), 2, "{tsconfig_addrs:?}");
+        assert!(
+            tsconfig_addrs
+                .iter()
+                .any(|a| a.contains("packages/a/tsconfig.json"))
+        );
+        assert!(
+            tsconfig_addrs
+                .iter()
+                .any(|a| a.contains("tsconfig.base.json")),
+            "the extends-chain ancestor must be a declared Input too: {tsconfig_addrs:?}"
+        );
+        assert!(
+            result.tsconfig_content.contains("strict"),
+            "the extended base config's content must be folded into the hashed content: {:?}",
+            result.tsconfig_content
+        );
+
+        // Editing only the base config (leaf byte-identical) must change the
+        // hashed content — the actual cache-soundness claim, not just "the
+        // file is listed".
+        write(
+            dir.path(),
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"strict":true}}"#,
+        );
+        let result2 = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::ESLINT)
+            .expect("build lint deps config after editing the base config");
+        assert_ne!(
+            result.tsconfig_content, result2.tsconfig_content,
+            "editing only the extended base config must change the hashed tsconfig content"
+        );
+    }
+
+    #[test]
+    fn lint_deps_config_eslint_not_type_aware_when_no_project_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/eslint.config.js",
+            "export default [{ rules: { semi: 'error' } }];\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::ESLINT)
+            .expect("build lint deps config");
+
+        assert!(result.tsconfig_path.is_empty());
+        assert!(result.tsconfig_content.is_empty());
+        assert!(!result.deps.contains_key("tsconfig"));
+    }
+
+    /// `extends`/`plugins` npm packages must resolve via the lockfile
+    /// (`deps::resolve_one_dependency`), not be silently dropped or treated
+    /// as filesystem paths.
+    #[test]
+    fn lint_deps_config_eslint_extends_plugins_resolved_via_lockfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "devDependencies": {"eslint-plugin-react-hooks": "^4.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/eslint.config.js",
+            "import reactHooks from 'eslint-plugin-react-hooks';\nexport default [{ plugins: \
+             { 'react-hooks': reactHooks } }];\n",
+        );
+
+        let lockfile = Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/eslint-plugin-react-hooks": {
+                        "version": "4.6.0",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        )
+        .expect("parse lockfile");
+        let resolved_graph = lockfile.resolved_graph();
+
+        let walker = CachedWalker::disabled();
+        let result = lint_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            toolchain::ESLINT,
+            Some(&lockfile),
+            Some(&resolved_graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+        .expect("build lint deps config");
+
+        let plugin_addrs = dep_addrs(&result.deps, "eslint_plugins");
+        assert!(
+            plugin_addrs
+                .iter()
+                .any(|a| a.contains("eslint-plugin-react-hooks") && a.contains("js_install")),
+            "an eslint config's `plugins` import must resolve to a js_install Input via the \
+             lockfile: {plugin_addrs:?}"
+        );
+    }
+
+    /// Code-quality M5 review finding: a multi-entry flat config (separate
+    /// override blocks, each with its own `parserOptions.project`) must have
+    /// **every** named tsconfig declared/hashed, not just the first. Before
+    /// the fix, `detect_eslint_type_aware` stopped at the first match, so
+    /// `tsconfig.test.json` here was invisible to the declared Input set.
+    #[test]
+    fn lint_deps_config_eslint_multi_entry_project_all_resolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/tsconfig.json",
+            r#"{"compilerOptions":{}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/tsconfig.test.json",
+            r#"{"compilerOptions":{"types":["jest"]}}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/eslint.config.js",
+            "export default [\n\
+             { files: ['src/**/*.ts'], languageOptions: { parserOptions: { project: \
+             './tsconfig.json' } } },\n\
+             { files: ['test/**/*.ts'], languageOptions: { parserOptions: { project: \
+             './tsconfig.test.json' } } },\n\
+             ];\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::ESLINT)
+            .expect("build lint deps config");
+
+        let tsconfig_addrs = dep_addrs(&result.deps, "tsconfig");
+        assert!(
+            tsconfig_addrs
+                .iter()
+                .any(|a| a.contains("packages/a/tsconfig.json")),
+            "{tsconfig_addrs:?}"
+        );
+        assert!(
+            tsconfig_addrs
+                .iter()
+                .any(|a| a.contains("packages/a/tsconfig.test.json")),
+            "the second override block's own tsconfig must also be a declared Input, not just \
+             the first entry's: {tsconfig_addrs:?}"
+        );
+        assert!(
+            result.tsconfig_content.contains("jest"),
+            "the second tsconfig's content must be folded into the hashed content: {:?}",
+            result.tsconfig_content
+        );
+    }
+
+    /// Hermeticity + code-quality M5 review finding: a `parserOptions.project`
+    /// value that resolves outside the workspace root must hard-error, never
+    /// silently fall back to reading/hashing the arbitrary absolute host
+    /// path. `config_dir.join(absolute_path)` yields `absolute_path` verbatim
+    /// (`Path::join`'s documented behavior), so an absolute-path
+    /// `parserOptions.project` is the simplest deterministic repro of the
+    /// escape without relying on a specific number of `..` segments.
+    #[test]
+    fn lint_deps_config_eslint_parser_options_project_outside_workspace_root_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write(outside.path(), "tsconfig.json", r#"{"compilerOptions":{}}"#);
+        let outside_tsconfig = outside
+            .path()
+            .join("tsconfig.json")
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/eslint.config.js",
+            &format!(
+                "export default [{{ languageOptions: {{ parserOptions: {{ project: {:?} }} }} \
+                 }}];\n",
+                outside_tsconfig
+            ),
+        );
+
+        let walker = CachedWalker::disabled();
+        let err = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::ESLINT)
+            .expect_err(
+                "a parserOptions.project resolving outside the workspace root must be a hard \
+                 error, not a silent same-path fallback",
+            );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("outside the workspace root"),
+            "error must name the actual failure, not just \"not found\": {msg}"
+        );
+    }
+
+    /// Hermeticity M5 review finding: a legacy eslint config's own relative
+    /// `extends` entry (`"extends": "./base.eslintrc.json"`) names a local
+    /// sibling config file, not an npm package — it must be declared as an
+    /// Input the same way `test_deps_config` already does for a shared
+    /// test-runner config, so editing only the base config busts the cache.
+    #[test]
+    fn lint_deps_config_eslint_legacy_relative_extends_declared_as_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/base.eslintrc.json",
+            r#"{"rules":{"no-console":"error"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/.eslintrc.json",
+            r#"{"extends":"./base.eslintrc.json"}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::ESLINT)
+            .expect("build lint deps config");
+
+        let ref_addrs = dep_addrs(&result.deps, "config_refs");
+        assert!(
+            ref_addrs
+                .iter()
+                .any(|a| a.contains("packages/a/base.eslintrc.json")),
+            "a legacy config's relative `extends` must be a declared js_lint Input: {ref_addrs:?}"
+        );
+    }
+
+    /// Same gap, for a modern flat config's own relative `import`/`require`
+    /// of a shared base config.
+    #[test]
+    fn lint_deps_config_eslint_flat_config_relative_import_declared_as_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/eslint-base.js",
+            "export default [{ rules: { 'no-console': 'error' } }];\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/eslint.config.js",
+            "import base from './eslint-base.js';\nexport default [...base];\n",
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let result = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::ESLINT)
+            .expect("build lint deps config");
+
+        let ref_addrs = dep_addrs(&result.deps, "config_refs");
+        assert!(
+            ref_addrs
+                .iter()
+                .any(|a| a.contains("packages/a/eslint-base.js")),
+            "a flat config's relative import of a shared base config must be a declared js_lint \
+             Input: {ref_addrs:?}"
+        );
+    }
+
+    // ---- `Provider::get` end to end for `js_lint` — gated on a real
+    // oxlint binary being available in this devenv (querying `--version` is
+    // unavoidably a real subprocess call), unlike the Input-scoping tests
+    // above.
+
+    fn find_real_oxlint_for_test() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join("oxlint");
+            if std::fs::metadata(&cand)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real `oxlint` on PATH — devenv.nix provisions no Node/oxlint \
+                toolchain (see toolchain.rs module docs); run explicitly with \
+                `cargo test -- --ignored` on a host with oxlint installed"]
+    async fn get_resolves_js_lint_target_end_to_end() {
+        find_real_oxlint_for_test().expect(
+            "this test is #[ignore]d precisely because `oxlint` isn't guaranteed on PATH — it \
+             was run explicitly, so a missing `oxlint` here is a real failure, not a skip",
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(
+                        PkgBuf::from("packages/a"),
+                        LINT_TARGET.to_string(),
+                        Default::default(),
+                    ),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_lint target_spec");
+        assert_eq!(resp.target_spec.driver, "js_lint");
+        assert!(resp.target_spec.config.contains_key("linter_version"));
     }
 
     // ---- `Provider::get` end to end for `js_test` — gated on a real
