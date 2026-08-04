@@ -236,7 +236,7 @@ impl ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let spec = NixSpec::from(req.target_spec.config.clone())?;
+        let spec = NixSpec::from(&req.target_spec.config)?;
         let mut packages = spec.packages;
         let mut programs = spec.programs;
         let system = match spec.system {

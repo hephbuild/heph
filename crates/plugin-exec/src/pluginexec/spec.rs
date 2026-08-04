@@ -57,7 +57,7 @@ mod tests {
     ) -> anyhow::Result<TargetSpec> {
         let mut m = HashMap::from([("run".to_string(), Value::String("echo".to_string()))]);
         m.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
-        TargetSpec::from(m)
+        TargetSpec::from(&m)
     }
 
     #[test]

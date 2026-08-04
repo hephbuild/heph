@@ -430,8 +430,8 @@ impl ManagedDriver for GoToolchainDriver {
         let pkg = req.target_spec.addr.package.clone();
         let pkg_str = pkg.as_str();
 
-        let spec = GoToolchainSpec::from(req.target_spec.config.clone())
-            .context("parse go_toolchain config")?;
+        let spec =
+            GoToolchainSpec::from(&req.target_spec.config).context("parse go_toolchain config")?;
 
         let def = GoToolchainDef {
             version: spec.version,

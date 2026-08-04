@@ -56,8 +56,7 @@ impl hplugin::driver::Driver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let spec =
-            TextFileSpec::from(req.target_spec.config.clone()).context("parse textfile config")?;
+        let spec = TextFileSpec::from(&req.target_spec.config).context("parse textfile config")?;
         let text = spec.text.trim().to_string();
         let out_rel = spec
             .out

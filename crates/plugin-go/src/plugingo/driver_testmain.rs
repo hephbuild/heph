@@ -89,8 +89,8 @@ impl ManagedDriver for GoTestmainDriver {
         let pkg = req.target_spec.addr.package.clone();
         let pkg_str = pkg.as_str();
 
-        let spec = GoTestmainSpec::from(req.target_spec.config.clone())
-            .context("parse go_testmain config")?;
+        let spec =
+            GoTestmainSpec::from(&req.target_spec.config).context("parse go_testmain config")?;
         let deps = spec.deps;
 
         let golist_addrs = deps
