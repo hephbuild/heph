@@ -1,7 +1,19 @@
 //! A GitHub Actions hook: folds the engine's build-event stream into a status
-//! tally (done/total, built, cached, failed, slow targets) and surfaces it two
-//! ways. Published out-of-process as a cdylib (see `plugin-gha-cdylib`) and
-//! enabled via a config `plugins:` entry.
+//! [`Tally`] and surfaces it two ways. Published out-of-process as a cdylib (see
+//! `plugin-gha-cdylib`) and enabled via a config `plugins:` entry.
+//!
+//! The design, and the reasoning behind it, is `docs/GHA_REPORTING.md`. The two
+//! things to know before editing:
+//!
+//! - **The live comment and the final summary are different products**, with
+//!   separate renderers ([`render::render_live`] / [`render::render_final`]). One
+//!   renderer serving both is what made the summary ship a "slow targets" table
+//!   that was structurally near-empty — it reported *currently-running* targets
+//!   at the moment everything had finished.
+//! - **A CI run has ~20k targets.** Nothing retained may be proportional to the
+//!   graph, and nothing rendered may be a per-target list. See [`tally`].
+//!
+//! Surfaces:
 //!
 //! - **Live**, while the job runs: a **sticky PR comment** whose body is PATCHed on
 //!   a timer. `$GITHUB_STEP_SUMMARY` is rendered by GitHub *only* when the step
@@ -12,243 +24,25 @@
 //!   section, so a job's earlier steps' results are preserved, not overwritten. The
 //!   comment also records the workflow run id, so a *new* run's first step resets
 //!   the body instead of stacking its sections on the previous build's.
-//! - **At the end**: the full markdown is written once to `$GITHUB_STEP_SUMMARY`.
+//! - **At the end**: the final report is appended once to `$GITHUB_STEP_SUMMARY`.
 //!
-//! The aggregation is intentionally self-contained (a small [`Tally`]) rather than
-//! reusing the TUI's `BuildState`: the renderer's aggregator is coupled to ratatui
-//! and lives in the (terminal) `tui` crate, and a hook only needs a handful of
-//! counts plus the in-flight set for slow detection.
+//! The aggregation is intentionally self-contained rather than reusing the TUI's
+//! `BuildState`: that aggregator is coupled to ratatui and lives in the
+//! (terminal) `tui` crate.
 
-use std::collections::{BTreeMap, BTreeSet};
+mod render;
+mod tally;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hcore::events::{BuildEvent, BuildEventKind, now_unix_ms};
+use hcore::events::{BuildEvent, now_unix_ms};
 use hplugin::config::{Options, decode_opt, deny_unknown};
 use hplugin::hook::Hook;
 
-/// A target executing longer than this (ms) is surfaced in the "slow targets"
-/// section of the summary.
-const SLOW_THRESHOLD_MS: u64 = 10_000;
-
-/// `$GITHUB_STEP_SUMMARY` is capped at 1 MiB by GitHub. The header is tiny and
-/// fixed; the only unbounded sections are the slow + failed lists, so they are
-/// truncated to the slowest / first N (with a "…and X more" line) to keep every
-/// snapshot well under the limit.
-const MAX_SLOW_ROWS: usize = 20;
-const MAX_FAILED_ROWS: usize = 50;
-
-/// One long-running phase a target can currently be in. A target is slow because
-/// of a *single* active phase (it executes, or pulls from cache, or writes cache —
-/// not several at once), so the summary names which one.
-#[derive(Clone, Copy)]
-enum Phase {
-    Execute,
-    CachePull,
-    LocalCacheWrite,
-    RemoteCacheWrite,
-}
-
-impl Phase {
-    fn label(self) -> &'static str {
-        match self {
-            Phase::Execute => "execute",
-            Phase::CachePull => "cache pull",
-            Phase::LocalCacheWrite => "cache write",
-            Phase::RemoteCacheWrite => "remote cache write",
-        }
-    }
-}
-
-/// The folded build status. Only what the summary renders: matched/finished sets
-/// for progress, cache-hit + built counts, the failure list, and the in-flight
-/// active phase per target for slow detection.
-#[derive(Default)]
-struct Tally {
-    matched: BTreeSet<String>,
-    matched_complete: bool,
-    /// Set once the build's event stream closes (`on_close`). The build is over,
-    /// so the status must settle: ✅ unless something failed. Without this the
-    /// emoji stays ⏳ whenever `done` never reaches `total` — e.g. transparent
-    /// group targets are matched but emit no `ResultEnd`, so they never finish.
-    closed: bool,
-    finished: BTreeSet<String>,
-    built: usize,
-    cache_hit: BTreeSet<String>,
-    failed: Vec<(String, Option<String>)>,
-    /// addr -> (active phase, its start timestamp). Set on a phase `*Start`,
-    /// cleared on the matching `*End`; the remaining entries are the targets
-    /// currently inside a phase (one phase each).
-    running: BTreeMap<String, (Phase, u64)>,
-}
-
-impl Tally {
-    fn apply(&mut self, ev: &BuildEvent) {
-        match &ev.kind {
-            BuildEventKind::Matched { addrs, complete } => {
-                for a in addrs {
-                    self.matched.insert(a.clone());
-                }
-                if *complete {
-                    self.matched_complete = true;
-                }
-            }
-            BuildEventKind::ResultEnd { addr, error } => {
-                self.finished.insert(addr.clone());
-                if let Some(e) = error {
-                    self.failed.push((addr.clone(), Some(e.clone())));
-                }
-            }
-            BuildEventKind::ExecuteStart { addr, .. } => {
-                self.running
-                    .insert(addr.clone(), (Phase::Execute, ev.at_unix_ms));
-                // A target that executes is not a cached target, even when it was
-                // announced as a hit first: the engine decides a hit from the
-                // revision's manifest, and a manifest can outlive its blobs (GC,
-                // an object-store lifecycle rule, or blobs never pulled on a run
-                // that is now offline), in which case it rebuilds. Retract the
-                // hit, or the summary counts the same addr under both "built" and
-                // "cached" and the two can sum past the target count.
-                self.cache_hit.remove(addr);
-            }
-            BuildEventKind::ExecuteEnd { addr, error } => {
-                self.running.remove(addr);
-                if error.is_none() {
-                    self.built += 1;
-                }
-            }
-            BuildEventKind::RemoteCacheReadStart { addr } => {
-                self.running
-                    .insert(addr.clone(), (Phase::CachePull, ev.at_unix_ms));
-            }
-            BuildEventKind::LocalCacheWriteStart { addr } => {
-                self.running
-                    .insert(addr.clone(), (Phase::LocalCacheWrite, ev.at_unix_ms));
-            }
-            BuildEventKind::RemoteCacheWriteStart { addr } => {
-                self.running
-                    .insert(addr.clone(), (Phase::RemoteCacheWrite, ev.at_unix_ms));
-            }
-            BuildEventKind::RemoteCacheReadEnd { addr, .. }
-            | BuildEventKind::LocalCacheWriteEnd { addr, .. }
-            | BuildEventKind::RemoteCacheWriteEnd { addr, .. } => {
-                self.running.remove(addr);
-            }
-            BuildEventKind::LocalCacheHit { addr } | BuildEventKind::RemoteCacheHit { addr } => {
-                self.cache_hit.insert(addr.clone());
-            }
-            _ => {}
-        }
-    }
-
-    /// `(done, total)` over the matched top-level set: done = matched targets that
-    /// have finished. `total` is provisional until the matcher resolves.
-    fn progress(&self) -> (usize, usize) {
-        let done = self
-            .matched
-            .iter()
-            .filter(|a| self.finished.contains(*a))
-            .count();
-        (done, self.matched.len())
-    }
-
-    fn cached_count(&self) -> usize {
-        self.matched
-            .iter()
-            .filter(|a| self.cache_hit.contains(*a))
-            .count()
-    }
-
-    /// Targets stuck in a single phase past [`SLOW_THRESHOLD_MS`], slowest first.
-    /// Each carries the phase label so the summary shows *what* is slow.
-    fn slow(&self, now_ms: u64) -> Vec<(String, &'static str, u64)> {
-        let mut slow: Vec<(String, &'static str, u64)> = self
-            .running
-            .iter()
-            .filter_map(|(addr, (phase, start))| {
-                let elapsed = now_ms.saturating_sub(*start);
-                (elapsed >= SLOW_THRESHOLD_MS).then(|| (addr.clone(), phase.label(), elapsed))
-            })
-            .collect();
-        // Slowest first.
-        slow.sort_by_key(|(_, _, elapsed)| std::cmp::Reverse(*elapsed));
-        slow
-    }
-
-    /// A status emoji reflecting whether *this invocation* is still running: ⏳
-    /// until its event stream closes, then ✅ (or ❌ if anything failed). Progress
-    /// counts (`done`/`total`) drive the targets line, not this — a matched
-    /// transparent group emits no `ResultEnd`, so `done == total` is unreliable as
-    /// a "finished" signal; the stream closing is the authoritative one.
-    fn status_emoji(&self) -> &'static str {
-        if !self.closed {
-            "⏳"
-        } else if self.failed.is_empty() {
-            "✅"
-        } else {
-            "❌"
-        }
-    }
-
-    /// Render the GitHub-Actions markdown for the current tally. `heading` is the
-    /// H2 title (the heph command being run).
-    fn render_markdown(&self, now_ms: u64, heading: &str) -> String {
-        let (done, total) = self.progress();
-        let total_str = if self.matched_complete {
-            total.to_string()
-        } else {
-            format!("~{total}")
-        };
-        let mut out = String::new();
-        // Heading leads with the invocation status emoji.
-        out.push_str(&format!("## {} {heading}\n\n", self.status_emoji()));
-        out.push_str(&format!(
-            "**Targets:** {done} / {total_str} &nbsp;•&nbsp; **built:** {} &nbsp;•&nbsp; **cached:** {} &nbsp;•&nbsp; **failed:** {}\n",
-            self.built,
-            self.cached_count(),
-            self.failed.len(),
-        ));
-
-        let slow = self.slow(now_ms);
-        if !slow.is_empty() {
-            // Collapsible: slow targets are noise most of the time, expanded on demand.
-            // The blank line after </summary> is required for the table to render.
-            out.push_str(&format!(
-                "\n<details><summary>🐢 Slow targets ({})</summary>\n\n| target | phase | running for |\n| --- | --- | --- |\n",
-                slow.len(),
-            ));
-            for (addr, phase, elapsed) in slow.iter().take(MAX_SLOW_ROWS) {
-                out.push_str(&format!("| `{addr}` | {phase} | {}s |\n", elapsed / 1000));
-            }
-            if slow.len() > MAX_SLOW_ROWS {
-                out.push_str(&format!("\n…and {} more\n", slow.len() - MAX_SLOW_ROWS));
-            }
-            out.push_str("</details>\n");
-        }
-
-        if !self.failed.is_empty() {
-            out.push_str("\n### Failed\n\n");
-            for (addr, err) in self.failed.iter().take(MAX_FAILED_ROWS) {
-                match err {
-                    Some(e) => out.push_str(&format!(
-                        "- `{addr}` — {}\n",
-                        e.lines().next().unwrap_or("")
-                    )),
-                    None => out.push_str(&format!("- `{addr}`\n")),
-                }
-            }
-            if self.failed.len() > MAX_FAILED_ROWS {
-                out.push_str(&format!(
-                    "\n…and {} more\n",
-                    self.failed.len() - MAX_FAILED_ROWS
-                ));
-            }
-        }
-        out
-    }
-}
+use crate::tally::Tally;
 
 /// Scopes the sticky comment to one per job: the Actions job id (`GITHUB_JOB`) when
 /// present, else the heph command (so local / non-Actions runs still get a stable
@@ -259,6 +53,73 @@ fn comment_key(command: &str, job: Option<String>) -> String {
         None if command.is_empty() => "heph".to_string(),
         None => command.to_string(),
     }
+}
+
+/// Longest command label rendered into a public comment.
+const MAX_COMMAND_LABEL: usize = 120;
+
+/// A safe label for the heph command being run, for the comment heading and the
+/// section key.
+///
+/// **Never the raw argv.** The comment is public on the PR, and joining
+/// `std::env::args()` publishes every flag — including any `--define`/`--env`
+/// carrying a secret.
+///
+/// This is an **allowlist, not a blocklist**: only the subcommand and things
+/// that look like target selectors (`//…`, `:…`, `…`) are kept. A blocklist that
+/// tried to pair flags with their values would have to know which flags are
+/// boolean — get that wrong in one direction and a selector is dropped, wrong in
+/// the other and a secret is published. Recognising the two shapes worth showing
+/// cannot leak a `--define` value, because a secret does not look like a target.
+fn command_label() -> String {
+    command_label_from(std::env::args().skip(1))
+}
+
+/// The filtering behind [`command_label`], over a supplied argument list so it
+/// can be tested without depending on how the test harness was invoked.
+fn command_label_from(args: impl Iterator<Item = String>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut have_subcommand = false;
+    for arg in args {
+        if arg.starts_with('-') {
+            continue;
+        }
+        let is_selector = arg.starts_with("//") || arg.starts_with(':') || arg == "...";
+        if is_selector {
+            parts.push(arg);
+            continue;
+        }
+        // The first bare word is the subcommand (`run`, `query`, …). Later bare
+        // words are flag values and are dropped.
+        if !have_subcommand {
+            have_subcommand = true;
+            parts.push(arg);
+        }
+    }
+    let joined = parts.join(" ");
+    if joined.chars().count() <= MAX_COMMAND_LABEL {
+        return joined;
+    }
+    joined
+        .chars()
+        .take(MAX_COMMAND_LABEL)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+/// A link to the current workflow run, when the Actions env provides one.
+fn run_url_from_env() -> Option<String> {
+    let server = std::env::var("GITHUB_SERVER_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://github.com".to_string());
+    let repo = std::env::var("GITHUB_REPOSITORY")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let run = std::env::var("GITHUB_RUN_ID")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    Some(format!("{server}/{repo}/actions/runs/{run}"))
 }
 
 /// Shared GitHub REST auth/version headers.
@@ -583,7 +444,7 @@ impl CommentClient {
 
 struct Inner {
     tally: Mutex<Tally>,
-    /// The summary H2 + comment heading: `heph: <command>`.
+    /// The summary H2 + comment heading: `heph <command>`.
     title: String,
     /// Final step-summary path; `None` disables the end-of-run file write.
     summary_path: Option<PathBuf>,
@@ -592,27 +453,68 @@ struct Inner {
     comment: Option<CommentClient>,
     /// Set by `on_close` so the live-update thread exits.
     stop: AtomicBool,
+    /// Threshold for "running longest" rows and lock-wait notices.
+    slow_after_ms: u64,
+    /// Link to the workflow run, when the Actions env provides one.
+    run_url: Option<String>,
 }
 
 impl Inner {
-    /// The full status markdown for the current tally.
-    fn render_markdown(&self) -> String {
-        let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
-        tally.render_markdown(now_unix_ms(), &self.title)
+    fn ctx(&self) -> render::RenderCtx<'_> {
+        render::RenderCtx {
+            heading: &self.title,
+            now_ms: now_unix_ms(),
+            slow_after_ms: self.slow_after_ms,
+            run_url: self.run_url.as_deref(),
+        }
     }
 
-    /// Write the full markdown to the step-summary file once, at the end of the
-    /// run. Atomic (temp + rename) so a reader never sees a half-written file.
+    /// The live comment body for the current tally.
+    ///
+    /// Budgeted well under GitHub's 65,536-character comment cap: this is one
+    /// section inside a body shared with every other heph step in the job, and
+    /// `assemble_body` concatenates them all.
+    fn render_live(&self) -> String {
+        let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+        render::render_live(&tally, &self.ctx(), render::LIVE_SECTION_BUDGET)
+    }
+
+    /// The end-of-run report for `$GITHUB_STEP_SUMMARY`.
+    fn render_final(&self) -> String {
+        let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+        render::render_final(&tally, &self.ctx(), render::SUMMARY_BUDGET)
+    }
+
+    /// Append the final report to the step-summary file.
+    ///
+    /// **Append, not replace.** `$GITHUB_STEP_SUMMARY` is a per-step append
+    /// target (the documented usage is `echo >> $GITHUB_STEP_SUMMARY`), so the
+    /// previous write-then-rename destroyed anything an earlier command in the
+    /// same step had written — including a user's own summary lines.
+    ///
+    /// Both failure paths are logged. The previous form,
+    /// `if write().is_ok() && let Err(e) = rename()`, short-circuited on a failed
+    /// *write*, so a full disk or a permissions error produced no summary and no
+    /// warning either.
     fn write_summary(&self) {
         let Some(path) = &self.summary_path else {
             return;
         };
-        let markdown = self.render_markdown();
-        let tmp = path.with_extension("heph-tmp");
-        if std::fs::write(&tmp, markdown.as_bytes()).is_ok()
-            && let Err(e) = std::fs::rename(&tmp, path)
-        {
-            tracing::warn!("failed to write step summary: {e}");
+        let markdown = self.render_final();
+        let opened = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path);
+        match opened {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(markdown.as_bytes()) {
+                    tracing::warn!(path = %path.display(), "writing step summary failed: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "opening step summary failed: {e}");
+            }
         }
     }
 }
@@ -626,16 +528,23 @@ impl GhaHook {
     /// Build from the plugin's `options:` map. Options (all optional):
     /// `refreshSecs` (live PR-comment PATCH interval, default 30), `summaryPath`
     /// (final step-summary file, default `$GITHUB_STEP_SUMMARY`), `tokenEnv` (name
-    /// of the env var holding the API token, default `GITHUB_TOKEN`). Spawns the
-    /// live-update thread when a PR comment can be created.
+    /// of the env var holding the API token, default `GITHUB_TOKEN`),
+    /// `slowAfterSecs` (how long a target must run before it is surfaced,
+    /// default 30). Spawns the live-update thread when a PR comment can be
+    /// created.
     pub fn from_options(opts: &Options) -> anyhow::Result<Self> {
         deny_unknown(
             "gha hook",
             opts,
-            &["refreshSecs", "summaryPath", "tokenEnv"],
+            &["refreshSecs", "summaryPath", "tokenEnv", "slowAfterSecs"],
         )?;
         tracing::info!("gha hook loaded");
         let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
+            .unwrap_or(30)
+            .max(1);
+        // 30s, not the previous hardcoded 10s: with a 30-second refresh, a 10s
+        // threshold lists half of a cold build as "slow".
+        let slow_after_secs: u64 = decode_opt(opts, "gha hook", "slowAfterSecs")?
             .unwrap_or(30)
             .max(1);
         let summary_path = decode_opt::<String>(opts, "gha hook", "summaryPath")?
@@ -647,14 +556,14 @@ impl GhaHook {
                  no step summary will be written"
             );
         }
-        // The plugin shares the heph process, so its args ARE the heph command:
-        // skip the binary (argv[0]) and join the rest, e.g. `run //foo:bar`.
-        let command = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+        // The plugin shares the heph process, so its args ARE the heph command.
+        let command = command_label();
         let title = if command.is_empty() {
             "heph".to_string()
         } else {
-            format!("heph: {command}")
+            format!("heph {command}")
         };
+        let run_url = run_url_from_env();
 
         let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
         // One sticky PR comment per job (keyed by GITHUB_JOB, command as fallback);
@@ -680,6 +589,8 @@ impl GhaHook {
             summary_path,
             comment,
             stop: AtomicBool::new(false),
+            slow_after_ms: slow_after_secs.saturating_mul(1000),
+            run_url,
         });
 
         // Live updates run only when a comment is configured. A plain thread (no
@@ -690,7 +601,7 @@ impl GhaHook {
             let t = Arc::clone(&inner);
             std::thread::spawn(move || {
                 if let Some(c) = &t.comment {
-                    c.sync(t.render_markdown());
+                    c.sync(t.render_live());
                 }
                 while !t.stop.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_secs(refresh_secs));
@@ -698,7 +609,7 @@ impl GhaHook {
                         break;
                     }
                     if let Some(c) = &t.comment {
-                        c.sync(t.render_markdown());
+                        c.sync(t.render_live());
                     }
                 }
             });
@@ -731,9 +642,9 @@ impl Hook for GhaHook {
             .tally
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .closed = true;
+            .set_closed();
         if let Some(c) = &self.inner.comment {
-            c.sync(self.inner.render_markdown());
+            c.sync(self.inner.render_live());
         }
         self.inner.write_summary();
     }
@@ -742,243 +653,13 @@ impl Hook for GhaHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hcore::events::BuildEventKind;
 
     fn ev(at: u64, kind: BuildEventKind) -> BuildEvent {
         BuildEvent {
             at_unix_ms: at,
             kind,
         }
-    }
-
-    fn scripted() -> Tally {
-        let mut t = Tally::default();
-        t.apply(&ev(
-            0,
-            BuildEventKind::Matched {
-                addrs: vec!["//a:x".into(), "//a:y".into(), "//a:z".into()],
-                complete: true,
-            },
-        ));
-        // x: built
-        t.apply(&ev(
-            10,
-            BuildEventKind::ExecuteStart {
-                addr: "//a:x".into(),
-                driver: "exec".into(),
-                cache: true,
-            },
-        ));
-        t.apply(&ev(
-            20,
-            BuildEventKind::ExecuteEnd {
-                addr: "//a:x".into(),
-                error: None,
-            },
-        ));
-        t.apply(&ev(
-            20,
-            BuildEventKind::ResultEnd {
-                addr: "//a:x".into(),
-                error: None,
-            },
-        ));
-        // y: cache hit, finished
-        t.apply(&ev(
-            15,
-            BuildEventKind::LocalCacheHit {
-                addr: "//a:y".into(),
-            },
-        ));
-        t.apply(&ev(
-            15,
-            BuildEventKind::ResultEnd {
-                addr: "//a:y".into(),
-                error: None,
-            },
-        ));
-        // z: started long ago, still running (slow), then a separate failure
-        t.apply(&ev(
-            0,
-            BuildEventKind::ExecuteStart {
-                addr: "//a:z".into(),
-                driver: "exec".into(),
-                cache: false,
-            },
-        ));
-        t.apply(&ev(
-            30,
-            BuildEventKind::ResultEnd {
-                addr: "//a:w".into(),
-                error: Some("boom".into()),
-            },
-        ));
-        t
-    }
-
-    #[test]
-    fn markdown_reports_counts_slow_and_failures() {
-        let mut t = scripted();
-        // The build has ended (stream closed) with a failure recorded.
-        t.closed = true;
-        // now far enough past //a:z's start to mark it slow.
-        let md = t.render_markdown(SLOW_THRESHOLD_MS + 5_000, "heph: test");
-
-        // The H2 is the heph command, led by a status emoji (❌ — there's a failure).
-        assert!(md.contains("## ❌ heph: test"), "command heading: {md}");
-        // 2 of 3 matched finished (x, y); w finished but isn't in the matched set.
-        assert!(md.contains("2 / 3"), "progress: {md}");
-        assert!(md.contains("**built:** 1"), "built: {md}");
-        assert!(md.contains("**cached:** 1"), "cached: {md}");
-        assert!(md.contains("**failed:** 1"), "failed: {md}");
-        // //a:z is still running past the threshold — in the collapsible.
-        assert!(
-            md.contains("<details><summary>🐢 Slow targets (1)</summary>"),
-            "slow collapsible: {md}"
-        );
-        assert!(md.contains("</details>"), "collapsible closed: {md}");
-        assert!(md.contains("//a:z"), "slow target listed: {md}");
-        // failure surfaced with its message.
-        assert!(md.contains("### Failed"), "failed section: {md}");
-        assert!(
-            md.contains("//a:w") && md.contains("boom"),
-            "failure detail: {md}"
-        );
-    }
-
-    #[test]
-    fn cached_count_includes_remote_hits() {
-        let mut t = Tally::default();
-        t.apply(&ev(
-            0,
-            BuildEventKind::Matched {
-                addrs: vec!["//a:local".into(), "//a:remote".into()],
-                complete: true,
-            },
-        ));
-        // One local hit and one remote hit — both are cache hits.
-        t.apply(&ev(
-            1,
-            BuildEventKind::LocalCacheHit {
-                addr: "//a:local".into(),
-            },
-        ));
-        t.apply(&ev(
-            2,
-            BuildEventKind::RemoteCacheHit {
-                addr: "//a:remote".into(),
-            },
-        ));
-        assert_eq!(t.cached_count(), 2, "remote hit must count as cached");
-    }
-
-    #[test]
-    fn status_emoji_tracks_invocation_outcome() {
-        let mut t = Tally::default();
-        t.apply(&ev(
-            0,
-            BuildEventKind::Matched {
-                addrs: vec!["//a:x".into()],
-                complete: true,
-            },
-        ));
-        // Stream still open → running, regardless of how much has finished.
-        assert_eq!(t.status_emoji(), "⏳");
-        assert!(
-            t.render_markdown(0, "heph: test")
-                .contains("## ⏳ heph: test")
-        );
-        t.apply(&ev(
-            1,
-            BuildEventKind::ResultEnd {
-                addr: "//a:x".into(),
-                error: None,
-            },
-        ));
-        assert_eq!(
-            t.status_emoji(),
-            "⏳",
-            "still running until the stream closes"
-        );
-
-        // Stream closes with no failure → success.
-        t.closed = true;
-        assert_eq!(t.status_emoji(), "✅");
-
-        // A failure flips a closed invocation to failed.
-        t.apply(&ev(
-            2,
-            BuildEventKind::ResultEnd {
-                addr: "//a:x".into(),
-                error: Some("boom".into()),
-            },
-        ));
-        assert_eq!(t.status_emoji(), "❌");
-    }
-
-    #[test]
-    fn slow_target_names_its_active_phase() {
-        let mut t = Tally::default();
-        // Stuck pulling from the remote cache (not executing).
-        t.apply(&ev(
-            0,
-            BuildEventKind::RemoteCacheReadStart {
-                addr: "//a:p".into(),
-            },
-        ));
-        let md = t.render_markdown(SLOW_THRESHOLD_MS + 1, "heph: test");
-        assert!(md.contains("//a:p"), "slow target listed: {md}");
-        assert!(md.contains("cache pull"), "phase labelled: {md}");
-        assert!(md.contains("| phase |"), "phase column header: {md}");
-
-        // Its end clears it — no longer slow.
-        t.apply(&ev(
-            0,
-            BuildEventKind::RemoteCacheReadEnd {
-                addr: "//a:p".into(),
-                error: None,
-            },
-        ));
-        assert!(
-            !t.render_markdown(SLOW_THRESHOLD_MS + 1, "heph: test")
-                .contains("### Slow"),
-            "cleared on phase end"
-        );
-    }
-
-    #[test]
-    fn slow_list_capped_to_top_n() {
-        let mut t = Tally::default();
-        // Many concurrent long-running targets; the slowest started earliest.
-        for i in 0..(MAX_SLOW_ROWS + 5) {
-            t.apply(&ev(
-                i as u64,
-                BuildEventKind::ExecuteStart {
-                    addr: format!("//a:t{i}"),
-                    driver: "exec".into(),
-                    cache: false,
-                },
-            ));
-        }
-        let md = t.render_markdown(1_000_000, "heph: test");
-        let rows = md.matches("| `//a:t").count();
-        assert_eq!(rows, MAX_SLOW_ROWS, "slow rows capped: {rows}");
-        assert!(md.contains("…and 5 more"), "overflow line: {md}");
-    }
-
-    #[test]
-    fn provisional_total_until_matcher_complete() {
-        let mut t = Tally::default();
-        t.apply(&ev(
-            0,
-            BuildEventKind::Matched {
-                addrs: vec!["//a:x".into()],
-                complete: false,
-            },
-        ));
-        assert!(
-            t.render_markdown(0, "heph: test").contains("~1"),
-            "provisional total"
-        );
     }
 
     #[test]
@@ -1067,34 +748,6 @@ mod tests {
     }
 
     #[test]
-    fn status_settles_to_success_when_stream_closes() {
-        let mut t = Tally::default();
-        // Matched a target that never finishes (e.g. a transparent group emits no
-        // ResultEnd), and the matcher set was never marked complete.
-        t.apply(&ev(
-            0,
-            BuildEventKind::Matched {
-                addrs: vec!["//a:grp".into()],
-                complete: false,
-            },
-        ));
-        assert_eq!(t.status_emoji(), "⏳", "still running before close");
-
-        // Stream closes: build is over, nothing failed → success, not stuck ⏳.
-        t.closed = true;
-        assert_eq!(t.status_emoji(), "✅");
-        assert!(
-            t.render_markdown(0, "heph: test")
-                .contains("## ✅ heph: test"),
-            "checkbox in final render"
-        );
-
-        // A failure still wins over the closed-success default.
-        t.failed.push(("//a:grp".into(), Some("boom".into())));
-        assert_eq!(t.status_emoji(), "❌");
-    }
-
-    #[test]
     fn pr_number_extracted_from_event_and_ref() {
         let payload = serde_json::json!({ "pull_request": { "number": 122 } }).to_string();
         assert_eq!(pr_number_from_json(payload.as_bytes()), Some(122));
@@ -1105,22 +758,32 @@ mod tests {
         assert_eq!(pr_number_from_ref("refs/heads/main"), None);
     }
 
-    #[test]
-    fn on_close_writes_final_summary_to_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("summary.md");
+    fn hook_writing_to(path: &std::path::Path) -> GhaHook {
         let opts: Options = [(
             "summaryPath".to_string(),
             serde_yaml::Value::String(path.to_string_lossy().into_owned()),
         )]
         .into_iter()
         .collect();
-        let hook = GhaHook::from_options(&opts).expect("hook");
+        GhaHook::from_options(&opts).expect("hook")
+    }
+
+    #[test]
+    fn on_close_writes_final_summary_to_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("summary.md");
+        let hook = hook_writing_to(&path);
         hook.on_event(&ev(
             0,
             BuildEventKind::Matched {
                 addrs: vec!["//a:x".into()],
                 complete: true,
+            },
+        ));
+        hook.on_event(&ev(
+            0,
+            BuildEventKind::LocalCacheHit {
+                addr: "//a:x".into(),
             },
         ));
         hook.on_event(&ev(
@@ -1133,6 +796,90 @@ mod tests {
         hook.on_close();
 
         let written = std::fs::read_to_string(&path).expect("summary written");
-        assert!(written.contains("1 / 1"), "final summary: {written}");
+        assert!(written.contains("✅"), "final summary: {written}");
+        assert!(
+            written.contains("nothing executed"),
+            "all-cached one-liner: {written}"
+        );
+    }
+
+    #[test]
+    fn step_summary_is_appended_not_clobbered() {
+        // `$GITHUB_STEP_SUMMARY` is a per-step *append* target. The previous
+        // write-then-rename destroyed whatever an earlier command in the same
+        // step had written there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("summary.md");
+        std::fs::write(&path, "## Set up by an earlier step\n").expect("seed");
+
+        let hook = hook_writing_to(&path);
+        hook.on_event(&ev(
+            0,
+            BuildEventKind::Matched {
+                addrs: vec!["//a:x".into()],
+                complete: true,
+            },
+        ));
+        hook.on_close();
+
+        let written = std::fs::read_to_string(&path).expect("summary written");
+        assert!(
+            written.contains("Set up by an earlier step"),
+            "pre-existing content preserved: {written}"
+        );
+        assert!(
+            written.contains("heph"),
+            "heph's report appended: {written}"
+        );
+    }
+
+    #[test]
+    fn a_failed_summary_write_is_logged_not_swallowed() {
+        // The path is a directory, so opening it for append fails. The old code
+        // short-circuited on a failed write and logged nothing at all; this must
+        // at minimum not panic and not create a file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a-directory");
+        std::fs::create_dir(&path).expect("mkdir");
+
+        let hook = hook_writing_to(&path);
+        hook.on_close();
+
+        assert!(path.is_dir(), "still a directory, nothing clobbered");
+    }
+
+    #[test]
+    fn command_label_drops_flags_and_their_values() {
+        // The comment is public on the PR: a `--define`/`--env` carrying a secret
+        // must never reach it.
+        assert_eq!(label_from(&["run", "//foo:bar"]), "run //foo:bar");
+        assert_eq!(
+            label_from(&["run", "--define", "TOKEN=hunter2", "//foo:bar"]),
+            "run //foo:bar"
+        );
+        assert_eq!(
+            label_from(&["run", "--env=SECRET=hunter2", "//foo:bar"]),
+            "run //foo:bar"
+        );
+        // A boolean flag must not swallow the selector that follows it.
+        assert_eq!(label_from(&["run", "--ff", "//a:b"]), "run //a:b");
+        // A flag value that is a bare word is dropped, not mistaken for a target.
+        assert_eq!(
+            label_from(&["run", "--token", "hunter2", "//a:b"]),
+            "run //a:b"
+        );
+        assert_eq!(label_from(&["query", "..."]), "query ...");
+        // Over-long labels are capped rather than published whole.
+        let long: Vec<String> = (0..100).map(|i| format!("//pkg{i}:target")).collect();
+        let refs: Vec<&str> = long.iter().map(String::as_str).collect();
+        let out = label_from(&refs);
+        assert!(
+            out.chars().count() <= MAX_COMMAND_LABEL + 1,
+            "capped: {out}"
+        );
+    }
+
+    fn label_from(args: &[&str]) -> String {
+        command_label_from(args.iter().map(|s| (*s).to_string()))
     }
 }
