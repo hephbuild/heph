@@ -30,13 +30,15 @@
 //! `BuildState`: that aggregator is coupled to ratatui and lives in the
 //! (terminal) `tui` crate.
 
+#[cfg(test)]
+mod comment_tests;
 mod render;
 mod tally;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hcore::events::{BuildEvent, now_unix_ms};
 use hplugin::config::{Options, decode_opt, deny_unknown};
@@ -44,15 +46,59 @@ use hplugin::hook::Hook;
 
 use crate::tally::Tally;
 
-/// Scopes the sticky comment to one per job: the Actions job id (`GITHUB_JOB`) when
-/// present, else the heph command (so local / non-Actions runs still get a stable
-/// key). A job keeps a single comment across all its steps.
-fn comment_key(command: &str, job: Option<String>) -> String {
-    match job.filter(|s| !s.is_empty()) {
+/// Scopes the sticky comment to one per job **leg**.
+///
+/// `GITHUB_JOB` alone is not enough: it is the job id *from the workflow file*,
+/// so every leg of a matrix reports the same value. With that as the sole key,
+/// all legs race `fetch_existing`, all find nothing, and all POST — producing
+/// duplicate comments — after which each caches the section list once and never
+/// re-reads, so the legs permanently erase each other's sections. This repo's own
+/// `test` job has three legs.
+///
+/// `leg` disambiguates them. It is the runner's OS/arch (`RUNNER_OS`,
+/// `RUNNER_ARCH`) rather than the matrix context, because the matrix is not
+/// exposed to a process as an env var while the runner identity always is, and
+/// the overwhelmingly common matrix axis *is* the platform. A matrix that varies
+/// something else (a Go version, a feature flag) still collides — hence the
+/// `commentKey` option, which overrides this wholesale.
+fn comment_key(command: &str, job: Option<String>, leg: Option<String>) -> String {
+    let base = match job.filter(|s| !s.is_empty()) {
         Some(job) => job,
         None if command.is_empty() => "heph".to_string(),
         None => command.to_string(),
+    };
+    match leg.filter(|s| !s.is_empty()) {
+        Some(leg) => format!("{base}:{leg}"),
+        None => base,
     }
+}
+
+/// The runner's identity, used to separate matrix legs. `None` outside Actions.
+fn runner_leg() -> Option<String> {
+    let os = std::env::var("RUNNER_OS").ok().filter(|s| !s.is_empty());
+    let arch = std::env::var("RUNNER_ARCH").ok().filter(|s| !s.is_empty());
+    match (os, arch) {
+        (Some(os), Some(arch)) => Some(format!("{os}-{arch}")),
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
+    }
+}
+
+/// A stable, delimiter-safe identifier for a section key.
+///
+/// The key goes into an HTML comment (`<!-- heph-gha-step:KEY -->`), so it must
+/// not contain the delimiter or a newline. It used to be the raw command: a
+/// command containing `" -->"` terminated the opening marker early, so
+/// `upsert_section` never matched that section again and every step **appended a
+/// new one** — growing the body until it hit GitHub's cap and 422'd.
+///
+/// Hashing rather than escaping, because the key is a hidden marker nobody reads;
+/// it only has to be stable and unambiguous.
+fn section_id(key: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 /// Longest command label rendered into a public comment.
@@ -279,27 +325,66 @@ struct CommentState {
 /// their own results instead of overwriting one another.
 struct CommentClient {
     http: std::sync::OnceLock<reqwest::blocking::Client>,
+    cfg: CommentConfig,
+    /// Hidden marker (`<!-- heph-gha:<job> -->`) identifying *this job's* comment.
+    container_marker: String,
+    state: Mutex<CommentState>,
+}
+
+/// Everything a [`CommentClient`] needs, with no ambient environment.
+///
+/// Split out from [`CommentClient::from_env`] so the client is constructible in a
+/// test. It previously read `std::env` directly, which meant nothing could build
+/// one without mutating global process state — so the entire HTTP layer, where
+/// this feature actually lives, had zero tests. Worse, the branch that ships
+/// (comment enabled) was the one never exercised: the suite only stayed quiet
+/// because `GITHUB_TOKEN` happens to be absent from the test job's env, an
+/// undeclared ambient invariant that would have posted comments onto the PR
+/// under test the day someone added it.
+#[derive(Debug, Clone)]
+struct CommentConfig {
     api_url: String,
     repo: String,
     token: String,
     /// The PR to comment on.
     pr: u64,
-    /// Hidden marker (`<!-- heph-gha:<job> -->`) identifying *this job's* comment.
-    container_marker: String,
+    /// Scopes the comment — one per job leg.
+    job_key: String,
     /// Identifies the current workflow run (run id + attempt). When an adopted
     /// comment carries a different run, its sections are from a prior build and
     /// are reset. Empty outside Actions (local runs keep reusing the comment).
     run_id: String,
-    /// This process's section key (the heph command) within that comment.
+    /// This process's section key within that comment.
     section_key: String,
-    state: Mutex<CommentState>,
+    /// Per-request timeout. Explicit rather than reqwest's 30s default, because
+    /// `on_close` runs inside the host's drain barrier before process exit.
+    timeout: Duration,
 }
 
+/// Total budget for the close-time sync.
+///
+/// `fetch_existing` can walk several pages, and the host awaits `Hook::drain`
+/// before exiting — so without a ceiling a slow or hanging GitHub API adds
+/// minutes to `heph`'s exit. The comment is best-effort; the step summary is the
+/// durable artifact, and it is written whether or not this succeeds.
+const CLOSE_SYNC_BUDGET: Duration = Duration::from_secs(10);
+
+/// Per-request timeout for live updates.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl CommentClient {
+    fn new(cfg: CommentConfig) -> Self {
+        Self {
+            http: std::sync::OnceLock::new(),
+            container_marker: format!("<!-- heph-gha:{} -->", cfg.job_key),
+            cfg,
+            state: Mutex::new(CommentState::default()),
+        }
+    }
+
     /// Build from the Actions env, or `None` outside a PR / without a token.
-    /// `job_key` scopes the comment (one per job); `section_key` scopes this
-    /// process's block within it. `token_env` names the token var (default
-    /// `GITHUB_TOKEN`).
+    /// `job_key` scopes the comment; `section_key` scopes this process's block
+    /// within it. `token_env` names the token var (default `GITHUB_TOKEN`).
     fn from_env(job_key: &str, section_key: &str, token_env: Option<String>) -> Option<Self> {
         let nonempty = |v: String| Some(v).filter(|s| !s.is_empty());
         let token_var = token_env
@@ -321,35 +406,45 @@ impl CommentClient {
         } else {
             format!("{run}-{attempt}")
         };
-        Some(Self {
-            http: std::sync::OnceLock::new(),
+        Some(Self::new(CommentConfig {
             api_url,
             repo,
             token,
             pr,
-            container_marker: format!("<!-- heph-gha:{job_key} -->"),
+            job_key: job_key.to_string(),
             run_id,
             section_key: section_key.to_string(),
-            state: Mutex::new(CommentState::default()),
-        })
+            timeout: REQUEST_TIMEOUT,
+        }))
     }
 
     fn http(&self) -> &reqwest::blocking::Client {
-        self.http.get_or_init(reqwest::blocking::Client::new)
+        self.http.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(self.cfg.timeout)
+                .build()
+                .unwrap_or_default()
+        })
     }
 
     /// Find this job's comment (by `container_marker`), returning its id + body.
     /// Pages through the PR's comments, capped to bound work.
-    fn fetch_existing(&self) -> Option<(u64, String)> {
+    fn fetch_existing(&self, deadline: Option<Instant>) -> Option<(u64, String)> {
         const MAX_PAGES: u32 = 10;
         for page in 1..=MAX_PAGES {
+            // The host awaits `Hook::drain` before process exit, so an unbounded
+            // page walk here adds its latency straight onto `heph`'s exit.
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                tracing::warn!("listing PR comments hit the deadline; giving up");
+                return None;
+            }
             let resp = self
                 .http()
                 .get(format!(
                     "{}/repos/{}/issues/{}/comments?per_page=100&page={page}",
-                    self.api_url, self.repo, self.pr
+                    self.cfg.api_url, self.cfg.repo, self.cfg.pr
                 ))
-                .headers(gh_headers(&self.token))
+                .headers(gh_headers(&self.cfg.token))
                 .send()
                 .and_then(|r| r.error_for_status())
                 .and_then(|r| r.json::<Vec<serde_json::Value>>());
@@ -381,25 +476,35 @@ impl CommentClient {
         None
     }
 
-    /// Upsert this process's section with `markdown` and write the merged comment.
-    /// On the first call it adopts any existing comment for this job (inheriting the
-    /// other steps' sections); afterwards it edits only its own block.
-    fn sync(&self, markdown: String) {
+    /// Upsert this process's section and write the merged comment.
+    ///
+    /// `render` is called **under the comment lock**, not before it. That is the
+    /// fix for a silent race: the live thread used to render (taking and
+    /// releasing the tally lock) and only then take the comment lock, so if
+    /// `on_close` landed in that window, the already-rendered "⏳ still running"
+    /// body would PATCH over the final one — leaving a finished build showing as
+    /// in-progress, permanently, with no error anywhere. Rendering inside the
+    /// lock makes render-and-write atomic with respect to other syncs.
+    ///
+    /// On the first call it adopts any existing comment for this job (inheriting
+    /// the other steps' sections); afterwards it edits only its own block.
+    fn sync(&self, render: impl FnOnce() -> String, deadline: Option<Instant>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let markdown = render();
         if !st.loaded {
-            if let Some((cid, body)) = self.fetch_existing() {
+            if let Some((cid, body)) = self.fetch_existing(deadline) {
                 st.id = Some(cid);
                 // Same run → inherit the other steps' sections. Different (or
                 // missing) run → the comment is from a prior build; start fresh so
                 // its stale sections don't pile up.
-                if parse_run_id(&body).as_deref() == Some(self.run_id.as_str()) {
+                if parse_run_id(&body).as_deref() == Some(self.cfg.run_id.as_str()) {
                     st.sections = parse_sections(&body);
                 }
             }
             st.loaded = true;
         }
-        upsert_section(&mut st.sections, &self.section_key, &markdown);
-        let body = assemble_body(&self.container_marker, &self.run_id, &st.sections);
+        upsert_section(&mut st.sections, &self.cfg.section_key, &markdown);
+        let body = assemble_body(&self.container_marker, &self.cfg.run_id, &st.sections);
 
         let mut payload = serde_json::Map::new();
         payload.insert("body".into(), serde_json::json!(body));
@@ -409,9 +514,9 @@ impl CommentClient {
                 .http()
                 .patch(format!(
                     "{}/repos/{}/issues/comments/{cid}",
-                    self.api_url, self.repo
+                    self.cfg.api_url, self.cfg.repo
                 ))
-                .headers(gh_headers(&self.token))
+                .headers(gh_headers(&self.cfg.token))
                 .json(&serde_json::Value::Object(payload))
                 .send()
                 .and_then(|r| r.error_for_status())
@@ -420,9 +525,9 @@ impl CommentClient {
                 .http()
                 .post(format!(
                     "{}/repos/{}/issues/{}/comments",
-                    self.api_url, self.repo, self.pr
+                    self.cfg.api_url, self.cfg.repo, self.cfg.pr
                 ))
-                .headers(gh_headers(&self.token))
+                .headers(gh_headers(&self.cfg.token))
                 .json(&serde_json::Value::Object(payload))
                 .send()
                 .and_then(|r| r.error_for_status())
@@ -467,6 +572,16 @@ impl Inner {
             slow_after_ms: self.slow_after_ms,
             run_url: self.run_url.as_deref(),
         }
+    }
+
+    /// Write the live comment.
+    ///
+    /// Unconditional: the comment is created at job start and kept current for
+    /// the whole run, so it is present and findable from the moment the job
+    /// begins rather than appearing partway through.
+    fn sync_comment(&self, deadline: Option<Instant>) {
+        let Some(c) = &self.comment else { return };
+        c.sync(|| self.render_live(), deadline);
     }
 
     /// The live comment body for the current tally.
@@ -536,7 +651,13 @@ impl GhaHook {
         deny_unknown(
             "gha hook",
             opts,
-            &["refreshSecs", "summaryPath", "tokenEnv", "slowAfterSecs"],
+            &[
+                "refreshSecs",
+                "summaryPath",
+                "tokenEnv",
+                "slowAfterSecs",
+                "commentKey",
+            ],
         )?;
         tracing::info!("gha hook loaded");
         let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
@@ -566,15 +687,16 @@ impl GhaHook {
         let run_url = run_url_from_env();
 
         let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
-        // One sticky PR comment per job (keyed by GITHUB_JOB, command as fallback);
-        // within it, one section per heph command so a job's steps each keep their
-        // own results.
-        let job_key = comment_key(&command, std::env::var("GITHUB_JOB").ok());
-        let section_key = if command.is_empty() {
-            "heph".to_string()
-        } else {
-            command.clone()
-        };
+        // One sticky PR comment per job leg; within it, one section per heph
+        // command so a job's steps each keep their own results.
+        let job_key =
+            match decode_opt::<String>(opts, "gha hook", "commentKey")?.filter(|s| !s.is_empty()) {
+                Some(explicit) => explicit,
+                None => comment_key(&command, std::env::var("GITHUB_JOB").ok(), runner_leg()),
+            };
+        // Hashed: the raw command can contain the marker delimiter, which used to
+        // append a new section on every step until the body hit GitHub's cap.
+        let section_key = section_id(if command.is_empty() { "heph" } else { &command });
         let comment = CommentClient::from_env(&job_key, &section_key, token_env);
         if comment.is_none() {
             tracing::info!(
@@ -595,22 +717,18 @@ impl GhaHook {
 
         // Live updates run only when a comment is configured. A plain thread (no
         // async runtime) keeps the hook free of runtime entanglement; it creates
-        // the comment up front so it appears at job start, then PATCHes it every
-        // `refreshSecs` until `on_close` sets `stop`.
+        // the comment up front so it is present from job start, then PATCHes it
+        // every `refreshSecs` until `on_close` sets `stop`.
         if inner.comment.is_some() {
             let t = Arc::clone(&inner);
             std::thread::spawn(move || {
-                if let Some(c) = &t.comment {
-                    c.sync(t.render_live());
-                }
+                t.sync_comment(None);
                 while !t.stop.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_secs(refresh_secs));
                     if t.stop.load(Ordering::Acquire) {
                         break;
                     }
-                    if let Some(c) = &t.comment {
-                        c.sync(t.render_live());
-                    }
+                    t.sync_comment(None);
                 }
             });
         }
@@ -643,9 +761,10 @@ impl Hook for GhaHook {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_closed();
-        if let Some(c) = &self.inner.comment {
-            c.sync(self.inner.render_live());
-        }
+        self.inner
+            .sync_comment(Some(Instant::now() + CLOSE_SYNC_BUDGET));
+        // The summary is the durable report; the comment is only a notification.
+        // durable report, the comment is only a notification.
         self.inner.write_summary();
     }
 }
@@ -665,16 +784,67 @@ mod tests {
     #[test]
     fn comment_key_prefers_job_then_command() {
         // Job id wins → one comment per job.
-        assert_eq!(comment_key("run //a:x", Some("test".into())), "test");
+        assert_eq!(comment_key("run //a:x", Some("test".into()), None), "test");
         // No job → command keeps it stable (local / non-Actions).
-        assert_eq!(comment_key("run //a:x", None), "run //a:x");
+        assert_eq!(comment_key("run //a:x", None, None), "run //a:x");
         // Empty job string treated as absent.
         assert_eq!(
-            comment_key("query //...", Some(String::new())),
+            comment_key("query //...", Some(String::new()), None),
             "query //..."
         );
         // Empty command → stable fallback.
-        assert_eq!(comment_key("", None), "heph");
+        assert_eq!(comment_key("", None, None), "heph");
+    }
+
+    #[test]
+    fn matrix_legs_get_distinct_comment_keys() {
+        // `GITHUB_JOB` is the job id from the workflow file, so it is IDENTICAL
+        // across matrix legs. Keyed on that alone, three legs raced to create
+        // three comments and then erased each other's sections forever. This
+        // repo's own `test` job has three legs.
+        let job = || Some("test".to_string());
+        let linux_amd = comment_key("run //...", job(), Some("Linux-X64".into()));
+        let linux_arm = comment_key("run //...", job(), Some("Linux-ARM64".into()));
+        let macos = comment_key("run //...", job(), Some("macOS-ARM64".into()));
+
+        assert_eq!(linux_amd, "test:Linux-X64");
+        let all = [&linux_amd, &linux_arm, &macos];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "every leg must own its own comment");
+            }
+        }
+        // Outside Actions there is no leg, and the key stays what it was.
+        assert_eq!(comment_key("run //...", job(), None), "test");
+    }
+
+    #[test]
+    fn section_id_is_delimiter_safe_and_stable() {
+        // The key lands inside `<!-- heph-gha-step:KEY -->`. A raw command
+        // containing " -->" used to terminate the marker early, so the section
+        // was never matched again and every step APPENDED a new one until the
+        // body hit GitHub's cap.
+        let nasty = section_id("run //a:b --> injected <!-- x\nnewline");
+        assert!(!nasty.contains("-->"), "no delimiter: {nasty}");
+        assert!(!nasty.contains('\n'), "no newline: {nasty}");
+        assert!(!nasty.contains('<'), "no markup: {nasty}");
+
+        // Stable across calls — the same step must find its own section next tick.
+        assert_eq!(section_id("run //a:b"), section_id("run //a:b"));
+        assert_ne!(section_id("run //a:b"), section_id("run //a:c"));
+
+        // And it round-trips through the real section machinery.
+        let mut sections = Vec::new();
+        upsert_section(&mut sections, &nasty, "body one");
+        upsert_section(&mut sections, &nasty, "body two");
+        let assembled = assemble_body("<!-- heph-gha:job -->", "1-1", &sections);
+        let parsed = parse_sections(&assembled);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "updated in place, not appended: {assembled}"
+        );
+        assert_eq!(parsed.first().map(|(_, c)| c.as_str()), Some("body two"));
     }
 
     #[test]
