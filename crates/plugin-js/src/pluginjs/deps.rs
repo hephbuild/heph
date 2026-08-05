@@ -209,6 +209,7 @@ mod tests {
         }
         PackageManifest {
             name: "a".to_string(),
+            main: None,
             dependencies,
             dev_dependencies: to_map(dev),
             optional_dependencies,
