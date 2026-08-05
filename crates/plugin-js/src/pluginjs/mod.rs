@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod conformance;
 mod deps;
+mod driver_bundle;
 mod driver_install;
 mod driver_lint;
 mod driver_package_info;
@@ -17,6 +18,7 @@ mod thirdparty;
 mod toolchain;
 mod workspace;
 
+pub use driver_bundle::JsBundleDriver;
 pub use driver_install::JsInstallDriver;
 pub use driver_lint::JsLintDriver;
 pub use driver_package_info::JsPackageInfoDriver;
@@ -55,6 +57,13 @@ pub const TEST_TARGET: &str = "js_test";
 /// granularity, the same as `js_typecheck` (see `driver_lint.rs` module docs
 /// for why per-file caching isn't worth the bookkeeping here either).
 pub const LINT_TARGET: &str = "js_lint";
+
+/// Target name of the M6 `js_bundle` target: runs the configured bundler
+/// (`esbuild` default) over one package's entry point at a time — whole
+/// first-party-transitive-closure granularity, deliberately not per-file or
+/// per-package (see `driver_bundle.rs` module docs' "Inputs / cache key"
+/// section for why per-file incrementality is explicitly not the goal here).
+pub const BUNDLE_TARGET: &str = "js_bundle";
 
 /// Directory names that are never a package boundary or workspace member,
 /// however deep they appear: `node_modules` is third-party/manager-owned
