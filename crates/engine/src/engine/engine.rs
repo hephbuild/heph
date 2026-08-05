@@ -94,7 +94,7 @@ pub struct Engine {
     pub(crate) runtime: tokio::runtime::Handle,
     pub(crate) result_permits: Arc<crate::engine::worker_pool::WorkerPool>,
     /// Maximum concurrent executes (the `result_permits` capacity). Cached
-    /// here so it can be announced to clients via a `MaxWorkers` build event
+    /// here so it can be announced to clients via a `RequestConfig` build event
     /// without reaching into the semaphore (whose live `available_permits` only
     /// reflects the *free* count, not the configured max).
     pub(crate) max_workers: usize,

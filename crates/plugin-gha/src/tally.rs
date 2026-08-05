@@ -28,7 +28,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use hcore::events::{BuildEvent, BuildEventKind};
+use hcore::events::{BuildEvent, BuildEventKind, LogTailData};
 use rustc_hash::FxHashMap;
 
 /// How many completed targets to retain for the "slowest" table. The heap is
@@ -128,6 +128,12 @@ impl PartialOrd for Completed {
 pub(crate) struct RootFailure {
     pub addr: String,
     pub message: String,
+    /// The subprocess's exit status, when the failure was a subprocess.
+    pub exit_status: Option<String>,
+    /// The last lines of the target's log — the part that actually says what
+    /// went wrong. This is what makes a red build diagnosable from the report
+    /// rather than only from the job log.
+    pub log_tail: Option<LogTailData>,
     pub driver: Option<String>,
     pub duration_ms: Option<u64>,
     /// Targets that failed solely because this one did.
@@ -210,6 +216,9 @@ pub(crate) struct Tally {
     misses_by_pkg: FxHashMap<Box<str>, usize>,
 
     max_workers: usize,
+    /// Whether this invocation stops at the first failure. Reported by the
+    /// engine, never inferred here — see `BuildEventKind::RequestConfig`.
+    fail_fast: bool,
     first_event_ms: Option<u64>,
     last_event_ms: u64,
 
@@ -219,19 +228,20 @@ pub(crate) struct Tally {
     closed: bool,
 }
 
-/// Extract the root addr from a collateral failure's message.
+/// A failing `ResultEnd`, borrowed from the event.
 ///
-/// **Interim.** `UpstreamFailed` renders as `dependency failed (root: //x:y)`
-/// (`crates/plugin/src/error.rs:201`) and `ResultEnd.error` is the whole cause
-/// chain flattened by `format!("{e:#}")`, so sniffing the string is the only way
-/// to tell collateral from root damage today. This is replaced by a structured
-/// `upstream_of` field on `ResultEnd`; see `docs/GHA_REPORTING.md` §7.1.
-fn parse_upstream_root(message: &str) -> Option<&str> {
-    const OPEN: &str = "dependency failed (root: ";
-    let i = message.find(OPEN)?;
-    let after = message.get(i.checked_add(OPEN.len())?..)?;
-    let end = after.find(')')?;
-    after.get(..end)
+/// The engine extracts this structure once at the emit site, so the reporter
+/// never has to re-derive it from prose. It previously told collateral damage
+/// from a root failure by searching the flattened message for
+/// `"dependency failed (root: …)"` — a sniff of a `Display` impl that would
+/// break silently the moment that wording changed, taking the root/collateral
+/// split with it.
+#[derive(Clone, Copy)]
+pub(crate) struct Failure<'a> {
+    pub message: &'a str,
+    pub upstream_of: Option<&'a str>,
+    pub exit_status: Option<&'a str>,
+    pub log_tail: Option<&'a LogTailData>,
 }
 
 /// The package part of `//pkg/sub:name`, or the whole addr if it has no `:`.
@@ -257,7 +267,13 @@ impl Tally {
         // here, not a silent drop. The previous `_ => {}` swallowed six kinds,
         // four of which this renderer wants.
         match &ev.kind {
-            BuildEventKind::MaxWorkers { count } => self.max_workers = *count,
+            BuildEventKind::RequestConfig {
+                max_workers,
+                fail_fast,
+            } => {
+                self.max_workers = *max_workers;
+                self.fail_fast = *fail_fast;
+            }
 
             BuildEventKind::Matched { addrs, complete } => {
                 for a in addrs {
@@ -276,8 +292,23 @@ impl Tally {
                 self.ensure(addr, ev.at_unix_ms);
             }
 
-            BuildEventKind::ResultEnd { addr, error } => {
-                self.finish(addr, error.as_deref(), ev.at_unix_ms);
+            BuildEventKind::ResultEnd {
+                addr,
+                error,
+                upstream_of,
+                exit_status,
+                log_tail,
+            } => {
+                self.finish(
+                    addr,
+                    error.as_deref().map(|message| Failure {
+                        message,
+                        upstream_of: upstream_of.as_deref(),
+                        exit_status: exit_status.as_deref(),
+                        log_tail: log_tail.as_ref(),
+                    }),
+                    ev.at_unix_ms,
+                );
             }
 
             BuildEventKind::ExecuteStart { addr, driver, .. } => {
@@ -367,6 +398,12 @@ impl Tally {
             // Emitted only by `heph tool gc` / `clean`, which this hook does not
             // report on — those commands have their own output.
             BuildEventKind::GcTargetSwept { .. } => {}
+
+            // An event kind from a host newer than this plugin. Skipping it keeps
+            // the rest of the stream flowing; the alternative is a decode failure,
+            // which the SDK treats as end-of-stream and would silently truncate
+            // everything after it.
+            BuildEventKind::Unknown => {}
         }
     }
 
@@ -441,7 +478,7 @@ impl Tally {
         self.misses_by_pkg.insert(pkg.into(), 1);
     }
 
-    fn finish(&mut self, addr: &str, error: Option<&str>, at: u64) {
+    fn finish(&mut self, addr: &str, error: Option<Failure<'_>>, at: u64) {
         let rec = self.live.remove(addr);
 
         // Progress is over the matched top-level set, deduped: the memoizer can
@@ -466,13 +503,13 @@ impl Tally {
             });
         }
 
-        let Some(message) = error else { return };
+        let Some(failure) = error else { return };
 
-        if let Some(root) = parse_upstream_root(message) {
+        if let Some(root) = failure.upstream_of {
             self.record_collateral(root, addr);
             return;
         }
-        self.record_root(addr, message, rec.as_ref(), at);
+        self.record_root(addr, failure, rec.as_ref(), at);
     }
 
     fn push_slowest(&mut self, c: Completed) {
@@ -490,7 +527,7 @@ impl Tally {
         }
     }
 
-    fn record_root(&mut self, addr: &str, message: &str, rec: Option<&TargetRec>, at: u64) {
+    fn record_root(&mut self, addr: &str, failure: Failure<'_>, rec: Option<&TargetRec>, at: u64) {
         self.counters.roots_total = self.counters.roots_total.saturating_add(1);
         if self.root_index.contains_key(addr) {
             // Deduped: one addr can produce several `ResultEnd`s.
@@ -504,7 +541,9 @@ impl Tally {
         self.root_index.insert(addr.into(), self.roots.len());
         self.roots.push(RootFailure {
             addr: addr.to_string(),
-            message: message.to_string(),
+            message: failure.message.to_string(),
+            exit_status: failure.exit_status.map(str::to_string),
+            log_tail: failure.log_tail.cloned(),
             driver: rec.and_then(|r| r.driver.as_deref().map(str::to_string)),
             duration_ms: rec.map(|r| at.saturating_sub(r.started_ms)),
             blocked: 0,
@@ -545,6 +584,10 @@ impl Tally {
 
     pub(crate) fn max_workers(&self) -> usize {
         self.max_workers
+    }
+
+    pub(crate) fn fail_fast(&self) -> bool {
+        self.fail_fast
     }
 
     /// Targets currently inside a *foreground* phase — the denominator for
@@ -726,6 +769,9 @@ mod tests {
             BuildEventKind::ResultEnd {
                 addr: addr.into(),
                 error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
         ));
     }
@@ -740,6 +786,9 @@ mod tests {
             BuildEventKind::ResultEnd {
                 addr: "//base:proto".into(),
                 error: Some("execute //base:proto: process exited with status 1".into()),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
         ));
         for i in 0..4_000 {
@@ -747,9 +796,10 @@ mod tests {
                 20,
                 BuildEventKind::ResultEnd {
                     addr: format!("//services/api:t{i}"),
-                    error: Some(
-                        "result //services/api:t: dependency failed (root: //base:proto)".into(),
-                    ),
+                    error: Some("dependency failed".into()),
+                    upstream_of: Some("//base:proto".into()),
+                    exit_status: None,
+                    log_tail: None,
                 },
             ));
         }
@@ -780,6 +830,9 @@ mod tests {
                 BuildEventKind::ResultEnd {
                     addr: "//a:x".into(),
                     error: Some("boom".into()),
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
                 },
             ));
         }
@@ -1070,6 +1123,9 @@ mod tests {
             BuildEventKind::ResultEnd {
                 addr: "//a:x".into(),
                 error: Some("boom".into()),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
         ));
         assert_eq!(t.status_emoji(), "❌", "red before the build finishes");
@@ -1084,6 +1140,9 @@ mod tests {
                 BuildEventKind::ResultEnd {
                     addr: format!("//a:t{i}"),
                     error: Some("boom".into()),
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
                 },
             ));
         }
@@ -1102,6 +1161,9 @@ mod tests {
                 BuildEventKind::ResultEnd {
                     addr: addr.into(),
                     error: Some("boom".into()),
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
                 },
             ));
         }
@@ -1110,14 +1172,31 @@ mod tests {
     }
 
     #[test]
-    fn upstream_root_parsing() {
-        assert_eq!(
-            parse_upstream_root("result //a:b: dependency failed (root: //base:proto)"),
-            Some("//base:proto")
+    fn a_root_failure_carries_its_exit_status_and_log_tail() {
+        // The whole point of the structured event: the report can show what
+        // actually went wrong instead of one line of a flattened cause chain.
+        let mut t = Tally::default();
+        t.apply(&ev(
+            10,
+            BuildEventKind::ResultEnd {
+                addr: "//services/api:test".into(),
+                error: Some("target failed: //services/api:test".into()),
+                upstream_of: None,
+                exit_status: Some("exit status: 1".into()),
+                log_tail: Some(LogTailData {
+                    text: "--- FAIL: TestCreateUser (0.03s)\n    want 201, got 500".into(),
+                    start_line: 88,
+                }),
+            },
+        ));
+        let root = t.roots().first().expect("root recorded");
+        assert_eq!(root.exit_status.as_deref(), Some("exit status: 1"));
+        assert!(
+            root.log_tail
+                .as_ref()
+                .is_some_and(|l| l.text.contains("TestCreateUser")),
+            "log tail reaches the reporter"
         );
-        assert_eq!(parse_upstream_root("process exited with status 1"), None);
-        // Malformed: no closing paren.
-        assert_eq!(parse_upstream_root("dependency failed (root: //a:b"), None);
     }
 
     #[test]
@@ -1131,12 +1210,21 @@ mod tests {
     #[test]
     fn elapsed_is_bounded_by_the_stream_once_closed() {
         let mut t = Tally::default();
-        t.apply(&ev(1_000, BuildEventKind::MaxWorkers { count: 16 }));
+        t.apply(&ev(
+            1_000,
+            BuildEventKind::RequestConfig {
+                max_workers: 16,
+                fail_fast: false,
+            },
+        ));
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
                 addr: "//a:x".into(),
                 error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
         ));
         // Still running: elapsed tracks now.

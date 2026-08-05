@@ -38,6 +38,21 @@ stabby_pin_files=(
 # (don't fail) so doc/comment proto edits stay quiet but real edits get a nudge.
 soft_glob="proto/plugin/v1/"
 
+# The build-event stream. Not a stabby vtable, but it crosses the same dlopen'd
+# seam: every event is serde-JSON encoded to out-of-process hooks, and a plugin
+# cdylib ships as its own artifact pinned independently of the binary — so
+# host/plugin skew is reachable, and a skewed pair loads fine at dlopen and only
+# breaks later. The decode path has no slack: a frame that fails to deserialize
+# is treated as end-of-stream, silently truncating that hook's whole stream.
+#
+# Warn rather than force a bump: additive `#[serde(default)]` fields and new
+# variants (absorbed by `Unknown`'s `#[serde(other)]`) are genuinely safe, and
+# most edits here are those. What we cannot detect cheaply is the unsafe kind —
+# retyping or removing a field — so the warning names it explicitly.
+event_paths=(
+  "crates/core/src/events.rs"
+)
+
 # Resolve the merge-base so we compare only what this branch introduced, not
 # unrelated commits that landed on the base since it forked.
 if ! base_sha=$(git merge-base "$base_ref" HEAD 2>/dev/null); then
@@ -118,4 +133,12 @@ fi
 # wire field, the author should bump at least the minor (see the doc).
 if grep -q "^${soft_glob}" <<<"$changed"; then
   echo "::warning::proto/plugin/v1 changed — if a wire field was added/removed, bump ABI_SEMVER minor (see $doc)" >&2
+fi
+
+# Event stream: see the note by `event_paths`.
+if matches "${event_paths[@]}"; then
+  echo "::warning::${event_paths[*]} changed — the build-event stream is a live wire format to out-of-process hooks." >&2
+  echo "  Safe: adding a field with #[serde(default)], or a new BuildEventKind variant." >&2
+  echo "  NOT safe: changing or removing an existing field's type, or dropping Unknown's #[serde(other)]." >&2
+  echo "  An undecodable event silently ends a skewed plugin's entire stream. See the module docs." >&2
 fi

@@ -75,7 +75,7 @@ impl Engine {
             },
             move |error| crate::engine::event::BuildEventKind::ExecuteEnd {
                 addr: addr_str,
-                error,
+                error: error.map(crate::engine::event::ErrorDetail::into_message),
             },
             async {
                 let sandbox_dir = {

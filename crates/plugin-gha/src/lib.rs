@@ -791,6 +791,9 @@ mod tests {
             BuildEventKind::ResultEnd {
                 addr: "//a:x".into(),
                 error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
         ));
         hook.on_close();

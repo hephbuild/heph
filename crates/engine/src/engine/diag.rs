@@ -811,7 +811,7 @@ impl hplugin::hook::Hook for DiagHook {
         let now = s.now_ms();
         match &ev.kind {
             BuildEventKind::ResultStart { addr } => s.op_start(Op::Result, addr, now),
-            BuildEventKind::ResultEnd { addr, error } => {
+            BuildEventKind::ResultEnd { addr, error, .. } => {
                 s.op_end(Op::Result, addr, now);
                 s.done.fetch_add(1, Ordering::Relaxed);
                 if error.is_some() {
@@ -2362,6 +2362,9 @@ mod tests {
         h.on_event(&ev(BuildEventKind::ResultEnd {
             addr: "//a:b".into(),
             error: Some("boom".into()),
+            upstream_of: None,
+            exit_status: None,
+            log_tail: None,
         }));
         assert_eq!(s.open_count(Op::Result), 0);
         assert_eq!((s.done(), s.failed()), (1, 1));

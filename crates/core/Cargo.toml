@@ -21,3 +21,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# The build-event stream is a live JSON wire format to out-of-process hooks; its
+# cross-version decode behaviour is tested against real JSON frames.
+serde_json = "1"

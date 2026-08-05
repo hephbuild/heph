@@ -1277,7 +1277,7 @@ impl Engine {
         // Announce worker capacity once per request. Covers the single-target
         // entry (`run` of one addr) that bypasses `Engine::result`; the once-guard
         // makes the dep recursion below a no-op.
-        rs.announce_max_workers(self.max_workers);
+        rs.announce_request_config(self.max_workers);
 
         // Single-target entry (`run` of one addr, which bypasses `Engine::result`):
         // claim the matched stream and emit the set-of-one as already-complete
@@ -1603,7 +1603,7 @@ impl Engine {
 
         // Announce worker capacity up front so the client can paint a fixed
         // worker-slot indicator before any execute lands.
-        rs.announce_max_workers(self.max_workers);
+        rs.announce_request_config(self.max_workers);
 
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
@@ -1866,9 +1866,21 @@ impl Engine {
             crate::engine::event::BuildEventKind::ResultStart {
                 addr: addr_str.clone(),
             },
-            move |error| crate::engine::event::BuildEventKind::ResultEnd {
-                addr: addr_str,
-                error,
+            // The one scope that carries structured detail: `ResultEnd` is where
+            // a consumer learns a target's outcome, so it is where `upstream_of`
+            // (root vs collateral), the exit status and the log tail belong.
+            move |error| {
+                let (error, upstream_of, exit_status, log_tail) = match error {
+                    Some(d) => (Some(d.message), d.upstream_of, d.exit_status, d.log_tail),
+                    None => (None, None, None, None),
+                };
+                crate::engine::event::BuildEventKind::ResultEnd {
+                    addr: addr_str,
+                    error,
+                    upstream_of,
+                    exit_status,
+                    log_tail,
+                }
             },
             async {
                 // Use _no_track: result_addr set parent=addr before entering the memoizer,
@@ -2320,7 +2332,7 @@ impl Engine {
             },
             move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
                 addr: addr_s,
-                error,
+                error: error.map(crate::engine::event::ErrorDetail::into_message),
             },
             async {
                 let mut pulls = Vec::with_capacity(missing.len());
@@ -2580,7 +2592,7 @@ impl Engine {
                         },
                         move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
                             addr: addr_s,
-                            error,
+                            error: error.map(crate::engine::event::ErrorDetail::into_message),
                         },
                         self.probe_remote_revision(ctoken, addr, opts.hashin.as_str(), &needed),
                     )
@@ -3070,7 +3082,7 @@ impl Engine {
                             move |error| {
                                 crate::engine::event::BuildEventKind::LocalCacheWriteEnd {
                                     addr: write_addr,
-                                    error,
+                                    error: error.map(crate::engine::event::ErrorDetail::into_message),
                                 }
                             },
                             engine.cache_locally(
@@ -8244,7 +8256,7 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 &e.kind,
-                BuildEventKind::ResultEnd { addr, error: None } if addr == "//pkg:a"
+                BuildEventKind::ResultEnd { addr, error: None, .. } if addr == "//pkg:a"
             )),
             "expected ResultEnd{{error:None}}, got {events:?}"
         );
@@ -8259,7 +8271,7 @@ mod tests {
     #[tokio::test]
     async fn single_target_result_addr_announces_max_workers_once() -> anyhow::Result<()> {
         // Regression: `run` of a single addr calls `result_addr` directly,
-        // bypassing `Engine::result`. The MaxWorkers announcement must still fire
+        // bypassing `Engine::result`. The RequestConfig announcement must still fire
         // (so the TUI paints the worker indicator), and exactly once.
         let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
         let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
@@ -8270,14 +8282,14 @@ mod tests {
         let max_workers: Vec<usize> = events
             .iter()
             .filter_map(|e| match &e.kind {
-                BuildEventKind::MaxWorkers { count } => Some(*count),
+                BuildEventKind::RequestConfig { max_workers, .. } => Some(*max_workers),
                 _ => None,
             })
             .collect();
         assert_eq!(
             max_workers.len(),
             1,
-            "expected exactly one MaxWorkers event, got {events:?}"
+            "expected exactly one RequestConfig event, got {events:?}"
         );
         assert!(max_workers[0] >= 1, "worker count must be positive");
         Ok(())
@@ -8470,7 +8482,7 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 &e.kind,
-                BuildEventKind::ResultEnd { addr, error: Some(_) } if addr == "//pkg:a"
+                BuildEventKind::ResultEnd { addr, error: Some(_), .. } if addr == "//pkg:a"
             )),
             "ResultEnd must carry the error, got {events:?}"
         );
