@@ -266,6 +266,7 @@ jobs:
           PLUGIN_GO_NAME="heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           PLUGIN_GHA_NAME="heph-gha-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           PLUGIN_OCI_NAME="heph-oci-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
+          PLUGIN_JS_NAME="heph-js-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           # heph-bench: the perf-regression harness (`perfbench` job). Publishing
           # it as a release asset alongside `heph` itself means that job never
           # builds anything to compare a PR against its baseline — both the
@@ -283,6 +284,7 @@ jobs:
           echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
           echo "plugin_gha_name=$PLUGIN_GHA_NAME" >> $GITHUB_OUTPUT
           echo "plugin_oci_name=$PLUGIN_OCI_NAME" >> $GITHUB_OUTPUT
+          echo "plugin_js_name=$PLUGIN_JS_NAME" >> $GITHUB_OUTPUT
           echo "bench_bin_name=$BENCH_BIN_NAME" >> $GITHUB_OUTPUT
           echo "debug_bin_name=$DEBUG_BIN_NAME" >> $GITHUB_OUTPUT
           OUT="target/${{ matrix.target }}/release"
@@ -305,20 +307,21 @@ jobs:
           # share nearly the whole workspace dep graph, and under the release
           # profile (thin-LTO + opt-level=3) each artifact's final codegen/LTO pass
           # is heavy — splitting into separate `cargo build` calls serializes those
-          # three passes and pays cargo startup + freshness re-resolution each time.
+          # passes and pays cargo startup + freshness re-resolution each time.
           # A single invocation lets cargo's jobserver overlap them (one artifact's
           # link tail filling cores while the next codegens). `--bin heph` selects
-          # the binary; `--lib` adds every selected package's lib target — i.e. both
-          # cdylibs (heph's own lib is already built as the bin's dependency, so it
+          # the binary; `--lib` adds every selected package's lib target — i.e. every
+          # cdylib (heph's own lib is already built as the bin's dependency, so it
           # costs nothing extra). `heph-bench` links the same `heph` lib crate, so
           # adding it here is marginal — the expensive part (engine + deps) is
           # already being compiled for `heph` itself.
-          TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p bench"
+          TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-js-cdylib -p bench"
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cargo build --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.dylib"
             gha_lib="$OUT/libplugin_gha_cdylib.dylib"
             oci_lib="$OUT/libplugin_oci_cdylib.dylib"
+            js_lib="$OUT/libplugin_js_cdylib.dylib"
             # The nix toolchain hard-links libiconv against its /nix/store path,
             # which is absent on user machines (dyld aborts at launch). Rewrite
             # those load commands to the OS /usr/lib copies — for every artifact.
@@ -327,16 +330,19 @@ jobs:
             bash scripts/macos-portable.sh "$lib"
             bash scripts/macos-portable.sh "$gha_lib"
             bash scripts/macos-portable.sh "$oci_lib"
+            bash scripts/macos-portable.sh "$js_lib"
           else
             cargo zigbuild --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.so"
             gha_lib="$OUT/libplugin_gha_cdylib.so"
             oci_lib="$OUT/libplugin_oci_cdylib.so"
+            js_lib="$OUT/libplugin_js_cdylib.so"
           fi
           cp "$OUT/heph-bench" $BENCH_BIN_NAME
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
           cp "$oci_lib" $PLUGIN_OCI_NAME
+          cp "$js_lib" $PLUGIN_JS_NAME
 
           # The build version, stamped into every artifact below rather than
           # compiled in. Deliberately a plain shell variable and NOT exported:
@@ -475,6 +481,12 @@ jobs:
           name: ${{steps.build.outputs.plugin_oci_name}}
           path: ${{steps.build.outputs.plugin_oci_name}}
 
+      - name: Upload js plugin artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{steps.build.outputs.plugin_js_name}}
+          path: ${{steps.build.outputs.plugin_js_name}}
+
       # Last, deliberately. This is the only job with steps after its compile,
       # and the drain must not sit in front of them: it would still be correct
       # today (nothing after `Build` compiles) but only by accident, and a
@@ -532,8 +544,9 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           # Matches the CLI, both release flavours (`heph_<os>_<arch>` std,
-          # `heph_debug_<os>_<arch>` debug) and the go plugin cdylib
-          # (`heph-go-plugin_<os>_<arch>.{so,dylib}`); excludes the `repo` source artifact.
+          # `heph_debug_<os>_<arch>` debug) and every plugin cdylib
+          # (`heph-{go,gha,oci,js}-plugin_<os>_<arch>.{so,dylib}`); excludes
+          # the `repo` source artifact.
           pattern: "heph*"
           path: dist
           merge-multiple: true
@@ -563,6 +576,17 @@ jobs:
               -prefix heph-gha-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
               -out "$GITHUB_WORKSPACE/dist/heph-gha-plugin.json" )
           cat dist/heph-gha-plugin.json
+          # Deliberately NOT generating a heph-js-plugin.json here. The `build`
+          # job above now publishes the raw per-os/arch js plugin cdylib as a
+          # release asset (`heph-js-plugin_<os>_<arch>.{so,dylib}`) — needed so
+          # `perfbench`/`perf.yml` can download it for Tier B, same as go/gha.
+          # A public `plugins: - { identifier: { url: .../heph-js-plugin.json } }`
+          # manifest is a separate, larger decision (declaring the js plugin
+          # generally available to any real workspace, not just this bench
+          # pipeline's own locally-built manifest — see
+          # `crates/bench/src/dist.rs`'s `write_dist_config`, which builds its
+          # OWN manifest straight from the downloaded raw dylib and never reads
+          # this file). Left for a future PR to make explicitly.
           echo "manifest checksum: $(cat dist/heph-gha-plugin.json.sha256)"
           # The oci plugin (`docker_build` / `oci_pull` / `oci_push` / `oci_load`)
           # ships the same way — it is not compiled into the CLI.
