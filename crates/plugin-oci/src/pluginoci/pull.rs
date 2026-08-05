@@ -323,7 +323,7 @@ impl ManagedDriver for Driver {
             // Validate now rather than at run time: a malformed platform is a
             // typo in the BUILD file, and parse is where the user finds out.
             (false, Some(p)) => {
-                super::split_platform(&p)?;
+                let p = super::normalize_platform(&p).context("`platform`")?;
                 PlatformSelect::One(p)
             }
             (false, None) => PlatformSelect::One(super::default_platform()),
