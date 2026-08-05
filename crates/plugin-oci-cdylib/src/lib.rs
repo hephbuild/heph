@@ -56,11 +56,22 @@ pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
 fn build() -> PluginComponents {
     let mut drivers = stabby::vec::Vec::new();
 
+    // Assembles target outputs into an image. No daemon, no execution.
+    let image: Arc<dyn ManagedDriver> = Arc::new(pluginoci::image::Driver::new());
+    drivers.push(NamedDriver {
+        name: pluginoci::image::DRIVER_NAME.into(),
+        driver: make_dyn_managed_driver(image),
+    });
+    let layer: Arc<dyn ManagedDriver> = Arc::new(pluginoci::layer::Driver::new());
+    drivers.push(NamedDriver {
+        name: pluginoci::layer::DRIVER_NAME.into(),
+        driver: make_dyn_managed_driver(layer),
+    });
     // Builds a Dockerfile + context into a cacheable image archive.
-    let image: Arc<dyn ManagedDriver> = Arc::new(pluginoci::docker_build::Driver::new());
+    let docker: Arc<dyn ManagedDriver> = Arc::new(pluginoci::docker_build::Driver::new());
     drivers.push(NamedDriver {
         name: pluginoci::docker_build::DRIVER_NAME.into(),
-        driver: make_dyn_managed_driver(image),
+        driver: make_dyn_managed_driver(docker),
     });
     // Pulls a base image into a cacheable archive (or OCI layout).
     let pull: Arc<dyn ManagedDriver> = Arc::new(pluginoci::pull::Driver::new());

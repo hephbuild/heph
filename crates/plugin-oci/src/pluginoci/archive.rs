@@ -153,6 +153,44 @@ impl Layout {
     }
 }
 
+/// A blob on its way *into* a layout: either bytes already in hand, or a file to
+/// be copied without ever holding it.
+///
+/// Manifests, indexes and configs are kilobytes and stay [`Blob::Bytes`]. A
+/// layer is not: `oci_image` builds one per `oci_layer` dep and a single layer
+/// can be most of an image, so it travels as [`Blob::File`] and is streamed at
+/// write time. Reading one into a `Vec<u8>` would put the whole image in memory
+/// once per concurrent image target.
+#[derive(Debug, Clone)]
+pub(crate) enum Blob {
+    Bytes(Vec<u8>),
+    File(std::path::PathBuf),
+}
+
+impl Blob {
+    fn len(&self) -> anyhow::Result<u64> {
+        match self {
+            Blob::Bytes(b) => Ok(b.len() as u64),
+            Blob::File(p) => Ok(std::fs::metadata(p)
+                .with_context(|| format!("stat blob file {p:?}"))?
+                .len()),
+        }
+    }
+
+    fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+        match self {
+            Blob::Bytes(b) => Ok(Box::new(std::io::Cursor::new(b.clone()))),
+            Blob::File(p) => Ok(Box::new(
+                std::fs::File::open(p).with_context(|| format!("open blob file {p:?}"))?,
+            )),
+        }
+    }
+}
+
+/// The blobs of a layout, keyed by digest. `BTreeMap` rather than `HashMap`
+/// because the write order is the archive's bytes.
+pub(crate) type Blobs = std::collections::BTreeMap<String, Blob>;
+
 /// `blobs/sha256/<hex>` → `sha256:<hex>`. Anything else is not a blob.
 fn blob_digest_of(name: &str) -> Option<String> {
     let rest = name.strip_prefix("blobs/")?;
@@ -171,10 +209,7 @@ fn blob_digest_of(name: &str) -> Option<String> {
 /// A single image is annotated in place. Several are wrapped in one index —
 /// buildx's own shape for a multi-platform image — so the tag names the *set*
 /// and the per-platform entries keep their platforms.
-fn tagged_index(
-    index: &OciImageIndex,
-    blobs: &mut HashMap<String, Vec<u8>>,
-) -> anyhow::Result<OciImageIndex> {
+fn tagged_index(index: &OciImageIndex, blobs: &mut Blobs) -> anyhow::Result<OciImageIndex> {
     const REF_NAME: &str = "org.opencontainers.image.ref.name";
     let mut annotations = std::collections::BTreeMap::new();
     annotations.insert(REF_NAME.to_string(), "latest".to_string());
@@ -201,7 +236,7 @@ fn tagged_index(
     let raw = serde_json::to_vec(&inner).context("encode the nested index")?;
     let digest = sha256_digest(&raw);
     let size = raw.len() as i64;
-    blobs.insert(digest.clone(), raw);
+    blobs.insert(digest.clone(), Blob::Bytes(raw));
 
     Ok(OciImageIndex {
         schema_version: 2,
@@ -227,9 +262,17 @@ pub(crate) fn write_layout_dir(
     index: &OciImageIndex,
     blobs: &HashMap<String, Vec<u8>>,
 ) -> anyhow::Result<()> {
+    write_layout_dir_blobs(dir, index, &owned(blobs))
+}
+
+/// [`write_layout_dir`], for blobs that may still be on disk.
+pub(crate) fn write_layout_dir_blobs(
+    dir: &Path,
+    index: &OciImageIndex,
+    blobs: &Blobs,
+) -> anyhow::Result<()> {
     let mut blobs = blobs.clone();
     let index = &tagged_index(index, &mut blobs)?;
-    let blobs = &blobs;
     std::fs::create_dir_all(dir).with_context(|| format!("create {dir:?}"))?;
     std::fs::write(dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)
         .context("write oci-layout")?;
@@ -238,12 +281,32 @@ pub(crate) fn write_layout_dir(
         serde_json::to_vec(index).context("encode index.json")?,
     )
     .context("write index.json")?;
-    for (digest, bytes) in blobs {
+    for (digest, blob) in &blobs {
         let path = dir.join(blob_path(digest)?);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("create {parent:?}"))?;
         }
-        std::fs::write(&path, bytes).with_context(|| format!("write blob {path:?}"))?;
+        // Written beside the final name and renamed, never in place: a blob's
+        // *name* asserts its digest, and nothing here or in `Layout::read` ever
+        // re-hashes one. A write interrupted by Ctrl-C or a full disk would
+        // otherwise leave a truncated file whose name claims a digest it does
+        // not have — served from the cache forever, and rejected only at the far
+        // end of a registry push.
+        let tmp = path.with_extension("partial");
+        let mut src = blob.reader()?;
+        let mut dst =
+            std::fs::File::create(&tmp).with_context(|| format!("create blob {tmp:?}"))?;
+        let n = std::io::copy(&mut src, &mut dst)
+            .with_context(|| format!("write blob {digest} to {tmp:?}"))?;
+        let want = blob.len()?;
+        anyhow::ensure!(
+            n == want,
+            "blob {digest} changed size while being written ({n} bytes, expected {want}); \
+             the layout would be corrupt"
+        );
+        drop(dst);
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("move blob {tmp:?} into place at {path:?}"))?;
     }
     Ok(())
 }
@@ -254,6 +317,17 @@ pub(crate) fn write_layout_tar(
     index: &OciImageIndex,
     blobs: &HashMap<String, Vec<u8>>,
 ) -> anyhow::Result<()> {
+    write_layout_tar_blobs(out, index, &owned(blobs))
+}
+
+/// [`write_layout_tar`], for blobs that may still be on disk.
+pub(crate) fn write_layout_tar_blobs(
+    out: &Path,
+    index: &OciImageIndex,
+    blobs: &Blobs,
+) -> anyhow::Result<()> {
+    let mut blobs = blobs.clone();
+    let index = &tagged_index(index, &mut blobs)?;
     let file = std::fs::File::create(out).with_context(|| format!("create {out:?}"))?;
     let mut ar = tar::Builder::new(file);
     append(&mut ar, "oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#)?;
@@ -262,16 +336,24 @@ pub(crate) fn write_layout_tar(
         INDEX_JSON,
         &serde_json::to_vec(index).context("encode index.json")?,
     )?;
-    // Sorted: a tar's member order is part of its bytes, and the archive is a
-    // cached artifact whose hash must not depend on HashMap iteration order.
-    let mut digests: Vec<&String> = blobs.keys().collect();
-    digests.sort();
-    for digest in digests {
-        let path = blob_path(digest)?;
-        append(&mut ar, &path, &blobs[digest])?;
+    // `Blobs` is a BTreeMap: a tar's member order is part of its bytes, and the
+    // archive is a cached artifact whose hash must not depend on map iteration
+    // order.
+    for (digest, blob) in &blobs {
+        append_blob(&mut ar, &blob_path(digest)?, blob)?;
     }
     ar.finish().context("finish archive")?;
     Ok(())
+}
+
+/// Wrap already-in-memory blobs. The callers that have them (`oci_pull`,
+/// `oci_push`) hold whole images anyway — the registry upload they feed is the
+/// same bytes — so nothing is lost by keeping their shape.
+fn owned(blobs: &HashMap<String, Vec<u8>>) -> Blobs {
+    blobs
+        .iter()
+        .map(|(d, b)| (d.clone(), Blob::Bytes(b.clone())))
+        .collect()
 }
 
 fn append<W: std::io::Write>(
@@ -289,6 +371,34 @@ fn append<W: std::io::Write>(
     ar.append_data(&mut header, name, data)
         .with_context(|| format!("append {name}"))?;
     Ok(())
+}
+
+/// [`append`] for a blob that may still be on disk — streamed, never buffered.
+fn append_blob<W: std::io::Write>(
+    ar: &mut tar::Builder<W>,
+    name: &str,
+    blob: &Blob,
+) -> anyhow::Result<()> {
+    if let Blob::Bytes(bytes) = blob {
+        return append(ar, name, bytes);
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_size(blob.len()?);
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    header.set_cksum();
+    ar.append_data(&mut header, name, blob.reader()?)
+        .with_context(|| format!("append {name}"))?;
+    Ok(())
+}
+
+/// The sha256 of a file, without reading it into memory.
+pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<(String, u64)> {
+    use sha2::{Digest as _, Sha256};
+    let mut f = std::fs::File::open(path).with_context(|| format!("open {path:?}"))?;
+    let mut h = Sha256::new();
+    let n = std::io::copy(&mut f, &mut h).with_context(|| format!("hash {path:?}"))?;
+    Ok((format!("sha256:{:x}", h.finalize()), n))
 }
 
 fn blob_path(digest: &str) -> anyhow::Result<String> {
