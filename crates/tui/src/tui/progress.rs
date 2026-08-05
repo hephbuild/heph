@@ -714,7 +714,7 @@ pub struct BuildState {
     done: Vec<String>,
     /// Targets whose driver actually ran to success (`ExecuteEnd` with no error).
     /// Distinct from `completed`, which includes cache hits that never executed.
-    built: usize,
+    executed: usize,
     local_hits: usize,
     local_misses: usize,
     remote_hits: usize,
@@ -757,7 +757,7 @@ pub struct Counts {
     /// The denominator, bound to the [`ViewMode::Matched`] tab and `~`-prefixed
     /// while the matcher is still streaming. `None` before any `Matched` event,
     /// where the segment reads `{done} done` with no denominator (and `done` is
-    /// the built count, not a matched count).
+    /// the executed count, not a matched count).
     pub total: Option<String>,
     /// Cache hits in scope, e.g. `"3 cached"`.
     pub cached: String,
@@ -910,7 +910,7 @@ impl BuildState {
                 self.open_ops.remove(addr);
             }
             // The op timeline (folded above) tracks Execute's duration; here we
-            // keep only the `built` counter side effect on a successful end.
+            // keep only the `executed` counter side effect on a successful end.
             //
             // A target that executes is not a cached target — even if it was
             // announced as a hit first. The engine decides a hit from the
@@ -918,13 +918,13 @@ impl BuildState {
             // turn out to be unreadable (GC'd, expired on a shared cache, or
             // simply never pulled and the remote is now unreachable) and the
             // target is rebuilt. Retract the hit here rather than counting the
-            // same addr as both cached and built, which would let "built + cached"
+            // same addr as both cached and executed, which would let "executed + cached"
             // exceed the number of targets — and, on an offline run over a
             // remote-mirrored cache, report a full rebuild as "N cached".
             BuildEventKind::ExecuteStart { addr, .. } => self.retract_cache_hit(addr),
             BuildEventKind::ExecuteEnd { error, .. } => {
                 if error.is_none() {
-                    self.built += 1;
+                    self.executed += 1;
                 }
             }
             BuildEventKind::LocalCacheHit { addr } => {
@@ -1089,7 +1089,7 @@ impl BuildState {
                     let tilde = if complete { "" } else { "~" };
                     (done.to_string(), Some(format!("{tilde}{total}")))
                 }
-                None => (self.built.to_string(), None),
+                None => (self.executed.to_string(), None),
             },
         };
         Counts {
@@ -1452,7 +1452,7 @@ impl ProgressHeader for BuildHeader {
         // The done segment `X / Y done` splits into two independent tabs: `X`
         // (the finished count → Done view) and `Y` (the matched total → Matched
         // view). The connective ` / ` and trailing ` done` are inert text. Before
-        // any `Matched` event there is no denominator, so it reads `{built} done`
+        // any `Matched` event there is no denominator, so it reads `{executed} done`
         // with only the Done tab.
         let mut done_parts = vec![HeaderPart::tab(ViewMode::Done, done)];
         match total {
@@ -2047,7 +2047,7 @@ impl TUIAppView for TuiProgressView {
     /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
     /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
     /// ```text
-    /// ╭─ heph · N built · N cached · N running · N failed ──── <workers> ─╮
+    /// ╭─ 1m05s · D / N done · N cached · N failed ──────────── <workers> ─╮
     ///   <slow rows + lock waits, scrollable>
     /// ╰─── <label> ───────────────────────────────────────────────────────╯
     ///   ↑/↓ scroll
@@ -2633,7 +2633,7 @@ mod tests {
     /// its blobs — a local GC, an expiry rule on a shared cache, or blobs that
     /// were never pulled and a remote that is now unreachable. It announces the
     /// hit, discovers the bytes are unreadable, and rebuilds. Counting both would
-    /// let "built + cached" exceed the number of targets, and would report a
+    /// let "executed + cached" exceed the number of targets, and would report a
     /// fully-offline rebuild of the whole graph as "N cached" — the header would
     /// say the opposite of what happened.
     #[test]
@@ -2671,9 +2671,9 @@ mod tests {
             (1, 1),
             "and counted as the miss it turned out to be"
         );
-        assert_eq!(s.built, 2);
+        assert_eq!(s.executed, 2);
         // Through the header's own accessors, not the raw counters: these are the
-        // numbers the user reads, and the point is that `built + cached` (2 + 1)
+        // numbers the user reads, and the point is that `executed + cached` (2 + 1)
         // does not exceed the three targets seen.
         assert_eq!(
             s.cached_count(CountScope::All),
@@ -2707,7 +2707,7 @@ mod tests {
         s.apply(&ev(2, execute_end("//a:fresh")));
         assert_eq!((s.local_hits, s.remote_hits), (0, 0));
         assert_eq!((s.local_misses, s.remote_misses), (0, 0));
-        assert_eq!(s.built, 1);
+        assert_eq!(s.executed, 1);
     }
 
     #[test]
@@ -3168,7 +3168,7 @@ mod tests {
         // frame precisely so the header does not re-derive them.
         let mut s = BuildState::new();
 
-        // Before any Matched event: the done segment falls back to `{built} done`
+        // Before any Matched event: the done segment falls back to `{executed} done`
         // with no denominator, and cached falls back to raw hit counts.
         s.apply(&ev(0, execute_start("//a:built")));
         s.apply(&ev(1, execute_end("//a:built")));

@@ -3901,6 +3901,7 @@ dependencies = [
  "core",
  "plugin",
  "reqwest",
+ "rustc-hash",
  "serde_json",
  "serde_yaml",
  "tempfile",
