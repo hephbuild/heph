@@ -14,3 +14,11 @@ serde_json = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: parse the generated `pnpm-workspace.yaml` / match its globs
+# against generated package dirs using the exact crate+version
+# `crates/plugin-js/src/pluginjs/workspace.rs` uses, so the discoverability
+# assertion in `js_only_corpus_matches_manifest_and_workspace_shape` proves
+# something about the real provider's matching semantics, not a hand-rolled
+# approximation of them.
+serde_yaml = "0.9"
+wax = "0.7"
