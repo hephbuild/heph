@@ -795,9 +795,8 @@ Current: `refreshSecs`, `summaryPath`, `tokenEnv`. Keep the names and the camelC
 
 | Option | Default | Why |
 |---|---|---|
-| `comment` | `onFailureOrSlow` | `always`/`never`/`onFailure`/`onFailureOrSlow`. A 3-second all-cached step must not post. The single biggest spam fix |
 | `commentKey` | `$GITHUB_JOB` + leg discriminator | Fixes the matrix collision (§13) |
-| `slowAfterSecs` | `30` | Both the "running longest" threshold and the `onFailureOrSlow` gate. One knob |
+| `slowAfterSecs` | `30` | How long a target must run before it is surfaced as "running longest" |
 | `jsonPath` | unset | The agent surface |
 | `annotations` | `true` | `::error::` workflow commands |
 | `detail` | `auto` | `compact`/`full`/`auto` (compact on success, full on failure) |
@@ -872,7 +871,7 @@ seam. Do not put summary-content assertions there.
 
 1. **Rendering, keying, and the test seam — no engine changes.** Bugs 1, 3, 4, 5, 6, 7, 8, 9, 10;
    split `render_live`/`render_final`; elapsed + `updated …Z`; `executed` rename across both
-   surfaces; `comment: onFailureOrSlow`; drop the t=0 sync; byte budgets. This alone fixes the live
+   surfaces; byte budgets. This alone fixes the live
    view and every comment bug.
 2. **`ResultEnd` structured failure detail** (§7.1) — gates live failure diagnosis, the highest-value
    item. Consult `compatibility` on the shape first.
@@ -904,6 +903,8 @@ seam. Do not put summary-content assertions there.
   fallback render at `progress.rs:1092`, and the stale doc comment at `progress.rs:2050` that
   advertises a header the code no longer produces).
 - Counts are **graph-wide**, not matched-only.
-- `comment` defaults to **`onFailureOrSlow`**.
+- The comment is **always posted**, from job start. An earlier draft gated it behind a
+  `comment: onFailureOrSlow` policy to avoid posting for short green steps; that was reversed —
+  a comment that is always present is findable and predictable, which beats saving two API writes.
 - Diagrams: **one gantt, step summary only.** No SVG, no badges, no cone flowchart.
 - The hook **never** influences `fail_fast`; it reports the mode.
