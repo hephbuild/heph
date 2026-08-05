@@ -33,6 +33,7 @@
 #[cfg(test)]
 mod comment_tests;
 mod render;
+mod report;
 mod tally;
 
 use std::path::PathBuf;
@@ -562,6 +563,39 @@ struct Inner {
     slow_after_ms: u64,
     /// Link to the workflow run, when the Actions env provides one.
     run_url: Option<String>,
+    /// Where to write the full JSON document, if configured.
+    json_path: Option<PathBuf>,
+    /// Whether to emit `::error::` workflow commands.
+    annotations: bool,
+    /// Root addrs already annotated, so a repeated `ResultEnd` for one addr does
+    /// not repeat its annotation.
+    annotated: Mutex<std::collections::HashSet<String>>,
+    /// Last out-of-band flush, for the floor between failure-triggered syncs.
+    last_flush: Mutex<Option<Instant>>,
+}
+
+/// Minimum gap between out-of-band, failure-triggered comment syncs.
+///
+/// The first root failure flushes immediately — that is the whole point of
+/// diagnosing before the build ends, and waiting up to `refreshSecs` for it
+/// wastes the window. Subsequent roots coalesce into the next tick if they land
+/// inside this floor, so a build breaking in twenty places does not become twenty
+/// API writes. Bounded by *breakage count*, not target count, which is what makes
+/// it safe on a 20k-target graph.
+const FLUSH_FLOOR: Duration = Duration::from_secs(10);
+
+/// Emit a workflow command on stdout.
+///
+/// `println!` is restricted in plugin code, and deliberately so — but a workflow
+/// command has exactly one channel: the step's stdout, read by the Actions
+/// runner. There is no file or API alternative. It is gated on `GITHUB_ACTIONS`
+/// so it can only ever fire inside a runner, where stderr is not a tty and the
+/// TUI has therefore taken its non-interactive backend, leaving stdout free.
+fn emit_workflow_command(line: &str) {
+    if std::env::var("GITHUB_ACTIONS").ok().as_deref() != Some("true") {
+        return;
+    }
+    println!("{line}");
 }
 
 impl Inner {
@@ -571,6 +605,102 @@ impl Inner {
             now_ms: now_unix_ms(),
             slow_after_ms: self.slow_after_ms,
             run_url: self.run_url.as_deref(),
+        }
+    }
+
+    /// React to newly-seen root failures: annotate them, and flush the comment
+    /// out of band so the failure is visible now rather than up to `refreshSecs`
+    /// later.
+    ///
+    /// Only *roots* trigger any of this. Collateral failures bump a counter — at
+    /// 20k targets one broken leaf blocks thousands, and flushing or annotating
+    /// each would be thousands of writes describing one bug.
+    fn notice_failures(&self) {
+        let new_roots: Vec<crate::tally::RootFailure> = {
+            let t = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen = self.annotated.lock().unwrap_or_else(|e| e.into_inner());
+            t.roots()
+                .iter()
+                .filter(|r| seen.insert(r.addr.clone()))
+                .cloned()
+                .collect()
+        };
+        if new_roots.is_empty() {
+            return;
+        }
+
+        if self.annotations {
+            for line in report::annotations(&new_roots, new_roots.len()) {
+                emit_workflow_command(&line);
+            }
+        }
+
+        // Flush immediately on the first failure; coalesce later ones.
+        let should_flush = {
+            let mut last = self.last_flush.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            match *last {
+                Some(prev) if now.duration_since(prev) < FLUSH_FLOOR => false,
+                _ => {
+                    *last = Some(now);
+                    true
+                }
+            }
+        };
+        if should_flush {
+            self.sync_comment(None);
+        }
+    }
+
+    /// Write the machine-readable end-of-run surfaces.
+    ///
+    /// Both are best-effort and independent of the comment: an agent reading
+    /// `GITHUB_OUTPUT` must not depend on whether a PR comment was warranted.
+    fn write_machine_surfaces(&self) {
+        let (elapsed, counters) = {
+            let t = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+            (t.elapsed_ms(now_unix_ms()), t.counters())
+        };
+        let json_path_str = self.json_path.as_ref().map(|p| p.display().to_string());
+
+        if let Some(path) = &self.json_path {
+            let t = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+            let doc = report::full_document(
+                &t,
+                &counters,
+                elapsed,
+                &self.title,
+                json_path_str.as_deref(),
+            );
+            match serde_json::to_vec_pretty(&doc) {
+                Ok(bytes) => {
+                    if let Err(e) = std::fs::write(path, bytes) {
+                        tracing::warn!(path = %path.display(), "writing heph json failed: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("serializing heph json failed: {e}"),
+            }
+        }
+
+        // `$GITHUB_OUTPUT` is an append target, one `key=value` per line.
+        if let Some(out) = std::env::var_os("GITHUB_OUTPUT") {
+            let t = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+            let lines = report::github_outputs(&t, &counters, elapsed, json_path_str.as_deref());
+            drop(t);
+            let opened = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&out);
+            match opened {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let body = format!("{}\n", lines.join("\n"));
+                    if let Err(e) = f.write_all(body.as_bytes()) {
+                        tracing::warn!("writing $GITHUB_OUTPUT failed: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("opening $GITHUB_OUTPUT failed: {e}"),
+            }
         }
     }
 
@@ -597,7 +727,24 @@ impl Inner {
     /// The end-of-run report for `$GITHUB_STEP_SUMMARY`.
     fn render_final(&self) -> String {
         let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
-        render::render_final(&tally, &self.ctx(), render::SUMMARY_BUDGET)
+        // The embed is reserved out of the budget *before* the prose, because a
+        // truncated fact is recoverable for a human while a truncated JSON object
+        // is unparseable — it would break the agent that depends on it.
+        let embed = report::embed_marker(&report::embedded_document(
+            &tally,
+            &tally.counters(),
+            tally.elapsed_ms(now_unix_ms()),
+            self.json_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .as_deref(),
+        ));
+        let budget = render::SUMMARY_BUDGET.saturating_sub(embed.len().saturating_add(2));
+        let mut out = render::render_final(&tally, &self.ctx(), budget);
+        out.push('\n');
+        out.push_str(&embed);
+        out.push('\n');
+        out
     }
 
     /// Append the final report to the step-summary file.
@@ -657,6 +804,8 @@ impl GhaHook {
                 "tokenEnv",
                 "slowAfterSecs",
                 "commentKey",
+                "jsonPath",
+                "annotations",
             ],
         )?;
         tracing::info!("gha hook loaded");
@@ -686,6 +835,8 @@ impl GhaHook {
         };
         let run_url = run_url_from_env();
 
+        let json_path = decode_opt::<String>(opts, "gha hook", "jsonPath")?.map(PathBuf::from);
+        let annotations = decode_opt::<bool>(opts, "gha hook", "annotations")?.unwrap_or(true);
         let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
         // One sticky PR comment per job leg; within it, one section per heph
         // command so a job's steps each keep their own results.
@@ -713,6 +864,10 @@ impl GhaHook {
             stop: AtomicBool::new(false),
             slow_after_ms: slow_after_secs.saturating_mul(1000),
             run_url,
+            json_path,
+            annotations,
+            annotated: Mutex::new(std::collections::HashSet::new()),
+            last_flush: Mutex::new(None),
         });
 
         // Live updates run only when a comment is configured. A plain thread (no
@@ -743,11 +898,17 @@ impl Hook for GhaHook {
     }
 
     fn on_event(&self, ev: &BuildEvent) {
-        self.inner
-            .tally
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .apply(ev);
+        let newly_failed = {
+            let mut t = self.inner.tally.lock().unwrap_or_else(|e| e.into_inner());
+            let before = t.counters().roots_total;
+            t.apply(ev);
+            t.counters().roots_total > before
+        };
+        // Only on the edge, so the ~160k events of a 20k-target build do no work
+        // here beyond the fold itself.
+        if newly_failed {
+            self.inner.notice_failures();
+        }
     }
 
     fn on_close(&self) {
@@ -766,6 +927,7 @@ impl Hook for GhaHook {
         // The summary is the durable report; the comment is only a notification.
         // durable report, the comment is only a notification.
         self.inner.write_summary();
+        self.inner.write_machine_surfaces();
     }
 }
 
@@ -1054,5 +1216,118 @@ mod tests {
 
     fn label_from(args: &[&str]) -> String {
         command_label_from(args.iter().map(|s| (*s).to_string()))
+    }
+
+    fn hook_with(opts: &[(&str, &str)]) -> GhaHook {
+        let opts: Options = opts
+            .iter()
+            .map(|(k, v)| {
+                (
+                    (*k).to_string(),
+                    serde_yaml::Value::String((*v).to_string()),
+                )
+            })
+            .collect();
+        GhaHook::from_options(&opts).expect("hook")
+    }
+
+    #[test]
+    fn the_summary_carries_a_parseable_embedded_json_document() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let summary = dir.path().join("summary.md");
+        let json = dir.path().join("heph.json");
+        let hook = hook_with(&[
+            ("summaryPath", &summary.to_string_lossy()),
+            ("jsonPath", &json.to_string_lossy()),
+        ]);
+
+        hook.on_event(&ev(
+            0,
+            BuildEventKind::Matched {
+                addrs: vec!["//a:x".into()],
+                complete: true,
+            },
+        ));
+        hook.on_event(&ev(
+            1_000,
+            BuildEventKind::ResultEnd {
+                addr: "//a:x".into(),
+                error: Some("target failed".into()),
+                upstream_of: None,
+                exit_status: Some("exit status: 1".into()),
+                log_tail: None,
+            },
+        ));
+        hook.on_close();
+
+        // The embed must survive in the summary AND parse — a truncated JSON
+        // object would break the agent that reads it.
+        let body = std::fs::read_to_string(&summary).expect("summary written");
+        let start = body.find(report::EMBED_OPEN).expect("embed present");
+        let rest = body.get(start + report::EMBED_OPEN.len()..).expect("after");
+        let end = rest.find(report::EMBED_CLOSE).expect("embed closed");
+        let raw = rest.get(..end).expect("json slice");
+        assert!(
+            raw.len() <= report::EMBED_MAX,
+            "embed capped: {}",
+            raw.len()
+        );
+        let v: serde_json::Value = serde_json::from_str(raw).expect("embed parses");
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["targets"]["failed"], 1);
+
+        // And the full document is written separately, with the detail the embed
+        // deliberately omits.
+        let full: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).expect("json written"))
+                .expect("full doc parses");
+        assert_eq!(full["schema"], report::SCHEMA);
+        assert_eq!(
+            full["failures"][0]["exit_status"], "exit status: 1",
+            "detail lives in the file, not the embed"
+        );
+    }
+
+    #[test]
+    fn a_collateral_cone_does_not_reach_the_json_failure_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = dir.path().join("heph.json");
+        let hook = hook_with(&[
+            ("summaryPath", &dir.path().join("s.md").to_string_lossy()),
+            ("jsonPath", &json.to_string_lossy()),
+        ]);
+        hook.on_event(&ev(
+            10,
+            BuildEventKind::ResultEnd {
+                addr: "//base:proto".into(),
+                error: Some("boom".into()),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+            },
+        ));
+        for i in 0..4_117 {
+            hook.on_event(&ev(
+                20,
+                BuildEventKind::ResultEnd {
+                    addr: format!("//svc:t{i}"),
+                    error: Some("dependency failed".into()),
+                    upstream_of: Some("//base:proto".into()),
+                    exit_status: None,
+                    log_tail: None,
+                },
+            ));
+        }
+        hook.on_close();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).expect("json")).expect("parses");
+        assert_eq!(
+            v["failures"].as_array().map(Vec::len),
+            Some(1),
+            "one root, not 4,118 entries"
+        );
+        assert_eq!(v["targets"]["blocked"], 4_117);
+        assert_eq!(v["failures"][0]["blocked_count"], 4_117);
     }
 }
