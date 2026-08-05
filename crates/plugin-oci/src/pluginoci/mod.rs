@@ -306,6 +306,10 @@ struct OciImageSpec {
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     dockerfile: Option<String>,
     /// Build-context dependencies, grouped by name → list of target addresses.
+    ///
+    /// These, and only these, are what the build sees: heph's own deps (the
+    /// builder-platform probe, `bases` layouts) and the target's own output
+    /// archive are all kept out of the context deliberately.
     /// Every file these targets produce is materialized into the sandbox at its
     /// **workspace-relative** path, and the sandbox workspace root is the
     /// `docker build` context — so a dep from any package is visible, and
@@ -1098,12 +1102,19 @@ impl ManagedDriver for Driver {
             }
         };
 
-        // Archive and digest are written into the package dir, where `parse`
-        // declared them as outputs.
-        let out_tar = pkg_dir.join(basename(&def.out)?);
+        // `parse` declared both of these in the package dir, and that is where
+        // they have to end up for collection to find them.
+        let out_name = basename(&def.out)?;
+        let final_tar = pkg_dir.join(out_name);
         let digest_path = pkg_dir.join(basename(&def.digest_out)?);
-        // Metadata lands outside the workspace dir so it is not collected as an
-        // output.
+
+        // The build writes the archive *outside* the workspace dir, then it is
+        // moved into place below. The workspace dir is the build context, so
+        // building straight into it would put the archive inside the context
+        // that produces it: a wildcard `COPY` would pull the in-progress image
+        // into the image, and BuildKit would be walking a tree the build is
+        // still growing. Same reason the metadata file lands out here.
+        let build_tar = req.sandbox_dir.join(out_name);
         let metadata_file = req.sandbox_dir.join("oci-metadata.json");
 
         // The probe dep's file holds the platform the key was computed from.
@@ -1125,7 +1136,7 @@ impl ManagedDriver for Driver {
             &def,
             &context_dir,
             &dockerfile_full,
-            &out_tar,
+            &build_tar,
             &metadata_file,
             &named_contexts,
             &src_args,
@@ -1142,6 +1153,12 @@ impl ManagedDriver for Driver {
             .await
             .with_context(|| format!("read buildx metadata {metadata_file:?}"))?;
         let digest = parse_metadata_digest(&metadata)?;
+
+        // Same filesystem (both live under the sandbox), so this is a rename,
+        // not a copy of the whole image.
+        tokio::fs::rename(&build_tar, &final_tar)
+            .await
+            .with_context(|| format!("move the built archive {build_tar:?} to {final_tar:?}"))?;
         tokio::fs::write(&digest_path, &digest)
             .await
             .with_context(|| format!("write digest {digest_path:?}"))?;

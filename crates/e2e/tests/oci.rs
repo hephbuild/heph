@@ -268,6 +268,13 @@ target(
         !listing.contains("platform.txt"),
         "heph's own plumbing must stay out of the build context, got: {listing}"
     );
+    // The image archive is written outside the context and moved in afterwards,
+    // so the build never sees its own output: a wildcard `COPY` would otherwise
+    // pull the in-progress image into the image being built.
+    assert!(
+        !listing.contains(".tar"),
+        "the target's own output archive must not be in its build context, got: {listing}"
+    );
 
     // …and the Dockerfile can find it without hardcoding the layout.
     let build = fake
