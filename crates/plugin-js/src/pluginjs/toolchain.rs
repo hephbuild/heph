@@ -246,6 +246,79 @@ pub(crate) fn query_test_runner_version(runner_bin: &Path) -> anyhow::Result<Str
     Ok(version)
 }
 
+/// Sentinel `bundler` value `js_bundle` accepts in this milestone — see this
+/// module's `resolve_host_bundler` doc and `driver_bundle.rs` module docs for
+/// the same disclosed non-hermetic-toolchain shape `tstool = "host"`/
+/// `testrunner`/`linter` already have. Mirrors
+/// `ai-docs/js-plugin-plan.md`'s `js_bundle` row: `bundler` defaults to
+/// `esbuild` (the only value implemented this milestone — `rollup`/
+/// `webpack`/`vite` are a stated M6+ follow-up, not silently pretended to
+/// work).
+pub const ESBUILD: &str = "esbuild";
+
+/// Whether `bundler` names a supported bundler — only `esbuild` in this
+/// milestone.
+pub fn is_supported_bundler(bundler: &str) -> bool {
+    bundler == ESBUILD
+}
+
+/// Resolve the configured `bundler`'s binary:
+/// `<workspace_root>/node_modules/.bin/<bundler>` first, then the process's
+/// own `PATH` — the same disclosed non-hermetic escape hatch
+/// `tstool = "host"`/`testrunner`/`linter` already have (see
+/// [`resolve_host_tsc`]), extended to `js_bundle`'s toolchain axis. Fails
+/// loudly, naming both places checked, when neither has it.
+pub(crate) fn resolve_host_bundler(
+    workspace_root: &Path,
+    bundler: &str,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        is_supported_bundler(bundler),
+        "js_bundle: unsupported bundler {bundler:?} — expected \"esbuild\" (rollup/webpack/vite \
+         are a stated M6+ follow-up, not yet supported)"
+    );
+    let local = workspace_root
+        .join("node_modules")
+        .join(".bin")
+        .join(bundler);
+    find_host_bin(workspace_root, bundler).ok_or_else(|| {
+        anyhow::anyhow!(
+            "js_bundle: no `{bundler}` binary found at {local:?} or on PATH — install it (`npm \
+             install -D {bundler}` / `pnpm add -D {bundler}`) so `node_modules/.bin/{bundler}` \
+             exists, or make a `{bundler}` binary available on PATH. There is no hermetic \
+             {bundler} toolchain yet in this plugin — `bundler=\"{bundler}\"` requires one of \
+             those two to be reachable."
+        )
+    })
+}
+
+/// Query the resolved bundler's own `--version` output, trimmed — hashed
+/// into `JsBundleDef` so a host bundler upgrade/downgrade busts the cache,
+/// mirroring [`query_tsc_version`]/[`query_test_runner_version`]/
+/// [`query_linter_version`]'s identical "query once at `Provider::get` time,
+/// not `run()` time" rationale.
+pub(crate) fn query_bundler_version(bundler_bin: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new(bundler_bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("run {bundler_bin:?} --version"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`{bundler_bin:?} --version` failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let version = String::from_utf8(out.stdout)
+        .with_context(|| format!("{bundler_bin:?} --version output is not utf8"))?
+        .trim()
+        .to_string();
+    anyhow::ensure!(
+        !version.is_empty(),
+        "`{bundler_bin:?} --version` returned empty output"
+    );
+    Ok(version)
+}
+
 /// Query `tsc --version`'s full trimmed output (e.g. `"Version 5.6.2"`) —
 /// hashed into `JsTypecheckDef` so a host tsc upgrade/downgrade busts the
 /// cache. See module docs for why this runs at `Provider::get` time.
@@ -522,6 +595,92 @@ mod tests {
             std::fs::set_permissions(&fake_bin, perms).expect("chmod");
         }
         let err = query_linter_version(&fake_bin).expect_err("nonzero exit must error");
+        assert!(format!("{err:#}").contains("failed"));
+    }
+
+    // ---- bundler (js_bundle) ----
+
+    #[test]
+    fn is_supported_bundler_recognizes_only_esbuild() {
+        assert!(is_supported_bundler(ESBUILD));
+        assert!(!is_supported_bundler("rollup"));
+        assert!(!is_supported_bundler("webpack"));
+        assert!(!is_supported_bundler(""));
+    }
+
+    #[test]
+    fn resolve_host_bundler_rejects_unsupported_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err =
+            resolve_host_bundler(dir.path(), "rollup").expect_err("unsupported bundler must error");
+        assert!(format!("{err:#}").contains("rollup"));
+    }
+
+    #[test]
+    fn resolve_host_bundler_prefers_local_node_modules_bin_over_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_bin_dir = dir.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&local_bin_dir).expect("mkdir");
+        let local_esbuild = local_bin_dir.join(ESBUILD);
+        std::fs::write(&local_esbuild, b"#!/bin/sh\necho local\n").expect("write local esbuild");
+
+        let found = resolve_host_bundler(dir.path(), ESBUILD).expect("resolve");
+        assert_eq!(found, local_esbuild);
+    }
+
+    #[test]
+    fn resolve_host_bundler_errors_clearly_when_absent_everywhere() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prior = std::env::var_os("PATH");
+        // SAFETY: test-only, single-threaded within this process for the
+        // duration of the mutation; restored immediately below.
+        unsafe { std::env::set_var("PATH", "") };
+        let result = resolve_host_bundler(dir.path(), ESBUILD);
+        match &prior {
+            // SAFETY: test-only, restoring the prior value we saved above.
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            // SAFETY: test-only, restoring the prior (unset) state.
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        let err = result.expect_err("no esbuild anywhere must error, not silently succeed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("esbuild"), "{msg}");
+        assert!(msg.contains("PATH"), "{msg}");
+    }
+
+    #[test]
+    fn query_bundler_version_reads_trimmed_stdout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_bin = dir.path().join("esbuild");
+        std::fs::write(&fake_bin, "#!/bin/sh\necho '0.19.2'\n").expect("write fake bundler");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).expect("chmod");
+        }
+        let version = query_bundler_version(&fake_bin).expect("query version");
+        assert_eq!(version, "0.19.2");
+    }
+
+    #[test]
+    fn query_bundler_version_errors_on_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_bin = dir.path().join("esbuild");
+        std::fs::write(&fake_bin, "#!/bin/sh\nexit 2\n").expect("write fake bundler");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).expect("chmod");
+        }
+        let err = query_bundler_version(&fake_bin).expect_err("nonzero exit must error");
         assert!(format!("{err:#}").contains("failed"));
     }
 }

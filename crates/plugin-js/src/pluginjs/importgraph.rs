@@ -461,6 +461,20 @@ pub fn find_nearest_lint_config(
     find_nearest_file(workspace_root, pkg_dir, candidates)
 }
 
+/// Same ancestor walk, generalized once more to `js_bundle`'s bundler config
+/// file — see `driver_bundle.rs` module docs. Only `esbuild.config.json` is
+/// recognized in this milestone (the esbuild CLI has no auto-discovered
+/// config file convention of its own; a JS/TS esbuild config driven through
+/// its Node API is out of scope for this CLI-based driver — a disclosed gap,
+/// not a silently missing feature).
+pub fn find_nearest_bundler_config(
+    workspace_root: &Path,
+    pkg_dir: &Path,
+    candidates: &[&str],
+) -> Option<PathBuf> {
+    find_nearest_file(workspace_root, pkg_dir, candidates)
+}
+
 /// Walk up from `pkg_dir` (inclusive) to `workspace_root` looking for the
 /// nearest `package.json` whose own `"jest"` field is present — jest's other
 /// documented config location, alongside the dedicated `jest.config.*`
@@ -2017,7 +2031,14 @@ pub(crate) fn thirdparty_pkg_name_from_path(resolved: &Path) -> Option<String> {
 /// owns it — `None` if it escaped `workspace_root` entirely (shouldn't
 /// happen for a first-party resolution, but resolution is not proof of
 /// that).
-fn firstparty_owning_pkg_dir(resolved: &Path, workspace_root: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)`, not private: `provider.rs`'s `js_bundle` cross-package
+/// closure walk (`Provider::bundle_closure`) reuses this to find which
+/// sibling package a first-party edge crossed into, so it knows which
+/// package's own `ImportGraph` to fetch next — the exact "which package owns
+/// this resolved path" question [`check_phantom_dependencies`] already
+/// answers for a one-hop edge.
+pub(crate) fn firstparty_owning_pkg_dir(resolved: &Path, workspace_root: &Path) -> Option<PathBuf> {
     let mut dir = if resolved.is_dir() {
         resolved
     } else {
@@ -2175,6 +2196,7 @@ mod tests {
     ) -> PackageManifest {
         PackageManifest {
             name: name.to_string(),
+            main: None,
             dependencies: deps
                 .iter()
                 .map(|d| (d.to_string(), "*".to_string()))

@@ -1,6 +1,6 @@
 //! The JS/TS plugin as a loadable cdylib behind the stable ABI.
 //!
-//! **M0-M5 scope**: exports the `js` provider (package discovery + pnpm/npm
+//! **M0-M6 scope**: exports the `js` provider (package discovery + pnpm/npm
 //! workspace-member resolution + lockfile-driven dependency wiring + oxc-based
 //! import-graph resolution), its `js_package_info` dependency-wiring driver,
 //! the hermetic `js_install` third-party fetch driver, the `js_typecheck`
@@ -9,23 +9,29 @@
 //! module docs), the `js_test` driver (M4 — one target per test file, via
 //! the configured `testrunner` (`vitest`/`jest`), same disclosed non-hermetic
 //! host-toolchain shape; see `hplugin_js::pluginjs::driver_test` module
-//! docs), and the `js_lint` driver (M5 — one target per package, via the
+//! docs), the `js_lint` driver (M5 — one target per package, via the
 //! configured `linter` (`oxlint`/`eslint`), same disclosed non-hermetic
 //! host-toolchain shape; see `hplugin_js::pluginjs::driver_lint` module
+//! docs), and the `js_bundle` driver (M6 — one target per package entry
+//! point, via the configured `bundler` (`esbuild` only, in this milestone),
+//! same disclosed non-hermetic host-toolchain shape, plus `format`/`target`
+//! addr-arg variants; see `hplugin_js::pluginjs::driver_bundle` module
 //! docs). The host loads this with `hplugin_stabby::load_stable::load`,
 //! which verifies ABI compatibility via stabby's type reports before use.
 //! Calls then run in-process at native speed — no serialization on the hot
 //! path, no IPC.
 //!
-//! Formatting and bundling drivers are later milestones (see
-//! `ai-docs/js-plugin-plan.md`) and are not wired up here yet.
+//! `js_format` (the one remaining driver named in
+//! `ai-docs/js-plugin-plan.md`'s v1 scope table) has no milestone in the
+//! plan's Milestones list and is not wired up here — see that doc.
 //!
 //! Plugin-specific settings are read from the environment; only the
 //! workspace root crosses in [`CreateConfig`].
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_js::pluginjs::{
-    JsInstallDriver, JsLintDriver, JsPackageInfoDriver, JsTestDriver, JsTypecheckDriver, Provider,
+    JsBundleDriver, JsInstallDriver, JsLintDriver, JsPackageInfoDriver, JsTestDriver,
+    JsTypecheckDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
@@ -130,6 +136,16 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     drivers.push(NamedDriver {
         name: "js_lint".into(),
         driver: make_dyn_managed_driver(lint),
+    });
+    // `js_bundle` (M6): runs the configured bundler (`esbuild` default, the
+    // only value implemented this milestone) over one package's entry point
+    // at a time — see `hplugin_js::pluginjs::driver_bundle` module docs,
+    // including its disclosed non-hermetic host-toolchain gap and its
+    // `format`/`target` addr-arg variant mechanism.
+    let bundle: Arc<dyn ManagedDriver> = Arc::new(JsBundleDriver::new());
+    drivers.push(NamedDriver {
+        name: "js_bundle".into(),
+        driver: make_dyn_managed_driver(bundle),
     });
 
     Ok(PluginComponents {

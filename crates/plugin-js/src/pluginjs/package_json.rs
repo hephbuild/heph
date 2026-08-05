@@ -15,6 +15,13 @@ use std::path::Path;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PackageManifest {
     pub name: String,
+    /// The package's own `"main"` field — `js_bundle`'s default entry point
+    /// when no `entry=` addr arg overrides it (see
+    /// `pluginjs::provider::Provider::default_entry_for_package`). `None`
+    /// when the field is absent; a package with no `"main"` and no `entry=`
+    /// override simply has no default `js_bundle` target listed (mirrors
+    /// `js_test`'s "no matched files, no listed target" shape).
+    pub main: Option<String>,
     pub dependencies: BTreeMap<String, String>,
     pub dev_dependencies: BTreeMap<String, String>,
     pub optional_dependencies: BTreeMap<String, String>,
@@ -53,6 +60,8 @@ struct RawManifest {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    main: Option<String>,
+    #[serde(default)]
     dependencies: BTreeMap<String, String>,
     #[serde(default)]
     dev_dependencies: BTreeMap<String, String>,
@@ -82,6 +91,7 @@ pub fn read_package_manifest(package_json: &Path) -> anyhow::Result<PackageManif
     }
     Ok(PackageManifest {
         name,
+        main: parsed.main,
         dependencies,
         dev_dependencies: parsed.dev_dependencies,
         optional_dependencies: parsed.optional_dependencies,
@@ -158,6 +168,22 @@ mod tests {
             Some("^18.0.0")
         );
         assert!(!manifest.dependencies.contains_key("react"));
+    }
+
+    #[test]
+    fn reads_main_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(dir.path(), r#"{"name": "a", "main": "src/index.ts"}"#);
+        let manifest = read_package_manifest(&path).expect("parse manifest");
+        assert_eq!(manifest.main.as_deref(), Some("src/index.ts"));
+    }
+
+    #[test]
+    fn missing_main_field_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(dir.path(), r#"{"name": "a"}"#);
+        let manifest = read_package_manifest(&path).expect("parse manifest");
+        assert_eq!(manifest.main, None);
     }
 
     #[test]
