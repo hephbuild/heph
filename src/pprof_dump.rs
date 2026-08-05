@@ -370,23 +370,44 @@ mod tests {
 
     /// Rounds of [`cpu_only`] per `burn` iteration.
     ///
-    /// A trade, and both sides were measured rather than guessed — 8 runs per
-    /// cell, darwin/arm64, `burn(4, 500ms)`, counting stacks naming
-    /// [`CPU_NEEDLE`] and `cpu_only`'s share of the ~2.0s burn window:
+    /// A trade between the two assertions, which share one fixed burn window:
+    /// every round spends time in [`cpu_only`] *and* in [`libc_only`], so rounds
+    /// bought for one half are taken from the other. Up buys margin on the
+    /// in-binary assertion; down leaves more of the window inside libc, which is
+    /// the only part that exposes the sampler to the frames `UNWIND_BLOCKLIST`
+    /// exists for.
     ///
-    /// | rounds | opt0 hits | opt0 cpu share | opt3 hits |
+    /// **Re-measure this whenever either half's workload changes** — it is the
+    /// balance point between them, not a property of [`cpu_only`] alone. It was
+    /// last set from the numbers below: 3 runs per cell, darwin/arm64, opt0,
+    /// `burn(4, 1500ms)`, idle, counting sample *events* (`Sample::value`, not
+    /// distinct stacks) against a ~1000-event window:
+    ///
+    /// | rounds | `cpu_only` stacks | `cpu_only` events | `libc_only` events |
     /// |---|---|---|---|
-    /// | 10_000 | 17-34 | 22-36% | 2-4 |
-    /// | **25_000** | **21-45** | **39-60%** | **4** |
-    /// | 50_000 | 35-42 | 50-72% | 4 |
+    /// | 25_000 | 6-14 | 6-20 | 155-169 |
+    /// | 100_000 | 22-25 | 50-85 | 125-130 |
+    /// | **250_000** | **27** | **142-164** | **70-87** |
+    /// | 500_000 | 28 | 229-247 | 33-43 |
+    /// | 1_000_000 | 28 | 227-281 | 21-31 |
     ///
-    /// Up buys margin on the assertion; down leaves more of the window inside
-    /// libc, which is the only part that exposes the sampler to the frames
-    /// `UNWIND_BLOCKLIST` exists for. 25_000 keeps a ~20x margin on an assertion
-    /// that needs 1, at a roughly even split, with 2000-5000 full libc-churn
-    /// iterations still running per run. Re-measure before moving it; the split
-    /// depends on the allocator, so it will not be the same on the Linux targets.
-    const CPU_ROUNDS: u64 = 25_000;
+    /// 250_000 is where the two halves are within ~2x of each other. Both
+    /// neighbours starve one assertion or the other: 25_000 leaves `cpu_only` at
+    /// ~1% of the window, and 500_000 takes `libc_only` down toward the level
+    /// that already produced zero stacks on a linux/amd64 runner once (see
+    /// [`LIBC_COPY_BYTES`]).
+    ///
+    /// 25_000 is where this constant sat until the libc half grew 32x
+    /// ([`LIBC_COPY_BYTES`], 1 MiB x1 -> 4 MiB x8) without it being re-measured.
+    /// That silently cut `cpu_only` from a roughly even split to ~1% of the
+    /// window — 6-20 events across as few as 6 distinct stacks, for an assertion
+    /// needing 1 — and the in-binary half went red on master's darwin/arm64 CI
+    /// with 0 hits in a 30-stack profile. Under the same load here the recalibrated
+    /// value holds 25 stacks and 87-140 events.
+    ///
+    /// The split depends on the allocator and on memory bandwidth, so it will not
+    /// be the same on the Linux targets — the margins above are sized for that.
+    const CPU_ROUNDS: u64 = 250_000;
 
     /// Substring identifying an in-binary frame: matches both [`cpu_only`] and
     /// [`cpu_only_round`], because which of the two a given build surfaces
@@ -431,6 +452,11 @@ mod tests {
     ///
     /// 8 x 4 MiB = 32 MiB per round puts the two halves within the same order,
     /// so neither assertion depends on the runner having a good day.
+    ///
+    /// Both halves run in the same round, so **changing this changes the split**:
+    /// this 32x bump took `cpu_only` from a roughly even share of the window to
+    /// ~1% of it, and the in-binary assertion went red on CI a week later. Whoever
+    /// moves this next re-measures [`CPU_ROUNDS`] against it.
     const LIBC_COPY_BYTES: usize = 4 << 20;
     const LIBC_COPIES_PER_ROUND: usize = 8;
 
