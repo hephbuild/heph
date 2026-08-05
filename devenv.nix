@@ -312,21 +312,16 @@ in
   scripts.tst.exec = "cargo test --locked --workspace --exclude bin-e2e && cargo test --locked -p plugin-stabby --features host && cargo test --locked -p plugin-sdk --features stabby";
 
   # Binary end-to-end suite: black-box tests against the artifacts CI publishes
-  # (the `heph` binary + the go/gha plugin cdylibs). ONE entrypoint, identical
-  # locally and in CI — the only difference is where the artifacts come from:
+  # (the `heph` binary + the go/gha/oci/js plugin cdylibs). ONE entrypoint,
+  # identical locally and in CI — the only difference is where the artifacts
+  # come from:
   #
   #   e2e                      # build them from this tree (local default)
   #   HEPH_E2E_FROM=dist e2e   # use an already-downloaded set (CI)
   #
-  # Deliberately does NOT build/stage `plugin-js-cdylib` here (as of the
-  # bench js/go/both selector work): every artifact this script stages is
-  # named because `crates/bin-e2e/tests/plugin_dylib.rs` actually dlopens it
-  # (`shipped_go_cdylib_loads` / `shipped_gha_cdylib_loads`) — there is no
-  # equivalent js test yet. Adding it here would build an artifact `e2e`
-  # never exercises, purely for its own build-time cost. `qualityCrates`
-  # above already lints/fmts `plugin-js-cdylib` without `e2e` testing it —
-  # same asymmetry, same reason. Revisit once a `shipped_js_cdylib_loads`
-  # test exists; add both together.
+  # Every staged artifact is named because a test actually dlopens it:
+  # `crates/bin-e2e/tests/plugin_dylib.rs` for go/gha/oci,
+  # `crates/bin-e2e/tests/plugin_dylib_js.rs` for `heph-js-plugin.$ext`.
   #
   # Both branches converge on the same normalized layout, so the tests never
   # learn which one ran. Extra args pass through to cargo test (e.g.
@@ -350,7 +345,7 @@ in
     # or a re-run started before the first finished — still collide: a fixed
     # path would let the second `rm -rf` the binaries the first is still running
     # tests against, and the failure would surface as an unrelated test blowing
-    # up somewhere else. mktemp costs one copy of three files and removes the
+    # up somewhere else. mktemp costs one copy of five files and removes the
     # whole class.
     dist_root="$target/e2e-dist"
     mkdir -p "$dist_root"
@@ -370,10 +365,11 @@ in
       cp "$src/heph-go-plugin_''${os}_''${arch}.$ext"  "$dist/heph-go-plugin.$ext"
       cp "$src/heph-gha-plugin_''${os}_''${arch}.$ext" "$dist/heph-gha-plugin.$ext"
       cp "$src/heph-oci-plugin_''${os}_''${arch}.$ext" "$dist/heph-oci-plugin.$ext"
+      cp "$src/heph-js-plugin_''${os}_''${arch}.$ext"  "$dist/heph-js-plugin.$ext"
     else
       # Local: build the same artifacts the build job builds, the same way (one
       # invocation so cargo overlaps their LTO tails — see heph.yml).
-      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib
+      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-js-cdylib
       out="$target/release"
 
       # cargo's build lock covers the build but not the gap between it and the
@@ -390,14 +386,15 @@ in
       fingerprint() {
         stat -c '%i %s %Y' "$@" 2>/dev/null || stat -f '%i %z %m' "$@"
       }
-      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext")"
+      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_js_cdylib.$ext")"
 
       cp "$out/heph"                       "$dist/heph"
       cp "$out/libplugin_go_cdylib.$ext"   "$dist/heph-go-plugin.$ext"
       cp "$out/libplugin_gha_cdylib.$ext"  "$dist/heph-gha-plugin.$ext"
       cp "$out/libplugin_oci_cdylib.$ext"  "$dist/heph-oci-plugin.$ext"
+      cp "$out/libplugin_js_cdylib.$ext"   "$dist/heph-js-plugin.$ext"
 
-      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext")"
+      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_js_cdylib.$ext")"
       if [ "$before" != "$after" ]; then
         echo "e2e: $out changed while staging — another build in this" >&2
         echo "e2e: worktree raced this one. Re-run." >&2
@@ -407,7 +404,7 @@ in
       if [ "$os" = "darwin" ]; then
         # Same post-processing the shipped macOS artifacts get, so a local run
         # tests the same bytes CI would publish.
-        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext"; do
+        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-js-plugin.$ext"; do
           bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$f"
         done
       fi
