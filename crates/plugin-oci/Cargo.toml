@@ -20,6 +20,20 @@ async-trait = "0.1.89"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 tracing = "0.1"
+# Registry transport: the OCI distribution protocol as a library, so `oci_push`
+# and `oci_pull` no longer shell out to skopeo. Maintained by the ORAS project.
+oci-client = "0.17"
+# `oci-client` takes credentials as a value; resolving them from
+# `~/.docker/config.json` and the `docker-credential-*` helpers is the caller's
+# job — which is what skopeo used to do for us, and what ECR/GCR/ACR need.
+docker_credential = "1.3"
+tar = "0.4"
+sha2 = "0.10"
+# `docker load` on a daemon without the containerd image store wants a
+# docker-format archive with *uncompressed* layers; OCI layers are gzipped.
+flate2 = "1.1.9"
+# The Docker daemon API, for `oci_load`'s `/images/load`.
+bollard = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
