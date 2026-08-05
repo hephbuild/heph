@@ -470,14 +470,16 @@ whole anyhow chain on one line. `e.lines().next()` therefore yields the entire c
 width, and for the common case renders `execute //x:test: process exited with status 1`, which says
 nothing.
 
-```rust
-ResultEnd { addr: String, error: Option<TargetError> }
+**Approved shape — sibling fields, `error` untouched.** `compatibility` reviewed this and rejected
+retyping `error` to a struct. Add fields alongside it instead:
 
-struct TargetError {
-    message: String,               // unchanged semantics: `{e:#}`
-    upstream_of: Option<String>,   // collateral: this failed because `root` did
-    exit_code: Option<i32>,
-    log_tail: Option<LogTail>,     // already captured at result.rs:1182, already bounded
+```rust
+ResultEnd {
+    addr: String,
+    error: Option<String>,                          // unchanged type AND semantics: still `{e:#}`
+    #[serde(default)] upstream_of: Option<String>,  // collateral: this failed because `root` did
+    #[serde(default)] exit_code: Option<i32>,
+    #[serde(default)] log_tail: Option<LogTailData>,
 }
 ```
 
@@ -485,8 +487,67 @@ struct TargetError {
 free — the engine constructs `UpstreamFailed { root }` at that exact site
 (`crates/plugin/src/error.rs:195`).
 
-This gates the live *and* final failure views. **Consult `compatibility` before the shape is
-fixed**: it is a stream-format change and telemetry reads the field.
+### Why retyping `error` was rejected
+
+`BuildEvent` is **already a live cross-process, cross-artifact boundary**, not the hypothetical one
+the module doc implies. `StableRemoteHook` serde-JSON-encodes every event to out-of-process hooks
+(`crates/plugin-stabby/src/load_stable.rs:826`), and `plugin-gha-cdylib` ships as its own release
+artifact pinned by manifest URL independently of the `heph` binary — so host/plugin version skew is
+a normal reachable state.
+
+A skewed pair still loads at `dlopen` (stabby's structural check covers only the
+`StreamItem { item: SVec<u8> }` envelope, which doesn't change). The break happens later, and the
+failure mode is the worst available:
+
+```rust
+// crates/plugin-sdk/src/serve.rs
+Body::StreamItem(si) => serde_json::from_slice(&si.item).ok(),   // decode failure -> None
+...
+match decode_event_frame(&bytes) {
+    Some(ev) => hook.on_event(&ev),
+    None => break,                                                // ends the WHOLE stream
+}
+}
+hook.on_close();                                                  // hook thinks the build ended fine
+```
+
+**One undecodable frame silently truncates that hook's entire event stream**, and `on_close` then
+fires as if the build had finished normally. No error surfaces anywhere. Worse, it is conditional
+on a *failure* occurring — a green build with a skewed pair looks perfectly healthy, so it passes
+every smoke test and breaks in the field on exactly the red builds this feature exists to diagnose.
+
+The sibling shape is additive in both directions:
+
+| | Result |
+|---|---|
+| old host → new plugin | keys absent; `#[serde(default)]` fills `None`; decodes fine, no richer detail |
+| new host → old plugin | serde ignores unknown fields (no `deny_unknown_fields` on the enum); decodes fine, zero regression |
+| matched | full detail |
+
+`#[serde(default)]` is load-bearing, not decoration: a bare `Option<T>` field is **not**
+absent-tolerant under `serde_derive` — a missing key is an error without it.
+
+### Two constraints on the shape
+
+- **`LogTail` cannot be used directly.** It lives in `crates/plugin/src/error.rs`, derives only
+  `Debug, Clone, PartialEq, Eq` (no serde), and `crates/plugin` depends on `crates/core` — not the
+  reverse. `hcore::events` is deliberately the lowest crate. So either define a small serde mirror
+  in `hcore::events` (`text`, `start_line`) and convert at the emit site, or move the plain-data
+  part of `LogTail` down into `hcore` and re-export it from `crates/plugin`.
+- **The doc previously claimed telemetry reads this field.** It doesn't —
+  `collector.rs::observe_event` only counts variant occurrences, it never inspects `.error`. The
+  real exposure is the out-of-process hook seam above.
+
+### Two follow-ups this surfaced (not part of the reporting work)
+
+1. **`crates/core/src/events.rs` is in no ABI watch set.** `scripts/abi-check.sh` guards
+   `crates/plugin-stabby/src/abi.rs` as a hard path and `proto/plugin/v1` as a warn-only glob;
+   `events.rs` crosses the same dlopen'd seam and produces **zero** CI signal. Nothing forces a
+   change here to be reviewed as a wire change, so this class of break will recur.
+2. **Adding a `BuildEventKind` variant has the same failure characteristic.** The enum is
+   `#[serde(tag = "type")]`; an old plugin meeting an unknown tag fails to decode and truncates its
+   stream by the same path. A `#[serde(other)] Unknown` catch-all variant would make unknown kinds
+   skippable rather than fatal. Pre-existing fragility, worth its own fix.
 
 ### 7.2 `MissReason` on cache-miss events + one-shot `CacheConfig`
 
@@ -827,12 +888,18 @@ seam. Do not put summary-content assertions there.
   matrix context passed as an option), or re-read the body and merge before each PATCH at one extra
   GET per tick? Per `CLAUDE.md`, a per-platform behavioural difference is the user's call, and this
   one is now urgent (§13.1).
-- **`upstream_of` on the wire** — `compatibility` must rule on whether changing
-  `ResultEnd.error` from `Option<String>` to a struct needs a version bump or a compatibility
-  shim, given telemetry reads the field.
+- **Where the `LogTail` plain data lives** — a serde mirror in `hcore::events`, or move
+  `LogTail`'s data part down into `hcore` and re-export it from `crates/plugin`? Either satisfies
+  the layering; §7.1 does not pick one.
+- **Whether the two follow-ups in §7.1 are taken now or tracked** — adding `events.rs` to
+  `abi-check.sh`, and the `#[serde(other)] Unknown` catch-all variant. Both are pre-existing
+  fragility this work surfaced rather than caused.
 
 ### Settled
 
+- **`ResultEnd` gains sibling `#[serde(default)]` fields; `error` keeps its type.** Ruled by
+  `compatibility` (§7.1) — retyping it would silently truncate a skewed plugin's whole event
+  stream, and only on builds that fail.
 - `built` → **`executed`**, in both the GHA output and the TUI (the `BuildState::built` field, the
   fallback render at `progress.rs:1092`, and the stale doc comment at `progress.rs:2050` that
   advertises a header the code no longer produces).

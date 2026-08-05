@@ -207,7 +207,6 @@ pub(crate) struct RenderCtx<'a> {
     pub slow_after_ms: u64,
     /// A link to the workflow run, when one can be built from the environment.
     pub run_url: Option<&'a str>,
-    pub fail_fast: bool,
 }
 
 fn counts_line(t: &Tally, c: &Counters) -> String {
@@ -299,13 +298,6 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
             "↑ {} cache uploads in flight (background)\n",
             fmt_count(t.background_ops())
         ));
-    }
-
-    if ctx.fail_fast && c.roots_total > 0 {
-        b.push(
-            "\n> [!WARNING]\n> Stopped at the first failure (`--fail-fast`) — \
-             remaining targets were not attempted.\n",
-        );
     }
 
     push_lock_waits(&mut b, t, ctx);
@@ -696,7 +688,6 @@ mod tests {
             now_ms,
             slow_after_ms: 30_000,
             run_url: None,
-            fail_fast: false,
         }
     }
 
@@ -1070,17 +1061,6 @@ mod tests {
         assert_eq!(fmt_count(4_117), "4,117");
         assert_eq!(fmt_count(20_140), "20,140");
         assert_eq!(fmt_count(7), "7");
-    }
-
-    #[test]
-    fn fail_fast_mode_is_disclosed() {
-        // Otherwise a one-failure report reads as "one thing is broken" when the
-        // truth is "we stopped looking".
-        let t = build(20_000, 1, 0);
-        let mut c = ctx("heph run //...", 9_000);
-        c.fail_fast = true;
-        let md = render_live(&t, &c, COMMENT_LIMIT);
-        assert!(md.contains("Stopped at the first failure"), "{md}");
     }
 
     /// Prints the rendered views for eyeballing against the mockups in

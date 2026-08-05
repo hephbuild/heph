@@ -455,9 +455,6 @@ struct Inner {
     stop: AtomicBool,
     /// Threshold for "running longest" rows and lock-wait notices.
     slow_after_ms: u64,
-    /// Whether this invocation stops at the first failure. Reported, never set:
-    /// a reporter that changes which targets execute is the wrong shape.
-    fail_fast: bool,
     /// Link to the workflow run, when the Actions env provides one.
     run_url: Option<String>,
 }
@@ -469,7 +466,6 @@ impl Inner {
             now_ms: now_unix_ms(),
             slow_after_ms: self.slow_after_ms,
             run_url: self.run_url.as_deref(),
-            fail_fast: self.fail_fast,
         }
     }
 
@@ -567,7 +563,6 @@ impl GhaHook {
         } else {
             format!("heph {command}")
         };
-        let fail_fast = std::env::args().any(|a| a == "--fail-fast" || a == "--ff");
         let run_url = run_url_from_env();
 
         let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
@@ -595,7 +590,6 @@ impl GhaHook {
             comment,
             stop: AtomicBool::new(false),
             slow_after_ms: slow_after_secs.saturating_mul(1000),
-            fail_fast,
             run_url,
         });
 
