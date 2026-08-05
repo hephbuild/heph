@@ -1,12 +1,11 @@
-//! The `oci_image` managed driver: builds an OCI (or docker-format) image
-//! archive from a build context as a cacheable target output. Depends on the
-//! contract + `heph-driver-support`.
+//! The container rules: build an image, and move one between a registry, the
+//! local daemon and the cache. Depends on the contract + `heph-driver-support`.
 //!
-//! Docker/BuildKit is the builder heph shells out to, but the plugin is named
-//! for what it *produces* — an OCI image archive — so the builder can be swapped
-//! (buildah, podman, a hermetic buildkit) without changing the plugin's
-//! identity. See sibling `oci_push` / `oci_load` action drivers that consume
-//! this driver's tar output.
+//! The plugin is named for the artifact — an OCI image — and each *driver* is
+//! named for what it needs from the host, because that is the part a user has to
+//! plan around. `docker_build` says it shells out to `docker buildx`; `oci_push`
+//! and `oci_pull` speak the distribution protocol in-process and need no host
+//! binary at all. See [`pluginoci`] for the split.
 //!
 //! Not compiled into the CLI: like the go plugin, this ships as a loadable
 //! cdylib (`crates/plugin-oci-cdylib`) published per os/arch with a

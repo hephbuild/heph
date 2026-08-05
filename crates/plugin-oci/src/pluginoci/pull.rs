@@ -3,11 +3,11 @@
 //!
 //! The image-world analogue of `http_fetch`: bytes come from the network (no
 //! target inputs), and the pulled archive is a cacheable target output — so a
-//! base image shared by many `oci_image` builds is pulled once and served from
+//! base image shared by many `docker_build` builds is pulled once and served from
 //! the local or remote cache thereafter.
 //!
 //! To actually *be* that shared base, a pull needs `layout = True`: that writes
-//! an OCI layout directory, which `oci_image`'s `bases` wires to a buildx
+//! an OCI layout directory, which `docker_build`'s `bases` wires to a buildx
 //! `--build-context <name>=oci-layout://…` so the Dockerfile can `FROM <name>`.
 //! Without it the pulled archive can only be pushed or loaded — a plain
 //! `FROM alpine:3.20` still goes to the network, unhashed, whatever this target
@@ -28,7 +28,7 @@
 //!
 //!   `all_platforms = True` is the other half of that: it keeps the whole index
 //!   rather than selecting one instance, which is what a base image for a
-//!   **multi-platform** `oci_image` has to be — a one-instance layout has no
+//!   **multi-platform** `docker_build` has to be — a one-instance layout has no
 //!   manifest for the architectures it was not pulled for.
 
 use anyhow::Context as _;
@@ -59,10 +59,10 @@ struct OciPullSpec {
     #[spec(required, rename = "ref")]
     src: String,
     /// Write an OCI **layout directory** instead of a single archive file. This
-    /// is the form `oci_image`'s `bases` consumes — buildx's `oci-layout://`
+    /// is the form `docker_build`'s `bases` consumes — buildx's `oci-layout://`
     /// build context reads a layout tree, not a tar.
     ///
-    /// This is the shape `oci_image`'s `bases` consumes.
+    /// This is the shape `docker_build`'s `bases` consumes.
     layout: bool,
     /// Which platforms to pull out of a multi-platform manifest list, as
     /// `os/arch` (e.g. `["linux/amd64", "linux/arm64"]`). One entry takes one
@@ -78,14 +78,14 @@ struct OciPullSpec {
     /// Pull **every** instance of the manifest list instead of naming them,
     /// keeping the index intact.
     ///
-    /// This is what a base image for a multi-platform `oci_image` needs: a
+    /// This is what a base image for a multi-platform `docker_build` needs: a
     /// single-instance layout has no manifest for the other platforms, so
     /// `platforms = ["linux/amd64", "linux/arm64"]` would fail on whichever one
     /// the base was not pulled for. Pair it with `layout = True`:
     ///
     /// ```python
     /// oci_pull(name = "alpine", ref = "alpine:3.20", layout = True, all_platforms = True)
-    /// oci_image(name = "img", bases = {"base": ":alpine"},
+    /// docker_build(name = "img", bases = {"base": ":alpine"},
     ///           platforms = ["linux/amd64", "linux/arm64"])
     /// ```
     ///
@@ -315,7 +315,7 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("pull image {}", def.src))?;
 
         if def.layout {
-            // A layout *directory* is the shape `oci_image`'s `bases` consumes:
+            // A layout *directory* is the shape `docker_build`'s `bases` consumes:
             // buildx's `oci-layout://` reads a tree, not a tar.
             super::archive::write_layout_dir(&out_path, &index, &blobs)
         } else {
@@ -452,7 +452,7 @@ mod tests {
         );
     }
 
-    /// `layout = True` produces the OCI layout *directory* that `oci_image`'s
+    /// `layout = True` produces the OCI layout *directory* that `docker_build`'s
     /// `bases` (buildx `oci-layout://`) can consume — a tar cannot be used there.
     #[tokio::test]
     async fn parse_layout_declares_a_directory_output() {

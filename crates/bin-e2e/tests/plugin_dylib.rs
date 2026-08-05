@@ -220,7 +220,7 @@ fn manifest_checksum_mismatch_is_rejected() {
 /// The oci cdylib, exercised through `inspect def` — which makes the host call
 /// the plugin's `parse` across the seam.
 ///
-/// `parse` is where `oci_image` asks buildx for its default platform, i.e. where
+/// `parse` is where `docker_build` asks buildx for its default platform, i.e. where
 /// it shells out. A cdylib's statically-linked tokio is a *different instance*
 /// from the host's, and the future the host polls carries none of it, so a
 /// reactor touch there panics — and a panic across the ABI seam is a
@@ -250,7 +250,7 @@ fn shipped_oci_cdylib_parses_across_the_abi_without_aborting() {
         "pkg/BUILD",
         "target(name = \"df\", driver = \"bash\", run = \"echo 'FROM scratch' > $OUT\", \
          out = \"Dockerfile\")\n\
-         target(name = \"img\", driver = \"oci_image\", context = [\":df\"])\n",
+         target(name = \"img\", driver = \"docker_build\", context = [\":df\"])\n",
     )
     .expect("write BUILD");
 

@@ -92,7 +92,7 @@ fn docker_available() -> bool {
     static OK: OnceLock<bool> = OnceLock::new();
     // `buildx version` proves the plugin is installed; `buildx inspect
     // --bootstrap` proves a builder is actually reachable — and it is the exact
-    // call `oci_image::parse` makes, so if it works the driver works.
+    // call `docker_build::parse` makes, so if it works the driver works.
     //
     // Deliberately not `docker info`: it walks every configured builder, so one
     // stale context (a Docker Desktop entry left behind after switching to
@@ -108,7 +108,7 @@ fn docker_available() -> bool {
 /// gives you — has no file exporters at all: it can load or push into the
 /// daemon and nothing else, so `--output type=oci,dest=…` *and*
 /// `type=docker,dest=…` both fail. A `docker-container` builder, or the daemon's
-/// containerd image store, is what `oci_image` actually needs.
+/// containerd image store, is what `docker_build` actually needs.
 ///
 /// There is no cheap way to ask (`buildx inspect` reports the driver but not the
 /// image store), so the probe is a real one-platform build.
@@ -154,7 +154,7 @@ macro_rules! require_docker {
 /// `None` means "the default one is fine" — a containerd-backed daemon, or
 /// something like OrbStack. Otherwise a throwaway `docker-container` builder is
 /// created for the test and removed when it drops, which is exactly what a user
-/// on a stock Docker Engine has to do: `oci_image` writes an archive, and the
+/// on a stock Docker Engine has to do: `docker_build` writes an archive, and the
 /// plain `docker` driver cannot write one at all.
 ///
 /// `Err` when neither is possible — the caller skips.
@@ -197,7 +197,7 @@ fn workspace() -> htestkit::Workspace {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::Driver::new()))
+        .with_managed_driver(Box::new(pluginoci::docker_build::Driver::new()))
         .with_provider(|_| Box::new(pluginoci::platform::Provider))
         .with_managed_driver(Box::new(pluginoci::platform::Driver::new()))
         .with_managed_driver(Box::new(pluginoci::load::Driver::new()))
@@ -348,7 +348,7 @@ fn blob_path(digest: &str) -> String {
     format!("blobs/{algo}/{hex}")
 }
 
-/// The image archive an `oci_image` target produced, as bytes.
+/// The image archive a `docker_build` target produced, as bytes.
 ///
 /// Restricted to the default output group: a bare run would also return the
 /// `digest` group, and the two would concatenate into something that is not a
@@ -379,7 +379,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     context = [":dockerfile", ":payload"],
     {builder}
 )
@@ -443,7 +443,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     format = "docker",
     context = {{"": [":dockerfile"], "bin": ["//cmd/server:bin"]}},
     {builder}
@@ -493,7 +493,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     context = {{"": [":dockerfile"], "bin": ["//cmd/server:bin"]}},
     {builder}
 )
@@ -533,7 +533,7 @@ target(
 target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
 target(
     name = "good",
-    driver = "oci_image",
+    driver = "docker_build",
     stage = "good",
     out = "good.tar",
     context = [":dockerfile", ":payload"],
@@ -541,7 +541,7 @@ target(
 )
 target(
     name = "bad",
-    driver = "oci_image",
+    driver = "docker_build",
     stage = "bad",
     out = "bad.tar",
     context = [":dockerfile", ":payload"],
@@ -588,7 +588,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     context = [":dockerfile", ":payload"],
     platforms = ["linux/amd64", "linux/arm64"],
     {builder}
@@ -641,7 +641,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     format = "docker",
     context = [":dockerfile", ":payload"],
     {builder}
@@ -693,7 +693,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     context = [":dockerfile", ":payload"],
     {builder}
 )
@@ -750,7 +750,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     context = [":dockerfile", ":payload"],
     platforms = ["linux/amd64", "linux/arm64"],
     {builder}
@@ -778,7 +778,7 @@ target(
 )
 target(
     name = "derived",
-    driver = "oci_image",
+    driver = "docker_build",
     dockerfile = "Dockerfile.derived",
     out = "derived.tar",
     context = [":derived_dockerfile", ":payload"],
@@ -906,7 +906,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     context = [":dockerfile", ":payload"],
     platforms = ["linux/amd64", "linux/arm64"],
     builder = "{name}",
@@ -934,7 +934,7 @@ target(
 }
 
 /// On a stock Docker Engine the default builder cannot write an image archive
-/// at all — the `docker` driver has no file exporters — so *every* `oci_image`
+/// at all — the `docker` driver has no file exporters — so *every* `docker_build`
 /// build fails there, whatever `format` says. BuildKit's own message names the
 /// exporter but not the remedy; heph has to supply it.
 ///
@@ -959,7 +959,7 @@ target(
     run = "printf 'FROM scratch\nCOPY app/payload.txt /payload.txt\n' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "oci_image", context = [":dockerfile", ":payload"])
+target(name = "img", driver = "docker_build", context = [":dockerfile", ":payload"])
 "#,
     );
 
@@ -967,7 +967,7 @@ target(name = "img", driver = "oci_image", context = [":dockerfile", ":payload"]
         .run("//app:img")
         .await
         .err()
-        .expect("a builder with no file exporters cannot build an oci_image");
+        .expect("a builder with no file exporters cannot build a docker_build target");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("docker-container") && msg.contains("builder ="),

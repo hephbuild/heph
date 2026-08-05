@@ -1,6 +1,6 @@
 //! The builder-platform probe, as a target.
 //!
-//! `oci_image` with no explicit `platforms` builds whatever the buildx builder
+//! `docker_build` with no explicit `platforms` builds whatever the buildx builder
 //! defaults to. Nothing else in the cache key varies by platform — the remote
 //! key is `package/name/hashin` with no arch segment — so that default has to
 //! reach the key, or an arm64 laptop and an amd64 runner compute the same key
@@ -9,7 +9,7 @@
 //!
 //! This makes the answer a **target**: `//@heph/oci:platform` runs
 //! `docker buildx inspect --bootstrap` and writes the platform it reports. An
-//! `oci_image` that needs it depends on it, so the platform enters the image's
+//! `docker_build` that needs it depends on it, so the platform enters the image's
 //! key as an ordinary input hash rather than as a parse-time side effect. It is
 //! visible in `heph inspect deps`, single-flighted across every image target in
 //! a run, and its subprocess is a normal target execution with the cancellation
@@ -107,7 +107,7 @@ impl EProvider for Provider {
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
     {
         // Deliberately not listed: the probe is an implementation detail an
-        // `oci_image` depends on, not something a user builds by name, and it
+        // `docker_build` depends on, not something a user builds by name, and it
         // would otherwise show up in every `heph query //...`.
         Box::pin(async move {
             Ok(Box::new(std::iter::empty())
@@ -283,21 +283,27 @@ impl ManagedDriver for Driver {
             argv.push(builder.clone());
         }
 
-        let mut io = super::ToolIo::from_request(&mut req.request);
-        let stdout = super::run_tool(argv, &cwd, "docker buildx inspect", &mut io, ctoken)
-            .await
-            .with_context(|| {
-                let which = def.builder.as_deref().map_or_else(
-                    || "the current builder".to_string(),
-                    |b| format!("builder {b:?}"),
-                );
-                format!(
-                    "asking {which} for its default platform — an `oci_image` with no `platforms` \
+        let mut io = super::docker_build::ToolIo::from_request(&mut req.request);
+        let stdout = super::docker_build::run_tool(
+            argv,
+            &cwd,
+            "docker buildx inspect",
+            &mut io,
+            ctoken,
+        )
+        .await
+        .with_context(|| {
+            let which = def.builder.as_deref().map_or_else(
+                || "the current builder".to_string(),
+                |b| format!("builder {b:?}"),
+            );
+            format!(
+                "asking {which} for its default platform — a `docker_build` with no `platforms` \
                      needs it for the cache key. Set `platforms` explicitly to skip this probe."
-                )
-            })?;
+            )
+        })?;
 
-        let platform = super::parse_builder_platform(&stdout)?;
+        let platform = super::docker_build::parse_builder_platform(&stdout)?;
         tokio::fs::write(&out, &platform)
             .await
             .with_context(|| format!("write platform {out:?}"))?;

@@ -93,7 +93,7 @@ impl Fake {
     }
 }
 
-/// A workspace whose `oci_image` driver shells out to `fake` instead of docker.
+/// A workspace whose `docker_build` driver shells out to `fake` instead of docker.
 fn workspace_with_fake(fake: &Fake) -> htestkit::Workspace {
     let bin = fake.bin.to_string_lossy().into_owned();
     WorkspaceBuilder::new()
@@ -105,8 +105,10 @@ fn workspace_with_fake(fake: &Fake) -> htestkit::Workspace {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::Driver::with_binary(bin.clone())))
-        // `oci_image` without explicit `platforms` depends on
+        .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
+            bin.clone(),
+        )))
+        // `docker_build` without explicit `platforms` depends on
         // `//@heph/oci:platform`, so the probe's provider and driver have to be
         // registered for the graph to resolve at all.
         .with_provider(|_| Box::new(pluginoci::platform::Provider))
@@ -118,7 +120,7 @@ fn workspace_with_fake(fake: &Fake) -> htestkit::Workspace {
 /// The archive and the digest are real target outputs: a downstream `bash`
 /// target can depend on either group and read the bytes.
 #[tokio::test]
-async fn test_oci_image_outputs_are_consumable_by_a_downstream_target() -> anyhow::Result<()> {
+async fn test_docker_build_outputs_are_consumable_by_a_downstream_target() -> anyhow::Result<()> {
     let fake = Fake::new();
     let ws = workspace_with_fake(&fake);
     ws.write_build_file(
@@ -127,7 +129,7 @@ async fn test_oci_image_outputs_are_consumable_by_a_downstream_target() -> anyho
 target(name = "srcs", driver = "bash", run = "echo hi > $OUT", out = "hi.txt")
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     context = [":srcs", ":dockerfile"],
 )
 target(
@@ -159,7 +161,7 @@ target(
 /// the builder again. This is the whole efficiency claim of the driver, and
 /// only the builder can prove it.
 #[tokio::test]
-async fn test_oci_image_unchanged_context_does_not_rebuild() -> anyhow::Result<()> {
+async fn test_docker_build_unchanged_context_does_not_rebuild() -> anyhow::Result<()> {
     let fake = Fake::new();
     let ws = workspace_with_fake(&fake);
     ws.write_build_file(
@@ -171,7 +173,7 @@ target(
     run = "echo 'FROM scratch' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "oci_image", context = [":dockerfile"])
+target(name = "img", driver = "docker_build", context = [":dockerfile"])
 "#,
     );
 
@@ -192,7 +194,7 @@ target(name = "img", driver = "oci_image", context = [":dockerfile"])
 /// rather than an uncached one — an uncached dep must execute every invocation
 /// to produce the hashout its consumer needs.
 #[tokio::test]
-async fn test_oci_image_probes_the_builder_once_across_runs() -> anyhow::Result<()> {
+async fn test_docker_build_probes_the_builder_once_across_runs() -> anyhow::Result<()> {
     let fake = Fake::new();
     let ws = workspace_with_fake(&fake);
     ws.write_build_file(
@@ -204,7 +206,7 @@ target(
     run = "echo 'FROM scratch' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "oci_image", context = [":dockerfile"])
+target(name = "img", driver = "docker_build", context = [":dockerfile"])
 "#,
     );
 
@@ -225,7 +227,7 @@ target(name = "img", driver = "oci_image", context = [":dockerfile"])
 /// is reachable — a package-rooted context would leave it outside, and the
 /// Dockerfile's `COPY` would fail with the dep still moving the cache key.
 #[tokio::test]
-async fn test_oci_image_sees_a_context_dep_from_another_package() -> anyhow::Result<()> {
+async fn test_docker_build_sees_a_context_dep_from_another_package() -> anyhow::Result<()> {
     let fake = Fake::new();
     let ws = workspace_with_fake(&fake);
     ws.write_build_file(
@@ -245,7 +247,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     context = {"": [":dockerfile"], "bin": ["//cmd/server:bin"]},
 )
 "#,
@@ -293,7 +295,7 @@ target(
 /// Dockerfile is a dep, so it is staged and hashed without appearing in
 /// `context` and without the BUILD file spelling where it lands.
 #[tokio::test]
-async fn test_oci_image_takes_a_dockerfile_by_address() -> anyhow::Result<()> {
+async fn test_docker_build_takes_a_dockerfile_by_address() -> anyhow::Result<()> {
     let fake = Fake::new();
     let ws = workspace_with_fake(&fake);
     ws.write_build_file(
@@ -308,7 +310,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     dockerfile = ":gen",
     context = [":srcs"],
 )
@@ -335,7 +337,7 @@ target(
 /// `COPY bin-${TARGETARCH}` idiom needs names heph cannot give them. Each
 /// platform's deps stage under their own prefix instead.
 #[tokio::test]
-async fn test_oci_image_stages_context_per_platform() -> anyhow::Result<()> {
+async fn test_docker_build_stages_context_per_platform() -> anyhow::Result<()> {
     let fake = Fake::new();
     let ws = workspace_with_fake(&fake);
     ws.write_build_file(
@@ -356,7 +358,7 @@ target(
 )
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "docker_build",
     context = [":dockerfile"],
     platforms = ["linux/amd64", "linux/arm64"],
     context_by_platform = {
@@ -401,7 +403,7 @@ target(
 /// the builder, and two targets that differ only by stage are two cache entries.
 /// Collapsing them would serve one stage's image under the other's name.
 #[tokio::test]
-async fn test_oci_image_multi_stage_multi_arch() -> anyhow::Result<()> {
+async fn test_docker_build_multi_stage_multi_arch() -> anyhow::Result<()> {
     let fake = Fake::new();
     let ws = workspace_with_fake(&fake);
     ws.write_build_file(
@@ -415,7 +417,7 @@ target(
 )
 target(
     name = "runtime",
-    driver = "oci_image",
+    driver = "docker_build",
     context = [":dockerfile"],
     stage = "runtime",
     platforms = ["linux/amd64", "linux/arm64"],
@@ -423,7 +425,7 @@ target(
 )
 target(
     name = "build",
-    driver = "oci_image",
+    driver = "docker_build",
     context = [":dockerfile"],
     stage = "build",
     platforms = ["linux/amd64", "linux/arm64"],
@@ -467,7 +469,7 @@ target(
 /// the user. The archive never becomes an artifact, so a broken build cannot
 /// poison the cache.
 #[tokio::test]
-async fn test_oci_image_build_failure_surfaces_the_builder_error() -> anyhow::Result<()> {
+async fn test_docker_build_build_failure_surfaces_the_builder_error() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().expect("tempdir");
     let bin = dir.path().join("docker");
     hcore::fsutil::write_executable(
@@ -486,7 +488,7 @@ async fn test_oci_image_build_failure_surfaces_the_builder_error() -> anyhow::Re
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::Driver::with_binary(
+        .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
             bin.to_string_lossy().into_owned(),
         )))
         .with_provider(|_| Box::new(pluginoci::platform::Provider))
@@ -505,7 +507,7 @@ target(
     run = "echo 'FROOM scratch' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "oci_image", context = [":dockerfile"])
+target(name = "img", driver = "docker_build", context = [":dockerfile"])
 "#,
     );
 

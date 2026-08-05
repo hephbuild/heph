@@ -63,7 +63,7 @@ pub fn parse_map_string_strings(v: &Value) -> anyhow::Result<HashMap<String, Vec
 }
 
 /// A map whose values are themselves `{string: [string]}` maps — the shape of an
-/// attribute that keys a grouped dep map by something else, e.g. `oci_image`'s
+/// attribute that keys a grouped dep map by something else, e.g. `docker_build`'s
 /// `context_by_platform`. Strict: unlike [`parse_map_string_strings`], there is
 /// no bare-string or bare-list shorthand, because the outer key carries meaning
 /// (which platform) that cannot be defaulted.

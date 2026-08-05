@@ -59,7 +59,7 @@ fn auth_for(reference: &Reference) -> RegistryAuth {
 /// Push every image in `layout` to `reference`, and a manifest list when there
 /// is more than one.
 ///
-/// Returns the digest the registry filed it under — the same value `oci_image`'s
+/// Returns the digest the registry filed it under — the same value `docker_build`'s
 /// `digest` output group carries, so a caller can compare them.
 pub(crate) async fn push_layout(
     layout: &Layout,

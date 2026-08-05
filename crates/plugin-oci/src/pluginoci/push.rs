@@ -1,4 +1,4 @@
-//! The `oci_push` driver: pushes an image archive (produced by an `oci_image`
+//! The `oci_push` driver: pushes an image archive (produced by a `docker_build`
 //! target) to a registry.
 //!
 //! An *action*, not an artifact: it has an external side effect (the upload) and
@@ -35,7 +35,7 @@ const IMAGE_ORIGIN: &str = "image";
 /// Config for an `oci_push` target.
 #[derive(Spec)]
 struct OciPushSpec {
-    /// Target address of the image to push — an `oci_image` target. Only its
+    /// Target address of the image to push — a `docker_build` target. Only its
     /// archive output (group `""`) is consumed.
     #[spec(required)]
     image: String,

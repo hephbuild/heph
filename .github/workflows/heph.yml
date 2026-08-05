@@ -481,7 +481,7 @@ jobs:
               -out "$GITHUB_WORKSPACE/dist/heph-gha-plugin.json" )
           cat dist/heph-gha-plugin.json
           echo "manifest checksum: $(cat dist/heph-gha-plugin.json.sha256)"
-          # The oci plugin (`oci_image` / `oci_pull` / `oci_push` / `oci_load`)
+          # The oci plugin (`docker_build` / `oci_pull` / `oci_push` / `oci_load`)
           # ships the same way — it is not compiled into the CLI.
           ( cd tools/pluginmanifest && go run . -name oci -version "$VERSION" \
               -prefix heph-oci-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \

@@ -2,7 +2,7 @@
 //!
 //! [`oci_client`] speaks the registry protocol and nothing else — it has no idea
 //! what an `oci-archive` is. This module is the other half: it turns the bytes
-//! `oci_image` produced into the `(manifest, config, layers)` triples a push
+//! `docker_build` produced into the `(manifest, config, layers)` triples a push
 //! needs, and turns what a pull fetched back into a layout on disk.
 //!
 //! Everything here is content-addressed by the digests already in the manifest,
@@ -34,7 +34,7 @@ impl Layout {
     /// Read an `oci-archive` (a tar of an OCI layout) or a layout directory.
     ///
     /// Both shapes are accepted because both are things this plugin produces:
-    /// `oci_image` writes the tar, `oci_pull(layout = True)` writes the tree.
+    /// `docker_build` writes the tar, `oci_pull(layout = True)` writes the tree.
     pub(crate) fn read(path: &Path) -> anyhow::Result<Self> {
         if path.is_dir() {
             Self::read_dir(path)
@@ -221,7 +221,7 @@ fn tagged_index(
 
 /// Write a layout to `dir` in the on-disk OCI layout shape (`oci-layout`,
 /// `index.json`, `blobs/<algo>/<hex>`) — what `oci_pull(layout = True)` produces
-/// and what `oci_image`'s `bases` consumes.
+/// and what `docker_build`'s `bases` consumes.
 pub(crate) fn write_layout_dir(
     dir: &Path,
     index: &OciImageIndex,
@@ -427,7 +427,7 @@ mod tests {
         );
     }
 
-    /// What a push reads back out of what `oci_image` wrote.
+    /// What a push reads back out of what `docker_build` wrote.
     #[test]
     fn a_written_layout_reads_back() {
         let dir = tempfile::tempdir().expect("tempdir");

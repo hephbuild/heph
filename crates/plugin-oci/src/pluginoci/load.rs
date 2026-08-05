@@ -1,4 +1,4 @@
-//! The `oci_load` driver: loads an image archive (produced by an `oci_image`
+//! The `oci_load` driver: loads an image archive (produced by a `docker_build`
 //! target) into the local docker daemon.
 //!
 //! An *action*, not an artifact: it mutates the host daemon's image store and is
@@ -43,7 +43,7 @@ const IMAGE_ORIGIN: &str = "image";
 /// Config for an `oci_load` target.
 #[derive(Spec)]
 struct OciLoadSpec {
-    /// Target address of the image to load — an `oci_image` target. Only its
+    /// Target address of the image to load — a `docker_build` target. Only its
     /// archive output (group `""`) is consumed.
     #[spec(required)]
     image: String,
@@ -56,7 +56,7 @@ struct OciLoadSpec {
     /// (e.g. `linux/amd64`). Defaults to Linux on the host's architecture.
     ///
     /// A daemon holds one image per tag, so a multi-arch archive built by
-    /// `oci_image(platforms = [...])` must be narrowed to one instance on the way
+    /// `docker_build(platforms = [...])` must be narrowed to one instance on the way
     /// in. Left to skopeo's own default the choice would follow the host's
     /// GOOS/GOARCH — `darwin` on macOS, which no Linux manifest list matches, so
     /// the load would fail outright there.

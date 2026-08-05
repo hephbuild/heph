@@ -1,19 +1,20 @@
 //! The OCI plugin as a loadable cdylib behind the stable ABI.
 //!
-//! Exports a single stabby `create` entry that constructs the four `oci_*`
-//! managed drivers and hands them back as ABI-stable handles. The host loads
-//! this with `hplugin_stabby::load_stable::load`, which verifies ABI
-//! compatibility via stabby's type reports before use.
+//! Exports a single stabby `create` entry that constructs the plugin's managed
+//! drivers and hands them back as ABI-stable handles. The host loads this with
+//! `hplugin_stabby::load_stable::load`, which verifies ABI compatibility via
+//! stabby's type reports before use.
 //!
 //! Images themselves are declared by whatever provider the workspace already
 //! uses (`BUILD` files). The one thing this plugin's own provider contributes is
-//! `//@heph/oci:platform` — the builder-platform probe an `oci_image` without
+//! `//@heph/oci:platform` — the builder-platform probe a `docker_build` without
 //! explicit `platforms` depends on, so that platform reaches the cache key as an
 //! input hash rather than as a parse-time side effect. No hooks.
 //!
-//! Nothing crosses in [`CreateConfig`] that the drivers need — they take the
-//! `docker` / `skopeo` binaries from `PATH`, the same host capability the
-//! in-process build used.
+//! Nothing crosses in [`CreateConfig`] that the drivers need — `docker_build`
+//! and the platform probe take the `docker` binary from `PATH`, the same host
+//! capability the in-process build used, and `oci_push` / `oci_pull` need no
+//! host binary at all.
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_oci::pluginoci;
@@ -34,7 +35,7 @@ pub extern "C" fn heph_plugin_create(_cfg: stabby::vec::Vec<u8>) -> PluginCompon
 
 /// Stable ABI log-sink entry: the host calls this right after `create` to hand
 /// the plugin a sink for its `tracing` events. Without it, this cdylib's
-/// statically-linked `tracing` has no subscriber and every `oci_image built` /
+/// statically-linked `tracing` has no subscriber and every `docker_build built` /
 /// `oci_push: pushed` line vanishes.
 #[stabby::export]
 pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
@@ -43,7 +44,7 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
 
 /// Stable ABI supervisor entry: the host hands the plugin its process-supervisor
 /// client. This cdylib links its own `proc`, whose tracker the host's startup
-/// `init` never reached — without this, every `docker buildx` and `skopeo` this
+/// `init` never reached — without this, every `docker buildx` this
 /// plugin spawns goes unregistered with the sidecar and is orphaned on a hard
 /// kill of the host. A detached `buildx` is exactly the child that must not
 /// survive: it keeps writing into a sandbox the cleaner is deleting.
@@ -56,9 +57,9 @@ fn build() -> PluginComponents {
     let mut drivers = stabby::vec::Vec::new();
 
     // Builds a Dockerfile + context into a cacheable image archive.
-    let image: Arc<dyn ManagedDriver> = Arc::new(pluginoci::Driver::new());
+    let image: Arc<dyn ManagedDriver> = Arc::new(pluginoci::docker_build::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::DRIVER_NAME.into(),
+        name: pluginoci::docker_build::DRIVER_NAME.into(),
         driver: make_dyn_managed_driver(image),
     });
     // Pulls a base image into a cacheable archive (or OCI layout).

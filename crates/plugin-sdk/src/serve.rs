@@ -938,7 +938,7 @@ fn driver_schema(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
 ///
 /// `run` has always hopped for this reason. `parse` and `apply_transitive` must
 /// too: a driver that probes its toolchain to build the cache key shells out
-/// from `parse` (`oci_image` asks buildx for its default platform), which is the
+/// from `parse` (`docker_build` asks buildx for its default platform), which is the
 /// same reactor touch one call earlier.
 ///
 /// The `CancelGuard` moves into the task so the registry entry outlives the
