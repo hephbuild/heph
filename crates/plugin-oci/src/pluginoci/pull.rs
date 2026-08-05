@@ -47,7 +47,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use super::{ImageFormat, Tool, ToolIo, ensure_tool_supports_format, run_tool, ws_path};
+use super::ws_path;
 
 pub const DRIVER_NAME: &str = "oci_pull";
 
@@ -58,15 +58,11 @@ struct OciPullSpec {
     /// `alpine@sha256:...`. Pin by digest for a reproducible pull.
     #[spec(required, rename = "ref")]
     src: String,
-    /// Output archive format: `oci` (default) or `docker`. Ignored when
-    /// `layout = True`, which always writes an OCI layout.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
-    format: Option<String>,
     /// Write an OCI **layout directory** instead of a single archive file. This
     /// is the form `oci_image`'s `bases` consumes — buildx's `oci-layout://`
     /// build context reads a layout tree, not a tar.
     ///
-    /// Requires `tool = "skopeo"` (the docker CLI cannot write a layout).
+    /// This is the shape `oci_image`'s `bases` consumes.
     layout: bool,
     /// Image platform to pull out of a multi-platform manifest list, as
     /// `os/arch` (e.g. `linux/arm64`). Defaults to Linux on the host's
@@ -77,7 +73,7 @@ struct OciPullSpec {
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     platform: Option<String>,
     /// Pull **every** instance of the manifest list instead of selecting one,
-    /// keeping the index intact (`skopeo --multi-arch all`).
+    /// keeping the index intact.
     ///
     /// This is what a base image for a multi-platform `oci_image` needs: a
     /// single-instance layout has no manifest for the other platforms, so
@@ -90,22 +86,15 @@ struct OciPullSpec {
     ///           platforms = ["linux/amd64", "linux/arm64"])
     /// ```
     ///
-    /// Requires `tool = "skopeo"` — `docker save` writes one image, not an index.
     all_platforms: bool,
     /// Output filename (or directory name, with `layout = True`), relative to
     /// the target's package. Must be a bare name. Default `<target name>.tar`,
     /// or `<target name>.oci` for a layout.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     out: Option<String>,
-    /// Pull from an insecure (HTTP / self-signed) registry — passes
-    /// `--src-tls-verify=false` to skopeo. Ignored by the `docker` tool, which
-    /// takes insecure registries from the daemon config.
+    /// Pull from an insecure (HTTP / self-signed) registry: plain HTTP, and
+    /// certificate validation off.
     insecure: bool,
-    /// Tool to pull with: `skopeo` (default for an `oci` archive) or `docker`
-    /// (default for a `docker` archive — `docker pull` + `docker save`, no
-    /// skopeo needed). `docker` can only produce a `docker` archive.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
-    tool: Option<String>,
     /// Caching for the pulled archive. Defaults to on for both tiers. A pull is
     /// content-addressed only when the ref is digest-pinned.
     cache: TargetSpecCache,
@@ -133,7 +122,6 @@ impl PlatformSelect {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciPullDef {
     src: String,
-    format: ImageFormat,
     /// Workspace-relative output archive (or layout directory) path.
     out: String,
     layout: bool,
@@ -141,23 +129,22 @@ struct OciPullDef {
     /// is" — that is what makes the key honest.
     platform: PlatformSelect,
     insecure: bool,
-    tool: Tool,
 }
 
 /// v3: `all_platforms` pulls the whole index, so the platform selection is no
 /// longer a single `os/arch` string.
-const OCI_PULL_FORMAT_VERSION: u32 = 3;
+/// v4: pulled in-process over the distribution protocol; `tool` and `format` are
+/// gone, so neither is in the key any more.
+const OCI_PULL_FORMAT_VERSION: u32 = 4;
 
 impl Hash for OciPullDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         OCI_PULL_FORMAT_VERSION.hash(state);
         self.src.hash(state);
-        self.format.transport().hash(state);
         self.out.hash(state);
         self.layout.hash(state);
         self.platform.label().hash(state);
         self.insecure.hash(state);
-        self.tool.label().hash(state);
     }
 }
 
@@ -175,99 +162,14 @@ fn is_digest_pinned(image_ref: &str) -> bool {
     !algo.is_empty() && hex.len() >= 32 && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Pull an image into a docker-format archive with the docker CLI: pull it into
-/// the daemon, then `docker save` it to `out_tar`. No skopeo.
-async fn docker_pull(
-    docker_bin: &str,
-    src: &str,
-    platform: &str,
-    out_tar: &std::path::Path,
-    cwd: &std::path::Path,
-    io: &mut ToolIo<'_>,
-    ctoken: &(dyn Cancellable + Send + Sync),
-) -> anyhow::Result<()> {
-    run_tool(
-        vec![
-            docker_bin.to_string(),
-            "pull".to_string(),
-            "--platform".to_string(),
-            platform.to_string(),
-            src.to_string(),
-        ],
-        cwd,
-        "docker pull (oci_pull)",
-        io,
-        ctoken,
-    )
-    .await?;
-    run_tool(
-        vec![
-            docker_bin.to_string(),
-            "save".to_string(),
-            src.to_string(),
-            "-o".to_string(),
-            out_tar.to_string_lossy().into_owned(),
-        ],
-        cwd,
-        "docker save (oci_pull)",
-        io,
-        ctoken,
-    )
-    .await?;
-    Ok(())
-}
-
-/// Assemble the `skopeo copy` argv for a pull. Pure so it can be unit-tested
-/// without skopeo. `argv[0]` is the skopeo binary.
-///
-/// `dest` is the already-formatted destination (`oci-archive:/path`,
-/// `docker-archive:/path`, or `oci:/dir:latest` for a layout directory).
-fn pull_argv(
-    skopeo_bin: &str,
-    src: &str,
-    platform: &PlatformSelect,
-    dest: &str,
-    insecure: bool,
-) -> anyhow::Result<Vec<String>> {
-    let mut argv = vec![
-        skopeo_bin.to_string(),
-        "copy".to_string(),
-        "--insecure-policy".to_string(),
-    ];
-    match platform {
-        // Pin the instance chosen out of a manifest list. Without these skopeo
-        // takes the host's GOOS/GOARCH — which is `darwin` on macOS, where no
-        // Linux image has a matching instance.
-        PlatformSelect::One(p) => argv.extend(super::platform_override_args(p)?),
-        // Copy every instance and keep the index, so a multi-platform build can
-        // resolve its own architecture out of the result.
-        PlatformSelect::All => {
-            argv.push("--multi-arch".to_string());
-            argv.push("all".to_string());
-        }
-    }
-    if insecure {
-        argv.push("--src-tls-verify=false".to_string());
-    }
-    argv.push(format!("docker://{src}"));
-    argv.push(dest.to_string());
-    Ok(argv)
-}
-
+/// Stateless: the registry client is built per pull from the target's own
+/// config, and there is no host binary left to point anywhere.
 #[derive(Default)]
-pub struct Driver {
-    tools: super::Tools,
-}
+pub struct Driver;
 
 impl Driver {
     pub fn new() -> Self {
-        Driver::default()
-    }
-
-    /// Point the driver at specific binaries. Public so tests — including
-    /// out-of-crate e2e — can substitute fakes.
-    pub fn with_tools(tools: super::Tools) -> Self {
-        Driver { tools }
+        Driver
     }
 }
 
@@ -290,30 +192,6 @@ impl ManagedDriver for Driver {
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
         let spec = OciPullSpec::from(&req.target_spec.config).context("parse oci_pull config")?;
-        let format = ImageFormat::parse(spec.format.as_deref().unwrap_or("oci"))?;
-        let tool = Tool::parse_opt(spec.tool.as_deref(), format)?;
-        ensure_tool_supports_format(tool, format)?;
-
-        if spec.layout && tool == Tool::Docker {
-            anyhow::bail!(
-                "`layout = True` requires tool = \"skopeo\": the docker CLI can only write a \
-                 docker-format archive, not an OCI layout directory"
-            );
-        }
-        if spec.insecure && tool == Tool::Docker {
-            anyhow::bail!(
-                "`insecure = True` is not supported with tool = \"docker\": the daemon decides \
-                 which registries are insecure. Add the registry to the daemon's \
-                 `insecure-registries`, or use tool = \"skopeo\"."
-            );
-        }
-
-        if spec.all_platforms && tool == Tool::Docker {
-            anyhow::bail!(
-                "`all_platforms = True` requires tool = \"skopeo\": `docker save` writes a single \
-                 image, not a manifest list"
-            );
-        }
         let platform = match (spec.all_platforms, spec.platform) {
             (true, Some(p)) => anyhow::bail!(
                 "`all_platforms = True` pulls every instance, so `platform` ({p:?}) has nothing to \
@@ -361,12 +239,10 @@ impl ManagedDriver for Driver {
 
         let def = OciPullDef {
             src: spec.src,
-            format,
             out: out.clone(),
             layout: spec.layout,
             platform,
             insecure: spec.insecure,
-            tool,
         };
         let hash = {
             let mut h =
@@ -415,60 +291,33 @@ impl ManagedDriver for Driver {
 
     async fn run<'a, 'io>(
         &self,
-        mut req: ManagedRunRequest<'a, 'io>,
-        ctoken: &(dyn Cancellable + Send + Sync),
+        req: ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<OciPullDef>().clone();
         let out_name = std::path::Path::new(&def.out)
             .file_name()
             .with_context(|| format!("out {:?} has no file name", def.out))?;
         let out_path = req.sandbox_pkg_dir.join(out_name);
-        let cwd = req.sandbox_ws_dir.clone();
-        let mut io = ToolIo::from_request(&mut req.request);
 
-        match def.tool {
-            Tool::Skopeo => {
-                let dest = if def.layout {
-                    // `oci:<dir>:<tag>` writes an OCI layout tree. The tag is
-                    // internal to the layout; `latest` keeps `FROM <name>`
-                    // resolving without the user naming it.
-                    format!("oci:{}:latest", out_path.to_string_lossy())
-                } else {
-                    format!("{}:{}", def.format.transport(), out_path.to_string_lossy())
-                };
-                let argv = pull_argv(
-                    &self.tools.skopeo,
-                    &def.src,
-                    &def.platform,
-                    &dest,
-                    def.insecure,
-                )?;
-                run_tool(argv, &cwd, "skopeo copy (oci_pull)", &mut io, ctoken)
-                    .await
-                    .with_context(|| format!("pull image {}", def.src))?;
-            }
-            Tool::Docker => {
-                // `all_platforms` is rejected at parse for this tool, so the
-                // selection is always a concrete platform here.
-                let PlatformSelect::One(platform) = &def.platform else {
-                    anyhow::bail!(
-                        "internal: oci_pull with tool = \"docker\" reached run with an \
-                         all-platforms selection"
-                    )
-                };
-                docker_pull(
-                    &self.tools.docker,
-                    &def.src,
-                    platform,
-                    &out_path,
-                    &cwd,
-                    &mut io,
-                    ctoken,
-                )
-                .await
-                .with_context(|| format!("pull image {}", def.src))?;
-            }
+        let (index, blobs) = super::registry::pull_layout(&def.src, def.insecure)
+            .await
+            .with_context(|| format!("pull image {}", def.src))?;
+
+        if def.layout {
+            // A layout *directory* is the shape `oci_image`'s `bases` consumes:
+            // buildx's `oci-layout://` reads a tree, not a tar.
+            super::archive::write_layout_dir(&out_path, &index, &blobs)
+        } else {
+            super::archive::write_layout_tar(&out_path, &index, &blobs)
         }
+        .with_context(|| format!("write the pulled image to {out_path:?}"))?;
+
+        tracing::info!(
+            image = def.src,
+            platform = def.platform.label(),
+            "oci_pull: pulled"
+        );
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
@@ -511,95 +360,6 @@ mod tests {
     /// A digest-pinned ref, 64 hex chars — the form `is_digest_pinned` accepts.
     const PINNED: &str =
         "alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    #[test]
-    fn pull_argv_oci_from_registry() {
-        let argv = pull_argv(
-            "skopeo",
-            "docker.io/library/alpine:3.20",
-            &PlatformSelect::One("linux/arm64".to_string()),
-            "oci-archive:/sbx/base/image.tar",
-            false,
-        )
-        .expect("argv");
-        assert_eq!(argv[0..3], ["skopeo", "copy", "--insecure-policy"]);
-        let joined = argv.join(" ");
-        assert!(
-            joined.contains("docker://docker.io/library/alpine:3.20"),
-            "{joined}"
-        );
-        assert!(
-            joined.contains("oci-archive:/sbx/base/image.tar"),
-            "{joined}"
-        );
-        assert!(!joined.contains("--src-tls-verify"), "{joined}");
-    }
-
-    /// The instance taken out of a manifest list is pinned explicitly. Without
-    /// these, skopeo asks for the host's GOOS — `darwin` on macOS, which no
-    /// Linux image publishes — so the same target fails there and silently picks
-    /// the host arch on Linux.
-    #[test]
-    fn pull_argv_overrides_os_and_arch_from_platform() {
-        let argv = pull_argv(
-            "skopeo",
-            "alpine:3.20",
-            &PlatformSelect::One("linux/amd64".to_string()),
-            "oci-archive:/t/i.tar",
-            false,
-        )
-        .expect("argv");
-        let joined = argv.join(" ");
-        assert!(joined.contains("--override-os linux"), "{joined}");
-        assert!(joined.contains("--override-arch amd64"), "{joined}");
-    }
-
-    #[test]
-    fn pull_argv_rejects_malformed_platform() {
-        let err = pull_argv(
-            "skopeo",
-            "alpine",
-            &PlatformSelect::One("linux".to_string()),
-            "oci-archive:/t.tar",
-            false,
-        )
-        .expect_err("a platform without an arch must fail");
-        assert!(format!("{err:#}").contains("os/arch"), "got: {err:#}");
-    }
-
-    /// `all_platforms` keeps the manifest list instead of selecting an instance
-    /// — the only shape a base image for a multi-platform build can have. The
-    /// override flags must be gone: they would narrow the copy back to one.
-    #[test]
-    fn pull_argv_all_platforms_copies_the_whole_index() {
-        let argv = pull_argv(
-            "skopeo",
-            "alpine:3.20",
-            &PlatformSelect::All,
-            "oci:/t/base.oci:latest",
-            false,
-        )
-        .expect("argv");
-        let joined = argv.join(" ");
-        assert!(joined.contains("--multi-arch all"), "{joined}");
-        assert!(!joined.contains("--override-os"), "{joined}");
-        assert!(!joined.contains("--override-arch"), "{joined}");
-    }
-
-    #[test]
-    fn pull_argv_docker_format_and_insecure() {
-        let argv = pull_argv(
-            "skopeo",
-            "localhost:5000/app:dev",
-            &PlatformSelect::One("linux/amd64".to_string()),
-            "docker-archive:/t/image.tar",
-            true,
-        )
-        .expect("argv");
-        let joined = argv.join(" ");
-        assert!(joined.contains("docker-archive:/t/image.tar"), "{joined}");
-        assert!(joined.contains("--src-tls-verify=false"), "{joined}");
-    }
 
     /// Only a real content digest counts as a pin. `@latest` contains an `@`
     /// and pins nothing, so it must still warn.
@@ -694,26 +454,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn parse_layout_with_docker_tool_fails() {
-        let err = Driver::new()
-            .parse(
-                parse_req(
-                    "//base:x",
-                    cfg(&[
-                        ("ref", Value::String(PINNED.to_string())),
-                        ("layout", Value::Bool(true)),
-                        ("format", Value::String("docker".to_string())),
-                    ]),
-                ),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("docker cannot write an OCI layout");
-        assert!(format!("{err:#}").contains("layout"), "got: {err:#}");
-    }
-
     /// The multi-arch base recipe: an all-platforms layout, which is what a
     /// `platforms = [...]` build needs from its `bases` entry.
     #[tokio::test]
@@ -751,29 +491,6 @@ mod tests {
         )
         .await;
         assert_ne!(one.target_def.hash, all.target_def.hash);
-    }
-
-    /// `docker save` writes one image, so the flag could only be silently
-    /// dropped — the user would get a single-arch base and a build that fails on
-    /// the other platform.
-    #[tokio::test]
-    async fn parse_all_platforms_with_docker_tool_fails() {
-        let err = Driver::new()
-            .parse(
-                parse_req(
-                    "//base:x",
-                    cfg(&[
-                        ("ref", Value::String(PINNED.to_string())),
-                        ("format", Value::String("docker".to_string())),
-                        ("all_platforms", Value::Bool(true)),
-                    ]),
-                ),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("all_platforms + docker must fail");
-        assert!(format!("{err:#}").contains("all_platforms"), "got: {err:#}");
     }
 
     /// Asking for every instance *and* naming one is a contradiction; honouring
@@ -819,28 +536,6 @@ mod tests {
         assert!(format!("{err:#}").contains("bare name"), "got: {err:#}");
     }
 
-    /// `insecure` is a skopeo flag; accepting it and dropping it would leave the
-    /// user believing TLS verification is off when it is not.
-    #[tokio::test]
-    async fn parse_insecure_with_docker_tool_fails() {
-        let err = Driver::new()
-            .parse(
-                parse_req(
-                    "//base:x",
-                    cfg(&[
-                        ("ref", Value::String(PINNED.to_string())),
-                        ("format", Value::String("docker".to_string())),
-                        ("insecure", Value::Bool(true)),
-                    ]),
-                ),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("insecure + docker must fail");
-        assert!(format!("{err:#}").contains("insecure"), "got: {err:#}");
-    }
-
     #[tokio::test]
     async fn parse_requires_ref() {
         let err = Driver::new()
@@ -868,99 +563,5 @@ mod tests {
         )
         .await;
         assert_ne!(a.target_def.hash, b.target_def.hash);
-    }
-
-    /// A docker-format pull defaults to the `docker` tool (docker pull + save) —
-    /// no skopeo needed.
-    #[tokio::test]
-    async fn parse_docker_format_defaults_to_docker_tool() {
-        let resp = parse(
-            "//base:x",
-            cfg(&[
-                ("ref", Value::String("alpine@sha256:abc".to_string())),
-                ("format", Value::String("docker".to_string())),
-            ]),
-        )
-        .await;
-        assert_eq!(resp.target_def.def::<OciPullDef>().tool, Tool::Docker);
-    }
-
-    /// docker save only makes a docker archive — docker+oci is rejected.
-    #[tokio::test]
-    async fn parse_docker_tool_with_oci_format_fails() {
-        let err = Driver::new()
-            .parse(
-                parse_req(
-                    "//base:x",
-                    cfg(&[
-                        ("ref", Value::String("alpine@sha256:abc".to_string())),
-                        ("tool", Value::String("docker".to_string())),
-                    ]),
-                ),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("docker+oci must fail");
-        assert!(format!("{err:#}").contains("oci"), "got: {err:#}");
-    }
-
-    /// `layout = True` writes an OCI layout *tree* via skopeo's `oci:` transport
-    /// — the form buildx's `oci-layout://` build context reads. An `oci-archive:`
-    /// tar cannot be used there, so this is what makes `bases` work at all.
-    #[tokio::test]
-    async fn run_layout_uses_the_oci_directory_transport() {
-        let sbx = super::super::testfake::Sandbox::new("base");
-        let resp = parse(
-            "//base:alpine",
-            cfg(&[
-                ("ref", Value::String(PINNED.to_string())),
-                ("layout", Value::Bool(true)),
-            ]),
-        )
-        .await;
-
-        let skopeo = sbx.fake("skopeo", "exit 0");
-        let rid = "req".to_string();
-        let req = super::super::testfake::run_request(&rid, "hashin", &resp.target_def, &sbx, &[]);
-        Driver::with_tools(super::super::Tools {
-            docker: "docker".to_string(),
-            skopeo,
-        })
-        .run(req, &StdCancellationToken::new())
-        .await
-        .expect("run");
-
-        let call = sbx.calls().into_iter().next().expect("a skopeo call");
-        assert!(
-            call.contains(" oci:"),
-            "expected the oci: transport: {call}"
-        );
-        assert!(call.contains("alpine.oci:latest"), "{call}");
-        assert!(!call.contains("oci-archive:"), "{call}");
-    }
-
-    /// A failing pull surfaces the tool's own message.
-    #[tokio::test]
-    async fn run_surfaces_stderr_on_failure() {
-        let sbx = super::super::testfake::Sandbox::new("base");
-        let resp = parse(
-            "//base:alpine",
-            cfg(&[("ref", Value::String(PINNED.to_string()))]),
-        )
-        .await;
-
-        let skopeo = sbx.fake("skopeo", "echo 'FATA[0000] unauthorized' >&2\nexit 1");
-        let rid = "req".to_string();
-        let req = super::super::testfake::run_request(&rid, "hashin", &resp.target_def, &sbx, &[]);
-        let err = Driver::with_tools(super::super::Tools {
-            docker: "docker".to_string(),
-            skopeo,
-        })
-        .run(req, &StdCancellationToken::new())
-        .await
-        .err()
-        .expect("a failing pull must error");
-        assert!(format!("{err:#}").contains("unauthorized"), "got: {err:#}");
     }
 }
