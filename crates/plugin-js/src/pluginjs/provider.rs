@@ -1,8 +1,9 @@
 use crate::pluginjs::lockfile::{self, Lockfile, ResolvedGraph};
 use crate::pluginjs::workspace::{self, PkgManager, WorkspaceMember};
 use crate::pluginjs::{
-    LINT_TARGET, PACKAGE_INFO_TARGET, PACKAGE_JSON, TEST_TARGET, TYPECHECK_TARGET, deps,
-    importgraph, is_skipped_dir_name, package_json, platform, resolvers, thirdparty, toolchain,
+    BUNDLE_TARGET, LINT_TARGET, PACKAGE_INFO_TARGET, PACKAGE_JSON, TEST_TARGET, TYPECHECK_TARGET,
+    deps, importgraph, is_skipped_dir_name, package_json, platform, resolvers, thirdparty,
+    toolchain,
 };
 use anyhow::Context;
 use enclose::enclose;
@@ -18,7 +19,7 @@ use hplugin::provider::{
 };
 use hwalk::{CachedWalker, EntryKind, Ignore};
 use std::collections::BTreeSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -72,6 +73,11 @@ pub struct Config {
     /// host-toolchain shape as `tstool`/`testrunner` — see
     /// `toolchain::resolve_host_linter`.
     pub linter: String,
+    /// Which bundler `js_bundle` invokes — `"esbuild"` (default, the only
+    /// value implemented this milestone), per `ai-docs/js-plugin-plan.md`'s
+    /// `js_bundle` row. Same provider-level, host-toolchain shape as
+    /// `tstool`/`testrunner`/`linter` — see `toolchain::resolve_host_bundler`.
+    pub bundler: String,
 }
 
 impl Config {
@@ -88,6 +94,7 @@ impl Config {
                 .map(|s| (*s).to_string())
                 .collect(),
             linter: toolchain::OXLINT.to_string(),
+            bundler: toolchain::ESBUILD.to_string(),
         }
     }
 }
@@ -136,6 +143,17 @@ pub struct Provider {
     /// (the same M3/M4-review-flagged mistake this milestone's task
     /// explicitly calls out not to repeat).
     linter_cache: OnceCell<Arc<(PathBuf, String)>>,
+    /// Which bundler `js_bundle` invokes — see [`Config::bundler`]'s doc.
+    bundler: String,
+    /// Lazily resolved host bundler binary path + queried `--version`,
+    /// cached once for the `Provider`'s lifetime — same rationale as
+    /// `tsc_cache`/`testrunner_cache`/`linter_cache`: `bundle_config` runs
+    /// once per `js_bundle` target per `Provider::get`, so re-resolving and
+    /// re-spawning `<bundler> --version` per target would scale a real
+    /// subprocess cost with target count, including a 100%-cache-hit run
+    /// (the same M3/M4-review-flagged mistake this milestone's task
+    /// explicitly calls out not to repeat).
+    bundler_cache: OnceCell<Arc<(PathBuf, String)>>,
     /// Workspace-member `{name -> addr}` map, resolved once and cached for
     /// the `Provider`'s lifetime — same rationale as `tsc_cache`/
     /// `testrunner_cache`/`linter_cache`: `deps_config`/`typecheck_config`/
@@ -177,7 +195,25 @@ pub struct Provider {
     /// tests.
     #[cfg(test)]
     graph_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-`(entry_pkg, entry_file_rel)` [`BundleClosureResult`], built once
+    /// and cached for the `Provider`'s lifetime — same `Arc<OnceCell<_>>`-
+    /// per-key shape as `graph_cache`, applied to `Provider::bundle_closure`'s
+    /// whole-graph BFS (feature-quality/hermeticity M6 review finding): the
+    /// closure is provably invariant across `js_bundle`'s `format`/`target`
+    /// variant axis for the same entry point, but was recomputed from
+    /// scratch — manifest re-reads, phantom-dependency cross-checks, edge
+    /// walk and all — on every single `Provider::get`, unlike every other
+    /// expensive per-target-kind computation in this file. Requesting the
+    /// common esm+cjs (or four-way esm/cjs × node/browser) pair for one
+    /// package now pays the BFS once, not once per variant.
+    bundle_closure_cache: BundleClosureCache,
 }
+
+/// Key: `(entry_pkg, entry_file_rel)`. See [`Provider::bundle_closure_cache`]'s
+/// doc — factored into its own alias since the nested `Arc<OnceCell<_>>>`
+/// shape trips clippy's `type_complexity` inline.
+type BundleClosureCache =
+    tokio::sync::Mutex<HashMap<(String, String), Arc<OnceCell<Arc<BundleClosureResult>>>>>;
 
 impl Provider {
     pub fn new(workspace_root: PathBuf, pkgmanager: PkgManager) -> Self {
@@ -206,6 +242,7 @@ impl Provider {
                 "testrunner",
                 "test_glob",
                 "linter",
+                "bundler",
             ],
         )?;
         let pkgmanager_str: String =
@@ -261,6 +298,17 @@ impl Provider {
             "js provider: unsupported `linter` {linter:?} — expected \"oxlint\" or \"eslint\""
         );
 
+        // See `Config::bundler`'s doc: defaults to the design doc's
+        // recommended default (`esbuild`, the fast oxc-family-adjacent
+        // bundler; `rollup`/`webpack`/`vite` are a stated M6+ follow-up).
+        let bundler: String = hplugin::config::decode_opt(opts, "js provider", "bundler")?
+            .unwrap_or_else(|| toolchain::ESBUILD.to_string());
+        anyhow::ensure!(
+            toolchain::is_supported_bundler(&bundler),
+            "js provider: unsupported `bundler` {bundler:?} — expected \"esbuild\" \
+             (rollup/webpack/vite are a stated M6+ follow-up, not yet supported)"
+        );
+
         Ok(Self::with_config(
             workspace_root,
             Config {
@@ -272,6 +320,7 @@ impl Provider {
                 testrunner,
                 test_glob,
                 linter,
+                bundler,
             },
         ))
     }
@@ -292,10 +341,13 @@ impl Provider {
             testrunner_cache: OnceCell::new(),
             linter: config.linter,
             linter_cache: OnceCell::new(),
+            bundler: config.bundler,
+            bundler_cache: OnceCell::new(),
             member_addrs_cache: OnceCell::new(),
             graph_cache: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             graph_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bundle_closure_cache: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -461,6 +513,33 @@ impl Provider {
                     let linter_version = toolchain::query_linter_version(&linter_bin)
                         .with_context(|| format!("querying {linter_bin:?} --version"))?;
                     Ok(Arc::new((linter_bin, linter_version)))
+                })
+                .await
+            })
+            .await?;
+        Ok(Arc::clone(result))
+    }
+
+    /// The host bundler binary path and its queried `--version`, resolved
+    /// once and cached for the `Provider`'s lifetime — see
+    /// [`Provider::bundler_cache`]'s doc for why this matters.
+    async fn resolved_host_bundler(&self) -> anyhow::Result<Arc<(PathBuf, String)>> {
+        let workspace_root = self.workspace_root.clone();
+        let bundler = self.bundler.clone();
+        let result = self
+            .bundler_cache
+            .get_or_try_init(|| async move {
+                anyhow::ensure!(
+                    toolchain::is_supported_bundler(&bundler),
+                    "js provider: unsupported bundler {bundler:?} — only \"esbuild\" is \
+                     supported in this milestone; see pluginjs::toolchain module docs"
+                );
+                hcore::blocking::run(move || -> anyhow::Result<Arc<(PathBuf, String)>> {
+                    let bundler_bin = toolchain::resolve_host_bundler(&workspace_root, &bundler)
+                        .context("resolving the js_bundle bundler toolchain")?;
+                    let bundler_version = toolchain::query_bundler_version(&bundler_bin)
+                        .with_context(|| format!("querying {bundler_bin:?} --version"))?;
+                    Ok(Arc::new((bundler_bin, bundler_version)))
                 })
                 .await
             })
@@ -912,6 +991,750 @@ impl Provider {
             approval: Default::default(),
         })
     }
+
+    /// The workspace-relative path to a package's default `js_bundle` entry
+    /// point — its own `package.json` `"main"` field, resolved against the
+    /// package directory and checked to actually exist. `None` when the
+    /// package has no `"main"` field, `"main"` fails the same escape/
+    /// containment checks a user-supplied `entry=` addr arg gets (see module
+    /// docs' bug-class (c) note), or `"main"` names a file that doesn't
+    /// exist — any of these simply means there is no usable default, so
+    /// `Provider::list` lists no `js_bundle` target for this package
+    /// (mirrors `js_test`'s "no matched files, no listed target" shape); an
+    /// explicit `entry=` addr arg still works via `Provider::get` regardless.
+    async fn default_entry_for_package(&self, pkg: &PkgBuf) -> anyhow::Result<Option<String>> {
+        let workspace_root = self.workspace_root.clone();
+        let pkg_str = pkg.as_str().to_string();
+        hcore::blocking::run(move || -> anyhow::Result<Option<String>> {
+            let pkg_dir = if pkg_str.is_empty() {
+                workspace_root.clone()
+            } else {
+                workspace_root.join(&pkg_str)
+            };
+            let manifest = package_json::read_package_manifest(&pkg_dir.join(PACKAGE_JSON))
+                .with_context(|| {
+                    format!("reading {pkg_str:?}'s package.json for its default js_bundle entry")
+                })?;
+            let Some(main) = manifest.main else {
+                return Ok(None);
+            };
+            let main_rel = main.trim_start_matches("./");
+            let entry_rel = if pkg_str.is_empty() {
+                main_rel.to_string()
+            } else {
+                format!("{pkg_str}/{main_rel}")
+            };
+            // `package.json`'s own `"main"` is first-party content this
+            // package fully controls — trusted the same way this crate
+            // already trusts tsconfig/runner-config content elsewhere — but
+            // still run through the same escape/containment checks a
+            // user-supplied `entry=` addr arg gets (bug class (c) in this
+            // milestone's task): a malformed `"main"` (e.g.
+            // `"../../../etc/passwd"`) must not become a default entry.
+            if reject_path_escape("package.json main", &entry_rel).is_err()
+                || !path_under_package(&pkg_str, &entry_rel)
+            {
+                return Ok(None);
+            }
+            let entry_abs = workspace_root.join(&entry_rel);
+            if !entry_abs.is_file() {
+                return Ok(None);
+            }
+            Ok(Some(entry_rel))
+        })
+        .await
+    }
+
+    /// The full transitive first-party closure reachable from
+    /// `entry_pkg`'s `entry_file_rel` via `ImportGraph::runtime_edges`,
+    /// recursing across workspace-package boundaries, plus every
+    /// third-party package the closure's own unresolved bare specifiers (or
+    /// ambiently-resolved `node_modules` edges) name — see
+    /// `driver_bundle.rs` module docs' "Inputs / cache key" section for why
+    /// this cannot reuse `importgraph::build_test_closure`'s one-hop-external
+    /// trim. `entry_file_rel` is workspace-relative and must already be
+    /// validated (`reject_path_escape` + `path_under_package`) by the
+    /// caller.
+    ///
+    /// Memoized per `(entry_pkg, entry_file_rel)` on the `Provider` — see
+    /// [`Provider::bundle_closure_cache`]'s doc — since the BFS below is
+    /// provably invariant across `js_bundle`'s `format`/`target` variant
+    /// axis for the same entry point; callers requesting more than one
+    /// variant of the same package share one BFS.
+    async fn bundle_closure(
+        &self,
+        entry_pkg: &str,
+        entry_file_rel: &str,
+    ) -> anyhow::Result<Arc<BundleClosureResult>> {
+        let key = (entry_pkg.to_string(), entry_file_rel.to_string());
+        let cell = {
+            let mut cache = self.bundle_closure_cache.lock().await;
+            Arc::clone(
+                cache
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+        let result = cell
+            .get_or_try_init(|| self.bundle_closure_uncached(entry_pkg, entry_file_rel))
+            .await?;
+        Ok(Arc::clone(result))
+    }
+
+    /// The actual BFS behind [`Provider::bundle_closure`] — split out so the
+    /// memoizing wrapper stays a thin, easy-to-audit cache lookup. Returns
+    /// `(first_party_files, third_party_addrs, third_party_names)` bundled
+    /// as a [`BundleClosureResult`]: `third_party_names` (the bare specifier
+    /// each third-party edge was actually imported by, e.g. `"lodash"`) is
+    /// what `Provider::bundle_config` feeds esbuild's own `--external:<name>`
+    /// flag — see that field's doc and the feature-quality M6 review BLOCKER
+    /// it fixes (the discovered closure and the bundler's `--external` flags
+    /// were previously two disconnected sources, so every real third-party
+    /// import made `esbuild --bundle` hard-fail with "Could not resolve").
+    ///
+    /// **Known perf trim, disclosed rather than silent**: each dequeued file
+    /// (and each newly-visited package's manifest read + phantom check)
+    /// gets its own `hcore::blocking::run` round trip rather than batching a
+    /// whole package's worth of files into one blocking call — correct, but
+    /// more blocking-pool hops than necessary for a package with many
+    /// closure-reached files. `Provider::import_graph`'s own per-package
+    /// memoization means no *parse* work is repeated, so this is scheduling
+    /// overhead, not redundant computation — acceptable for this milestone,
+    /// a real target for batching if profiling ever names it a bottleneck.
+    async fn bundle_closure_uncached(
+        &self,
+        entry_pkg: &str,
+        entry_file_rel: &str,
+    ) -> anyhow::Result<Arc<BundleClosureResult>> {
+        let workspace_root = self.workspace_root.clone();
+        let canonical_root = hcore::blocking::run(enclose!((workspace_root) move || {
+            workspace_root
+                .canonicalize()
+                .with_context(|| format!("canonicalize workspace root {workspace_root:?}"))
+        }))
+        .await?;
+
+        let lockfile = self.lockfile().await?;
+        let resolved_graph = self.resolved_graph().await?;
+        let member_addrs_by_name = self.member_addrs_by_name().await?;
+        let goos = platform::current_goos();
+        let goarch = platform::current_goarch();
+
+        let mut files: BTreeSet<String> = BTreeSet::new();
+        let mut external_addrs: BTreeSet<String> = BTreeSet::new();
+        let mut external_names: BTreeSet<String> = BTreeSet::new();
+        let mut visited_pkgs: HashSet<String> = HashSet::new();
+        let mut manifests: HashMap<String, package_json::PackageManifest> = HashMap::new();
+        let mut queue: VecDeque<(String, String)> = VecDeque::new();
+        files.insert(entry_file_rel.to_string());
+        queue.push_back((entry_pkg.to_string(), entry_file_rel.to_string()));
+
+        while let Some((cur_pkg, cur_file)) = queue.pop_front() {
+            let graph = self.import_graph(&PkgBuf::from(cur_pkg.clone())).await?;
+
+            if !manifests.contains_key(&cur_pkg) {
+                let manifest = hcore::blocking::run(enclose!(
+                    (workspace_root, cur_pkg) move || -> anyhow::Result<package_json::PackageManifest> {
+                        let pkg_dir = if cur_pkg.is_empty() {
+                            workspace_root.clone()
+                        } else {
+                            workspace_root.join(&cur_pkg)
+                        };
+                        package_json::read_package_manifest(&pkg_dir.join(PACKAGE_JSON))
+                            .with_context(|| {
+                                format!("reading {cur_pkg:?}'s package.json for js_bundle")
+                            })
+                    }
+                ))
+                .await?;
+                manifests.insert(cur_pkg.clone(), manifest);
+            }
+            let manifest = manifests
+                .get(&cur_pkg)
+                .expect("just inserted above")
+                .clone();
+
+            // Defense in depth, mirroring `deps_config`/`typecheck_deps_config`'s
+            // identical phantom-dependency cross-check — each package this
+            // closure reaches gets checked exactly once, even though its own
+            // `js_package_info`/`js_typecheck` targets (if requested
+            // separately) already check it too; a `js_bundle`-only workflow
+            // that never requests those targets for a *sibling* package must
+            // not silently skip this.
+            if visited_pkgs.insert(cur_pkg.clone()) {
+                hcore::blocking::run(enclose!(
+                    (workspace_root, cur_pkg, graph, manifest) move || -> anyhow::Result<()> {
+                        let declared = importgraph::declared_closure(&manifest);
+                        importgraph::check_phantom_dependencies(
+                            &workspace_root,
+                            &cur_pkg,
+                            &graph,
+                            &declared,
+                        )
+                    }
+                ))
+                .await
+                .with_context(|| {
+                    format!(
+                        "cross-checking {cur_pkg:?}'s import graph against its declared \
+                         dependencies for js_bundle"
+                    )
+                })?;
+            }
+
+            let step = hcore::blocking::run(enclose!(
+                (canonical_root, cur_pkg, cur_file, graph, manifest, lockfile, resolved_graph,
+                 member_addrs_by_name, goos, goarch) move || {
+                    bundle_closure_step(
+                        &canonical_root,
+                        &cur_pkg,
+                        &cur_file,
+                        &graph,
+                        &manifest,
+                        lockfile.as_deref(),
+                        resolved_graph.as_deref(),
+                        &member_addrs_by_name,
+                        &goos,
+                        &goarch,
+                    )
+                }
+            ))
+            .await
+            .with_context(|| {
+                format!("walking js_bundle closure edges for {cur_pkg:?}'s {cur_file:?}")
+            })?;
+
+            for (name, addr) in step.new_external {
+                external_names.insert(name);
+                external_addrs.insert(addr);
+            }
+            for (owning_pkg, rel) in step.new_files {
+                if files.insert(rel.clone()) {
+                    queue.push_back((owning_pkg, rel));
+                }
+            }
+        }
+
+        Ok(Arc::new(BundleClosureResult {
+            files,
+            external_addrs,
+            external_names,
+        }))
+    }
+
+    /// Build everything about a `js_bundle` target's config *except* the
+    /// bundler toolchain resolution/version-query: `bundle_closure`'s full
+    /// transitive first-party/third-party Input scoping, the resolved
+    /// bundler config file (if any) and anything it itself references, and
+    /// the entry package's resolved tsconfig (if any) plus its `extends`
+    /// chain. Deliberately split out from [`Provider::bundle_config`] so it
+    /// never touches the host bundler binary — unit-testable **without** a
+    /// real `esbuild` installed, mirroring `typecheck_deps_config`/
+    /// `test_deps_config`/`lint_deps_config`'s identical split (this
+    /// milestone's own "single most important test" precedent).
+    async fn bundle_deps_config(
+        &self,
+        pkg: &PkgBuf,
+        entry_file_rel: &str,
+    ) -> anyhow::Result<BundleDepsConfig> {
+        let closure = self.bundle_closure(pkg.as_str(), entry_file_rel).await?;
+
+        let workspace_root = self.workspace_root.clone();
+        let pkg_str = pkg.as_str().to_string();
+
+        let ancillary =
+            hcore::blocking::run(move || -> anyhow::Result<BundleAncillary> {
+                let canonical_root = workspace_root
+                    .canonicalize()
+                    .with_context(|| format!("canonicalize workspace root {workspace_root:?}"))?;
+                let pkg_dir = if pkg_str.is_empty() {
+                    workspace_root.clone()
+                } else {
+                    workspace_root.join(&pkg_str)
+                };
+
+                // The bundler config file (`esbuild.config.json`), if any, plus
+                // every file it itself references.
+                let config_path = importgraph::find_nearest_bundler_config(
+                    &workspace_root,
+                    &pkg_dir,
+                    &["esbuild.config.json"],
+                );
+                let (
+                    bundler_config_path,
+                    bundler_config_content,
+                    bundler_config_refs,
+                    config_external,
+                ) = match &config_path {
+                    Some(p) => {
+                        let rel = p
+                            .strip_prefix(&workspace_root)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        let content = std::fs::read_to_string(p)
+                            .with_context(|| format!("reading bundler config {p:?}"))?;
+                        let refs = importgraph::resolve_runner_config_referenced_files(p, &content)
+                            .with_context(|| {
+                                format!("resolving files referenced by bundler config {p:?}")
+                            })?;
+                        // Hard error (never a silent same-path fallback) on
+                        // workspace-root escape — the exact M5-review-fixed
+                        // anti-pattern (`strip_prefix(...).unwrap_or(...)`
+                        // quietly keeping a raw, possibly-absolute host path),
+                        // recurring in this sibling call site (code-quality
+                        // M6 review MAJOR).
+                        let refs_rel: Vec<String> = refs
+                            .iter()
+                            .map(|r| {
+                                anyhow::ensure!(
+                                    r.starts_with(&canonical_root),
+                                    "js_bundle: bundler config {p:?} references {r:?}, which \
+                                     resolved outside the workspace root ({canonical_root:?})"
+                                );
+                                Ok(r.strip_prefix(&canonical_root)
+                                    .unwrap_or(r)
+                                    .to_string_lossy()
+                                    .replace('\\', "/"))
+                            })
+                            .collect::<anyhow::Result<Vec<String>>>()
+                            .with_context(|| {
+                                format!("scoping files referenced by bundler config {p:?}")
+                            })?;
+                        let external = parse_bundler_config_external(&content)
+                            .with_context(|| format!("parsing bundler config {p:?}"))?;
+                        (rel, content, refs_rel, external)
+                    }
+                    None => (String::new(), String::new(), Vec::new(), Vec::new()),
+                };
+
+                // The entry package's own resolved tsconfig (if any) plus its
+                // `extends` chain — esbuild auto-discovers and applies a
+                // tsconfig's `compilerOptions` (`paths`/`baseUrl`/`jsx`/`target`/
+                // `experimentalDecorators`) the same way `tsc` does, so it must
+                // be a declared, staged, hashed Input the same way
+                // `typecheck_deps_config` already treats it (code-quality M6
+                // review BLOCKER).
+                let tsconfig = importgraph::find_nearest_tsconfig(&workspace_root, &pkg_dir);
+                let (tsconfig_path, mut tsconfig_content) = match &tsconfig {
+                    Some(p) => {
+                        let rel = p
+                            .strip_prefix(&workspace_root)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        let content = std::fs::read_to_string(p)
+                            .with_context(|| format!("reading tsconfig {p:?}"))?;
+                        (rel, content)
+                    }
+                    None => (String::new(), String::new()),
+                };
+                let mut tsconfig_refs: Vec<String> = Vec::new();
+                if let Some(leaf) = &tsconfig {
+                    let chain = importgraph::resolve_tsconfig_extends_chain(&workspace_root, leaf)
+                        .with_context(|| {
+                            format!("resolving tsconfig extends chain for {pkg_str:?}")
+                        })?;
+                    for ancestor in &chain {
+                        anyhow::ensure!(
+                            ancestor.starts_with(&canonical_root),
+                            "js_bundle: tsconfig {leaf:?}'s extends chain resolved {ancestor:?} \
+                         outside the workspace root ({canonical_root:?})"
+                        );
+                        let rel = ancestor
+                            .strip_prefix(&canonical_root)
+                            .unwrap_or(ancestor)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        tsconfig_refs.push(rel);
+                        let content = std::fs::read_to_string(ancestor)
+                            .with_context(|| format!("reading extended tsconfig {ancestor:?}"))?;
+                        tsconfig_content.push('\n');
+                        tsconfig_content.push_str(&content);
+                    }
+                }
+
+                Ok(BundleAncillary {
+                    bundler_config_path,
+                    bundler_config_content,
+                    bundler_config_refs,
+                    config_external,
+                    tsconfig_path,
+                    tsconfig_content,
+                    tsconfig_refs,
+                })
+            })
+            .await?;
+
+        let mut deps: HashMap<String, Value> = HashMap::new();
+        deps.insert(
+            String::new(),
+            Value::List(
+                closure
+                    .files
+                    .iter()
+                    .map(|p| Value::String(hbuiltins::pluginfs::file_addr(p).format()))
+                    .collect(),
+            ),
+        );
+        if !closure.external_addrs.is_empty() {
+            deps.insert(
+                "external".to_string(),
+                Value::List(
+                    closure
+                        .external_addrs
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        let mut bundler_config_addrs: BTreeSet<String> = BTreeSet::new();
+        if !ancillary.bundler_config_path.is_empty() {
+            bundler_config_addrs
+                .insert(hbuiltins::pluginfs::file_addr(&ancillary.bundler_config_path).format());
+        }
+        for rel in &ancillary.bundler_config_refs {
+            bundler_config_addrs.insert(hbuiltins::pluginfs::file_addr(rel).format());
+        }
+        if !bundler_config_addrs.is_empty() {
+            deps.insert(
+                "bundler_config".to_string(),
+                Value::List(
+                    bundler_config_addrs
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        let mut tsconfig_addrs: BTreeSet<String> = BTreeSet::new();
+        if !ancillary.tsconfig_path.is_empty() {
+            tsconfig_addrs
+                .insert(hbuiltins::pluginfs::file_addr(&ancillary.tsconfig_path).format());
+        }
+        for rel in &ancillary.tsconfig_refs {
+            tsconfig_addrs.insert(hbuiltins::pluginfs::file_addr(rel).format());
+        }
+        if !tsconfig_addrs.is_empty() {
+            deps.insert(
+                "tsconfig".to_string(),
+                Value::List(tsconfig_addrs.into_iter().map(Value::String).collect()),
+            );
+        }
+
+        // Union the closure's own discovered third-party bare-specifier
+        // names with the bundler config's opt-in `"external"` list — see
+        // `BundleClosureResult::external_names`'s doc and the feature-quality
+        // M6 review BLOCKER this fixes.
+        let mut external_set: BTreeSet<String> = closure.external_names.clone();
+        external_set.extend(ancillary.config_external.iter().cloned());
+
+        Ok(BundleDepsConfig {
+            deps,
+            bundler_config_path: ancillary.bundler_config_path,
+            bundler_config_content: ancillary.bundler_config_content,
+            external: external_set.into_iter().collect(),
+            tsconfig_path: ancillary.tsconfig_path,
+            tsconfig_content: ancillary.tsconfig_content,
+        })
+    }
+
+    /// Build the config for a `js_bundle` target: the host bundler toolchain
+    /// resolution/version-query this milestone's disclosed
+    /// `bundler`-is-host-resolved escape hatch requires (see `toolchain.rs`
+    /// module docs for why the version is queried here, at spec-resolution
+    /// time, rather than deferred to the driver's `run()`), plus
+    /// `bundle_deps_config`'s pure, bundler-binary-free Input-scoping.
+    async fn bundle_config(
+        &self,
+        pkg: &PkgBuf,
+        entry_file_rel: &str,
+        format: &str,
+        target_env: &str,
+    ) -> anyhow::Result<HashMap<String, Value>> {
+        let resolved_bundler = self.resolved_host_bundler().await?;
+        let bundler_bin = resolved_bundler.0.to_string_lossy().into_owned();
+        let bundler_version = resolved_bundler.1.clone();
+        let bundler = self.bundler.clone();
+
+        let deps_config = self.bundle_deps_config(pkg, entry_file_rel).await?;
+
+        // `format`/`target_env` are part of the output path — otherwise
+        // `js_bundle@format=esm` and `js_bundle@format=cjs` for the same
+        // package both declare the identical `Content::DirPath` output,
+        // colliding whenever both are built together (the common dual-
+        // format-publish shape this milestone's own headline variant axis
+        // exists for — feature-quality M6 review BLOCKER).
+        let outdir = if pkg.as_str().is_empty() {
+            format!("dist/{format}-{target_env}")
+        } else {
+            format!("{}/dist/{format}-{target_env}", pkg.as_str())
+        };
+
+        let mut config: HashMap<String, Value> = HashMap::new();
+        config.insert("bundler".to_string(), Value::String(bundler));
+        config.insert("bundler_bin".to_string(), Value::String(bundler_bin));
+        config.insert(
+            "bundler_version".to_string(),
+            Value::String(bundler_version),
+        );
+        config.insert(
+            "entry_file".to_string(),
+            Value::String(entry_file_rel.to_string()),
+        );
+        config.insert("format".to_string(), Value::String(format.to_string()));
+        config.insert("target".to_string(), Value::String(target_env.to_string()));
+        config.insert("outdir".to_string(), Value::String(outdir));
+        config.insert(
+            "bundler_config_path".to_string(),
+            Value::String(deps_config.bundler_config_path),
+        );
+        config.insert(
+            "bundler_config_content".to_string(),
+            Value::String(deps_config.bundler_config_content),
+        );
+        config.insert(
+            "external".to_string(),
+            Value::List(
+                deps_config
+                    .external
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        config.insert(
+            "tsconfig_path".to_string(),
+            Value::String(deps_config.tsconfig_path),
+        );
+        config.insert(
+            "tsconfig_content".to_string(),
+            Value::String(deps_config.tsconfig_content),
+        );
+        config.insert("deps".to_string(), Value::Map(deps_config.deps));
+        Ok(config)
+    }
+}
+
+/// Result of [`Provider::bundle_closure`]: the full transitive first-party
+/// closure plus the third-party packages it reaches, both by declared
+/// `Input` addr (`external_addrs`) and by the bare-specifier name esbuild's
+/// own `--external:<name>` flag needs (`external_names`) — see that field's
+/// doc.
+struct BundleClosureResult {
+    files: BTreeSet<String>,
+    external_addrs: BTreeSet<String>,
+    /// The bare specifier name (e.g. `"lodash"`, `"@scope/pkg"`) each
+    /// third-party edge in `external_addrs` was actually imported by —
+    /// captured from `graph.unresolved_bare_specifiers`' own
+    /// `site.package_name` (the lockfile-driven path) or
+    /// `importgraph::thirdparty_pkg_name_from_path` (the ambient-
+    /// `node_modules` path), never re-derived from the resolved addr, which
+    /// carries only a version-pinned `js_install` target, not the specifier
+    /// text a source file actually wrote. Feeds esbuild's `--external:<name>`
+    /// flag directly (`Provider::bundle_deps_config`) — the piece the
+    /// feature-quality M6 review found missing entirely: previously only a
+    /// bundler-config-file's own opt-in `"external"` array reached `--external`,
+    /// so every real third-party import (never listed there) made
+    /// `esbuild --bundle` hard-fail trying to inline it.
+    external_names: BTreeSet<String>,
+}
+
+/// Result of [`Provider::bundle_deps_config`]: the `deps` map (see that
+/// function's doc) plus the resolved bundler config's and tsconfig's own
+/// workspace-relative paths/raw content, and the merged `--external` name
+/// list, for a `js_bundle` target. A plain tuple would work but — same
+/// precedent as [`LintDepsConfig`] — a 6-element one is too easy to
+/// mis-order at the call site; a named struct makes each field
+/// self-documenting instead.
+struct BundleDepsConfig {
+    deps: HashMap<String, Value>,
+    bundler_config_path: String,
+    bundler_config_content: String,
+    /// The closure's own discovered third-party bare-specifier names, unioned
+    /// with the bundler config's opt-in `"external"` array — see
+    /// [`BundleClosureResult::external_names`]'s doc.
+    external: Vec<String>,
+    tsconfig_path: String,
+    tsconfig_content: String,
+}
+
+/// Filesystem-only resolution [`Provider::bundle_deps_config`] performs
+/// inside a single `hcore::blocking::run` round trip: the bundler config (if
+/// any) plus its own referenced files, and the entry package's tsconfig (if
+/// any) plus its `extends` chain.
+struct BundleAncillary {
+    bundler_config_path: String,
+    bundler_config_content: String,
+    bundler_config_refs: Vec<String>,
+    config_external: Vec<String>,
+    tsconfig_path: String,
+    tsconfig_content: String,
+    tsconfig_refs: Vec<String>,
+}
+
+/// One BFS step's discoveries when walking `file_rel`'s own `runtime_edges`
+/// in `pkg`'s [`importgraph::ImportGraph`] — see [`Provider::bundle_closure`].
+struct BundleClosureStep {
+    /// `(owning_pkg, workspace_rel_path)` pairs for every not-yet-seen
+    /// first-party edge target — `owning_pkg` may differ from `pkg` when the
+    /// edge crosses into a sibling workspace package (see
+    /// `importgraph::firstparty_owning_pkg_dir`).
+    new_files: Vec<(String, String)>,
+    /// `(bare_specifier_name, target_addr)` pairs for every third-party
+    /// package this step's edges/bare specifiers reached — see
+    /// `driver_bundle.rs` module docs' "Inputs / cache key" section and
+    /// [`BundleClosureResult::external_names`]'s doc for why the name is
+    /// carried alongside the addr, not discarded.
+    new_external: Vec<(String, String)>,
+}
+
+/// Pure (no async, only what's already loaded) per-file edge walk:
+/// everything [`importgraph::build_test_closure`] does for one file,
+/// generalized to (a) recurse across package boundaries instead of stopping
+/// at one hop and (b) only follow `runtime_edges`, never `type_edges` (a
+/// bundler erases type-only imports — see `driver_bundle.rs` module docs).
+/// Split out from [`Provider::bundle_closure`] so the per-file work can run
+/// on the blocking pool without an `async fn` in the way, and so it is
+/// unit-testable without a real bundler binary.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors typecheck_deps_config's/test_deps_config's own lockfile/graph/member/\
+              platform parameter set, needed here too for the same on-demand third-party-input \
+              resolution"
+)]
+fn bundle_closure_step(
+    canonical_root: &Path,
+    pkg: &str,
+    file_rel: &str,
+    graph: &importgraph::ImportGraph,
+    manifest: &package_json::PackageManifest,
+    lockfile: Option<&Lockfile>,
+    resolved_graph: Option<&ResolvedGraph>,
+    member_addrs_by_name: &BTreeMap<String, String>,
+    goos: &str,
+    goarch: &str,
+) -> anyhow::Result<BundleClosureStep> {
+    let mut new_files = Vec::new();
+    let mut new_external = Vec::new();
+
+    for edge in graph.runtime_edges.iter().filter(|e| e.file == file_rel) {
+        if let Some(name) = importgraph::thirdparty_pkg_name_from_path(&edge.resolved) {
+            // Resolved into `node_modules` — only possible when it happens
+            // to exist ambient on this host (`Provider::get` runs before
+            // `js_install` ever executes; see importgraph.rs module docs'
+            // "Hermeticity" section). Declared as a plain file Input at the
+            // resolved path, mirroring `typecheck_deps_config`'s identical
+            // treatment of an ambient-resolved third-party edge — the
+            // hermetically-correct path (a fresh checkout with no
+            // `node_modules`) instead surfaces this specifier as an
+            // `unresolved_bare_specifiers` site, handled below via the
+            // lockfile-driven mechanism (bug class (b): never resolve
+            // third-party inputs via ambient `node_modules`).
+            let rel = edge
+                .resolved
+                .strip_prefix(canonical_root)
+                .with_context(|| {
+                    format!(
+                        "js_bundle: {:?} imports from {:?}, a third-party path outside the \
+                         workspace root ({:?})",
+                        edge.file, edge.resolved, canonical_root
+                    )
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+            new_external.push((name, hbuiltins::pluginfs::file_addr(&rel).format()));
+            continue;
+        }
+
+        anyhow::ensure!(
+            edge.resolved.starts_with(canonical_root),
+            "js_bundle: {:?} imports from {:?}, which resolved outside the workspace root \
+             ({:?}) — cannot express it as a declared js_bundle input (this typically means \
+             node_modules is a symlink to a global store outside the workspace)",
+            edge.file,
+            edge.resolved,
+            canonical_root
+        );
+        let rel = edge
+            .resolved
+            .strip_prefix(canonical_root)
+            .unwrap_or(&edge.resolved)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let owning_pkg = importgraph::firstparty_owning_pkg_dir(&edge.resolved, canonical_root)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "js_bundle: {:?} imports from {:?}, which resolved inside the workspace \
+                     root but has no owning package.json ancestor",
+                    edge.file,
+                    edge.resolved
+                )
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+        new_files.push((owning_pkg, rel));
+    }
+
+    for site in graph
+        .unresolved_bare_specifiers
+        .iter()
+        .filter(|s| s.file == file_rel)
+    {
+        if let Some(addr) = deps::resolve_one_dependency(
+            pkg,
+            &site.package_name,
+            manifest,
+            lockfile,
+            resolved_graph,
+            member_addrs_by_name,
+            goos,
+            goarch,
+        )
+        .with_context(|| {
+            format!(
+                "resolving {:?}'s unresolved import of `{}` for js_bundle",
+                site.file, site.package_name
+            )
+        })? {
+            new_external.push((site.package_name.clone(), addr));
+        }
+    }
+
+    Ok(BundleClosureStep {
+        new_files,
+        new_external,
+    })
+}
+
+/// Parse a `js_bundle` bundler config's `"external"` array (esbuild's own
+/// `--external:<name>` flag, one per entry) — the only field this
+/// milestone's minimal `esbuild.config.json` schema recognizes (the esbuild
+/// CLI has no config-file convention of its own; see `driver_bundle.rs`
+/// module docs and `importgraph::find_nearest_bundler_config`'s doc for why
+/// this crate defines its own small schema instead). `Ok(vec![])` for a
+/// config with no `"external"` key. A malformed JSON document, or a present
+/// `"external"` value that isn't an array of strings, is a hard
+/// `Provider::get` error naming the problem — never a silently ignored
+/// config.
+fn parse_bundler_config_external(content: &str) -> anyhow::Result<Vec<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(content).context("parsing bundler config as JSON")?;
+    let Some(external) = value.get("external") else {
+        return Ok(Vec::new());
+    };
+    let arr = external.as_array().ok_or_else(|| {
+        anyhow::anyhow!("bundler config's \"external\" field must be an array of strings")
+    })?;
+    arr.iter()
+        .map(|v| {
+            v.as_str().map(str::to_string).ok_or_else(|| {
+                anyhow::anyhow!("bundler config's \"external\" array must contain only strings")
+            })
+        })
+        .collect()
 }
 
 /// Build the `deps` map (`""` = the package's own first-party source files,
@@ -1216,45 +2039,53 @@ fn runner_config_candidates(testrunner: &str) -> anyhow::Result<&'static [&'stat
     }
 }
 
-/// Reject a `js_test` addr's `file` arg — or, defensively, a resolved
-/// `runner_config_path` read back out of a cached `JsTestDef` — that is
+/// Reject an addr arg or a resolved/cached config field — `js_test`'s `file`
+/// arg, `js_bundle`'s `entry` arg/`entry_file`/`outdir`, `package.json`'s own
+/// `"main"`, or any of these read back out of a cached `TargetDef` — that is
 /// anything other than a plain workspace-relative path: absolute, or
 /// `..`-escaping. `Path::join` silently *replaces* the base when the joined
-/// argument is absolute, so an unvalidated `file=/etc/passwd` addr would
+/// argument is absolute, so an unvalidated e.g. `file=/etc/passwd` addr would
 /// otherwise resolve to the literal host path in both `Provider::get`
-/// (`workspace_root.join(&test_file)`) and `driver_test.rs::run()`
-/// (`sandbox_ws_dir.join(&def.test_file)`) — a direct violation of
-/// architecture.md's target-isolation invariant ("It sees only its declared
-/// inputs; no ambient filesystem access"). Mirrors
-/// `hbuiltins::pluginfs::normalize_path`'s escape rejection (this crate
-/// cannot depend on `builtins`, and the fs-provider's own protection never
-/// fires here: `def.test_file` is a raw config string consumed directly, not
-/// a `fs:file` dep-group addr the engine resolves through it).
+/// (`workspace_root.join(...)`) and a driver's `run()`
+/// (`sandbox_ws_dir.join(...)`) — a direct violation of architecture.md's
+/// target-isolation invariant ("It sees only its declared inputs; no ambient
+/// filesystem access"). Mirrors `hbuiltins::pluginfs::normalize_path`'s
+/// escape rejection (this crate cannot depend on `builtins`, and the
+/// fs-provider's own protection never fires here: the caller's value is a
+/// raw config string consumed directly, not a `fs:file` dep-group addr the
+/// engine resolves through it).
+///
+/// `field` names the caller's own field/arg (e.g. `"entry_file"`,
+/// `"file arg"`, `"package.json main"`) so the error always names the value
+/// that actually failed — a code-quality review MAJOR previously found this
+/// hardcoding `"js_test"` even when validating an unrelated `js_bundle`
+/// field, actively misleading during debugging.
 pub(crate) fn reject_path_escape(field: &str, path: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !Path::new(path).is_absolute(),
-        "js_test {field} {path:?} must be a workspace-relative path, not absolute"
+        "{field} {path:?} must be a workspace-relative path, not absolute"
     );
     anyhow::ensure!(
         !path.split('/').any(|c| c == ".."),
-        "js_test {field} {path:?} must not contain a `..` path component"
+        "{field} {path:?} must not contain a `..` path component"
     );
     Ok(())
 }
 
-/// A validated `test_file` must additionally live under the addressed
-/// package's own directory — otherwise `//packages/a:js_test@file=<path>`
-/// could address any other real, existing, non-test file anywhere in the
-/// workspace (e.g. a sibling package's source file never surfaced by
-/// `Provider::list`), confined to the workspace but still never a real
-/// `js_test` target. `package` empty means the root package (everything not
-/// already claimed by a nested `package.json` is "under" it).
-fn test_file_under_package(package: &str, test_file: &str) -> bool {
+/// A validated workspace-relative path must additionally live under the
+/// addressed package's own directory — otherwise
+/// `//packages/a:js_test@file=<path>` (or, since M6,
+/// `//packages/a:js_bundle@entry=<path>`) could address any other real,
+/// existing file anywhere in the workspace (e.g. a sibling package's source
+/// file never surfaced by `Provider::list`), confined to the workspace but
+/// still never a real target for the addressed package. `package` empty
+/// means the root package (everything not already claimed by a nested
+/// `package.json` is "under" it).
+fn path_under_package(package: &str, path: &str) -> bool {
     if package.is_empty() {
         return true;
     }
-    test_file
-        .strip_prefix(package)
+    path.strip_prefix(package)
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
@@ -2086,6 +2917,37 @@ impl ProviderTrait for Provider {
                 }
             }
 
+            // A default (bare, no `format=`/`target=`/`entry=` addr args —
+            // resolved to `esm`/`node`/`package.json`'s own `"main"` by
+            // `Provider::get`) `js_bundle` target, listed only when the
+            // package actually has a usable default entry point — same
+            // "optional, additive listing" shape `js_test`'s discovery has
+            // just above; an entry-resolution failure here must not take
+            // `package_info` (or any other target kind in this package) down
+            // with it. Addressing a non-default variant/entry
+            // (`//pkg:js_bundle@format=cjs`, `@entry=…`) always works via
+            // `Provider::get` regardless of what's listed here — mirrors
+            // `js_test`'s identical "not every valid addr is enumerated"
+            // shape for an explicit `file=` override.
+            match self.default_entry_for_package(&req.package).await {
+                Ok(Some(_)) => {
+                    responses.push(Ok(ListResponse {
+                        addr: Addr::new(
+                            req.package.clone(),
+                            BUNDLE_TARGET.to_string(),
+                            Default::default(),
+                        ),
+                    }));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    responses.push(Err(e.context(format!(
+                        "resolving the default js_bundle entry point for {}",
+                        req.package.as_str()
+                    ))));
+                }
+            }
+
             Ok(Box::new(responses.into_iter())
                 as Box<
                     dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
@@ -2259,7 +3121,7 @@ impl ProviderTrait for Provider {
                 // doc for why (a code-quality review BLOCKER — `Path::join`
                 // silently replaces the base for an absolute argument).
                 reject_path_escape("file arg", &test_file).map_err(GetError::Other)?;
-                if !test_file_under_package(req.addr.package.as_str(), &test_file) {
+                if !path_under_package(req.addr.package.as_str(), &test_file) {
                     return Err(GetError::Other(anyhow::anyhow!(
                         "js_test addr {} names file {test_file:?} outside its own package {:?}",
                         req.addr.format(),
@@ -2283,6 +3145,121 @@ impl ProviderTrait for Provider {
                     target_spec: TargetSpec {
                         addr: req.addr.clone(),
                         driver: "js_test".to_string(),
+                        config,
+                        labels: vec![],
+                        transitive: Default::default(),
+                        approval: Default::default(),
+                    },
+                });
+            }
+
+            // `js_bundle` (M6) is a fifth per-package target kind: one addr
+            // per package, with `format`/`target`/`entry` addr args scoped
+            // to it alone — see `driver_bundle.rs` module docs for why these
+            // are plain addr args with a flat default, not a
+            // `provider_state`/ancestry-resolved variant. Checked before the
+            // `PACKAGE_INFO_TARGET` gate below for the same reason
+            // `TYPECHECK_TARGET`/`LINT_TARGET`/`TEST_TARGET` are.
+            if req.addr.name == BUNDLE_TARGET {
+                if self
+                    .skip
+                    .prunes_package(&self.workspace_root, Path::new(req.addr.package.as_str()))
+                {
+                    return Err(GetError::NotFound);
+                }
+                let package_json = self
+                    .workspace_root
+                    .join(req.addr.package.as_str())
+                    .join(PACKAGE_JSON);
+                if !package_json.is_file() {
+                    return Err(GetError::NotFound);
+                }
+
+                let format = req
+                    .addr
+                    .args
+                    .get("format")
+                    .cloned()
+                    .unwrap_or_else(|| "esm".to_string());
+                if format != "esm" && format != "cjs" {
+                    return Err(GetError::Other(anyhow::anyhow!(
+                        "js_bundle addr {} has unsupported `format` arg {format:?} — expected \
+                         \"esm\" or \"cjs\"",
+                        req.addr.format()
+                    )));
+                }
+                let target_env = req
+                    .addr
+                    .args
+                    .get("target")
+                    .cloned()
+                    .unwrap_or_else(|| "node".to_string());
+                if target_env != "node" && target_env != "browser" {
+                    return Err(GetError::Other(anyhow::anyhow!(
+                        "js_bundle addr {} has unsupported `target` arg {target_env:?} — \
+                         expected \"node\" or \"browser\"",
+                        req.addr.format()
+                    )));
+                }
+
+                let entry_file = match req.addr.args.get("entry").cloned() {
+                    Some(entry) => {
+                        // Validated *before* ever touching the filesystem —
+                        // see `js_test`'s identical `file` arg handling
+                        // above for why (a code-quality review BLOCKER).
+                        reject_path_escape("entry arg", &entry).map_err(GetError::Other)?;
+                        if !path_under_package(req.addr.package.as_str(), &entry) {
+                            return Err(GetError::Other(anyhow::anyhow!(
+                                "js_bundle addr {} names entry {entry:?} outside its own \
+                                 package {:?}",
+                                req.addr.format(),
+                                req.addr.package.as_str()
+                            )));
+                        }
+                        let entry_abs = self.workspace_root.join(&entry);
+                        let is_file = hcore::blocking::run(enclose!((entry_abs) move || {
+                            entry_abs.is_file()
+                        }))
+                        .await;
+                        if !is_file {
+                            return Err(GetError::NotFound);
+                        }
+                        entry
+                    }
+                    None => match self
+                        .default_entry_for_package(&req.addr.package)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "resolving the default js_bundle entry point for {}",
+                                req.addr.format()
+                            )
+                        })
+                        .map_err(GetError::Other)?
+                    {
+                        Some(entry) => entry,
+                        None => {
+                            return Err(GetError::Other(anyhow::anyhow!(
+                                "js_bundle addr {} has no entry point: package.json has no \
+                                 usable \"main\" field (or it names a file that doesn't exist) \
+                                 and no `entry=` addr arg was given",
+                                req.addr.format()
+                            )));
+                        }
+                    },
+                };
+
+                let config = self
+                    .bundle_config(&req.addr.package, &entry_file, &format, &target_env)
+                    .await
+                    .with_context(|| {
+                        format!("resolving js_bundle config for {}", req.addr.format())
+                    })
+                    .map_err(GetError::Other)?;
+                return Ok(GetResponse {
+                    target_spec: TargetSpec {
+                        addr: req.addr.clone(),
+                        driver: "js_bundle".to_string(),
                         config,
                         labels: vec![],
                         transitive: Default::default(),
@@ -2368,6 +3345,21 @@ mod tests {
 
     fn ctoken() -> StdCancellationToken {
         StdCancellationToken::new()
+    }
+
+    /// `GetError` implements neither `Debug` nor `Display` (it wraps a
+    /// non-`Debug` `TargetSpec`/`GetResponse` on the `Ok` side via
+    /// `Result::expect_err`'s bound, and its own `Other` variant's inner
+    /// `anyhow::Error` is the only formattable part) — assert on a
+    /// `Provider::get` failure by matching `GetError::Other` directly and
+    /// formatting its inner error, rather than via `.expect_err()`/`{err:#}`
+    /// the way a plain `anyhow::Result` failure elsewhere in this module can.
+    fn expect_get_other_error(result: Result<GetResponse, GetError>, msg: &str) -> String {
+        match result {
+            Err(GetError::Other(e)) => format!("{e:#}"),
+            Err(GetError::NotFound) => panic!("{msg}: got GetError::NotFound, expected Other(_)"),
+            Ok(_) => panic!("{msg}: got Ok(_), expected an error"),
+        }
     }
 
     /// Synthetic pnpm workspace: root + two members, one nested `node_modules`
@@ -3135,6 +4127,7 @@ mod tests {
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
                 linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
             },
         );
 
@@ -4342,22 +5335,19 @@ mod tests {
     }
 
     #[test]
-    fn test_file_under_package_confines_to_the_addressed_package() {
-        assert!(test_file_under_package(
+    fn path_under_package_confines_to_the_addressed_package() {
+        assert!(path_under_package(
             "packages/a",
             "packages/a/src/index.test.ts"
         ));
-        assert!(!test_file_under_package(
-            "packages/a",
-            "packages/b/src/index.ts"
-        ));
+        assert!(!path_under_package("packages/a", "packages/b/src/index.ts"));
         // A sibling directory that merely shares a prefix with the package
         // name must not be treated as "under" it.
-        assert!(!test_file_under_package(
+        assert!(!path_under_package(
             "packages/a",
             "packages/a-other/src/index.ts"
         ));
-        assert!(test_file_under_package("", "packages/a/src/index.test.ts"));
+        assert!(path_under_package("", "packages/a/src/index.test.ts"));
     }
 
     #[tokio::test]
@@ -5256,5 +6246,872 @@ mod tests {
             .expect("get js_test target_spec");
         assert_eq!(resp.target_spec.driver, "js_test");
         assert!(resp.target_spec.config.contains_key("runner_version"));
+    }
+
+    // ---- M6: `js_bundle` entry-point validation, cross-package closure, ----
+    // ---- and variant addr-arg wiring                                    ----
+    //
+    // `bundle_closure` (like `typecheck_deps_config`/`test_deps_config`) is
+    // deliberately bundler-binary-free, so its Input-scoping is testable
+    // unconditionally — this is the "single most important test" shape this
+    // milestone's task calls out, applied to `js_bundle`'s own differentiator:
+    // a *cross-package* transitive closure, not a one-hop trim.
+
+    /// The package's own `package.json` `"main"` becomes the default entry
+    /// — proven directly against `default_entry_for_package` (no real
+    /// bundler binary needed; the full `Provider::get` path is additionally
+    /// covered, `#[ignore]`d, by `get_resolves_js_bundle_target_end_to_end`
+    /// below). `list_discovers_js_bundle_target_only_when_main_resolves`
+    /// proves the same default drives `Provider::list`'s discovery.
+    #[tokio::test]
+    async fn default_entry_for_package_uses_package_json_main() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let entry = provider
+            .default_entry_for_package(&PkgBuf::from("packages/a"))
+            .await
+            .expect("default_entry_for_package");
+        assert_eq!(entry.as_deref(), Some("packages/a/src/index.ts"));
+    }
+
+    #[tokio::test]
+    async fn get_js_bundle_errors_when_no_main_and_no_entry_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(
+                        PkgBuf::from("packages/a"),
+                        BUNDLE_TARGET.to_string(),
+                        Default::default(),
+                    ),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        let msg = expect_get_other_error(
+            result,
+            "no main field and no entry= override must fail, not silently succeed",
+        );
+        assert!(msg.contains("entry point") || msg.contains("main"), "{msg}");
+    }
+
+    /// Task requirement: entry-point path-escape validation gets its own
+    /// unconditional test, mirroring `js_test`'s `file` addr arg tests.
+    #[tokio::test]
+    async fn get_js_bundle_rejects_dotdot_escaping_entry_arg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert(
+            "entry".to_string(),
+            "packages/a/../../../etc/passwd".to_string(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), BUNDLE_TARGET.to_string(), args),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        let msg = expect_get_other_error(result, "a `..`-escaping entry arg must be rejected");
+        assert!(msg.contains(".."));
+    }
+
+    #[tokio::test]
+    async fn get_js_bundle_rejects_absolute_entry_arg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert("entry".to_string(), "/etc/passwd".to_string());
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), BUNDLE_TARGET.to_string(), args),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        let msg = expect_get_other_error(result, "an absolute entry arg must be rejected");
+        assert!(msg.contains("absolute"));
+    }
+
+    #[tokio::test]
+    async fn get_js_bundle_rejects_entry_outside_addressed_package() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(dir.path(), "packages/b/package.json", r#"{"name": "b"}"#);
+        write(
+            dir.path(),
+            "packages/b/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert("entry".to_string(), "packages/b/src/index.ts".to_string());
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), BUNDLE_TARGET.to_string(), args),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        let msg = expect_get_other_error(
+            result,
+            "an entry outside the addressed package must be rejected",
+        );
+        assert!(msg.contains("outside its own package"));
+    }
+
+    #[tokio::test]
+    async fn get_js_bundle_not_found_for_nonexistent_entry_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert(
+            "entry".to_string(),
+            "packages/a/src/does-not-exist.ts".to_string(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), BUNDLE_TARGET.to_string(), args),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(matches!(result, Err(GetError::NotFound)));
+    }
+
+    // Task requirement: esm/cjs (and node/browser) must produce genuinely
+    // different `js_bundle` config. Proven two ways: `driver_bundle.rs`'s
+    // `parse_hash_changes_between_esm_and_cjs`/`parse_hash_changes_between_node_and_browser`
+    // (no real bundler needed — those exercise `JsBundleDef::hash` directly),
+    // and, end to end through `Provider::get`'s own addr-arg parsing,
+    // `get_js_bundle_format_and_target_addr_args_flow_into_config_e2e` below
+    // (`#[ignore]`d — reaching a *successful* `Provider::get` return
+    // additionally resolves+queries the host `esbuild` binary via
+    // `bundle_config`, unlike the rejection-path tests above which fail
+    // before ever reaching it).
+
+    #[tokio::test]
+    async fn get_js_bundle_rejects_unsupported_format_arg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let mut args = BTreeMap::new();
+        args.insert("format".to_string(), "umd".to_string());
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), BUNDLE_TARGET.to_string(), args),
+                    states: vec![],
+                    executor: Arc::new(NoopExecutor),
+                },
+                &ct,
+            )
+            .await;
+        let msg = expect_get_other_error(result, "an unsupported format addr arg must be rejected");
+        assert!(msg.contains("umd"));
+    }
+
+    /// `Provider::list` only lists the default `js_bundle` target for a
+    /// package with a usable `"main"` — mirrors `js_test`'s "no matched
+    /// files, no listed target" shape. An explicit `entry=` addr still works
+    /// via `Provider::get` regardless (proven by the tests above).
+    #[tokio::test]
+    async fn list_discovers_js_bundle_target_only_when_main_resolves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        // No "main" field at all.
+        write(dir.path(), "packages/b/package.json", r#"{"name": "b"}"#);
+        // A "main" field naming a file that doesn't exist.
+        write(
+            dir.path(),
+            "packages/c/package.json",
+            r#"{"name": "c", "main": "src/missing.ts"}"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+
+        for (pkg, expect_bundle) in [
+            ("packages/a", true),
+            ("packages/b", false),
+            ("packages/c", false),
+        ] {
+            let responses = provider
+                .list(
+                    ListRequest {
+                        request_id: "test".to_string(),
+                        package: PkgBuf::from(pkg),
+                        states: vec![],
+                        executor: Arc::new(NoopExecutor),
+                    },
+                    &ct,
+                )
+                .await
+                .expect("list")
+                .collect::<anyhow::Result<Vec<_>>>()
+                .expect("no per-entry errors");
+            let has_bundle = responses.iter().any(|r| r.addr.name == BUNDLE_TARGET);
+            let addr_names: Vec<&str> = responses.iter().map(|r| r.addr.name.as_str()).collect();
+            assert_eq!(
+                has_bundle, expect_bundle,
+                "{pkg}: expected js_bundle listed = {expect_bundle}, listed target names = \
+                 {addr_names:?}"
+            );
+        }
+    }
+
+    // ---- `bundle_closure`: cross-package transitive-closure scoping ----
+
+    /// The closure must recurse *through* a sibling workspace package, not
+    /// stop at one hop the way `build_test_closure` deliberately does for
+    /// `js_test`/`js_typecheck` — this is `js_bundle`'s stated
+    /// differentiator (see `driver_bundle.rs` module docs). Fixture: `a`'s
+    /// entry reaches sibling `b` via a relative import (the same shape
+    /// `importgraph.rs`'s own
+    /// `build_test_closure_records_cross_package_import_as_external_one_hop`
+    /// fixture uses to cross a package boundary, without needing a real
+    /// `node_modules` symlink), `b`'s own entry imports a second first-party
+    /// file `b/src/helper.ts` — both must be in the closure. A third,
+    /// unrelated workspace file must NOT be in the closure, proving the
+    /// whole-graph-not-whole-workspace scoping the task calls for.
+    #[tokio::test]
+    async fn bundle_closure_recurses_across_package_boundaries_and_excludes_unrelated_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "dependencies": {"b": "workspace:*"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "import { helper } from '../../b/src/index';\nhelper();\n",
+        );
+        write(dir.path(), "packages/b/package.json", r#"{"name": "b"}"#);
+        write(
+            dir.path(),
+            "packages/b/src/index.ts",
+            "export { helper } from './helper';\n",
+        );
+        write(
+            dir.path(),
+            "packages/b/src/helper.ts",
+            "export function helper() {}\n",
+        );
+        // Unrelated workspace content nothing in the closure ever imports.
+        write(
+            dir.path(),
+            "packages/a/src/unrelated.ts",
+            "export const unrelated = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let closure = provider
+            .bundle_closure("packages/a", "packages/a/src/index.ts")
+            .await
+            .expect("bundle_closure over the cross-package fixture");
+        let files = &closure.files;
+
+        assert!(
+            files.contains("packages/a/src/index.ts"),
+            "entry file itself must be in the closure: {files:?}"
+        );
+        assert!(
+            files.contains("packages/b/src/index.ts"),
+            "the sibling package's own entry, reached one hop out, must be in the closure: \
+             {files:?}"
+        );
+        assert!(
+            files.contains("packages/b/src/helper.ts"),
+            "a file the sibling package's entry itself imports — reached TWO hops from js_bundle's \
+             own entry — must also be in the closure; this is the whole point of not reusing \
+             build_test_closure's one-hop trim: {files:?}"
+        );
+        assert!(
+            !files.contains("packages/a/src/unrelated.ts"),
+            "a workspace file nothing in the closure imports must NOT be declared as an input \
+             (whole-graph, not whole-workspace): {files:?}"
+        );
+        assert!(
+            closure.external_addrs.is_empty(),
+            "every import in this fixture resolved to first-party content; nothing should have \
+             been treated as third-party: {:?}",
+            closure.external_addrs
+        );
+    }
+
+    /// An unresolved bare specifier (the realistic steady state on a fresh
+    /// checkout with no `node_modules` installed yet) inside the closure
+    /// must resolve to the third-party package's `js_install` addr via the
+    /// lockfile-driven mechanism — never left silently unaddressed, and
+    /// never resolved by walking an ambient `node_modules` on disk (bug
+    /// class (b) this milestone's task calls out).
+    #[tokio::test]
+    async fn bundle_closure_resolves_thirdparty_import_via_lockfile_with_no_ambient_node_modules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name": "root", "dependencies": {"lodash": "^4.17.21"}}"#,
+        );
+        write(dir.path(), "src/index.ts", "import _ from 'lodash';\n");
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root", "dependencies": { "lodash": "^4.17.21" } },
+                    "node_modules/lodash": {
+                        "version": "4.17.21",
+                        "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        );
+        // Deliberately no `node_modules/lodash` on disk — the realistic
+        // fresh-checkout state this test is named for.
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let closure = provider
+            .bundle_closure("", "src/index.ts")
+            .await
+            .expect("bundle_closure with a lockfile-resolved, not-yet-installed third-party dep");
+
+        assert!(closure.files.contains("src/index.ts"));
+        assert_eq!(
+            closure.external_addrs.len(),
+            1,
+            "{:?}",
+            closure.external_addrs
+        );
+        let addr = closure
+            .external_addrs
+            .iter()
+            .next()
+            .expect("one external addr");
+        assert!(
+            addr.contains("@heph/js/thirdparty/lodash@4.17.21"),
+            "must be the lockfile-resolved js_install addr, not an ambient node_modules path: {addr}"
+        );
+        assert_eq!(
+            closure.external_names,
+            BTreeSet::from(["lodash".to_string()]),
+            "the bare specifier name esbuild's own --external:<name> flag needs must be \
+             captured alongside the resolved addr: {:?}",
+            closure.external_names
+        );
+    }
+
+    // ---- bundler config discovery (bundle_deps_config: no real bundler binary needed) ----
+
+    #[tokio::test]
+    async fn bundle_deps_config_declares_bundler_config_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/esbuild.config.json",
+            r#"{"external": ["react", "react-dom"]}"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let result = provider
+            .bundle_deps_config(&PkgBuf::from("packages/a"), "packages/a/src/index.ts")
+            .await
+            .expect("bundle_deps_config with a real esbuild.config.json present");
+
+        assert_eq!(result.bundler_config_path, "packages/a/esbuild.config.json");
+        assert_eq!(result.external, vec!["react", "react-dom"]);
+        assert!(
+            dep_addrs(&result.deps, "bundler_config")
+                .iter()
+                .any(|a| a.contains("esbuild.config.json")),
+            "the resolved bundler config file must be a declared \"bundler_config\" input: \
+             {:?}",
+            result.deps
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_deps_config_no_bundler_config_group_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let result = provider
+            .bundle_deps_config(&PkgBuf::from("packages/a"), "packages/a/src/index.ts")
+            .await
+            .expect("bundle_deps_config with no esbuild.config.json");
+
+        assert_eq!(result.bundler_config_path, "");
+        assert_eq!(result.bundler_config_content, "");
+        assert!(result.external.is_empty());
+        assert!(dep_addrs(&result.deps, "bundler_config").is_empty());
+    }
+
+    /// Feature-quality M6 review BLOCKER: `--external` bundler flags were
+    /// derived only from a bundler config file's own opt-in `"external"`
+    /// array — the closure's own discovered third-party bare specifiers
+    /// (the realistic case for essentially every real npm dependency) never
+    /// reached it, so `esbuild --bundle` hard-failed on every real
+    /// third-party import. Proves the union: a closure-discovered name
+    /// (`lodash`, no config file at all) and a config-file-only name
+    /// (`react`, via the config's `"external"` array) both end up in
+    /// `BundleDepsConfig::external`.
+    #[tokio::test]
+    async fn bundle_deps_config_externals_union_closure_discovered_and_config_file_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name": "root", "dependencies": {"lodash": "^4.17.21"}}"#,
+        );
+        write(dir.path(), "src/index.ts", "import _ from 'lodash';\n");
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root", "dependencies": { "lodash": "^4.17.21" } },
+                    "node_modules/lodash": {
+                        "version": "4.17.21",
+                        "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        );
+        // "moment" is never actually imported — an opt-in-only config entry
+        // (e.g. externalizing a peer dep the entry doesn't itself import
+        // yet) must still survive the union, not be dropped in favor of the
+        // closure's own discoveries.
+        write(
+            dir.path(),
+            "esbuild.config.json",
+            r#"{"external": ["moment"]}"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let result = provider
+            .bundle_deps_config(&PkgBuf::from(""), "src/index.ts")
+            .await
+            .expect(
+                "bundle_deps_config over a mixed closure-discovered/config-file external fixture",
+            );
+
+        assert_eq!(
+            result.external,
+            vec!["lodash".to_string(), "moment".to_string()],
+            "must union the closure's own discovered third-party name (lodash, no config entry) \
+             with the bundler config's opt-in name (moment, never actually imported): {:?}",
+            result.external
+        );
+    }
+
+    /// Code-quality M6 review BLOCKER: `js_bundle` never declared/staged/
+    /// hashed the entry package's own tsconfig, even though esbuild reads
+    /// `compilerOptions` (`paths`/`baseUrl`/`jsx`/decorators/target) from it
+    /// the same way `tsc` does — a package using a tsconfig `paths` alias
+    /// (a mainstream TS-monorepo pattern) would fail at real `esbuild`
+    /// execution because the sandbox never had a `tsconfig.json` at all.
+    /// Proves the resolved tsconfig is both declared as a `"tsconfig"` Input
+    /// (so it's staged) and returned for direct hashing, for a package whose
+    /// entry point only resolves via a `paths` alias.
+    #[tokio::test]
+    async fn bundle_deps_config_declares_and_hashes_tsconfig_for_a_paths_aliased_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/tsconfig.json",
+            r#"{"compilerOptions": {"baseUrl": ".", "paths": {"@app/*": ["src/*"]}}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export { helper } from '@app/utils';\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/utils.ts",
+            "export function helper() {}\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let result = provider
+            .bundle_deps_config(&PkgBuf::from("packages/a"), "packages/a/src/index.ts")
+            .await
+            .expect("bundle_deps_config over a paths-aliased entry point");
+
+        assert_eq!(result.tsconfig_path, "packages/a/tsconfig.json");
+        assert!(
+            result.tsconfig_content.contains("@app/*"),
+            "the resolved tsconfig's own raw content must be hashed directly: {:?}",
+            result.tsconfig_content
+        );
+        assert!(
+            dep_addrs(&result.deps, "tsconfig")
+                .iter()
+                .any(|a| a.contains("packages/a/tsconfig.json")),
+            "the resolved tsconfig must be a declared \"tsconfig\" input so it's staged into the \
+             sandbox at the path esbuild expects: {:?}",
+            result.deps
+        );
+    }
+
+    /// No tsconfig anywhere on the ancestor chain: `bundle_deps_config` must
+    /// not declare a `"tsconfig"` group or fail — mirrors
+    /// `bundle_deps_config_no_bundler_config_group_when_absent`'s identical
+    /// "absence is not an error" shape for the bundler config.
+    #[tokio::test]
+    async fn bundle_deps_config_no_tsconfig_group_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let result = provider
+            .bundle_deps_config(&PkgBuf::from("packages/a"), "packages/a/src/index.ts")
+            .await
+            .expect("bundle_deps_config with no tsconfig.json");
+
+        assert_eq!(result.tsconfig_path, "");
+        assert_eq!(result.tsconfig_content, "");
+        assert!(dep_addrs(&result.deps, "tsconfig").is_empty());
+    }
+
+    /// Feature-quality/hermeticity M6 review finding: `bundle_closure`'s BFS
+    /// is provably invariant across `js_bundle`'s `format`/`target` variant
+    /// axis for the same entry point, but was recomputed from scratch on
+    /// every `Provider::get` — unlike every other expensive per-target-kind
+    /// computation in this file. Proves two independent `bundle_closure`
+    /// calls for the same `(entry_pkg, entry_file_rel)` share one BFS
+    /// (mirrors `import_graph_is_shared_across_independent_callers`'s own
+    /// `graph_build_count` proof technique, one layer up: a shared
+    /// `import_graph` call underneath is *also* memoized, so a second
+    /// `bundle_closure` call that actually re-walks would still show as a
+    /// second `import_graph` build).
+    #[tokio::test]
+    async fn bundle_closure_is_shared_across_independent_callers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+
+        provider
+            .bundle_closure("packages/a", "packages/a/src/index.ts")
+            .await
+            .expect("first bundle_closure call");
+        assert_eq!(
+            provider
+                .graph_build_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first bundle_closure call must build the import graph exactly once"
+        );
+
+        provider
+            .bundle_closure("packages/a", "packages/a/src/index.ts")
+            .await
+            .expect("second bundle_closure call for the same entry point (a different variant)");
+        assert_eq!(
+            provider
+                .graph_build_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second bundle_closure call for the same (entry_pkg, entry_file_rel) — e.g. a \
+             sibling format=cjs variant of the same package — must reuse the memoized closure, \
+             not re-walk the BFS (and, one layer down, not re-build the import graph either)"
+        );
+    }
+
+    // ---- run() precondition: Provider::get end to end, gated on a real ----
+    // ---- esbuild binary being available in this devenv                 ----
+    //
+    // Everything above (bundle_closure/bundle_deps_config) tests Input-scoping
+    // behavior and needs no real bundler. `Provider::get` for `js_bundle`
+    // additionally resolves+queries the host `esbuild` binary's own
+    // `--version` (see `resolved_host_bundler`), so these two mirror
+    // `get_resolves_js_typecheck_target_end_to_end`'s identical `#[ignore]`
+    // gating and reasoning.
+
+    #[tokio::test]
+    #[ignore = "requires a real `esbuild` on PATH — devenv.nix provisions no Node/esbuild \
+                toolchain (see toolchain.rs module docs); run explicitly with \
+                `cargo test -- --ignored` on a host with esbuild installed"]
+    async fn get_resolves_js_bundle_target_end_to_end() {
+        find_real_bin_for_test("esbuild").expect(
+            "this test is #[ignore]d precisely because esbuild isn't guaranteed on PATH — it \
+             was run explicitly, so a missing esbuild here is a real failure, not a skip",
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(
+                        PkgBuf::from("packages/a"),
+                        BUNDLE_TARGET.to_string(),
+                        Default::default(),
+                    ),
+                    states: vec![],
+                    executor: Arc::new(NoopExecutor),
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_bundle target_spec");
+        assert_eq!(resp.target_spec.driver, "js_bundle");
+        assert!(resp.target_spec.config.contains_key("bundler_version"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real `esbuild` on PATH — devenv.nix provisions no Node/esbuild \
+                toolchain (see toolchain.rs module docs); run explicitly with \
+                `cargo test -- --ignored` on a host with esbuild installed"]
+    async fn get_js_bundle_format_and_target_addr_args_flow_into_config_e2e() {
+        find_real_bin_for_test("esbuild").expect(
+            "this test is #[ignore]d precisely because esbuild isn't guaranteed on PATH — it \
+             was run explicitly, so a missing esbuild here is a real failure, not a skip",
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+
+        let mut args = BTreeMap::new();
+        args.insert("format".to_string(), "cjs".to_string());
+        args.insert("target".to_string(), "browser".to_string());
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), BUNDLE_TARGET.to_string(), args),
+                    states: vec![],
+                    executor: Arc::new(NoopExecutor),
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_bundle target_spec with explicit format/target args");
+        assert_eq!(
+            resp.target_spec.config.get("format"),
+            Some(&Value::String("cjs".to_string()))
+        );
+        assert_eq!(
+            resp.target_spec.config.get("target"),
+            Some(&Value::String("browser".to_string()))
+        );
+    }
+
+    /// Feature-quality M6 review BLOCKER: `outdir` was computed purely from
+    /// the package path, with no `format`/`target` component, so
+    /// `js_bundle@format=esm` and `js_bundle@format=cjs` for the same
+    /// package declared the identical `Content::DirPath` output — the
+    /// milestone's own headline dual-format-publish use case collided on
+    /// the same declared output directory. Proves two variants of the same
+    /// package now produce distinct `outdir` values.
+    #[tokio::test]
+    #[ignore = "requires a real `esbuild` on PATH — devenv.nix provisions no Node/esbuild \
+                toolchain (see toolchain.rs module docs); run explicitly with \
+                `cargo test -- --ignored` on a host with esbuild installed"]
+    async fn get_js_bundle_variants_of_the_same_package_get_distinct_outdirs() {
+        find_real_bin_for_test("esbuild").expect(
+            "this test is #[ignore]d precisely because esbuild isn't guaranteed on PATH — it \
+             was run explicitly, so a missing esbuild here is a real failure, not a skip",
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+
+        let get_outdir = |args: BTreeMap<String, String>| {
+            let provider = &provider;
+            let ct = &ct;
+            async move {
+                let resp = provider
+                    .get(
+                        GetRequest {
+                            request_id: "test".to_string(),
+                            addr: Addr::new(
+                                PkgBuf::from("packages/a"),
+                                BUNDLE_TARGET.to_string(),
+                                args,
+                            ),
+                            states: vec![],
+                            executor: Arc::new(NoopExecutor),
+                        },
+                        ct,
+                    )
+                    .await
+                    .expect("get js_bundle target_spec");
+                match resp.target_spec.config.get("outdir") {
+                    Some(Value::String(s)) => s.clone(),
+                    other => panic!("expected outdir to be a string, got {other:?}"),
+                }
+            }
+        };
+
+        let esm_node_outdir = get_outdir(BTreeMap::new()).await;
+
+        let mut cjs_browser_args = BTreeMap::new();
+        cjs_browser_args.insert("format".to_string(), "cjs".to_string());
+        cjs_browser_args.insert("target".to_string(), "browser".to_string());
+        let cjs_browser_outdir = get_outdir(cjs_browser_args).await;
+
+        assert_ne!(
+            esm_node_outdir, cjs_browser_outdir,
+            "two variants of the same package must not declare the same output directory — the \
+             default esm/node outdir was {esm_node_outdir:?}, cjs/browser was \
+             {cjs_browser_outdir:?}"
+        );
     }
 }
