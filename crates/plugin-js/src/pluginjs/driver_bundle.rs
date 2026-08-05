@@ -373,8 +373,7 @@ impl ManagedDriver for JsBundleDriver {
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
         let pkg = addr.package.clone();
-        let spec =
-            JsBundleSpec::from(req.target_spec.config.clone()).context("parse js_bundle config")?;
+        let spec = JsBundleSpec::from(&req.target_spec.config).context("parse js_bundle config")?;
 
         anyhow::ensure!(
             spec.format == "esm" || spec.format == "cjs",
