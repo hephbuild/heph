@@ -329,6 +329,16 @@ in
   #   e2e                      # build them from this tree (local default)
   #   HEPH_E2E_FROM=dist e2e   # use an already-downloaded set (CI)
   #
+  # Deliberately does NOT build/stage `plugin-js-cdylib` here (as of the
+  # bench js/go/both selector work): every artifact this script stages is
+  # named because `crates/bin-e2e/tests/plugin_dylib.rs` actually dlopens it
+  # (`shipped_go_cdylib_loads` / `shipped_gha_cdylib_loads`) — there is no
+  # equivalent js test yet. Adding it here would build an artifact `e2e`
+  # never exercises, purely for its own build-time cost. `qualityCrates`
+  # above already lints/fmts `plugin-js-cdylib` without `e2e` testing it —
+  # same asymmetry, same reason. Revisit once a `shipped_js_cdylib_loads`
+  # test exists; add both together.
+  #
   # Both branches converge on the same normalized layout, so the tests never
   # learn which one ran. Extra args pass through to cargo test (e.g.
   # `e2e tui_pty -- --nocapture`).

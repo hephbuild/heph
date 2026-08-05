@@ -108,6 +108,10 @@ jobs:
       PERFBENCH_LAYERS: "10"
       PERFBENCH_FAN_OUT: "4"
       PERFBENCH_GO_PACKAGES: "60"
+      # Same corpus size as go's — no measured reason yet to size the two
+      # differently, and keeping them equal makes go-vs-js deltas easier to
+      # read at a glance.
+      PERFBENCH_JS_PACKAGES: "60"
       # 3 was too few to tell signal from CI-runner noise (the first live
       # runs showed exactly that). Interleaving (see the run steps below)
       # fixes systematic drift between candidate/baseline; more reps is what
@@ -240,6 +244,21 @@ jobs:
             echo "no heph-bench asset in ${{ steps.baseline_release.outputs.version }} — predates publishing it, Tier A skipped"
             echo "bench_ok=false" >> "$GITHUB_OUTPUT"
           fi
+          # js plugin cdylib, fetched separately and best-effort for the same
+          # bootstrap reason as heph-bench above: baseline releases published
+          # before the bench js/go/both selector landed have no
+          # heph-js-plugin_<os>_<arch> asset at all, and that must not fail
+          # this whole step (go's Tier B comparison must still run).
+          if gh release download "${{ steps.baseline_release.outputs.version }}" \
+              --repo hephbuild/heph-artifacts-v1 \
+              --dir baseline-dist-raw \
+              --pattern "heph-js-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"; then
+            cp "baseline-dist-raw/heph-js-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" "baseline-dist/heph-js-plugin.$ext"
+            echo "js_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no heph-js-plugin asset in ${{ steps.baseline_release.outputs.version }} — predates publishing it, JS Tier B skipped"
+            echo "js_ok=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Download candidate (N) artifacts
         uses: actions/download-artifact@v7
@@ -255,6 +274,11 @@ jobs:
           cp "candidate-dist-raw/heph_${{ matrix.os }}_${{ matrix.arch }}" candidate-dist/heph
           cp "candidate-dist-raw/heph-bench_${{ matrix.os }}_${{ matrix.arch }}" candidate-dist/heph-bench
           cp "candidate-dist-raw/heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" "candidate-dist/heph-go-plugin.$ext"
+          # Candidate is always this same run's `build` job — no bootstrap gap
+          # like baseline's (see "Fetch baseline" above), so this is
+          # unconditional: the js plugin cdylib is always present here once
+          # the `build` job publishes it.
+          cp "candidate-dist-raw/heph-js-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" "candidate-dist/heph-js-plugin.$ext"
           chmod +x candidate-dist/heph candidate-dist/heph-bench
 
       - name: Generate corpus
@@ -264,6 +288,7 @@ jobs:
             --targets "$PERFBENCH_TARGETS" --packages "$PERFBENCH_PACKAGES" \
             --layers "$PERFBENCH_LAYERS" --fan-out "$PERFBENCH_FAN_OUT" \
             --go-packages "$PERFBENCH_GO_PACKAGES" \
+            --js-packages "$PERFBENCH_JS_PACKAGES" \
             --out bench-corpus
 
       # `heph-bench run inprocess`/`run dist` are themselves the orchestrator
@@ -301,6 +326,41 @@ jobs:
               --out-candidate "candidate_dist_${scenario}.json" --out-baseline "baseline_dist_${scenario}.json"
           done
 
+      # Separate `--lang js` invocation (rather than folding into the go step
+      # above via `--lang both`) so `distjs` is its own tier below, gated on
+      # its own `js_ok` (baseline releases predating the js plugin cdylib
+      # must not sink the go comparison). The "Compare and report" jq merge
+      # below flattens `.scenarios[]` (not a hardcoded `[0]`) specifically so
+      # a future `--lang both` invocation — two `ScenarioResult`s per file —
+      # merges both instead of silently dropping the second.
+      #
+      # KNOWN GAP, disclosed rather than silently left: every generated js
+      # package always lists a `js_lint` target (`oxlint` by default) and,
+      # once it has a usable entry point, a `js_bundle` target (`esbuild`) —
+      # see `crates/plugin-js/src/pluginjs/provider.rs`'s `list()`. Neither
+      # tool is installed on these runners (no `setup-node`/`oxlint`/`esbuild`
+      # anywhere in this repo's workflows or `devenv.nix` as of this change),
+      # and this plugin has "no hermetic toolchain yet" for either (its own
+      # error message says so) — so this step will fail with "no oxlint/
+      # esbuild binary found" every run until a js toolchain is provisioned
+      # for CI. `continue-on-error: true` + "Compare and report"'s missing-
+      # file handling absorb that the same way a missing baseline artifact
+      # is absorbed elsewhere in this job: the `distjs` tier reports "no
+      # results", nothing else in this job is affected. Provisioning that
+      # toolchain is a separate, larger decision (which linter/bundler
+      # version, hermetic vs host) left for a follow-up.
+      - name: Time Tier B (dist) JS scenarios
+        if: steps.baseline_fetch.outputs.ok == 'true' && steps.baseline_fetch.outputs.js_ok == 'true'
+        continue-on-error: true
+        run: |
+          for scenario in cold full-hit incremental; do
+            ./candidate-dist/heph-bench run dist \
+              --candidate-dist candidate-dist --baseline-dist baseline-dist \
+              --corpus bench-corpus --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_REPS" \
+              --lang js \
+              --out-candidate "candidate_distjs_${scenario}.json" --out-baseline "baseline_distjs_${scenario}.json"
+          done
+
       # Every scenario/tier combination is always attempted and reported —
       # `--allow-regression` keeps an individual `compare` call from ever
       # exiting non-zero, so one regression doesn't cut the table short. The
@@ -330,11 +390,15 @@ jobs:
               echo ""
               echo "_FAILED: no published release found for baseline \`${{ steps.base.outputs.sha }}\`_"
             else
-              for tier in inproc dist; do
+              for tier in inproc dist distjs; do
                 echo ""
                 echo "## Tier: $tier"
                 if [ "$tier" = "inproc" ] && [ "${{ steps.baseline_fetch.outputs.bench_ok }}" != "true" ]; then
                   echo "_skipped: baseline release predates publishing \`heph-bench\`_"
+                  continue
+                fi
+                if [ "$tier" = "distjs" ] && [ "${{ steps.baseline_fetch.outputs.js_ok }}" != "true" ]; then
+                  echo "_skipped: baseline release predates publishing the js plugin cdylib_"
                   continue
                 fi
                 base_files=()
@@ -351,8 +415,13 @@ jobs:
                   echo "_no results (run step failed — see logs)_"
                   continue
                 fi
-                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[0]]}' "${base_files[@]}" > "merged_baseline_${tier}.json"
-                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[0]]}' "${cand_files[@]}" > "merged_candidate_${tier}.json"
+                # `.scenarios[]`, not a hardcoded `.scenarios[0]`: a
+                # single-scenario result file (every tier today) still
+                # yields exactly one element, but a future `--lang both`
+                # result file (two `ScenarioResult`s per file) merges both
+                # instead of silently keeping only the first.
+                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[]]}' "${base_files[@]}" > "merged_baseline_${tier}.json"
+                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[]]}' "${cand_files[@]}" > "merged_candidate_${tier}.json"
                 "$BENCH" compare --baseline "merged_baseline_${tier}.json" --candidate "merged_candidate_${tier}.json" \
                   --thresholds "$GITHUB_WORKSPACE/.github/perfbench-thresholds.json" \
                   --json "verdicts/${tier}.json" \
