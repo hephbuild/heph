@@ -167,7 +167,14 @@ pub fn build_spec(
             Value::List(vec![Value::String(out_file)]),
         )])),
     );
-
+    // NOTE: `build_lib` stays remote-cached even though running it is one `mv`.
+    // Cheap to run is not the same as cheap to *need*: a dependent needs this
+    // target's hashout to compute its own input hash, and a remote manifest
+    // carries that with no blob transfer at all. Opting out of the remote cache
+    // would mean the hashout could only come from executing, and executing needs
+    // `install|pkg` staged — so a build that is otherwise 100% remote hits would
+    // download the entire compiled std to learn a hash it can currently fetch
+    // for free.
     TargetSpec {
         addr,
         driver: "sh".to_string(),
@@ -325,6 +332,31 @@ mod tests {
             _ => panic!("deps must be map"),
         };
         assert!(!deps.contains_key(crate::plugingo::addr_util::GO_SDK_DEP_GROUP));
+    }
+
+    /// `build_lib` must stay remote-cacheable. Running it is one `mv`, which
+    /// makes opting out of the remote cache look free — it is not. A dependent
+    /// needs this target's hashout to compute its own input hash, and a remote
+    /// manifest carries hashouts with no blob transfer, whereas producing the
+    /// hashout locally means executing, and executing means `install|pkg` is
+    /// staged. Opting out would turn a free hash lookup into a download of the
+    /// entire compiled std on a build that is otherwise 100% cache hits.
+    #[test]
+    fn test_build_lib_stays_remote_cacheable() {
+        use hplugin::htspec::{FromSpecValue, TargetSpecCache};
+
+        let spec = build_spec(build_lib_addr(), "fmt", &test_factors(), &test_vref());
+        // An absent `cache` is both tiers on — the same default the driver applies.
+        let cache = match spec.config.get("cache") {
+            Some(v) => TargetSpecCache::from_spec_value(v).expect("`cache` must parse"),
+            None => TargetSpecCache::default(),
+        };
+        assert!(
+            cache.remote,
+            "std build_lib must stay remote-cacheable: a dependent reads its hashout \
+             from the remote manifest for free, and rebuilding it locally drags the \
+             whole `install` output down with it"
+        );
     }
 
     #[test]

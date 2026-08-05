@@ -179,7 +179,25 @@ impl ManagedDriver for GoTestmainDriver {
                 inputs,
                 outputs,
                 support_files: vec![],
-                cache: CacheConfig::on(true),
+                // Local cache only (`on(false)` = local on, remote off).
+                // Generating testmain.go is a scan of the package's test files
+                // plus a string build — microseconds, in-process, no subprocess.
+                //
+                // Opting out of the remote cache means this target executes
+                // whenever the local cache is cold, because a dependent needs
+                // its hashout and only a cache hit or a real run can produce
+                // one. That is the whole cost here, and it is bounded: the
+                // inputs are materialized either way — the provider reads the
+                // golist `package.bin` to build this spec at all, and the test
+                // sources are workspace files. Nothing is dragged in.
+                //
+                // This is exactly why `@heph/go/std/…:build_lib` keeps its
+                // remote cache despite being one `mv`: running *it* needs the
+                // whole `install|pkg` staged, so the same trade there would
+                // download all of std to learn a hash the remote manifest
+                // hands over for free. Cheap to run is not enough — the inputs
+                // have to already be there.
+                cache: CacheConfig::on(false),
                 pty: false,
                 hash,
                 transparent: false,
@@ -332,6 +350,20 @@ mod tests {
                 .any(|i| i.origin_id == "dep|golist|0"),
             "golist input must be present"
         );
+    }
+
+    /// Generating testmain.go is cheaper than fetching it, so the target stays
+    /// in the local cache and out of the remote one.
+    #[tokio::test]
+    async fn test_parse_keeps_testmain_out_of_the_remote_cache() {
+        let ct = noop_ctoken();
+        let req = make_parse_request("mypkg", "//mypkg:_golist|pkg");
+        let resp = driver().parse(req, &ct).await.unwrap();
+        assert!(
+            resp.target_def.cache.enabled,
+            "local cache must stay on — regenerating on every build is not the goal"
+        );
+        assert!(!resp.target_def.cache.remote_enabled);
     }
 
     #[tokio::test]
