@@ -112,11 +112,11 @@ pub enum BuildEventKind {
         addr: String,
         error: Option<String>,
     },
-    /// One target finished garbage collection: how many cache revisions it
-    /// dropped and how many bytes those revisions freed (summed from manifest
-    /// artifact sizes). Emitted once per target the `heph gc` sweep visits —
-    /// including targets that dropped nothing — so a consumer can show both the
-    /// count of targets explored and the total data reclaimed.
+    /// One target finished a cache sweep: how many cache revisions it dropped
+    /// and how many bytes those revisions freed (summed from manifest artifact
+    /// sizes). Emitted once per target visited by `heph tool gc` or by
+    /// `heph tool clean` — including targets that dropped nothing — so a consumer can
+    /// show both the count of targets explored and the total data reclaimed.
     GcTargetSwept {
         revisions_removed: usize,
         bytes_removed: u64,

@@ -174,7 +174,11 @@ impl Engine {
     /// manifest itself. Returns the bytes freed (Σ manifest artifact sizes).
     /// Best-effort if the manifest is missing (still removes the manifest key in
     /// case of a partial write; reports 0 bytes).
-    fn gc_entry(&self, addr: &Addr, hashin: &str) -> Result<u64> {
+    ///
+    /// Shared with [`Engine::clean`]: both commands delete revisions, and only
+    /// the *choice* of which ones differs. Callers must hold the addr's write
+    /// lock.
+    pub(crate) fn gc_entry(&self, addr: &Addr, hashin: &str) -> Result<u64> {
         let mut bytes = 0u64;
         if let Some(manifest) = self.read_manifest(addr, hashin)? {
             for a in &manifest.artifacts {
@@ -877,6 +881,7 @@ fn emit_gc_target_swept(rs: &RequestState, revisions_removed: usize, bytes_remov
 mod tests {
     use super::*;
     use crate::engine::Config;
+    use crate::engine::cache_test_support::{addr, present, test_engine, wlock, write_revision};
     use crate::engine::local_cache::{
         EntryWriter, Existence, LocalCache, MANIFEST_V1, Manifest, ManifestArtifact,
         ManifestArtifactContentType, ManifestArtifactEncoding, ManifestArtifactType, PendingWrite,
@@ -884,23 +889,8 @@ mod tests {
     };
     use crate::engine::local_cache_test_double::ForwardingCache;
     use hcore::hasync::StdCancellationToken;
-    use hmodel::htpkg::PkgBuf;
-    use std::collections::BTreeMap;
     use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    fn test_engine() -> (Arc<Engine>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _rt = crate::engine::test_rt_enter();
-        let engine = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
-            parallelism: None,
-            ..Default::default()
-        })
-        .expect("engine");
-        (Arc::new(engine), dir)
-    }
 
     /// Engine whose durable cache spills any blob over `spill` bytes to the FS
     /// store, so GC tests can exercise reclaiming filesystem-spilled blobs
@@ -1116,75 +1106,6 @@ mod tests {
                 }),
         );
         (Arc::new(engine), barrier_reads, manifest_reads, dir)
-    }
-
-    fn addr(name: &str) -> Addr {
-        Addr::new(PkgBuf::from("pkg"), name.to_string(), BTreeMap::new())
-    }
-
-    /// Write a cache revision with a controlled `created_at` and artifact set,
-    /// so recency ordering is deterministic (real writes stamp wall-clock time).
-    fn write_revision(
-        engine: &Engine,
-        addr: &Addr,
-        hashin: &str,
-        created: i64,
-        artifacts: &[&str],
-    ) {
-        for name in artifacts {
-            let mut w = engine
-                .local_cache
-                .writer(addr, hashin, name)
-                .expect("writer");
-            w.write_all(b"data").expect("write artifact");
-            w.commit().expect("commit artifact");
-        }
-        let manifest = Manifest {
-            version: "1.0.0".to_string(),
-            target: addr.format(),
-            created_at_nanos: created,
-            hashin: hashin.to_string(),
-            artifacts: artifacts
-                .iter()
-                .map(|name| ManifestArtifact {
-                    hashout: "ho".to_string(),
-                    group: String::new(),
-                    name: (*name).to_string(),
-                    size: 4,
-                    r#type: ManifestArtifactType::Output,
-                    content_type: ManifestArtifactContentType::Tar,
-                    encoding: ManifestArtifactEncoding::None,
-                })
-                .collect(),
-        };
-        let mut w = engine
-            .local_cache
-            .writer(addr, hashin, MANIFEST_V1)
-            .expect("manifest writer");
-        borsh::to_writer(&mut w, &manifest).expect("write manifest");
-        w.commit().expect("commit manifest");
-        // Barrier: ensure the write landed before callers enumerate.
-        assert!(
-            engine
-                .local_cache
-                .exists(addr, hashin, MANIFEST_V1)
-                .expect("exists")
-        );
-    }
-
-    fn present(engine: &Engine, addr: &Addr, hashin: &str) -> bool {
-        engine
-            .local_cache
-            .exists(addr, hashin, MANIFEST_V1)
-            .expect("exists")
-    }
-
-    async fn wlock(engine: &Engine, addr: &Addr) -> ResultWriteGuard {
-        engine
-            .result_lock()
-            .write(addr, &StdCancellationToken::new())
-            .await
-            .expect("write lock")
     }
 
     #[tokio::test]

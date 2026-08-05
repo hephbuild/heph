@@ -73,8 +73,12 @@ mod execute;
 mod managed_register;
 mod result_lock;
 pub use result_lock::{LockBackend, ResultLock};
+#[cfg(test)]
+pub(crate) mod cache_test_support;
+mod clean;
 mod expand;
 pub mod fanout;
+pub use clean::CleanStats;
 mod gc;
 pub use gc::GcStats;
 pub mod gitignore;
