@@ -17,7 +17,7 @@ use oci_client::manifest::OciImageIndex;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
-use super::archive::{self, Layout};
+use super::archive::Layout;
 
 /// Build a client for `insecure` (plain HTTP / self-signed) or the default TLS.
 fn client(insecure: bool) -> Client {
@@ -138,14 +138,16 @@ pub(crate) async fn push_layout(
     // with MANIFEST_BLOB_UNKNOWN.
     let manifests = entries
         .iter()
-        .map(|(platform, digest, size)| oci_client::manifest::ImageIndexEntry {
-            media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
-            artifact_type: None,
-            digest: digest.clone(),
-            size: *size,
-            platform: platform.clone(),
-            annotations: None,
-        })
+        .map(
+            |(platform, digest, size)| oci_client::manifest::ImageIndexEntry {
+                media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+                artifact_type: None,
+                digest: digest.clone(),
+                size: *size,
+                platform: platform.clone(),
+                annotations: None,
+            },
+        )
         .collect();
 
     let index = OciImageIndex {
@@ -161,12 +163,15 @@ pub(crate) async fn push_layout(
         .context("push manifest list")
 }
 
-/// Pull `reference` into an in-memory layout.
+/// Pull the selected platforms of `reference` into an in-memory layout.
 ///
-/// `platform` selects one instance out of a manifest list; `None` takes the
-/// whole index, which is what a base image for a multi-platform build needs.
+/// Goes through the raw manifest rather than `Client::pull`, which resolves a
+/// multi-platform index against the *client's own* default platform — on an
+/// arm64 mac that matches nothing in a `linux/*` index, and it gives the caller
+/// no way to ask for a platform, let alone several.
 pub(crate) async fn pull_layout(
     reference: &str,
+    platforms: &super::pull::PlatformSelect,
     insecure: bool,
 ) -> anyhow::Result<(OciImageIndex, std::collections::HashMap<String, Vec<u8>>)> {
     let reference: Reference = reference
@@ -175,46 +180,139 @@ pub(crate) async fn pull_layout(
     let client = client(insecure);
     let auth = auth_for(&reference);
 
-    let image = client
-        .pull(
-            &reference,
-            &auth,
-            vec![
-                oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
-                oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
-                oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
-            ],
-        )
+    const ACCEPTED: &[&str] = &[
+        oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
+        oci_client::manifest::IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+        oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+        oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+    ];
+    let (raw, digest) = client
+        .pull_manifest_raw(&reference, &auth, ACCEPTED)
         .await
-        .with_context(|| format!("pull {reference}"))?;
+        .with_context(|| format!("pull the manifest of {reference}"))?;
 
     let mut blobs = std::collections::HashMap::new();
-    let config_digest = archive::sha256_digest(&image.config.data);
-    blobs.insert(config_digest.clone(), image.config.data.to_vec());
-    for layer in &image.layers {
-        blobs.insert(archive::sha256_digest(&layer.data), layer.data.to_vec());
-    }
 
-    let manifest = image
-        .manifest
-        .context("registry returned no manifest for the pulled image")?;
-    let manifest_bytes = serde_json::to_vec(&manifest).context("encode manifest")?;
-    let manifest_digest = archive::sha256_digest(&manifest_bytes);
-    blobs.insert(manifest_digest.clone(), manifest_bytes.clone());
+    // An index: choose among its instances. A bare manifest: there is nothing to
+    // choose, and asking for a platform it does not advertise would be pedantry.
+    let entries = match serde_json::from_slice::<OciImageIndex>(&raw) {
+        Ok(index) if !index.manifests.is_empty() => {
+            blobs.insert(digest.clone(), raw.to_vec());
+            select_entries(&index, platforms)?
+        }
+        _ => {
+            let manifest: oci_client::manifest::OciImageManifest =
+                serde_json::from_slice(&raw).context("parse image manifest")?;
+            blobs.insert(digest.clone(), raw.to_vec());
+            pull_one(&client, &reference, &auth, &manifest, &mut blobs).await?;
+            let index = OciImageIndex {
+                schema_version: 2,
+                media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+                artifact_type: None,
+                manifests: vec![oci_client::manifest::ImageIndexEntry {
+                    media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+                    artifact_type: None,
+                    digest,
+                    size: raw.len() as i64,
+                    platform: None,
+                    annotations: None,
+                }],
+                annotations: None,
+            };
+            return Ok((index, blobs));
+        }
+    };
+
+    for entry in &entries {
+        let by_digest: Reference = format!(
+            "{}/{}@{}",
+            reference.resolve_registry(),
+            reference.repository(),
+            entry.digest
+        )
+        .parse()
+        .context("build a digest reference")?;
+        let (raw, _) = client
+            .pull_manifest_raw(&by_digest, &auth, ACCEPTED)
+            .await
+            .with_context(|| format!("pull the manifest for {}", entry.digest))?;
+        let manifest: oci_client::manifest::OciImageManifest =
+            serde_json::from_slice(&raw).context("parse a platform's manifest")?;
+        blobs.insert(entry.digest.clone(), raw.to_vec());
+        pull_one(&client, &reference, &auth, &manifest, &mut blobs).await?;
+    }
 
     let index = OciImageIndex {
         schema_version: 2,
         media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
         artifact_type: None,
-        manifests: vec![oci_client::manifest::ImageIndexEntry {
-            media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
-            artifact_type: None,
-            digest: manifest_digest,
-            size: manifest_bytes.len() as i64,
-            platform: None,
-            annotations: None,
-        }],
+        manifests: entries,
         annotations: None,
     };
     Ok((index, blobs))
+}
+
+/// The index entries the selection asks for, or an error naming what is on offer.
+fn select_entries(
+    index: &OciImageIndex,
+    platforms: &super::pull::PlatformSelect,
+) -> anyhow::Result<Vec<oci_client::manifest::ImageIndexEntry>> {
+    let wanted = match platforms {
+        super::pull::PlatformSelect::All => return Ok(index.manifests.clone()),
+        super::pull::PlatformSelect::Only(wanted) => wanted,
+    };
+
+    let available: Vec<String> = index
+        .manifests
+        .iter()
+        .filter_map(|e| e.platform.as_ref())
+        .map(|p| format!("{}/{}", p.os, p.architecture))
+        .collect();
+
+    let mut out = Vec::new();
+    for want in wanted {
+        let (os, arch) = super::split_platform(want)?;
+        let hit = index.manifests.iter().find(|e| {
+            e.platform
+                .as_ref()
+                .is_some_and(|p| p.os.to_string() == os && p.architecture.to_string() == arch)
+        });
+        match hit {
+            Some(entry) => out.push(entry.clone()),
+            // Loud: a silently-missing platform produces a layout that fails
+            // much later, inside someone else's build.
+            None => anyhow::bail!(
+                "{want} is not published for this image (it has: {}). Pick one of those, or set \
+                 `all_platforms = True` to take whatever the registry has.",
+                available.join(", ")
+            ),
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch one manifest's config and layers into `blobs`.
+async fn pull_one(
+    client: &Client,
+    reference: &Reference,
+    _auth: &RegistryAuth,
+    manifest: &oci_client::manifest::OciImageManifest,
+    blobs: &mut std::collections::HashMap<String, Vec<u8>>,
+) -> anyhow::Result<()> {
+    let mut wanted = vec![manifest.config.digest.clone()];
+    wanted.extend(manifest.layers.iter().map(|l| l.digest.clone()));
+    for digest in wanted {
+        if blobs.contains_key(&digest) {
+            // Shared between platforms more often than not — a base layer is
+            // the same blob for every architecture that inherits it.
+            continue;
+        }
+        let mut buf = Vec::new();
+        client
+            .pull_blob(reference, digest.as_str(), &mut buf)
+            .await
+            .with_context(|| format!("pull blob {digest}"))?;
+        blobs.insert(digest, buf);
+    }
+    Ok(())
 }

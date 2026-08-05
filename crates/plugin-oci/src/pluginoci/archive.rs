@@ -112,7 +112,13 @@ impl Layout {
     /// the platform on the *inner* entry — the only place it exists.
     pub(crate) fn manifests(
         &self,
-    ) -> anyhow::Result<Vec<(OciImageManifest, Option<oci_client::manifest::Platform>, String)>> {
+    ) -> anyhow::Result<
+        Vec<(
+            OciImageManifest,
+            Option<oci_client::manifest::Platform>,
+            String,
+        )>,
+    > {
         let mut out = Vec::new();
         for entry in &self.index.manifests {
             let raw = self.blob(&entry.digest)?;
@@ -154,6 +160,65 @@ fn blob_digest_of(name: &str) -> Option<String> {
     (!hex.is_empty() && !hex.contains('/')).then(|| format!("{algo}:{hex}"))
 }
 
+/// Give the layout's entry point a `ref.name` annotation, wrapping a
+/// multi-platform set in a nested index first.
+///
+/// buildx resolves `--build-context name=oci-layout://<dir>` by looking for a
+/// tag: without `org.opencontainers.image.ref.name` it reports "could not be
+/// resolved: failed to resolve digest" and the `FROM name` fails. skopeo used to
+/// supply this implicitly through `oci:<dir>:latest`.
+///
+/// A single image is annotated in place. Several are wrapped in one index —
+/// buildx's own shape for a multi-platform image — so the tag names the *set*
+/// and the per-platform entries keep their platforms.
+fn tagged_index(
+    index: &OciImageIndex,
+    blobs: &mut HashMap<String, Vec<u8>>,
+) -> anyhow::Result<OciImageIndex> {
+    const REF_NAME: &str = "org.opencontainers.image.ref.name";
+    let mut annotations = std::collections::BTreeMap::new();
+    annotations.insert(REF_NAME.to_string(), "latest".to_string());
+
+    if let [only] = index.manifests.as_slice() {
+        let mut entry = only.clone();
+        let mut ann = entry.annotations.unwrap_or_default();
+        ann.entry(REF_NAME.to_string())
+            .or_insert_with(|| "latest".to_string());
+        entry.annotations = Some(ann);
+        return Ok(OciImageIndex {
+            manifests: vec![entry],
+            ..index.clone()
+        });
+    }
+
+    let inner = OciImageIndex {
+        schema_version: 2,
+        media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+        artifact_type: None,
+        manifests: index.manifests.clone(),
+        annotations: None,
+    };
+    let raw = serde_json::to_vec(&inner).context("encode the nested index")?;
+    let digest = sha256_digest(&raw);
+    let size = raw.len() as i64;
+    blobs.insert(digest.clone(), raw);
+
+    Ok(OciImageIndex {
+        schema_version: 2,
+        media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+        artifact_type: None,
+        manifests: vec![oci_client::manifest::ImageIndexEntry {
+            media_type: oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string(),
+            artifact_type: None,
+            digest,
+            size,
+            platform: None,
+            annotations: Some(annotations),
+        }],
+        annotations: None,
+    })
+}
+
 /// Write a layout to `dir` in the on-disk OCI layout shape (`oci-layout`,
 /// `index.json`, `blobs/<algo>/<hex>`) — what `oci_pull(layout = True)` produces
 /// and what `oci_image`'s `bases` consumes.
@@ -162,6 +227,9 @@ pub(crate) fn write_layout_dir(
     index: &OciImageIndex,
     blobs: &HashMap<String, Vec<u8>>,
 ) -> anyhow::Result<()> {
+    let mut blobs = blobs.clone();
+    let index = &tagged_index(index, &mut blobs)?;
+    let blobs = &blobs;
     std::fs::create_dir_all(dir).with_context(|| format!("create {dir:?}"))?;
     std::fs::write(dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)
         .context("write oci-layout")?;
@@ -234,6 +302,85 @@ fn blob_path(digest: &str) -> anyhow::Result<String> {
 pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+/// Write one image out of an OCI layout as a docker-format archive — the shape
+/// `docker load` accepts on every daemon, including those without the
+/// containerd image store.
+///
+/// This is what `buildx --output type=docker` itself emits, and copying that
+/// exactly is the point: a *hybrid*. The OCI layout is written unchanged, and a
+/// `manifest.json` is added beside it naming the config and layers by their
+/// `blobs/sha256/<hex>` paths. Layers stay gzipped — the daemon reads them as
+/// they are, so there is nothing to inflate and no digest to recompute.
+///
+/// A single instance, not the whole index: a daemon tag holds one image.
+pub(crate) fn write_docker_archive(
+    out: &Path,
+    layout: &Layout,
+    manifest: &OciImageManifest,
+    manifest_digest: &str,
+    repo_tag: &str,
+) -> anyhow::Result<()> {
+    // Only the blobs this instance needs — a multi-arch layout would otherwise
+    // carry every architecture's layers into a tag that holds one image.
+    let mut blobs = HashMap::new();
+    let manifest_bytes = layout.blob(manifest_digest)?.clone();
+    blobs.insert(manifest_digest.to_string(), manifest_bytes.clone());
+    blobs.insert(
+        manifest.config.digest.clone(),
+        layout.blob(&manifest.config.digest)?.clone(),
+    );
+    for layer in &manifest.layers {
+        blobs.insert(layer.digest.clone(), layout.blob(&layer.digest)?.clone());
+    }
+
+    let index = OciImageIndex {
+        schema_version: 2,
+        media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+        artifact_type: None,
+        manifests: vec![oci_client::manifest::ImageIndexEntry {
+            media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+            artifact_type: None,
+            digest: manifest_digest.to_string(),
+            size: manifest_bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        }],
+        annotations: None,
+    };
+
+    let docker_manifest = serde_json::json!([{
+        "Config": blob_path(&manifest.config.digest)?,
+        "RepoTags": [repo_tag],
+        "Layers": manifest.layers.iter()
+            .map(|l| blob_path(&l.digest))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    }]);
+
+    let file = std::fs::File::create(out).with_context(|| format!("create {out:?}"))?;
+    let mut ar = tar::Builder::new(file);
+    append(&mut ar, "oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#)?;
+    append(
+        &mut ar,
+        INDEX_JSON,
+        &serde_json::to_vec(&index).context("encode index.json")?,
+    )?;
+    let mut digests: Vec<&String> = blobs.keys().collect();
+    digests.sort();
+    for digest in digests {
+        let bytes = blobs
+            .get(digest)
+            .with_context(|| format!("blob {digest} vanished between listing and writing"))?;
+        append(&mut ar, &blob_path(digest)?, bytes)?;
+    }
+    append(
+        &mut ar,
+        "manifest.json",
+        &serde_json::to_vec(&docker_manifest).context("encode manifest.json")?,
+    )?;
+    ar.finish().context("finish docker archive")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -346,72 +493,4 @@ mod tests {
         assert!(err.contains("not an OCI layout"), "got: {err}");
         assert!(err.contains("format = \"docker\""), "got: {err}");
     }
-}
-
-/// Convert one image out of an OCI layout into a docker-format archive — the
-/// shape `docker load` accepts on every daemon.
-///
-/// A daemon with the containerd image store reads an OCI archive directly, but
-/// one without it does not, and that is still the default on plenty of
-/// installs. skopeo used to hide this by converting during the copy; this is
-/// that conversion, in-tree.
-///
-/// The substantive part is the layers. A docker archive carries them
-/// *uncompressed*, while OCI layers are gzipped, so each one is inflated here —
-/// the one genuinely expensive step, and the reason this is not just a manifest
-/// rewrite.
-pub(crate) fn write_docker_archive(
-    out: &Path,
-    layout: &Layout,
-    manifest: &OciImageManifest,
-    repo_tag: &str,
-) -> anyhow::Result<()> {
-    use std::io::Write as _;
-
-    let config = layout.blob(&manifest.config.digest)?;
-    let config_name = format!("{}.json", hex_of(&manifest.config.digest)?);
-
-    let file = std::fs::File::create(out).with_context(|| format!("create {out:?}"))?;
-    let mut ar = tar::Builder::new(file);
-    append(&mut ar, &config_name, config)?;
-
-    let mut layer_names = Vec::new();
-    for (i, layer) in manifest.layers.iter().enumerate() {
-        let raw = layout.blob(&layer.digest)?;
-        // Gzip magic rather than the media type: a layer's declared type and its
-        // actual encoding can disagree, and the bytes are what `docker load`
-        // has to read.
-        let bytes = if raw.starts_with(&[0x1f, 0x8b]) {
-            let mut decoded = Vec::new();
-            flate2::read::GzDecoder::new(&raw[..])
-                .read_to_end(&mut decoded)
-                .with_context(|| format!("inflate layer {}", layer.digest))?;
-            decoded
-        } else {
-            raw.clone()
-        };
-        let name = format!("{i}/layer.tar");
-        append(&mut ar, &name, &bytes)?;
-        layer_names.push(name);
-    }
-
-    let manifest_json = serde_json::json!([{
-        "Config": config_name,
-        "RepoTags": [repo_tag],
-        "Layers": layer_names,
-    }]);
-    let manifest_bytes = serde_json::to_vec(&manifest_json).context("encode manifest.json")?;
-    append(&mut ar, "manifest.json", &manifest_bytes)?;
-    ar.finish().context("finish docker archive")?;
-    drop(ar);
-    std::io::stdout().flush().ok();
-    Ok(())
-}
-
-/// The hex half of an `algo:hex` digest.
-fn hex_of(digest: &str) -> anyhow::Result<&str> {
-    digest
-        .split_once(':')
-        .map(|(_, hex)| hex)
-        .with_context(|| format!("malformed digest {digest:?}"))
 }

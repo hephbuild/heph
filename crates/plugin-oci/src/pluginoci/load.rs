@@ -2,16 +2,21 @@
 //! target) into the local docker daemon.
 //!
 //! An *action*, not an artifact: it mutates the host daemon's image store and is
-//! therefore **not cached** — it runs every time. The tool follows the archive
-//! format: a `docker` archive is loaded with `docker load -i` (tags come from
-//! the archive); an `oci` archive is loaded with `skopeo copy oci-archive:<tar>
-//! docker-daemon:<tag>`, which needs an explicit `tag` to name the image in the
-//! daemon.
+//! therefore **not cached** — it runs every time.
+//!
+//! Talks to the daemon's API directly (`bollard`, `/images/load`), so there is
+//! no skopeo and no `docker` CLI on the path. What skopeo used to do invisibly
+//! and is done here instead is the *conversion*: `docker load` accepts an OCI
+//! archive only on a daemon with the containerd image store, which is still not
+//! the default everywhere, so the image is rewritten into a docker-format
+//! archive with uncompressed layers first (see
+//! [`super::archive::write_docker_archive`]).
 //!
 //! A daemon tag holds one image, so loading a **multi-platform** archive means
-//! choosing an instance: `platform` (default Linux on the host's architecture)
-//! is pinned onto the skopeo copy rather than left to skopeo's host-derived
-//! default, which on macOS is a `darwin` no Linux manifest list matches.
+//! choosing an instance: `platform` (default Linux on the host's architecture).
+//! The selection happens here, while assembling the archive, rather than being
+//! delegated to a tool whose own default is the host's GOOS — `darwin` on a Mac,
+//! which no Linux manifest list contains.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -29,10 +34,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use super::{
-    ImageFormat, Tool, ToolIo, dep_single_file, ensure_tool_supports_format, parse_docker_load_ref,
-    run_tool,
-};
+use super::{archive::Layout, dep_single_file};
 
 pub const DRIVER_NAME: &str = "oci_load";
 
@@ -45,21 +47,11 @@ struct OciLoadSpec {
     /// archive output (group `""`) is consumed.
     #[spec(required)]
     image: String,
-    /// Local tag to give the loaded image, e.g. `app:dev`. Required when loading
-    /// with `skopeo` (it must name the daemon image) — i.e. for the `oci` format
-    /// or an explicit `tool = "skopeo"`. Optional for `docker load` (tags come
-    /// from the archive).
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
-    tag: Option<String>,
-    /// Source archive format: `oci` (default) or `docker`. Must match how the
-    /// `oci_image` target was built.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
-    format: Option<String>,
-    /// Tool to load with: `skopeo` (default for an `oci` archive) or `docker`
-    /// (default for a `docker` archive — `docker load`, no skopeo needed).
-    /// `docker` cannot load an `oci` archive.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
-    tool: Option<String>,
+    /// Local tag to give the loaded image, e.g. `app:dev`. Required: a daemon
+    /// image is named by its tag, and an untagged load leaves a dangling
+    /// `<none>:<none>` the user cannot run.
+    #[spec(required)]
+    tag: String,
     /// Which instance to load out of a **multi-platform** archive, as `os/arch`
     /// (e.g. `linux/amd64`). Defaults to Linux on the host's architecture.
     ///
@@ -76,80 +68,94 @@ struct OciLoadSpec {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciLoadDef {
-    format: ImageFormat,
-    tag: Option<String>,
-    tool: Tool,
-    /// The `os/arch` instance taken out of the archive. `None` for `docker
-    /// load`, which has no instance selection.
-    platform: Option<String>,
+    tag: String,
+    /// The `os/arch` instance taken out of the archive — always concrete, never
+    /// "whatever the host is": a multi-arch archive has no `darwin` instance to
+    /// match on macOS.
+    platform: String,
 }
 
 /// v2: the skopeo path pins the loaded instance instead of following the host's
 /// GOOS/GOARCH.
-const OCI_LOAD_FORMAT_VERSION: u32 = 2;
+/// v3: loaded through the daemon API, converting to a docker-format archive on
+/// the way in; `tool` and `format` are gone, so neither is in the key.
+const OCI_LOAD_FORMAT_VERSION: u32 = 3;
 
 impl Hash for OciLoadDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         OCI_LOAD_FORMAT_VERSION.hash(state);
-        self.format.transport().hash(state);
         self.tag.hash(state);
-        self.tool.label().hash(state);
         self.platform.hash(state);
     }
 }
 
-/// Assemble the load argv. Pure so it can be unit-tested without a daemon.
-/// `argv[0]` is the binary (docker or skopeo, per `tool`).
-fn load_argv(
-    docker_bin: &str,
-    skopeo_bin: &str,
-    def: &OciLoadDef,
-    tar: &std::path::Path,
-) -> anyhow::Result<Vec<String>> {
-    match def.tool {
-        Tool::Docker => Ok(vec![
-            docker_bin.to_string(),
-            "load".to_string(),
-            "-i".to_string(),
-            tar.to_string_lossy().into_owned(),
-        ]),
-        Tool::Skopeo => {
-            let tag = def.tag.as_deref().context(
-                "oci_load with skopeo requires `tag` (skopeo must name the daemon image)",
-            )?;
-            let mut argv = vec![
-                skopeo_bin.to_string(),
-                "copy".to_string(),
-                "--insecure-policy".to_string(),
-            ];
-            if let Some(platform) = &def.platform {
-                argv.extend(super::platform_override_args(platform)?);
-            }
-            argv.push(format!(
-                "{}:{}",
-                def.format.transport(),
-                tar.to_string_lossy()
-            ));
-            argv.push(format!("docker-daemon:{tag}"));
-            Ok(argv)
-        }
+/// Connect to the daemon the docker CLI would use.
+///
+/// `bollard` honours `$DOCKER_HOST` and otherwise assumes
+/// `/var/run/docker.sock`. That is wrong on any machine using a docker
+/// *context* — OrbStack, Colima, Rancher, a rootless Podman — where the default
+/// socket is often a stale Docker Desktop one that accepts the connection and
+/// then never answers. The symptom is not an error but a two-minute hang, so
+/// this reads the current context's endpoint the way the CLI does.
+fn connect_daemon() -> anyhow::Result<bollard::Docker> {
+    if std::env::var_os("DOCKER_HOST").is_some() {
+        // An explicit host wins, exactly as it does for the CLI.
+        return bollard::Docker::connect_with_defaults()
+            .context("connect to the docker daemon named by $DOCKER_HOST");
     }
+    if let Some(host) = current_context_host() {
+        return bollard::Docker::connect_with_socket(&host, 120, bollard::API_DEFAULT_VERSION)
+            .with_context(|| format!("connect to the docker daemon at {host}"));
+    }
+    bollard::Docker::connect_with_local_defaults()
+        .context("connect to the docker daemon (is it running?)")
 }
 
-#[derive(Default)]
-pub struct Driver {
-    tools: super::Tools,
+/// The unix socket of the docker CLI's current context, if it names one.
+///
+/// Read from `~/.docker` rather than shelled out to: `docker context inspect`
+/// is a process spawn on a path that runs for every load, and the file is the
+/// same thing the CLI reads.
+fn current_context_host() -> Option<String> {
+    let home = match std::env::var_os("DOCKER_CONFIG") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".docker"),
+    };
+    let name = std::fs::read_to_string(home.join("config.json"))
+        .ok()
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()?
+                .get("currentContext")?
+                .as_str()
+                .map(str::to_string)
+        })?;
+    if name == "default" {
+        return None;
+    }
+    // The CLI stores each context under the sha256 of its name.
+    let digest = super::archive::sha256_digest(name.as_bytes());
+    let hex = digest.strip_prefix("sha256:")?;
+    let meta = home.join("contexts/meta").join(hex).join("meta.json");
+    let raw = std::fs::read_to_string(meta).ok()?;
+    let host = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("Endpoints")?
+        .get("docker")?
+        .get("Host")?
+        .as_str()?
+        .to_string();
+    host.strip_prefix("unix://").map(str::to_string)
 }
+
+/// Stateless: the daemon connection is made per load from the ambient docker
+/// environment, and there is no host binary left to point anywhere.
+#[derive(Default)]
+pub struct Driver;
 
 impl Driver {
     pub fn new() -> Self {
-        Driver::default()
-    }
-
-    /// Point the driver at specific binaries. Public so tests — including
-    /// out-of-crate e2e — can substitute fakes.
-    pub fn with_tools(tools: super::Tools) -> Self {
-        Driver { tools }
+        Driver
     }
 }
 
@@ -172,43 +178,16 @@ impl ManagedDriver for Driver {
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
         let spec = OciLoadSpec::from(&req.target_spec.config).context("parse oci_load config")?;
-        let format = ImageFormat::parse(spec.format.as_deref().unwrap_or("oci"))?;
-        let tool = Tool::parse_opt(spec.tool.as_deref(), format)?;
-        ensure_tool_supports_format(tool, format)?;
-
-        // Fail closed at parse time: a skopeo load with no tag can never run.
-        if tool == Tool::Skopeo && spec.tag.is_none() {
-            anyhow::bail!("oci_load with skopeo requires `tag`");
-        }
-
-        let platform = match tool {
-            Tool::Docker => {
-                if let Some(p) = &spec.platform {
-                    anyhow::bail!(
-                        "`platform` ({p:?}) is not supported with tool = \"docker\": `docker load` \
-                         loads what the archive holds and cannot select an instance. Use \
-                         tool = \"skopeo\"."
-                    );
-                }
-                None
-            }
-            // Always concrete, never the host's GOOS/GOARCH: a multi-arch
-            // archive has no `darwin` instance to match on macOS.
-            Tool::Skopeo => {
-                let p = spec.platform.unwrap_or_else(super::default_platform);
-                let p = super::normalize_platform(&p).context("`platform`")?;
-                Some(p)
-            }
-        };
+        let platform =
+            super::normalize_platform(&spec.platform.unwrap_or_else(super::default_platform))
+                .context("`platform`")?;
 
         let mut image_ref = TargetAddr::parse(&spec.image, &addr.package)
             .with_context(|| format!("parse image ref {:?}", spec.image))?;
         super::pin_archive_group(&mut image_ref, &spec.image)?;
 
         let def = OciLoadDef {
-            format,
             tag: spec.tag,
-            tool,
             platform,
         };
         let hash = {
@@ -253,43 +232,80 @@ impl ManagedDriver for Driver {
 
     async fn run<'a, 'io>(
         &self,
-        mut req: ManagedRunRequest<'a, 'io>,
-        ctoken: &(dyn Cancellable + Send + Sync),
+        req: ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<OciLoadDef>().clone();
-        let tar = dep_single_file(&req, IMAGE_ORIGIN)?;
-        let cwd = req.sandbox_ws_dir.clone();
-        let argv = load_argv(&self.tools.docker, &self.tools.skopeo, &def, &tar)?;
-        let mut io = ToolIo::from_request(&mut req.request);
-        let stdout = run_tool(argv, &cwd, "oci_load", &mut io, ctoken)
-            .await
-            .context("load image into docker daemon")?;
+        let path = dep_single_file(&req, IMAGE_ORIGIN)?;
+        let layout =
+            Layout::read(&path).with_context(|| format!("read the image to load from {path:?}"))?;
 
-        // `docker load` takes tags from the archive and has no `--tag`, so an
-        // explicit `tag` has to be applied afterwards. Doing nothing with it
-        // would leave the user with a dangling `<none>:<none>` image and no way
-        // to run what they just asked to load.
-        match (def.tool, def.tag.as_deref()) {
-            (Tool::Docker, Some(tag)) => {
-                let loaded = parse_docker_load_ref(&stdout)?;
-                run_tool(
-                    vec![
-                        self.tools.docker.clone(),
-                        "tag".to_string(),
-                        loaded,
-                        tag.to_string(),
-                    ],
-                    &cwd,
-                    "docker tag (oci_load)",
-                    &mut io,
-                    ctoken,
-                )
-                .await?;
+        // A daemon tag holds one image, so pick the instance here rather than
+        // handing the daemon a manifest list it may or may not understand.
+        let (manifest, manifest_digest) = super::select_platform(&layout, &def.platform)?;
+
+        let docker_tar = req.sandbox_dir.join("oci-load-docker.tar");
+        super::archive::write_docker_archive(
+            &docker_tar,
+            &layout,
+            &manifest,
+            &manifest_digest,
+            &def.tag,
+        )
+        .context("convert the image to a docker-format archive")?;
+
+        let docker = connect_daemon()?;
+        let bytes = tokio::fs::read(&docker_tar)
+            .await
+            .with_context(|| format!("read {docker_tar:?}"))?;
+
+        use futures::StreamExt as _;
+        let mut stream = docker.import_image(
+            bollard::query_parameters::ImportImageOptions::default(),
+            bollard::body_full(bytes.into()),
+            None,
+        );
+        // The daemon narrates the load and names what it loaded; that name is
+        // the only reliable handle on the new image. Its id is not the config
+        // digest under the containerd image store, so guessing gets a 404.
+        let mut narration = String::new();
+        while let Some(item) = stream.next().await {
+            let info = item.context("load image into the docker daemon")?;
+            // A rejected image arrives in-band, as a frame on an otherwise
+            // successful stream — not as a transport error.
+            if let Some(err) = info.error_detail {
+                anyhow::bail!(
+                    "docker rejected the image: {}",
+                    err.message.unwrap_or_default()
+                );
             }
-            // skopeo named the daemon image via `docker-daemon:<tag>` already,
-            // and `docker load` with no `tag` keeps whatever the archive named.
-            (Tool::Skopeo, _) | (Tool::Docker, None) => {}
+            if let Some(line) = info.stream {
+                narration.push_str(&line);
+            }
         }
+        let loaded = super::parse_docker_load_ref(&narration)
+            .context("the daemon accepted the archive but did not say what it loaded")?;
+
+        // Tag explicitly rather than trusting `manifest.json`'s `RepoTags`: with
+        // both an `index.json` and a `manifest.json` in the archive, a
+        // containerd-backed daemon takes the OCI path and ignores RepoTags,
+        // leaving a `<none>:<none>` image the user cannot run.
+        let (repo, tag) = def
+            .tag
+            .rsplit_once(':')
+            .unwrap_or((def.tag.as_str(), "latest"));
+        docker
+            .tag_image(
+                &loaded,
+                Some(bollard::query_parameters::TagImageOptions {
+                    repo: Some(repo.to_string()),
+                    tag: Some(tag.to_string()),
+                }),
+            )
+            .await
+            .with_context(|| format!("tag the loaded image as {}", def.tag))?;
+
+        tracing::info!(tag = def.tag, platform = def.platform, "oci_load: loaded");
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
@@ -329,119 +345,6 @@ mod tests {
             .expect("parse")
     }
 
-    #[test]
-    fn load_argv_docker_uses_docker_load() {
-        let def = OciLoadDef {
-            format: ImageFormat::Docker,
-            tag: None,
-            tool: Tool::Docker,
-            platform: None,
-        };
-        let argv = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar")).unwrap();
-        assert_eq!(argv, ["docker", "load", "-i", "/t/i.tar"]);
-    }
-
-    #[test]
-    fn load_argv_oci_uses_skopeo_to_daemon() {
-        let def = OciLoadDef {
-            format: ImageFormat::Oci,
-            tag: Some("app:dev".to_string()),
-            tool: Tool::Skopeo,
-            platform: Some("linux/amd64".to_string()),
-        };
-        let argv = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar")).unwrap();
-        let joined = argv.join(" ");
-        assert!(
-            joined.starts_with("skopeo copy --insecure-policy"),
-            "{joined}"
-        );
-        assert!(joined.contains("oci-archive:/t/i.tar"), "{joined}");
-        assert!(joined.contains("docker-daemon:app:dev"), "{joined}");
-    }
-
-    /// Explicit skopeo on a docker-format archive loads via docker-archive
-    /// transport — still no docker CLI.
-    #[test]
-    fn load_argv_skopeo_docker_format_uses_docker_archive() {
-        let def = OciLoadDef {
-            format: ImageFormat::Docker,
-            tag: Some("app:dev".to_string()),
-            tool: Tool::Skopeo,
-            platform: Some("linux/amd64".to_string()),
-        };
-        let argv = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar")).unwrap();
-        let joined = argv.join(" ");
-        assert!(joined.contains("docker-archive:/t/i.tar"), "{joined}");
-        assert!(joined.contains("docker-daemon:app:dev"), "{joined}");
-    }
-
-    /// A daemon tag holds one image, so the instance taken out of a multi-arch
-    /// archive is pinned rather than matched against the host — which on macOS is
-    /// a `darwin` no Linux manifest list contains.
-    #[test]
-    fn load_argv_pins_the_instance_out_of_a_multi_arch_archive() {
-        let def = OciLoadDef {
-            format: ImageFormat::Oci,
-            tag: Some("app:dev".to_string()),
-            tool: Tool::Skopeo,
-            platform: Some("linux/arm64".to_string()),
-        };
-        let joined = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar"))
-            .expect("argv")
-            .join(" ");
-        assert!(joined.contains("--override-os linux"), "{joined}");
-        assert!(joined.contains("--override-arch arm64"), "{joined}");
-    }
-
-    #[test]
-    fn load_argv_skopeo_without_tag_errors() {
-        let def = OciLoadDef {
-            format: ImageFormat::Oci,
-            tag: None,
-            tool: Tool::Skopeo,
-            platform: Some("linux/amd64".to_string()),
-        };
-        let err = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar"))
-            .expect_err("skopeo without tag must fail");
-        assert!(format!("{err:#}").contains("tag"), "got: {err:#}");
-    }
-
-    /// docker cannot load an oci archive — rejected at parse.
-    #[tokio::test]
-    async fn parse_docker_tool_with_oci_format_fails() {
-        let err = Driver::new()
-            .parse(
-                parse_req(
-                    "//app:load",
-                    cfg(&[
-                        ("image", Value::String(":img".to_string())),
-                        ("tool", Value::String("docker".to_string())),
-                    ]),
-                ),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("docker+oci must fail");
-        assert!(format!("{err:#}").contains("oci"), "got: {err:#}");
-    }
-
-    #[tokio::test]
-    async fn parse_oci_without_tag_fails() {
-        let err = Driver::new()
-            .parse(
-                parse_req(
-                    "//app:load",
-                    cfg(&[("image", Value::String(":img".to_string()))]),
-                ),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("oci load without tag must fail parse");
-        assert!(format!("{err:#}").contains("tag"), "got: {err:#}");
-    }
-
     /// An implicit load records a concrete instance, so a multi-arch archive
     /// resolves the same way on every host — and at all on macOS.
     #[tokio::test]
@@ -454,12 +357,7 @@ mod tests {
             ]),
         )
         .await;
-        let platform = resp
-            .target_def
-            .def::<OciLoadDef>()
-            .platform
-            .clone()
-            .expect("skopeo load pins a platform");
+        let platform = resp.target_def.def::<OciLoadDef>().platform.clone();
         assert!(platform.starts_with("linux/"), "got: {platform}");
     }
 
@@ -477,95 +375,6 @@ mod tests {
         let a = parse("//app:load", base("linux/amd64")).await;
         let b = parse("//app:load", base("linux/arm64")).await;
         assert_ne!(a.target_def.hash, b.target_def.hash);
-    }
-
-    /// `docker load` has no instance selection, so honouring `platform` there is
-    /// impossible — say so instead of loading whatever the archive holds.
-    #[tokio::test]
-    async fn parse_platform_with_docker_tool_fails() {
-        let err = Driver::new()
-            .parse(
-                parse_req(
-                    "//app:load",
-                    cfg(&[
-                        ("image", Value::String(":img".to_string())),
-                        ("format", Value::String("docker".to_string())),
-                        ("platform", Value::String("linux/amd64".to_string())),
-                    ]),
-                ),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("platform + docker must fail");
-        assert!(format!("{err:#}").contains("platform"), "got: {err:#}");
-    }
-
-    #[tokio::test]
-    async fn parse_docker_format_without_tag_ok_and_not_cached() {
-        let resp = Driver::new()
-            .parse(
-                parse_req(
-                    "//app:load",
-                    cfg(&[
-                        ("image", Value::String(":img".to_string())),
-                        ("format", Value::String("docker".to_string())),
-                    ]),
-                ),
-                &StdCancellationToken::new(),
-            )
-            .await
-            .expect("parse");
-        assert_eq!(resp.target_def.inputs.len(), 1);
-        assert_eq!(resp.target_def.inputs[0].r#ref.output.as_deref(), Some(""));
-        assert!(resp.target_def.outputs.is_empty());
-        assert!(!resp.target_def.cache.enabled);
-    }
-
-    /// `docker load` has no `--tag` and takes tags from the archive, so an
-    /// explicit `tag` has to be applied afterwards. Accepting it and dropping it
-    /// would leave a dangling `<none>:<none>` image the user cannot run.
-    #[tokio::test]
-    async fn run_docker_applies_an_explicit_tag() {
-        let sbx = super::super::testfake::Sandbox::new("app");
-        let tar = sbx.pkg.join("img.tar");
-        std::fs::write(&tar, "tar").expect("tar");
-
-        let resp = parse(
-            "//app:load",
-            cfg(&[
-                ("image", Value::String(":img".to_string())),
-                ("format", Value::String("docker".to_string())),
-                ("tag", Value::String("app:dev".to_string())),
-            ]),
-        )
-        .await;
-
-        let docker = sbx.fake(
-            "docker",
-            "case \"$1\" in load) echo 'Loaded image ID: sha256:abc';; esac\nexit 0",
-        );
-        let rid = "req".to_string();
-        let req = super::super::testfake::run_request(
-            &rid,
-            "hashin",
-            &resp.target_def,
-            &sbx,
-            &[(IMAGE_ORIGIN, vec![tar])],
-        );
-        Driver::with_tools(super::super::Tools {
-            docker,
-            skopeo: "skopeo".to_string(),
-        })
-        .run(req, &StdCancellationToken::new())
-        .await
-        .expect("run");
-
-        let calls = sbx.calls();
-        assert!(
-            calls.iter().any(|c| c.contains("tag sha256:abc app:dev")),
-            "the explicit tag must be applied: {calls:?}"
-        );
     }
 
     /// Handing skopeo the `digest` group would give it a text file where it

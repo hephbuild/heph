@@ -29,9 +29,6 @@ oci-client = "0.17"
 docker_credential = "1.3"
 tar = "0.4"
 sha2 = "0.10"
-# `docker load` on a daemon without the containerd image store wants a
-# docker-format archive with *uncompressed* layers; OCI layers are gzipped.
-flate2 = "1.1.9"
 # The Docker daemon API, for `oci_load`'s `/images/load`.
 bollard = "0.21"
 
