@@ -754,6 +754,47 @@ pub(crate) fn default_platform() -> String {
 }
 
 /// Split `os/arch` into its parts.
+/// Normalize a platform string to the spelling BuildKit and containerd use.
+///
+/// The same platform has several accepted spellings — `linux/x86_64` and
+/// `linux/amd64` are the same machine, `linux/arm64/v8` and `linux/arm64` the
+/// same CPU — and every one of them was previously carried verbatim into
+/// `--platform`, into the cache key, and (once `context_by_platform` stages by
+/// platform) into a directory name. Two spellings therefore meant two cache
+/// entries for one image, and a staged directory a Dockerfile expanding
+/// `TARGETPLATFORM` could never find.
+///
+/// This is a deliberate subset of containerd's rules — the aliases people
+/// actually type, plus the redundant default variant — not a reimplementation
+/// of its full table. An unknown os/arch passes through lowercased rather than
+/// being rejected: BuildKit accepts platforms heph has never heard of, and
+/// guessing wrong here would be worse than carrying the user's own word.
+pub(crate) fn normalize_platform(platform: &str) -> anyhow::Result<String> {
+    let lower = platform.to_ascii_lowercase();
+    let (os, arch) = split_platform(&lower)?;
+    let variant = lower.splitn(3, '/').nth(2).unwrap_or("");
+
+    let arch = match arch {
+        "x86_64" | "x86-64" => "amd64",
+        "aarch64" => "arm64",
+        "i386" | "i686" | "x86" => "386",
+        other => other,
+    };
+    // containerd treats v8 as arm64's default and drops it; keeping it would
+    // make `linux/arm64` and `linux/arm64/v8` two keys for one CPU.
+    let variant = if arch == "arm64" && variant == "v8" {
+        ""
+    } else {
+        variant
+    };
+
+    Ok(if variant.is_empty() {
+        format!("{os}/{arch}")
+    } else {
+        format!("{os}/{arch}/{variant}")
+    })
+}
+
 pub(crate) fn split_platform(platform: &str) -> anyhow::Result<(&str, &str)> {
     // A platform may carry a variant (`linux/arm/v7`); only os and arch are
     // addressable by skopeo's override flags.
@@ -910,11 +951,18 @@ impl ManagedDriver for Driver {
         ensure_no_src_source("secrets", &spec.secrets)?;
         ensure_no_src_source("ssh", &spec.ssh)?;
 
-        if spec.platforms.len() > 1 && format == ImageFormat::Docker {
+        let platforms = spec
+            .platforms
+            .iter()
+            .map(|p| normalize_platform(p))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("`platforms`")?;
+
+        if platforms.len() > 1 && format == ImageFormat::Docker {
             anyhow::bail!(
                 "`platforms` lists {} platforms but `format = \"docker\"`; a docker-format archive \
                  holds a single image, not a manifest list. Use the default `format = \"oci\"`.",
-                spec.platforms.len()
+                platforms.len()
             );
         }
 
@@ -944,7 +992,7 @@ impl ManagedDriver for Driver {
         // the key varies by platform — so depend on the probe target and let its
         // content hash carry the answer. An explicit `platforms` needs no probe
         // and declares no dep.
-        if spec.platforms.is_empty() {
+        if platforms.is_empty() {
             let probe = platform::addr_for(builder.as_deref());
             inputs.push(Input {
                 r#ref: TargetAddr::parse(&probe, &pkg)
@@ -1013,7 +1061,7 @@ impl ManagedDriver for Driver {
             format,
             build_args: spec.build_args.into_iter().collect(),
             stage: spec.stage,
-            platforms: spec.platforms,
+            platforms,
             builder,
             secrets,
             ssh,
@@ -1867,6 +1915,53 @@ exit 0
         assert_eq!(parse_builder_platform(out).expect("parse"), "linux/arm64");
         let err = parse_builder_platform("Name: default\n").expect_err("no platforms line");
         assert!(format!("{err:#}").contains("Platforms"), "got: {err:#}");
+    }
+
+    /// The same machine has several accepted spellings. Carrying them verbatim
+    /// meant two cache entries for one image — and, once deps stage by platform,
+    /// a directory name a Dockerfile expanding `TARGETPLATFORM` could not find.
+    #[test]
+    fn platform_spellings_normalize_to_one() {
+        for (raw, want) in [
+            ("linux/x86_64", "linux/amd64"),
+            ("linux/x86-64", "linux/amd64"),
+            ("linux/AMD64", "linux/amd64"),
+            ("linux/aarch64", "linux/arm64"),
+            // containerd treats v8 as arm64's default and drops it.
+            ("linux/arm64/v8", "linux/arm64"),
+            ("linux/i386", "linux/386"),
+            // A real variant is not a default and must survive.
+            ("linux/arm/v7", "linux/arm/v7"),
+            ("linux/amd64", "linux/amd64"),
+            // Unknown but well-formed: heph carries the user's own word rather
+            // than guessing, since BuildKit accepts platforms we have not heard of.
+            ("linux/riscv64", "linux/riscv64"),
+            ("windows/amd64", "windows/amd64"),
+        ] {
+            assert_eq!(normalize_platform(raw).expect("normalize"), want, "{raw}");
+        }
+        assert!(
+            normalize_platform("linux").is_err(),
+            "os alone is not a platform"
+        );
+    }
+
+    /// Two spellings of one platform must be one cache entry, not two.
+    #[tokio::test]
+    async fn platform_spelling_does_not_split_the_cache() {
+        let sbx = Sandbox::new("app");
+        let with = |p: &str| {
+            cfg(&[
+                ctx(),
+                ("platforms", Value::List(vec![Value::String(p.to_string())])),
+            ])
+        };
+        let a = parse_in(&sbx, "//app:img", with("linux/amd64")).await;
+        let b = parse_in(&sbx, "//app:img", with("linux/x86_64")).await;
+        assert_eq!(
+            a.target_def.hash, b.target_def.hash,
+            "linux/x86_64 and linux/amd64 are the same platform"
+        );
     }
 
     #[test]

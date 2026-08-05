@@ -196,7 +196,7 @@ impl ManagedDriver for Driver {
             // archive has no `darwin` instance to match on macOS.
             Tool::Skopeo => {
                 let p = spec.platform.unwrap_or_else(super::default_platform);
-                super::split_platform(&p)?;
+                let p = super::normalize_platform(&p).context("`platform`")?;
                 Some(p)
             }
         };
