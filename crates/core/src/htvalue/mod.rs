@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -59,6 +60,29 @@ pub fn parse_map_string_strings(v: &Value) -> anyhow::Result<HashMap<String, Vec
             )),
         }?
     })
+}
+
+/// A map whose values are themselves `{string: [string]}` maps — the shape of an
+/// attribute that keys a grouped dep map by something else, e.g. `oci_image`'s
+/// `context_by_platform`. Strict: unlike [`parse_map_string_strings`], there is
+/// no bare-string or bare-list shorthand, because the outer key carries meaning
+/// (which platform) that cannot be defaulted.
+pub fn parse_map_string_map_string_strings(
+    v: &Value,
+) -> anyhow::Result<HashMap<String, HashMap<String, Vec<String>>>> {
+    match v {
+        Value::Map(m) => m
+            .iter()
+            .map(|(k, v)| {
+                parse_map_string_strings(v)
+                    .with_context(|| format!("key {k:?}"))
+                    .map(|inner| (k.clone(), inner))
+            })
+            .collect(),
+        v => Err(anyhow::anyhow!(
+            "invalid: expected {{string: {{string: [string]}}}} got: {v:?}"
+        )),
+    }
 }
 
 pub fn parse_map_string_string(v: &Value) -> anyhow::Result<HashMap<String, String>> {

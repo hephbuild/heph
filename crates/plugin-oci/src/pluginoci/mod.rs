@@ -328,6 +328,37 @@ struct OciImageSpec {
     /// The default (unnamed) group is `SRC`. Group names are uppercased and
     /// non-alphanumerics become `_`, matching `exec`'s `SRC_*` convention.
     context: HashMap<String, Vec<String>>,
+    /// Build-context dependencies that differ **per platform**, keyed by
+    /// platform → the same `{group: [addr]}` shape as `context`.
+    ///
+    /// One buildx invocation builds every platform from one context, so a dep
+    /// that differs by architecture cannot simply go in `context`: two variants
+    /// of one target produce the same workspace-relative path and collide. Each
+    /// platform's deps stage under their own prefix instead, and the Dockerfile
+    /// selects with BuildKit's own `TARGETPLATFORM`:
+    ///
+    /// ```python
+    /// platforms = ["linux/amd64", "linux/arm64"],
+    /// context_by_platform = {
+    ///     "linux/amd64": {"bin": ["//cmd/server:bin@v=linux_amd64"]},
+    ///     "linux/arm64": {"bin": ["//cmd/server:bin@v=linux_arm64"]},
+    /// },
+    /// ```
+    ///
+    /// ```dockerfile
+    /// ARG TARGETPLATFORM
+    /// ARG CTX_BY_PLATFORM
+    /// ARG SRC_BIN
+    /// COPY ${CTX_BY_PLATFORM}/${TARGETPLATFORM}/${SRC_BIN} /usr/bin/server
+    /// ```
+    ///
+    /// `SRC_<GROUP>` is relative to the platform prefix, so the group must
+    /// produce the same paths on every platform — the usual case, one target
+    /// built two ways. Groups here may not reuse a `context` group name, every
+    /// platform in `platforms` must have an entry (and vice versa), and
+    /// `platforms` must be explicit: the builder's default is not known until
+    /// the build runs, so heph could not tell you which key to write.
+    context_by_platform: HashMap<String, HashMap<String, Vec<String>>>,
     /// Base images, by build-context name → a single `oci_pull` (or `oci_image`)
     /// target address. Wired to `docker buildx --build-context <name>=…` so the
     /// Dockerfile can `FROM <name>` a base heph produced, instead of a registry
@@ -455,6 +486,73 @@ const DOCKERFILE_ORIGIN: &str = "dockerfile";
 /// is empty.
 const PLATFORM_ORIGIN: &str = "builder_platform";
 
+/// The build-context subdirectory each platform's `context_by_platform` deps
+/// stage under, exported to the Dockerfile as `CTX_BY_PLATFORM`. Inside the
+/// context on purpose — unlike heph's own deps, the build has to read these.
+const PLATFORM_CTX_PREFIX: &str = ".heph/ctx";
+
+/// Build arg naming [`PLATFORM_CTX_PREFIX`], so a Dockerfile never hardcodes
+/// heph's staging layout.
+const PLATFORM_CTX_ARG: &str = "CTX_BY_PLATFORM";
+
+/// A platform as a single path/id segment: `linux/arm64` → `linux_arm64`.
+///
+/// An origin id becomes a `input_<id>.list` filename, so it cannot carry the
+/// `/` a platform string has.
+fn platform_segment(platform: &str) -> String {
+    platform.replace('/', "_")
+}
+
+/// Origin id for a per-platform context dep. The platform is *in* the id so a
+/// `HEPH_DEBUG_HASH` trace names the arm64 binary rather than "a context dep".
+fn platform_ctx_origin(platform: &str, group: &str, i: usize) -> String {
+    format!(
+        "context_by_platform|{}|{group}|{i}",
+        platform_segment(platform)
+    )
+}
+
+/// Stage each per-platform dep into the build context under its own platform
+/// prefix, by hard link.
+///
+/// The deps unpack outside the context (one root per platform, so two variants
+/// of one target do not collide on a shared path), but the build has to *read*
+/// them — so they are linked into `<ws>/.heph/ctx/<platform>/…` here. Links, not
+/// copies: the bytes are already staged, and a binary per platform per image is
+/// exactly the thing not worth copying twice.
+fn link_platform_contexts(
+    req: &ManagedRunRequest<'_, '_>,
+    def: &OciImageDef,
+    context_dir: &Path,
+) -> anyhow::Result<()> {
+    for (platform, group) in &def.platform_context_keys {
+        let seg = platform_segment(platform);
+        let root = req.sandbox_dir.join(format!("exec_{seg}_{group}"));
+        let dest_root = context_dir.join(PLATFORM_CTX_PREFIX).join(platform);
+        for m in &req.inputs {
+            let prefix = format!("context_by_platform|{seg}|{group}|");
+            if !m.input.origin_id.starts_with(&prefix) {
+                continue;
+            }
+            for path in dep_files(req, &m.input.origin_id)? {
+                let rel = path.strip_prefix(&root).unwrap_or(&path);
+                let dest = dest_root.join(rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create {parent:?}"))?;
+                }
+                // Fall back to a copy when the link cannot be made (a different
+                // filesystem, or the sandbox already placed the file).
+                if std::fs::hard_link(&path, &dest).is_err() && !dest.exists() {
+                    std::fs::copy(&path, &dest)
+                        .with_context(|| format!("stage {path:?} into the context at {dest:?}"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Unpack root for every dep that must **not** be part of the build context.
 ///
 /// A dep with no `unpack_root` annotation materializes at the sandbox workspace
@@ -499,6 +597,12 @@ struct OciImageDef {
     secrets: Vec<String>,
     /// Sorted before hashing, as `secrets`.
     ssh: Vec<String>,
+    /// The `(platform, group)` pairs `context_by_platform` declared, sorted.
+    /// The deps' contents ride in via their own input hashes; this is here so
+    /// that *adding or removing* a platform or a group busts the key, since the
+    /// staged layout is what buildx sees. Sorted rather than order-sensitive:
+    /// unlike `platforms`, these keys carry no manifest ordering.
+    platform_context_keys: Vec<(String, String)>,
     /// Named build contexts (`--build-context <name>=…`) for base images, by
     /// group name. The origin_id is derived from the name; the resolved sandbox
     /// path is not known until run time, so only the names are hashed here —
@@ -517,7 +621,11 @@ struct OciImageDef {
 /// key. Every one of those changes what a given input set produces.
 ///
 /// v3: the builder is selectable (`builder`) and hashed.
-const OCI_IMAGE_FORMAT_VERSION: u32 = 3;
+///
+/// v4: platform strings are normalized before they reach the key, and
+/// `context_by_platform` adds per-platform deps plus the `CTX_BY_PLATFORM` build
+/// arg. Both change what a given input set produces.
+const OCI_IMAGE_FORMAT_VERSION: u32 = 4;
 
 impl Hash for OciImageDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -544,6 +652,7 @@ impl Hash for OciImageDef {
         self.secrets.hash(state);
         self.ssh.hash(state);
         self.bases.hash(state);
+        self.platform_context_keys.hash(state);
         // `cache_from` / `cache_to` are deliberately excluded: they select where
         // BuildKit may reuse layers from, which changes how long a build takes
         // and can change the exported layer digests, but never what the image
@@ -958,6 +1067,49 @@ impl ManagedDriver for Driver {
             .collect::<anyhow::Result<Vec<_>>>()
             .context("`platforms`")?;
 
+        // Every failure below is a hard parse error naming the fix. The one
+        // outcome that must never ship is silently dropping a platform's deps:
+        // that removes a binary from an image with no signal at all.
+        // Checked before the per-entry loop: with no `platforms` every entry is
+        // "not in platforms", which is a true but useless thing to say.
+        anyhow::ensure!(
+            spec.context_by_platform.is_empty() || !platforms.is_empty(),
+            "`context_by_platform` requires an explicit `platforms = [...]`: the builder's \
+             default platform is not known until the build runs, so heph cannot tell which key \
+             to write."
+        );
+
+        let mut pbp: Vec<(String, HashMap<String, Vec<String>>)> = Vec::new();
+        for (raw, groups) in &spec.context_by_platform {
+            let platform = normalize_platform(raw).context("`context_by_platform` key")?;
+            anyhow::ensure!(
+                platforms.contains(&platform),
+                "`context_by_platform` declares {raw:?}, which is not in `platforms` \
+                 ({platforms:?}). Add it to `platforms`, or drop the block."
+            );
+            for group in groups.keys() {
+                anyhow::ensure!(
+                    !spec.context.contains_key(group),
+                    "group {group:?} is in both `context` and `context_by_platform`; they would \
+                     export the same SRC_{} build arg. Rename one.",
+                    arg_key_segment(group)
+                );
+            }
+            pbp.push((platform, groups.clone()));
+        }
+        pbp.sort_by(|a, b| a.0.cmp(&b.0));
+
+        if !pbp.is_empty() {
+            for platform in &platforms {
+                anyhow::ensure!(
+                    pbp.iter().any(|(p, _)| p == platform),
+                    "`platforms` lists {platform:?} but `context_by_platform` has no entry for \
+                     it. Every platform must be covered, or the build fails on that leg alone \
+                     with a missing COPY path. Add: {platform:?}: {{...}}"
+                );
+            }
+        }
+
         if platforms.len() > 1 && format == ImageFormat::Docker {
             anyhow::bail!(
                 "`platforms` lists {} platforms but `format = \"docker\"`; a docker-format archive \
@@ -1003,6 +1155,37 @@ impl ManagedDriver for Driver {
                 hashed: true,
                 runtime: true,
             });
+        }
+
+        // Per-platform context deps: staged under their own platform prefix, so
+        // two variants of one target no longer collide on a shared path.
+        let mut platform_context_keys: Vec<(String, String)> = Vec::new();
+        for (platform, groups) in &pbp {
+            let mut names: Vec<&String> = groups.keys().collect();
+            names.sort();
+            for group in names {
+                platform_context_keys.push((platform.clone(), group.clone()));
+                let refs = groups.get(group).map_or(&[][..], Vec::as_slice);
+                for (i, r) in refs.iter().enumerate() {
+                    let origin = platform_ctx_origin(platform, group, i);
+                    inputs.push(Input {
+                        r#ref: TargetAddr::parse(r, &pkg)?,
+                        mode: InputMode::Standard,
+                        // Inside the context, under the platform's own prefix.
+                        // Outside the context: unpacking two variants of one
+                        // target at their shared workspace-relative path would
+                        // collide. `run` links them into the context under
+                        // their platform prefix.
+                        annotations: BTreeMap::from([(
+                            "unpack_root".to_string(),
+                            format!("{}_{group}", platform_segment(platform)),
+                        )]),
+                        origin_id: origin,
+                        hashed: true,
+                        runtime: true,
+                    });
+                }
+            }
         }
 
         let mut context_groups: Vec<String> = spec.context.keys().cloned().collect();
@@ -1066,6 +1249,7 @@ impl ManagedDriver for Driver {
             secrets,
             ssh,
             bases,
+            platform_context_keys,
             cache_from: spec.cache_from,
             cache_to: spec.cache_to,
         };
@@ -1176,6 +1360,9 @@ impl ManagedDriver for Driver {
         } else {
             None
         };
+
+        link_platform_contexts(&req, &def, &context_dir)
+            .context("staging per-platform context deps")?;
 
         let named_contexts = resolve_named_contexts(&req, &def)?;
         let src_args = resolve_src_args(&req, &context_dir)?;
@@ -1557,7 +1744,35 @@ fn resolve_src_args(
     context_dir: &Path,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let mut by_group: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Per-platform groups: paths are relative to the platform prefix, not to the
+    // context, so one `SRC_<GROUP>` works for every platform and the Dockerfile
+    // joins it with `TARGETPLATFORM`. That requires the group to produce the
+    // same paths everywhere — one target built two ways, the usual case — so
+    // disagreement is an error rather than a silently platform-dependent arg.
+    let mut by_platform_group: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
     for m in &req.inputs {
+        if let Some(rest) = m.input.origin_id.strip_prefix("context_by_platform|") {
+            // `context_by_platform|<platform>|<group>|<index>`; the platform
+            // itself contains `/` but never `|`.
+            let mut parts = rest.splitn(2, '|');
+            let (Some(platform), Some(tail)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let Some((group, _)) = tail.rsplit_once('|') else {
+                continue;
+            };
+            let root = req.sandbox_dir.join(format!("exec_{platform}_{group}"));
+            for path in dep_files(req, &m.input.origin_id)? {
+                let rel = path.strip_prefix(&root).unwrap_or(&path);
+                by_platform_group
+                    .entry(group.to_string())
+                    .or_default()
+                    .entry(platform.to_string())
+                    .or_default()
+                    .push(rel.to_string_lossy().into_owned());
+            }
+            continue;
+        }
         let Some(rest) = m.input.origin_id.strip_prefix("context|") else {
             continue;
         };
@@ -1573,14 +1788,45 @@ fn resolve_src_args(
                 .push(rel.to_string_lossy().into_owned());
         }
     }
-    Ok(by_group
+    let mut args: BTreeMap<String, String> = by_group
         .into_iter()
         .map(|(group, mut paths)| {
             // Stable order: the arg feeds the build and therefore the image.
             paths.sort();
             (src_arg_name(&group), paths.join(" "))
         })
-        .collect())
+        .collect();
+
+    let has_platform_groups = !by_platform_group.is_empty();
+    for (group, per_platform) in by_platform_group {
+        let mut agreed: Option<(String, String)> = None;
+        for (platform, mut paths) in per_platform {
+            paths.sort();
+            let joined = paths.join(" ");
+            match &agreed {
+                None => agreed = Some((platform, joined)),
+                Some((first_platform, first)) if *first != joined => anyhow::bail!(
+                    "`context_by_platform` group {group:?} produces {first:?} for \
+                     {first_platform} but {joined:?} for {platform}. SRC_{} names one path set \
+                     for every platform — split into separate groups, or COPY the literal path.",
+                    arg_key_segment(&group)
+                ),
+                Some(_) => {}
+            }
+        }
+        if let Some((_, joined)) = agreed {
+            args.insert(src_arg_name(&group), joined);
+        }
+    }
+    // Only when there is something to select: a target with no per-platform
+    // groups should not carry a build arg naming a directory it never staged.
+    if has_platform_groups {
+        args.insert(
+            PLATFORM_CTX_ARG.to_string(),
+            PLATFORM_CTX_PREFIX.to_string(),
+        );
+    }
+    Ok(args)
 }
 
 /// Resolve each `bases` entry to a `--build-context <name>=oci-layout://<dir>`
@@ -1990,6 +2236,7 @@ exit 0
             secrets: vec!["id=token,env=TOKEN".to_string()],
             ssh: vec!["default".to_string()],
             bases: vec![],
+            platform_context_keys: vec![],
             cache_from: vec!["type=registry,ref=reg/app:cache".to_string()],
             cache_to: vec!["type=inline".to_string()],
         };
@@ -2039,6 +2286,7 @@ exit 0
             secrets: vec![],
             ssh: vec![],
             bases: vec![],
+            platform_context_keys: vec![],
             cache_from: vec![],
             cache_to: vec![],
         };
@@ -2070,6 +2318,7 @@ exit 0
             secrets: vec![],
             ssh: vec![],
             bases: vec!["base".to_string()],
+            platform_context_keys: vec![],
             cache_from: vec![],
             cache_to: vec![],
         };
@@ -2114,6 +2363,7 @@ exit 0
             secrets: vec![],
             ssh: vec![],
             bases: vec![],
+            platform_context_keys: vec![],
             cache_from: vec![],
             cache_to: vec![],
         };
@@ -2342,6 +2592,7 @@ exit 0
             secrets: vec![],
             ssh: vec![],
             bases: vec![],
+            platform_context_keys: vec![],
             cache_from: vec![],
             cache_to: vec![],
         };
@@ -2383,6 +2634,178 @@ exit 0
         )
         .await;
         assert_ne!(a.target_def.hash, b.target_def.hash);
+    }
+
+    fn pbp(entries: &[(&str, &[(&str, &str)])]) -> (&'static str, Value) {
+        let map: HashMap<String, Value> = entries
+            .iter()
+            .map(|(platform, groups)| {
+                let inner: HashMap<String, Value> = groups
+                    .iter()
+                    .map(|(g, addr)| {
+                        (
+                            (*g).to_string(),
+                            Value::List(vec![Value::String((*addr).to_string())]),
+                        )
+                    })
+                    .collect();
+                ((*platform).to_string(), Value::Map(inner))
+            })
+            .collect();
+        ("context_by_platform", Value::Map(map))
+    }
+
+    fn platforms_of(list: &[&str]) -> (&'static str, Value) {
+        (
+            "platforms",
+            Value::List(
+                list.iter()
+                    .map(|p| Value::String((*p).to_string()))
+                    .collect(),
+            ),
+        )
+    }
+
+    /// Two variants of one target produce the same workspace-relative path, so
+    /// they cannot both sit in `context`. Per-platform deps stage under their
+    /// own prefix, and the platform is in the origin id so a hash trace names
+    /// *the arm64 binary* rather than "a context dep".
+    #[tokio::test]
+    async fn per_platform_deps_stage_under_their_platform() {
+        let sbx = Sandbox::new("app");
+        let resp = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                platforms_of(&["linux/amd64", "linux/arm64"]),
+                pbp(&[
+                    ("linux/amd64", &[("bin", "//cmd/server:bin@v=amd")]),
+                    ("linux/arm64", &[("bin", "//cmd/server:bin@v=arm")]),
+                ]),
+            ]),
+        )
+        .await;
+
+        for (platform, want_addr) in [
+            ("linux/amd64", "//cmd/server:bin@v=amd"),
+            ("linux/arm64", "//cmd/server:bin@v=arm"),
+        ] {
+            let origin = format!("context_by_platform|{}|bin|0", platform_segment(platform));
+            let input = resp
+                .target_def
+                .inputs
+                .iter()
+                .find(|i| i.origin_id == origin)
+                .unwrap_or_else(|| panic!("no input for {platform}"));
+            assert_eq!(input.r#ref.r#ref.format(), want_addr);
+            assert!(input.hashed, "each platform's dep must feed the key");
+            assert_eq!(
+                input.annotations.get("unpack_root").map(String::as_str),
+                Some(format!("{}_bin", platform_segment(platform)).as_str()),
+                "each platform unpacks under its own root, or the two collide"
+            );
+        }
+    }
+
+    /// Adding or removing a platform changes the staged layout buildx sees, so
+    /// it must bust the key even when every dep is otherwise identical.
+    #[tokio::test]
+    async fn the_platform_key_set_is_hashed() {
+        let sbx = Sandbox::new("app");
+        let one = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                platforms_of(&["linux/amd64"]),
+                pbp(&[("linux/amd64", &[("bin", ":b")])]),
+            ]),
+        )
+        .await;
+        let two = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                platforms_of(&["linux/amd64", "linux/arm64"]),
+                pbp(&[
+                    ("linux/amd64", &[("bin", ":b")]),
+                    ("linux/arm64", &[("bin", ":b")]),
+                ]),
+            ]),
+        )
+        .await;
+        assert_ne!(one.target_def.hash, two.target_def.hash);
+    }
+
+    /// Silently dropping a platform's deps would remove a binary from an image
+    /// with no signal, so every mismatch is a hard parse error naming the fix.
+    #[tokio::test]
+    async fn per_platform_mismatches_are_parse_errors() {
+        let sbx = Sandbox::new("app");
+
+        // A platform in the map that is not being built.
+        let err = parse_err(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                platforms_of(&["linux/amd64"]),
+                pbp(&[("linux/arm64", &[("bin", ":b")])]),
+            ]),
+        )
+        .await;
+        assert!(err.contains("not in `platforms`"), "got: {err}");
+
+        // A platform being built with no deps declared: without this the build
+        // fails on one leg of the fan-out, deep in a BuildKit log.
+        let err = parse_err(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                platforms_of(&["linux/amd64", "linux/arm64"]),
+                pbp(&[("linux/amd64", &[("bin", ":b")])]),
+            ]),
+        )
+        .await;
+        assert!(err.contains("no entry for it"), "got: {err}");
+
+        // No explicit platforms: the probe answers at run time, so heph cannot
+        // say which key to write.
+        let err = parse_err(
+            &sbx,
+            "//app:img",
+            cfg(&[ctx(), pbp(&[("linux/amd64", &[("bin", ":b")])])]),
+        )
+        .await;
+        assert!(
+            err.contains("requires an explicit `platforms"),
+            "got: {err}"
+        );
+
+        // A group name in both maps would export one SRC_ arg twice.
+        let err = parse_err(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                (
+                    "context",
+                    Value::Map(HashMap::from([(
+                        "bin".to_string(),
+                        Value::List(vec![Value::String(":shared".to_string())]),
+                    )])),
+                ),
+                platforms_of(&["linux/amd64"]),
+                pbp(&[("linux/amd64", &[("bin", ":b")])]),
+            ]),
+        )
+        .await;
+        assert!(
+            err.contains("both `context` and `context_by_platform`"),
+            "got: {err}"
+        );
     }
 
     /// Layer-cache refs are build optimizations: changing them must NOT change

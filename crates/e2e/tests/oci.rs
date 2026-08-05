@@ -329,6 +329,74 @@ target(
     Ok(())
 }
 
+/// Two variants of one binary, one image. This is the case that has no
+/// workaround: both variants produce the same workspace-relative path, so
+/// putting them in `context` is an output collision, and the BuildKit-native
+/// `COPY bin-${TARGETARCH}` idiom needs names heph cannot give them. Each
+/// platform's deps stage under their own prefix instead.
+#[tokio::test]
+async fn test_oci_image_stages_context_per_platform() -> anyhow::Result<()> {
+    let fake = Fake::new();
+    let ws = workspace_with_fake(&fake);
+    ws.write_build_file(
+        "cmd/server",
+        r#"
+target(name = "amd", driver = "bash", run = "echo amd-binary > $OUT", out = "server")
+target(name = "arm", driver = "bash", run = "echo arm-binary > $OUT", out = "server")
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(
+    name = "dockerfile",
+    driver = "bash",
+    run = "printf 'FROM scratch\nARG TARGETPLATFORM\nARG CTX_BY_PLATFORM\nARG SRC_BIN\nCOPY ${CTX_BY_PLATFORM}/${TARGETPLATFORM}/${SRC_BIN} /usr/bin/server\n' > $OUT",
+    out = "Dockerfile",
+)
+target(
+    name = "img",
+    driver = "oci_image",
+    context = [":dockerfile"],
+    platforms = ["linux/amd64", "linux/arm64"],
+    context_by_platform = {
+        "linux/amd64": {"bin": ["//cmd/server:amd"]},
+        "linux/arm64": {"bin": ["//cmd/server:arm"]},
+    },
+)
+"#,
+    );
+
+    let result = ws.run("//app:img").await?;
+    // The fake writes the context listing into the archive, so it records what
+    // the build could actually see: both variants, side by side, un-collided.
+    let listing = common::artifact_string(&result);
+    for platform in ["linux/amd64", "linux/arm64"] {
+        let want = format!("./.heph/ctx/{platform}/cmd/server/server");
+        assert!(
+            listing.contains(&want),
+            "{platform}'s binary must be staged under its own prefix, got: {listing}"
+        );
+    }
+
+    // …and the Dockerfile is handed the pieces to select between them without
+    // knowing heph's layout.
+    let build = fake
+        .calls()
+        .into_iter()
+        .find(|c| c.contains("buildx build"))
+        .expect("a buildx build call");
+    assert!(
+        build.contains("--build-arg CTX_BY_PLATFORM=.heph/ctx"),
+        "got: {build}"
+    );
+    assert!(
+        build.contains("--build-arg SRC_BIN=cmd/server/server"),
+        "SRC_BIN is relative to the platform prefix, got: {build}"
+    );
+    Ok(())
+}
+
 /// A multi-stage, multi-arch image: the stage and the whole platform list reach
 /// the builder, and two targets that differ only by stage are two cache entries.
 /// Collapsing them would serve one stage's image under the other's name.
