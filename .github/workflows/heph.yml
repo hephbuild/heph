@@ -576,17 +576,6 @@ jobs:
               -prefix heph-gha-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
               -out "$GITHUB_WORKSPACE/dist/heph-gha-plugin.json" )
           cat dist/heph-gha-plugin.json
-          # Deliberately NOT generating a heph-js-plugin.json here. The `build`
-          # job above now publishes the raw per-os/arch js plugin cdylib as a
-          # release asset (`heph-js-plugin_<os>_<arch>.{so,dylib}`) — needed so
-          # `perfbench`/`perf.yml` can download it for Tier B, same as go/gha.
-          # A public `plugins: - { identifier: { url: .../heph-js-plugin.json } }`
-          # manifest is a separate, larger decision (declaring the js plugin
-          # generally available to any real workspace, not just this bench
-          # pipeline's own locally-built manifest — see
-          # `crates/bench/src/dist.rs`'s `write_dist_config`, which builds its
-          # OWN manifest straight from the downloaded raw dylib and never reads
-          # this file). Left for a future PR to make explicitly.
           echo "manifest checksum: $(cat dist/heph-gha-plugin.json.sha256)"
           # The oci plugin (`docker_build` / `oci_pull` / `oci_push` / `oci_load`)
           # ships the same way — it is not compiled into the CLI.
@@ -595,6 +584,15 @@ jobs:
               -out "$GITHUB_WORKSPACE/dist/heph-oci-plugin.json" )
           cat dist/heph-oci-plugin.json
           echo "manifest checksum: $(cat dist/heph-oci-plugin.json.sha256)"
+          # The js plugin ships the same way: one manifest entry per
+          # per-os/arch cdylib in dist/, published as a release asset. A real
+          # workspace opts in the same way as go/gha:
+          # `plugins: - { identifier: { url: .../heph-js-plugin.json } }`.
+          ( cd tools/pluginmanifest && go run . -name js -version "$VERSION" \
+              -prefix heph-js-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
+              -out "$GITHUB_WORKSPACE/dist/heph-js-plugin.json" )
+          cat dist/heph-js-plugin.json
+          echo "manifest checksum: $(cat dist/heph-js-plugin.json.sha256)"
 
       - name: Create Release in artifacts repo
         id: create_release
