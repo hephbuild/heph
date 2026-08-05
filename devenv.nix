@@ -29,10 +29,6 @@ in
     # code paths on real release-profile output; cargo-binutils' llvm-objcopy
     # is the mature tool for this.)
     pkgs.cargo-binutils
-    # `oci_push` / `oci_pull` / `oci_load` shell out to skopeo for OCI-format
-    # archives (the default), so the e2e suite needs it on PATH. docker is the
-    # other half and comes from the host/runner, not from here.
-    pkgs.skopeo
     # pkg-config + libfuse for the `fuse-sandbox` feature.
     # - Linux: `fuse3` ships headers/pc files fuser links against.
     # - macOS: `macfuse-stubs` provides the build-time `osxfuse.pc` per

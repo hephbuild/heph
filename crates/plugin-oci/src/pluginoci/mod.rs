@@ -39,7 +39,7 @@
 //! - **Secret and SSH *values*.** The spec strings are hashed; what the agent or
 //!   the environment hands the build is not, and cannot be (it would land in the
 //!   `HEPH_DEBUG_HASH` trace).
-//! - **The host `docker` / `buildx` / `skopeo` version.** BuildKit changes
+//! - **The host `docker` / `buildx` version.** BuildKit changes
 //!   output-visible defaults across releases (attestations, compression), so two
 //!   machines on different versions can produce structurally different archives
 //!   under one key. Pinning the toolchain is the end state; the host is what
@@ -176,7 +176,7 @@ pub mod registry;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ImageFormat {
     /// OCI image layout archive (`--output type=oci`). Portable, standard;
-    /// pushed/loaded daemonlessly with `skopeo`.
+    /// pushed and pulled daemonlessly over the registry protocol.
     Oci,
     /// Docker-format image archive (`--output type=docker`). Loadable straight
     /// into a docker daemon with `docker load`.
@@ -192,15 +192,6 @@ impl ImageFormat {
         }
     }
 
-    /// The containers/image transport name for reading this archive as a source
-    /// (skopeo `<transport>:<path>`).
-    pub(crate) fn transport(self) -> &'static str {
-        match self {
-            ImageFormat::Oci => "oci-archive",
-            ImageFormat::Docker => "docker-archive",
-        }
-    }
-
     pub(crate) fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
             "oci" => Ok(ImageFormat::Oci),
@@ -208,78 +199,6 @@ impl ImageFormat {
             other => anyhow::bail!("`format` must be \"oci\" or \"docker\", got {other:?}"),
         }
     }
-}
-
-/// The host CLIs these drivers shell out to.
-///
-/// One struct rather than two adjacent `String` parameters: the drivers had
-/// already drifted into `(skopeo, docker)` in one file and `(docker, skopeo)` in
-/// another, and swapping two same-typed arguments compiles and passes.
-#[derive(Clone, Debug)]
-pub struct Tools {
-    pub docker: String,
-    pub skopeo: String,
-}
-
-impl Default for Tools {
-    fn default() -> Self {
-        Tools {
-            docker: "docker".to_string(),
-            skopeo: "skopeo".to_string(),
-        }
-    }
-}
-
-/// The CLI used to move an image between an archive, a registry, and the local
-/// daemon (for `oci_push` / `oci_pull` / `oci_load`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum Tool {
-    /// `skopeo` — daemonless, reads/writes both OCI and docker archives.
-    Skopeo,
-    /// The `docker` CLI — needs the daemon and only handles docker-format
-    /// archives (`docker load`/`save`/`push`), but keeps `skopeo` off the
-    /// dependency list.
-    Docker,
-}
-
-impl Tool {
-    /// Resolve the `tool` config value. Absent picks per format so `skopeo` is
-    /// only required for OCI archives: a docker-format image uses the `docker`
-    /// CLI, an OCI-format image uses `skopeo`.
-    pub(crate) fn parse_opt(s: Option<&str>, format: ImageFormat) -> anyhow::Result<Self> {
-        match s {
-            None => Ok(match format {
-                ImageFormat::Docker => Tool::Docker,
-                ImageFormat::Oci => Tool::Skopeo,
-            }),
-            Some("skopeo") => Ok(Tool::Skopeo),
-            Some("docker") => Ok(Tool::Docker),
-            Some(other) => {
-                anyhow::bail!("`tool` must be \"skopeo\" or \"docker\", got {other:?}")
-            }
-        }
-    }
-
-    /// Stable label for hashing.
-    fn label(self) -> &'static str {
-        match self {
-            Tool::Skopeo => "skopeo",
-            Tool::Docker => "docker",
-        }
-    }
-}
-
-/// The `docker` CLI cannot read an OCI archive (`docker load`/`save`/`push` are
-/// docker-format only). Reject that combination at parse time with a clear
-/// message rather than a cryptic runtime failure.
-pub(crate) fn ensure_tool_supports_format(tool: Tool, format: ImageFormat) -> anyhow::Result<()> {
-    if tool == Tool::Docker && format == ImageFormat::Oci {
-        anyhow::bail!(
-            "tool=\"docker\" cannot handle an `oci` archive; build with format=\"docker\" or use \
-             tool=\"skopeo\""
-        );
-    }
-    Ok(())
 }
 
 /// Config for an `oci_image` target.
@@ -799,8 +718,8 @@ pub(crate) fn parse_docker_load_ref(stdout: &str) -> anyhow::Result<String> {
 
 /// Pin an image dep to the archive output group (`""`). An explicit group is
 /// rejected rather than honoured: every other group on an `oci_image` target
-/// (`digest`) is a text file, and handing skopeo a text file where it expects an
-/// archive fails deep inside its layout parser.
+/// (`digest`) is a text file, and handing the archive reader a text file where
+/// it expects a layout fails deep inside the parse.
 pub(crate) fn pin_archive_group(
     image_ref: &mut TargetAddr,
     spec_value: &str,
@@ -828,6 +747,45 @@ fn parse_metadata_digest(metadata: &str) -> anyhow::Result<String> {
         .context("buildx metadata missing `containerimage.digest`")
 }
 
+/// Pick the image manifest for `platform` out of a layout.
+///
+/// Goes through [`archive::Layout::manifests`] rather than the top-level index,
+/// because a buildx multi-platform image nests one index inside another and
+/// records the platform on the *inner* entry.
+///
+/// A single-image layout has nothing to choose and is returned as-is — asking a
+/// one-platform archive for `linux/amd64` and failing because its index carries
+/// no platform annotation would be pedantry, not safety.
+pub(crate) fn select_platform(
+    layout: &archive::Layout,
+    platform: &str,
+) -> anyhow::Result<(oci_client::manifest::OciImageManifest, String)> {
+    let manifests = layout.manifests()?;
+    anyhow::ensure!(
+        !manifests.is_empty(),
+        "the image layout holds no manifests; there is nothing to load"
+    );
+    if manifests.len() == 1 {
+        let (m, _, digest) = manifests.into_iter().next().expect("checked non-empty");
+        return Ok((m, digest));
+    }
+
+    let (os, arch) = split_platform(platform)?;
+    let mut available = Vec::new();
+    for (manifest, p, digest) in manifests {
+        let Some(p) = p else { continue };
+        available.push(format!("{}/{}", p.os, p.architecture));
+        if p.os.to_string() == os && p.architecture.to_string() == arch {
+            return Ok((manifest, digest));
+        }
+    }
+    anyhow::bail!(
+        "the image has no {platform} instance (it has: {}). A daemon tag holds one image, so \
+         `platform` has to name one the archive actually contains.",
+        available.join(", ")
+    )
+}
+
 /// Whether an attribute value names a target rather than a path.
 ///
 /// The same two prefixes every other target-valued attribute here accepts
@@ -847,14 +805,13 @@ pub(crate) fn ws_path(pkg: &str, rel: &str) -> String {
     }
 }
 
-/// The platform a `skopeo`-driven pull/load resolves to when the BUILD file does
-/// not name one: Linux on the host's own architecture.
+/// The platform a pull or load resolves to when the BUILD file does not name
+/// one: Linux on the host's own architecture.
 ///
 /// The OS is pinned to `linux` rather than taken from the host because container
-/// images are Linux images — on macOS, `skopeo` would otherwise ask a manifest
-/// list for a `darwin` instance that does not exist and fail, while `docker`
-/// would quietly get `linux` from the daemon's VM. Same target, two different
-/// answers, one of them an error.
+/// images are Linux images: on macOS, asking a manifest list for a `darwin`
+/// instance finds nothing, while the daemon's own default would quietly be
+/// `linux` from inside its VM. Same target, two different answers, one an error.
 pub(crate) fn default_platform() -> String {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -907,28 +864,13 @@ pub(crate) fn normalize_platform(platform: &str) -> anyhow::Result<String> {
 }
 
 pub(crate) fn split_platform(platform: &str) -> anyhow::Result<(&str, &str)> {
-    // A platform may carry a variant (`linux/arm/v7`); only os and arch are
-    // addressable by skopeo's override flags.
+    // A platform may carry a variant (`linux/arm/v7`); only os and arch select
+    // an instance out of a manifest list.
     let mut parts = platform.splitn(3, '/');
     match (parts.next(), parts.next()) {
         (Some(os), Some(arch)) if !os.is_empty() && !arch.is_empty() => Ok((os, arch)),
         _ => anyhow::bail!("`platform` must look like `os/arch`, got {platform:?}"),
     }
-}
-
-/// The `skopeo` flags that pin which instance is taken out of a manifest list.
-///
-/// Without them skopeo matches against the host's own GOOS/GOARCH — which is
-/// `darwin` on macOS, where no Linux image has a matching instance, so a
-/// multi-arch archive fails to copy at all.
-pub(crate) fn platform_override_args(platform: &str) -> anyhow::Result<[String; 4]> {
-    let (os, arch) = split_platform(platform)?;
-    Ok([
-        "--override-os".to_string(),
-        os.to_string(),
-        "--override-arch".to_string(),
-        arch.to_string(),
-    ])
 }
 
 /// Extract the builder's first (default) platform from `docker buildx inspect`
@@ -1466,14 +1408,14 @@ fn build_error_hint(e: anyhow::Error, def: &OciImageDef, addr: &str) -> anyhow::
     e.context(format!("oci_image {addr}: {builder}{bases}"))
 }
 
-/// Host env vars forwarded to `docker` / `skopeo`. Everything else is cleared
+/// Host env vars forwarded to `docker`. Everything else is cleared
 /// (`proc_exec::Spec` populates a cleared environment from this list), so a
 /// stray `BUILDX_BUILDER` or `SOURCE_DATE_EPOCH` cannot change the image behind
 /// the cache key's back.
 ///
 /// What is passed and why:
-/// - `PATH` — resolve the `docker`/`skopeo` binary and the credential helpers
-///   the CLI execs (`docker-credential-*`).
+/// - `PATH` — resolve the `docker` binary and the credential helpers it execs
+///   (`docker-credential-*`).
 /// - `HOME`, `DOCKER_CONFIG`, `REGISTRY_AUTH_FILE`, `XDG_RUNTIME_DIR` — locate
 ///   the registry credentials. Auth decides whether a pull/push is permitted,
 ///   never what the resulting bytes are, so it is deliberately not hashed.
@@ -1695,15 +1637,12 @@ pub(crate) async fn run_tool(
 }
 
 /// Turn the bare `No such file or directory` a missing tool produces into
-/// something the reader can act on. `docker` and `skopeo` are host capabilities
+/// something the reader can act on. `docker` is a host capability
 /// heph does not install, so "not found" is a routine first-run state, not an
 /// internal error.
 fn missing_tool_error(e: std::io::Error, bin: &str, what: &str) -> anyhow::Error {
     if e.kind() == std::io::ErrorKind::NotFound {
         let hint = match Path::new(bin).file_name().and_then(|n| n.to_str()) {
-            Some("skopeo") => {
-                " — install skopeo, or set `tool = \"docker\"` on a `format = \"docker\"` target"
-            }
             Some("docker") => " — install Docker (the `oci_image` driver needs `docker buildx`)",
             _ => "",
         };
@@ -1918,7 +1857,7 @@ fn basename(path: &str) -> anyhow::Result<&std::ffi::OsStr> {
 ///
 /// The drivers' whole job is to assemble a command and interpret its result, so
 /// the interesting behaviour only shows up once something is actually executed.
-/// These helpers stand a shell script in for `docker` / `skopeo`, record what it
+/// These helpers stand a shell script in for `docker`, record what it
 /// was called with, and let a test dictate how it behaves.
 #[cfg(test)]
 pub(crate) mod testfake {

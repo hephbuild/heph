@@ -64,15 +64,18 @@ struct OciPullSpec {
     ///
     /// This is the shape `oci_image`'s `bases` consumes.
     layout: bool,
-    /// Image platform to pull out of a multi-platform manifest list, as
-    /// `os/arch` (e.g. `linux/arm64`). Defaults to Linux on the host's
-    /// architecture, and is always part of the cache key — otherwise an arm64
-    /// and an amd64 machine would share one entry for two different images.
+    /// Which platforms to pull out of a multi-platform manifest list, as
+    /// `os/arch` (e.g. `["linux/amd64", "linux/arm64"]`). One entry takes one
+    /// instance; several keep an index holding exactly those.
+    ///
+    /// Defaults to Linux on the host's architecture, and is always part of the
+    /// cache key — otherwise an arm64 and an amd64 machine would share one entry
+    /// for two different images. A platform the registry does not publish is an
+    /// error naming what it does.
     ///
     /// Mutually exclusive with `all_platforms`.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
-    platform: Option<String>,
-    /// Pull **every** instance of the manifest list instead of selecting one,
+    platforms: Vec<String>,
+    /// Pull **every** instance of the manifest list instead of naming them,
     /// keeping the index intact.
     ///
     /// This is what a base image for a multi-platform `oci_image` needs: a
@@ -103,18 +106,20 @@ struct OciPullSpec {
 /// Which instance(s) of a manifest list a pull takes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PlatformSelect {
-    /// One concrete `os/arch`, pinned with skopeo's override flags.
-    One(String),
-    /// Every instance, index intact (`--multi-arch all`).
+    /// The platforms named in `platforms`, or the host's own when it is empty.
+    /// Always concrete — never "whatever the client defaults to", which on a mac
+    /// is a `darwin` no Linux image publishes.
+    Only(Vec<String>),
+    /// Every instance the registry has, index intact.
     All,
 }
 
 impl PlatformSelect {
     /// Stable label for hashing and for the `oci_pull: pulled` log line.
-    fn label(&self) -> &str {
+    fn label(&self) -> String {
         match self {
-            PlatformSelect::One(p) => p,
-            PlatformSelect::All => "all",
+            PlatformSelect::Only(ps) => ps.join(","),
+            PlatformSelect::All => "all".to_string(),
         }
     }
 }
@@ -192,19 +197,24 @@ impl ManagedDriver for Driver {
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
         let spec = OciPullSpec::from(&req.target_spec.config).context("parse oci_pull config")?;
-        let platform = match (spec.all_platforms, spec.platform) {
-            (true, Some(p)) => anyhow::bail!(
-                "`all_platforms = True` pulls every instance, so `platform` ({p:?}) has nothing to \
-                 select; drop one of them"
+        let platform = match (spec.all_platforms, spec.platforms.is_empty()) {
+            (true, false) => anyhow::bail!(
+                "`all_platforms = True` pulls every instance, so `platforms` ({:?}) has nothing \
+                 to select; drop one of them",
+                spec.platforms
             ),
-            (true, None) => PlatformSelect::All,
-            // Validate now rather than at run time: a malformed platform is a
-            // typo in the BUILD file, and parse is where the user finds out.
-            (false, Some(p)) => {
-                let p = super::normalize_platform(&p).context("`platform`")?;
-                PlatformSelect::One(p)
-            }
-            (false, None) => PlatformSelect::One(super::default_platform()),
+            (true, true) => PlatformSelect::All,
+            // Normalized and validated now rather than at run time: a malformed
+            // platform is a typo in the BUILD file, and parse is where the user
+            // finds out.
+            (false, true) => PlatformSelect::Only(vec![super::default_platform()]),
+            (false, false) => PlatformSelect::Only(
+                spec.platforms
+                    .iter()
+                    .map(|p| super::normalize_platform(p))
+                    .collect::<anyhow::Result<Vec<_>>>()
+                    .context("`platforms`")?,
+            ),
         };
 
         let default_out = if spec.layout {
@@ -300,7 +310,7 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("out {:?} has no file name", def.out))?;
         let out_path = req.sandbox_pkg_dir.join(out_name);
 
-        let (index, blobs) = super::registry::pull_layout(&def.src, def.insecure)
+        let (index, blobs) = super::registry::pull_layout(&def.src, &def.platform, def.insecure)
             .await
             .with_context(|| format!("pull image {}", def.src))?;
 
@@ -397,7 +407,10 @@ mod tests {
             "//base:x",
             cfg(&[
                 ("ref", Value::String(PINNED.to_string())),
-                ("platform", Value::String("linux/amd64".to_string())),
+                (
+                    "platforms",
+                    Value::List(vec![Value::String("linux/amd64".to_string())]),
+                ),
             ]),
         )
         .await;
@@ -405,7 +418,10 @@ mod tests {
             "//base:x",
             cfg(&[
                 ("ref", Value::String(PINNED.to_string())),
-                ("platform", Value::String("linux/arm64".to_string())),
+                (
+                    "platforms",
+                    Value::List(vec![Value::String("linux/arm64".to_string())]),
+                ),
             ]),
         )
         .await;
@@ -427,7 +443,7 @@ mod tests {
         let def = resp.target_def.def::<OciPullDef>();
         assert_eq!(
             def.platform,
-            PlatformSelect::One(super::super::default_platform())
+            PlatformSelect::Only(vec![super::super::default_platform()])
         );
         assert!(
             def.platform.label().starts_with("linux/"),
@@ -504,7 +520,10 @@ mod tests {
                     cfg(&[
                         ("ref", Value::String(PINNED.to_string())),
                         ("all_platforms", Value::Bool(true)),
-                        ("platform", Value::String("linux/amd64".to_string())),
+                        (
+                            "platforms",
+                            Value::List(vec![Value::String("linux/amd64".to_string())]),
+                        ),
                     ]),
                 ),
                 &StdCancellationToken::new(),

@@ -17,9 +17,11 @@
 //! skips (it does not fail) when there is no usable `docker` — notably macOS
 //! CI, which has no daemon.
 //!
-//! The `skopeo` half (`oci_push` / `oci_pull` / an `oci`-format `oci_load`) is
+//! The registry and daemon halves (`oci_push` / `oci_pull` / `oci_load`) are
 //! covered too, against a throwaway `registry:2` container. Those tests need the
 //! network once, to pull the registry image, and skip if they cannot get it.
+//! They no longer need any host tool beyond docker itself: push and pull speak
+//! the registry protocol in-process and load goes through the daemon API.
 
 mod common;
 
@@ -142,59 +144,6 @@ macro_rules! require_docker {
     () => {
         if !docker_available() {
             eprintln!("skipping: no usable docker (needs buildx and a running daemon)");
-            return Ok(());
-        }
-    };
-}
-
-/// `skopeo` on PATH. The dev shell provides it (`devenv.nix`), which is also
-/// how CI gets it; a bare `cargo test` outside the shell skips instead.
-fn skopeo_available() -> bool {
-    static OK: OnceLock<bool> = OnceLock::new();
-    *OK.get_or_init(|| probe_bin("skopeo", &["--version"], PROBE_TIMEOUT))
-}
-
-macro_rules! require_skopeo {
-    () => {
-        if !skopeo_available() {
-            eprintln!("skipping: skopeo not on PATH (run inside `devenv shell`)");
-            return Ok(());
-        }
-    };
-}
-
-/// Whether skopeo's `docker-daemon:` transport can reach a daemon.
-///
-/// Separate from [`docker_available`] because skopeo does *not* read docker
-/// contexts: it goes to `$DOCKER_HOST` or `/var/run/docker.sock`. On a machine
-/// running an alternative runtime (OrbStack, Colima) the CLI is happy while that
-/// socket belongs to a stopped Docker Desktop, and the copy then hangs rather
-/// than failing. Probed by asking about an image that does not exist: any answer
-/// means the daemon is there, no answer means it is not.
-fn skopeo_daemon_available() -> bool {
-    static OK: OnceLock<bool> = OnceLock::new();
-    *OK.get_or_init(|| {
-        skopeo_available()
-            && probe_status(
-                "skopeo",
-                &[
-                    "inspect",
-                    "--insecure-policy",
-                    "docker-daemon:heph-e2e-absent:none",
-                ],
-                PROBE_TIMEOUT,
-            )
-            .is_some()
-    })
-}
-
-macro_rules! require_skopeo_daemon {
-    () => {
-        if !skopeo_daemon_available() {
-            eprintln!(
-                "skipping: skopeo cannot reach a docker daemon (it uses $DOCKER_HOST or \
-                 /var/run/docker.sock, not docker contexts)"
-            );
             return Ok(());
         }
     };
@@ -697,7 +646,7 @@ target(
     context = [":dockerfile", ":payload"],
     {builder}
 )
-target(name = "load", driver = "oci_load", image = ":img", format = "docker", tag = "{tag}")
+target(name = "load", driver = "oci_load", image = ":img", tag = "{tag}")
 "#,
             builder = builder_attr(&builder),
         ),
@@ -727,8 +676,6 @@ target(name = "load", driver = "oci_load", image = ":img", format = "docker", ta
 #[tokio::test]
 async fn test_real_skopeo_loads_an_oci_archive_into_the_daemon() -> anyhow::Result<()> {
     require_docker!();
-    require_skopeo!();
-    require_skopeo_daemon!();
     let builder = require_builder!();
     let tag = format!("heph-e2e-skopeo-load:{}", std::process::id());
 
@@ -783,7 +730,6 @@ target(name = "load", driver = "oci_load", image = ":img", tag = "{tag}")
 #[tokio::test]
 async fn test_real_multi_arch_push_pull_and_build_from_the_pulled_base() -> anyhow::Result<()> {
     require_docker!();
-    require_skopeo!();
     let builder = require_builder!();
     let Some(registry) = Registry::start() else {
         eprintln!("skipping: could not start a local registry:2 (no network, or no daemon)");
@@ -848,9 +794,12 @@ target(
 
     ws.run("//app:push").await?;
 
-    // The pulled layout must still be a manifest list covering both platforms —
-    // that is what `--multi-arch all` on the push and `all_platforms` on the
-    // pull are for, and what the derived build below needs.
+    // The pulled layout must still cover both platforms — that is what pushing
+    // the whole manifest list and pulling with `all_platforms` are for, and what
+    // the derived build below needs.
+    //
+    // `index.json` is the tagged entry point buildx resolves `oci-layout://`
+    // against; the per-platform entries live in the index it points at.
     let pulled = ws.run("//app:base").await?;
     let layout_files = common::artifact_paths(&pulled);
     assert!(
@@ -858,8 +807,11 @@ target(
         "an OCI layout must have an index.json, got: {layout_files:?}"
     );
     let index = artifact_file(&pulled, "index.json");
-    let inner = digest_of(&index);
-    let manifest_list: String = artifact_file(&pulled, &blob_path(&inner))
+    assert!(
+        index.contains("org.opencontainers.image.ref.name"),
+        "the layout needs a tag for buildx to resolve `FROM base`, got: {index}"
+    );
+    let manifest_list: String = artifact_file(&pulled, &blob_path(&digest_of(&index)))
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();

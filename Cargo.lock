@@ -4204,7 +4204,6 @@ dependencies = [
  "core",
  "docker_credential",
  "driver-support",
- "flate2",
  "futures",
  "model",
  "oci-client",
