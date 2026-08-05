@@ -655,21 +655,40 @@ async fn pump_stdin_pty(
     drop(sink.shutdown().await);
 }
 
-/// Await `io` for up to `deadline`. By the time this runs the child has
-/// already exited, so anything it wrote is already read or sitting in the
-/// pipe — `io` arriving late means something else (typically a surviving
-/// descendant sharing the same stdout/stderr fd) still holds the write end
-/// open. Runs `on_timeout` in that case rather than silently discarding the
-/// timeout, so a truncated log.txt tail is diagnosable instead of vanishing
-/// unremarked — mirrors `proc_exec`'s own `DRAIN_DEADLINE` abandonment log.
-async fn drain_or_warn(
-    io: impl std::future::Future<Output = ()>,
-    deadline: std::time::Duration,
-    on_timeout: impl FnOnce(),
-) {
-    if tokio::time::timeout(deadline, io).await.is_err() {
-        on_timeout();
-    }
+/// Await `io` for up to [`proc_exec::DRAIN_DEADLINE`], reporting how long it
+/// actually took and whether the deadline elapsed.
+///
+/// By the time this runs the child has already exited, so anything it wrote is
+/// already read or sitting in the pipe — `io` arriving late means something
+/// else (typically a surviving descendant sharing the same stdout/stderr fd)
+/// still holds the write end open. The caller warns in that case rather than
+/// silently discarding the timeout, so a truncated log.txt tail is diagnosable
+/// instead of vanishing unremarked — mirroring `proc_exec`'s own abandonment
+/// log, whose window this now shares.
+///
+/// **The deadline is `proc_exec`'s, not a local number.** It was an
+/// independent 50 ms, which is not a bound on "a descendant is holding the
+/// pipe" — it is a bound on *how promptly this task gets polled after the EOF
+/// wake*, and under a burst of short-lived targets that loses the race
+/// routinely. A `go` std build (a few hundred `sh -c 'mv …'` targets, each a
+/// couple of milliseconds and silent) produced tens of these warnings per
+/// couple of minutes with `stdout_bytes=0 stderr_bytes=0` — a `mv` forks
+/// nothing, so there was never a descendant to abandon. Each false positive
+/// cost that target 50 ms and, worse, abandoned the tee of a target whose
+/// stderr is the only diagnostic it will ever produce. `DRAIN_DEADLINE` is
+/// the window `proc_exec` already documents as the one knob for this, and
+/// spending it only lengthens the genuinely-stuck case, which is a bug you
+/// want to see.
+///
+/// Returns `(waited, timed_out)`. `timeout` polls the inner future before the
+/// delay, so a drain that lands exactly on the deadline still counts as
+/// finished.
+async fn drain_bounded(io: impl std::future::Future<Output = ()>) -> (std::time::Duration, bool) {
+    let started = std::time::Instant::now();
+    let timed_out = tokio::time::timeout(proc_exec::DRAIN_DEADLINE, io)
+        .await
+        .is_err();
+    (started.elapsed(), timed_out)
 }
 
 /// Pump bytes from an async source into a [`proc_exec::StdinPump`].
@@ -1627,13 +1646,23 @@ impl Driver {
                         _ = stdin_cancel_tx.send(());
                         if !ctoken.is_cancelled() {
                             hcore::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
-                            drain_or_warn(&mut io, std::time::Duration::from_millis(50), || {
+                            let (waited, timed_out) = drain_bounded(&mut io).await;
+                            let pty_bytes = stdout_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                            if timed_out {
                                 tracing::warn!(
                                     addr = addr_str.as_str(),
-                                    pty_bytes = stdout_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                                    pty_bytes,
+                                    waited_ms = waited.as_millis(),
                                     "pluginexec: post-wait output drain timed out; log tail may be truncated"
                                 );
-                            }).await;
+                            } else {
+                                tracing::debug!(
+                                    addr = addr_str.as_str(),
+                                    pty_bytes,
+                                    waited_ms = waited.as_millis(),
+                                    "pluginexec: post-wait output drain finished"
+                                );
+                            }
                         }
                         wait_res
                     }
@@ -1655,14 +1684,26 @@ impl Driver {
                         _ = stdin_cancel_tx.send(());
                         if !ctoken.is_cancelled() {
                             hcore::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
-                            drain_or_warn(&mut io, std::time::Duration::from_millis(50), || {
+                            let (waited, timed_out) = drain_bounded(&mut io).await;
+                            let out_bytes = stdout_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                            let err_bytes = stderr_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                            if timed_out {
                                 tracing::warn!(
                                     addr = addr_str.as_str(),
-                                    stdout_bytes = stdout_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                                    stderr_bytes = stderr_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                                    stdout_bytes = out_bytes,
+                                    stderr_bytes = err_bytes,
+                                    waited_ms = waited.as_millis(),
                                     "pluginexec: post-wait output drain timed out; log tail may be truncated"
                                 );
-                            }).await;
+                            } else {
+                                tracing::debug!(
+                                    addr = addr_str.as_str(),
+                                    stdout_bytes = out_bytes,
+                                    stderr_bytes = err_bytes,
+                                    waited_ms = waited.as_millis(),
+                                    "pluginexec: post-wait output drain finished"
+                                );
+                            }
                         }
                         wait_res
                     }
@@ -1913,33 +1954,110 @@ mod tests {
 
     /// Regression for the post-wait drain: before the fix, whether
     /// `tokio::time::timeout` elapsed was discarded (`_ = timeout(...).await`)
-    /// so a truncated tail vanished silently. `drain_or_warn` is the
-    /// extracted decision — this proves it actually invokes the diagnostic
-    /// when time runs out on stalled IO (a stand-in for a stray descendant
-    /// still holding the pipe open), the shape `run_inner` wires to
-    /// `tracing::warn!` on both the PTY and pipes branches.
+    /// so a truncated tail vanished silently. `drain_bounded` is the extracted
+    /// decision — this proves it reports the timeout when time runs out on
+    /// stalled IO (a stand-in for a stray descendant still holding the pipe
+    /// open), which is what `run_inner` turns into `tracing::warn!` on both
+    /// the PTY and pipes branches.
+    ///
+    /// Time is asserted against `proc_exec::DRAIN_DEADLINE` rather than a
+    /// literal: the point of the change this covers is that the two are one
+    /// knob, so a future divergence should fail here.
     #[tokio::test]
-    async fn drain_or_warn_fires_when_deadline_elapses() {
-        let fired = std::sync::atomic::AtomicBool::new(false);
-        drain_or_warn(
-            std::future::pending::<()>(),
-            std::time::Duration::from_millis(1),
-            || {
-                fired.store(true, std::sync::atomic::Ordering::SeqCst);
-            },
-        )
-        .await;
-        assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+    async fn drain_bounded_reports_the_deadline_elapsing() {
+        let (waited, timed_out) = drain_bounded(std::future::pending::<()>()).await;
+        assert!(timed_out, "a drain that never finishes must be reported");
+        assert!(
+            waited >= proc_exec::DRAIN_DEADLINE,
+            "waited {waited:?}, shorter than the shared deadline \
+             {:?} — the window is not proc_exec's",
+            proc_exec::DRAIN_DEADLINE
+        );
     }
 
     #[tokio::test]
-    async fn drain_or_warn_stays_quiet_when_io_finishes_in_time() {
-        let fired = std::sync::atomic::AtomicBool::new(false);
-        drain_or_warn(async {}, std::time::Duration::from_millis(50), || {
-            fired.store(true, std::sync::atomic::Ordering::SeqCst);
-        })
-        .await;
-        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
+    async fn drain_bounded_stays_quiet_when_io_finishes_in_time() {
+        let (waited, timed_out) = drain_bounded(async {}).await;
+        assert!(!timed_out);
+        assert!(waited < proc_exec::DRAIN_DEADLINE, "waited {waited:?}");
+    }
+
+    /// The failing-target case the drain bound must not break: a descendant
+    /// holding the pipe write end open makes EOF unreachable, so the drain is
+    /// abandoned — but everything the child itself wrote was already in the
+    /// pipe when it exited, and `log.txt` is the *only* diagnostic a failed
+    /// target produces. Abandoning must therefore never cost the tail.
+    ///
+    /// `sleep` inherits stdout/stderr and outlives the deadline, so the
+    /// abandon path is taken deterministically rather than by racing a wake.
+    /// The outer timeout is the test's failure mechanism, not the mechanism
+    /// under test: without a bound, a regression here hangs the suite instead
+    /// of failing it.
+    #[tokio::test]
+    async fn stray_descendant_does_not_truncate_a_failed_targets_log() -> anyhow::Result<()> {
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 5 & echo boom >&2; exit 3".to_string(),
+                ],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            // Pipes, not a PTY: the PTY path shares one fd for both streams
+            // and is not where the std build's targets run.
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
+
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        let res = tokio::time::timeout(
+            proc_exec::DRAIN_DEADLINE * 20,
+            driver.run(make_req(req), &ctoken),
+        )
+        .await
+        .expect("the run must end on the drain bound, not wait out the descendant");
+        assert!(res.is_err(), "exit 3 must fail the target");
+
+        let log = std::fs::read_to_string(tmp.path().join("log.txt"))?;
+        assert!(
+            log.contains("boom"),
+            "the child's own stderr must survive the abandoned drain, got {log:?}"
+        );
+
+        Ok(())
     }
 
     #[test]
