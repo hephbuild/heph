@@ -731,7 +731,7 @@ pub struct BuildState {
     /// counted as cached. Without the kind there is no way to know which counter
     /// to take it back out of.
     cache_hit: HashMap<String, CacheHitKind>,
-    /// Worker capacity announced by the engine via `MaxWorkers`. `None` until
+    /// Worker capacity announced by the engine via `RequestConfig`. `None` until
     /// the event lands (no worker indicator rendered before then).
     max_workers: Option<usize>,
     /// Server timestamp of the first event seen — the run's start anchor for the
@@ -843,7 +843,9 @@ impl BuildState {
             }
         }
         match &ev.kind {
-            BuildEventKind::MaxWorkers { count } => {
+            BuildEventKind::RequestConfig {
+                max_workers: count, ..
+            } => {
                 self.max_workers = Some(*count);
             }
             BuildEventKind::Matched { addrs, complete } => {
@@ -872,7 +874,7 @@ impl BuildState {
             BuildEventKind::ResultStart { addr } => {
                 self.in_flight_results.insert(addr.clone());
             }
-            BuildEventKind::ResultEnd { addr, error } => {
+            BuildEventKind::ResultEnd { addr, error, .. } => {
                 if self.in_flight_results.remove(addr) {
                     if let Some(err) = error {
                         self.errored += 1;
@@ -956,6 +958,9 @@ impl BuildState {
             // elapsed-clock anchor at the top of `apply` still runs, so the
             // clock works during a gc sweep.
             BuildEventKind::GcTargetSwept { .. } => {}
+            // An event kind newer than this build knows about. Skipped rather
+            // than fatal — see `BuildEventKind::Unknown`.
+            BuildEventKind::Unknown => {}
         }
     }
 
@@ -1259,7 +1264,7 @@ impl BuildState {
             .count()
     }
 
-    /// Announced worker capacity, or `None` before the `MaxWorkers` event.
+    /// Announced worker capacity, or `None` before the `RequestConfig` event.
     pub fn max_workers(&self) -> Option<usize> {
         self.max_workers
     }
@@ -2351,6 +2356,9 @@ mod tests {
         BuildEventKind::ResultEnd {
             addr: addr.into(),
             error,
+            upstream_of: None,
+            exit_status: None,
+            log_tail: None,
         }
     }
     fn execute_start(addr: &str) -> BuildEventKind {
@@ -2763,7 +2771,10 @@ mod tests {
     }
 
     fn max_workers(count: usize) -> BuildEventKind {
-        BuildEventKind::MaxWorkers { count }
+        BuildEventKind::RequestConfig {
+            max_workers: count,
+            fail_fast: false,
+        }
     }
 
     #[test]

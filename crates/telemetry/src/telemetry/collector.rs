@@ -482,6 +482,9 @@ mod tests {
         c.observe_event(&BuildEventKind::ResultEnd {
             addr: addr(),
             error: None,
+            upstream_of: None,
+            exit_status: None,
+            log_tail: None,
         });
 
         let s = c.snapshot();

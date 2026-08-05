@@ -66,6 +66,10 @@ const LIVE_LOG_BYTES: usize = 1024;
 /// Final view: table sizes.
 const FINAL_SLOWEST_ROWS: usize = 20;
 const FINAL_PKG_ROWS: usize = 15;
+/// Log-tail budget in the final report: generous, since the summary has ~900 KiB
+/// and this is what the reader came for — but still bounded, because the tail is
+/// attacker-shaped data (it is whatever the target printed).
+const FINAL_LOG_BYTES: usize = 8 * 1024;
 
 /// A `String` that will not grow past a byte budget.
 ///
@@ -300,6 +304,13 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
         ));
     }
 
+    if t.fail_fast() && c.roots_total > 0 {
+        b.push(
+            "\n> [!WARNING]\n> Stopped at the first failure (`--fail-fast`) — \
+             remaining targets were not attempted.\n",
+        );
+    }
+
     push_lock_waits(&mut b, t, ctx);
     push_running_longest(&mut b, t, ctx);
 
@@ -340,7 +351,7 @@ fn push_live_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
         // Only the first root gets a log tail live: mid-build the reader is
         // answering "is this mine?", and one error answers that where ten don't.
         if i == 0
-            && let Some(tail) = live_log_tail(&r.message)
+            && let Some(tail) = r.log_tail.as_ref().and_then(live_log_tail)
         {
             section.push_str(&format!("\n```\n{tail}\n```\n"));
         }
@@ -365,13 +376,47 @@ fn push_live_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
     }
 }
 
-/// The log tail is not on the event stream yet (`docs/GHA_REPORTING.md` §7.1), so
-/// live rendering has only the flattened cause chain to work with. Returns
-/// `None` until `ResultEnd` carries a real tail — better nothing than a fake
-/// code block containing the same sentence already printed above it.
-fn live_log_tail(_message: &str) -> Option<String> {
-    let _ = (LIVE_LOG_LINES, LIVE_LOG_BYTES);
-    None
+/// The last few lines of a failing target's log, bounded for the live view.
+///
+/// Mid-build the reader is answering "is this mine?", which one error answers
+/// and ten don't — so this is deliberately shorter than the final view's tail,
+/// and only the first root gets one. The byte cap matters independently of the
+/// line cap: a single line of a minified bundle or a base64 blob can be
+/// megabytes on its own.
+fn live_log_tail(tail: &hcore::events::LogTailData) -> Option<String> {
+    bounded_tail(&tail.text, LIVE_LOG_LINES, LIVE_LOG_BYTES)
+}
+
+/// The full retained tail for the final report, bounded in bytes only — the
+/// engine already applied the user's `--log-lines`, so a line cap here would
+/// silently override their choice.
+fn final_log_tail(tail: &hcore::events::LogTailData) -> Option<String> {
+    bounded_tail(&tail.text, usize::MAX, FINAL_LOG_BYTES)
+}
+
+/// The last `max_lines` lines of `text`, in order, stopping before `max_bytes`.
+///
+/// Both caps are load-bearing. A line cap alone does not bound the output: one
+/// line of a minified bundle, a base64 blob, or a stack trace with a huge inline
+/// value can be megabytes by itself. A byte cap alone would cut mid-line.
+fn bounded_tail(text: &str, max_lines: usize, max_bytes: usize) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    let mut kept: Vec<&str> = Vec::new();
+    let mut bytes = 0usize;
+    // Walk backwards so the *end* of the log survives — that is where the error
+    // is — then restore order.
+    for line in lines.get(start..).unwrap_or(&[]).iter().rev() {
+        let cost = line.len().saturating_add(1);
+        if bytes.saturating_add(cost) > max_bytes {
+            break;
+        }
+        bytes = bytes.saturating_add(cost);
+        kept.push(line);
+    }
+    kept.reverse();
+    let out = kept.join("\n");
+    (!out.trim().is_empty()).then_some(out)
 }
 
 fn pkg_rollup(r: &crate::tally::RootFailure, limit: usize) -> String {
@@ -591,10 +636,19 @@ fn push_final_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
         if let Some(d) = r.duration_ms {
             meta.push(format!("executed {}", fmt_duration(d)));
         }
+        if let Some(status) = r.exit_status.as_deref() {
+            meta.push(truncate_chars(status, 64));
+        }
         if !meta.is_empty() {
             s.push_str(&format!("{}\n\n", meta.join(" · ")));
         }
         s.push_str(&format!("{}\n\n", one_line(&r.message, MAX_MSG_CHARS)));
+        // The log tail is the whole product of a failure report — the message is
+        // an index, this is what actually says what went wrong. Bounded in bytes:
+        // one line of a minified bundle can be megabytes on its own.
+        if let Some(tail) = r.log_tail.as_ref().and_then(final_log_tail) {
+            s.push_str(&format!("```\n{tail}\n```\n\n"));
+        }
         s.push_str(&format!("Reproduce: `heph run {}`\n", addr_cell(&r.addr)));
         if r.blocked > 0 {
             s.push_str(&format!(
@@ -695,7 +749,13 @@ mod tests {
     /// `blocked` collateral failures under the first root.
     fn build(matched: usize, failing: usize, blocked: usize) -> Tally {
         let mut t = Tally::default();
-        t.apply(&ev(0, BuildEventKind::MaxWorkers { count: 64 }));
+        t.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 64,
+                fail_fast: false,
+            },
+        ));
         t.apply(&ev(
             0,
             BuildEventKind::Matched {
@@ -710,9 +770,10 @@ mod tests {
                 1_000,
                 BuildEventKind::ResultEnd {
                     addr: format!("//root{i}:broken"),
-                    error: Some(format!(
-                        "execute //root{i}:broken: process exited with status 1"
-                    )),
+                    error: Some("target failed".into()),
+                    upstream_of: None,
+                    exit_status: Some("exit status: 1".into()),
+                    log_tail: None,
                 },
             ));
         }
@@ -721,9 +782,10 @@ mod tests {
                 2_000,
                 BuildEventKind::ResultEnd {
                     addr: format!("//services/api:t{i}"),
-                    error: Some(
-                        "result //services/api:t: dependency failed (root: //root0:broken)".into(),
-                    ),
+                    error: Some("dependency failed".into()),
+                    upstream_of: Some("//root0:broken".into()),
+                    exit_status: None,
+                    log_tail: None,
                 },
             ));
         }
@@ -813,6 +875,9 @@ mod tests {
                 BuildEventKind::ResultEnd {
                     addr: format!("//pkg{i}:broken"),
                     error: Some(format!("execute failed: {huge}")),
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
                 },
             ));
         }
@@ -844,6 +909,9 @@ mod tests {
                 // `format!("{e:#}")` puts the whole chain on ONE line, so a line
                 // cap alone would not bound this.
                 error: Some("y".repeat(10_000)),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
@@ -859,6 +927,9 @@ mod tests {
             BuildEventKind::ResultEnd {
                 addr: format!("//パッケージ:{}", "名前".repeat(200)),
                 error: Some("エラー".repeat(500)),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
@@ -898,6 +969,9 @@ mod tests {
                 BuildEventKind::ResultEnd {
                     addr: format!("//pkg:t{i}"),
                     error: None,
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
                 },
             ));
         }
@@ -946,6 +1020,9 @@ mod tests {
             BuildEventKind::ResultEnd {
                 addr: "//a:slow".into(),
                 error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
         ));
         t.set_closed();
@@ -1002,6 +1079,9 @@ mod tests {
             BuildEventKind::ResultEnd {
                 addr: "//a:x".into(),
                 error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
         ));
         t.set_closed();
@@ -1063,6 +1143,31 @@ mod tests {
         assert_eq!(fmt_count(7), "7");
     }
 
+    #[test]
+    fn fail_fast_mode_is_disclosed() {
+        // Otherwise a one-failure report reads as "one thing is broken" when the
+        // truth is "we stopped looking".
+        //
+        // The mode comes off the event stream, not from argv: the hook is handed
+        // what it needs rather than discovering it, and an argv scan would
+        // false-positive on a flag *value* like `--define X=--ff`.
+        let mut t = build(20_000, 1, 0);
+        t.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 64,
+                fail_fast: true,
+            },
+        ));
+        let md = render_live(&t, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
+        assert!(md.contains("Stopped at the first failure"), "{md}");
+
+        // And absent by default, so a keep-going build is not mislabelled.
+        let plain = build(20_000, 1, 0);
+        let md = render_live(&plain, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
+        assert!(!md.contains("Stopped at the first failure"), "{md}");
+    }
+
     /// Prints the rendered views for eyeballing against the mockups in
     /// `docs/GHA_REPORTING.md`. Ignored: it asserts nothing, it is a way to look
     /// at the output.
@@ -1094,10 +1199,19 @@ mod tests {
                 BuildEventKind::ResultEnd {
                     addr: format!("//pkg{}:t{i}", i % 50),
                     error: None,
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
                 },
             ));
         }
-        t.apply(&ev(0, BuildEventKind::MaxWorkers { count: 64 }));
+        t.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 64,
+                fail_fast: false,
+            },
+        ));
         println!("\n===== LIVE, healthy =====\n");
         println!(
             "{}",

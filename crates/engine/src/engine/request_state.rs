@@ -330,7 +330,7 @@ pub struct RequestStateData {
     ///
     /// [`emit`]: RequestState::emit
     pub hooks: Vec<Arc<dyn crate::engine::hook::Hook>>,
-    /// Guards the one-shot `MaxWorkers` announcement so it fires once per request
+    /// Guards the one-shot `RequestConfig` announcement so it fires once per request
     /// regardless of which entry point (`result` / `result_addr`) is hit first.
     pub workers_announced: std::sync::atomic::AtomicBool,
     /// Guards the `Matched` stream so only the first/top-level `result` (or the
@@ -749,16 +749,19 @@ impl RequestState {
         Arc::clone(&self.data)
     }
 
-    /// Emit the `MaxWorkers` capacity event at most once per request. Safe to
+    /// Emit the `RequestConfig` announcement at most once per request. Safe to
     /// call from every top-level entry point (`result`, `result_addr`); only the
     /// first call emits, so dep recursion never re-announces.
-    pub fn announce_max_workers(&self, count: usize) {
+    pub fn announce_request_config(&self, count: usize) {
         if !self
             .data
             .workers_announced
             .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            self.emit(crate::engine::event::BuildEventKind::MaxWorkers { count });
+            self.emit(crate::engine::event::BuildEventKind::RequestConfig {
+                max_workers: count,
+                fail_fast: self.data.fail_fast,
+            });
         }
     }
 
@@ -1792,9 +1795,12 @@ mod tests {
             BuildEventKind::ResultStart {
                 addr: "//a:b".into(),
             },
-            |error| BuildEventKind::ResultEnd {
+            |error: Option<crate::engine::event::ErrorDetail>| BuildEventKind::ResultEnd {
                 addr: "//a:b".into(),
-                error,
+                error: error.map(crate::engine::event::ErrorDetail::into_message),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
             },
             async { anyhow::Ok(()) },
         )
