@@ -971,14 +971,20 @@ pub mod outputartifact {
                         x: raw.x,
                     },
                 }))),
-                Content::File(file) => Box::new(std::iter::once(Ok(WalkEntry {
-                    path: PathBuf::from(&file.out_path),
-                    kind: WalkEntryKind::File {
-                        size: std::fs::metadata(&file.source_path)?.len(),
-                        data: Box::new(File::open(&file.source_path)?),
-                        x: file.x,
-                    },
-                }))),
+                Content::File(file) => Box::new(std::iter::once((|| {
+                    // Opened once and `fstat`ed, rather than a `stat` by path
+                    // plus an open — one path resolution, not two.
+                    let f = File::open(&file.source_path)?;
+                    let size = f.metadata()?.len();
+                    Ok(WalkEntry {
+                        path: PathBuf::from(&file.out_path),
+                        kind: WalkEntryKind::File {
+                            data: Box::new(f),
+                            x: file.x,
+                            size,
+                        },
+                    })
+                })())),
                 Content::TarPath(p) => Box::new(hcore::hartifactcontent::tar::TarWalker::new(
                     File::open(&p.path)?,
                 )?),

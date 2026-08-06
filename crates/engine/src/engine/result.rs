@@ -658,16 +658,33 @@ struct PassthroughContent {
 
 impl PassthroughContent {
     fn verifying_reader(&self) -> anyhow::Result<VerifyingReader> {
+        Ok(self.open()?.0)
+    }
+
+    /// Open the source once and read its size off the resulting handle.
+    ///
+    /// `fstat` on the open descriptor, not a second `stat` by path: this runs
+    /// once per source file per materialization — the hottest walk in a build —
+    /// so a path-based size lookup would pay a full second path resolution for
+    /// a file already open in this function.
+    fn open(&self) -> anyhow::Result<(VerifyingReader, u64)> {
         let file = std::fs::File::open(&self.source_path)
             .with_context(|| format!("open passthrough source '{}'", self.source_path))?;
-        Ok(VerifyingReader {
-            inner: Box::new(file),
-            hasher: xxhash_rust::xxh3::Xxh3::new(),
-            x: self.x,
-            expected: self.expected.clone(),
-            source_path: self.source_path.clone(),
-            verified: false,
-        })
+        let size = file
+            .metadata()
+            .with_context(|| format!("stat passthrough source '{}'", self.source_path))?
+            .len();
+        Ok((
+            VerifyingReader {
+                inner: Box::new(file),
+                hasher: xxhash_rust::xxh3::Xxh3::new(),
+                x: self.x,
+                expected: self.expected.clone(),
+                source_path: self.source_path.clone(),
+                verified: false,
+            },
+            size,
+        ))
     }
 }
 
@@ -677,10 +694,8 @@ impl Content for PassthroughContent {
     }
 
     fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
-        let size = std::fs::metadata(&self.source_path)
-            .with_context(|| format!("stat passthrough source '{}'", self.source_path))?
-            .len();
-        let data: Box<dyn std::io::Read> = Box::new(self.verifying_reader()?);
+        let (reader, size) = self.open()?;
+        let data: Box<dyn std::io::Read> = Box::new(reader);
         Ok(Box::new(std::iter::once(Ok(WalkEntry {
             path: std::path::PathBuf::from(&self.out_path),
             kind: WalkEntryKind::File {
