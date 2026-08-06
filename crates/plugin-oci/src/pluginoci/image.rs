@@ -59,7 +59,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::archive::{self, Blob, Blobs};
-use super::{ImageFormat, dep_files, normalize_platform, split_platform, ws_path};
+use super::{ImageFormat, dep_files, layout_path, normalize_platform, split_platform, ws_path};
 
 pub const DRIVER_NAME: &str = "oci_image";
 
@@ -422,35 +422,6 @@ fn base_for(layout: Option<&archive::Layout>, platform: &str) -> anyhow::Result<
     })
 }
 
-/// Absolute path of the OCI layout the `base` dep materialized.
-///
-/// A dep's list names *files*, never the directories holding them, so the root
-/// is found by its marker: an OCI layout is exactly a tree with an `oci-layout`
-/// file at its root.
-fn base_layout_path(req: &ManagedRunRequest<'_, '_>) -> anyhow::Result<PathBuf> {
-    let paths = dep_files(req, BASE_ORIGIN)?;
-    anyhow::ensure!(!paths.is_empty(), "`base` produced no files in the sandbox");
-    if let Some(dir) = paths
-        .iter()
-        .find(|p| p.file_name().is_some_and(|n| n == "oci-layout"))
-        .and_then(|p| p.parent())
-    {
-        return Ok(dir.to_path_buf());
-    }
-    // Not a layout directory: a single archive is the other shape this plugin
-    // produces, and `Layout::read` accepts it.
-    if let [only] = paths.as_slice() {
-        return Ok(only.clone());
-    }
-    anyhow::bail!(
-        "`base` is neither an OCI layout directory nor a single archive: no `oci-layout` file \
-         among {} staged path(s), the first being {:?}. Produce it with \
-         `oci_pull(layout = True)` or `oci_image(layout = True)`.",
-        paths.len(),
-        paths.first()
-    )
-}
-
 /// Stateless: an image is assembled from declared inputs and attributes.
 #[derive(Default)]
 pub struct Driver;
@@ -673,7 +644,7 @@ impl ManagedDriver for Driver {
 
         let base_layout = match &def.base {
             Some(_) => {
-                let path = base_layout_path(&req)?;
+                let path = layout_path(&req, BASE_ORIGIN, "`base`")?;
                 Some(
                     archive::Layout::read(&path)
                         .with_context(|| format!("read the base image at {path:?}"))?,
