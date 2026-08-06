@@ -626,7 +626,19 @@ fn add_path_to_tar(
                 "declared directory output {dir:?} (group={group_for_err}) is a file, \
                  not a directory; declare it as a file or glob output instead"
             );
-            for entry in walkdir::WalkDir::new(&dir_full) {
+            // `sort_by_file_name`, not the bare walk: `read_dir` returns entries
+            // in whatever order the filesystem keeps them (hash order on ext4,
+            // insertion order on APFS, something else again on tmpfs), and that
+            // order is the tar member order, which is the artifact's hashout.
+            // Unsorted, the *same* directory tree packs to two different hashouts
+            // on two machines — so every downstream target folding it computes a
+            // different hashin and the remote cache misses for identical content.
+            // It shows up as "heph is slow", never as an error.
+            //
+            // Sorted per directory rather than by full path: walkdir already
+            // buffers each directory's entries, so this reuses that buffer
+            // instead of collecting the whole tree to sort it.
+            for entry in walkdir::WalkDir::new(&dir_full).sort_by_file_name() {
                 let entry = entry.with_context(|| {
                     format!("walk output dir {:?} (group={})", dir_full, group_for_err)
                 })?;
@@ -884,6 +896,46 @@ mod source_map_tests {
         assert!(
             msg.contains("out") && msg.contains("data"),
             "must name path+group: {msg}"
+        );
+    }
+
+    // A directory output's tar member order is its hashout, so it must not
+    // depend on `read_dir` order — that differs between ext4, APFS and tmpfs,
+    // and an unsorted walk makes the *same* tree hash differently on two
+    // machines. Every downstream target folding it then computes a different
+    // hashin and the remote cache misses for identical content, silently.
+    //
+    // The files are created in reverse order on purpose: on a filesystem that
+    // returns entries in insertion order (APFS), an unsorted walk reproduces
+    // exactly that, so this fails without the sort rather than passing by luck.
+    #[test]
+    fn dir_output_packs_in_a_stable_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out");
+        fs::create_dir_all(out.join("sub")).expect("mkdir");
+        for rel in ["z.txt", "sub/b.txt", "sub/a.txt", "a.txt"] {
+            fs::write(out.join(rel), b"x").expect("write");
+        }
+
+        let p = out_path(path::Content::DirPath("out".to_string()));
+        let mut tar = TarPacker::new();
+        add_path_to_tar(&mut tar, dir.path(), &p, "data").expect("add dir output");
+        let mut buf = Vec::new();
+        tar.pack(&mut buf).expect("pack");
+
+        let packed: Vec<String> = TarWalker::new(Cursor::new(buf))
+            .expect("walk packed tar")
+            .map(|e| e.expect("entry").path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            packed,
+            vec![
+                "out/a.txt".to_string(),
+                "out/sub/a.txt".to_string(),
+                "out/sub/b.txt".to_string(),
+                "out/z.txt".to_string(),
+            ],
+            "directory outputs must pack in a filesystem-independent order"
         );
     }
 
