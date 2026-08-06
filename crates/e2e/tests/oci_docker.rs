@@ -616,27 +616,33 @@ target(
     Ok(())
 }
 
-/// `oci_load` must put a runnable image in the daemon under the requested tag.
-/// The archive-format/tool pairing and the post-`docker load` tagging are both
-/// invisible to a fake — the daemon is the only thing that can confirm them.
+/// Both tagging paths must actually land in the daemon: the tag a BUILD file
+/// names, and the content-addressed one derived when it does not.
+///
+/// Only a daemon can confirm either. The archive carries `RepoTags`, but a
+/// containerd-backed daemon ignores them in favour of the OCI path, so the
+/// driver tags explicitly afterwards — and a fake cannot tell whether that
+/// worked.
 #[tokio::test]
 async fn test_real_docker_load_tags_the_image_in_the_daemon() -> anyhow::Result<()> {
     require_docker!();
     let builder = require_builder!();
-    // Unique per process so parallel runs (and a leftover from a killed run) do
-    // not collide in the shared daemon.
+    // The package is unique per process so the *derived* repository is too:
+    // parallel runs, and leftovers from a killed one, share the daemon.
+    let pkg = format!("app{}", std::process::id());
+    let repo = format!("{pkg}/img");
     let tag = format!("heph-e2e-oci-load:{}", std::process::id());
 
     let ws = workspace();
     ws.write_build_file(
-        "app",
+        &pkg,
         &format!(
             r#"
 target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
 target(
     name = "dockerfile",
     driver = "bash",
-    run = "printf 'FROM scratch\nCOPY app/payload.txt /payload.txt\n' > $OUT",
+    run = "printf 'FROM scratch\nCOPY {pkg}/payload.txt /payload.txt\n' > $OUT",
     out = "Dockerfile",
 )
 target(
@@ -647,37 +653,73 @@ target(
     {builder}
 )
 target(name = "load", driver = "oci_load", image = ":img", tag = "{tag}")
+target(name = "autoload", driver = "oci_load", image = ":img")
 "#,
             builder = builder_attr(&builder),
         ),
     );
 
-    let loaded = ws.run("//app:load").await;
-    // Clean up before asserting: the daemon is shared state, and a failed
-    // assertion must not leave an image behind.
-    let inspect = Command::new("docker")
+    let loaded = ws.run(&format!("//{pkg}:load")).await;
+    let autoloaded = ws.run(&format!("//{pkg}:autoload")).await;
+    // Read the daemon's state, then clean up, then assert: the daemon is shared
+    // and a failed assertion must not leave images behind.
+    let explicit = Command::new("docker")
         .args(["image", "inspect", &tag])
         .output();
+    let derived = Command::new("docker")
+        .args([
+            "images",
+            "--format",
+            "{{.Repository}}:{{.Tag}}",
+            repo.as_str(),
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
     drop(Command::new("docker").args(["rmi", "-f", &tag]).output());
+    for line in derived.lines() {
+        drop(Command::new("docker").args(["rmi", "-f", line]).output());
+    }
 
     loaded?;
+    autoloaded?;
     assert!(
-        inspect.is_ok_and(|o| o.status.success()),
+        explicit.is_ok_and(|o| o.status.success()),
         "the tag {tag} must exist in the daemon after oci_load"
+    );
+    // The derived tag is the one a caller can predict from the graph, and the
+    // only one the untagged target produced.
+    let derived: Vec<&str> = derived.lines().collect();
+    assert_eq!(
+        derived.len(),
+        1,
+        "exactly one content-addressed tag under {repo}, got: {derived:?}"
+    );
+    let hash = derived[0]
+        .rsplit_once(':')
+        .map(|(_, t)| t)
+        .unwrap_or_default();
+    assert!(
+        !hash.is_empty() && hash != "<none>" && hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "the derived tag must be the input hash, got: {:?}",
+        derived[0]
     );
     Ok(())
 }
 
 /// The default `format = "oci"` path end to end: buildx writes an OCI archive
-/// and `skopeo` copies it into the daemon under the requested tag. Nothing in
-/// the argv-level tests can show that skopeo accepts the transport, the
-/// `--override-os/--override-arch` pair and the `docker-daemon:` destination in
-/// the order the driver emits them.
+/// and the driver converts it to the docker-format shape on the way into the
+/// daemon.
+///
+/// The conversion is the point. `docker load` accepts an OCI archive only on a
+/// daemon with the containerd image store, which is still not the default
+/// everywhere, so anything short of a real daemon proves nothing about whether
+/// the rewritten archive is accepted.
 #[tokio::test]
-async fn test_real_skopeo_loads_an_oci_archive_into_the_daemon() -> anyhow::Result<()> {
+async fn test_real_oci_archive_loads_into_the_daemon() -> anyhow::Result<()> {
     require_docker!();
     let builder = require_builder!();
-    let tag = format!("heph-e2e-skopeo-load:{}", std::process::id());
+    let tag = format!("heph-e2e-oci-archive-load:{}", std::process::id());
 
     let ws = workspace();
     ws.write_build_file(
@@ -712,7 +754,7 @@ target(name = "load", driver = "oci_load", image = ":img", tag = "{tag}")
     loaded?;
     assert!(
         inspect.is_ok_and(|o| o.status.success()),
-        "the tag {tag} must exist in the daemon after a skopeo oci_load"
+        "the tag {tag} must exist in the daemon after loading an OCI archive"
     );
     Ok(())
 }
