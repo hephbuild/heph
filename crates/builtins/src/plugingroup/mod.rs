@@ -273,7 +273,10 @@ impl hplugin::driver::Driver for Driver {
         // `rename` key is ambiguous only relative to every path in play.
         let mut sources = Vec::with_capacity(req.inputs.len());
         for input in &req.inputs {
-            if matches!(input.artifact.r#type, hplugin::driver::inputartifact::Type::Dep) {
+            if matches!(
+                input.artifact.r#type,
+                hplugin::driver::inputartifact::Type::Dep
+            ) {
                 sources.push(SourcePaths::new(
                     dep_package(input),
                     input
@@ -343,9 +346,9 @@ impl hplugin::driver::Driver for Driver {
                             input.source_addr
                         )
                     })?;
-                    let hashout = view.hashout().with_context(|| {
-                        format!("hashout of view over '{}'", input.source_addr)
-                    })?;
+                    let hashout = view
+                        .hashout()
+                        .with_context(|| format!("hashout of view over '{}'", input.source_addr))?;
                     artifacts.push(outputartifact::OutputArtifact {
                         group: String::new(),
                         name: format!("view_{i}"),
@@ -568,13 +571,19 @@ mod tests {
     #[tokio::test]
     async fn transform_makes_the_group_non_transparent_and_uncacheable() {
         for (key, value) in [
-            ("include", Value::List(vec![Value::String("**/*.so".into())])),
+            (
+                "include",
+                Value::List(vec![Value::String("**/*.so".into())]),
+            ),
             ("exclude", Value::List(vec![Value::String("**/x".into())])),
             ("strip_prefix", Value::String("build/out".into())),
             ("prefix", Value::String("lib".into())),
             (
                 "rename",
-                Value::Map(HashMap::from([("a".to_string(), Value::String("b".into()))])),
+                Value::Map(HashMap::from([(
+                    "a".to_string(),
+                    Value::String("b".into()),
+                )])),
             ),
         ] {
             let def = parse_group(&[(key, value)]).await;
@@ -636,11 +645,8 @@ mod tests {
 
     #[tokio::test]
     async fn include_patterns_are_reflected_in_declared_outputs() {
-        let def = parse_group(&[(
-            "include",
-            Value::List(vec![Value::String("bin/**".into())]),
-        )])
-        .await;
+        let def =
+            parse_group(&[("include", Value::List(vec![Value::String("bin/**".into())]))]).await;
         let PathContent::Glob(ref g) = def.outputs[0].paths[0].content else {
             panic!("expected a glob path, got {:?}", def.outputs[0].paths[0]);
         };
@@ -686,11 +692,7 @@ mod tests {
             Ok("dephash".to_string())
         }
         fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
-            Ok(self
-                .paths
-                .iter()
-                .map(std::path::PathBuf::from)
-                .collect())
+            Ok(self.paths.iter().map(std::path::PathBuf::from).collect())
         }
     }
 
@@ -802,7 +804,10 @@ mod tests {
             ("prefix".to_string(), Value::String("lib".into())),
         ]);
         // `ParseResponse` has no `Debug`, so `expect_err` is unavailable.
-        let err = match Driver.parse(make_parse_req("//pkg:g", config), &ctoken()).await {
+        let err = match Driver
+            .parse(make_parse_req("//pkg:g", config), &ctoken())
+            .await
+        {
             Ok(_) => panic!("must reject dead prefix config"),
             Err(e) => e,
         };
@@ -838,7 +843,9 @@ mod tests {
     #[tokio::test]
     async fn string_rename_places_the_sole_output_without_naming_it() {
         let def = parse_group(&[("rename", Value::String("bin/myserver".into()))]).await;
-        let resp = run_group(&def, &[&["build/out/server"]]).await.expect("run");
+        let resp = run_group(&def, &[&["build/out/server"]])
+            .await
+            .expect("run");
         let paths: Vec<String> = hcore::hartifactcontent::Content::entry_paths(&resp.artifacts[0])
             .expect("entry paths")
             .iter()
@@ -855,7 +862,10 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("a/server"), "{msg}");
         assert!(msg.contains("b/server"), "{msg}");
-        assert!(msg.contains("//pkg:g"), "error should name the group: {msg}");
+        assert!(
+            msg.contains("//pkg:g"),
+            "error should name the group: {msg}"
+        );
     }
 
     /// Every produced artifact's recorded `hashout` must equal what its own
@@ -897,7 +907,10 @@ mod tests {
         let err = run_group_err(&def, &[&["build/out/server"]]).await;
         let msg = format!("{err:#}");
         assert!(msg.contains("nope"), "{msg}");
-        assert!(msg.contains("build/out/server"), "should list what is available: {msg}");
+        assert!(
+            msg.contains("build/out/server"),
+            "should list what is available: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -913,7 +926,10 @@ mod tests {
         let err = run_group_err(&def, &[&["server"]]).await;
         let msg = format!("{err:#}");
         assert!(msg.contains("sever"), "{msg}");
-        assert!(msg.contains("//pkg:g"), "error should name the group: {msg}");
+        assert!(
+            msg.contains("//pkg:g"),
+            "error should name the group: {msg}"
+        );
     }
 
     /// Two files colliding must fail here, naming the group, rather than
@@ -924,6 +940,9 @@ mod tests {
         let err = run_group_err(&def, &[&["a/x", "x"]]).await;
         let msg = format!("{err:#}");
         assert!(msg.contains("collision"), "{msg}");
-        assert!(msg.contains("//pkg:g"), "error should name the group: {msg}");
+        assert!(
+            msg.contains("//pkg:g"),
+            "error should name the group: {msg}"
+        );
     }
 }

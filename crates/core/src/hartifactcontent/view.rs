@@ -923,7 +923,10 @@ mod tests {
     fn rename_is_exact_and_bypasses_prefix_rules() {
         let t = PathTransform {
             prefix: Some("lib".into()),
-            rename: Rename::Exact(BTreeMap::from([("build/out/server".into(), "bin/myserver".into())])),
+            rename: Rename::Exact(BTreeMap::from([(
+                "build/out/server".into(),
+                "bin/myserver".into(),
+            )])),
             ..transform()
         };
         assert_eq!(
@@ -941,7 +944,10 @@ mod tests {
     fn rename_overrides_include_filtering() {
         let t = PathTransform {
             include: vec!["**/*.so".into()],
-            rename: Rename::Exact(BTreeMap::from([("README.md".into(), "docs/README.md".into())])),
+            rename: Rename::Exact(BTreeMap::from([(
+                "README.md".into(),
+                "docs/README.md".into(),
+            )])),
             ..transform()
         };
         assert_eq!(
@@ -1199,9 +1205,10 @@ mod tests {
     #[test]
     fn unknown_exact_rename_key_errors_with_the_available_paths() {
         let t = PathTransform {
-            rename: Rename::Exact(BTreeMap::from([
-                ("app/build/out/sever".into(), "bin/s".into()),
-            ])),
+            rename: Rename::Exact(BTreeMap::from([(
+                "app/build/out/sever".into(),
+                "bin/s".into(),
+            )])),
             ..transform()
         };
         let err = validated_in(&t, Some("app"), &["app/build/out/server"])
@@ -1329,9 +1336,7 @@ mod tests {
         fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
             anyhow::bail!("not used")
         }
-        fn walk(
-            &self,
-        ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
             Ok(Box::new(self.entries.iter().map(|(path, data)| {
                 Ok(WalkEntry {
                     path: PathBuf::from(path),
@@ -1363,11 +1368,16 @@ mod tests {
 
     #[test]
     fn view_walk_rewrites_paths_and_preserves_data() {
-        let view = ViewContent::new(source(&[("build/out/server", "elf"), ("build/out/x.txt", "hi")]), PathTransform {
+        let view = ViewContent::new(
+            source(&[("build/out/server", "elf"), ("build/out/x.txt", "hi")]),
+            PathTransform {
                 strip_prefix: Some("build/out".into()),
                 prefix: Some("lib".into()),
                 ..transform()
-            }, None, RenamePlan::default());
+            },
+            None,
+            RenamePlan::default(),
+        );
 
         let mut got: Vec<(String, String)> = Vec::new();
         for entry in view.walk().expect("walk") {
@@ -1391,10 +1401,15 @@ mod tests {
 
     #[test]
     fn view_walk_drops_filtered_entries() {
-        let view = ViewContent::new(source(&[("a.so", "x"), ("a.txt", "y")]), PathTransform {
+        let view = ViewContent::new(
+            source(&[("a.so", "x"), ("a.txt", "y")]),
+            PathTransform {
                 include: vec!["**/*.so".into()],
                 ..transform()
-            }, None, RenamePlan::default());
+            },
+            None,
+            RenamePlan::default(),
+        );
         assert_eq!(view.entry_paths().unwrap(), vec![p("a.so")]);
         assert_eq!(view.walk().unwrap().count(), 1);
     }
@@ -1405,22 +1420,37 @@ mod tests {
     #[test]
     fn view_hashout_changes_with_the_transform() {
         let src = source(&[("a/x", "data")]);
-        let a = ViewContent::new(Arc::clone(&src), PathTransform {
+        let a = ViewContent::new(
+            Arc::clone(&src),
+            PathTransform {
                 prefix: Some("lib".into()),
                 ..transform()
-            }, None, RenamePlan::default())
+            },
+            None,
+            RenamePlan::default(),
+        )
         .hashout()
         .unwrap();
-        let b = ViewContent::new(Arc::clone(&src), PathTransform {
+        let b = ViewContent::new(
+            Arc::clone(&src),
+            PathTransform {
                 prefix: Some("bin".into()),
                 ..transform()
-            }, None, RenamePlan::default())
+            },
+            None,
+            RenamePlan::default(),
+        )
         .hashout()
         .unwrap();
-        let c = ViewContent::new(Arc::clone(&src), PathTransform {
+        let c = ViewContent::new(
+            Arc::clone(&src),
+            PathTransform {
                 prefix: Some("lib".into()),
                 ..transform()
-            }, None, RenamePlan::default())
+            },
+            None,
+            RenamePlan::default(),
+        )
         .hashout()
         .unwrap();
 
@@ -1435,15 +1465,22 @@ mod tests {
             prefix: Some("lib".into()),
             ..transform()
         };
-        let a = ViewContent::new(source(&[("a/x", "one")]), t.clone(), None, RenamePlan::default())
-            .hashout()
-            .unwrap();
+        let a = ViewContent::new(
+            source(&[("a/x", "one")]),
+            t.clone(),
+            None,
+            RenamePlan::default(),
+        )
+        .hashout()
+        .unwrap();
         let mut other = FakeSource {
             entries: vec![("a/x".to_string(), b"one".to_vec())],
             hashout: "different".to_string(),
         };
         other.hashout = "different".to_string();
-        let b = ViewContent::new(Arc::new(other), t, None, RenamePlan::default()).hashout().unwrap();
+        let b = ViewContent::new(Arc::new(other), t, None, RenamePlan::default())
+            .hashout()
+            .unwrap();
         assert_ne!(a, b, "source hashout must be part of the view's identity");
     }
 
@@ -1469,10 +1506,15 @@ mod tests {
 
     #[test]
     fn view_reader_packs_rewritten_paths() {
-        let view = ViewContent::new(source(&[("build/out/server", "elf")]), PathTransform {
+        let view = ViewContent::new(
+            source(&[("build/out/server", "elf")]),
+            PathTransform {
                 strip_prefix: Some("build/out".into()),
                 ..transform()
-            }, None, RenamePlan::default());
+            },
+            None,
+            RenamePlan::default(),
+        );
         let mut buf = Vec::new();
         std::io::copy(&mut view.reader().expect("reader"), &mut buf).expect("copy");
 
@@ -1509,7 +1551,8 @@ mod tests {
             }
             fn walk(
                 &self,
-            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
+            {
                 Ok(Box::new(std::iter::once(Ok(WalkEntry {
                     path: PathBuf::from("a/x"),
                     kind: WalkEntryKind::File {
@@ -1577,7 +1620,8 @@ mod tests {
             }
             fn walk(
                 &self,
-            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
+            {
                 Ok(Box::new(std::iter::once(Ok(WalkEntry {
                     path: PathBuf::from("big/blob.bin"),
                     kind: WalkEntryKind::File {
@@ -1676,7 +1720,8 @@ mod tests {
             }
             fn walk(
                 &self,
-            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
+            {
                 Ok(Box::new(std::iter::once(Err(anyhow::anyhow!(
                     "source blew up mid-walk"
                 )))))
@@ -1710,10 +1755,15 @@ mod tests {
 
     #[test]
     fn view_surfaces_collision_errors_from_walk() {
-        let view = ViewContent::new(source(&[("a/x", "d"), ("x", "e")]), PathTransform {
+        let view = ViewContent::new(
+            source(&[("a/x", "d"), ("x", "e")]),
+            PathTransform {
                 strip_prefix: Some("a".into()),
                 ..transform()
-            }, None, RenamePlan::default());
+            },
+            None,
+            RenamePlan::default(),
+        );
         assert!(view.walk().is_err(), "collision must surface from walk");
     }
 }

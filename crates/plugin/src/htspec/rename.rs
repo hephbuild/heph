@@ -31,9 +31,7 @@ impl FromSpecValue for Rename {
                 let mut out = std::collections::BTreeMap::new();
                 for (k, val) in m {
                     let Value::String(dst) = val else {
-                        anyhow::bail!(
-                            "`rename` dict values must be strings; key '{k}' is not"
-                        );
+                        anyhow::bail!("`rename` dict values must be strings; key '{k}' is not");
                     };
                     out.insert(k.clone(), dst.clone());
                 }

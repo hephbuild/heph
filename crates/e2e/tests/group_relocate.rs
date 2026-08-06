@@ -23,11 +23,7 @@ const PKG: &str = "reloc";
 
 async fn hashin(ws: &Workspace, addr: &str) -> anyhow::Result<String> {
     let rs = ws.engine.new_state();
-    let meta = ws
-        .engine
-        .clone()
-        .meta(rs, &parse_addr(addr)?)
-        .await?;
+    let meta = ws.engine.clone().meta(rs, &parse_addr(addr)?).await?;
     Ok(meta.hashin)
 }
 
