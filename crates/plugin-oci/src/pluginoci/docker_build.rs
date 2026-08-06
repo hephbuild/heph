@@ -421,7 +421,7 @@ fn link_platform_contexts(
     def: &DockerBuildDef,
     context_dir: &Path,
 ) -> anyhow::Result<()> {
-    for (platform, group) in &def.platform_context_keys {
+    for (platform, group, _) in &def.platform_contexts {
         let seg = platform_segment(platform);
         let root = req.sandbox_dir.join(format!("exec_{seg}_{group}"));
         let dest_root = context_dir.join(PLATFORM_CTX_PREFIX).join(platform);
@@ -493,17 +493,32 @@ struct DockerBuildDef {
     secrets: Vec<String>,
     /// Sorted before hashing, as `secrets`.
     ssh: Vec<String>,
-    /// The `(platform, group)` pairs `context_by_platform` declared, sorted.
-    /// The deps' contents ride in via their own input hashes; this is here so
-    /// that *adding or removing* a platform or a group busts the key, since the
-    /// staged layout is what buildx sees. Sorted rather than order-sensitive:
-    /// unlike `platforms`, these keys carry no manifest ordering.
-    platform_context_keys: Vec<(String, String)>,
-    /// Named build contexts (`--build-context <name>=…`) for base images, by
-    /// group name. The origin_id is derived from the name; the resolved sandbox
-    /// path is not known until run time, so only the names are hashed here —
-    /// the contents arrive through the corresponding hashed dep inputs.
-    bases: Vec<String>,
+    /// `context` as `(group, normalized addresses)`, sorted by group, addresses
+    /// in declaration order.
+    ///
+    /// The **addresses**, not just the group names, and this is load-bearing:
+    /// `hashin` folds a *sorted, unlabeled multiset* of dep hashouts
+    /// (`engine/meta.rs`), with no origin_id, no address, and no output-group
+    /// selector — `inputs_result_meta` folds every group a dep has regardless of
+    /// the `|group` on the ref. So `{"a": [":x"], "b": [":y"]}` and the swap
+    /// reached the key identically while producing different `SRC_A` / `SRC_B`
+    /// build args, and `[":bin|release"]` and `[":bin|debug"]` were one entry.
+    ///
+    /// Normalized (`//pkg:name`, not the BUILD-file spelling) so `:x` and
+    /// `//app:x` in package `app` stay one key.
+    context: Vec<(String, Vec<String>)>,
+    /// `context_by_platform` as `(platform, group, normalized addresses)`,
+    /// sorted by platform then group.
+    ///
+    /// Same reason as [`context`](Self::context), with the platform as an extra
+    /// coordinate: swapping which platform gets which target left the key
+    /// untouched and put the amd64 binary in the arm64 image.
+    platform_contexts: Vec<(String, String, Vec<String>)>,
+    /// Named build contexts (`--build-context <name>=…`) for base images, as
+    /// `(name, normalized address)`, sorted by name. The address is hashed for
+    /// the same reason as [`context`](Self::context) — swapping two bases
+    /// between their names changes which image each `FROM` resolves to.
+    bases: Vec<(String, String)>,
     /// Layer-cache sources — NOT hashed (build optimization only).
     cache_from: Vec<String>,
     /// Layer-cache destinations — NOT hashed.
@@ -521,7 +536,13 @@ struct DockerBuildDef {
 /// v4: platform strings are normalized before they reach the key, and
 /// `context_by_platform` adds per-platform deps plus the `CTX_BY_PLATFORM` build
 /// arg. Both change what a given input set produces.
-const DOCKER_BUILD_FORMAT_VERSION: u32 = 4;
+///
+/// v5: `context`, `context_by_platform` and `bases` hash the target *addresses*
+/// they map each name to, not just the names. Correctness, not layout: `hashin`
+/// folds an unlabeled multiset of dep hashouts, so swapping two groups' targets
+/// left the key untouched while changing the `SRC_*` args and the `FROM`
+/// resolution.
+const DOCKER_BUILD_FORMAT_VERSION: u32 = 5;
 
 impl Hash for DockerBuildDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -547,8 +568,9 @@ impl Hash for DockerBuildDef {
         self.builder.hash(state);
         self.secrets.hash(state);
         self.ssh.hash(state);
+        self.context.hash(state);
         self.bases.hash(state);
-        self.platform_context_keys.hash(state);
+        self.platform_contexts.hash(state);
         // `cache_from` / `cache_to` are deliberately excluded: they select where
         // BuildKit may reuse layers from, which changes how long a build takes
         // and can change the exported layer digests, but never what the image
@@ -916,17 +938,19 @@ impl ManagedDriver for Driver {
 
         // Per-platform context deps: staged under their own platform prefix, so
         // two variants of one target no longer collide on a shared path.
-        let mut platform_context_keys: Vec<(String, String)> = Vec::new();
+        let mut platform_contexts: Vec<(String, String, Vec<String>)> = Vec::new();
         for (platform, groups) in &pbp {
             let mut names: Vec<&String> = groups.keys().collect();
             names.sort();
             for group in names {
-                platform_context_keys.push((platform.clone(), group.clone()));
+                let mut addrs = Vec::new();
                 let refs = groups.get(group).map_or(&[][..], Vec::as_slice);
                 for (i, r) in refs.iter().enumerate() {
                     let origin = platform_ctx_origin(platform, group, i);
+                    let r#ref = TargetAddr::parse(r, &pkg)?;
+                    addrs.push(r#ref.to_string());
                     inputs.push(Input {
-                        r#ref: TargetAddr::parse(r, &pkg)?,
+                        r#ref,
                         mode: InputMode::Standard,
                         // Inside the context, under the platform's own prefix.
                         // Outside the context: unpacking two variants of one
@@ -942,6 +966,7 @@ impl ManagedDriver for Driver {
                         runtime: true,
                     });
                 }
+                platform_contexts.push((platform.clone(), group.clone(), addrs));
             }
         }
 
@@ -949,11 +974,15 @@ impl ManagedDriver for Driver {
         // HashMap iteration order varies per process; sort so the def and the
         // input ordering are byte-stable across runs.
         context_groups.sort();
+        let mut context: Vec<(String, Vec<String>)> = Vec::new();
         for group in &context_groups {
             let refs = spec.context.get(group).map_or(&[][..], Vec::as_slice);
+            let mut addrs = Vec::new();
             for (i, r) in refs.iter().enumerate() {
+                let r#ref = TargetAddr::parse(r, &pkg)?;
+                addrs.push(r#ref.to_string());
                 inputs.push(Input {
-                    r#ref: TargetAddr::parse(r, &pkg)?,
+                    r#ref,
                     mode: InputMode::Standard,
                     origin_id: format!("context|{group}|{i}"),
                     annotations: BTreeMap::new(),
@@ -961,12 +990,14 @@ impl ManagedDriver for Driver {
                     runtime: true,
                 });
             }
+            context.push((group.clone(), addrs));
         }
 
         // Base images: one dep each, consumed as a named `--build-context`.
-        let mut bases: Vec<String> = spec.bases.keys().cloned().collect();
-        bases.sort();
-        for name in &bases {
+        let mut base_names: Vec<String> = spec.bases.keys().cloned().collect();
+        base_names.sort();
+        let mut bases: Vec<(String, String)> = Vec::new();
+        for name in &base_names {
             anyhow::ensure!(
                 !name.is_empty(),
                 "`bases` keys name a Dockerfile `FROM` target and cannot be empty"
@@ -979,8 +1010,10 @@ impl ManagedDriver for Driver {
                     refs.len()
                 );
             };
+            let r#ref = TargetAddr::parse(image, &pkg)?;
+            bases.push((name.clone(), r#ref.to_string()));
             inputs.push(Input {
-                r#ref: TargetAddr::parse(image, &pkg)?,
+                r#ref,
                 mode: InputMode::Standard,
                 origin_id: format!("base|{name}"),
                 annotations: out_of_context_root(&format!("base_{}", arg_key_segment(name))),
@@ -1005,8 +1038,9 @@ impl ManagedDriver for Driver {
             builder,
             secrets,
             ssh,
+            context,
             bases,
-            platform_context_keys,
+            platform_contexts,
             cache_from: spec.cache_from,
             cache_to: spec.cache_to,
         };
@@ -1201,7 +1235,11 @@ fn build_error_hint(e: anyhow::Error, def: &DockerBuildDef, addr: &str) -> anyho
     } else {
         format!(
             ", and every base in `bases` ({}) must be pulled with `all_platforms = True`",
-            def.bases.join(", ")
+            def.bases
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     };
     let builder = def.builder.as_deref().map_or_else(
@@ -1570,7 +1608,7 @@ fn resolve_named_contexts(
     def: &DockerBuildDef,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
-    for name in &def.bases {
+    for (name, _) in &def.bases {
         let origin = format!("base|{name}");
         let paths = dep_files(req, &origin)?;
         anyhow::ensure!(
@@ -1757,6 +1795,118 @@ exit 0
         assert_eq!(src_arg_name("my-group"), "SRC_MY_GROUP");
     }
 
+    fn bare_def() -> DockerBuildDef {
+        DockerBuildDef {
+            dockerfile: DockerfileSource::Path("app/Dockerfile".to_string()),
+            out: "app/img.tar".to_string(),
+            digest_out: "app/img.digest".to_string(),
+            format: ImageFormat::Oci,
+            build_args: BTreeMap::new(),
+            stage: None,
+            platforms: vec![],
+            builder: None,
+            secrets: vec![],
+            ssh: vec![],
+            bases: vec![],
+            context: vec![],
+            platform_contexts: vec![],
+            cache_from: vec![],
+            cache_to: vec![],
+        }
+    }
+
+    fn def_hash(def: &DockerBuildDef) -> u64 {
+        let mut h = Xxh3Default::new();
+        def.hash(&mut h);
+        h.finish()
+    }
+
+    /// Which target fills which named slot must reach the key, and only the def
+    /// hash can carry it.
+    ///
+    /// `hashin` folds a *sorted, unlabeled multiset* of dep hashouts
+    /// (`engine/meta.rs`) — no origin_id, no address — and `inputs_result_meta`
+    /// folds every output group a dep has regardless of the `|group` selector on
+    /// the ref. So every swap below leaves `hashin` byte-identical while
+    /// changing what the build sees: the `SRC_*` args point at different files,
+    /// or a `FROM` resolves to a different image.
+    #[test]
+    fn swapping_targets_between_named_slots_changes_the_key() {
+        let base = bare_def();
+
+        let mut xy = base.clone();
+        xy.context = vec![
+            ("a".to_string(), vec!["//app:x".to_string()]),
+            ("b".to_string(), vec!["//app:y".to_string()]),
+        ];
+        let mut yx = base.clone();
+        yx.context = vec![
+            ("a".to_string(), vec!["//app:y".to_string()]),
+            ("b".to_string(), vec!["//app:x".to_string()]),
+        ];
+        assert_ne!(
+            def_hash(&xy),
+            def_hash(&yx),
+            "SRC_A and SRC_B would name each other's files"
+        );
+
+        let mut b1 = base.clone();
+        b1.bases = vec![
+            ("base".to_string(), "//app:alpine".to_string()),
+            ("tools".to_string(), "//app:ubuntu".to_string()),
+        ];
+        let mut b2 = base.clone();
+        b2.bases = vec![
+            ("base".to_string(), "//app:ubuntu".to_string()),
+            ("tools".to_string(), "//app:alpine".to_string()),
+        ];
+        assert_ne!(
+            def_hash(&b1),
+            def_hash(&b2),
+            "`FROM base` would resolve to the other image"
+        );
+
+        let mut p1 = base.clone();
+        p1.platform_contexts = vec![
+            (
+                "linux/amd64".to_string(),
+                "bin".to_string(),
+                vec!["//cmd:x".to_string()],
+            ),
+            (
+                "linux/arm64".to_string(),
+                "bin".to_string(),
+                vec!["//cmd:y".to_string()],
+            ),
+        ];
+        let mut p2 = base.clone();
+        p2.platform_contexts = vec![
+            (
+                "linux/amd64".to_string(),
+                "bin".to_string(),
+                vec!["//cmd:y".to_string()],
+            ),
+            (
+                "linux/arm64".to_string(),
+                "bin".to_string(),
+                vec!["//cmd:x".to_string()],
+            ),
+        ];
+        assert_ne!(
+            def_hash(&p1),
+            def_hash(&p2),
+            "the amd64 leg would stage the arm64 binary"
+        );
+
+        // The output-group selector reaches no other part of the key either:
+        // `inputs_result_meta` folds every group the dep has.
+        let mut rel = base.clone();
+        rel.context = vec![("a".to_string(), vec!["//app:bin|release".to_string()])];
+        let mut dbg = base.clone();
+        dbg.context = vec![("a".to_string(), vec!["//app:bin|debug".to_string()])];
+        assert_ne!(def_hash(&rel), def_hash(&dbg));
+    }
+
     /// The build command carries the format, dockerfile, output dest, metadata
     /// file, sorted build args and cache refs, ending in the context dir.
     #[test]
@@ -1776,7 +1926,8 @@ exit 0
             secrets: vec!["id=token,env=TOKEN".to_string()],
             ssh: vec!["default".to_string()],
             bases: vec![],
-            platform_context_keys: vec![],
+            context: vec![],
+            platform_contexts: vec![],
             cache_from: vec!["type=registry,ref=reg/app:cache".to_string()],
             cache_to: vec!["type=inline".to_string()],
         };
@@ -1826,7 +1977,8 @@ exit 0
             secrets: vec![],
             ssh: vec![],
             bases: vec![],
-            platform_context_keys: vec![],
+            context: vec![],
+            platform_contexts: vec![],
             cache_from: vec![],
             cache_to: vec![],
         };
@@ -1857,8 +2009,9 @@ exit 0
             builder: None,
             secrets: vec![],
             ssh: vec![],
-            bases: vec!["base".to_string()],
-            platform_context_keys: vec![],
+            bases: vec![("base".to_string(), "//app:alpine".to_string())],
+            context: vec![],
+            platform_contexts: vec![],
             cache_from: vec![],
             cache_to: vec![],
         };
@@ -1903,7 +2056,8 @@ exit 0
             secrets: vec![],
             ssh: vec![],
             bases: vec![],
-            platform_context_keys: vec![],
+            context: vec![],
+            platform_contexts: vec![],
             cache_from: vec![],
             cache_to: vec![],
         };
@@ -2117,7 +2271,8 @@ exit 0
             secrets: vec![],
             ssh: vec![],
             bases: vec![],
-            platform_context_keys: vec![],
+            context: vec![],
+            platform_contexts: vec![],
             cache_from: vec![],
             cache_to: vec![],
         };
