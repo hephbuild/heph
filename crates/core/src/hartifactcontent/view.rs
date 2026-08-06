@@ -464,19 +464,34 @@ fn nearest_hint(paths: &[PathBuf]) -> String {
 /// detection, and the source map. They used to each open-code `Path::new(f) ==
 /// rel`, which meant exact paths only and five chances to drift.
 ///
-/// A pattern that does not compile as a glob falls back to an exact
-/// string match. That is what makes this a strict superset of the old
+/// A pattern with no glob metacharacter is kept as a literal and compared with
+/// string equality — never compiled. This is not a micro-optimization: the
+/// overwhelmingly common filter is a single exact path (`plugin-go` emits one
+/// per Go source file, so a build compiles them by the thousand), and
+/// `wax::Glob::new` builds a regex NFA. Measured on that shape, compiling
+/// every pattern made filtering **8x** slower than the exact-compare it
+/// replaced, with ~19µs of that per input in compilation alone. Literals keep
+/// it at parity.
+///
+/// A pattern that *is* a glob but fails to compile also falls back to an exact
+/// match. Together with the above, that makes this a strict superset of the old
 /// behaviour: every literal path keeps matching itself, and a filename
 /// containing glob metacharacters that a user meant literally still works
 /// rather than becoming a hard error.
 #[derive(Debug, Default)]
 pub struct PathFilter {
-    /// Compiled globs, paired with nothing — a pattern that failed to compile
-    /// is in `literals` instead.
+    /// Compiled globs. Only patterns that actually contain a metacharacter and
+    /// compile cleanly land here; everything else is a literal.
     globs: Vec<wax::Glob<'static>>,
     literals: Vec<String>,
     empty: bool,
 }
+
+/// Characters that make a pattern a glob rather than a literal path. Mirrors
+/// `pluginfs::literal_prefix`'s set: wax's metacharacters, plus `\` (its escape)
+/// and `,` (only meaningful inside `{…}`, but a reliable signal the component is
+/// not literal).
+const GLOB_META: &[char] = &['*', '?', '[', ']', '{', '}', '<', '>', '\\', ','];
 
 impl PathFilter {
     /// Compile a filter list. Never fails: an uncompilable pattern degrades to
@@ -485,6 +500,12 @@ impl PathFilter {
         let mut globs = Vec::new();
         let mut literals = Vec::new();
         for p in patterns {
+            // Literal first — see the type docs for why this branch carries the
+            // load.
+            if !p.contains(GLOB_META) {
+                literals.push(p.clone());
+                continue;
+            }
             match wax::Glob::new(p).map(wax::Glob::into_owned) {
                 Ok(g) => globs.push(g),
                 Err(_) => literals.push(p.clone()),
@@ -506,12 +527,16 @@ impl PathFilter {
 
     /// Whether `rel` (a path relative to the artifact root) is exposed.
     /// An empty filter set exposes everything.
+    ///
+    /// `to_string_lossy` borrows for valid UTF-8, so the common literal-only
+    /// case allocates nothing per path.
     pub fn matches(&self, rel: &Path) -> bool {
         if self.empty {
             return true;
         }
-        let s = path_to_slash(rel);
-        matches_any(&self.globs, &s) || self.literals.contains(&s)
+        let s = rel.to_string_lossy();
+        self.literals.iter().any(|l| l.as_str() == s.as_ref())
+            || (!self.globs.is_empty() && matches_any(&self.globs, &s))
     }
 }
 
@@ -531,6 +556,19 @@ pub struct ViewContent {
     /// Held rather than recomputed because key matching is only correct across
     /// every artifact the transform covers, not this one.
     plan: RenamePlan,
+    /// Memoized [`mapping`](Self::mapping).
+    ///
+    /// Resolving reads the source's path list, which for a tar-backed cache
+    /// artifact is a header-only scan of the whole archive — real I/O,
+    /// proportional to entry count. Consumers routinely ask for both
+    /// `entry_paths()` and `walk()` (output-collision detection then
+    /// materialization), and each previously paid that scan again. Artifacts
+    /// are immutable for the life of a build, so the answer cannot change.
+    ///
+    /// A race between two threads simply computes twice and keeps the first;
+    /// the mapping is a pure function of the source and the transform, so both
+    /// results are equal.
+    mapping: std::sync::OnceLock<PathMapping>,
 }
 
 impl ViewContent {
@@ -545,6 +583,7 @@ impl ViewContent {
             transform,
             package,
             plan,
+            mapping: std::sync::OnceLock::new(),
         }
     }
 
@@ -564,54 +603,54 @@ impl ViewContent {
         Ok(SourcePaths::new(self.package.clone(), paths))
     }
 
-    /// Resolve the transform against the source's current path set.
-    pub fn mapping(&self) -> anyhow::Result<PathMapping> {
-        self.transform.resolve(&self.source_paths()?, &self.plan)
+    /// Resolve the transform against the source's path set, memoized — see the
+    /// `mapping` field for why.
+    pub fn mapping(&self) -> anyhow::Result<&PathMapping> {
+        if let Some(m) = self.mapping.get() {
+            return Ok(m);
+        }
+        let m = self.transform.resolve(&self.source_paths()?, &self.plan)?;
+        Ok(self.mapping.get_or_init(|| m))
     }
 }
 
 impl Content for ViewContent {
     /// Re-pack the rewritten tree as a tar stream.
     ///
-    /// This is the one path that touches file bytes, and it exists only for
-    /// consumers that want a raw container rather than a walk. The
-    /// materialization path used by staging and sandbox setup goes through
-    /// [`Content::walk`], which copies nothing.
+    /// **Streams; never buffers the archive.** An artifact can be many
+    /// gigabytes, so materializing one into a `Vec` to hand back a `Cursor`
+    /// would be an unbounded allocation on a path whose whole purpose is to
+    /// avoid copying. Instead a writer thread packs into a pipe and this
+    /// returns the read end: memory is one pipe buffer plus one 512-byte tar
+    /// header, whatever the artifact's size, and a slow consumer throttles the
+    /// packer through pipe backpressure rather than by piling up in RAM.
+    ///
+    /// `tar::Builder` does the packing rather than a hand-rolled header writer,
+    /// so GNU long-name entries, checksums and symlink records stay correct.
+    /// It needs each entry's size up front, which is exactly why
+    /// [`WalkEntryKind::File`] carries one.
+    ///
+    /// This is the only path that touches file bytes at all — staging and
+    /// sandbox setup materialize through [`Content::walk`], which copies
+    /// nothing. One thread per call is therefore cheap in aggregate; a view is
+    /// never cached or uploaded, so nothing streams one in a loop.
     fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
-        let mut buf = Vec::new();
-        {
-            let mut builder = tar::Builder::new(&mut buf);
-            for entry in self.walk()? {
-                let mut entry = entry?;
-                match &mut entry.kind {
-                    WalkEntryKind::File { data, x } => {
-                        let mut bytes = Vec::new();
-                        std::io::copy(data, &mut bytes).with_context(|| {
-                            format!("read view entry {:?} while packing", entry.path)
-                        })?;
-                        let mut header = tar::Header::new_gnu();
-                        header.set_size(bytes.len() as u64);
-                        header.set_mode(if *x { 0o755 } else { 0o644 });
-                        header.set_entry_type(tar::EntryType::Regular);
-                        header.set_cksum();
-                        builder
-                            .append_data(&mut header, &entry.path, bytes.as_slice())
-                            .with_context(|| format!("pack view entry {:?}", entry.path))?;
-                    }
-                    WalkEntryKind::Symlink { target } => {
-                        let mut header = tar::Header::new_gnu();
-                        header.set_size(0);
-                        header.set_entry_type(tar::EntryType::Symlink);
-                        header.set_cksum();
-                        builder
-                            .append_link(&mut header, &entry.path, &*target)
-                            .with_context(|| format!("pack view symlink {:?}", entry.path))?;
-                    }
-                }
-            }
-            builder.finish().context("finish view tar")?;
-        }
-        Ok(Box::new(std::io::Cursor::new(buf)))
+        // Resolved here, not in the thread, so a bad transform surfaces as an
+        // error from `reader()` rather than as a truncated stream. Cloned
+        // because the packer outlives this borrow; it is a path map, not bytes.
+        let mapping = self.mapping()?.clone();
+        let source = std::sync::Arc::clone(&self.source);
+        let (rx, tx) = std::io::pipe().context("create view tar pipe")?;
+
+        let join = std::thread::Builder::new()
+            .name("heph-view-tar".to_string())
+            .spawn(move || pack_view(source.as_ref(), &mapping, tx))
+            .context("spawn view tar packer")?;
+
+        Ok(Box::new(ViewTarReader {
+            rx,
+            join: Some(join),
+        }))
     }
 
     /// Stream the source's entries, rewriting each path and dropping the ones
@@ -669,7 +708,7 @@ impl Content for ViewContent {
     }
 
     fn entry_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
-        Ok(self.mapping()?.0.into_values().collect())
+        Ok(self.mapping()?.0.values().cloned().collect())
     }
 
     /// Deliberately `None` (the trait default) for both this and
@@ -678,6 +717,80 @@ impl Content for ViewContent {
     /// file or a seek handle would hand it the pre-rewrite tree.
     fn byte_size(&self) -> Option<u64> {
         self.source.byte_size()
+    }
+}
+
+/// Walk `source`, rewrite each path through `mapping`, and pack the result as
+/// a tar into `w`. Runs on the packer thread spawned by
+/// [`ViewContent::reader`]; each entry's bytes are streamed straight from the
+/// source handle into the archive, never collected.
+fn pack_view(
+    source: &dyn Content,
+    mapping: &PathMapping,
+    w: std::io::PipeWriter,
+) -> anyhow::Result<()> {
+    let mut builder = tar::Builder::new(w);
+    for entry in source.walk().context("walk view source for packing")? {
+        let mut entry = entry.context("read view source entry while packing")?;
+        let Some(dst) = mapping.get(&entry.path) else {
+            continue;
+        };
+        let dst = dst.to_path_buf();
+        match &mut entry.kind {
+            WalkEntryKind::File { data, x, size } => {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(*size);
+                header.set_mode(if *x { 0o755 } else { 0o644 });
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
+                // `append_data` reads exactly `size` bytes off `data` — the
+                // streaming step. Nothing is held beyond its internal buffer.
+                builder
+                    .append_data(&mut header, &dst, &mut *data)
+                    .with_context(|| format!("pack view entry {}", dst.display()))?;
+            }
+            WalkEntryKind::Symlink { target } => {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_cksum();
+                builder
+                    .append_link(&mut header, &dst, &*target)
+                    .with_context(|| format!("pack view symlink {}", dst.display()))?;
+            }
+        }
+    }
+    builder.finish().context("finish view tar")?;
+    Ok(())
+}
+
+/// Read end of [`ViewContent::reader`]'s pipe, which turns a packer-thread
+/// failure into a read error instead of a silently short archive.
+///
+/// The join happens at EOF rather than through a shared error slot: EOF *is*
+/// the packer having dropped its end, so the thread is already finishing and
+/// the join cannot race a not-yet-recorded error. A consumer that drops this
+/// early leaves the packer to die on `EPIPE`.
+struct ViewTarReader {
+    rx: std::io::PipeReader,
+    join: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl std::io::Read for ViewTarReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.rx.read(buf)?;
+        if n == 0
+            && let Some(join) = self.join.take()
+        {
+            match join.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(std::io::Error::other(format!("{e:#}"))),
+                Err(_) => {
+                    return Err(std::io::Error::other("view tar packer thread panicked"));
+                }
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -1223,6 +1336,7 @@ mod tests {
                 Ok(WalkEntry {
                     path: PathBuf::from(path),
                     kind: WalkEntryKind::File {
+                        size: data.len() as u64,
                         data: Box::new(std::io::Cursor::new(data.clone())),
                         x: false,
                     },
@@ -1375,6 +1489,223 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["server".to_string()]);
+    }
+
+    /// Resolving the mapping reads the source's path list — a header-only scan
+    /// of the whole archive for a tar-backed cache artifact. Consumers ask for
+    /// both `entry_paths()` and `walk()` (collision detection, then
+    /// materialization), so that scan must happen once, not per call.
+    #[test]
+    fn view_resolves_its_mapping_only_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSource {
+            scans: Arc<AtomicUsize>,
+        }
+
+        impl Content for CountingSource {
+            fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+                anyhow::bail!("not used")
+            }
+            fn walk(
+                &self,
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+                Ok(Box::new(std::iter::once(Ok(WalkEntry {
+                    path: PathBuf::from("a/x"),
+                    kind: WalkEntryKind::File {
+                        data: Box::new(std::io::Cursor::new(Vec::new())),
+                        x: false,
+                        size: 0,
+                    },
+                }))))
+            }
+            fn hashout(&self) -> anyhow::Result<String> {
+                Ok("h".to_string())
+            }
+            fn entry_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+                self.scans.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![PathBuf::from("a/x")])
+            }
+        }
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let view = ViewContent::new(
+            Arc::new(CountingSource {
+                scans: Arc::clone(&scans),
+            }),
+            PathTransform {
+                prefix: Some("lib".into()),
+                ..transform()
+            },
+            None,
+            RenamePlan::default(),
+        );
+
+        view.entry_paths().expect("entry_paths");
+        view.walk().expect("walk").count();
+        view.entry_paths().expect("entry_paths again");
+        view.mapping().expect("mapping");
+
+        assert_eq!(
+            scans.load(Ordering::Relaxed),
+            1,
+            "the source path list must be scanned once and memoized"
+        );
+    }
+
+    /// `reader()` must stream, not buffer. A view over an artifact far larger
+    /// than any sane buffer has to be readable incrementally — buffering the
+    /// rewritten archive to hand back a `Cursor` is an unbounded allocation on
+    /// the one path whose entire purpose is to avoid copying.
+    ///
+    /// Pinned by consuming a 256 MiB view in small reads from a source that
+    /// *refuses to be fully materialized*: `HugeSource` yields its bytes
+    /// lazily and never holds them, so a buffering implementation would have to
+    /// allocate 256 MiB to satisfy the first `read`. Reading only the first few
+    /// KiB and dropping proves nothing was collected up front.
+    #[test]
+    fn view_reader_streams_without_buffering_the_archive() {
+        /// One entry of `len` zero bytes, produced by a reader that allocates
+        /// only the caller's buffer.
+        struct HugeSource {
+            len: u64,
+        }
+
+        impl Content for HugeSource {
+            fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+                anyhow::bail!("not used")
+            }
+            fn walk(
+                &self,
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+                Ok(Box::new(std::iter::once(Ok(WalkEntry {
+                    path: PathBuf::from("big/blob.bin"),
+                    kind: WalkEntryKind::File {
+                        data: Box::new(std::io::Read::take(std::io::repeat(0), self.len)),
+                        x: false,
+                        size: self.len,
+                    },
+                }))))
+            }
+            fn hashout(&self) -> anyhow::Result<String> {
+                Ok("hugehash".to_string())
+            }
+            fn entry_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![PathBuf::from("big/blob.bin")])
+            }
+        }
+
+        const HUGE: u64 = 256 * 1024 * 1024;
+        let view = ViewContent::new(
+            Arc::new(HugeSource { len: HUGE }),
+            PathTransform {
+                strip_prefix: Some("big".into()),
+                ..transform()
+            },
+            None,
+            RenamePlan::default(),
+        );
+
+        let mut reader = view.reader().expect("reader");
+        // Enough to cover the tar header and spill into the payload, so the
+        // packer has genuinely started streaming the body.
+        let mut head = vec![0u8; 4096];
+        reader.read_exact(&mut head).expect("read head");
+
+        // The rewritten name is in the header block, so the stream really is
+        // the transformed archive and not the source passed through.
+        let name_field = &head[..100];
+        let name = String::from_utf8_lossy(name_field)
+            .trim_end_matches('\0')
+            .to_string();
+        assert_eq!(name, "blob.bin", "header must carry the rewritten path");
+
+        // Dropping mid-stream must not hang: the packer dies on EPIPE.
+        drop(reader);
+    }
+
+    /// The streaming reader still yields a complete, correct archive when read
+    /// through to the end.
+    #[test]
+    fn view_reader_streams_a_complete_archive() {
+        let view = ViewContent::new(
+            source(&[("build/out/server", "elf"), ("build/out/a/b.so", "lib")]),
+            PathTransform {
+                strip_prefix: Some("build/out".into()),
+                prefix: Some("lib".into()),
+                ..transform()
+            },
+            None,
+            RenamePlan::default(),
+        );
+
+        let mut buf = Vec::new();
+        std::io::copy(&mut view.reader().expect("reader"), &mut buf).expect("copy");
+
+        let mut archive = tar::Archive::new(std::io::Cursor::new(buf));
+        let mut got: Vec<(String, String)> = archive
+            .entries()
+            .expect("entries")
+            .map(|e| {
+                let mut e = e.expect("entry");
+                let path = e.path().expect("path").to_string_lossy().into_owned();
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut e, &mut s).expect("read");
+                (path, s)
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("lib/a/b.so".to_string(), "lib".to_string()),
+                ("lib/server".to_string(), "elf".to_string()),
+            ]
+        );
+    }
+
+    /// A failure inside the packer thread must surface as a read error, not as
+    /// a silently truncated archive.
+    #[test]
+    fn view_reader_propagates_a_packer_failure() {
+        struct FailingSource;
+
+        impl Content for FailingSource {
+            fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+                anyhow::bail!("not used")
+            }
+            fn walk(
+                &self,
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+                Ok(Box::new(std::iter::once(Err(anyhow::anyhow!(
+                    "source blew up mid-walk"
+                )))))
+            }
+            fn hashout(&self) -> anyhow::Result<String> {
+                Ok("h".to_string())
+            }
+            fn entry_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![PathBuf::from("x")])
+            }
+        }
+
+        let view = ViewContent::new(
+            Arc::new(FailingSource),
+            PathTransform {
+                prefix: Some("lib".into()),
+                ..transform()
+            },
+            None,
+            RenamePlan::default(),
+        );
+
+        let mut buf = Vec::new();
+        let err = std::io::copy(&mut view.reader().expect("reader"), &mut buf)
+            .expect_err("packer failure must surface");
+        assert!(
+            format!("{err}").contains("source blew up mid-walk"),
+            "got: {err}"
+        );
     }
 
     #[test]

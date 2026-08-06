@@ -19,8 +19,26 @@ pub struct WalkEntry {
 }
 
 pub enum WalkEntryKind {
-    File { data: Box<dyn io::Read>, x: bool },
-    Symlink { target: PathBuf },
+    File {
+        data: Box<dyn io::Read>,
+        x: bool,
+        /// Byte length of `data`.
+        ///
+        /// Carried because a tar header must state an entry's size *before* its
+        /// bytes, so anything re-packing a walk (see
+        /// [`ViewContent`](view::ViewContent)) would otherwise have to buffer
+        /// each entry whole just to measure it. Every producer already knows
+        /// this — a tar walker reads it from the header it just parsed, a file
+        /// walker from `stat`, an in-memory one from `len` — so surfacing it
+        /// makes streaming re-packs possible at no cost.
+        ///
+        /// Must equal the number of bytes `data` yields; a re-pack writes
+        /// exactly this many.
+        size: u64,
+    },
+    Symlink {
+        target: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy)]

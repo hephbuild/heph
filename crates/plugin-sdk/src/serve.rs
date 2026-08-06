@@ -1319,11 +1319,16 @@ impl Content for DiskInputContent {
                 }
             };
             let f = std::fs::File::open(&abs).with_context(|| format!("open {}", abs.display()))?;
+            let size = f
+                .metadata()
+                .with_context(|| format!("stat {}", abs.display()))?
+                .len();
             Ok(WalkEntry {
                 path: rel,
                 kind: WalkEntryKind::File {
                     data: Box::new(f),
                     x,
+                    size,
                 },
             })
         });

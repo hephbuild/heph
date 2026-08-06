@@ -966,6 +966,7 @@ pub mod outputartifact {
                 Content::Raw(raw) => Box::new(std::iter::once(Ok(WalkEntry {
                     path: PathBuf::from(&raw.path),
                     kind: WalkEntryKind::File {
+                        size: raw.data.len() as u64,
                         data: Box::new(io::Cursor::new(raw.data.clone())),
                         x: raw.x,
                     },
@@ -973,6 +974,7 @@ pub mod outputartifact {
                 Content::File(file) => Box::new(std::iter::once(Ok(WalkEntry {
                     path: PathBuf::from(&file.out_path),
                     kind: WalkEntryKind::File {
+                        size: std::fs::metadata(&file.source_path)?.len(),
                         data: Box::new(File::open(&file.source_path)?),
                         x: file.x,
                     },

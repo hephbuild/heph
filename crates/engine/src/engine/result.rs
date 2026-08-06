@@ -677,10 +677,17 @@ impl Content for PassthroughContent {
     }
 
     fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+        let size = std::fs::metadata(&self.source_path)
+            .with_context(|| format!("stat passthrough source '{}'", self.source_path))?
+            .len();
         let data: Box<dyn std::io::Read> = Box::new(self.verifying_reader()?);
         Ok(Box::new(std::iter::once(Ok(WalkEntry {
             path: std::path::PathBuf::from(&self.out_path),
-            kind: WalkEntryKind::File { data, x: self.x },
+            kind: WalkEntryKind::File {
+                data,
+                x: self.x,
+                size,
+            },
         }))))
     }
 
@@ -2795,7 +2802,7 @@ impl Engine {
                     let entry = entry
                         .with_context(|| format!("read codegen entry for frozen check: {group}"))?;
                     let (new_bytes, x) = match entry.kind {
-                        WalkEntryKind::File { mut data, x } => {
+                        WalkEntryKind::File { mut data, x, .. } => {
                             let mut buf = Vec::new();
                             std::io::Read::read_to_end(&mut data, &mut buf)
                                 .with_context(|| format!("read generated file {:?}", entry.path))?;
@@ -2895,7 +2902,7 @@ impl Engine {
                         continue;
                     }
                     match entry.kind {
-                        WalkEntryKind::File { mut data, x } => {
+                        WalkEntryKind::File { mut data, x, .. } => {
                             let mut new_bytes = Vec::new();
                             std::io::Read::read_to_end(&mut data, &mut new_bytes)
                                 .with_context(|| format!("read generated file {:?}", entry.path))?;

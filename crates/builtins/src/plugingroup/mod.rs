@@ -677,6 +677,7 @@ mod tests {
                     kind: hcore::hartifactcontent::WalkEntryKind::File {
                         data: Box::new(std::io::Cursor::new(Vec::new())),
                         x: false,
+                        size: 0,
                     },
                 })
             })))
