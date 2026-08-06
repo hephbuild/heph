@@ -80,7 +80,7 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
                 .to_owned();
             let dest = tmp.path().join(&name);
             match entry.kind {
-                heph::hartifactcontent::WalkEntryKind::File { mut data, x } => {
+                heph::hartifactcontent::WalkEntryKind::File { mut data, x, .. } => {
                     let mut buf = Vec::new();
                     data.read_to_end(&mut buf)?;
                     if x {

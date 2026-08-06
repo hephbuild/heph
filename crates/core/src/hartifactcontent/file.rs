@@ -38,11 +38,15 @@ impl Content for FileContent {
 
     fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
         let name = self.path.file_name().map(PathBuf::from).unwrap_or_default();
+        let size = std::fs::metadata(&self.path)
+            .with_context(|| format!("stat {}", self.path.display()))?
+            .len();
         let entry = WalkEntry {
             path: name,
             kind: WalkEntryKind::File {
                 data: self.reader()?,
                 x: false,
+                size,
             },
         };
         Ok(Box::new(std::iter::once(Ok(entry))))

@@ -144,7 +144,7 @@ pub fn unpack(
                     );
                 }
             }
-            WalkEntryKind::File { data, x } => {
+            WalkEntryKind::File { data, x, .. } => {
                 let f = fs::File::create(&dest).with_context(|| {
                     format!(
                         "create unpack dest {:?} (entry={:?}, existing={})",

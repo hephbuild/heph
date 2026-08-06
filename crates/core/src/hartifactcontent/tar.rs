@@ -102,6 +102,8 @@ impl Iterator for TarWalker {
                 Err(e) => return Some(Err(e.into())),
             };
             let x = mode & 0o111 != 0;
+            // Straight off the header we just parsed — no extra read.
+            let size = entry.header().size().unwrap_or(0);
             let poison = Arc::new(AtomicBool::new(false));
             self.current_poison = Some(poison.clone());
             // SAFETY: entry borrows from entries which borrows from archive's stable heap allocation.
@@ -118,7 +120,11 @@ impl Iterator for TarWalker {
             };
             return Some(Ok(WalkEntry {
                 path,
-                kind: WalkEntryKind::File { data: reader, x },
+                kind: WalkEntryKind::File {
+                    data: reader,
+                    x,
+                    size,
+                },
             }));
         }
     }

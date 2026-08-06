@@ -3745,6 +3745,7 @@ mod tests {
             let entry = WalkEntry {
                 path: self.path.clone(),
                 kind: WalkEntryKind::File {
+                    size: self.bytes.len() as u64,
                     data: Box::new(io::Cursor::new(self.bytes.clone())),
                     x: false,
                 },

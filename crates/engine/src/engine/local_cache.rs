@@ -456,7 +456,9 @@ fn cache_entry_name(artifact: &outputartifact::OutputArtifact) -> String {
     };
     match &artifact.content {
         // Packed on the way in, so the entry carries the container suffix.
-        outputartifact::Content::Raw(_) | outputartifact::Content::File(_) => {
+        outputartifact::Content::Raw(_)
+        | outputartifact::Content::File(_)
+        | outputartifact::Content::View(_) => {
             format!("{}_{}.tar", type_prefix, artifact.name)
         }
         // Already a container on disk; copied verbatim.
@@ -579,6 +581,32 @@ impl Engine {
                     let size = cw.bytes_written();
                     cw.into_inner().commit().with_context(|| {
                         format!("commit file artifact {addr} {name}")
+                    })?;
+                    (size, hartifactcontent::Type::Tar)
+                }
+                // A view normally never arrives here: `is_passthrough` diverts it
+                // before the cache write, because its whole point is to own no
+                // bytes. It reaches this arm only if a driver returns one from a
+                // *cacheable* target, and then the honest thing is to pack it —
+                // a cached revision must own durable bytes, and a view's source
+                // is free to change or be reclaimed underneath it. That costs a
+                // full copy, which is the cost of having asked to cache it.
+                outputartifact::Content::View(v) => {
+                    let mut cw = CountingWriter::new(
+                        open_writer(&name).with_context(|| {
+                            format!("open cache writer for {addr} {name}")
+                        })?,
+                    );
+                    let mut r = hartifactcontent::Content::reader(v.view.as_ref())
+                        .with_context(|| {
+                            format!("open view artifact reader for {addr} {name}")
+                        })?;
+                    io::copy(&mut r, &mut cw).with_context(|| {
+                        format!("pack view artifact into {addr} {name}")
+                    })?;
+                    let size = cw.bytes_written();
+                    cw.into_inner().commit().with_context(|| {
+                        format!("commit view artifact {addr} {name}")
                     })?;
                     (size, hartifactcontent::Type::Tar)
                 }

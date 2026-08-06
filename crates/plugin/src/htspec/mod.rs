@@ -29,6 +29,10 @@ pub use htspec_derive::{Spec, SpecEnum, SpecStruct, SpecUnion};
 mod cache;
 pub use cache::TargetSpecCache;
 
+// `Rename`'s type lives in `hcore` (it is applied by `hartifactcontent::view`);
+// only its BUILD-file parsing belongs here.
+mod rename;
+
 // The `Spec` derive macro emits `crate::htspec::DriverField` / `DriverSchema`
 // (portable across the monolith re-export and this crate). Re-export them here
 // so those expansions resolve wherever the macro is used.

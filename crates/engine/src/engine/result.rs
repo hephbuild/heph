@@ -602,9 +602,9 @@ impl ResultArtifact {
     /// it on consume and fails if it diverges from the hash recorded at
     /// input-hashing time. See [`PassthroughContent`].
     ///
-    /// `is_passthrough` only ever flags a `Content::File`; any other variant
-    /// reaching here is a producer bug, so it falls back to carrying the raw
-    /// artifact rather than panicking.
+    /// `is_passthrough` only ever flags a `Content::File` or a
+    /// `Content::View`; any other variant reaching here is a producer bug, so
+    /// it falls back to carrying the raw artifact rather than panicking.
     fn passthrough(a: outputartifact::OutputArtifact) -> Self {
         let group = a.group.clone();
         let r#type = manifest_artifact_type(&a.r#type);
@@ -615,6 +615,11 @@ impl ResultArtifact {
                 x: f.x,
                 expected: a.hashout,
             }),
+            // Hand the view out directly rather than re-wrapping it in its
+            // `OutputArtifact`: the `ViewContent` is already a full `Content`,
+            // so consumers get its header-only `entry_paths` and its
+            // data-forwarding `walk` instead of the enum's generic fallbacks.
+            outputartifact::Content::View(v) => v.view,
             other => Arc::new(outputartifact::OutputArtifact {
                 content: other,
                 ..a
@@ -653,16 +658,33 @@ struct PassthroughContent {
 
 impl PassthroughContent {
     fn verifying_reader(&self) -> anyhow::Result<VerifyingReader> {
+        Ok(self.open()?.0)
+    }
+
+    /// Open the source once and read its size off the resulting handle.
+    ///
+    /// `fstat` on the open descriptor, not a second `stat` by path: this runs
+    /// once per source file per materialization — the hottest walk in a build —
+    /// so a path-based size lookup would pay a full second path resolution for
+    /// a file already open in this function.
+    fn open(&self) -> anyhow::Result<(VerifyingReader, u64)> {
         let file = std::fs::File::open(&self.source_path)
             .with_context(|| format!("open passthrough source '{}'", self.source_path))?;
-        Ok(VerifyingReader {
-            inner: Box::new(file),
-            hasher: xxhash_rust::xxh3::Xxh3::new(),
-            x: self.x,
-            expected: self.expected.clone(),
-            source_path: self.source_path.clone(),
-            verified: false,
-        })
+        let size = file
+            .metadata()
+            .with_context(|| format!("stat passthrough source '{}'", self.source_path))?
+            .len();
+        Ok((
+            VerifyingReader {
+                inner: Box::new(file),
+                hasher: xxhash_rust::xxh3::Xxh3::new(),
+                x: self.x,
+                expected: self.expected.clone(),
+                source_path: self.source_path.clone(),
+                verified: false,
+            },
+            size,
+        ))
     }
 }
 
@@ -672,10 +694,15 @@ impl Content for PassthroughContent {
     }
 
     fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
-        let data: Box<dyn std::io::Read> = Box::new(self.verifying_reader()?);
+        let (reader, size) = self.open()?;
+        let data: Box<dyn std::io::Read> = Box::new(reader);
         Ok(Box::new(std::iter::once(Ok(WalkEntry {
             path: std::path::PathBuf::from(&self.out_path),
-            kind: WalkEntryKind::File { data, x: self.x },
+            kind: WalkEntryKind::File {
+                data,
+                x: self.x,
+                size,
+            },
         }))))
     }
 
@@ -739,13 +766,26 @@ fn manifest_artifact_type(t: &outputartifact::Type) -> ManifestArtifactType {
     }
 }
 
-/// Whether a produced output is a zero-copy source-file passthrough that must
-/// skip the local cache. True only on the uncached (`tmp`) path AND when its
-/// producer flagged a `Content::File` as a durable source reference (e.g.
-/// `@heph/fs:file`). A cacheable revision must own a durable copy of its bytes
-/// (`source_path` may change/vanish across runs), so it is never a passthrough.
+/// Whether a produced output is a zero-copy passthrough that must skip the
+/// local cache. Two shapes qualify, both on the uncached (`tmp`) path only:
+///
+/// * a `Content::File` its producer flagged as a durable source reference
+///   (e.g. `@heph/fs:file`);
+/// * a `Content::View` — a path-rewritten window onto another target's
+///   artifact (the `group` driver's relocate/filter mode). Storing it would
+///   duplicate every byte of the source for nothing; the source revision is
+///   already cached, and the view is a few string operations to re-derive.
+///
+/// Both borrow bytes they do not own, which is exactly why a *cacheable*
+/// revision is never a passthrough: it must own a durable copy, since the
+/// borrowed source may change or vanish across runs.
 fn is_passthrough(use_tmp_cache: bool, content: &outputartifact::Content) -> bool {
-    use_tmp_cache && matches!(content, outputartifact::Content::File(f) if f.passthrough)
+    use_tmp_cache
+        && match content {
+            outputartifact::Content::File(f) => f.passthrough,
+            outputartifact::Content::View(_) => true,
+            _ => false,
+        }
 }
 
 /// The `@heph/fs` addrs covering every `codegen = in_place` output path.
@@ -2777,7 +2817,7 @@ impl Engine {
                     let entry = entry
                         .with_context(|| format!("read codegen entry for frozen check: {group}"))?;
                     let (new_bytes, x) = match entry.kind {
-                        WalkEntryKind::File { mut data, x } => {
+                        WalkEntryKind::File { mut data, x, .. } => {
                             let mut buf = Vec::new();
                             std::io::Read::read_to_end(&mut data, &mut buf)
                                 .with_context(|| format!("read generated file {:?}", entry.path))?;
@@ -2877,7 +2917,7 @@ impl Engine {
                         continue;
                     }
                     match entry.kind {
-                        WalkEntryKind::File { mut data, x } => {
+                        WalkEntryKind::File { mut data, x, .. } => {
                             let mut new_bytes = Vec::new();
                             std::io::Read::read_to_end(&mut data, &mut new_bytes)
                                 .with_context(|| format!("read generated file {:?}", entry.path))?;

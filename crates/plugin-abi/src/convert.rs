@@ -741,7 +741,14 @@ fn oa_type_from_pb(t: i32) -> OaType {
     }
 }
 
-pub fn output_artifact_to_pb(oa: &OutputArtifact) -> pb::OutputArtifactRef {
+/// Encode a driver-produced artifact for the wire.
+///
+/// Fallible for exactly one reason: [`OaContent::View`] holds a live
+/// `Arc<dyn Content>` into the host's cache and has no wire form. It is
+/// unconstructible from a plugin — only in-process built-in drivers make one —
+/// so this is a "cannot happen" that is reported rather than panicked, because
+/// the caller is a plugin cdylib where a panic is a non-unwinding abort.
+pub fn output_artifact_to_pb(oa: &OutputArtifact) -> anyhow::Result<pb::OutputArtifactRef> {
     let content = match &oa.content {
         OaContent::File(f) => pb::output_artifact_ref::Content::File(pb::ContentFile {
             source_path: f.source_path.clone(),
@@ -755,14 +762,20 @@ pub fn output_artifact_to_pb(oa: &OutputArtifact) -> pb::OutputArtifactRef {
         }),
         OaContent::TarPath(p) => pb::output_artifact_ref::Content::TarPath(p.path.clone()),
         OaContent::CpioPath(p) => pb::output_artifact_ref::Content::CpioPath(p.path.clone()),
+        OaContent::View(_) => anyhow::bail!(
+            "artifact '{}' is a path-rewriting view, which references host cache content \
+             and cannot cross the plugin ABI — only in-process built-in drivers may \
+             produce one",
+            oa.name,
+        ),
     };
-    pb::OutputArtifactRef {
+    Ok(pb::OutputArtifactRef {
         group: oa.group.clone(),
         name: oa.name.clone(),
         r#type: oa_type_to_pb(&oa.r#type) as i32,
         content: Some(content),
         hashout: oa.hashout.clone(),
-    }
+    })
 }
 
 pub fn output_artifact_from_pb(oa: pb::OutputArtifactRef) -> OutputArtifact {

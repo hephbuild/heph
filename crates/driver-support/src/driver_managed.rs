@@ -347,7 +347,8 @@ pub(crate) fn build_source_map(
             continue;
         }
         let source_addr_str = managed_input.input.source_addr.format();
-        let filters = &managed_input.input.filters;
+        // Compiled once per input, outside the per-path loop below.
+        let filters = hartifactcontent::PathFilter::new(&managed_input.input.filters);
         // Enumerate the artifact's own paths directly instead of reading
         // list_path: after group expansion, multiple inputs share parent
         // origin_id → list_path_for gives them one shared file (opened append).
@@ -359,7 +360,7 @@ pub(crate) fn build_source_map(
         for rel in content.entry_paths().with_context(|| {
             format!("enumerate content for source_map (source={source_addr_str})")
         })? {
-            if !filters.is_empty() && !filters.iter().any(|f| Path::new(f) == rel.as_path()) {
+            if !filters.matches(&rel) {
                 continue;
             }
             source_map.insert(rel.to_string_lossy().into_owned(), source_addr_str.clone());
@@ -462,10 +463,9 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
                     producer.format(),
                 )
             })?;
+            let filters = hartifactcontent::PathFilter::new(&input.filters);
             for rel in paths {
-                if !input.filters.is_empty()
-                    && !input.filters.iter().any(|f| Path::new(f) == rel.as_path())
-                {
+                if !filters.matches(&rel) {
                     continue;
                 }
                 let abs = unpack_root.join(&rel);
@@ -523,8 +523,9 @@ pub async fn unpack_blocking(
     filters: Vec<String>,
 ) -> anyhow::Result<()> {
     hcore::blocking::run(move || {
-        let pred = |rel: &Path| filters.iter().any(|f| Path::new(f) == rel);
-        let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
+        let compiled = hartifactcontent::PathFilter::new(&filters);
+        let pred = |rel: &Path| compiled.matches(rel);
+        let predicate: Option<&dyn Fn(&Path) -> bool> = if compiled.is_empty() {
             None
         } else {
             Some(&pred)

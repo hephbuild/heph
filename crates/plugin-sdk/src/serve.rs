@@ -1173,14 +1173,18 @@ async fn run_once(
         driver.run(mrr, ct).await
     };
     match result {
-        Ok(resp) => pb::RunOutFrame {
-            msg: Some(pb::run_out_frame::Msg::Response(pb::ManagedRunResponse {
-                artifacts: resp
-                    .artifacts
-                    .iter()
-                    .map(convert::output_artifact_to_pb)
-                    .collect(),
-            })),
+        Ok(resp) => match resp
+            .artifacts
+            .iter()
+            .map(convert::output_artifact_to_pb)
+            .collect::<anyhow::Result<Vec<_>>>()
+        {
+            Ok(artifacts) => pb::RunOutFrame {
+                msg: Some(pb::run_out_frame::Msg::Response(pb::ManagedRunResponse {
+                    artifacts,
+                })),
+            },
+            Err(e) => run_out_err(err_message(&e)),
         },
         Err(e) => run_out_err(err_message(&e)),
     }
@@ -1315,11 +1319,16 @@ impl Content for DiskInputContent {
                 }
             };
             let f = std::fs::File::open(&abs).with_context(|| format!("open {}", abs.display()))?;
+            let size = f
+                .metadata()
+                .with_context(|| format!("stat {}", abs.display()))?
+                .len();
             Ok(WalkEntry {
                 path: rel,
                 kind: WalkEntryKind::File {
                     data: Box::new(f),
                     x,
+                    size,
                 },
             })
         });
