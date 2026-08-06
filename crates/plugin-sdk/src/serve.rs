@@ -1173,14 +1173,18 @@ async fn run_once(
         driver.run(mrr, ct).await
     };
     match result {
-        Ok(resp) => pb::RunOutFrame {
-            msg: Some(pb::run_out_frame::Msg::Response(pb::ManagedRunResponse {
-                artifacts: resp
-                    .artifacts
-                    .iter()
-                    .map(convert::output_artifact_to_pb)
-                    .collect(),
-            })),
+        Ok(resp) => match resp
+            .artifacts
+            .iter()
+            .map(convert::output_artifact_to_pb)
+            .collect::<anyhow::Result<Vec<_>>>()
+        {
+            Ok(artifacts) => pb::RunOutFrame {
+                msg: Some(pb::run_out_frame::Msg::Response(pb::ManagedRunResponse {
+                    artifacts,
+                })),
+            },
+            Err(e) => run_out_err(err_message(&e)),
         },
         Err(e) => run_out_err(err_message(&e)),
     }

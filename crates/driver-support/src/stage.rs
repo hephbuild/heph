@@ -479,6 +479,9 @@ fn link_tree(
         None => None,
     };
 
+    // Compiled once, outside the walk.
+    let filters = hcore::hartifactcontent::PathFilter::new(filters);
+
     for ent in walkdir::WalkDir::new(entry) {
         let ent = ent.with_context(|| format!("walk staged tree {:?}", entry))?;
         let rel = match ent.path().strip_prefix(entry) {
@@ -492,7 +495,7 @@ fn link_tree(
                 .with_context(|| format!("create linked dir {:?}", dst))?;
             continue;
         }
-        if !filters.is_empty() && !filters.iter().any(|f| Path::new(f) == rel) {
+        if !filters.matches(rel) {
             continue;
         }
         // A prior input may have linked the same relative path into a shared

@@ -276,10 +276,8 @@ fn build_slot_layers(
                 format!("build tar index for input origin_id={}", input.origin_id)
             })?;
             if !input.filters.is_empty() {
-                let filters = input.filters.clone();
-                index
-                    .entries
-                    .retain(|p, _| filters.iter().any(|f| Path::new(f) == p));
+                let filters = hcore::hartifactcontent::PathFilter::new(&input.filters);
+                index.entries.retain(|p, _| filters.matches(p));
             }
             let list_write = list_path_for(input, list_dir).map(|list_path| {
                 let abs_paths: Vec<PathBuf> =

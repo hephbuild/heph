@@ -48,6 +48,43 @@ impl Display for TargetAddr {
     }
 }
 
+/// Split a `[…]` filter list on commas, ignoring commas nested inside `{}`.
+///
+/// The filter list is comma-separated and its patterns are globs, and glob
+/// alternation is also comma-separated (`src/{a,b}.go`) — so a naive
+/// `split(',')` would tear `{a,b}` into `{a` and `b}`. Neither half compiles as
+/// a glob, so both would degrade to literal matches and silently select
+/// nothing. Tracking brace depth keeps alternation working and costs one
+/// counter.
+///
+/// Unbalanced braces are left to the glob compiler, which rejects them (and
+/// `PathFilter` then treats the pattern as a literal) — this function only
+/// decides where the commas are.
+fn split_filters(rest: &str) -> Vec<String> {
+    if rest.is_empty() {
+        return vec![];
+    }
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    for c in rest.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
 impl TargetAddr {
     pub fn parse(v: &str, base: &PkgBuf) -> anyhow::Result<Self> {
         // Strip optional trailing [filter1,filter2] suffix.
@@ -60,11 +97,7 @@ impl TargetAddr {
             let rest = rest
                 .strip_suffix(']')
                 .ok_or_else(|| anyhow::anyhow!("unclosed '[' in target addr: {v}"))?;
-            let filters = if rest.is_empty() {
-                vec![]
-            } else {
-                rest.split(',').map(|s| s.to_string()).collect()
-            };
+            let filters = split_filters(rest);
             (addr_part, filters)
         } else {
             (v, vec![])
@@ -135,6 +168,32 @@ mod tests {
     #[test]
     fn parse_unclosed_bracket_errors() {
         assert!(TargetAddr::parse("//foo:bar[a.go", &base()).is_err());
+    }
+
+    #[test]
+    fn parse_glob_filters() {
+        let t = TargetAddr::parse("//foo:bar[**/*.go,bin/**]", &base()).unwrap();
+        assert_eq!(t.filters, vec!["**/*.go", "bin/**"]);
+    }
+
+    /// Glob alternation is itself comma-separated, so the filter split must be
+    /// brace-aware or `{a,b}` is torn in half and silently matches nothing.
+    #[test]
+    fn parse_keeps_brace_alternation_intact() {
+        let t = TargetAddr::parse("//foo:bar[src/{a,b}.go,README.md]", &base()).unwrap();
+        assert_eq!(t.filters, vec!["src/{a,b}.go", "README.md"]);
+    }
+
+    #[test]
+    fn parse_nested_braces_are_balanced_correctly() {
+        let t = TargetAddr::parse("//foo:bar[{a,{b,c}},d]", &base()).unwrap();
+        assert_eq!(t.filters, vec!["{a,{b,c}}", "d"]);
+    }
+
+    #[test]
+    fn display_roundtrip_with_glob_filters() {
+        let t = TargetAddr::parse("//foo:bar[src/{a,b}.go,bin/**]", &base()).unwrap();
+        assert_eq!(t.to_string(), "//foo:bar[src/{a,b}.go,bin/**]");
     }
 
     #[test]
@@ -852,12 +911,34 @@ pub mod outputartifact {
         }
     }
 
+    /// A zero-copy, path-rewritten view over an artifact the driver received as
+    /// an *input* — see [`hcore::hartifactcontent::view`].
+    ///
+    /// This is how a target relocates or filters another target's outputs
+    /// without copying them: no sandbox, no subprocess, and no second copy of
+    /// the bytes in the cache. The producing target must declare itself
+    /// uncacheable, because the view owns no durable bytes of its own — it
+    /// borrows its source's, exactly as [`ContentFile::passthrough`] borrows a
+    /// workspace file's. The engine enforces nothing here; a driver that
+    /// returns a view from a *cacheable* target would have it packed and
+    /// stored, which is merely wasteful, not wrong.
+    ///
+    /// Host-only: a view holds a live `Arc<dyn Content>` into the host's cache,
+    /// so it cannot cross the plugin ABI (see
+    /// [`output_artifact_to_pb`](../../../plugin_abi/convert/fn.output_artifact_to_pb.html)).
+    /// Only in-process built-in drivers construct one.
+    #[derive(Clone)]
+    pub struct ContentView {
+        pub view: std::sync::Arc<hcore::hartifactcontent::ViewContent>,
+    }
+
     #[derive(Clone)]
     pub enum Content {
         File(ContentFile),
         Raw(ContentRaw),
         TarPath(ContentPath),
         CpioPath(ContentPath),
+        View(ContentView),
     }
 
     #[derive(Clone)]
@@ -876,6 +957,7 @@ pub mod outputartifact {
                 Content::File(file) => Box::new(File::open(&file.source_path)?),
                 Content::TarPath(p) => Box::new(File::open(&p.path)?),
                 Content::CpioPath(p) => Box::new(File::open(&p.path)?),
+                Content::View(v) => v.view.reader()?,
             })
         }
 
@@ -900,11 +982,28 @@ pub mod outputartifact {
                 )?),
                 #[expect(clippy::unimplemented, reason = "cpio format is not yet implemented")]
                 Content::CpioPath(_) => unimplemented!("cpio is not implemented"),
+                Content::View(v) => v.view.walk()?,
             })
         }
 
         fn hashout(&self) -> anyhow::Result<String> {
             Ok(self.hashout.clone())
+        }
+
+        /// Delegated for a view so the path set comes from the source's
+        /// header-only scan rather than the default walk-and-discard.
+        fn entry_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+            match &self.content {
+                Content::View(v) => v.view.entry_paths(),
+                _ => self.walk()?.map(|r| r.map(|e| e.path)).collect(),
+            }
+        }
+
+        fn byte_size(&self) -> Option<u64> {
+            match &self.content {
+                Content::View(v) => v.view.byte_size(),
+                _ => None,
+            }
         }
     }
 }

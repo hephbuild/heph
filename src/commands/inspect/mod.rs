@@ -5,6 +5,7 @@ mod functions;
 mod hashin;
 mod hashout;
 mod labels;
+mod outputs;
 mod packages;
 mod path;
 mod revdeps;
@@ -64,6 +65,23 @@ pub enum InspectCommands {
     ///
     /// Example: `heph inspect hashout //cmd/server:bin`
     Hashout(hashout::Args),
+    /// Print the paths a target actually produces
+    ///
+    /// Runs the target (or reads its cached result) and prints every path in
+    /// its output artifacts, one per line — the paths as a consumer sees them
+    /// in its sandbox, after any filtering or relocation.
+    ///
+    /// This is the answer to "why did that file land there?" for a `group`
+    /// target using `include`/`exclude`/`strip_prefix`/`prefix`/`rename`:
+    /// compare the group's paths with its deps' to see exactly what the
+    /// transform did.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect outputs //cmd/server:bin`
+    ///
+    /// `heph inspect outputs //cmd:dist --json` — also lists support files
+    Outputs(outputs::Args),
     /// Print a target's spec, as supplied by its provider
     ///
     /// Prints the raw spec — the unresolved definition a provider returns
@@ -179,6 +197,7 @@ impl InspectCommands {
             InspectCommands::Labels(args) => labels::execute(args, sink, global),
             InspectCommands::Hashin(args) => hashin::execute(args, sink, global),
             InspectCommands::Hashout(args) => hashout::execute(args, sink, global),
+            InspectCommands::Outputs(args) => outputs::execute(args, sink, global),
             InspectCommands::Spec(args) => spec::execute(args, sink, global),
             InspectCommands::Def(args) => def::execute(args, sink, global),
             InspectCommands::Deps(args) => deps::execute(args, sink, global),

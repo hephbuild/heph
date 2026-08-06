@@ -10,6 +10,7 @@ workspace = true
 anyhow = "1.0.102"
 serde = { version = "1", features = ["derive"] }
 tar = "0.4"
+wax = "0.7"
 futures = "0.3.32"
 enclose = "1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }

@@ -602,9 +602,9 @@ impl ResultArtifact {
     /// it on consume and fails if it diverges from the hash recorded at
     /// input-hashing time. See [`PassthroughContent`].
     ///
-    /// `is_passthrough` only ever flags a `Content::File`; any other variant
-    /// reaching here is a producer bug, so it falls back to carrying the raw
-    /// artifact rather than panicking.
+    /// `is_passthrough` only ever flags a `Content::File` or a
+    /// `Content::View`; any other variant reaching here is a producer bug, so
+    /// it falls back to carrying the raw artifact rather than panicking.
     fn passthrough(a: outputartifact::OutputArtifact) -> Self {
         let group = a.group.clone();
         let r#type = manifest_artifact_type(&a.r#type);
@@ -615,6 +615,11 @@ impl ResultArtifact {
                 x: f.x,
                 expected: a.hashout,
             }),
+            // Hand the view out directly rather than re-wrapping it in its
+            // `OutputArtifact`: the `ViewContent` is already a full `Content`,
+            // so consumers get its header-only `entry_paths` and its
+            // data-forwarding `walk` instead of the enum's generic fallbacks.
+            outputartifact::Content::View(v) => v.view,
             other => Arc::new(outputartifact::OutputArtifact {
                 content: other,
                 ..a
@@ -739,13 +744,26 @@ fn manifest_artifact_type(t: &outputartifact::Type) -> ManifestArtifactType {
     }
 }
 
-/// Whether a produced output is a zero-copy source-file passthrough that must
-/// skip the local cache. True only on the uncached (`tmp`) path AND when its
-/// producer flagged a `Content::File` as a durable source reference (e.g.
-/// `@heph/fs:file`). A cacheable revision must own a durable copy of its bytes
-/// (`source_path` may change/vanish across runs), so it is never a passthrough.
+/// Whether a produced output is a zero-copy passthrough that must skip the
+/// local cache. Two shapes qualify, both on the uncached (`tmp`) path only:
+///
+/// * a `Content::File` its producer flagged as a durable source reference
+///   (e.g. `@heph/fs:file`);
+/// * a `Content::View` — a path-rewritten window onto another target's
+///   artifact (the `group` driver's relocate/filter mode). Storing it would
+///   duplicate every byte of the source for nothing; the source revision is
+///   already cached, and the view is a few string operations to re-derive.
+///
+/// Both borrow bytes they do not own, which is exactly why a *cacheable*
+/// revision is never a passthrough: it must own a durable copy, since the
+/// borrowed source may change or vanish across runs.
 fn is_passthrough(use_tmp_cache: bool, content: &outputartifact::Content) -> bool {
-    use_tmp_cache && matches!(content, outputartifact::Content::File(f) if f.passthrough)
+    use_tmp_cache
+        && match content {
+            outputartifact::Content::File(f) => f.passthrough,
+            outputartifact::Content::View(_) => true,
+            _ => false,
+        }
 }
 
 /// The `@heph/fs` addrs covering every `codegen = in_place` output path.

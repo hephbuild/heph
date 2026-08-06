@@ -3,8 +3,12 @@ pub mod sniff;
 pub mod tar;
 pub mod tar_index;
 pub mod unpack;
+pub mod view;
 
 pub use file::FileContent;
+pub use view::{
+    PathFilter, PathMapping, PathTransform, Rename, RenamePlan, SourcePaths, ViewContent,
+};
 
 use std::io;
 use std::path::PathBuf;
