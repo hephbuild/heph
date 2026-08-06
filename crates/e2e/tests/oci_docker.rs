@@ -630,7 +630,9 @@ async fn test_real_docker_load_tags_the_image_in_the_daemon() -> anyhow::Result<
     // The package is unique per process so the *derived* repository is too:
     // parallel runs, and leftovers from a killed one, share the daemon.
     let pkg = format!("app{}", std::process::id());
-    let repo = format!("{pkg}/img");
+    // One `_`-joined component, matching `docker_repo`: a `/` path would let
+    // docker read the first segment as a registry host.
+    let repo = format!("{pkg}_img");
     let tag = format!("heph-e2e-oci-load:{}", std::process::id());
 
     let ws = workspace();
@@ -666,12 +668,16 @@ target(name = "autoload", driver = "oci_load", image = ":img")
     let explicit = Command::new("docker")
         .args(["image", "inspect", &tag])
         .output();
+    // Looked up by the package prefix rather than the exact repository, so a
+    // change to how the name is derived fails below with the name it actually
+    // used — not here with an empty list and nothing to go on.
     let derived = Command::new("docker")
         .args([
             "images",
             "--format",
             "{{.Repository}}:{{.Tag}}",
-            repo.as_str(),
+            "--filter",
+            &format!("reference={pkg}*"),
         ])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -693,12 +699,14 @@ target(name = "autoload", driver = "oci_load", image = ":img")
     assert_eq!(
         derived.len(),
         1,
-        "exactly one content-addressed tag under {repo}, got: {derived:?}"
+        "exactly one derived tag under {pkg}*, got: {derived:?}"
     );
-    let hash = derived[0]
-        .rsplit_once(':')
-        .map(|(_, t)| t)
-        .unwrap_or_default();
+    let (got_repo, hash) = derived[0].rsplit_once(':').unwrap_or((derived[0], ""));
+    assert_eq!(
+        got_repo, repo,
+        "the repository is one `_`-joined component; a `/` path would let docker \
+         read the first segment as a registry host"
+    );
     assert!(
         !hash.is_empty() && hash != "<none>" && hash.chars().all(|c| c.is_ascii_hexdigit()),
         "the derived tag must be the input hash, got: {:?}",
