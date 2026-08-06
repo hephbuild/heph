@@ -27,6 +27,7 @@ oci-client = "0.17"
 # `~/.docker/config.json` and the `docker-credential-*` helpers is the caller's
 # job — which is what skopeo used to do for us, and what ECR/GCR/ACR need.
 docker_credential = "1.3"
+bytes = "1"
 tar = "0.4"
 sha2 = "0.10"
 # The Docker daemon API, for `oci_load`'s `/images/load`.

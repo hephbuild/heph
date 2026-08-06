@@ -310,16 +310,21 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("out {:?} has no file name", def.out))?;
         let out_path = req.sandbox_pkg_dir.join(out_name);
 
-        let (index, blobs) = super::registry::pull_layout(&def.src, &def.platform, def.insecure)
-            .await
-            .with_context(|| format!("pull image {}", def.src))?;
+        // Blobs land here on their way out of the registry, outside the
+        // workspace dir so they are not collected as outputs. The sandbox is
+        // torn down after the run, so there is nothing to clean up.
+        let blob_dir = req.sandbox_dir.join("heph-oci-blobs");
+        let (index, blobs) =
+            super::registry::pull_layout(&def.src, &def.platform, def.insecure, &blob_dir)
+                .await
+                .with_context(|| format!("pull image {}", def.src))?;
 
         if def.layout {
             // A layout *directory* is the shape `docker_build`'s `bases` consumes:
             // buildx's `oci-layout://` reads a tree, not a tar.
-            super::archive::write_layout_dir(&out_path, &index, &blobs)
+            super::archive::write_layout_dir_blobs(&out_path, &index, &blobs)
         } else {
-            super::archive::write_layout_tar(&out_path, &index, &blobs)
+            super::archive::write_layout_tar_blobs(&out_path, &index, &blobs)
         }
         .with_context(|| format!("write the pulled image to {out_path:?}"))?;
 

@@ -11,20 +11,22 @@
 
 use anyhow::Context as _;
 use oci_client::manifest::{OciImageIndex, OciImageManifest};
-use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::Path;
 
-/// An OCI layout read into memory: the index, plus every blob by digest.
+/// An OCI layout: the index, plus where to find every blob by digest.
 ///
-/// Blobs are held in memory because the layers of one image are exactly what a
-/// push is about to send anyway. A layout whose blobs do not fit in memory is a
-/// layout that will not fit through a registry upload either — if that stops
-/// being true, this is the type that grows a streaming variant.
+/// Deliberately *not* the blobs themselves. Reading a layout used to slurp
+/// every blob into a `HashMap<String, Vec<u8>>`, which put a whole image —
+/// often a whole base image on top of it — in memory once per concurrent
+/// target. Layers stay where they are: on disk in a layout directory, or at a
+/// known offset inside an `oci-archive`, which is a tar and therefore
+/// seekable. Only manifests, indexes and configs are ever read, and those are
+/// kilobytes.
 #[derive(Debug)]
 pub(crate) struct Layout {
     pub index: OciImageIndex,
-    pub blobs: HashMap<String, Vec<u8>>,
+    pub blobs: Blobs,
 }
 
 /// Which file inside an OCI layout is the entrypoint.
@@ -43,11 +45,15 @@ impl Layout {
         }
     }
 
+    /// An `oci-archive` is a tar, so every blob is already a contiguous range of
+    /// a file on disk. `raw_file_position` is where the entry's data starts —
+    /// recording that instead of reading it is what keeps a multi-gigabyte image
+    /// out of memory. `index.json` is the one entry actually read here.
     fn read_tar(path: &Path) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path).with_context(|| format!("open archive {path:?}"))?;
         let mut ar = tar::Archive::new(file);
         let mut index_bytes = None;
-        let mut blobs = HashMap::new();
+        let mut blobs = Blobs::new();
         for entry in ar.entries().with_context(|| format!("read {path:?}"))? {
             let mut entry = entry.context("archive entry")?;
             let name = entry
@@ -55,12 +61,19 @@ impl Layout {
                 .context("entry path")?
                 .to_string_lossy()
                 .into_owned();
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).context("read entry")?;
             if name == INDEX_JSON {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).context("read index.json")?;
                 index_bytes = Some(buf);
             } else if let Some(digest) = blob_digest_of(&name) {
-                blobs.insert(digest, buf);
+                blobs.insert(
+                    digest,
+                    Blob::FileRange {
+                        path: path.to_path_buf(),
+                        offset: entry.raw_file_position(),
+                        len: entry.size(),
+                    },
+                );
             }
         }
         Self::finish(path, index_bytes, blobs)
@@ -68,7 +81,7 @@ impl Layout {
 
     fn read_dir(dir: &Path) -> anyhow::Result<Self> {
         let index_bytes = std::fs::read(dir.join(INDEX_JSON)).ok();
-        let mut blobs = HashMap::new();
+        let mut blobs = Blobs::new();
         let algos = dir.join("blobs");
         if algos.is_dir() {
             for algo in std::fs::read_dir(&algos).with_context(|| format!("read {algos:?}"))? {
@@ -80,18 +93,14 @@ impl Layout {
                 for blob in std::fs::read_dir(algo.path()).context("read blob dir")? {
                     let blob = blob.context("blob entry")?;
                     let digest = format!("{name}:{}", blob.file_name().to_string_lossy());
-                    blobs.insert(digest, std::fs::read(blob.path()).context("read blob")?);
+                    blobs.insert(digest, Blob::File(blob.path()));
                 }
             }
         }
         Self::finish(dir, index_bytes, blobs)
     }
 
-    fn finish(
-        path: &Path,
-        index_bytes: Option<Vec<u8>>,
-        blobs: HashMap<String, Vec<u8>>,
-    ) -> anyhow::Result<Self> {
+    fn finish(path: &Path, index_bytes: Option<Vec<u8>>, blobs: Blobs) -> anyhow::Result<Self> {
         let index_bytes = index_bytes.with_context(|| {
             format!(
                 "{path:?} has no `index.json`: it is not an OCI layout. A docker-format archive \
@@ -121,16 +130,16 @@ impl Layout {
     > {
         let mut out = Vec::new();
         for entry in &self.index.manifests {
-            let raw = self.blob(&entry.digest)?;
+            let raw = self.blob_bytes(&entry.digest)?;
             // An index may point at another index (a manifest list nested one
             // level, which is what buildx emits for a multi-platform build).
-            if let Ok(inner) = serde_json::from_slice::<OciImageIndex>(raw)
+            if let Ok(inner) = serde_json::from_slice::<OciImageIndex>(&raw)
                 && !inner.manifests.is_empty()
             {
                 for nested in &inner.manifests {
-                    let raw = self.blob(&nested.digest)?;
+                    let raw = self.blob_bytes(&nested.digest)?;
                     out.push((
-                        serde_json::from_slice(raw).context("parse nested manifest")?,
+                        serde_json::from_slice(&raw).context("parse nested manifest")?,
                         nested.platform.clone(),
                         nested.digest.clone(),
                     ));
@@ -138,7 +147,7 @@ impl Layout {
                 continue;
             }
             out.push((
-                serde_json::from_slice(raw).context("parse manifest")?,
+                serde_json::from_slice(&raw).context("parse manifest")?,
                 entry.platform.clone(),
                 entry.digest.clone(),
             ));
@@ -146,10 +155,22 @@ impl Layout {
         Ok(out)
     }
 
-    pub(crate) fn blob(&self, digest: &str) -> anyhow::Result<&Vec<u8>> {
+    /// Where a blob lives. Cheap — nothing is read.
+    pub(crate) fn blob(&self, digest: &str) -> anyhow::Result<&Blob> {
         self.blobs
             .get(digest)
             .with_context(|| format!("blob {digest} is referenced but not in the layout"))
+    }
+
+    /// A blob's bytes. Only for manifests, indexes and configs — a layer goes
+    /// through [`Blob::reader`], which is the whole point of the split.
+    pub(crate) fn blob_bytes(&self, digest: &str) -> anyhow::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.blob(digest)?
+            .reader()?
+            .read_to_end(&mut buf)
+            .with_context(|| format!("read blob {digest}"))?;
+        Ok(buf)
     }
 }
 
@@ -165,24 +186,40 @@ impl Layout {
 pub(crate) enum Blob {
     Bytes(Vec<u8>),
     File(std::path::PathBuf),
+    /// A byte range inside a file — an `oci-archive`'s blobs, which are already
+    /// contiguous in a tar and need no extraction to read.
+    FileRange {
+        path: std::path::PathBuf,
+        offset: u64,
+        len: u64,
+    },
 }
 
 impl Blob {
-    fn len(&self) -> anyhow::Result<u64> {
+    pub(crate) fn len(&self) -> anyhow::Result<u64> {
         match self {
             Blob::Bytes(b) => Ok(b.len() as u64),
             Blob::File(p) => Ok(std::fs::metadata(p)
                 .with_context(|| format!("stat blob file {p:?}"))?
                 .len()),
+            Blob::FileRange { len, .. } => Ok(*len),
         }
     }
 
-    fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+    pub(crate) fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
         match self {
             Blob::Bytes(b) => Ok(Box::new(std::io::Cursor::new(b.clone()))),
             Blob::File(p) => Ok(Box::new(
                 std::fs::File::open(p).with_context(|| format!("open blob file {p:?}"))?,
             )),
+            Blob::FileRange { path, offset, len } => {
+                use std::io::Seek as _;
+                let mut f = std::fs::File::open(path)
+                    .with_context(|| format!("open blob archive {path:?}"))?;
+                f.seek(std::io::SeekFrom::Start(*offset))
+                    .with_context(|| format!("seek to {offset} in {path:?}"))?;
+                Ok(Box::new(f.take(*len)))
+            }
         }
     }
 }
@@ -257,15 +294,6 @@ fn tagged_index(index: &OciImageIndex, blobs: &mut Blobs) -> anyhow::Result<OciI
 /// Write a layout to `dir` in the on-disk OCI layout shape (`oci-layout`,
 /// `index.json`, `blobs/<algo>/<hex>`) — what `oci_pull(layout = True)` produces
 /// and what `docker_build`'s `bases` consumes.
-pub(crate) fn write_layout_dir(
-    dir: &Path,
-    index: &OciImageIndex,
-    blobs: &HashMap<String, Vec<u8>>,
-) -> anyhow::Result<()> {
-    write_layout_dir_blobs(dir, index, &owned(blobs))
-}
-
-/// [`write_layout_dir`], for blobs that may still be on disk.
 pub(crate) fn write_layout_dir_blobs(
     dir: &Path,
     index: &OciImageIndex,
@@ -312,15 +340,6 @@ pub(crate) fn write_layout_dir_blobs(
 }
 
 /// Pack a layout directory into an `oci-archive` tar.
-pub(crate) fn write_layout_tar(
-    out: &Path,
-    index: &OciImageIndex,
-    blobs: &HashMap<String, Vec<u8>>,
-) -> anyhow::Result<()> {
-    write_layout_tar_blobs(out, index, &owned(blobs))
-}
-
-/// [`write_layout_tar`], for blobs that may still be on disk.
 pub(crate) fn write_layout_tar_blobs(
     out: &Path,
     index: &OciImageIndex,
@@ -344,16 +363,6 @@ pub(crate) fn write_layout_tar_blobs(
     }
     ar.finish().context("finish archive")?;
     Ok(())
-}
-
-/// Wrap already-in-memory blobs. The callers that have them (`oci_pull`,
-/// `oci_push`) hold whole images anyway — the registry upload they feed is the
-/// same bytes — so nothing is lost by keeping their shape.
-fn owned(blobs: &HashMap<String, Vec<u8>>) -> Blobs {
-    blobs
-        .iter()
-        .map(|(d, b)| (d.clone(), Blob::Bytes(b.clone())))
-        .collect()
 }
 
 fn append<W: std::io::Write>(
@@ -434,9 +443,12 @@ pub(crate) fn write_docker_archive(
 ) -> anyhow::Result<()> {
     // Only the blobs this instance needs — a multi-arch layout would otherwise
     // carry every architecture's layers into a tag that holds one image.
-    let mut blobs = HashMap::new();
-    let manifest_bytes = layout.blob(manifest_digest)?.clone();
-    blobs.insert(manifest_digest.to_string(), manifest_bytes.clone());
+    let mut blobs = Blobs::new();
+    let manifest_bytes = layout.blob_bytes(manifest_digest)?;
+    blobs.insert(
+        manifest_digest.to_string(),
+        Blob::Bytes(manifest_bytes.clone()),
+    );
     blobs.insert(
         manifest.config.digest.clone(),
         layout.blob(&manifest.config.digest)?.clone(),
@@ -476,13 +488,9 @@ pub(crate) fn write_docker_archive(
         INDEX_JSON,
         &serde_json::to_vec(&index).context("encode index.json")?,
     )?;
-    let mut digests: Vec<&String> = blobs.keys().collect();
-    digests.sort();
-    for digest in digests {
-        let bytes = blobs
-            .get(digest)
-            .with_context(|| format!("blob {digest} vanished between listing and writing"))?;
-        append(&mut ar, &blob_path(digest)?, bytes)?;
+    // `Blobs` is a BTreeMap, so the member order is fixed without a sort.
+    for (digest, blob) in &blobs {
+        append_blob(&mut ar, &blob_path(digest)?, blob)?;
     }
     append(
         &mut ar,
@@ -522,14 +530,14 @@ mod tests {
             manifests: vec![],
             annotations: None,
         };
-        let blobs = HashMap::from([
-            ("sha256:aaa".to_string(), b"one".to_vec()),
-            ("sha256:bbb".to_string(), b"two".to_vec()),
+        let blobs = Blobs::from([
+            ("sha256:aaa".to_string(), Blob::Bytes(b"one".to_vec())),
+            ("sha256:bbb".to_string(), Blob::Bytes(b"two".to_vec())),
         ]);
         let a = dir.path().join("a.tar");
         let b = dir.path().join("b.tar");
-        write_layout_tar(&a, &index, &blobs).expect("write a");
-        write_layout_tar(&b, &index, &blobs).expect("write b");
+        write_layout_tar_blobs(&a, &index, &blobs).expect("write a");
+        write_layout_tar_blobs(&b, &index, &blobs).expect("write b");
         assert_eq!(
             std::fs::read(&a).expect("a"),
             std::fs::read(&b).expect("b"),
@@ -565,10 +573,13 @@ mod tests {
             }],
             annotations: None,
         };
-        let blobs = HashMap::from([(manifest_digest, manifest_bytes), (config_digest, config)]);
+        let blobs = Blobs::from([
+            (manifest_digest, Blob::Bytes(manifest_bytes)),
+            (config_digest, Blob::Bytes(config)),
+        ]);
 
         let tar = dir.path().join("img.tar");
-        write_layout_tar(&tar, &index, &blobs).expect("write");
+        write_layout_tar_blobs(&tar, &index, &blobs).expect("write");
         let read = Layout::read(&tar).expect("read");
         let manifests = read.manifests().expect("manifests");
         assert_eq!(manifests.len(), 1, "one image in, one image out");
@@ -576,7 +587,7 @@ mod tests {
         // The same layout as a directory reads identically — `bases` consumes
         // that shape and a push must accept either.
         let as_dir = dir.path().join("layout");
-        write_layout_dir(&as_dir, &index, &blobs).expect("write dir");
+        write_layout_dir_blobs(&as_dir, &index, &blobs).expect("write dir");
         assert_eq!(
             Layout::read(&as_dir)
                 .expect("read dir")
@@ -584,6 +595,71 @@ mod tests {
                 .expect("m")
                 .len(),
             1
+        );
+    }
+
+    /// Reading a layout must not read its layers.
+    ///
+    /// This is the property, not an optimization: `Layout::read` used to slurp
+    /// every blob into a `HashMap<String, Vec<u8>>`, so a push, a load or an
+    /// image build held a whole image — plus a whole base image — in memory,
+    /// once per concurrent target. A layer now comes back as a *location*.
+    #[test]
+    fn reading_a_layout_locates_its_blobs_without_reading_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layer = vec![b'L'; 4096];
+        let layer_digest = sha256_digest(&layer);
+        let index = OciImageIndex {
+            schema_version: 2,
+            media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+            artifact_type: None,
+            manifests: vec![],
+            annotations: None,
+        };
+        let blobs = Blobs::from([(layer_digest.clone(), Blob::Bytes(layer.clone()))]);
+
+        // An oci-archive is a tar, so the blob is a byte range in it.
+        let tar = dir.path().join("img.tar");
+        write_layout_tar_blobs(&tar, &index, &blobs).expect("write tar");
+        let read = Layout::read(&tar).expect("read tar");
+        let blob = read.blob(&layer_digest).expect("blob");
+        assert!(
+            matches!(blob, Blob::FileRange { .. }),
+            "a layer in an archive must be located, not loaded: {blob:?}"
+        );
+        assert_eq!(blob.len().expect("len"), layer.len() as u64);
+        assert_eq!(
+            read.blob_bytes(&layer_digest).expect("bytes"),
+            layer,
+            "the recorded range must be exactly the blob"
+        );
+
+        // A layout directory keeps them as plain files.
+        let as_dir = dir.path().join("layout");
+        write_layout_dir_blobs(&as_dir, &index, &blobs).expect("write dir");
+        let read = Layout::read(&as_dir).expect("read dir");
+        let blob = read.blob(&layer_digest).expect("blob");
+        assert!(
+            matches!(blob, Blob::File(_)),
+            "a layer in a layout directory is already a file: {blob:?}"
+        );
+        assert_eq!(read.blob_bytes(&layer_digest).expect("bytes"), layer);
+
+        // And a blob located in one layout can be written into another without
+        // ever being read — the path `oci_image` takes for a base's layers.
+        let copied = dir.path().join("copy.tar");
+        write_layout_tar_blobs(
+            &copied,
+            &index,
+            &Blobs::from([(layer_digest.clone(), blob.clone())]),
+        )
+        .expect("write copy");
+        assert_eq!(
+            Layout::read(&copied)
+                .expect("read copy")
+                .blob_bytes(&layer_digest)
+                .expect("bytes"),
+            layer
         );
     }
 

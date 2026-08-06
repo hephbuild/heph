@@ -230,8 +230,9 @@ struct BaseFor {
     layers: Vec<Value>,
     diff_ids: Vec<Value>,
     config: Map<String, Value>,
-    /// Blobs to carry into the output layout.
-    blobs: Vec<(String, Vec<u8>)>,
+    /// Blobs to carry into the output layout, by reference — a base's layers
+    /// are never read here.
+    blobs: Vec<(String, Blob)>,
 }
 
 /// Merge the base's `config` object with what the BUILD file set.
@@ -387,7 +388,7 @@ fn base_for(layout: Option<&archive::Layout>, platform: &str) -> anyhow::Result<
         )
     })?;
 
-    let config_bytes = layout.blob(&manifest.config.digest)?.clone();
+    let config_bytes = layout.blob_bytes(&manifest.config.digest)?;
     let config: Value =
         serde_json::from_slice(&config_bytes).context("parse the base image config")?;
     let diff_ids = config
@@ -404,6 +405,8 @@ fn base_for(layout: Option<&archive::Layout>, platform: &str) -> anyhow::Result<
     let mut blobs = Vec::new();
     let mut layers = Vec::new();
     for layer in &manifest.layers {
+        // The base's layers are carried by *reference* — they stay in the base's
+        // own layout on disk and are streamed straight into this image's.
         blobs.push((layer.digest.clone(), layout.blob(&layer.digest)?.clone()));
         layers.push(json!({
             "mediaType": layer.media_type,
@@ -684,8 +687,8 @@ impl ManagedDriver for Driver {
 
         for platform in &def.platforms {
             let base = base_for(base_layout.as_ref(), platform)?;
-            for (digest, bytes) in &base.blobs {
-                blobs.insert(digest.clone(), Blob::Bytes(bytes.clone()));
+            for (digest, blob) in &base.blobs {
+                blobs.insert(digest.clone(), blob.clone());
             }
 
             let mut layer_descs = base.layers.clone();

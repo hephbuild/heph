@@ -367,6 +367,65 @@ target(
     Ok(())
 }
 
+/// `format = "docker"` writes the hybrid shape a daemon's `docker load` takes:
+/// the OCI layout plus a `manifest.json` naming the config and layers by their
+/// blob paths.
+///
+/// Not gated on docker, deliberately — the archive's *shape* is what this
+/// driver owns, and gating it would leave the docker-format path covered only
+/// by a suite that skips on most machines.
+#[tokio::test]
+async fn test_the_docker_format_archive_has_a_manifest_json() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
+target(name = "etc", driver = "oci_layer", srcs = [":conf"], prefix = "/etc")
+target(
+    name = "img",
+    driver = "oci_image",
+    layers = [":etc"],
+    platforms = ["linux/amd64"],
+    format = "docker",
+)
+"#,
+    );
+
+    let r = ws.run("//app:img").await?;
+    let bytes = htestkit::artifact_bytes(&r);
+    let members = layout_members(&bytes);
+    assert!(
+        members.contains(&"manifest.json".to_string()),
+        "a docker-format archive needs manifest.json, got: {members:?}"
+    );
+
+    use std::io::Read as _;
+    let mut ar = tar::Archive::new(std::io::Cursor::new(bytes.clone()));
+    let mut manifest = None;
+    for entry in ar.entries().expect("entries") {
+        let mut entry = entry.expect("entry");
+        if entry.path().expect("path").to_string_lossy() == "manifest.json" {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).expect("read");
+            manifest = Some(serde_json::from_slice::<serde_json::Value>(&buf).expect("json"));
+        }
+    }
+    let manifest = manifest.expect("manifest.json");
+    let layers = manifest[0]["Layers"].as_array().expect("Layers");
+    assert_eq!(layers.len(), 1);
+    let layer_path = layers[0].as_str().expect("layer path");
+    assert!(
+        members.contains(&layer_path.to_string()),
+        "manifest.json names {layer_path}, which must be in the archive: {members:?}"
+    );
+    assert!(
+        members.contains(&manifest[0]["Config"].as_str().expect("Config").to_string()),
+        "manifest.json's Config must be in the archive too"
+    );
+    Ok(())
+}
+
 /// A layer whose `strip` matched nothing is the failure this rule is most
 /// likely to produce and least likely to be noticed: the image builds, pushes
 /// and starts, and dies when something execs the binary that is not there. It
