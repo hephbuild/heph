@@ -328,11 +328,6 @@ impl ManagedDriver for Driver {
         }
         .with_context(|| format!("write the pulled image to {out_path:?}"))?;
 
-        tracing::info!(
-            image = def.src,
-            platform = def.platform.label(),
-            "oci_pull: pulled"
-        );
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }

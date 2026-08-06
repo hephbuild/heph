@@ -164,14 +164,10 @@ impl ManagedDriver for Driver {
         let layout =
             Layout::read(&path).with_context(|| format!("read the image to push from {path:?}"))?;
 
-        let digest = registry::push_layout(&layout, &def.dest, def.insecure)
+        registry::push_layout(&layout, &def.dest, def.insecure)
             .await
             .with_context(|| format!("push {}", def.dest))?;
 
-        // A push is the one place the build graph meets the outside world, so
-        // say what left the machine: without it neither a human nor an agent can
-        // learn what `heph run //app:push` actually shipped.
-        tracing::info!(r#ref = def.dest, digest, "oci_push: pushed");
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }

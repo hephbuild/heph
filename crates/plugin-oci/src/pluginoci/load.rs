@@ -426,9 +426,6 @@ impl ManagedDriver for Driver {
             .await
             .with_context(|| format!("tag the loaded image as {image}"))?;
 
-        // Logged, not printed: stdout belongs to the TUI. This is the line that
-        // tells the user what to `docker run`.
-        tracing::info!(image, platform = def.platform, "oci_load: loaded");
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
