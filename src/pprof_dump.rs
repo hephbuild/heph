@@ -370,16 +370,20 @@ mod tests {
 
     /// Rounds of [`cpu_only`] per `burn` iteration.
     ///
-    /// A trade between the two assertions, which share one fixed burn window:
-    /// every round spends time in [`cpu_only`] *and* in [`libc_only`], so rounds
-    /// bought for one half are taken from the other. Up buys margin on the
-    /// in-binary assertion; down leaves more of the window inside libc, which is
-    /// the only part that exposes the sampler to the frames `UNWIND_BLOCKLIST`
-    /// exists for.
+    /// A trade between the two assertions, which share one burn window: every
+    /// round spends time in [`cpu_only`] *and* in [`libc_only`], so rounds bought
+    /// for one half are taken from the other. Up buys margin on the in-binary
+    /// assertion; down leaves more of the window inside libc, which is the only
+    /// part that exposes the sampler to the frames `UNWIND_BLOCKLIST` exists for.
     ///
-    /// **Re-measure this whenever either half's workload changes** — it is the
-    /// balance point between them, not a property of [`cpu_only`] alone. It was
-    /// last set from the numbers below: 3 runs per cell, darwin/arm64, opt0,
+    /// It is a **pacing** knob, not a correctness one: the window grows until both
+    /// halves have been sampled (see the test), so a starved half costs slices of
+    /// [`BURN_SLICE`], not a red test. Keeping it near the balance point is still
+    /// worth doing — a value that starves one half by two orders of magnitude
+    /// spends most of [`CONVERGE_TIMEOUT`] getting there, and a test that takes
+    /// 30s to pass is one somebody deletes.
+    ///
+    /// It was last measured with 3 runs per cell, darwin/arm64, opt0,
     /// `burn(4, 1500ms)`, idle, counting sample *events* (`Sample::value`, not
     /// distinct stacks) against a ~1000-event window:
     ///
@@ -400,13 +404,12 @@ mod tests {
     /// 25_000 is where this constant sat until the libc half grew 32x
     /// ([`LIBC_COPY_BYTES`], 1 MiB x1 -> 4 MiB x8) without it being re-measured.
     /// That silently cut `cpu_only` from a roughly even split to ~1% of the
-    /// window — 6-20 events across as few as 6 distinct stacks, for an assertion
-    /// needing 1 — and the in-binary half went red on master's darwin/arm64 CI
-    /// with 0 hits in a 30-stack profile. Under the same load here the recalibrated
-    /// value holds 25 stacks and 87-140 events.
+    /// window, which was enough to turn a fixed-window run red — the failure that
+    /// made the window adaptive in the first place.
     ///
     /// The split depends on the allocator and on memory bandwidth, so it will not
-    /// be the same on the Linux targets — the margins above are sized for that.
+    /// be the same on the Linux targets — which is precisely why no single value
+    /// here is allowed to decide the verdict.
     const CPU_ROUNDS: u64 = 250_000;
 
     /// Substring identifying an in-binary frame: matches both [`cpu_only`] and
@@ -455,8 +458,9 @@ mod tests {
     ///
     /// Both halves run in the same round, so **changing this changes the split**:
     /// this 32x bump took `cpu_only` from a roughly even share of the window to
-    /// ~1% of it, and the in-binary assertion went red on CI a week later. Whoever
-    /// moves this next re-measures [`CPU_ROUNDS`] against it.
+    /// ~1% of it, and the in-binary assertion went red on CI a week later. That
+    /// class of failure is now a slow test rather than a red one, but whoever
+    /// moves this next still re-measures [`CPU_ROUNDS`] against it.
     const LIBC_COPY_BYTES: usize = 4 << 20;
     const LIBC_COPIES_PER_ROUND: usize = 8;
 
@@ -503,6 +507,10 @@ mod tests {
     /// which thread the kernel picks to deliver `SIGPROF` to — a process-directed
     /// timer signal is delivered to *some* eligible thread, and on Darwin that is
     /// routinely not the one burning the most CPU.
+    ///
+    /// Called once per slice of the burn-dump-look loop rather than once for a
+    /// whole fixed window, so `at_least` is [`BURN_SLICE`] and not the sampling
+    /// budget: the budget is however many slices it takes.
     fn burn(threads: usize, at_least: Duration) {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
@@ -741,8 +749,58 @@ mod tests {
         assert!(f.frames.is_empty());
     }
 
+    /// Threads kept busy while sampling.
+    const BURN_THREADS: usize = 4;
+
+    /// How long [`burn`] runs before the profile is re-read.
+    ///
+    /// `SIGPROF` is *process*-directed, so 199 Hz is 199 deliveries per second no
+    /// matter how many threads burn: a slice is ~100 samples, split between the
+    /// two halves and then deduped into distinct stacks. Small enough that a
+    /// healthy run pays about this much and stops; large enough that the
+    /// watcher's 200ms tick and the encode are not most of the slice.
+    const BURN_SLICE: Duration = Duration::from_millis(500);
+
+    /// How long to wait for the watcher to write a *new* profile after a dump
+    /// request, before burning another slice and asking again.
+    ///
+    /// The watcher polls on a 200ms tick and then encodes, so a request landing
+    /// just after a tick waits nearly two. This is a per-slice timeout, not a
+    /// failure: expiring costs one more slice, and the loop is bounded by
+    /// [`CONVERGE_TIMEOUT`] regardless.
+    const DUMP_WAIT: Duration = Duration::from_secs(3);
+
+    /// Ceiling on the whole burn-dump-look loop.
+    ///
+    /// Sized for the case where no amount of burning will help — the sampler is
+    /// broken and the test has to say so in bounded time. A healthy run on any
+    /// supported target finishes in the first slice or two and never approaches
+    /// it.
+    const CONVERGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Wait for a dump *newer than* `previous` to land at `path`, up to `deadline`.
+    ///
+    /// Freshness is decided by comparing bytes, because that is the only signal
+    /// the production path offers: the watcher clears the request flag before it
+    /// builds the report, so the flag says "seen", not "written". Bytes are enough
+    /// — the profile accumulates over the guard's whole lifetime, so any dump
+    /// carrying a sample the last one did not differs somewhere in the encoding.
+    /// Two identical dumps therefore mean no new samples were recorded, which is
+    /// the state the caller is trying to burn its way out of.
+    fn await_dump(path: &Path, previous: Option<&[u8]>, deadline: Instant) -> Option<Vec<u8>> {
+        while Instant::now() < deadline {
+            if let Ok(content) = std::fs::read(path)
+                && previous != Some(content.as_slice())
+            {
+                return Some(content);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        None
+    }
+
     /// Profiling a busy multi-threaded process must produce a decodable profile
-    /// with samples in it.
+    /// with heph's own frames in it.
     ///
     /// Regression: `--pprof-cpu` segfaulted the process it was meant to diagnose,
     /// within seconds of startup on a wide run, because the `SIGPROF` handler
@@ -767,6 +825,27 @@ mod tests {
     /// strictly stronger — a lone libc straggler satisfies "non-empty" while every
     /// heph frame is being dropped, which is the failure it claimed to guard.
     ///
+    /// **The sampling window is grown until the profile answers, rather than
+    /// fixed**, and that is what keeps the two name assertions from being a coin
+    /// flip. Sampling is statistical at both ends: 199 process-directed deliveries
+    /// per second gave a 1.5s window ~300 samples, to be split between two
+    /// workloads whose relative sizes depend on the allocator, on memory
+    /// bandwidth, and on what else the runner is doing. Whichever half came out
+    /// smaller was one bad run from zero, and both have gone red that way —
+    /// `libc_only` first, then `cpu_only` with "27 distinct stacks, none naming
+    /// `cpu_only`" on a profile that was otherwise perfectly healthy. Each was
+    /// answered by re-tuning [`CPU_ROUNDS`] or [`LIBC_COPY_BYTES`] against
+    /// whichever runner had just failed, which cannot converge: the halves share
+    /// one window, so margin bought for one is taken from the other.
+    ///
+    /// So the window is a loop — burn a [`BURN_SLICE`], dump, look, and go round
+    /// again until both names appear or [`CONVERGE_TIMEOUT`] expires. A starved
+    /// half now costs slices instead of turning the test red, a healthy sampler on
+    /// a slow or loaded runner simply takes one more slice, and a genuinely broken
+    /// one still fails with the same diagnosis in bounded time. Nothing about
+    /// *what* is asserted changed; the deadline moved from "one window's worth of
+    /// luck" to 30 seconds of trying.
+    ///
     /// **Only one test in this binary may call [`start`].** pprof's `PROFILER` is
     /// a process singleton: a concurrent second `start` fails with
     /// `Error::Running`, and a sequential one would silently profile under the
@@ -778,46 +857,61 @@ mod tests {
         let path = dir.path().join("cpu.pb");
 
         let watcher = start(path.clone()).expect("start profiler");
-        // 1.5s, not 500ms. `SIGPROF` is *process*-directed, so 199 Hz is 199
-        // deliveries per second for the whole process no matter how many threads
-        // burn — ~100 samples in 500ms, split across two halves and then deduped
-        // into distinct stacks. That was already thin enough to turn this test
-        // red on master's own CI once; it now carries a second assertion, so the
-        // sample budget has to cover both.
-        burn(4, Duration::from_millis(1500));
-        request_dump();
 
-        // The watcher wakes on a 200ms tick, then encodes and renames into place.
-        // Poll for the file rather than sleeping a fixed amount.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut snapshot = None;
+        let started = Instant::now();
+        let deadline = started + CONVERGE_TIMEOUT;
+        let mut snapshot: Option<Vec<u8>> = None;
+        let mut profile: Option<pprof::protos::Profile> = None;
+        let mut slices = 0usize;
+        let (mut in_binary, mut in_libc) = (0usize, 0usize);
         while Instant::now() < deadline {
-            if let Ok(content) = std::fs::read(&path) {
-                snapshot = Some(content);
+            slices += 1;
+            burn(BURN_THREADS, BURN_SLICE);
+            request_dump();
+
+            // A slice whose dump never lands is not a failure — burn another and
+            // ask again, until the outer deadline says otherwise.
+            let wait_until = deadline.min(Instant::now() + DUMP_WAIT);
+            let Some(content) = await_dump(&path, snapshot.as_deref(), wait_until) else {
+                continue;
+            };
+            // Not tolerated the way a missing dump is: `write_atomic` renames into
+            // place, so every read sees one whole profile or the previous one. An
+            // undecodable read means that guarantee broke.
+            let decoded = pprof::protos::Profile::decode(content.as_slice())
+                .expect("on-demand dump must be a decodable pprof profile — never a partial write");
+            in_binary = stacks_naming(&decoded, CPU_NEEDLE);
+            in_libc = stacks_naming(&decoded, LIBC_NEEDLE);
+            snapshot = Some(content);
+            profile = Some(decoded);
+            if in_binary > 0 && in_libc > 0 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
         }
+        let elapsed = started.elapsed();
 
         // Before any assertion: an `assert!` that escapes here would leave the
         // watcher thread looping forever, holding the `ProfilerGuard` and keeping
         // SIGPROF firing for the rest of this test binary's life, with the
         // `TempDir` deleted out from under its next write.
-        let snapshot = snapshot;
         watcher.shutdown();
         let final_report = std::fs::read(&path);
 
-        let snapshot = snapshot.unwrap_or_else(|| panic!("no profile at {}", path.display()));
-        let profile = pprof::protos::Profile::decode(snapshot.as_slice())
-            .expect("on-demand dump must be a decodable pprof profile — never a partial write");
+        let profile = profile.unwrap_or_else(|| {
+            panic!(
+                "no profile at {} after {slices} slice(s) over {elapsed:?}: the watcher \
+                 never wrote one, so no sample was ever taken and nothing else here can \
+                 be judged",
+                path.display()
+            )
+        });
         // Diagnosis is branched on whether *anything* was sampled, because the two
         // states have disjoint causes and a message naming the wrong one sends the
         // reader after a bug that is not there.
-        let in_binary = stacks_naming(&profile, CPU_NEEDLE);
         assert!(
             in_binary > 0,
-            "no stack named `{}`, though it burned a large share of this process's \
-             CPU inside the main binary for the whole sampling window. {}",
+            "no stack named `{}` after {slices} slice(s) over {elapsed:?}, all of them \
+             burning a large share of this process's CPU inside the main binary. {}",
             CPU_NEEDLE,
             if profile.sample.is_empty() {
                 "The profile is empty: either UNWIND_BLOCKLIST now matches the main \
@@ -827,9 +921,14 @@ mod tests {
             } else {
                 format!(
                     "The profile has {} distinct stack(s), so the sampler is \
-                     working — the frames did not symbolize (a stripped build), or \
-                     `cpu_only`/`cpu_only_round` was renamed without updating \
-                     CPU_NEEDLE, or this build folded both frames away.",
+                     working, but none of them is heph's: UNWIND_BLOCKLIST now \
+                     matches the main binary (check \
+                     `blocklist_spares_the_c_library_and_the_main_binary`, which \
+                     goes red with this), the frames did not symbolize (a stripped \
+                     build), `cpu_only`/`cpu_only_round` was renamed without \
+                     updating CPU_NEEDLE, or this build folded both frames away. A \
+                     merely unlucky split cannot get here: the window kept growing \
+                     until CONVERGE_TIMEOUT.",
                     profile.sample.len()
                 )
             }
@@ -841,12 +940,11 @@ mod tests {
         // library to the blocklist and this goes to zero while `cpu_only` above
         // stays green — which is exactly how the missing half of every profile
         // went unnoticed.
-        let in_libc = stacks_naming(&profile, LIBC_NEEDLE);
         assert!(
             in_libc > 0,
-            "no stack named `{LIBC_NEEDLE}`, though every thread spent most of the \
-             sampling window inside {LIBC_COPIES_PER_ROUND} x {LIBC_COPY_BYTES}-byte \
-             memmoves per round. The profile has \
+            "no stack named `{LIBC_NEEDLE}` after {slices} slice(s) over {elapsed:?}, in \
+             every one of which each thread spent most of its time inside \
+             {LIBC_COPIES_PER_ROUND} x {LIBC_COPY_BYTES}-byte memmoves. The profile has \
              {} distinct stack(s) and {in_binary} naming `{CPU_NEEDLE}`, so the sampler \
              is working: UNWIND_BLOCKLIST covers the C library again, and every sample \
              interrupted in malloc/memcpy/a syscall is being discarded.",
