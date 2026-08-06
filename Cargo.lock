@@ -1447,6 +1447,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "heph",
+ "serde_yaml",
  "tempfile",
  "testkit",
  "tokio",
@@ -3892,6 +3893,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "which",
  "xxhash-rust",
 ]
 
