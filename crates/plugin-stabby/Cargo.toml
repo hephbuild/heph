@@ -27,7 +27,7 @@ async-trait = { version = "0.1.89", optional = true }
 serde_json = { version = "1", optional = true }
 # Host spawns one background task per hook to drive its client-stream RPC to the
 # plugin (it runs concurrently with event production).
-tokio = { version = "1.52", features = ["rt", "sync"], optional = true }
+tokio = { version = "1.52", features = ["rt", "sync", "io-util"], optional = true }
 # Re-emit a loaded plugin's forwarded tracing events on the host subscriber.
 tracing = { version = "0.1", optional = true }
 

@@ -20,8 +20,8 @@
 
 use hcore::htvalue::signature::ParamType;
 use hcore::htvalue::{
-    Value, parse_bool, parse_map_string_string, parse_map_string_strings, parse_string,
-    parse_strings,
+    Value, parse_bool, parse_map_string_map_string_strings, parse_map_string_string,
+    parse_map_string_strings, parse_string, parse_strings,
 };
 
 pub use htspec_derive::{Spec, SpecEnum, SpecStruct, SpecUnion};
@@ -147,6 +147,20 @@ impl FromSpecValue for std::collections::HashMap<String, Vec<String>> {
             ParamType::list(ParamType::String),
             ParamType::map(str_or_list),
         ])
+    }
+}
+
+impl FromSpecValue
+    for std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>
+{
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        parse_map_string_map_string_strings(v)
+    }
+
+    fn spec_param_type() -> ParamType {
+        let str_or_list =
+            ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
+        ParamType::map(ParamType::map(str_or_list))
     }
 }
 

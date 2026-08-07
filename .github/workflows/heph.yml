@@ -259,6 +259,7 @@ jobs:
           if [ "${{ matrix.os }}" = "darwin" ]; then ext=dylib; else ext=so; fi
           PLUGIN_GO_NAME="heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           PLUGIN_GHA_NAME="heph-gha-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
+          PLUGIN_OCI_NAME="heph-oci-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           # heph-bench: the perf-regression harness (`perfbench` job). Publishing
           # it as a release asset alongside `heph` itself means that job never
           # builds anything to compare a PR against its baseline — both the
@@ -275,6 +276,7 @@ jobs:
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
           echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
           echo "plugin_gha_name=$PLUGIN_GHA_NAME" >> $GITHUB_OUTPUT
+          echo "plugin_oci_name=$PLUGIN_OCI_NAME" >> $GITHUB_OUTPUT
           echo "bench_bin_name=$BENCH_BIN_NAME" >> $GITHUB_OUTPUT
           echo "debug_bin_name=$DEBUG_BIN_NAME" >> $GITHUB_OUTPUT
           OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release"
@@ -293,7 +295,7 @@ jobs:
           # Debian 12 (2.36), Ubuntu 22.04 (2.35) and Amazon Linux 2023 (2.34).
           # Do not "simplify" this to a native cargo build.
           #
-          # The heph bin and the two plugin cdylibs build in ONE invocation. They
+          # The heph bin and the plugin cdylibs build in ONE invocation. They
           # share nearly the whole workspace dep graph, and under the release
           # profile (thin-LTO + opt-level=3) each artifact's final codegen/LTO pass
           # is heavy — splitting into separate `cargo build` calls serializes those
@@ -305,11 +307,12 @@ jobs:
           # costs nothing extra). `heph-bench` links the same `heph` lib crate, so
           # adding it here is marginal — the expensive part (engine + deps) is
           # already being compiled for `heph` itself.
-          TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p bench"
+          TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p bench"
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cargo build --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.dylib"
             gha_lib="$OUT/libplugin_gha_cdylib.dylib"
+            oci_lib="$OUT/libplugin_oci_cdylib.dylib"
             # The nix toolchain hard-links libiconv against its /nix/store path,
             # which is absent on user machines (dyld aborts at launch). Rewrite
             # those load commands to the OS /usr/lib copies — for every artifact.
@@ -317,14 +320,17 @@ jobs:
             bash scripts/macos-portable.sh "$OUT/heph-bench"
             bash scripts/macos-portable.sh "$lib"
             bash scripts/macos-portable.sh "$gha_lib"
+            bash scripts/macos-portable.sh "$oci_lib"
           else
             cargo zigbuild --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.so"
             gha_lib="$OUT/libplugin_gha_cdylib.so"
+            oci_lib="$OUT/libplugin_oci_cdylib.so"
           fi
           cp "$OUT/heph-bench" $BENCH_BIN_NAME
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
+          cp "$oci_lib" $PLUGIN_OCI_NAME
 
           # `heph` diverges into its two flavours from here — each stamped by
           # `patch-flavour.sh` with which one it is (`heph version` / self-upgrade
@@ -413,6 +419,12 @@ jobs:
           name: ${{steps.build.outputs.plugin_gha_name}}
           path: ${{steps.build.outputs.plugin_gha_name}}
 
+      - name: Upload oci plugin artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{steps.build.outputs.plugin_oci_name}}
+          path: ${{steps.build.outputs.plugin_oci_name}}
+
   upload_artifacts:
     name: Pre-release
     needs: [gen, govet, build]
@@ -453,7 +465,7 @@ jobs:
       # `sha256:` checksum; a `<manifest>.sha256` sidecar (published too) holds the
       # manifest's own checksum for consumers to pin as `plugins[].checksum`.
       # JSON via tools/pluginmanifest.
-      - name: Generate go plugin manifest
+      - name: Generate plugin manifests
         run: |
           VERSION="${{needs.gen.outputs.version}}"
           BASE="https://github.com/hephbuild/heph-artifacts-v1/releases/download/$VERSION"
@@ -469,6 +481,13 @@ jobs:
               -out "$GITHUB_WORKSPACE/dist/heph-gha-plugin.json" )
           cat dist/heph-gha-plugin.json
           echo "manifest checksum: $(cat dist/heph-gha-plugin.json.sha256)"
+          # The oci plugin (`docker_build` / `oci_pull` / `oci_push` / `oci_load`)
+          # ships the same way — it is not compiled into the CLI.
+          ( cd tools/pluginmanifest && go run . -name oci -version "$VERSION" \
+              -prefix heph-oci-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
+              -out "$GITHUB_WORKSPACE/dist/heph-oci-plugin.json" )
+          cat dist/heph-oci-plugin.json
+          echo "manifest checksum: $(cat dist/heph-oci-plugin.json.sha256)"
 
       - name: Create Release in artifacts repo
         id: create_release
@@ -641,6 +660,18 @@ jobs:
           name: repo
           path: .
 
+      # `tst` links a test binary per workspace crate; with the nix store and the
+      # heavy dep graph this can exhaust the ~14 GB ubuntu-latest root disk mid-link
+      # ("No space left on device"). Drop preinstalled toolchains this job never
+      # uses to reclaim ~15 GB before the build. Linux only (paths are linux, and
+      # the macOS runner is not disk-constrained here).
+      - name: Free disk space (linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+
       - name: Setup Nix + devenv
         uses: ./.github/actions/setup-nix
         with:
@@ -770,8 +801,8 @@ jobs:
       # Only this platform's artifacts: the std-flavour `heph_<os>_<arch>` (what
       # the `e2e` script stages as `dist/heph`), the debug-flavour
       # `heph_debug_<os>_<arch>` (downloaded too since it matches the glob, but
-      # unused — the `e2e` script only picks up the exact std name), and the two
-      # `heph-*-plugin_<os>_<arch>.{so,dylib}`. `heph-govet` carries no os/arch
+      # unused — the `e2e` script only picks up the exact std name), and the
+      # `heph-*-plugin_<os>_<arch>.{so,dylib}` cdylibs. `heph-govet` carries no os/arch
       # suffix, so the pattern leaves it out.
       - name: Download artifacts under test
         uses: actions/download-artifact@v7

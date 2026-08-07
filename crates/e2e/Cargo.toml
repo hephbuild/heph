@@ -10,6 +10,9 @@ workspace = true
 [dev-dependencies]
 heph = { path = "../.." }
 htestkit = { package = "testkit", path = "../testkit" }
+hplugin-oci = { package = "plugin-oci", path = "../plugin-oci" }
+hcore = { package = "core", path = "../core" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"
 tempfile = "3"
+tar = "0.4"

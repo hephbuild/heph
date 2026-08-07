@@ -131,6 +131,10 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // `http_fetch`: downloads a URL (templated over the target's addr args) into a
     // cacheable file output — how tool binaries are provisioned off the internet.
     e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
+    // The `oci_*` drivers are not compiled in: like the go plugin, they ship as
+    // a separate cdylib loaded from a `path:`/`url:` manifest entry
+    // (`heph-oci-plugin.json`), under their own `docker_build` / `oci_pull` /
+    // `oci_push` / `oci_load` names.
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
     // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:

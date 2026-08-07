@@ -216,3 +216,72 @@ fn manifest_checksum_mismatch_is_rejected() {
         describe(&out)
     );
 }
+
+/// The oci cdylib, exercised through `inspect def` — which makes the host call
+/// the plugin's `parse` across the seam.
+///
+/// `parse` is where `docker_build` asks buildx for its default platform, i.e. where
+/// it shells out. A cdylib's statically-linked tokio is a *different instance*
+/// from the host's, and the future the host polls carries none of it, so a
+/// reactor touch there panics — and a panic across the ABI seam is a
+/// non-unwinding abort that kills `heph` outright, with a backtrace instead of
+/// an error. That is invisible to every in-process test: they run on the host's
+/// runtime, where the reactor is right there.
+///
+/// So the assertion is not "the target parses" — without docker it cannot, and
+/// that is fine. It is that the process came back at all, with a diagnosable
+/// error rather than a SIGABRT.
+#[test]
+fn shipped_oci_cdylib_parses_across_the_abi_without_aborting() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("oci");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-oci-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash oci cdylib");
+    write_manifest(&manifest, "oci", &dylib, Some(&sum)).expect("write manifest");
+    ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
+        .expect("write config");
+
+    // `platforms` is left unset on purpose: that is the branch that probes the
+    // builder, and therefore the branch that shells out from `parse`.
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"df\", driver = \"bash\", run = \"echo 'FROM scratch' > $OUT\", \
+         out = \"Dockerfile\")\n\
+         target(name = \"img\", driver = \"docker_build\", context = [\":df\"])\n",
+    )
+    .expect("write BUILD");
+
+    let out = ws
+        .run(&dist, &["inspect", "def", "//pkg:img"])
+        .expect("run");
+
+    // A non-unwinding abort leaves no exit code (killed by SIGABRT) and prints
+    // the panic banner. Either is the failure this test exists to catch.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.code().is_some(),
+        "heph was killed by a signal — the plugin panicked across the ABI seam: {}",
+        describe(&out)
+    );
+    assert!(
+        !combined.contains("panic in a function that cannot unwind")
+            && !combined.contains("there is no reactor running"),
+        "plugin `parse` touched the reactor on the host's poll: {}",
+        describe(&out)
+    );
+
+    // With a builder present the def resolves; without one the probe fails and
+    // heph says so. Both are a working seam — an abort is not.
+    assert!(
+        out.status.success() || combined.contains("docker"),
+        "expected a def or a docker-shaped failure, got: {}",
+        describe(&out)
+    );
+}

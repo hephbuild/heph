@@ -250,10 +250,25 @@ fn host_item_stream(items: Vec<Vec<u8>>) -> DynItemStream {
     }))
 }
 
-/// Drain a bidi `run` response stream to its terminal result. Blocking (called on a
-/// blocking task) because the stream's `next` blocks on subprocess output. stdout/
-/// stderr chunks are reserved — routed to host stdio once live streaming is wired.
-fn drain_run(stream: DynItemStream) -> anyhow::Result<ManagedRunResponse> {
+/// Which of the target's two streams a forwarded chunk belongs to.
+enum Chunk {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+/// Drain a bidi `run` response stream to its terminal result, forwarding the
+/// driver's stdout/stderr chunks to `chunks` as they arrive. Blocking (called on
+/// a dedicated thread) because the stream's `next` blocks on subprocess output.
+///
+/// The chunks go out on a channel rather than being written here: the caller
+/// owns the target's stdio sinks, which are async and borrowed from the run
+/// request. Forwarding them as they arrive rather than at the end is the whole
+/// point — a `docker buildx build` or a `go build` should print while it runs,
+/// not in one burst after it finishes.
+fn drain_run(
+    stream: DynItemStream,
+    chunks: &tokio::sync::mpsc::UnboundedSender<Chunk>,
+) -> anyhow::Result<ManagedRunResponse> {
     loop {
         let bytes = stream.next();
         if bytes.is_empty() {
@@ -270,8 +285,15 @@ fn drain_run(stream: DynItemStream) -> anyhow::Result<ManagedRunResponse> {
                 });
             }
             Some(pb::run_out_frame::Msg::Error(e)) => anyhow::bail!("{e}"),
-            // stdout/stderr chunks: not yet surfaced; ignore and keep draining.
-            _ => {}
+            // A dropped receiver means the caller stopped reading; keep draining
+            // so the run still reaches its result.
+            Some(pb::run_out_frame::Msg::StdoutChunk(b)) => {
+                drop(chunks.send(Chunk::Stdout(b.to_vec())));
+            }
+            Some(pb::run_out_frame::Msg::StderrChunk(b)) => {
+                drop(chunks.send(Chunk::Stderr(b.to_vec())));
+            }
+            None => {}
         }
     }
 }
@@ -685,7 +707,7 @@ impl ManagedDriver for StableRemoteManagedDriver {
 impl StableRemoteManagedDriver {
     async fn dispatch_run(
         &self,
-        req: ManagedRunRequest<'_, '_>,
+        mut req: ManagedRunRequest<'_, '_>,
         shell: bool,
         ct: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
@@ -719,11 +741,49 @@ impl StableRemoteManagedDriver {
         // a dedicated thread and bridge the result back — while watching `ct` so a
         // cancel trips the plugin's run token (which stops the subprocess).
         let (tx, rx) = futures::channel::oneshot::channel();
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<Chunk>();
         std::thread::spawn(move || {
             // Receiver dropped only if the caller gave up; ignore send failure.
-            drop(tx.send(drain_run(resp_stream)));
+            drop(tx.send(drain_run(resp_stream, &chunk_tx)));
         });
-        match await_with_cancel(ct, driver_cancel(&self.inner, &request_id), rx).await {
+
+        // Relay the driver's output to the target's own stdio while the run is
+        // still going. The sinks belong to the request, so this has to happen
+        // here rather than on the drain thread.
+        let mut stdout = req.request.stdout.take();
+        let mut stderr = req.request.stderr.take();
+        let pump = async {
+            use tokio::io::AsyncWriteExt as _;
+            while let Some(chunk) = chunk_rx.recv().await {
+                let (sink, bytes) = match chunk {
+                    Chunk::Stdout(b) => (stdout.as_deref_mut(), b),
+                    Chunk::Stderr(b) => (stderr.as_deref_mut(), b),
+                };
+                if let Some(w) = sink {
+                    drop(w.write_all(&bytes).await);
+                    drop(w.flush().await);
+                }
+            }
+            // The drain thread dropped its sender, so no more output is coming.
+            // Park rather than resolve: the run's terminal result is what ends
+            // the select below. `Infallible` says that in the type, so the
+            // select's other arm needs no unreachable branch.
+            std::future::pending::<std::convert::Infallible>().await
+        };
+
+        let result = {
+            futures::pin_mut!(pump);
+            let run = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), rx);
+            futures::pin_mut!(run);
+            // `pump` never completes; the run's terminal result ends the select.
+            match futures::future::select(run, pump).await {
+                futures::future::Either::Left((out, _)) => out,
+                // `pump` resolves to `Infallible`, so this arm is uninhabited:
+                // only the run's terminal result can win the select.
+                futures::future::Either::Right((never, _)) => match never {},
+            }
+        };
+        match result {
             Ok(result) => result,
             Err(_canceled) => anyhow::bail!("run drain thread dropped"),
         }

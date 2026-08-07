@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
+  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
 in
 {
   # https://devenv.sh/basics/
@@ -275,10 +275,11 @@ in
       cp "$src/heph_''${os}_''${arch}"                 "$dist/heph"
       cp "$src/heph-go-plugin_''${os}_''${arch}.$ext"  "$dist/heph-go-plugin.$ext"
       cp "$src/heph-gha-plugin_''${os}_''${arch}.$ext" "$dist/heph-gha-plugin.$ext"
+      cp "$src/heph-oci-plugin_''${os}_''${arch}.$ext" "$dist/heph-oci-plugin.$ext"
     else
-      # Local: build the same three artifacts the build job builds, the same way
-      # (one invocation so cargo overlaps the three LTO tails — see heph.yml).
-      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib
+      # Local: build the same artifacts the build job builds, the same way (one
+      # invocation so cargo overlaps their LTO tails — see heph.yml).
+      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib
       out="$CARGO_TARGET_DIR/release"
 
       # `release/` is shared across worktrees too, and cargo's build lock only
@@ -294,13 +295,14 @@ in
       fingerprint() {
         stat -c '%i %s %Y' "$@" 2>/dev/null || stat -f '%i %z %m' "$@"
       }
-      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext")"
+      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext")"
 
       cp "$out/heph"                       "$dist/heph"
       cp "$out/libplugin_go_cdylib.$ext"   "$dist/heph-go-plugin.$ext"
       cp "$out/libplugin_gha_cdylib.$ext"  "$dist/heph-gha-plugin.$ext"
+      cp "$out/libplugin_oci_cdylib.$ext"  "$dist/heph-oci-plugin.$ext"
 
-      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext")"
+      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext")"
       if [ "$before" != "$after" ]; then
         echo "e2e: $out changed while staging — another build (likely another" >&2
         echo "e2e: worktree sharing CARGO_TARGET_DIR) raced this one. Re-run." >&2
@@ -310,7 +312,7 @@ in
       if [ "$os" = "darwin" ]; then
         # Same post-processing the shipped macOS artifacts get, so a local run
         # tests the same bytes CI would publish.
-        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext"; do
+        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext"; do
           bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$f"
         done
       fi
