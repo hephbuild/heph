@@ -24,8 +24,9 @@
 //! M2 scope (the oxc-based resolver), not this milestone's.
 
 use anyhow::Context;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
+use crate::pluginjs::package_json::PackageManifest;
 use crate::pluginjs::workspace::PkgManager;
 
 /// One resolved node: an exact `(name, version)` with the bytes that make it
@@ -75,6 +76,119 @@ impl ResolvedGraph {
     pub fn get(&self, name: &str, version: &str) -> Option<&ResolvedPackage> {
         self.packages.get(&graph_key(name, version))
     }
+
+    /// BFS outward from `seed_keys` (graph keys already known to be reachable
+    /// — e.g. a consumer's own direct dependencies, resolved), mapping every
+    /// reachable package's name to its resolved version.
+    ///
+    /// Deterministic given a deterministic seed order: each
+    /// `ResolvedPackage::dependencies` is itself a `BTreeMap`, so sibling
+    /// edges are always walked in the same (sorted) order regardless of
+    /// process/host — a name reachable at more than one version keeps the
+    /// one first reached in that fixed BFS order (`entry().or_insert`),
+    /// never an arbitrary or ambient-filesystem-dependent pick.
+    pub fn transitive_reachable(
+        &self,
+        seed_keys: impl IntoIterator<Item = String>,
+    ) -> BTreeMap<String, String> {
+        let mut result: BTreeMap<String, String> = BTreeMap::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        for key in seed_keys {
+            if seen_keys.insert(key.clone()) {
+                queue.push_back(key);
+            }
+        }
+        while let Some(key) = queue.pop_front() {
+            let Some(pkg) = self.packages.get(&key) else {
+                continue;
+            };
+            result
+                .entry(pkg.name.clone())
+                .or_insert_with(|| pkg.version.clone());
+            for dep_key in pkg.dependencies.values() {
+                if seen_keys.insert(dep_key.clone()) {
+                    queue.push_back(dep_key.clone());
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Graph keys for `manifest`'s own direct dependencies
+/// (`dependencies`/`devDependencies`/`peerDependencies`; `dependencies`
+/// already folds in `optionalDependencies` — see [`PackageManifest`]),
+/// resolved through `lockfile`. The seed set [`resolve_transitive`] and
+/// [`crate::pluginjs::importgraph::transitive_declared_closure`] both BFS
+/// outward from — the two must use the same seeds, or a package one accepts
+/// could differ from what the other can wire an Input for.
+pub(crate) fn direct_dep_seed_keys(
+    lockfile: &Lockfile,
+    from_pkg: &str,
+    manifest: &PackageManifest,
+) -> anyhow::Result<Vec<String>> {
+    let names = manifest
+        .dependencies
+        .keys()
+        .chain(manifest.dev_dependencies.keys())
+        .chain(manifest.peer_dependencies.keys());
+    let mut keys = Vec::new();
+    for name in names {
+        if let Some(DepResolution::ThirdParty { name, version }) =
+            lockfile.resolve_dependency(from_pkg, name)?
+        {
+            keys.push(graph_key(&name, &version));
+        }
+    }
+    Ok(keys)
+}
+
+/// [`Lockfile::resolve_dependency`], with a transitive fallback for when the
+/// direct/importer-only lookup misses: BFS outward from `manifest`'s own
+/// direct dependencies (via [`direct_dep_seed_keys`] and
+/// [`ResolvedGraph::transitive_reachable`]) looking for `name`.
+///
+/// A package reached this way — e.g. `@eslint/js`, pulled in because a
+/// declared `devDependency` (`typescript-eslint`) depends on it — is fully
+/// determined by this already-hashed lockfile, not by ambient `node_modules`
+/// hoisting, so wiring an Input for it here is exactly as hermetic as wiring
+/// one for a direct dependency. This exists specifically so
+/// `deps::resolve_one_dependency`'s Input-wiring agrees with
+/// `importgraph::transitive_declared_closure`'s phantom-dependency check —
+/// a package the check accepts must always be one this can also resolve an
+/// addr for, or `Provider::get` would succeed while producing a `TargetDef`
+/// missing the Input the actual `tsc`/`vitest`/`esbuild` run needs, and
+/// whether that gap is later papered over by ambient `node_modules` (on a
+/// host where something happens to have installed it) becomes exactly the
+/// same-source-different-host non-determinism this whole subsystem exists
+/// to close.
+///
+/// Unlike the phantom check (which only asks "is `name` reachable at all"),
+/// this picks a specific *version* to wire an Input for — the module docs'
+/// M2-scope note applies here for real: a name resolved differently per
+/// peer context is folded onto one node, so the version picked is whichever
+/// one BFS reaches first (deterministic, see [`ResolvedGraph::transitive_reachable`]'s
+/// doc — never ambient or host-dependent), not necessarily "the" version if
+/// more than one is genuinely in the graph.
+pub fn resolve_transitive(
+    lockfile: &Lockfile,
+    resolved_graph: &ResolvedGraph,
+    from_pkg: &str,
+    manifest: &PackageManifest,
+    name: &str,
+) -> anyhow::Result<Option<DepResolution>> {
+    if let Some(direct) = lockfile.resolve_dependency(from_pkg, name)? {
+        return Ok(Some(direct));
+    }
+    let seed_keys = direct_dep_seed_keys(lockfile, from_pkg, manifest)?;
+    Ok(resolved_graph
+        .transitive_reachable(seed_keys)
+        .get(name)
+        .map(|version| DepResolution::ThirdParty {
+            name: name.to_string(),
+            version: version.clone(),
+        }))
 }
 
 /// What a package's declared dependency on `name` resolves to.
@@ -669,5 +783,113 @@ snapshots:
     fn lockfile_filename_matches_manager() {
         assert_eq!(Lockfile::filename(PkgManager::Npm), "package-lock.json");
         assert_eq!(Lockfile::filename(PkgManager::Pnpm), "pnpm-lock.yaml");
+    }
+
+    // ---- transitive resolution ----
+
+    fn transitive_manifest() -> PackageManifest {
+        PackageManifest {
+            name: "a".to_string(),
+            main: None,
+            dependencies: BTreeMap::new(),
+            dev_dependencies: [("typescript-eslint".to_string(), "^8.0.0".to_string())].into(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+        }
+    }
+
+    /// pnpm's strict, non-flat `node_modules` means the *direct* lookup
+    /// (`resolve_dependency`, `importers`-only by design — see the module
+    /// docs' "M1" note) never finds a name that isn't itself in `a`'s own
+    /// `importers` entry, unlike npm's ancestor-`node_modules` walk. This is
+    /// exactly the case `resolve_transitive` exists to cover on pnpm.
+    fn pnpm_transitive_fixture() -> &'static str {
+        r#"
+lockfileVersion: '9.0'
+importers:
+  packages/a:
+    devDependencies:
+      typescript-eslint:
+        specifier: ^8.0.0
+        version: 8.0.0
+packages:
+  typescript-eslint@8.0.0:
+    resolution: {integrity: sha512-abc}
+  '@eslint/js@9.0.0':
+    resolution: {integrity: sha512-def}
+  unrelated@1.0.0:
+    resolution: {integrity: sha512-ghi}
+snapshots:
+  typescript-eslint@8.0.0:
+    dependencies:
+      '@eslint/js': 9.0.0
+  '@eslint/js@9.0.0': {}
+  unrelated@1.0.0: {}
+"#
+    }
+
+    #[test]
+    fn pnpm_direct_lookup_does_not_see_a_transitive_name() {
+        let lock = Lockfile::parse(PkgManager::Pnpm, pnpm_transitive_fixture()).unwrap();
+        assert_eq!(
+            lock.resolve_dependency("packages/a", "@eslint/js").unwrap(),
+            None,
+            "pnpm's importers-only lookup must not find a name it never declared directly"
+        );
+    }
+
+    #[test]
+    fn resolve_transitive_finds_a_pnpm_companion_package() {
+        let lock = Lockfile::parse(PkgManager::Pnpm, pnpm_transitive_fixture()).unwrap();
+        let graph = lock.resolved_graph();
+        let manifest = transitive_manifest();
+        let got = resolve_transitive(&lock, &graph, "packages/a", &manifest, "@eslint/js")
+            .unwrap()
+            .expect("reachable through the declared typescript-eslint");
+        assert_eq!(
+            got,
+            DepResolution::ThirdParty {
+                name: "@eslint/js".to_string(),
+                version: "9.0.0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_transitive_does_not_find_an_unrelated_pnpm_package() {
+        let lock = Lockfile::parse(PkgManager::Pnpm, pnpm_transitive_fixture()).unwrap();
+        let graph = lock.resolved_graph();
+        let manifest = transitive_manifest();
+        assert_eq!(
+            resolve_transitive(&lock, &graph, "packages/a", &manifest, "unrelated").unwrap(),
+            None,
+            "a package with no edge from anything `a` declares is still a genuine phantom, \
+             not merely present somewhere in the lockfile"
+        );
+    }
+
+    #[test]
+    fn resolve_transitive_prefers_the_direct_lookup_when_it_hits() {
+        // npm's fixture already declares `lodash` directly from `packages/a`
+        // — the transitive fallback must not shadow that with some other
+        // resolution path; it only kicks in when the direct lookup misses.
+        let lock = Lockfile::parse(PkgManager::Npm, npm_fixture()).unwrap();
+        let graph = lock.resolved_graph();
+        let manifest = PackageManifest {
+            name: "a".to_string(),
+            main: None,
+            dependencies: [("lodash".to_string(), "^4.17.21".to_string())].into(),
+            dev_dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+        };
+        let got = resolve_transitive(&lock, &graph, "packages/a", &manifest, "lodash").unwrap();
+        assert_eq!(
+            got,
+            Some(DepResolution::ThirdParty {
+                name: "lodash".to_string(),
+                version: "4.17.21".to_string()
+            })
+        );
     }
 }

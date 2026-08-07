@@ -719,10 +719,14 @@ impl Provider {
     /// import graph (`importgraph::build_package_import_graph`, oxc-based —
     /// see that module and `resolvers.rs`) and cross-checks every resolved
     /// edge against the package's declared-dependency closure
-    /// (`importgraph::declared_closure`). M1's `package.json`-declaration
-    /// path above is still what maps a specifier to an addr; this is the
-    /// correctness check on top of it — a resolved-but-undeclared import is
-    /// a hermeticity violation and fails `Provider::get` loudly, per
+    /// (`importgraph::transitive_declared_closure`, which folds in the
+    /// direct `dependencies`/`devDependencies`/`peerDependencies`
+    /// `declared_closure` returns *plus* anything transitively reachable
+    /// through them per the lockfile — see that function's doc). M1's
+    /// `package.json`-declaration path above is still what maps a specifier
+    /// to an addr; this is the correctness check on top of it — a
+    /// resolved-but-undeclared-and-unreachable import is a hermeticity
+    /// violation and fails `Provider::get` loudly, per
     /// `ai-docs/js-plugin-plan.md`'s Hermeticity section. See
     /// `importgraph.rs` module docs for why an *unresolvable* specifier is
     /// deliberately not treated the same way.
@@ -756,7 +760,12 @@ impl Provider {
             // comment and `importgraph.rs` module docs. `graph` was already
             // built (and cached) by `Provider::import_graph` before this
             // closure was spawned.
-            let declared_closure = importgraph::declared_closure(&manifest);
+            let declared_closure = importgraph::transitive_declared_closure(
+                &manifest,
+                &pkg_str,
+                lockfile.as_deref(),
+                resolved_graph.as_deref(),
+            );
             importgraph::check_phantom_dependencies(
                 &workspace_root,
                 &pkg_str,
@@ -1163,8 +1172,13 @@ impl Provider {
             // not silently skip this.
             if visited_pkgs.insert(cur_pkg.clone()) {
                 hcore::blocking::run(enclose!(
-                    (workspace_root, cur_pkg, graph, manifest) move || -> anyhow::Result<()> {
-                        let declared = importgraph::declared_closure(&manifest);
+                    (workspace_root, cur_pkg, graph, manifest, lockfile, resolved_graph) move || -> anyhow::Result<()> {
+                        let declared = importgraph::transitive_declared_closure(
+                            &manifest,
+                            &cur_pkg,
+                            lockfile.as_deref(),
+                            resolved_graph.as_deref(),
+                        );
                         importgraph::check_phantom_dependencies(
                             &workspace_root,
                             &cur_pkg,
@@ -1869,7 +1883,8 @@ fn typecheck_deps_config(
     // `member_addrs_by_name`/the lockfile as genuinely declared, rather than
     // re-deriving that from scratch. `graph` is the caller-supplied,
     // `Provider::import_graph`-cached graph — see this function's doc.
-    let declared_closure = importgraph::declared_closure(&manifest);
+    let declared_closure =
+        importgraph::transitive_declared_closure(&manifest, pkg, lockfile, resolved_graph);
     importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
@@ -2236,7 +2251,8 @@ fn test_deps_config(
     // rationale `typecheck_deps_config` documents for its own identical call.
     // `graph` is the caller-supplied, `Provider::import_graph`-cached graph —
     // see this function's doc.
-    let declared_closure = importgraph::declared_closure(&manifest);
+    let declared_closure =
+        importgraph::transitive_declared_closure(&manifest, pkg, lockfile, resolved_graph);
     importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
