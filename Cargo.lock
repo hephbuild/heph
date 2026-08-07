@@ -336,12 +336,6 @@ dependencies = [
 
 [[package]]
 name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
-
-[[package]]
-name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -482,7 +476,7 @@ version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9d0a013e3d3ee4edd61e779adf117944c08902d375f18630a0c5b8f95659734"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bollard-stubs",
  "bytes",
  "futures-core",
@@ -1411,7 +1405,7 @@ version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29547a1dc60885a552306986316bc9701ba120c1a8db6769fa68691529ad373d"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "serde",
  "serde_json",
 ]
@@ -2053,7 +2047,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f54aab44c16b8463ae11b165a87c3d484780231f157bb1ed65843d591beb5abd"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "chrono",
  "google-cloud-gax",
@@ -2111,7 +2105,7 @@ version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fccf98cfd5481a5f5a285181ab0c62123d7d47cd2bb7299448440649349e4e7"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "serde",
  "serde_json",
@@ -2460,7 +2454,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -2816,7 +2810,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64",
  "getrandom 0.2.17",
  "js-sys",
  "serde",
@@ -3587,7 +3581,7 @@ checksum = "d354792e39fa5f0009e47623cf8b15b099bf9a652fa55c6f817fe28ac84fea50"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "chrono",
  "crc-fast",
@@ -3841,11 +3835,11 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pbjson"
-version = "0.7.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e6349fa080353f4a597daffd05cb81572a9c031a6d4fff7e504947496fcc68"
+checksum = "e8edd1efdd8ab23ba9cb9ace3d9987a72663d5d7c9f74fa00b51d6213645cf6c"
 dependencies = [
- "base64 0.21.7",
+ "base64",
  "serde",
 ]
 
@@ -4189,7 +4183,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64",
  "core",
  "driver-support",
  "enclose",
@@ -5000,7 +4994,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -5465,7 +5459,7 @@ version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bs58",
  "chrono",
  "hex",
@@ -6178,7 +6172,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4676b37242ccbd1aabf56edb093a4827dc49086c0ffd764a5705899e0f35f8f7"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64",
  "bitflags 2.13.1",
  "fancy-regex 0.11.0",
  "filedescriptor",
