@@ -148,6 +148,18 @@ runs:
     #
     # Skipped without credentials — a local-only kache needs no daemon, and the
     # matching drain step in each job tolerates one not running.
+    #
+    # The daemon is started here but drained *there*: every compiling job ends
+    # with its own `kache stats + drain uploads` step. That asymmetry is not a
+    # preference — `post:`/`post-if:` exist only for `runs.using: node20`
+    # JavaScript actions, and this is a composite one, so it has nowhere to hang
+    # a job-end hook. (Nesting a JS action here would work — `actions/cache`
+    # below does exactly that for its save — but it would be this repo's first
+    # JS action, and it would bury `kache stats` in a collapsed post group.)
+    #
+    # The cost of the per-job copies is that a new compiling job can forget one,
+    # and the symptom is silent: the cache still reads correctly, it just stops
+    # filling. If you add a job that compiles, add the drain step too.
     - name: Start kache daemon
       if: inputs.cargo-target != '' && inputs.r2-secret != ''
       shell: bash

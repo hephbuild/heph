@@ -361,23 +361,6 @@ jobs:
           rust-strip --strip-all $BIN_NAME
           bash scripts/patch-flavour.sh $BIN_NAME ""
 
-      # Also the upload barrier, which is why it is `always()` and why every
-      # compiling job needs one. The daemon uploads to R2 in the background so
-      # no rustc invocation waits on the network — but an ephemeral runner is
-      # torn down the moment the job ends, taking any queued upload with it.
-      # `daemon stop` drains the queue (up to 30s) before returning, so what
-      # this job compiled is actually published. Without it the cache still
-      # reads correctly, it just never fills.
-      #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
-      - name: kache stats + drain uploads
-        if: always()
-        shell: devenv shell bash -- -e {0}
-        run: |
-          kache stats
-          kache daemon stop || true
-
       # Runs wherever this runner can actually execute what it just built: the
       # darwin leg and the linux/amd64 leg both build for the runner's own
       # arch. linux/arm64 cross-compiles on an amd64 runner (see the zigbuild
@@ -444,6 +427,17 @@ jobs:
         with:
           name: ${{steps.build.outputs.plugin_oci_name}}
           path: ${{steps.build.outputs.plugin_oci_name}}
+
+      # Last, deliberately. This is the only job with steps after its compile,
+      # and the drain must not sit in front of them: it would still be correct
+      # today (nothing after `Build` compiles) but only by accident, and a
+      # compiling step appended later would silently stop being published.
+      - name: kache stats + drain uploads
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: |
+          kache stats
+          kache daemon stop || true
 
   upload_artifacts:
     name: Pre-release
