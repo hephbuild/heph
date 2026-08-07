@@ -12,6 +12,26 @@
 //! archive with uncompressed layers first (see
 //! [`super::archive::write_docker_archive`]).
 //!
+//! # Tagging
+//!
+//! With no `tag`, the image is tagged by **content**: the image target's address
+//! as the repository, this load's input hash as the tag.
+//!
+//! ```console
+//! $ heph run //app:load
+//! app_img:9f2c4e1b7a0d3856
+//! ```
+//!
+//! A default is possible here at all because the useful property is not a name,
+//! it is *which image is this*. A tag written in a BUILD file is a moving
+//! target — it says which image was loaded last, so two branches, two people, or
+//! a rebuild after a change all collide on it and `docker run app:dev` silently
+//! runs the wrong thing. The derived one cannot: it changes when and only when
+//! the image changes, two people on the same commit get the same string, and it
+//! can be predicted from the graph rather than read out of a log.
+//!
+//! `tag` overrides it, for when a human has to type something.
+//!
 //! A daemon tag holds one image, so loading a **multi-platform** archive means
 //! choosing an instance: `platform` (default Linux on the host's architecture).
 //! The selection happens here, while assembling the archive, rather than being
@@ -47,11 +67,23 @@ struct OciLoadSpec {
     /// archive output (group `""`) is consumed.
     #[spec(required)]
     image: String,
-    /// Local tag to give the loaded image, e.g. `app:dev`. Required: a daemon
-    /// image is named by its tag, and an untagged load leaves a dangling
-    /// `<none>:<none>` the user cannot run.
-    #[spec(required)]
-    tag: String,
+    /// Local tag to give the loaded image, e.g. `app:dev`.
+    ///
+    /// Optional. Left unset, the tag is derived from the image target and this
+    /// load's input hash:
+    ///
+    /// ```console
+    /// $ heph run //app:load
+    /// app_img:9f2c4e1b7a0d3856
+    /// ```
+    ///
+    /// The derived one is what anything automated wants: it names exactly what
+    /// was built, it changes when and only when the image changes, and two
+    /// people running the same commit get the same string. A name written here
+    /// can do none of that — it says which image was loaded *last*, not which
+    /// one is which — so set it only when a human has to type it.
+    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
+    tag: Option<String>,
     /// Which instance to load out of a **multi-platform** archive, as `os/arch`
     /// (e.g. `linux/amd64`). Defaults to Linux on the host's architecture.
     ///
@@ -68,7 +100,17 @@ struct OciLoadSpec {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciLoadDef {
-    tag: String,
+    /// The tag the BUILD file asked for. `None` derives one from `repo` and the
+    /// input hash at run time.
+    tag: Option<String>,
+    /// Docker repository name derived from the **image** target's address —
+    /// `//cmd/server:img` becomes `cmd_server_img`.
+    ///
+    /// The image target's, not this load target's: the repository names what
+    /// you are about to run, and nobody names their load target after the image
+    /// it loads. Resolved at parse so a name that cannot be made into a legal
+    /// repository is a BUILD-file error, not a surprise from the daemon.
+    repo: String,
     /// The `os/arch` instance taken out of the archive — always concrete, never
     /// "whatever the host is": a multi-arch archive has no `darwin` instance to
     /// match on macOS.
@@ -79,14 +121,86 @@ struct OciLoadDef {
 /// GOOS/GOARCH.
 /// v3: loaded through the daemon API, converting to a docker-format archive on
 /// the way in; `tool` and `format` are gone, so neither is in the key.
-const OCI_LOAD_FORMAT_VERSION: u32 = 3;
+/// v4: `tag` is optional and defaults to a content-addressed name, so the
+/// derived repository is part of the def.
+const OCI_LOAD_FORMAT_VERSION: u32 = 4;
 
 impl Hash for OciLoadDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         OCI_LOAD_FORMAT_VERSION.hash(state);
         self.tag.hash(state);
+        self.repo.hash(state);
         self.platform.hash(state);
     }
+}
+
+/// A docker repository name derived from a target address.
+///
+/// `//cmd/server:img` becomes `cmd_server_img`; `//app:img@v=linux_amd64`
+/// becomes `app_img-v-linux-amd64`, so two variants of one target do not land
+/// on one name.
+///
+/// **One component, joined by `_`** rather than a `/`-separated path. A
+/// multi-component name invites docker to read the first one as a *registry
+/// host* — it does exactly that whenever that component holds a `.` or a `:` —
+/// so `example.com/svc/img` turns `docker run` into a network pull from a
+/// registry that does not exist. A single component can never be read that way,
+/// and it keeps `docker images` one flat row per target.
+///
+/// The reference grammar is narrow — a component is
+/// `[a-z0-9]+([._]|__|[-]+[a-z0-9]+)*` — and a heph address is not, so every
+/// character outside `[a-z0-9]` becomes `-` and each address segment is trimmed
+/// of leading and trailing dashes before being joined. `_` therefore only ever
+/// appears as this function's own separator, one at a time, between non-empty
+/// segments: never the `___` run the grammar rejects.
+fn docker_repo(addr: &hmodel::htaddr::Addr) -> anyhow::Result<String> {
+    fn component(raw: &str) -> String {
+        let mapped: String = raw
+            .chars()
+            .map(|c| {
+                let c = c.to_ascii_lowercase();
+                if c.is_ascii_alphanumeric() { c } else { '-' }
+            })
+            .collect();
+        mapped.trim_matches('-').to_string()
+    }
+
+    let mut parts: Vec<String> = addr
+        .package
+        .as_str()
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(component)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Variants are different images and must not share a repository: the tag
+    // distinguishes them by hash, but `docker images` would show two rows under
+    // one name with nothing to tell them apart.
+    let mut name = component(&addr.name);
+    for (k, v) in &addr.args {
+        name.push('-');
+        name.push_str(&component(k));
+        name.push('-');
+        name.push_str(&component(v));
+    }
+    anyhow::ensure!(
+        !name.is_empty(),
+        "the image target's name {:?} has no character a docker repository name can hold \
+         (it takes `a-z0-9`); give `oci_load` an explicit `tag`",
+        addr.name
+    );
+    parts.push(name);
+
+    let repo = parts.join("_");
+    // The one name docker reads as a registry host without needing a `.` or a
+    // `:`. Only reachable from a root-package target literally called
+    // `localhost`, but the failure — `docker run` going to the network instead
+    // of the image just loaded — is bad enough to be worth two lines.
+    if repo == "localhost" {
+        return Ok("heph_localhost".to_string());
+    }
+    Ok(repo)
 }
 
 /// Connect to the daemon the docker CLI would use.
@@ -188,6 +302,7 @@ impl ManagedDriver for Driver {
 
         let def = OciLoadDef {
             tag: spec.tag,
+            repo: docker_repo(&image_ref.r#ref)?,
             platform,
         };
         let hash = {
@@ -244,13 +359,21 @@ impl ManagedDriver for Driver {
         // handing the daemon a manifest list it may or may not understand.
         let (manifest, manifest_digest) = super::select_platform(&layout, &def.platform)?;
 
+        // Unset, the tag is derived: what was built, and nothing about when.
+        // `hashin` is only known here — the engine computes it after `parse` —
+        // so this is materialized at run time rather than carried in the def.
+        let image = def
+            .tag
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", def.repo, req.request.hashin));
+
         let docker_tar = req.sandbox_dir.join("oci-load-docker.tar");
         super::archive::write_docker_archive(
             &docker_tar,
             &layout,
             &manifest,
             &manifest_digest,
-            &def.tag,
+            &image,
         )
         .context("convert the image to a docker-format archive")?;
 
@@ -290,10 +413,8 @@ impl ManagedDriver for Driver {
         // both an `index.json` and a `manifest.json` in the archive, a
         // containerd-backed daemon takes the OCI path and ignores RepoTags,
         // leaving a `<none>:<none>` image the user cannot run.
-        let (repo, tag) = def
-            .tag
-            .rsplit_once(':')
-            .unwrap_or((def.tag.as_str(), "latest"));
+        //
+        let (repo, tag) = image.rsplit_once(':').unwrap_or((image.as_str(), "latest"));
         docker
             .tag_image(
                 &loaded,
@@ -303,9 +424,11 @@ impl ManagedDriver for Driver {
                 }),
             )
             .await
-            .with_context(|| format!("tag the loaded image as {}", def.tag))?;
+            .with_context(|| format!("tag the loaded image as {image}"))?;
 
-        tracing::info!(tag = def.tag, platform = def.platform, "oci_load: loaded");
+        // Logged, not printed: stdout belongs to the TUI. This is the line that
+        // tells the user what to `docker run`.
+        tracing::info!(image, platform = def.platform, "oci_load: loaded");
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
@@ -375,6 +498,114 @@ mod tests {
         let a = parse("//app:load", base("linux/amd64")).await;
         let b = parse("//app:load", base("linux/arm64")).await;
         assert_ne!(a.target_def.hash, b.target_def.hash);
+    }
+
+    /// A repository name is built out of the *image* target's address, and the
+    /// grammar it has to fit is much narrower than an address: lowercase
+    /// alphanumerics and a few separators, per path component.
+    #[test]
+    fn repositories_are_derived_from_the_image_address() {
+        let repo = |a: &str| docker_repo(&parse_addr(a).expect("addr")).expect("repo");
+
+        assert_eq!(repo("//cmd/server:img"), "cmd_server_img");
+        assert_eq!(repo("//:img"), "img");
+        // Uppercase and underscores are not in the grammar.
+        assert_eq!(repo("//Cmd/My_Server:Img"), "cmd_my-server_img");
+
+        // A single component can never be read as a registry host — which is
+        // the reason for joining with `_` rather than keeping the `/` path. A
+        // `.` in the first component of a *path* makes docker treat it as a
+        // hostname and `docker run` goes to the network.
+        assert_eq!(repo("//example.com/svc:img"), "example-com_svc_img");
+        // `localhost` is a host by name alone, but only when it is the whole
+        // first component — which after joining it no longer is.
+        assert_eq!(repo("//localhost:img"), "localhost_img");
+        assert_eq!(repo("//:localhost"), "heph_localhost");
+
+        // `_` is this function's separator and appears one at a time: the
+        // grammar allows `_` and `__` between alphanumerics but not `___`.
+        assert!(
+            !repo("//a/_/b:_c_").contains("___"),
+            "a run of three underscores is not a legal repository name"
+        );
+    }
+
+    /// Two variants of one target are two different images. They must not share
+    /// a repository, or `docker images` shows two rows under one name with
+    /// nothing to tell them apart.
+    #[test]
+    fn variants_get_their_own_repository() {
+        let repo = |a: &str| docker_repo(&parse_addr(a).expect("addr")).expect("repo");
+        assert_eq!(repo("//app:img@v=linux_amd64"), "app_img-v-linux-amd64");
+        assert_ne!(
+            repo("//app:img@v=linux_amd64"),
+            repo("//app:img@v=linux_arm64")
+        );
+    }
+
+    /// A name with nothing a repository can hold fails in `parse`, naming the
+    /// way out — not later, from the daemon, as a reference-format error.
+    #[test]
+    fn an_unrepresentable_name_is_a_build_file_error() {
+        let addr = parse_addr("//app:___").expect("addr");
+        let err = format!("{:#}", docker_repo(&addr).expect_err("unrepresentable"));
+        assert!(err.contains("explicit `tag`"), "got: {err}");
+    }
+
+    /// `tag` is optional now: one is derived, so an `oci_load` without it is a
+    /// complete target rather than one that leaves a dangling `<none>:<none>`.
+    #[tokio::test]
+    async fn parse_needs_no_tag() {
+        let resp = parse(
+            "//app:load",
+            cfg(&[("image", Value::String(":img".to_string()))]),
+        )
+        .await;
+        let def = resp.target_def.def::<OciLoadDef>();
+        assert_eq!(
+            def.repo, "app_img",
+            "the repo follows the image, not the load"
+        );
+        assert!(def.tag.is_none());
+    }
+
+    /// The tag is part of the def: naming the image differently is a different
+    /// action, and `oci_load` is uncached precisely because its effect is on the
+    /// daemon.
+    #[tokio::test]
+    async fn an_extra_tag_changes_the_def() {
+        let bare = parse(
+            "//app:load",
+            cfg(&[("image", Value::String(":img".to_string()))]),
+        )
+        .await;
+        let tagged = parse(
+            "//app:load",
+            cfg(&[
+                ("image", Value::String(":img".to_string())),
+                ("tag", Value::String("app:dev".to_string())),
+            ]),
+        )
+        .await;
+        assert_ne!(bare.target_def.hash, tagged.target_def.hash);
+    }
+
+    /// Two load targets pointing at *different* images must not tag one
+    /// repository — the whole point is that the name says what it is.
+    #[tokio::test]
+    async fn the_repo_follows_which_image_is_loaded() {
+        let a = parse(
+            "//app:load",
+            cfg(&[("image", Value::String("//svc/api:img".to_string()))]),
+        )
+        .await;
+        let b = parse(
+            "//app:load",
+            cfg(&[("image", Value::String("//svc/web:img".to_string()))]),
+        )
+        .await;
+        assert_eq!(a.target_def.def::<OciLoadDef>().repo, "svc_api_img");
+        assert_eq!(b.target_def.def::<OciLoadDef>().repo, "svc_web_img");
     }
 
     /// Handing skopeo the `digest` group would give it a text file where it
