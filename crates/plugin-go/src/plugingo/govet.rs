@@ -9,7 +9,7 @@
 //!   synthesizes ([`build_spec`]) on the built-in `http_fetch` driver: it
 //!   downloads the `heph-govet_<goos>_<goarch>` asset published in heph release
 //!   `<tag>` and verifies its SHA-256. `<tag>` is the release this plugin itself
-//!   was built from ([`hcore::version::VERSION`]) — the CI run that built the
+//!   was built from ([`hcore::version::current`]) — the CI run that built the
 //!   plugin published the binary, so the two always agree. Consumers of the go
 //!   plugin need nothing checked in: they have no `tools/heph-govet` to build.
 //!
@@ -42,10 +42,15 @@ use crate::plugingo::factors::{current_goarch, current_goos};
 #[cfg(test)]
 use hmodel::htpkg::PkgBuf;
 
-/// The dev-build version stamped into [`hcore::version::VERSION`] when
-/// `HEPH_BUILD_VERSION` is unset. No release carries this tag, so a dev build has
-/// no `heph-govet` asset to download and must point `govet` at a source build.
-const DEV_VERSION: &str = "v0.0.0-dev";
+/// The dev-build version [`hcore::version::current`] reports when CI never
+/// stamped this artifact's version slot. No release carries this tag, so a dev
+/// build has no `heph-govet` asset to download and must point `govet` at a
+/// source build.
+///
+/// Taken from `hcore` rather than spelled again: `current()` falls back to this
+/// exact string, and a local copy that drifted from it would send a dev build
+/// hunting for a release asset that does not exist.
+use hcore::version::DEV_VERSION;
 
 /// Base URL of the published release artifacts (the same release the heph binary
 /// and the plugin cdylibs ship in).
@@ -69,7 +74,7 @@ pub const GOVET_NAME: &str = "heph-govet";
 /// the dev target fails with that fix in the message (see [`is_dev_tag`]) rather
 /// than 404-ing mid-build.
 pub fn default_addr() -> String {
-    format!("//{}:{GOVET_NAME}", govet_pkg(hcore::version::VERSION))
+    format!("//{}:{GOVET_NAME}", govet_pkg(hcore::version::current()))
 }
 
 /// Whether `tag` is the dev-build version — a release that was never published, so
@@ -260,7 +265,7 @@ mod tests {
         assert_eq!(addr.name, GOVET_NAME);
         assert_eq!(
             tag_from_pkg(addr.package.as_str()),
-            Some(hcore::version::VERSION)
+            Some(hcore::version::current())
         );
         // The test binary is never built from a release, so the default addr is
         // the (nonexistent) dev tag — resolving it must surface that, not 404.

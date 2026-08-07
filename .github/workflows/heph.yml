@@ -250,7 +250,6 @@ jobs:
         env:
           CARGO_TARGET_DIR: "./target"
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
-          HEPH_BUILD_VERSION: "${{needs.gen.outputs.version}}"
           # Checksums of the heph-govet assets this same run publishes. Baked into
           # the go plugin so it verifies the binary it downloads at build time
           # (see crates/plugin-go/src/plugingo/govet.rs). All platforms are baked
@@ -340,12 +339,36 @@ jobs:
           cp "$gha_lib" $PLUGIN_GHA_NAME
           cp "$oci_lib" $PLUGIN_OCI_NAME
 
+          # The build version, stamped into every artifact below rather than
+          # compiled in. Deliberately a plain shell variable and NOT exported:
+          # it must not be visible to rustc. kache keys a compile on the
+          # `option_env!` values rustc reports, and this string folds in
+          # `git describe` and the run number — so exporting it and reading it
+          # back at compile time is what used to invalidate `core`, and with it
+          # every first-party crate and link above it, on every single push.
+          # See `VERSION_SLOT_LEN` in crates/core/src/version.rs.
+          VERSION='${{needs.gen.outputs.version}}'
+
+          # Every shipped artifact gets the version, not just `heph`: they all
+          # link `hcore`, so they all carry the slot, and an unstamped one
+          # reports `v0.0.0-dev` — which self-upgrade reads as "this is a dev
+          # build, never upgrade". The go plugin additionally derives its
+          # default govet target address from the version, so a dev-stamped
+          # cdylib would resolve the wrong address at runtime.
+          for artifact in \
+            $BENCH_BIN_NAME $PLUGIN_GO_NAME $PLUGIN_GHA_NAME $PLUGIN_OCI_NAME
+          do
+            bash scripts/patch-slot.sh "$artifact" "version=$VERSION"
+          done
+
           # `heph` diverges into its two flavours from here — each stamped by
-          # `patch-flavour.sh` with which one it is (`heph version` / self-upgrade
+          # `patch-slot.sh` with which one it is (`heph version` / self-upgrade
           # read that back via `hcore::version::flavour()`), since nothing at
           # compile time can tell them apart (see the comment above `OUT/heph`).
+          # Both slots in one call so macOS is re-signed once, after the last
+          # write, rather than once per slot.
           cp "$OUT/heph" $DEBUG_BIN_NAME
-          bash scripts/patch-flavour.sh $DEBUG_BIN_NAME debug
+          bash scripts/patch-slot.sh $DEBUG_BIN_NAME "version=$VERSION" flavour=debug
 
           # "std" flavour: strip a copy of the same compiled `heph` — no second
           # compile. `rust-strip` (cargo-binutils' wrapper around the
@@ -357,9 +380,14 @@ jobs:
           # was tried first — already in this shell for zigbuild — but its
           # `--strip-all` hit an unimplemented code path on real release
           # output (verified in CI, not just locally).
+          #
+          # Stamped *after* stripping, not before: `rust-strip` rewrites the
+          # file, and the slots are ordinary `.rodata` that survive it — but
+          # patching first would mean re-signing first, and stripping would then
+          # invalidate that signature again on darwin.
           cp "$OUT/heph" $BIN_NAME
           rust-strip --strip-all $BIN_NAME
-          bash scripts/patch-flavour.sh $BIN_NAME ""
+          bash scripts/patch-slot.sh $BIN_NAME "version=$VERSION" flavour=
 
       # Runs wherever this runner can actually execute what it just built: the
       # darwin leg and the linux/amd64 leg both build for the runner's own
@@ -374,7 +402,7 @@ jobs:
         run: |
           ./$BIN_NAME version
           ./$BENCH_BIN_NAME --help
-          # Both flavours launch, and each reports the flavour patch-flavour.sh
+          # Both flavours launch, and each reports the flavour patch-slot.sh
           # actually stamped — not just that the binary runs at all. The
           # baked-in version already carries its own build metadata (a commit
           # hash), so check for the debug flavour marker specifically, not
@@ -387,10 +415,30 @@ jobs:
           echo "debug: $debug_version"
           case "$std_version" in *+debug|*.debug) echo "std flavour must not report the debug flavour: $std_version" >&2; exit 1 ;; esac
           case "$debug_version" in *+debug|*.debug) ;; *) echo "debug flavour did not report itself: $debug_version" >&2; exit 1 ;; esac
+
+          # The version slot actually took. This is the failure the slot
+          # mechanism introduces and nothing else would catch: the version is no
+          # longer compiled in, so if `patch-slot.sh` were dropped, silently
+          # matched nothing, or ran before a step that rewrites the file, every
+          # artifact would still build, still launch, still pass every other
+          # check — and ship reporting `v0.0.0-dev`, which self-upgrade treats as
+          # a dev build and never upgrades. Assert the real version instead.
+          for reported in "$std_version" "$debug_version"; do
+            case "$reported" in
+              *v0.0.0-dev*)
+                echo "version slot was never stamped — reports the dev sentinel: $reported" >&2
+                exit 1 ;;
+            esac
+          done
+          case "$std_version" in
+            *"$EXPECTED_VERSION"*) ;;
+            *) echo "expected version '$EXPECTED_VERSION', got: $std_version" >&2; exit 1 ;;
+          esac
         env:
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
           BENCH_BIN_NAME: "heph-bench_${{ matrix.os }}_${{ matrix.arch }}"
           DEBUG_BIN_NAME: "heph_debug_${{ matrix.os }}_${{ matrix.arch }}"
+          EXPECTED_VERSION: "${{needs.gen.outputs.version}}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6

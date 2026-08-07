@@ -70,7 +70,7 @@ in
     pkgs.tokio-console
     kache
     # `rust-objcopy`/`rust-strip` (wraps the `llvm-tools` component's
-    # llvm-objcopy, below) — used by `scripts/patch-flavour.sh`'s CI caller to
+    # llvm-objcopy, below) — used by `scripts/patch-slot.sh`'s CI caller to
     # derive the "std" release flavour's stripped binary. LLVM-based and
     # target-agnostic, unlike host binutils `strip`: the Linux arm64 leg
     # cross-compiles on an amd64 runner (see the zigbuild comment in
@@ -80,6 +80,12 @@ in
     # code paths on real release-profile output; cargo-binutils' llvm-objcopy
     # is the mature tool for this.)
     pkgs.cargo-binutils
+    # `scripts/patch-slot.sh` stamps the version/flavour slots with it. Pinned
+    # here rather than taken from the host: CI ran it on whatever python the
+    # runner image happened to ship, and the local `e2e` path now runs the same
+    # patch (see `scripts.e2e`), where a machine without an interpreter — a Mac
+    # with no Xcode CLT, say — would otherwise fail to stage artifacts at all.
+    pkgs.python3
     # pkg-config + libfuse for the `fuse-sandbox` feature.
     # - Linux: `fuse3` ships headers/pc files fuser links against.
     # - macOS: `macfuse-stubs` provides the build-time `osxfuse.pc` per
@@ -392,6 +398,21 @@ in
           bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$f"
         done
       fi
+
+      # Stamp the version slot, for the same reason as the macOS step above:
+      # the shipped artifacts get this patch (see the `build` job in
+      # .github/workflows/heph.yml), so a local run must too. The version is no
+      # longer compiled in, so without this a locally staged binary reports
+      # `v0.0.0-dev` — and `crates/bin-e2e`'s assertion that a shipped artifact
+      # is never the dev sentinel would fail locally while passing in CI, which
+      # is the exact CI-vs-local split that assertion exists to prevent.
+      #
+      # After macos-portable.sh, not before: both re-sign, and this one must
+      # have the last word or the signature covers pre-patch bytes.
+      version="$(bash "$DEVENV_ROOT/.github/workflows/version.sh")"
+      for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext"; do
+        bash "$DEVENV_ROOT/scripts/patch-slot.sh" "$f" "version=$version"
+      done
     fi
 
     # download-artifact does not preserve the executable bit.

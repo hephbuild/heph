@@ -44,7 +44,7 @@ fn shipped_binary_launches_outside_a_workspace() {
     // `dist/heph` is always the "std" release flavour (the `e2e` script only
     // ever stages the exact `heph_<os>_<arch>` name, never a flavoured one —
     // see devenv.nix). Its `version_flavour` slot must have been patched
-    // empty by `scripts/patch-flavour.sh`, not left as "debug" or the
+    // empty by `scripts/patch-slot.sh`, not left as "debug" or the
     // unpatched marker — a compile-only (in-process) test can't catch this,
     // since it never runs the patch/strip pipeline the shipped binary went
     // through. The baked-in version already carries its own build metadata (a
@@ -57,6 +57,28 @@ fn shipped_binary_launches_outside_a_workspace() {
         "std flavour must not report the debug flavour: {}",
         describe(&out)
     );
+
+    // The version slot took as well. Same reason this test exists for the
+    // flavour, and now load-bearing for the version too: it is no longer
+    // compiled in, so a `patch-slot.sh` that was dropped from the pipeline, or
+    // that matched nothing, yields an artifact which builds, launches and
+    // prints a version — just the dev sentinel. An in-process test cannot see
+    // it, because it never runs the patch/strip pipeline at all. A shipped
+    // binary reporting `v0.0.0-dev` silently never self-upgrades, and makes the
+    // go plugin resolve a govet target address no release publishes.
+    assert!(
+        !trimmed.contains(hcore_dev_version()),
+        "shipped binary reports the unstamped dev version — the version slot \
+         was never patched: {}",
+        describe(&out)
+    );
+}
+
+/// `hcore::version::DEV_VERSION`, spelled out rather than imported: `bin-e2e`
+/// deliberately links no workspace crate, so that it tests the shipped
+/// artifacts rather than this source tree (see `.claude/testing.md`).
+fn hcore_dev_version() -> &'static str {
+    "v0.0.0-dev"
 }
 
 /// A target that exits non-zero must make `heph` exit non-zero. The mapping

@@ -65,9 +65,13 @@ pub enum SelfUpgradeError {
 /// flavour, e.g. `debug`) binaries under `<base>/<tag>/`.
 const ARTIFACTS_BASE: &str = "https://github.com/hephbuild/heph-artifacts-v1/releases/download";
 
-/// The dev-build sentinel stamped when `HEPH_BUILD_VERSION` is unset. Never
+/// The dev-build sentinel an artifact CI never stamped reports. Never
 /// self-upgrades — a local/dev binary stays in charge.
-const DEV_VERSION: &str = "v0.0.0-dev";
+///
+/// Re-exported from `hcore` rather than spelled again here: the same string is
+/// what `version::current()` falls back to for an unpatched version slot, and
+/// two independent copies would drift into a dev binary that self-upgrades.
+use hcore::version::DEV_VERSION;
 
 /// Set to any non-empty value to disable self-upgrade for the whole process tree.
 pub const DISABLE_ENV: &str = "HEPH_NO_SELF_UPDATE";
@@ -104,7 +108,7 @@ pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
         return Ok(());
     }
 
-    let current = version::VERSION;
+    let current = version::current();
     // Not inside a heph workspace: no config, nothing to pin against. Surfaced as
     // a distinct error so the caller can tolerate it for `heph version`.
     let root = hconfig::get_root().map_err(|_e| SelfUpgradeError::NoConfig)?;
@@ -146,7 +150,7 @@ fn env_opts_out() -> bool {
     if std::env::var_os(DISABLE_ENV).is_some_and(|v| !v.is_empty()) {
         return true;
     }
-    version::VERSION == DEV_VERSION
+    version::current() == DEV_VERSION
 }
 
 /// Decide what to do given the running version+flavour and the configured

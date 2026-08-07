@@ -1,16 +1,104 @@
-pub const VERSION: &str = match option_env!("HEPH_BUILD_VERSION") {
-    Some(val) => val,
-    None => "v0.0.0-dev",
-};
+/// The version an unpatched artifact reports: a local `cargo build`, a test
+/// binary, or anything CI did not stamp. Also what `hselfupdate` compares
+/// against to recognise a dev build, so it lives here rather than being spelled
+/// twice.
+pub const DEV_VERSION: &str = "v0.0.0-dev";
+
+/// Width of the build-version slot CI patches into an already-compiled
+/// artifact (`scripts/patch-slot.sh`, run from the "Build" job in
+/// `.github/workflows/heph.yml`), the same mechanism [`FLAVOUR_SLOT_LEN`]
+/// documents for the release flavour.
+///
+/// This used to be `option_env!("HEPH_BUILD_VERSION")`, a compile-time
+/// constant. That made the version an *input to the compile*, and
+/// `version.sh` folds both `git describe` and the CI run number into it — so
+/// the string changed on every single push. `core` is at the bottom of the
+/// dependency graph, so that invalidated `core` and, transitively, every
+/// first-party crate plus the binary, cdylib and bench links above them.
+/// Measured on this workspace: changing only this env var recompiled 20 crates
+/// locally, and in CI it accounted for ~68% of the build job's compile time
+/// while third-party dependencies sat at a 95% cache hit rate. A build cache
+/// cannot help a graph whose root changes every commit.
+///
+/// Patching it post-build instead takes it out of the compile entirely: two
+/// commits that do not touch Rust source now produce byte-identical compile
+/// inputs and hit the cache, and CI stamps the real version into the finished
+/// artifact afterwards.
+const VERSION_SLOT_LEN: usize = 64;
+
+/// Distinctive marker the slot is initialized with, so the patch script can
+/// find (and verify the uniqueness of) it inside the compiled artifact. An
+/// unpatched slot still starts with this marker, which [`parse_version_slot`]
+/// reads back as [`DEV_VERSION`].
+const VERSION_SLOT_MARKER: &[u8] = b"HEPH_VERSION_SLOT_V1";
+
+const _: () = assert!(
+    VERSION_SLOT_MARKER.len() < VERSION_SLOT_LEN,
+    "the version slot marker must fit within the slot, with room for a nul"
+);
+
+#[expect(
+    clippy::indexing_slicing,
+    reason = "const-evaluated at compile time: `i` is loop-bounded by \
+              VERSION_SLOT_MARKER.len(), which a `const_assert` above keeps under \
+              VERSION_SLOT_LEN — an out-of-bounds index fails the build, it can't panic at runtime"
+)]
+const fn version_slot_init() -> [u8; VERSION_SLOT_LEN] {
+    let mut buf = [0u8; VERSION_SLOT_LEN];
+    let mut i = 0;
+    while i < VERSION_SLOT_MARKER.len() {
+        buf[i] = VERSION_SLOT_MARKER[i];
+        i += 1;
+    }
+    buf
+}
+
+#[used]
+static VERSION_SLOT: [u8; VERSION_SLOT_LEN] = version_slot_init();
+
+/// Read a version slot's content: [`DEV_VERSION`] if it is still the unpatched
+/// marker or is entirely zeroed, otherwise the bytes up to the first nul, as
+/// UTF-8. Split out from [`current`] so tests can exercise arbitrary slot
+/// contents without patching the actual compiled artifact.
+fn parse_version_slot(slot: &[u8; VERSION_SLOT_LEN]) -> &str {
+    if slot.starts_with(VERSION_SLOT_MARKER) {
+        return DEV_VERSION;
+    }
+    let end = slot.iter().position(|&b| b == 0).unwrap_or(slot.len());
+    match slot.get(..end).and_then(|s| std::str::from_utf8(s).ok()) {
+        // An all-zero slot is "stamped with nothing", which is not a version.
+        Some("") | None => DEV_VERSION,
+        Some(v) => v,
+    }
+}
+
+/// This artifact's build version, e.g. `v0.1.0-build.5.1464+g36e65abc`, or
+/// [`DEV_VERSION`] when it was never stamped. See [`VERSION_SLOT_LEN`] for why
+/// this is a post-build patch rather than a compile-time constant.
+///
+/// Cached in a `OnceLock` so the volatile read happens once and callers still
+/// get a `&'static str` — the slot bytes themselves cannot be borrowed for
+/// `'static` because [`std::ptr::read_volatile`] yields them by value (see
+/// [`flavour`] for why that volatile read is not optional).
+pub fn current() -> &'static str {
+    static CURRENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CURRENT.get_or_init(|| {
+        // SAFETY: `VERSION_SLOT` is a valid, always-initialized `'static`
+        // array; reading it by volatile load is always sound, it just forces an
+        // actual memory access instead of the compile-time-known value.
+        let slot = unsafe { std::ptr::read_volatile(&raw const VERSION_SLOT) };
+        parse_version_slot(&slot).to_string()
+    })
+}
 
 /// Width of the release-flavour slot CI patches into an already-compiled
-/// binary (`scripts/patch-flavour.sh`, run from the "Build" job in
+/// binary (`scripts/patch-slot.sh`, run from the "Build" job in
 /// `.github/workflows/heph.yml`) so `heph version` and self-upgrade
 /// (`hselfupdate`) can tell std and debug flavours apart without a second
 /// compile — both flavours of a release share one compile (see the
 /// strip-after-build note on `[profile.release]` in the root `Cargo.toml`), so
-/// a compile-time constant (`option_env!`, like [`VERSION`] above) would be
-/// identical for both and couldn't distinguish them. `strip` doesn't touch
+/// a compile-time constant would be identical for both and couldn't
+/// distinguish them. `strip` doesn't touch
 /// this slot: it's ordinary `.rodata`, not a debug section or a symbol-table
 /// entry.
 const FLAVOUR_SLOT_LEN: usize = 32;
@@ -72,7 +160,7 @@ fn parse_flavour_slot(slot: &[u8; FLAVOUR_SLOT_LEN]) -> &str {
 /// (thin LTO, `opt-level = 3`): a plain load of an immutable `static` with a
 /// fully known initializer is exactly what LLVM is entitled to (and does)
 /// constant-fold to that initializer, silently ignoring whatever
-/// `scripts/patch-flavour.sh` wrote into the compiled file afterward.
+/// `scripts/patch-slot.sh` wrote into the compiled file afterward.
 pub fn flavour() -> String {
     // SAFETY: `FLAVOUR_SLOT` is a valid, always-initialized `'static` array;
     // reading it by volatile load is always sound, it just forces an actual
@@ -81,25 +169,25 @@ pub fn flavour() -> String {
     parse_flavour_slot(&slot).to_string()
 }
 
-/// [`VERSION`] with the release flavour folded into semver build metadata
+/// [`current`] with the release flavour folded into semver build metadata
 /// when this binary was stamped with one — what `heph version` and
-/// diagnostic banners should show a human. [`VERSION`] itself stays plain:
+/// diagnostic banners should show a human. [`current`] itself stays plain:
 /// other consumers (self-upgrade's version-pin compare, the default govet
 /// target address, telemetry) need the bare tag, not a value that varies by
 /// flavour.
 ///
-/// CI's actual `HEPH_BUILD_VERSION` already carries build metadata (a commit
-/// hash, e.g. `v1.2.3+gcf0045d9`) — semver allows only one `+`, so the
-/// flavour joins the existing metadata with a `.` (`v1.2.3+gcf0045d9.debug`)
-/// rather than appending a second `+` (`v1.2.3+gcf0045d9+debug`, which isn't
-/// valid build metadata syntax).
+/// CI's stamped version already carries build metadata (a commit hash, e.g.
+/// `v1.2.3+gcf0045d9`) — semver allows only one `+`, so the flavour joins the
+/// existing metadata with a `.` (`v1.2.3+gcf0045d9.debug`) rather than
+/// appending a second `+` (`v1.2.3+gcf0045d9+debug`, which isn't valid build
+/// metadata syntax).
 pub fn reported() -> String {
-    fold_flavour_into_version(VERSION, &flavour())
+    fold_flavour_into_version(current(), &flavour())
 }
 
 /// The string-manipulation half of [`reported`], split out so it's testable
-/// against an arbitrary `version` — [`VERSION`] itself is fixed at compile
-/// time, so a test can't make it carry build metadata to exercise the merge.
+/// against an arbitrary `version` — [`current`] is fixed for any given
+/// artifact, so a test can't make it carry build metadata to exercise the merge.
 fn fold_flavour_into_version(version: &str, flavour: &str) -> String {
     if flavour.is_empty() {
         return version.to_string();
@@ -194,7 +282,7 @@ mod tests {
     #[test]
     fn parses_dev_default() {
         assert_eq!(
-            parse(VERSION),
+            parse(current()),
             Some(SemVer {
                 major: 0,
                 minor: 0,
@@ -229,9 +317,9 @@ mod tests {
 
     #[test]
     fn flavour_is_empty_when_never_patched() {
-        // Test binaries are never touched by `scripts/patch-flavour.sh`.
+        // Test binaries are never touched by `scripts/patch-slot.sh`.
         assert_eq!(flavour(), "");
-        assert_eq!(reported(), VERSION);
+        assert_eq!(reported(), current());
     }
 
     #[test]
@@ -263,6 +351,48 @@ mod tests {
     #[test]
     fn parse_flavour_slot_unpatched_marker_is_empty() {
         assert_eq!(parse_flavour_slot(&flavour_slot_init()), "");
+    }
+
+    #[test]
+    fn parse_version_slot_unpatched_marker_is_the_dev_sentinel() {
+        assert_eq!(parse_version_slot(&version_slot_init()), DEV_VERSION);
+    }
+
+    #[test]
+    fn parse_version_slot_reads_patched_value() {
+        let stamped = b"v1.2.3-build.4.567+gabcdef0";
+        let mut slot = [0u8; VERSION_SLOT_LEN];
+        slot[..stamped.len()].copy_from_slice(stamped);
+        assert_eq!(parse_version_slot(&slot), "v1.2.3-build.4.567+gabcdef0");
+    }
+
+    #[test]
+    fn parse_version_slot_all_zero_is_the_dev_sentinel() {
+        // An all-zero slot is not "version = empty string" — an empty version
+        // would parse as junk everywhere downstream and, worse, would not equal
+        // DEV_VERSION, so self-upgrade would treat an unstamped build as a real
+        // release and try to upgrade it.
+        assert_eq!(parse_version_slot(&[0u8; VERSION_SLOT_LEN]), DEV_VERSION);
+    }
+
+    #[test]
+    fn the_version_slot_holds_a_realistic_ci_version() {
+        // The slot is fixed-width and `patch-slot.sh` hard-fails if the value
+        // does not fit, which would break the release build rather than
+        // degrade quietly. `version.sh` produces `<tag>-build.<n>.<run>+g<sha>`;
+        // this pins that a plausible one still has room.
+        let realistic = "v10.20.30-build.1234.56789+gabcdef01";
+        assert!(
+            realistic.len() < VERSION_SLOT_LEN,
+            "{realistic} ({} bytes) must fit the {VERSION_SLOT_LEN}-byte slot",
+            realistic.len()
+        );
+    }
+
+    #[test]
+    fn an_unpatched_build_reports_the_dev_sentinel() {
+        // Test binaries are never touched by `scripts/patch-slot.sh`.
+        assert_eq!(current(), DEV_VERSION);
     }
 
     #[test]
