@@ -67,6 +67,12 @@ fn build() -> PluginComponents {
         name: pluginoci::layer::DRIVER_NAME.into(),
         driver: make_dyn_managed_driver(layer),
     });
+    // Groups per-platform images into one multi-platform image.
+    let index: Arc<dyn ManagedDriver> = Arc::new(pluginoci::index::Driver::new());
+    drivers.push(NamedDriver {
+        name: pluginoci::index::DRIVER_NAME.into(),
+        driver: make_dyn_managed_driver(index),
+    });
     // Builds a Dockerfile + context into a cacheable image archive.
     let docker: Arc<dyn ManagedDriver> = Arc::new(pluginoci::docker_build::Driver::new());
     drivers.push(NamedDriver {

@@ -37,6 +37,7 @@ fn workspace() -> htestkit::Workspace {
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginoci::image::Driver::new()))
         .with_managed_driver(Box::new(pluginoci::layer::Driver::new()))
+        .with_managed_driver(Box::new(pluginoci::index::Driver::new()))
         .build()
         .expect("build workspace")
 }
@@ -551,6 +552,195 @@ async fn test_the_image_digest_is_the_same_on_every_supported_target() -> anyhow
          OCI_IMAGE_FORMAT_VERSION (or OCI_LAYER_FORMAT_VERSION) in the same commit — \
          otherwise every cached image keeps its old key with new meaning. If it was not \
          deliberate, something host-dependent reached the bytes."
+    );
+    Ok(())
+}
+
+/// `oci_index` groups images built *separately* into one multi-platform image.
+///
+/// This is the shape `docker_build` cannot express on its own: one buildx
+/// invocation means one Dockerfile for every platform, so platforms needing
+/// genuinely different recipes have nowhere to put the difference. Here each
+/// platform is its own target with its own layers, and the index makes them one
+/// image from the repo's point of view.
+///
+/// Built out of `oci_image` rather than `docker_build` so it needs no daemon —
+/// the grouping is the same either way, and the driver takes any layout.
+#[tokio::test]
+async fn test_an_index_groups_separately_built_images() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "bin_amd64", driver = "bash", run = "echo amd > $OUT", out = "server-amd64")
+target(name = "bin_arm64", driver = "bash", run = "echo arm > $OUT", out = "server-arm64")
+target(name = "l_amd64", driver = "oci_layer", srcs = [":bin_amd64"], prefix = "/usr/bin")
+target(name = "l_arm64", driver = "oci_layer", srcs = [":bin_arm64"], prefix = "/usr/bin")
+
+# Deliberately different per platform: different layers, different entrypoint,
+# different env. One `docker_build` could not produce both.
+target(
+    name = "amd64",
+    driver = "oci_image",
+    layers = [":l_amd64"],
+    platforms = ["linux/amd64"],
+    entrypoint = ["/usr/bin/server-amd64"],
+    env = {"ARCH": "amd64"},
+)
+target(
+    name = "arm64",
+    driver = "oci_image",
+    layers = [":l_arm64"],
+    platforms = ["linux/arm64"],
+    entrypoint = ["/usr/bin/server-arm64"],
+)
+
+target(name = "img", driver = "oci_index", images = [":amd64", ":arm64"])
+"#,
+    );
+
+    let r = ws.run("//app:img").await?;
+    let bytes = htestkit::artifact_bytes(&r);
+
+    // The entry point is a manifest *list* naming both platforms — not the
+    // single manifest each input held.
+    let blobs = layout_blobs(&bytes);
+    let mut ar = tar::Archive::new(std::io::Cursor::new(bytes.clone()));
+    let mut index = None;
+    for entry in ar.entries().expect("entries") {
+        use std::io::Read as _;
+        let mut entry = entry.expect("entry");
+        if entry.path().expect("path").to_string_lossy() == "index.json" {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).expect("read");
+            index = Some(serde_json::from_slice::<serde_json::Value>(&buf).expect("index"));
+        }
+    }
+    // `write_layout_*` wraps a multi-image set in a nested, ref.name-annotated
+    // index so buildx can resolve it; the list is one hop in.
+    let outer = index.expect("index.json");
+    let inner_digest = outer["manifests"][0]["digest"]
+        .as_str()
+        .expect("entry digest");
+    let list: serde_json::Value =
+        serde_json::from_slice(blobs.get(inner_digest).expect("list blob")).expect("list");
+    let manifests = list["manifests"].as_array().expect("manifests");
+    assert_eq!(manifests.len(), 2, "one entry per grouped image");
+
+    let mut seen: Vec<String> = manifests
+        .iter()
+        .map(|m| {
+            format!(
+                "{}/{}",
+                m["platform"]["os"].as_str().unwrap_or("?"),
+                m["platform"]["architecture"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(seen, vec!["linux/amd64", "linux/arm64"]);
+
+    // Each entry still points at the image its own target built, config and all
+    // — nothing was rebuilt or merged.
+    for m in manifests {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            blobs
+                .get(m["digest"].as_str().expect("digest"))
+                .expect("blob"),
+        )
+        .expect("manifest");
+        let config: serde_json::Value = serde_json::from_slice(
+            blobs
+                .get(
+                    manifest["config"]["digest"]
+                        .as_str()
+                        .expect("config digest"),
+                )
+                .expect("config blob"),
+        )
+        .expect("config");
+        let arch = config["architecture"].as_str().expect("arch");
+        assert_eq!(
+            config["config"]["Entrypoint"],
+            serde_json::json!([format!("/usr/bin/server-{arch}")]),
+            "each platform keeps the entrypoint its own target set"
+        );
+    }
+    Ok(())
+}
+
+/// Two images claiming one platform would silently shadow each other, and which
+/// one shipped would depend on the order `images` happens to be written in.
+#[tokio::test]
+async fn test_two_images_for_one_platform_is_an_error() {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt")
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt")
+target(name = "la", driver = "oci_layer", srcs = [":a"], prefix = "/etc")
+target(name = "lb", driver = "oci_layer", srcs = [":b"], prefix = "/etc")
+target(name = "ia", driver = "oci_image", layers = [":la"], platforms = ["linux/amd64"])
+target(name = "ib", driver = "oci_image", layers = [":lb"], platforms = ["linux/amd64"])
+target(name = "img", driver = "oci_index", images = [":ia", ":ib"])
+"#,
+    );
+    let err = format!(
+        "{:#}",
+        ws.run("//app:img")
+            .await
+            .err()
+            .expect("duplicate platforms must fail")
+    );
+    assert!(err.contains("linux/amd64"), "must name the platform: {err}");
+    assert!(
+        err.contains("//app:ia") && err.contains("//app:ib"),
+        "must name both images: {err}"
+    );
+}
+
+/// The grouped image is consumable downstream exactly like any other: the
+/// digest group is there, and the layout reads back as a multi-platform image.
+#[tokio::test]
+async fn test_a_grouped_image_reads_back_as_one_image() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt")
+target(name = "la", driver = "oci_layer", srcs = [":a"], prefix = "/etc")
+target(name = "ia", driver = "oci_image", layers = [":la"], platforms = ["linux/amd64"])
+target(name = "ib", driver = "oci_image", layers = [":la"], platforms = ["linux/arm64"])
+target(name = "img", driver = "oci_index", images = [":ia", ":ib"], layout = True)
+target(
+    name = "show",
+    driver = "bash",
+    run = "cat $SRC_DIGEST > $OUT",
+    out = "out.txt",
+    deps = {"digest": ["//app:img|digest"]},
+)
+"#,
+    );
+    let r = ws.run("//app:show").await?;
+    let digest = htestkit::artifact_string(&r);
+    assert!(
+        digest.trim().starts_with("sha256:") && digest.trim().len() == 71,
+        "the digest group must carry the manifest list digest, got: {digest:?}"
+    );
+
+    // Both platforms share one layer, so the blob is stored once.
+    let r = ws.run("//app:img").await?;
+    let paths = htestkit::artifact_paths(&r);
+    let layer_blobs: Vec<_> = paths
+        .iter()
+        .filter(|p| p.to_string_lossy().contains("blobs/sha256/"))
+        .collect();
+    let unique: std::collections::BTreeSet<_> = layer_blobs.iter().collect();
+    assert_eq!(
+        layer_blobs.len(),
+        unique.len(),
+        "a layout must not carry the same blob twice: {layer_blobs:?}"
     );
     Ok(())
 }

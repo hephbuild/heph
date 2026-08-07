@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 pub mod archive;
 pub mod docker_build;
 pub mod image;
+pub mod index;
 pub mod layer;
 pub mod load;
 pub mod platform;
@@ -241,6 +242,42 @@ fn dep_files(req: &ManagedRunRequest<'_, '_>, origin_id: &str) -> anyhow::Result
         .map(PathBuf::from)
         .collect())
 }
+/// Absolute path of the OCI layout a dep materialized — a layout *directory*,
+/// or the single archive file that is the other shape this plugin writes.
+///
+/// A dep's list names *files*, never the directories holding them, so the root
+/// cannot be found by looking for a directory entry. It is found by its marker
+/// instead: an OCI layout is exactly a tree with an `oci-layout` file at its
+/// root, which is also what buildx's `oci-layout://` wants pointed at.
+///
+/// `attr` names the BUILD-file attribute in the error, since the same shape is
+/// consumed by `base`, `image` and `images`.
+pub(crate) fn layout_path(
+    req: &ManagedRunRequest<'_, '_>,
+    origin: &str,
+    attr: &str,
+) -> anyhow::Result<PathBuf> {
+    let paths = dep_files(req, origin)?;
+    anyhow::ensure!(!paths.is_empty(), "{attr} produced no files in the sandbox");
+    if let Some(dir) = paths
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "oci-layout"))
+        .and_then(|p| p.parent())
+    {
+        return Ok(dir.to_path_buf());
+    }
+    if let [only] = paths.as_slice() {
+        return Ok(only.clone());
+    }
+    anyhow::bail!(
+        "{attr} is neither an OCI layout directory nor a single archive: no `oci-layout` file \
+         among {} staged path(s), the first being {:?}. Produce it with \
+         `oci_pull(layout = True)`, `oci_image(...)` or `docker_build(...)`.",
+        paths.len(),
+        paths.first()
+    )
+}
+
 /// Absolute path to the single file a Dep input materialized into the sandbox.
 /// Reads the input's `.list` file (one absolute path per line — see
 /// `driver_managed.rs::list_path_for`). Errors unless exactly one file was
