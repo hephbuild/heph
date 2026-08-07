@@ -129,11 +129,23 @@ pub fn resolve_one_dependency(
         return Ok(Some(addr.clone()));
     }
 
-    let resolution = match lockfile {
-        Some(lf) => lf
+    // A transitive fallback (via `resolved_graph`) when the direct/importer
+    // lookup misses: a name reachable only through one of `manifest`'s own
+    // dependencies — e.g. `@eslint/js` pulled in by a declared
+    // `typescript-eslint` — must resolve to the same addr here that
+    // `importgraph::transitive_declared_closure`'s phantom-dependency check
+    // already accepts it under, or `Provider::get` could succeed with a
+    // `TargetDef` missing the Input the real toolchain run needs. See
+    // `crate::pluginjs::lockfile::resolve_transitive`'s doc.
+    let resolution = match (lockfile, resolved_graph) {
+        (Some(lf), Some(rg)) => {
+            crate::pluginjs::lockfile::resolve_transitive(lf, rg, pkg, manifest, name)
+                .with_context(|| format!("resolving `{name}` declared by {pkg:?}"))?
+        }
+        (Some(lf), None) => lf
             .resolve_dependency(pkg, name)
             .with_context(|| format!("resolving `{name}` declared by {pkg:?}"))?,
-        None => None,
+        (None, _) => None,
     };
 
     match resolution {
@@ -276,6 +288,120 @@ mod tests {
             deps[0].addr
         );
         assert!(deps[0].addr.contains("goos=linux"), "{}", deps[0].addr);
+    }
+
+    /// A minimal npm `package-lock.json` where `a` declares
+    /// `typescript-eslint`, which itself depends on `@eslint/js` — the same
+    /// companion-package pattern `importgraph::transitive_declared_closure`'s
+    /// own fixture uses.
+    fn transitive_npm_lockfile() -> Lockfile {
+        Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/typescript-eslint": {
+                        "version": "8.0.0",
+                        "integrity": "sha512-abc",
+                        "dependencies": { "@eslint/js": "9.0.0" }
+                    },
+                    "node_modules/@eslint/js": {
+                        "version": "9.0.0",
+                        "integrity": "sha512-def"
+                    }
+                }
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// The gap a hermeticity review caught: widening
+    /// `check_phantom_dependencies`'s accepted set without also widening
+    /// this function's own resolution would let `Provider::get` succeed
+    /// while silently wiring no Input for the import at all. This proves
+    /// `resolve_one_dependency` resolves `@eslint/js` to the same addr the
+    /// phantom check now accepts it under — reachable only through the
+    /// declared `typescript-eslint`, never declared directly.
+    #[test]
+    fn resolve_one_dependency_falls_back_transitively_through_a_declared_dependency() {
+        let manifest = manifest(&[], &[("typescript-eslint", "^8.0.0")], &[]);
+        let lock = transitive_npm_lockfile();
+        let graph = lock.resolved_graph();
+        let addr = resolve_one_dependency(
+            "packages/a",
+            "@eslint/js",
+            &manifest,
+            Some(&lock),
+            Some(&graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+        .unwrap()
+        .expect("transitively reachable through typescript-eslint");
+        assert!(
+            addr.contains("@heph/js/thirdparty/@eslint/js@9.0.0"),
+            "{addr}"
+        );
+    }
+
+    /// Unlike npm's ancestor-`node_modules` walk (which finds any name
+    /// hoisted to a common ancestor, phantom or not — see
+    /// `lockfile.rs`'s `pnpm_direct_lookup_does_not_see_a_transitive_name`
+    /// for why the equivalent npm fixture can't isolate this), pnpm's
+    /// strict, `importers`-only direct lookup genuinely cannot see
+    /// `unrelated` any other way than the transitive BFS, so this cleanly
+    /// proves the BFS itself does not leak into a package with no edge from
+    /// anything `a` declares.
+    #[test]
+    fn resolve_one_dependency_does_not_transitively_resolve_an_unrelated_package() {
+        let manifest = manifest(&[], &[("typescript-eslint", "^8.0.0")], &[]);
+        let lock = Lockfile::parse(
+            PkgManager::Pnpm,
+            r#"
+lockfileVersion: '9.0'
+importers:
+  packages/a:
+    devDependencies:
+      typescript-eslint:
+        specifier: ^8.0.0
+        version: 8.0.0
+packages:
+  typescript-eslint@8.0.0:
+    resolution: {integrity: sha512-abc}
+  '@eslint/js@9.0.0':
+    resolution: {integrity: sha512-def}
+  unrelated@1.0.0:
+    resolution: {integrity: sha512-ghi}
+snapshots:
+  typescript-eslint@8.0.0:
+    dependencies:
+      '@eslint/js': 9.0.0
+  '@eslint/js@9.0.0': {}
+  unrelated@1.0.0: {}
+"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph();
+        // Not optional and not declared at all, so a miss here is the same
+        // hard-error path `missing_required_dep_resolution_is_a_hard_error`
+        // exercises for a direct dependency — this is not a real production
+        // path (a name reaching this on-demand lookup was already proven
+        // reachable by `check_phantom_dependencies`), but it proves the
+        // negative case fails loudly rather than fabricating an addr.
+        let err = resolve_one_dependency(
+            "packages/a",
+            "unrelated",
+            &manifest,
+            Some(&lock),
+            Some(&graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("unrelated"), "{err:#}");
     }
 
     #[test]
