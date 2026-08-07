@@ -738,27 +738,44 @@ fn resolve_config_import_specifier(config_dir: &Path, specifier: &str) -> Option
     probe_first_party_path(&config_dir.join(specifier))
 }
 
+/// [`resolve_runner_config_referenced_files`]'s result: every additional
+/// first-party file the config transitively names/imports, plus every bare
+/// (third-party) specifier encountered along the way.
+#[derive(Debug)]
+pub struct RunnerConfigScan {
+    pub files: Vec<PathBuf>,
+    /// A bare import/require inside the config file (e.g. `import react
+    /// from '@vitejs/plugin-react'`) — not followed as a file (it names a
+    /// real npm dependency, not another config to recurse into), but
+    /// collected here for the same reason [`build_test_closure`]'s own
+    /// `bare_specifiers` are: a plugin the config itself imports (Vite's
+    /// `@vitejs/plugin-react`, `vite-plugin-svgr`, Lingui's
+    /// `@lingui/vite-plugin`, a browser-mode provider like
+    /// `@vitest/browser-playwright`, …) has to be staged in the sandbox and
+    /// declared as an Input the same as any other third-party dependency
+    /// the test actually needs, or resolving/loading the config itself
+    /// fails the moment vitest/jest tries to import it — regardless of
+    /// whether the test file's own source ever touches it.
+    pub bare_specifiers: Vec<BareSpecifierSite>,
+}
+
 /// Recursively resolve every additional first-party file a test-runner
 /// config's own content names or imports: [`RUNNER_CONFIG_FILE_KEYS`]
 /// entries, plus a relative `import`/`require` of a shared base config
 /// (`import base from '../../vitest.config.base'`) — which may itself name
 /// or import more, so each newly-resolved file is scanned the same way in
 /// turn. Bounded depth + a visited set guard against a cyclic/self-importing
-/// config; in practice a real config chain is one or two files deep.
-///
-/// **Known scope trim, disclosed rather than silent**: only a *relative*
-/// import/require inside the config file is followed — a shared base config
-/// pulled in via a bare package specifier (e.g. an internal
-/// `@myorg/test-config` package) is not, the same "third-party is
-/// `js_install`'s job" boundary `test_deps_config` draws elsewhere for the
-/// test file's own closure.
+/// config; in practice a real config chain is one or two files deep. See
+/// [`RunnerConfigScan::bare_specifiers`] for the config's own third-party
+/// imports, which this also collects but does not recurse into.
 pub fn resolve_runner_config_referenced_files(
     config_path: &Path,
     config_content: &str,
-) -> anyhow::Result<Vec<PathBuf>> {
+) -> anyhow::Result<RunnerConfigScan> {
     const MAX_DEPTH: usize = 4;
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut bare_specifiers: Vec<BareSpecifierSite> = Vec::new();
     let mut queue: VecDeque<(PathBuf, String, usize)> = VecDeque::new();
     seen.insert(config_path.to_path_buf());
     queue.push_back((config_path.to_path_buf(), config_content.to_string(), 0));
@@ -785,12 +802,21 @@ pub fn resolve_runner_config_referenced_files(
                     enqueue_referenced_config_file(
                         resolved, depth, &mut seen, &mut found, &mut queue,
                     );
+                } else if let Some(package_name) = bare_specifier_package_name(&site.specifier) {
+                    bare_specifiers.push(BareSpecifierSite {
+                        file: path.to_string_lossy().replace('\\', "/"),
+                        specifier: site.specifier,
+                        package_name,
+                    });
                 }
             }
         }
     }
 
-    Ok(found.into_iter().collect())
+    Ok(RunnerConfigScan {
+        files: found.into_iter().collect(),
+        bare_specifiers,
+    })
 }
 
 /// Record a newly-resolved referenced-config file (if not already seen) and
@@ -1145,7 +1171,21 @@ pub fn resolve_eslint_config_referenced_files(
 
     // Modern flat config's own relative `import`/`require` chain (recursive
     // — `resolve_runner_config_referenced_files` already walks depth).
-    for f in resolve_runner_config_referenced_files(config_path, config_content)? {
+    // `bare_specifiers` is unused here: `lint_deps_config`'s dedicated
+    // `eslint_plugins` field already resolves the *leaf* config's own
+    // `extends`/`plugins` values through the lockfile, covering the common
+    // case. It does not currently re-scan a relatively-imported *base*
+    // config's own plugin imports (`extract_eslint_module_refs` only ever
+    // runs on the leaf), so a plugin imported only by a shared base config
+    // is a real, pre-existing gap this call doesn't close either — unlike
+    // `test_deps_config`'s equivalent runner-config case, which does
+    // (`resolve_runner_config_referenced_files`'s own `bare_specifiers`
+    // there gets validated and staged). Left as a known gap rather than
+    // silently claimed as covered; fixing it means threading
+    // `bare_specifiers` through the same declared-dependency check/staging
+    // `test_deps_config` now has, for every file in the chain, not just
+    // this one's leaf.
+    for f in resolve_runner_config_referenced_files(config_path, config_content)?.files {
         if seen.insert(f.clone()) {
             found.insert(f);
         }
@@ -2994,17 +3034,22 @@ mod tests {
 
         let config_path = dir.path().join("vitest.config.ts");
         let content = std::fs::read_to_string(&config_path).expect("read fixture");
-        let mut refs = resolve_runner_config_referenced_files(&config_path, &content)
+        let mut scan = resolve_runner_config_referenced_files(&config_path, &content)
             .expect("resolve referenced files");
-        refs.sort();
+        scan.files.sort();
 
         assert_eq!(
-            refs,
+            scan.files,
             vec![
                 dir.path().join("base.setup.ts"),
                 dir.path().join("leaf.setup.ts"),
                 dir.path().join("vitest.config.base.ts"),
             ]
+        );
+        assert!(
+            scan.bare_specifiers.is_empty(),
+            "{:?}",
+            scan.bare_specifiers
         );
     }
 
@@ -3014,9 +3059,38 @@ mod tests {
         let config_path = dir.path().join("vitest.config.ts");
         let content = "export default { test: {} };\n";
         write(dir.path(), "vitest.config.ts", content);
-        let refs = resolve_runner_config_referenced_files(&config_path, content)
+        let scan = resolve_runner_config_referenced_files(&config_path, content)
             .expect("resolve referenced files");
-        assert!(refs.is_empty(), "{refs:?}");
+        assert!(scan.files.is_empty(), "{:?}", scan.files);
+        assert!(
+            scan.bare_specifiers.is_empty(),
+            "{:?}",
+            scan.bare_specifiers
+        );
+    }
+
+    /// The gap this session's fix closes: a bare (third-party) import inside
+    /// the runner config itself — e.g. vitest.config.ts's own `import react
+    /// from '@vitejs/plugin-react'` — is collected, not silently dropped,
+    /// so `test_deps_config` can stage it in the sandbox the same way it
+    /// already stages the test file's own third-party imports.
+    #[test]
+    fn resolve_runner_config_referenced_files_collects_bare_specifiers_without_following_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("vitest.config.ts");
+        let content = "import react from '@vitejs/plugin-react';\n\
+             export default { plugins: [react()], test: {} };\n";
+        write(dir.path(), "vitest.config.ts", content);
+        let scan = resolve_runner_config_referenced_files(&config_path, content)
+            .expect("resolve referenced files");
+        assert!(
+            scan.files.is_empty(),
+            "a bare specifier must not be followed as a file: {:?}",
+            scan.files
+        );
+        assert_eq!(scan.bare_specifiers.len(), 1);
+        assert_eq!(scan.bare_specifiers[0].package_name, "@vitejs/plugin-react");
+        assert_eq!(scan.bare_specifiers[0].specifier, "@vitejs/plugin-react");
     }
 
     /// The single most important test in this milestone (per the task): the

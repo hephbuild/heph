@@ -1292,6 +1292,15 @@ impl Provider {
                             .with_context(|| {
                                 format!("resolving files referenced by bundler config {p:?}")
                             })?;
+                        // `bare_specifiers` is deliberately unused here:
+                        // `esbuild.config.json` is JSON, which
+                        // `resolve_runner_config_referenced_files` (via
+                        // `importparse::parse_file_imports`) never parses as
+                        // a module in the first place, so this is always
+                        // empty in practice — unlike `test_deps_config`'s
+                        // real JS/TS runner configs, which do need it (see
+                        // that call site).
+                        //
                         // Hard error (never a silent same-path fallback) on
                         // workspace-root escape — the exact M5-review-fixed
                         // anti-pattern (`strip_prefix(...).unwrap_or(...)`
@@ -1299,6 +1308,7 @@ impl Provider {
                         // recurring in this sibling call site (code-quality
                         // M6 review MAJOR).
                         let refs_rel: Vec<String> = refs
+                            .files
                             .iter()
                             .map(|r| {
                                 anyhow::ensure!(
@@ -2231,12 +2241,21 @@ fn test_deps_config(
     // See `resolve_runner_config_referenced_files`'s doc for exactly what is
     // (and, in the disclosed-trim sense, is not) followed.
     let mut runner_config_ref_paths_rel: Vec<String> = Vec::new();
+    // The config's own bare (third-party) imports — e.g. vitest.config.ts's
+    // `import react from '@vitejs/plugin-react'` — resolved into `deps`'s
+    // `"external"` group below, the same way `closure.bare_specifiers` (the
+    // test *file's* own unresolved bare imports) already are. Without this,
+    // a plugin the config needs just to be loaded (JSX transform, Lingui
+    // macros, SVG imports, a browser-mode provider, …) was never staged in
+    // the sandbox at all, regardless of whether the test file's own source
+    // ever imported it.
+    let mut runner_config_bare_specifiers: Vec<importgraph::BareSpecifierSite> = Vec::new();
     if let Some(p) = &runner_config {
-        let refs = importgraph::resolve_runner_config_referenced_files(p, &runner_config_content)
+        let scan = importgraph::resolve_runner_config_referenced_files(p, &runner_config_content)
             .with_context(|| {
             format!("scanning test-runner config {p:?} for referenced files")
         })?;
-        for f in refs {
+        for f in scan.files {
             runner_config_ref_paths_rel.push(
                 f.strip_prefix(workspace_root)
                     .unwrap_or(&f)
@@ -2244,6 +2263,7 @@ fn test_deps_config(
                     .replace('\\', "/"),
             );
         }
+        runner_config_bare_specifiers = scan.bare_specifiers;
     }
 
     // Phantom-dependency check: a workspace member requesting only `js_test`
@@ -2257,6 +2277,27 @@ fn test_deps_config(
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
         })?;
+    // `check_phantom_dependencies` above only walks the test file's own
+    // import graph (`graph`) — the runner config's own bare imports are a
+    // separate source (see `runner_config_bare_specifiers`'s doc), so they
+    // get the same declared-dependency cross-check here, by hand, rather
+    // than silently passing through to `resolve_one_dependency` below (whose
+    // hard-error wording assumes the name is already known-declared, which
+    // isn't true for these).
+    for site in &runner_config_bare_specifiers {
+        anyhow::ensure!(
+            declared_closure.contains(&site.package_name),
+            "{pkg:?}: {file:?} imports `{specifier}`, which resolves to the third-party \
+             package `{name}` — but `{name}` is not declared in {pkg:?}'s package.json \
+             (`dependencies`/`devDependencies`). This is a phantom dependency: it may only \
+             work today because another package's install hoisted `{name}` into reach; \
+             declare it explicitly or the build is not hermetic across package \
+             managers/layouts.",
+            file = site.file,
+            specifier = site.specifier,
+            name = site.package_name,
+        );
+    }
 
     let closure = importgraph::build_test_closure(graph, &canonical_root, pkg, test_file_rel)
         .with_context(|| {
@@ -2284,7 +2325,11 @@ fn test_deps_config(
     // above already proved every one of these names is declared; a `None`
     // here means it's a declared `optionalDependencies` entry that doesn't
     // apply to this platform/lockfile state.
-    for site in &closure.bare_specifiers {
+    for site in closure
+        .bare_specifiers
+        .iter()
+        .chain(&runner_config_bare_specifiers)
+    {
         if let Some(addr) = deps::resolve_one_dependency(
             pkg,
             &site.package_name,
@@ -5228,6 +5273,132 @@ mod tests {
             "an unresolved third-party import must still declare a js_install Input even absent \
              ambient node_modules: {external_addrs:?}"
         );
+    }
+
+    /// The exact bug a real vitest.config.ts hit: `@vitejs/plugin-react` was
+    /// never staged in the sandbox at all — the test *file* never imports
+    /// it, only the runner config does, and only the file's own bare
+    /// imports were ever fed through `deps::resolve_one_dependency`. Proves
+    /// `test_deps_config` now declares a `js_install` Input for a plugin
+    /// the *config* imports, not just ones the test file imports.
+    ///
+    /// The config lives at the *workspace root*, shared across packages via
+    /// `find_nearest_test_runner_config`'s ancestor walk (see
+    /// `find_nearest_test_runner_config_walks_up_like_tsconfig`) — a real,
+    /// common monorepo shape, and deliberately not inside `packages/a`
+    /// itself: a package-local config would already be swept into `graph`
+    /// by `package_source_files`'s own directory walk and validated by the
+    /// pre-existing `check_phantom_dependencies` call, which would make this
+    /// test pass for the wrong reason and not actually exercise the new
+    /// runner-config-specific staging/check this fixes.
+    #[test]
+    fn test_deps_config_declares_third_party_input_from_runner_configs_own_plugin_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "devDependencies": {"@vitejs/plugin-react": "^4.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "import react from '@vitejs/plugin-react';\n\
+             export default { plugins: [react()], test: {} };\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => {});\n",
+        );
+        // Deliberately no `node_modules` anywhere in this fixture — same
+        // "no ambient install" scenario the sibling test above proves for a
+        // test file's own import.
+
+        let lockfile = Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/@vitejs/plugin-react": {
+                        "version": "4.0.0",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        )
+        .expect("parse lockfile");
+        let resolved_graph = lockfile.resolved_graph();
+
+        let walker = CachedWalker::disabled();
+        let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
+        let (deps, _, _) = test_deps_config(
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+            &graph,
+            Some(&lockfile),
+            Some(&resolved_graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+            toolchain::VITEST,
+            runner_config_candidates(toolchain::VITEST).expect("vitest is supported"),
+        )
+        .expect("build test deps config");
+
+        let external_addrs = dep_addrs(&deps, "external");
+        assert!(
+            external_addrs
+                .iter()
+                .any(|a| a.contains("@vitejs/plugin-react") && a.contains("js_install")),
+            "a plugin only the runner config imports must still declare a js_install Input: \
+             {external_addrs:?}"
+        );
+    }
+
+    /// The other half, same shared-root-config shape as the sibling test
+    /// above: a runner-config plugin that is genuinely undeclared (not
+    /// merely absent from disk) must still hard-fail as a phantom
+    /// dependency — this is not a free pass around
+    /// `check_phantom_dependencies`, it's a second, equally strict check for
+    /// a source `check_phantom_dependencies` itself never sees (a config
+    /// file outside the package's own directory is never part of `graph`).
+    #[test]
+    fn test_deps_config_rejects_an_undeclared_runner_config_plugin_as_phantom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "import react from '@vitejs/plugin-react';\n\
+             export default { plugins: [react()], test: {} };\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => {});\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
+        let err = test_deps_config(
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+            &graph,
+            None,
+            None,
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+            toolchain::VITEST,
+            runner_config_candidates(toolchain::VITEST).expect("vitest is supported"),
+        )
+        .expect_err("an undeclared runner-config plugin must be a phantom-dependency error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("@vitejs/plugin-react"), "{msg}");
+        assert!(msg.contains("phantom dependency"), "{msg}");
     }
 
     #[test]
