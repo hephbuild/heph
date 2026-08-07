@@ -1,6 +1,57 @@
 { pkgs, lib, config, inputs, ... }:
 
 let
+  # kache — the `RUSTC_WRAPPER` (see `env.RUSTC_WRAPPER` below). Not in nixpkgs,
+  # and the upstream flake builds it from source against a pinned toolchain,
+  # which would land in the devenv shell's critical path on every cold CI
+  # runner. The published release binaries are self-contained (static musl on
+  # Linux, signed Mach-O on darwin), so fetch those instead: ~2s and no compile.
+  #
+  # Bumping: change `version`, then re-derive each `hash` — upstream publishes a
+  # `<asset>.sha256` next to every asset, and
+  #   nix hash convert --hash-algo sha256 --to sri <hex>
+  # turns that hex into the SRI form below. All four are verified by Nix at
+  # fetch time, so a wrong hash fails loudly rather than silently installing
+  # something else.
+  kacheVersion = "0.13.0";
+  kacheAssets = {
+    aarch64-darwin = {
+      target = "aarch64-apple-darwin";
+      hash = "sha256-8/TXz+ziDSUfh0Da4iR3fQlqXtKxYIscrplumPYBijE=";
+    };
+    x86_64-darwin = {
+      target = "x86_64-apple-darwin";
+      hash = "sha256-waUdA52DT2qtusGhZrlUTVMgs8qMsEhSD0XH1nqsG7U=";
+    };
+    x86_64-linux = {
+      target = "x86_64-unknown-linux-musl";
+      hash = "sha256-MK7e1NxuYgxACqOq96sWPclccDoPPdtNC6VsUfI/C9A=";
+    };
+    aarch64-linux = {
+      target = "aarch64-unknown-linux-musl";
+      hash = "sha256-th3j3mqauyGjdfqcZRPUe7jPc5H07rJMW+KXJzi4POM=";
+    };
+  };
+  kacheAsset =
+    kacheAssets.${pkgs.stdenv.hostPlatform.system}
+      or (throw "kache: no prebuilt binary for ${pkgs.stdenv.hostPlatform.system}");
+  kache = pkgs.stdenvNoCC.mkDerivation {
+    pname = "kache";
+    version = kacheVersion;
+    src = pkgs.fetchurl {
+      url = "https://github.com/kunobi-ninja/kache/releases/download/v${kacheVersion}/kache-${kacheAsset.target}.tar.gz";
+      inherit (kacheAsset) hash;
+    };
+    # The tarball is a single `kache` at the root — no directory to strip.
+    sourceRoot = ".";
+    dontBuild = true;
+    # Static musl / already-signed Mach-O. patchelf would only break the former
+    # (there is no interpreter to rewrite) and invalidate the latter's signature.
+    dontPatchELF = true;
+    dontStrip = true;
+    installPhase = "install -Dm755 kache $out/bin/kache";
+  };
+
   binLocation = "$HOME/.local/bin/heph3";
   qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
 in
@@ -17,7 +68,7 @@ in
     pkgs.zig
     pkgs.cargo-zigbuild
     pkgs.tokio-console
-    pkgs.sccache
+    kache
     # `rust-objcopy`/`rust-strip` (wraps the `llvm-tools` component's
     # llvm-objcopy, below) — used by `scripts/patch-flavour.sh`'s CI caller to
     # derive the "std" release flavour's stripped binary. LLVM-based and
@@ -42,10 +93,35 @@ in
     pkgs.fuse3
   ];
 
-  # Route every rustc invocation through sccache (local + CI, since CI runs
-  # inside this shell). SCCACHE_DIR is left at its platform default locally;
-  # CI overrides it to a workspace path so it can be cached across runs.
-  env.RUSTC_WRAPPER = "sccache";
+  # Route every rustc invocation through kache (local + CI, since CI runs inside
+  # this shell). Replaced sccache, which cannot cache "crates that invoke the
+  # system linker" — i.e. `bin`, `dylib`, `cdylib` and `proc-macro`. That is
+  # exactly this workspace's expensive tail: the `heph` binary, the three plugin
+  # cdylibs, every proc-macro, and every test harness. kache caches all of them.
+  #
+  # No remote is configured here, so a local shell is a local-disk cache and
+  # needs no daemon. CI points the same wrapper at R2 via `KACHE_S3_*` (see
+  # `.github/actions/setup-nix`). To share CI's cache locally, export those same
+  # vars and run `kache daemon start` — the remote is inert without the daemon.
+  env.RUSTC_WRAPPER = "kache";
+
+  # Cache linked `bin` and `--test` executables on macOS too, not just Linux.
+  #
+  # kache defaults this on for Linux and off for macOS: a Mach-O binary carries
+  # only a *debug map* (`N_OSO` entries naming each `.o` by path + mtime) rather
+  # than embedded DWARF, so a restored mac binary points at object files that no
+  # longer match and LLDB drops to function names without file:line. Linux
+  # embeds DWARF in the binary and restores losslessly.
+  #
+  # Turned on anyway, uniformly, because the release artifacts already have no
+  # file:line on macOS to lose: cargo overrides rustc's macOS default to
+  # `split-debuginfo = "unpacked"` for any profile with debug info (including
+  # `[profile.release]`, which sets `debug = "line-tables-only"`), so the shipped
+  # mac binary references `.o` files left behind on a CI runner. Fixing that
+  # needs a `.dSYM` shipped as a release asset — tracked separately, not here.
+  # The only live cost is attaching a debugger to a locally cache-restored mac
+  # binary; touch the crate and rebuild to get a freshly linked one.
+  env.KACHE_CACHE_EXECUTABLES = "1";
 
   # https://devenv.sh/languages/
    languages.rust = {

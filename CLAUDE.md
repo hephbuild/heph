@@ -10,6 +10,30 @@ This project uses [devenv](https://devenv.sh) for reproducible development envir
 devenv shell        # enter the dev shell (provides Rust toolchain, buf, protoc plugins)
 ```
 
+### Build cache
+
+Every `rustc` invocation goes through [kache](https://github.com/kunobi-ninja/kache)
+(`RUSTC_WRAPPER`, set in `devenv.nix` — so it applies in CI too, which runs inside
+this shell). It replaced sccache, which by design cannot cache "crates that invoke
+the system linker" — `bin`, `dylib`, `cdylib`, `proc-macro` — i.e. the `heph`
+binary, the three plugin cdylibs, every proc-macro and every test harness.
+
+- **Local** is a local-disk store only, at `~/.cache/kache` (Linux) or
+  `~/Library/Caches/kache` (macOS). No remote, and therefore **no daemon needed** —
+  the wrapper reads and writes the store directly. On a copy-on-write filesystem
+  (APFS, btrfs, XFS-with-reflink) restores are reflinks, so a restored `target/`
+  costs almost no additional disk and blobs are shared across worktrees.
+- **CI** points the same wrapper at the shared R2 bucket via `KACHE_S3_*` and runs
+  the daemon (`.github/actions/setup-nix`). The remote is inert without the daemon:
+  it owns remote lookups and background uploads. Each compiling job ends with
+  `kache daemon stop`, which drains the upload queue before the runner is torn down.
+- To share CI's cache locally, export the same `KACHE_S3_*` vars and run
+  `kache daemon start`.
+
+`kache stats` for a summary, `kache monitor` for a live TUI, `kache why-miss <crate>`
+to explain a miss, `KACHE_PROGRESS=verbose` for per-crate stderr lines, and
+`kache doctor` when something looks wrong. `KACHE_DISABLED=1` bypasses it entirely.
+
 ## Commands
 
 ```bash
