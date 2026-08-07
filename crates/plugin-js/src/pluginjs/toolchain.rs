@@ -151,6 +151,72 @@ pub(crate) fn resolve_host_test_runner(
     })
 }
 
+/// Sentinel `linter` values `js_lint` accepts — see this module's
+/// `resolve_host_linter` doc and `driver_lint.rs` module docs for the same
+/// disclosed non-hermetic-toolchain shape `tstool = "host"`/`testrunner`
+/// already have. Mirrors `ai-docs/js-plugin-plan.md`'s `js_lint` row:
+/// `linter` defaults to `oxlint`, alt `eslint` (for type-aware rules).
+pub const OXLINT: &str = "oxlint";
+pub const ESLINT: &str = "eslint";
+
+/// Whether `linter` names a supported linter — the only two values `js_lint`
+/// recognizes in this milestone.
+pub fn is_supported_linter(linter: &str) -> bool {
+    linter == OXLINT || linter == ESLINT
+}
+
+/// Resolve the configured `linter`'s binary:
+/// `<workspace_root>/node_modules/.bin/<oxlint|eslint>` first, then the
+/// process's own `PATH` — the same disclosed non-hermetic escape hatch
+/// `tstool = "host"`/`testrunner` already have (see [`resolve_host_tsc`]),
+/// extended to `js_lint`'s toolchain axis. Fails loudly, naming both places
+/// checked, when neither has it.
+pub(crate) fn resolve_host_linter(workspace_root: &Path, linter: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        is_supported_linter(linter),
+        "js_lint: unsupported linter {linter:?} — expected \"oxlint\" or \"eslint\""
+    );
+    let local = workspace_root
+        .join("node_modules")
+        .join(".bin")
+        .join(linter);
+    find_host_bin(workspace_root, linter).ok_or_else(|| {
+        anyhow::anyhow!(
+            "js_lint: no `{linter}` binary found at {local:?} or on PATH — install it (`npm \
+             install -D {linter}` / `pnpm add -D {linter}`) so `node_modules/.bin/{linter}` \
+             exists, or make a `{linter}` binary available on PATH. There is no hermetic \
+             {linter} toolchain yet in this plugin — `linter=\"{linter}\"` requires one of those \
+             two to be reachable."
+        )
+    })
+}
+
+/// Query the resolved linter's own `--version` output, trimmed — hashed into
+/// `JsLintDef` so a host linter upgrade/downgrade busts the cache, mirroring
+/// [`query_tsc_version`]/[`query_test_runner_version`]'s identical "query
+/// once at `Provider::get` time, not `run()` time" rationale.
+pub(crate) fn query_linter_version(linter_bin: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new(linter_bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("run {linter_bin:?} --version"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`{linter_bin:?} --version` failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let version = String::from_utf8(out.stdout)
+        .with_context(|| format!("{linter_bin:?} --version output is not utf8"))?
+        .trim()
+        .to_string();
+    anyhow::ensure!(
+        !version.is_empty(),
+        "`{linter_bin:?} --version` returned empty output"
+    );
+    Ok(version)
+}
+
 /// Query the resolved test runner's own `--version` output, trimmed —
 /// hashed into `JsTestDef` so a host runner upgrade/downgrade busts the
 /// cache, mirroring [`query_tsc_version`]'s "query once at `Provider::get`
@@ -370,6 +436,92 @@ mod tests {
             std::fs::set_permissions(&fake_bin, perms).expect("chmod");
         }
         let err = query_test_runner_version(&fake_bin).expect_err("nonzero exit must error");
+        assert!(format!("{err:#}").contains("failed"));
+    }
+
+    // ---- linter (js_lint) ----
+
+    #[test]
+    fn is_supported_linter_recognizes_only_oxlint_and_eslint() {
+        assert!(is_supported_linter(OXLINT));
+        assert!(is_supported_linter(ESLINT));
+        assert!(!is_supported_linter("standard"));
+        assert!(!is_supported_linter(""));
+    }
+
+    #[test]
+    fn resolve_host_linter_rejects_unsupported_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err =
+            resolve_host_linter(dir.path(), "standard").expect_err("unsupported linter must error");
+        assert!(format!("{err:#}").contains("standard"));
+    }
+
+    #[test]
+    fn resolve_host_linter_prefers_local_node_modules_bin_over_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_bin_dir = dir.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&local_bin_dir).expect("mkdir");
+        let local_oxlint = local_bin_dir.join(OXLINT);
+        std::fs::write(&local_oxlint, b"#!/bin/sh\necho local\n").expect("write local oxlint");
+
+        let found = resolve_host_linter(dir.path(), OXLINT).expect("resolve");
+        assert_eq!(found, local_oxlint);
+    }
+
+    #[test]
+    fn resolve_host_linter_errors_clearly_when_absent_everywhere() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prior = std::env::var_os("PATH");
+        // SAFETY: test-only, single-threaded within this process for the
+        // duration of the mutation; restored immediately below.
+        unsafe { std::env::set_var("PATH", "") };
+        let result = resolve_host_linter(dir.path(), ESLINT);
+        match &prior {
+            // SAFETY: test-only, restoring the prior value we saved above.
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            // SAFETY: test-only, restoring the prior (unset) state.
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        let err = result.expect_err("no eslint anywhere must error, not silently succeed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("eslint"), "{msg}");
+        assert!(msg.contains("PATH"), "{msg}");
+    }
+
+    #[test]
+    fn query_linter_version_reads_trimmed_stdout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_bin = dir.path().join("oxlint");
+        std::fs::write(&fake_bin, "#!/bin/sh\necho '0.15.0'\n").expect("write fake linter");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).expect("chmod");
+        }
+        let version = query_linter_version(&fake_bin).expect("query version");
+        assert_eq!(version, "0.15.0");
+    }
+
+    #[test]
+    fn query_linter_version_errors_on_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_bin = dir.path().join("eslint");
+        std::fs::write(&fake_bin, "#!/bin/sh\nexit 2\n").expect("write fake linter");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).expect("chmod");
+        }
+        let err = query_linter_version(&fake_bin).expect_err("nonzero exit must error");
         assert!(format!("{err:#}").contains("failed"));
     }
 }
