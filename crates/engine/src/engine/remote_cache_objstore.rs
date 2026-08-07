@@ -895,10 +895,15 @@ mod tests {
     /// future edit dropped `.with_retry(retry_config())` from the actual
     /// match arm. And deliberately never embeds the Debug string in an
     /// assertion message: `from_uri` folds the live process environment into
-    /// these builders, and this repo's own CI sets real AWS credentials via
-    /// env for sccache/R2 — printing the store's Debug output on failure
-    /// would risk leaking them into CI logs, even though `AwsCredential`'s
-    /// `Debug` impl currently redacts secrets.
+    /// these builders, so any real `AWS_*` credentials in scope end up inside
+    /// the store — printing its Debug output on failure would risk leaking
+    /// them into CI logs, even though `AwsCredential`'s `Debug` impl currently
+    /// redacts secrets. This repo's CI no longer supplies any: the build cache
+    /// moved from sccache, which needed `AWS_ACCESS_KEY_ID` /
+    /// `AWS_SECRET_ACCESS_KEY`, to kache, which reads its own
+    /// `KACHE_S3_ACCESS_KEY` / `KACHE_S3_SECRET_KEY` that these builders do not
+    /// look at. Keep the practice regardless — it costs nothing, and it is one
+    /// `AWS_PROFILE` in a developer's shell away from mattering again.
     fn assert_wires_retry_config(store: &dyn ObjectStore, scheme: &str) {
         let debug = format!("{store:?}");
         let want = retry_config();
