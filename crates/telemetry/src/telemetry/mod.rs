@@ -465,10 +465,10 @@ fn build_props(
     // stamped by posthog-rs itself (via os_info) on the capture path, so we
     // only add arch here.
     put("arch", std::env::consts::ARCH.into());
-    put("version", hcore::version::VERSION.into());
+    put("version", hcore::version::current().into());
     // Semver segments, broken out for filtering/grouping in PostHog. Absent when
     // the version doesn't parse (rather than reporting junk).
-    if let Some(v) = hcore::version::parse(hcore::version::VERSION) {
+    if let Some(v) = hcore::version::parse(hcore::version::current()) {
         put("version_major", v.major.into());
         put("version_minor", v.minor.into());
         put("version_patch", v.patch.into());
