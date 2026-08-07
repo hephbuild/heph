@@ -414,6 +414,18 @@ fn array_exports_condition_mismatch_falls_through_to_next_entry() {
 /// — Node hard-throws `ERR_MODULE_NOT_FOUND` for `missing.mjs`, it does
 /// *not* fall through to the second entry (`fallback.mjs`, which does exist)
 /// (Node.js v18.12.1).
+///
+/// The live cross-check is deliberately not run here: `import.meta.resolve`
+/// stopped checking file existence for array-form `exports` entries
+/// somewhere after v18.12.1's `--experimental-import-meta-resolve` flag
+/// stabilized — later Node resolves `missing.mjs` and defers the existence
+/// check to the actual module load, which this test never performs. That is
+/// a real Node version difference, not a resolver bug: `plugin-js`'s own
+/// resolver (the assertion below, still checked unconditionally) implements
+/// the documented algorithm — an active-condition entry wins outright and
+/// does not fall through on a missing file — which is what every other
+/// fixture in this file's array-exports family cross-checks live without
+/// issue.
 #[test]
 fn array_exports_matched_entry_missing_on_disk_hard_fails_no_fallback() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -435,8 +447,7 @@ fn array_exports_matched_entry_missing_on_disk_hard_fails_no_fallback() {
 
     let resolvers = Resolvers::new(None);
     let outcome = resolvers.resolve_runtime(ModuleContext::Esm, &root, "pkg");
-    let live = node_import_meta_resolve(&root, "pkg");
-    assert_unresolved_and_cross_check(outcome, live);
+    assert_unresolved_and_cross_check(outcome, None);
 }
 
 /// A `null`-blocked subpath is unconditionally unresolvable — Node reports
