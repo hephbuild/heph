@@ -315,6 +315,12 @@ jobs:
           # already being compiled for `heph` itself.
           TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p bench"
           if [ "${{ matrix.os }}" = "darwin" ]; then
+            cp Cargo.lock /tmp/before.lock
+            cargo update --workspace 2>&1 | tee /tmp/update_output.txt || true
+            echo "=== DIAGNOSTIC: lockfile diff cargo update would apply ==="
+            diff /tmp/before.lock Cargo.lock || true
+            echo "=== END DIAGNOSTIC ==="
+            cp /tmp/before.lock Cargo.lock
             cargo build --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.dylib"
             gha_lib="$OUT/libplugin_gha_cdylib.dylib"
