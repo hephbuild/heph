@@ -135,6 +135,20 @@ runs:
           # means "no credentials" dressed up as a wrong-credentials error.
           echo "KACHE_S3_ACCESS_KEY=47bb1ffef0f93339c11fa28d7540fc3c"
           echo "KACHE_S3_SECRET_KEY=$R2_SECRET"
+          # Speculative prefetch off — measured, not assumed. Across two
+          # attempts of the same commit it downloaded 20 MiB and used 0% of it,
+          # while its whole-remote key index cost ~40s of LIST plus a 30s
+          # join-wait per job. Exact-key remote checks and background uploads
+          # are unaffected; only the guessing is.
+          #
+          # It is also a suspect in the miss count it was meant to reduce: a
+          # *negative* entry in that index suppresses the exact remote HEAD for
+          # up to 300s, so a key absent from the snapshot taken at daemon start
+          # is compiled rather than fetched even when it is sitting in R2.
+          #
+          # Must be set before the daemon starts (below): a running daemon's
+          # environment is fixed at spawn, so a later change needs a restart.
+          echo "KACHE_PREFETCH_ENABLED=0"
         } >> "$GITHUB_ENV"
 
     # The remote is inert without the daemon: the wrapper delegates remote
