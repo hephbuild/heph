@@ -334,6 +334,17 @@ jobs:
             bash scripts/macos-portable.sh "$gha_lib"
             bash scripts/macos-portable.sh "$oci_lib"
           else
+            cp Cargo.lock /tmp/before.lock
+            which cargo cargo-zigbuild
+            cargo -V
+            cargo-zigbuild -V || true
+            cat ~/.cargo/config.toml 2>/dev/null || echo "no ~/.cargo/config.toml"
+            env | grep -i cargo || true
+            cargo update --workspace 2>&1 | tee /tmp/update_output.txt || true
+            echo "=== DIAGNOSTIC: lockfile diff cargo update would apply ==="
+            diff /tmp/before.lock Cargo.lock || true
+            echo "=== END DIAGNOSTIC ==="
+            cp /tmp/before.lock Cargo.lock
             cargo zigbuild --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.so"
             gha_lib="$OUT/libplugin_gha_cdylib.so"
