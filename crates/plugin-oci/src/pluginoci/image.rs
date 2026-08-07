@@ -319,17 +319,43 @@ fn merge_config(base: &Map<String, Value>, def: &OciImageDef) -> Map<String, Val
     cfg
 }
 
+/// Recursively sorts a [`Value`]'s object keys before encoding.
+///
+/// `serde_json::Map`'s backing type — a canonically-sorted `BTreeMap`, or an
+/// insertion-order `IndexMap` under the `preserve_order` feature — is a
+/// *workspace-wide* Cargo choice, not one this crate makes: `plugin-js`'s
+/// `oxc_resolver` dependency requires `preserve_order` unconditionally (it is
+/// a plain, non-optional `serde_json` dependency of that crate), so it is on
+/// wherever this crate is compiled too, regardless of what plugin-oci itself
+/// selects. An image's bytes are its cache key, so they must be canonical on
+/// purpose here rather than by accident of whichever `Map` happens to be
+/// active — this is the single place that ambient assumption gets replaced
+/// with an explicit sort.
+fn canonical_bytes(value: &Value) -> serde_json::Result<Vec<u8>> {
+    fn sort(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by_key(|(k, _)| *k);
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(k, v)| (k.clone(), sort(v)))
+                        .collect(),
+                )
+            }
+            Value::Array(items) => Value::Array(items.iter().map(sort).collect()),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_vec(&sort(value))
+}
+
 /// The image config for one platform.
 ///
 /// `created` is deliberately absent, as are per-layer timestamps: a wall clock
 /// in here would give the same inputs a different image digest on every build
 /// and defeat cross-machine cache sharing entirely.
-///
-/// Built through `serde_json`, whose object type is a `BTreeMap` in this tree —
-/// so the emitted bytes are canonical without a second pass. (`oci-spec`'s own
-/// config types use `HashMap` for `Labels`, and Rust's `RandomState` is seeded
-/// *per process*: two heph runs on one machine would emit two byte orders, two
-/// config digests, and two manifest digests under one cache key.)
 fn build_config(
     platform: &str,
     base: &BaseFor,
@@ -348,7 +374,7 @@ fn build_config(
         "rootfs".to_string(),
         json!({"type": "layers", "diff_ids": diff_ids}),
     );
-    serde_json::to_vec(&Value::Object(config)).context("encode the image config")
+    canonical_bytes(&Value::Object(config)).context("encode the image config")
 }
 
 /// The base's per-platform pieces, or an empty contribution when there is none.
@@ -706,7 +732,7 @@ impl ManagedDriver for Driver {
                 },
                 "layers": layer_descs,
             });
-            let manifest_bytes = serde_json::to_vec(&manifest).context("encode the manifest")?;
+            let manifest_bytes = canonical_bytes(&manifest).context("encode the manifest")?;
             let manifest_digest = archive::sha256_digest(&manifest_bytes);
             let (os, arch) = split_platform(platform)?;
             entries.push(ImageIndexEntry {
@@ -1029,12 +1055,23 @@ mod tests {
             text.contains(r#""architecture":"amd64""#) && text.contains(r#""os":"linux""#),
             "got: {text}"
         );
-        // serde_json's Map is a BTreeMap here, so keys come out sorted — the
-        // property that keeps two runs of one process from disagreeing.
+        // `Env` is explicitly sorted through a `BTreeMap` before it ever
+        // reaches `Value` (see above) — asserted regardless of `canonical_bytes`,
+        // since it's an array, not an object, and array element order is not
+        // something `canonical_bytes` touches.
         assert!(
             text.find(r#""A=2""#) < text.find(r#""M=3""#)
                 && text.find(r#""M=3""#) < text.find(r#""Z=1""#),
             "env must be sorted: {text}"
+        );
+        // `Labels` is merged from a `HashMap`, so insertion order is
+        // unspecified — this only comes out sorted because `canonical_bytes`
+        // sorts every object's keys right before encoding. Asserted directly
+        // rather than relying on the ambient `serde_json` feature set, which a
+        // workspace-wide `preserve_order` flip would otherwise change silently.
+        assert!(
+            text.find(r#""a":"1""#) < text.find(r#""b":"2""#),
+            "labels must be sorted: {text}"
         );
     }
 }
