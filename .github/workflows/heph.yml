@@ -535,11 +535,18 @@ jobs:
   # The gate check-builds every workspace member's libs *and* test targets,
   # three times (default features, --all-features, --no-default-features),
   # where it used to build the root package alone in ~1m35s. A fork PR gets no
-  # R2 credentials and runs every pass stone cold. Even warm, the workspace's
-  # own crates go through `clippy-driver` via RUSTC_WORKSPACE_WRAPPER rather
-  # than the plain wrapper, so a warm cache mostly saves the dependency
-  # compiles. A timeout renders as a red lint leg indistinguishable from a real
-  # lint failure, so the 30min headroom is deliberate.
+  # R2 credentials and runs every pass stone cold, so the headroom is sized for
+  # that case. Under sccache this job was uncacheable on top of that — it did
+  # not cache `clippy-driver` at all, which is why these legs used to report
+  # ~200 "non-cacheable calls". kache does: cargo runs workspace members as
+  # `$RUSTC_WRAPPER $RUSTC_WORKSPACE_WRAPPER $RUSTC`, so the wrapper sees the
+  # clippy invocation and keys it on clippy-driver's own compiler identity,
+  # separately from the equivalent `cargo build` unit. Measured on a workspace
+  # member: `cargo clean -p <crate>` then `cargo clippy -p <crate>
+  # --all-targets` restores from cache rather than re-linting.
+  #
+  # A timeout renders as a red lint leg indistinguishable from a real lint
+  # failure, so the 30min headroom is deliberate.
   #
   # Both platforms, because macOS-only code was clippy-linted nowhere.
   # `Test darwin/arm64` compiles it, but nothing there passes `-D warnings`, so
