@@ -248,7 +248,6 @@ jobs:
         id: build
         shell: devenv shell bash -- -e {0}
         env:
-          CARGO_TARGET_DIR: "./target"
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
           # Checksums of the heph-govet assets this same run publishes. Baked into
           # the go plugin so it verifies the binary it downloads at build time
@@ -286,7 +285,7 @@ jobs:
           echo "plugin_oci_name=$PLUGIN_OCI_NAME" >> $GITHUB_OUTPUT
           echo "bench_bin_name=$BENCH_BIN_NAME" >> $GITHUB_OUTPUT
           echo "debug_bin_name=$DEBUG_BIN_NAME" >> $GITHUB_OUTPUT
-          OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release"
+          OUT="target/${{ matrix.target }}/release"
           # FUSE (default feature) on Linux is pure-Rust (no libfuse link), so
           # zigbuild cross-compiles cleanly. On macOS it links libfuse via the
           # devenv macfuse-stubs; zig mangles the nix `-L` path under its SDK
