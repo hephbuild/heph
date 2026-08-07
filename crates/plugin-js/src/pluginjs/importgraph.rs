@@ -134,6 +134,7 @@
 //! positive. See that type's doc for exactly what it can and can't see.
 
 use crate::pluginjs::importparse::{self, ModuleContext, ParsedImports};
+use crate::pluginjs::lockfile::{self, Lockfile, ResolvedGraph};
 use crate::pluginjs::package_json::PackageManifest;
 use crate::pluginjs::resolvers::{ResolveOutcome, Resolvers};
 use crate::pluginjs::{PACKAGE_JSON, is_skipped_dir_name};
@@ -260,6 +261,46 @@ pub fn declared_closure(manifest: &PackageManifest) -> HashSet<String> {
     set.extend(manifest.dev_dependencies.keys().cloned());
     set.extend(manifest.peer_dependencies.keys().cloned());
     set.insert(manifest.name.clone());
+    set
+}
+
+/// [`declared_closure`], widened to every package name reachable by walking
+/// the lockfile's resolved dependency graph outward from `manifest`'s own
+/// direct dependencies.
+///
+/// A package pulled in this way — e.g. `@eslint/js`, reachable because
+/// `typescript-eslint` (a real, declared `devDependency`) depends on it — is
+/// not a phantom dependency in the sense [`check_phantom_dependencies`]
+/// exists to catch: its presence is fully determined by the lockfile, which
+/// is itself an already-hashed input, not by workspace-wide `node_modules`
+/// hoisting that could place a *different* version (or nothing at all) in
+/// reach on another host or package manager. Only names that aren't
+/// reachable from *anything* this manifest declares still count as phantom.
+///
+/// `lockfile`/`resolved_graph` are `None` for a package with no lockfile
+/// entry yet (nothing installed) — falls back to [`declared_closure`]
+/// unchanged, same as before this widening existed.
+pub fn transitive_declared_closure(
+    manifest: &PackageManifest,
+    pkg: &str,
+    lockfile: Option<&Lockfile>,
+    resolved_graph: Option<&ResolvedGraph>,
+) -> HashSet<String> {
+    let mut set = declared_closure(manifest);
+    let (Some(lockfile), Some(resolved_graph)) = (lockfile, resolved_graph) else {
+        return set;
+    };
+    // Same seed computation `deps::resolve_one_dependency`'s
+    // `lockfile::resolve_transitive` fallback uses, so a package this check
+    // accepts is always one that path can also wire an Input for — see
+    // `resolve_transitive`'s doc for why that agreement matters. A seed
+    // resolution error here just means one fewer package widens the closure
+    // (never a silent-wrong-build either way: a name that stays unwidened
+    // still fails loudly, as a phantom dependency, at this function's own
+    // caller — `Lockfile::resolve_dependency` has no fallible path today,
+    // so this can't actually happen yet regardless).
+    let seed_keys = lockfile::direct_dep_seed_keys(lockfile, pkg, manifest).unwrap_or_default();
+    set.extend(resolved_graph.transitive_reachable(seed_keys).into_keys());
     set
 }
 
@@ -2581,6 +2622,96 @@ mod tests {
         let declared = declared_closure(&manifest("a", &["lodash"], &[]));
         check_phantom_dependencies(dir.path(), "packages/a", &graph, &declared)
             .expect("a declared bare specifier must pass even with no node_modules on disk");
+    }
+
+    /// A minimal npm `package-lock.json` for `transitive_declared_closure`'s
+    /// own tests: package `a` declares `typescript-eslint`, which the
+    /// lockfile resolves to depend on `@eslint/js` — the exact
+    /// companion-package pattern (a real ESLint flat-config monorepo hitting
+    /// `array_exports_matched_entry_missing_on_disk_hard_fails_no_fallback`'s
+    /// sibling bug report) this closure exists to stop flagging as phantom.
+    /// `unrelated` has no edge from anything `a` declares, so it stays a
+    /// genuine phantom even after the widening.
+    fn transitive_fixture() -> Lockfile {
+        Lockfile::parse(
+            crate::pluginjs::workspace::PkgManager::Npm,
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "packages/a": { "name": "a", "devDependencies": { "typescript-eslint": "^8.0.0" } },
+                    "node_modules/typescript-eslint": {
+                        "version": "8.0.0",
+                        "resolved": "https://registry.npmjs.org/typescript-eslint/-/typescript-eslint-8.0.0.tgz",
+                        "integrity": "sha512-abc",
+                        "dependencies": { "@eslint/js": "9.0.0" }
+                    },
+                    "node_modules/@eslint/js": {
+                        "version": "9.0.0",
+                        "resolved": "https://registry.npmjs.org/@eslint/js/-/js-9.0.0.tgz",
+                        "integrity": "sha512-def",
+                        "dependencies": {}
+                    },
+                    "node_modules/unrelated": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/unrelated/-/unrelated-1.0.0.tgz",
+                        "integrity": "sha512-ghi",
+                        "dependencies": {}
+                    }
+                }
+            }"#,
+        )
+        .expect("parse fixture lockfile")
+    }
+
+    #[test]
+    fn transitive_declared_closure_includes_a_dependency_of_a_declared_dependency() {
+        let lockfile = transitive_fixture();
+        let resolved_graph = lockfile.resolved_graph();
+        let manifest = manifest("a", &[], &["typescript-eslint"]);
+
+        // The narrower, direct-only closure does not know about `@eslint/js`
+        // at all — this is the exact gap `transitive_declared_closure` fills.
+        assert!(!declared_closure(&manifest).contains("@eslint/js"));
+
+        let widened = transitive_declared_closure(
+            &manifest,
+            "packages/a",
+            Some(&lockfile),
+            Some(&resolved_graph),
+        );
+        assert!(
+            widened.contains("@eslint/js"),
+            "a package reachable through a declared dependency's own lockfile-resolved \
+             dependencies must not be flagged as phantom: {widened:?}"
+        );
+        assert!(widened.contains("typescript-eslint"), "{widened:?}");
+    }
+
+    #[test]
+    fn transitive_declared_closure_does_not_include_an_unrelated_package() {
+        let lockfile = transitive_fixture();
+        let resolved_graph = lockfile.resolved_graph();
+        let manifest = manifest("a", &[], &["typescript-eslint"]);
+
+        let widened = transitive_declared_closure(
+            &manifest,
+            "packages/a",
+            Some(&lockfile),
+            Some(&resolved_graph),
+        );
+        assert!(
+            !widened.contains("unrelated"),
+            "a package with no edge from anything `a` declares is still a genuine phantom \
+             dependency, not merely hoisted into reach: {widened:?}"
+        );
+    }
+
+    #[test]
+    fn transitive_declared_closure_falls_back_to_direct_only_without_a_lockfile() {
+        let manifest = manifest("a", &[], &["typescript-eslint"]);
+        let widened = transitive_declared_closure(&manifest, "packages/a", None, None);
+        assert_eq!(widened, declared_closure(&manifest));
     }
 
     /// A `peerDependencies` entry counts as declared for phantom-check
