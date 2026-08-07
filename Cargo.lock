@@ -4307,6 +4307,7 @@ dependencies = [
  "tempfile",
  "testkit",
  "tokio",
+ "which",
 ]
 
 [[package]]

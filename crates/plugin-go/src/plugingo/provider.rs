@@ -2,8 +2,9 @@ use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
     encode_thirdparty_download,
 };
+use crate::plugingo::cc_toolchain;
 use crate::plugingo::errors::NoGoFilesError;
-use crate::plugingo::factors::{Factors, VariantRef, current_goarch, current_goos};
+use crate::plugingo::factors::{self, Factors, VariantRef, current_goarch, current_goos};
 use crate::plugingo::govet;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
@@ -63,6 +64,15 @@ pub struct Config {
     /// factors (`goos`/`goarch`) are added, since the tool always runs natively
     /// (see [`ProviderInner::govet_tool_addr`]).
     pub govet: String,
+    /// Addr of a target producing a C compiler, used only where a **race** build
+    /// needs cgo — i.e. on linux, where Go's `runtime/race` is a cgo package (see
+    /// [`factors::cgo_required`]). Defaults to [`cc_toolchain::default_addr`], the
+    /// host `cc` exposed by the hostbin provider. Point it at another target
+    /// (a nix-built gcc, say) to avoid depending on the host's.
+    ///
+    /// Nothing references it unless a race target is built, so an ordinary build
+    /// — and a darwin race build — never resolves it.
+    pub cc: String,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
     pub skip: Arc<Ignore>,
@@ -89,6 +99,7 @@ impl Default for Config {
             go_version: toolchain::DEFAULT_GO_VERSION.to_string(),
             sdk_checksums: HashMap::new(),
             govet: govet::default_addr(),
+            cc: cc_toolchain::default_addr(),
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
             walker: Arc::new(CachedWalker::disabled()),
@@ -113,6 +124,8 @@ pub(crate) struct ProviderInner {
     sdk_checksums: HashMap<String, String>,
     /// Addr of the `heph-govet` binary lint/format exec (see [`Config::govet`]).
     govet: String,
+    /// Addr of the C compiler a cgo-needing race build stages (see [`Config::cc`]).
+    cc: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
     /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
@@ -242,7 +255,7 @@ impl Provider {
         hplugin::config::deny_unknown(
             "go provider",
             opts,
-            &["gotool", "govet", "skip", "checksums"],
+            &["gotool", "govet", "cc", "skip", "checksums"],
         )?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
             .ok_or_else(|| {
@@ -265,6 +278,11 @@ impl Provider {
         // target (`//tools/heph-govet:build`) to run one built from source.
         let govet: String = hplugin::config::decode_opt(opts, "go provider", "govet")?
             .unwrap_or_else(govet::default_addr);
+        // Optional: the C compiler a race build stages where race needs cgo (linux
+        // only — see `factors::cgo_required`). Unset → the host `cc` via hostbin.
+        // Never resolved unless a race target is actually built.
+        let cc: String = hplugin::config::decode_opt(opts, "go provider", "cc")?
+            .unwrap_or_else(cc_toolchain::default_addr);
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
@@ -278,6 +296,7 @@ impl Provider {
                 go_version,
                 sdk_checksums,
                 govet,
+                cc,
                 skip,
                 walker,
                 ..Default::default()
@@ -297,6 +316,7 @@ impl Provider {
                 go_version: config.go_version,
                 sdk_checksums: config.sdk_checksums,
                 govet: config.govet,
+                cc: config.cc,
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
@@ -518,7 +538,9 @@ impl ProviderTrait for Provider {
                     "Test settings for this package. `test = False` skips its tests, \
                      `test = True` (or unset) runs them. \
                      The struct form configures the generated `test`/`xtest` run \
-                     targets — `env`/`runtime_env` (map[string]) and \
+                     targets — and their `test_race`/`xtest_race` counterparts, which \
+                     are the same targets built with the race detector — \
+                     `env`/`runtime_env` (map[string]) and \
                      `pass_env`/`runtime_pass_env` (list[string]) set env, and \
                      `pre_run` (list[string]) runs shell lines before the test binary \
                      (switching the target to the bash driver). By default applies \
@@ -784,7 +806,20 @@ impl ProviderInner {
                     if !skip_tests {
                         push_names(
                             &mut addrs,
-                            &["embed_xtest", "build_test", "test", "build_xtest", "xtest"],
+                            &[
+                                "embed_xtest",
+                                "build_test",
+                                "test",
+                                "build_xtest",
+                                "xtest",
+                                // Race flavours of the two runnable test targets.
+                                // Like `test`/`xtest` they only list for
+                                // host-matching variants (`is_run_test_target_name`)
+                                // — a race binary built for another platform can't
+                                // run here either.
+                                "test_race",
+                                "xtest_race",
+                            ],
                         );
                     }
                 }
@@ -881,6 +916,8 @@ fn pick_codegen_root(states: &[State]) -> Option<&State> {
 const TEST_TARGET_NAMES: &[&str] = &[
     "test",
     "xtest",
+    "test_race",
+    "xtest_race",
     "build_test",
     "build_xtest",
     "build_test_lib",
@@ -897,6 +934,54 @@ fn is_test_target_name(name: &str) -> bool {
     TEST_TARGET_NAMES.contains(&name)
 }
 
+/// The user-facing entry points into race mode, mapped to the target they are a
+/// race flavour of.
+///
+/// `test_race` is not a distinct kind of target — it is `test` built with the
+/// race detector on. Resolving the name to its base and flipping the `race`
+/// factor is the whole mechanism: from there the ordinary code path builds the
+/// spec, and every dependency address it derives carries `race=1`, so the entire
+/// graph beneath it (first-party, thirdparty, stdlib) resolves to
+/// race-instrumented archives kept separate from the ordinary ones.
+///
+/// A separate *name* rather than an addr arg on `test` because race is opt-in:
+/// it is several times slower to build and to run, so `//...` must not silently
+/// double every test. Asking for it is explicit and greppable.
+fn race_entry_base(name: &str) -> Option<&'static str> {
+    match name {
+        "test_race" => Some("test"),
+        "xtest_race" => Some("xtest"),
+        _ => None,
+    }
+}
+
+/// Import paths a link needs on top of what the source graph reveals. Empty
+/// unless this is a race build.
+///
+/// `runtime/race` carries the prebuilt TSan runtime the linker resolves the
+/// instrumentation calls against, but **nothing imports it** — `go build -race`
+/// injects it into the link itself. This provider's closure walk only follows
+/// import edges, so without seeding it here the race link fails on undefined
+/// `__tsan_*` symbols. Seeding it as an *import* (rather than appending the
+/// archive at link time) runs it through the normal stdlib path, so it brings
+/// its own closure with it.
+///
+/// Where race needs cgo (everywhere but darwin — see [`factors::cgo_required`]),
+/// `runtime/cgo` has to be seeded as well. `runtime/race` is a cgo package
+/// there, so its only *listed* import is the pseudo-package `C` — which the walk
+/// drops along with `unsafe` — and the real edge to `runtime/cgo` is one the go
+/// command synthesises rather than something in the source.
+fn race_link_imports(factors: &Factors) -> Vec<String> {
+    if !factors.race {
+        return Vec::new();
+    }
+    let mut imports = vec!["runtime/race".to_string()];
+    if factors::cgo_required(&factors.goos, factors.race) {
+        imports.push("runtime/cgo".to_string());
+    }
+    imports
+}
+
 /// User-facing **entry / binary** target names — the ones a user selects a
 /// variant on directly (bare `@v`, resolved by module-bounded ancestry). Every
 /// other target is a **library / intermediate** (carries `vp`, resolved against
@@ -908,7 +993,10 @@ fn is_test_target_name(name: &str) -> bool {
 /// `lint-check`/`lint`, which aggregate over every ancestry variant instead of
 /// being selected with one (see [`VARIANT_AGGREGATE_TARGET_NAMES`]).
 fn is_entry_target_name(name: &str) -> bool {
-    matches!(name, "build" | "test" | "xtest")
+    matches!(
+        name,
+        "build" | "test" | "xtest" | "test_race" | "xtest_race"
+    )
 }
 
 /// **Runnable** test target names — the ones that execute the built test binary
@@ -916,7 +1004,7 @@ fn is_entry_target_name(name: &str) -> bool {
 /// these are gated to the host `goos`/`goarch` in `list`, since a test binary
 /// built for another platform can't run here.
 fn is_run_test_target_name(name: &str) -> bool {
-    matches!(name, "test" | "xtest")
+    matches!(name, "test" | "xtest" | "test_race" | "xtest_race")
 }
 
 /// Workspace-relative go.mod directory of a decoded package (`""` for a root
@@ -1514,7 +1602,7 @@ impl ProviderInner {
                 variant::resolve(addr, &req.states, "", req.executor.as_ref(), true)
                     .await
                     .map_err(GetError::Other)?;
-            let spec = target_std::install_spec(addr.clone(), &factors, &self.go_version);
+            let spec = target_std::install_spec(addr.clone(), &factors, &self.go_version, &self.cc);
             return Ok(GetResponse { target_spec: spec });
         }
 
@@ -1686,14 +1774,19 @@ impl ProviderInner {
         }
 
         // Strict addr args: every variant-parameterized go target accepts only `v`
-        // (entry) and `vp` (library/dep pin). Reject anything else rather than
+        // (entry), `vp` (library/dep pin) and `race` (race-detector build, threaded
+        // down from a `*_race` entry target). Reject anything else rather than
         // silently ignoring it — notably a legacy `goos`/`goarch` from a pre-variant
         // BUILD file, which must surface as an actionable error, not resolve to the
         // wrong thing. (The host-keyed toolchain/govet targets, which do carry
         // `goos`/`goarch`, are handled earlier and never reach here.)
-        if let Some(bad) = addr.args.keys().find(|k| !matches!(k.as_str(), "v" | "vp")) {
+        if let Some(bad) = addr
+            .args
+            .keys()
+            .find(|k| !matches!(k.as_str(), "v" | "vp" | factors::RACE_ARG))
+        {
             return Err(GetError::Other(anyhow::anyhow!(
-                "unknown addr arg `{bad}` on go target `:{}` (allowed: v, vp); \
+                "unknown addr arg `{bad}` on go target `:{}` (allowed: v, vp, race); \
                  select a build variant with `@v=NAME` — `goos`/`goarch` are no \
                  longer addr args, declare a variant instead",
                 addr.name,
@@ -1727,6 +1820,21 @@ impl ProviderInner {
         )
         .await
         .map_err(GetError::Other)?;
+
+        // `test_race`/`xtest_race` are the entry points into race mode: the same
+        // targets as `test`/`xtest`, with the race factor on. Turning the flag on
+        // here — before anything derives a dependency address — is what threads
+        // `race=1` through the whole graph, since every internal addr is built
+        // from `vref`. `dispatch_name` is what the spec-building `match` below
+        // keys on; the spec keeps the address the user asked for.
+        let (dispatch_name, factors, vref) = match race_entry_base(&addr.name) {
+            Some(base) => {
+                let mut f = factors;
+                f.race = true;
+                (base, f, vref.with_race(true))
+            }
+            None => (addr.name.as_str(), factors, vref),
+        };
 
         // _golist — generate spec without executing go list (before stdlib check so
         // stdlib packages can also expose a _golist target for cached dep resolution)
@@ -1793,7 +1901,7 @@ impl ProviderInner {
             GoPackageKind::Stdlib { .. } => return Err(GetError::NotFound),
         };
 
-        match addr.name.as_str() {
+        match dispatch_name {
             "build_lib" => {
                 // A library with no Go source files isn't buildable. Previously
                 // caught by a shared `go_files.is_empty() && error.is_some()`
@@ -1955,7 +2063,7 @@ impl ProviderInner {
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
                         &pkg,
-                        &[],
+                        &race_link_imports(&factors),
                         &vref,
                         &module_root,
                     )
@@ -2271,6 +2379,7 @@ impl ProviderInner {
                             .collect::<Vec<_>>()
                             .iter(),
                     )
+                    .chain(race_link_imports(&factors).iter())
                     .cloned()
                     .collect();
                 let transitive = Arc::clone(&self)
@@ -2331,6 +2440,7 @@ impl ProviderInner {
                             .collect::<Vec<_>>()
                             .iter(),
                     )
+                    .chain(race_link_imports(&factors).iter())
                     .cloned()
                     .collect();
                 // Walk from a synthetic pkg whose imports are xtest_extra; pkg.imports
@@ -2423,6 +2533,7 @@ impl ProviderInner {
                     build_test_addr,
                     &data_query_addr,
                     &test_env,
+                    factors.race,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2441,6 +2552,7 @@ impl ProviderInner {
                     build_xtest_addr,
                     &data_query_addr,
                     &test_env,
+                    factors.race,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -5371,6 +5483,145 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         );
     }
 
+    // ---- race ----
+
+    /// Bare `test_race@v=host` — the user-facing entry point. It must resolve,
+    /// and its binary dep must be the *race* flavour of `build_test`: the whole
+    /// mechanism is that `race=1` gets threaded onto every derived address.
+    #[tokio::test]
+    async fn test_race_deps_on_the_race_flavour_of_build_test() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let resp = provider_get(&p, make_addr("pkg", "test_race"))
+            .await
+            .unwrap();
+        // The spec keeps the address the user asked for.
+        assert_eq!(resp.target_spec.addr.name, "test_race");
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m.clone(),
+            other => panic!("expected deps map: {other:?}"),
+        };
+        let bin = match deps.get("bin").unwrap() {
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.clone(),
+                other => panic!("expected string: {other:?}"),
+            },
+            other => panic!("expected list: {other:?}"),
+        };
+        assert!(bin.contains("build_test"), "{bin}");
+        assert!(
+            bin.contains("race=1"),
+            "the binary dep must be the race build, not the ordinary one: {bin}"
+        );
+    }
+
+    /// The ordinary `test` target is untouched: no `race` arg anywhere, so its
+    /// address — and every cache key beneath it — is what it always was.
+    #[tokio::test]
+    async fn ordinary_test_carries_no_race_arg() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m.clone(),
+            other => panic!("expected deps map: {other:?}"),
+        };
+        let bin = match deps.get("bin").unwrap() {
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.clone(),
+                other => panic!("expected string: {other:?}"),
+            },
+            other => panic!("expected list: {other:?}"),
+        };
+        assert!(!bin.contains("race"), "{bin}");
+    }
+
+    /// The race link must include `runtime/race`, which carries the TSan runtime.
+    /// Nothing imports it — `go build -race` injects it — so if the provider
+    /// stops seeding it the link fails on undefined `__tsan_*` symbols.
+    #[tokio::test]
+    async fn race_build_test_link_includes_the_race_runtime() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let addr = Addr::new(
+            PkgBuf::from("pkg"),
+            "build_test".to_string(),
+            VariantRef::new("host", "").with_race(true).to_args(),
+        );
+        let resp = provider_get(&p, addr).await.unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m.clone(),
+            other => panic!("expected deps map: {other:?}"),
+        };
+        let group = crate::plugingo::addr_util::import_path_to_dep_group("runtime/race");
+        assert!(
+            deps.contains_key(&group),
+            "race link must carry runtime/race: {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+        // And every staged archive must be a race one, stdlib included —
+        // mixing instrumented and uninstrumented archives is a link error.
+        for (name, value) in &deps {
+            if name == crate::plugingo::addr_util::GO_SDK_DEP_GROUP {
+                continue;
+            }
+            if let Value::List(v) = value {
+                for entry in v {
+                    if let Value::String(s) = entry {
+                        assert!(s.contains("race=1"), "dep {name} is not a race build: {s}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// An ordinary `build_test` must NOT drag `runtime/race` in.
+    #[tokio::test]
+    async fn non_race_build_test_omits_the_race_runtime() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let resp = provider_get(&p, make_addr("pkg", "build_test"))
+            .await
+            .unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m.clone(),
+            other => panic!("expected deps map: {other:?}"),
+        };
+        let group = crate::plugingo::addr_util::import_path_to_dep_group("runtime/race");
+        assert!(!deps.contains_key(&group));
+    }
+
+    /// A `race` value other than `1` is rejected rather than ignored. Silently
+    /// treating it as "no race" would build without instrumentation and report a
+    /// clean run — the one failure mode a user cannot spot.
+    #[tokio::test]
+    async fn bogus_race_arg_is_rejected() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let addr = Addr::new(
+            PkgBuf::from("pkg"),
+            "test".to_string(),
+            BTreeMap::from([
+                ("v".to_string(), "host".to_string()),
+                ("vp".to_string(), String::new()),
+                ("race".to_string(), "true".to_string()),
+            ]),
+        );
+        match provider_get(&p, addr).await {
+            Err(GetError::Other(e)) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("race"), "{msg}");
+            }
+            Err(GetError::NotFound) => panic!("expected an error for `race=true`, got NotFound"),
+            Ok(_) => panic!("expected an error for `race=true`, got a spec"),
+        }
+    }
+
     // ---- with_test_cycle ----
     // pkgb has internal _test.go (no cycle: internal tests can't import pkga
     // because pkga imports pkgb — Go rejects). pkgb also has xtest
@@ -5890,6 +6141,22 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "expected test in list: {:?}",
             names
         );
+    }
+
+    /// The race targets are discoverable, so `heph query` shows them and a user
+    /// does not have to know the name from documentation alone.
+    #[tokio::test]
+    async fn test_list_with_test_includes_race_targets() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let names = provider_list(&p, "pkg").await;
+        for want in ["test_race", "xtest_race"] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "expected {want} in list: {names:?}"
+            );
+        }
     }
 
     // `list` now emits the full candidate set unconditionally for any dir

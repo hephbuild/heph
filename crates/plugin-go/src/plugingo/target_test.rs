@@ -1,5 +1,5 @@
 use crate::plugingo::addr_util::{
-    go_build_env, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
+    go_build_env_for, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
     import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
 use crate::plugingo::driver_compile::{CompileParams, build_compile_spec};
@@ -184,8 +184,14 @@ pub fn build_test_spec(
     } else {
         format!(" {}", factors.ldflags.join(" "))
     };
+    // `-race` links the TSan runtime out of `runtime/race.a` (which the caller
+    // put in `all_libs`) and switches the linker to the race-aware layout. The
+    // buildmode is not fixed: race on linux must not be PIE (see
+    // `factors::link_buildmode`).
+    let race = if factors.race { " -race" } else { "" };
+    let buildmode = factors.link_buildmode();
     script.push(format!(
-        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode=pie{ldflags} -o test_binary \"$SRC_TESTMAIN\""
+        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode={buildmode}{race}{ldflags} -o test_binary \"$SRC_TESTMAIN\""
     ));
 
     let mut deps: BTreeMap<String, Value> = BTreeMap::new();
@@ -227,7 +233,7 @@ pub fn build_test_spec(
     config.insert("runtime_env".to_string(), Value::Map(runtime_env));
     // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert("env".to_string(), go_build_env());
+    config.insert("env".to_string(), go_build_env_for(factors));
 
     TargetSpec {
         addr,
@@ -253,6 +259,7 @@ pub fn test_spec(
     build_test_addr: Addr,
     data_query_addr: &Addr,
     test_env: &TestEnv,
+    race: bool,
 ) -> TargetSpec {
     // Both drivers run with cwd = the target's package dir, and the engine
     // stages dep outputs at <pkg>/<file> under ws_dir
@@ -311,11 +318,22 @@ pub fn test_spec(
         );
     }
 
+    // A race target deliberately does NOT carry the generic `test`/`go-test`
+    // labels. A race build is several times slower to produce and to run, so
+    // `heph run 'label(test)'` (and CI built on it) must keep meaning the
+    // ordinary suite; opting in is `label(test-race)`. Both are still reachable
+    // together as `label(test) || label(test-race)`.
+    let labels = if race {
+        vec!["test-race".to_string(), "go-test-race".to_string()]
+    } else {
+        vec!["test".to_string(), "go-test".to_string()]
+    };
+
     TargetSpec {
         addr,
         driver: driver.to_string(),
         config,
-        labels: vec!["test".to_string(), "go-test".to_string()],
+        labels,
         ..Default::default()
     }
 }
@@ -715,6 +733,7 @@ mod tests {
             build_addr.clone(),
             &query_addr("mypkg"),
             &TestEnv::default(),
+            false,
         );
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m.clone(),
@@ -735,6 +754,7 @@ mod tests {
             mk_addr("mypkg", "build_test"),
             &query_addr("mypkg"),
             &TestEnv::default(),
+            false,
         );
         assert_eq!(spec.driver, "exec");
         let run = match spec.config.get("run").expect("run present") {
@@ -761,6 +781,7 @@ mod tests {
             mk_addr("mypkg", "build_test"),
             &query_addr("mypkg"),
             &TestEnv::default(),
+            false,
         );
         assert!(!spec.config.contains_key("env"));
         assert!(!spec.config.contains_key("runtime_env"));
@@ -782,6 +803,7 @@ mod tests {
             mk_addr("mypkg", "build_test"),
             &query_addr("mypkg"),
             &test_env,
+            false,
         );
 
         let env = match spec.config.get("env").expect("env present") {
@@ -879,6 +901,7 @@ mod tests {
             mk_addr("mypkg", "build_test"),
             &query_addr("mypkg"),
             &TestEnv::default(),
+            false,
         );
         assert!(spec.labels.contains(&"test".to_string()));
         assert!(spec.labels.contains(&"go-test".to_string()));
@@ -892,6 +915,7 @@ mod tests {
             mk_addr("mypkg", "build_test"),
             &qa,
             &TestEnv::default(),
+            false,
         );
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m.clone(),
@@ -932,6 +956,7 @@ mod tests {
             mk_addr("mypkg", "build_test"),
             &query_addr("mypkg"),
             &test_env,
+            false,
         );
         assert_eq!(spec.driver, "bash");
         let lines: Vec<String> = match spec.config.get("run").expect("run present") {
@@ -955,6 +980,105 @@ mod tests {
         );
     }
 
+    // ---- race ----
+
+    fn race_factors(goos: &str) -> Factors {
+        Factors {
+            goos: goos.into(),
+            goarch: "arm64".into(),
+            race: true,
+            ..Default::default()
+        }
+    }
+
+    fn link_spec(factors: &Factors) -> TargetSpec {
+        build_test_spec(
+            mk_addr("pkg", "build_test"),
+            factors,
+            &mk_addr("pkg", "build_testmain_lib"),
+            &[],
+            V,
+        )
+    }
+
+    /// The linker needs `-race` to pull the TSan runtime in and lay the binary
+    /// out for it.
+    #[test]
+    fn race_link_passes_race_flag() {
+        assert!(run_str(&link_spec(&race_factors("darwin"))).contains(" -race"));
+        assert!(!run_str(&link_spec(&test_factors())).contains("-race"));
+    }
+
+    /// `go build` refuses pie+race on linux, and `go tool link` — which is what
+    /// we call — does not enforce that: it produces a binary that dies at
+    /// startup with "ThreadSanitizer failed to allocate". So the buildmode has to
+    /// be chosen here.
+    #[test]
+    fn linux_race_link_is_not_pie() {
+        let run = run_str(&link_spec(&race_factors("linux")));
+        assert!(run.contains("-buildmode=exe"), "{run}");
+        assert!(!run.contains("-buildmode=pie"), "{run}");
+    }
+
+    /// darwin supports pie+race, so it keeps the ordinary buildmode.
+    #[test]
+    fn darwin_race_link_stays_pie() {
+        assert!(
+            run_str(&link_spec(&race_factors("darwin"))).contains("-buildmode=pie"),
+            "{}",
+            run_str(&link_spec(&race_factors("darwin")))
+        );
+    }
+
+    #[test]
+    fn non_race_link_stays_pie_everywhere() {
+        for goos in ["linux", "darwin"] {
+            let f = Factors {
+                goos: goos.into(),
+                goarch: "arm64".into(),
+                ..Default::default()
+            };
+            assert!(run_str(&link_spec(&f)).contains("-buildmode=pie"), "{goos}");
+        }
+    }
+
+    /// linux race enables cgo (for `runtime/race`), and the value lives in the
+    /// hashed `env` so a stale non-cgo link can't be served from cache.
+    #[test]
+    fn race_link_env_tracks_cgo() {
+        let cgo = |f: &Factors| match link_spec(f).config.get("env").unwrap() {
+            Value::Map(m) => match m.get("CGO_ENABLED") {
+                Some(Value::String(s)) => s.clone(),
+                other => panic!("expected CGO_ENABLED string: {other:?}"),
+            },
+            other => panic!("expected env map: {other:?}"),
+        };
+        assert_eq!(cgo(&race_factors("linux")), "1");
+        assert_eq!(cgo(&race_factors("darwin")), "0");
+        assert_eq!(cgo(&test_factors()), "0");
+    }
+
+    /// A race run target is labelled apart from the ordinary suite. `label(test)`
+    /// must keep meaning "the fast tests" — a race build is several times slower
+    /// to produce and to run, so `//...` must not silently double every test.
+    #[test]
+    fn race_test_spec_is_labelled_separately() {
+        let racy = test_spec(
+            mk_addr("mypkg", "test_race"),
+            mk_addr("mypkg", "build_test"),
+            &query_addr("mypkg"),
+            &TestEnv::default(),
+            true,
+        );
+        assert!(racy.labels.contains(&"test-race".to_string()));
+        assert!(racy.labels.contains(&"go-test-race".to_string()));
+        assert!(
+            !racy.labels.contains(&"test".to_string()),
+            "a race target must not join the ordinary test suite: {:?}",
+            racy.labels
+        );
+    }
+
     #[test]
     fn test_test_spec_empty_pre_run_stays_exec() {
         let spec = test_spec(
@@ -962,6 +1086,7 @@ mod tests {
             mk_addr("mypkg", "build_test"),
             &query_addr("mypkg"),
             &TestEnv::default(),
+            false,
         );
         assert_eq!(spec.driver, "exec");
     }
