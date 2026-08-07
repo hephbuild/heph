@@ -757,11 +757,6 @@ impl ManagedDriver for Driver {
         )
         .context("write the digest output")?;
 
-        tracing::info!(
-            platforms = def.platforms.join(","),
-            digest,
-            "oci_image: assembled"
-        );
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }

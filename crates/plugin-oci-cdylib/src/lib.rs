@@ -35,8 +35,9 @@ pub extern "C" fn heph_plugin_create(_cfg: stabby::vec::Vec<u8>) -> PluginCompon
 
 /// Stable ABI log-sink entry: the host calls this right after `create` to hand
 /// the plugin a sink for its `tracing` events. Without it, this cdylib's
-/// statically-linked `tracing` has no subscriber and every `docker_build built` /
-/// `oci_push: pushed` line vanishes.
+/// statically-linked `tracing` has no subscriber and every diagnostic these
+/// drivers emit — an unpinned `oci_pull` tag, a log file that would not open —
+/// vanishes silently.
 #[stabby::export]
 pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);

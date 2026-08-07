@@ -442,12 +442,6 @@ impl ManagedDriver for Driver {
         )
         .context("write the digest output")?;
 
-        tracing::info!(
-            platforms = seen.keys().cloned().collect::<Vec<_>>().join(","),
-            images = def.images.len(),
-            digest,
-            "oci_index: grouped"
-        );
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }

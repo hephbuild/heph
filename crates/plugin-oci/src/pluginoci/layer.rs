@@ -467,11 +467,6 @@ impl ManagedDriver for Driver {
         write_layer(&out_path, &entries, def.mode)
             .with_context(|| format!("write the layer to {out_path:?}"))?;
 
-        tracing::info!(
-            files = entries.len(),
-            prefix = def.prefix,
-            "oci_layer: packed"
-        );
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
