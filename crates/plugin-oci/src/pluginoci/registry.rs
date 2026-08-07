@@ -203,6 +203,39 @@ pub(crate) async fn push_layout(
         .context("push manifest list")
 }
 
+/// `<registry>/<repository>@<digest>` — the ref with its tag replaced by what
+/// the registry actually served.
+///
+/// Built from the *resolved* registry and repository rather than by editing the
+/// user's string: `alpine:3.20` and `docker.io/library/alpine:3.20` name one
+/// image, and only the expanded form is unambiguous to paste back into `src`.
+fn pinned_ref(reference: &Reference, digest: &str) -> String {
+    // `registry()`, not `resolve_registry()`: the former keeps the spelling the
+    // BUILD file used and already normalizes Docker Hub shorthand to
+    // `docker.io`, while the latter reports the *API endpoint*
+    // (`index.docker.io`) — correct to connect to, needlessly surprising to
+    // paste back.
+    format!(
+        "{}/{}@{}",
+        reference.registry().trim_end_matches('/'),
+        reference.repository(),
+        digest
+    )
+}
+
+/// What a pull resolved to, beyond the bytes.
+pub(crate) struct Pulled {
+    pub index: OciImageIndex,
+    pub blobs: super::archive::Blobs,
+    /// See [`pinned_ref`] — e.g. `cgr.dev/chainguard/static@sha256:…`.
+    ///
+    /// A tag is a pointer, and heph keys a pull on the *string* — so a caller
+    /// who wants the pull to stay reproducible needs the thing the pointer
+    /// pointed at, at the moment it was followed. This is that, spelled so it
+    /// can be pasted straight back into `src`.
+    pub pinned_ref: String,
+}
+
 /// Pull the selected platforms of `reference` into an in-memory layout.
 ///
 /// Goes through the raw manifest rather than `Client::pull`, which resolves a
@@ -214,7 +247,7 @@ pub(crate) async fn pull_layout(
     platforms: &super::pull::PlatformSelect,
     insecure: bool,
     blob_dir: &std::path::Path,
-) -> anyhow::Result<(OciImageIndex, super::archive::Blobs)> {
+) -> anyhow::Result<Pulled> {
     let reference: Reference = reference
         .parse()
         .with_context(|| format!("parse image reference {reference:?}"))?;
@@ -231,6 +264,8 @@ pub(crate) async fn pull_layout(
         .pull_manifest_raw(&reference, &auth, ACCEPTED)
         .await
         .with_context(|| format!("pull the manifest of {reference}"))?;
+
+    let pinned_ref = pinned_ref(&reference, &digest);
 
     std::fs::create_dir_all(blob_dir)
         .with_context(|| format!("create the blob staging dir {blob_dir:?}"))?;
@@ -262,7 +297,11 @@ pub(crate) async fn pull_layout(
                 }],
                 annotations: None,
             };
-            return Ok((index, blobs));
+            return Ok(Pulled {
+                index,
+                blobs,
+                pinned_ref,
+            });
         }
     };
 
@@ -292,7 +331,11 @@ pub(crate) async fn pull_layout(
         manifests: entries,
         annotations: None,
     };
-    Ok((index, blobs))
+    Ok(Pulled {
+        index,
+        blobs,
+        pinned_ref,
+    })
 }
 
 /// The index entries the selection asks for, or an error naming what is on offer.
@@ -393,6 +436,38 @@ async fn pull_one(
 mod tests {
     use super::*;
     use futures::StreamExt as _;
+
+    /// The remedy the warning offers has to be pasteable: a ref the user can
+    /// drop straight into `src`, naming the digest the tag pointed at.
+    #[test]
+    fn a_resolved_ref_pins_the_digest_and_keeps_the_spelling() {
+        let d = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let pin = |r: &str| pinned_ref(&r.parse::<Reference>().expect("ref"), d);
+
+        // A private registry keeps the spelling the BUILD file used.
+        assert_eq!(
+            pin("cgr.dev/chainguard/static:latest-glibc"),
+            format!("cgr.dev/chainguard/static@{d}")
+        );
+        // Docker Hub shorthand expands, because `alpine` alone is not a ref any
+        // other tool would resolve the same way.
+        assert_eq!(
+            pin("alpine:3.20"),
+            format!("docker.io/library/alpine@{d}"),
+            "shorthand expands: `alpine@sha256:…` is not a ref every tool agrees on"
+        );
+        // Already pinned: the digest is simply restated, never doubled up.
+        assert_eq!(
+            pin(&format!("cgr.dev/chainguard/static@{d}")),
+            format!("cgr.dev/chainguard/static@{d}")
+        );
+        // The result is a ref again — the whole point is that it round-trips.
+        assert!(
+            pin("cgr.dev/chainguard/static:latest-glibc")
+                .parse::<Reference>()
+                .is_ok()
+        );
+    }
 
     /// The upload path reads a blob in bounded chunks and reassembles to exactly
     /// the original bytes.
