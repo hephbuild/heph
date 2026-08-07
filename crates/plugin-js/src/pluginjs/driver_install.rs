@@ -161,8 +161,8 @@ impl ManagedDriver for JsInstallDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
-        let spec = JsInstallSpec::from(&req.target_spec.config)
-            .context("parse js_install config")?;
+        let spec =
+            JsInstallSpec::from(&req.target_spec.config).context("parse js_install config")?;
 
         // Fail loudly, before any network fetch: never silently skip a
         // required lifecycle script (`.claude/rust.md`/memory: "fail or fix,
