@@ -17,7 +17,45 @@ use oci_client::manifest::OciImageIndex;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
-use super::archive::Layout;
+use super::archive::{Blob, Layout};
+
+/// How much of a blob is read at a time on its way to the registry. Bounded so
+/// a layer's size never becomes the driver's peak memory.
+const PUSH_CHUNK: usize = 512 * 1024;
+
+/// A blob as a chunked byte stream, read lazily off disk.
+///
+/// `push_blob` takes the whole blob as one `Bytes`; `push_blob_stream` takes
+/// this instead, which is what keeps a multi-gigabyte layer out of memory.
+fn blob_stream(
+    blob: &Blob,
+) -> anyhow::Result<impl futures::Stream<Item = oci_client::errors::Result<bytes::Bytes>>> {
+    let mut reader = blob.reader()?;
+    Ok(futures::stream::poll_fn(move |_| {
+        let mut buf = vec![0u8; PUSH_CHUNK];
+        let mut filled = 0;
+        // `read` is free to return short; keep going until the chunk is full or
+        // the blob ends, so the registry sees uniform chunks.
+        while let Some(rest) = buf.get_mut(filled..).filter(|r| !r.is_empty()) {
+            match std::io::Read::read(&mut reader, rest) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => {
+                    return std::task::Poll::Ready(Some(Err(
+                        oci_client::errors::OciDistributionError::GenericError(Some(format!(
+                            "read blob: {e}"
+                        ))),
+                    )));
+                }
+            }
+        }
+        if filled == 0 {
+            return std::task::Poll::Ready(None);
+        }
+        buf.truncate(filled);
+        std::task::Poll::Ready(Some(Ok(bytes::Bytes::from(buf))))
+    }))
+}
 
 /// Build a client for `insecure` (plain HTTP / self-signed) or the default TLS.
 fn client(insecure: bool) -> Client {
@@ -97,9 +135,11 @@ pub(crate) async fn push_layout(
             {
                 continue;
             }
-            let bytes = layout.blob(&digest)?.clone();
+            // Streamed off disk in chunks, never read whole: a layer is the
+            // largest thing this plugin touches, and `push_blob` would want it
+            // as one `Bytes`.
             client
-                .push_blob(&reference, bytes, &digest)
+                .push_blob_stream(&reference, blob_stream(layout.blob(&digest)?)?, &digest)
                 .await
                 .with_context(|| format!("push blob {digest}"))?;
         }
@@ -108,7 +148,7 @@ pub(crate) async fn push_layout(
         // exactly what it receives, and serde will not reproduce byte-for-byte
         // what buildx wrote (key order, spacing). Re-encoding gets
         // DIGEST_INVALID.
-        let raw = layout.blob(digest)?;
+        let raw = layout.blob_bytes(digest)?;
         client
             .push_manifest_raw(
                 &reference,
@@ -173,7 +213,8 @@ pub(crate) async fn pull_layout(
     reference: &str,
     platforms: &super::pull::PlatformSelect,
     insecure: bool,
-) -> anyhow::Result<(OciImageIndex, std::collections::HashMap<String, Vec<u8>>)> {
+    blob_dir: &std::path::Path,
+) -> anyhow::Result<(OciImageIndex, super::archive::Blobs)> {
     let reference: Reference = reference
         .parse()
         .with_context(|| format!("parse image reference {reference:?}"))?;
@@ -191,20 +232,22 @@ pub(crate) async fn pull_layout(
         .await
         .with_context(|| format!("pull the manifest of {reference}"))?;
 
-    let mut blobs = std::collections::HashMap::new();
+    std::fs::create_dir_all(blob_dir)
+        .with_context(|| format!("create the blob staging dir {blob_dir:?}"))?;
+    let mut blobs = super::archive::Blobs::new();
 
     // An index: choose among its instances. A bare manifest: there is nothing to
     // choose, and asking for a platform it does not advertise would be pedantry.
     let entries = match serde_json::from_slice::<OciImageIndex>(&raw) {
         Ok(index) if !index.manifests.is_empty() => {
-            blobs.insert(digest.clone(), raw.to_vec());
+            blobs.insert(digest.clone(), Blob::Bytes(raw.to_vec()));
             select_entries(&index, platforms)?
         }
         _ => {
             let manifest: oci_client::manifest::OciImageManifest =
                 serde_json::from_slice(&raw).context("parse image manifest")?;
-            blobs.insert(digest.clone(), raw.to_vec());
-            pull_one(&client, &reference, &auth, &manifest, &mut blobs).await?;
+            blobs.insert(digest.clone(), Blob::Bytes(raw.to_vec()));
+            pull_one(&client, &reference, &manifest, blob_dir, &mut blobs).await?;
             let index = OciImageIndex {
                 schema_version: 2,
                 media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
@@ -238,8 +281,8 @@ pub(crate) async fn pull_layout(
             .with_context(|| format!("pull the manifest for {}", entry.digest))?;
         let manifest: oci_client::manifest::OciImageManifest =
             serde_json::from_slice(&raw).context("parse a platform's manifest")?;
-        blobs.insert(entry.digest.clone(), raw.to_vec());
-        pull_one(&client, &reference, &auth, &manifest, &mut blobs).await?;
+        blobs.insert(entry.digest.clone(), Blob::Bytes(raw.to_vec()));
+        pull_one(&client, &reference, &manifest, blob_dir, &mut blobs).await?;
     }
 
     let index = OciImageIndex {
@@ -291,14 +334,28 @@ fn select_entries(
     Ok(out)
 }
 
-/// Fetch one manifest's config and layers into `blobs`.
+/// Fetch one manifest's config and layers, straight to disk.
+///
+/// Streamed rather than pulled into a `Vec<u8>`: a pull's whole job is to
+/// produce an artifact on disk, and buffering every layer first meant a
+/// multi-gigabyte base image was resident in the plugin before a single byte of
+/// it was written.
+///
+/// The chunks are written with `std::fs`, not `tokio::fs`, on purpose: a plugin
+/// cdylib's tokio is a separate runtime instance polled by host workers, so
+/// anything that reaches for a reactor or a blocking pool aborts across the ABI
+/// seam. Reading from the network is the host's socket; writing is a plain
+/// `write_all`.
 async fn pull_one(
     client: &Client,
     reference: &Reference,
-    _auth: &RegistryAuth,
     manifest: &oci_client::manifest::OciImageManifest,
-    blobs: &mut std::collections::HashMap<String, Vec<u8>>,
+    blob_dir: &std::path::Path,
+    blobs: &mut super::archive::Blobs,
 ) -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+    use std::io::Write as _;
+
     let mut wanted = vec![manifest.config.digest.clone()];
     wanted.extend(manifest.layers.iter().map(|l| l.digest.clone()));
     for digest in wanted {
@@ -307,12 +364,67 @@ async fn pull_one(
             // the same blob for every architecture that inherits it.
             continue;
         }
-        let mut buf = Vec::new();
-        client
-            .pull_blob(reference, digest.as_str(), &mut buf)
+        let path = blob_dir.join(digest.replace(':', "_"));
+        // Written to a temp name and renamed: the file is content-addressed by
+        // its digest and nothing re-verifies it, so an interrupted pull must not
+        // leave a truncated blob behind claiming to be the whole thing.
+        let tmp = path.with_extension("partial");
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("create blob file {tmp:?}"))?;
+        let mut stream = client
+            .pull_blob_stream(reference, digest.as_str())
             .await
             .with_context(|| format!("pull blob {digest}"))?;
-        blobs.insert(digest, buf);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("read blob {digest} from the registry"))?;
+            file.write_all(&chunk)
+                .with_context(|| format!("write blob {digest} to {tmp:?}"))?;
+        }
+        file.flush().with_context(|| format!("flush {tmp:?}"))?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("move blob {tmp:?} into place at {path:?}"))?;
+        blobs.insert(digest, Blob::File(path));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt as _;
+
+    /// The upload path reads a blob in bounded chunks and reassembles to exactly
+    /// the original bytes.
+    ///
+    /// Only the docker-gated suite drives a real push, so without this the
+    /// chunking — off-by-one on the last partial chunk, a short `read` treated
+    /// as EOF — would be covered by nothing that runs on every push.
+    #[tokio::test]
+    async fn a_blob_streams_back_in_bounded_chunks() {
+        // Deliberately not a multiple of PUSH_CHUNK: the last chunk is partial,
+        // which is where a length bug shows up.
+        let len = PUSH_CHUNK * 2 + 7;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blob");
+        std::fs::write(&path, &data).expect("write");
+
+        for blob in [Blob::Bytes(data.clone()), Blob::File(path)] {
+            let mut stream = Box::pin(blob_stream(&blob).expect("stream"));
+            let mut chunks = Vec::new();
+            let mut got = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.expect("chunk");
+                chunks.push(chunk.len());
+                got.extend_from_slice(&chunk);
+            }
+            assert_eq!(got, data, "the stream must reassemble to the blob");
+            assert_eq!(
+                chunks,
+                vec![PUSH_CHUNK, PUSH_CHUNK, 7],
+                "full chunks, then the remainder — never a chunk past the end"
+            );
+        }
+    }
 }

@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 pub mod archive;
 pub mod docker_build;
+pub mod image;
+pub mod layer;
 pub mod load;
 pub mod platform;
 pub mod pull;
