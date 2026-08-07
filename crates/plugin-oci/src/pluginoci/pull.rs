@@ -314,10 +314,31 @@ impl ManagedDriver for Driver {
         // workspace dir so they are not collected as outputs. The sandbox is
         // torn down after the run, so there is nothing to clean up.
         let blob_dir = req.sandbox_dir.join("heph-oci-blobs");
-        let (index, blobs) =
-            super::registry::pull_layout(&def.src, &def.platform, def.insecure, &blob_dir)
-                .await
-                .with_context(|| format!("pull image {}", def.src))?;
+        let pulled = super::registry::pull_layout(&def.src, &def.platform, def.insecure, &blob_dir)
+            .await
+            .with_context(|| format!("pull image {}", def.src))?;
+        let super::registry::Pulled {
+            index,
+            blobs,
+            pinned_ref,
+        } = pulled;
+
+        // The parse-time warning can only say *that* the ref is mutable — the
+        // digest it currently points at is not known until the registry has been
+        // asked. This is that answer, and it is the whole remedy: paste it back
+        // into `src` and the pull becomes reproducible.
+        //
+        // Only on a real pull, so it does not nag on a cache hit, where nothing
+        // was resolved and the recorded bytes are whatever the tag meant last.
+        if !is_digest_pinned(&def.src) {
+            tracing::warn!(
+                image = def.src,
+                resolved = pinned_ref,
+                "oci_pull: {:?} currently resolves to {pinned_ref:?} — pin `src` to that to \
+                 make this pull reproducible",
+                def.src
+            );
+        }
 
         if def.layout {
             // A layout *directory* is the shape `docker_build`'s `bases` consumes:
