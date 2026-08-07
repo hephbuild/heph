@@ -64,6 +64,11 @@ pub(crate) struct GocacheKey {
     pub goarch: String,
     pub build_tags: Vec<String>,
     pub goexperiment: Vec<String>,
+    /// Race builds see a different file set (`//go:build race`) and a different
+    /// import graph, so they get their own slot rather than churning the ordinary
+    /// one. Go's own cache would key the entries correctly either way; this keeps
+    /// the two working sets from evicting each other.
+    pub race: bool,
 }
 
 impl GocacheKey {
@@ -132,6 +137,7 @@ mod tests {
             goarch: "amd64".to_string(),
             build_tags: vec![],
             goexperiment: vec![],
+            race: false,
         }
     }
 

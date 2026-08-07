@@ -1,5 +1,5 @@
 use crate::plugingo::addr_util::{
-    go_build_env, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
+    go_build_env_for, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
     import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
 use crate::plugingo::factors::{BuildMode, Factors};
@@ -140,7 +140,7 @@ pub fn build_spec(
     config.insert("runtime_env".to_string(), Value::Map(runtime_env));
     // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert("env".to_string(), go_build_env());
+    config.insert("env".to_string(), go_build_env_for(factors));
 
     TargetSpec {
         addr,

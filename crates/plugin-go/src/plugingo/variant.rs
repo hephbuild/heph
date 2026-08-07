@@ -26,7 +26,7 @@
 //! **same `variants` map** and override selected fields (list fields replace, not
 //! append). `goos`/`goarch` may be omitted when inherited. Cycles are rejected.
 
-use crate::plugingo::factors::{BuildMode, Factors, VariantRef};
+use crate::plugingo::factors::{BuildMode, Factors, VariantRef, race_from_args};
 use anyhow::{Context, bail};
 use hcore::htvalue::{Value, parse_strings};
 use hmodel::htaddr::Addr;
@@ -363,6 +363,21 @@ pub async fn resolve(
             defined_variant_names(req_states).join(", ")
         );
     };
+    // Race is orthogonal to the variant: it comes off the addr, not the
+    // `variants` declaration, and overlays whichever factor set resolves below.
+    let race = race_from_args(&addr.args)?;
+    let apply_race = |(mut f, v): (Factors, VariantRef)| -> (Factors, VariantRef) {
+        f.race = race;
+        // Resolve the effective buildmode once, here, rather than at each of the
+        // places that consume it: a linux race build cannot be PIE (see
+        // `BuildMode::for_race`). Doing it at resolution keeps the compile's
+        // `-shared` and the link's `-buildmode=` deriving from one value, so they
+        // cannot drift apart — and it means the override is visible in the def
+        // hash, so a race archive is never confused with a `pie` one.
+        f.buildmode = f.buildmode.for_race(&f.goos, race);
+        (f, v.with_race(race))
+    };
+
     match addr.args.get("vp") {
         // Only honor `vp` when it lies within the target's OWN go module. The
         // variant universe is bounded to the module: a `vp` threaded from a
@@ -380,7 +395,7 @@ pub async fn resolve(
                 .find_map(|s| variant_in_state(s, name).transpose())
                 .transpose()?
             {
-                return Ok((f, vref));
+                return Ok(apply_race((f, vref)));
             }
             // Otherwise fetch `vp`'s own declaration directly. `states_under(vp)`
             // includes `vp`'s package (siblings of the target are reachable this
@@ -391,10 +406,10 @@ pub async fn resolve(
                 .with_context(|| format!("fetching variant declaration at `{vp}`"))?;
             let universe = build_universe(&vp_states)?;
             let f = resolve_in_universe(&vref, &universe)?;
-            Ok((f, vref))
+            Ok(apply_race((f, vref)))
         }
         // No `vp`, or a `vp` outside this module: resolve by module-bounded ancestry.
-        _ => resolve_ancestry(name, req_states, module_root),
+        _ => resolve_ancestry(name, req_states, module_root).map(apply_race),
     }
 }
 
@@ -744,5 +759,97 @@ mod tests {
             vref.pkg, "dev/app",
             "vp rebased to the target's own module, not the foreign `mgmt/go`"
         );
+    }
+
+    // ---- race ----
+
+    fn race_addr(pkg: &str, variant: &str) -> Addr {
+        Addr::new(
+            PkgBuf::from(pkg),
+            "build_test".to_string(),
+            VariantRef::new(variant, "").with_race(true).to_args(),
+        )
+    }
+
+    fn no_universe() -> UniverseExec {
+        UniverseExec {
+            under: HashMap::new(),
+        }
+    }
+
+    /// The integration point for the linux race rule: a variant that explicitly
+    /// declares `buildmode = "pie"` still resolves to `exe` under race, because
+    /// `go tool link` would otherwise emit a binary that dies at startup with
+    /// "ThreadSanitizer failed to allocate".
+    ///
+    /// Resolving it here (rather than at each consumer) is what keeps the
+    /// compile's `-shared` and the link's `-buildmode=` deriving from one value.
+    #[tokio::test]
+    async fn linux_race_resolves_pie_down_to_exe() {
+        let pie_linux = variant_val(&[
+            ("goos", s("linux")),
+            ("goarch", s("amd64")),
+            ("buildmode", s("pie")),
+        ]);
+        let states = vec![go_state("app", &[("dev", pie_linux)])];
+        let (f, vref) = resolve(
+            &race_addr("app", "dev"),
+            &states,
+            "app",
+            &no_universe(),
+            false,
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(f.buildmode, BuildMode::Exe, "linux race must not be PIE");
+        assert!(!f.buildmode.needs_shared(), "and must drop -shared with it");
+        assert!(f.race);
+        assert!(vref.race, "the race flag threads onto dependency addrs");
+    }
+
+    /// darwin supports pie+race, so the same declaration is honoured there —
+    /// the override is scoped to where Go actually forbids the combination.
+    #[tokio::test]
+    async fn darwin_race_keeps_a_declared_pie() {
+        let pie_darwin = variant_val(&[
+            ("goos", s("darwin")),
+            ("goarch", s("arm64")),
+            ("buildmode", s("pie")),
+        ]);
+        let states = vec![go_state("app", &[("dev", pie_darwin)])];
+        let (f, _) = resolve(
+            &race_addr("app", "dev"),
+            &states,
+            "app",
+            &no_universe(),
+            false,
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(f.buildmode, BuildMode::Pie);
+        assert!(f.buildmode.needs_shared());
+    }
+
+    /// An ordinary (non-race) build is untouched by any of this: the declared
+    /// buildmode survives on linux too.
+    #[tokio::test]
+    async fn non_race_linux_keeps_a_declared_pie() {
+        let pie_linux = variant_val(&[
+            ("goos", s("linux")),
+            ("goarch", s("amd64")),
+            ("buildmode", s("pie")),
+        ]);
+        let states = vec![go_state("app", &[("dev", pie_linux)])];
+        let addr = Addr::new(
+            PkgBuf::from("app"),
+            "build_test".to_string(),
+            VariantRef::new("dev", "").to_args(),
+        );
+        let (f, vref) = resolve(&addr, &states, "app", &no_universe(), false)
+            .await
+            .expect("resolves");
+        assert_eq!(f.buildmode, BuildMode::Pie);
+        assert!(!f.race);
+        assert!(!vref.race);
     }
 }
