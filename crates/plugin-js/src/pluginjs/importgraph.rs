@@ -461,6 +461,20 @@ pub fn find_nearest_lint_config(
     find_nearest_file(workspace_root, pkg_dir, candidates)
 }
 
+/// Same ancestor walk, generalized once more to `js_bundle`'s bundler config
+/// file — see `driver_bundle.rs` module docs. Only `esbuild.config.json` is
+/// recognized in this milestone (the esbuild CLI has no auto-discovered
+/// config file convention of its own; a JS/TS esbuild config driven through
+/// its Node API is out of scope for this CLI-based driver — a disclosed gap,
+/// not a silently missing feature).
+pub fn find_nearest_bundler_config(
+    workspace_root: &Path,
+    pkg_dir: &Path,
+    candidates: &[&str],
+) -> Option<PathBuf> {
+    find_nearest_file(workspace_root, pkg_dir, candidates)
+}
+
 /// Walk up from `pkg_dir` (inclusive) to `workspace_root` looking for the
 /// nearest `package.json` whose own `"jest"` field is present — jest's other
 /// documented config location, alongside the dedicated `jest.config.*`
@@ -2017,7 +2031,14 @@ pub(crate) fn thirdparty_pkg_name_from_path(resolved: &Path) -> Option<String> {
 /// owns it — `None` if it escaped `workspace_root` entirely (shouldn't
 /// happen for a first-party resolution, but resolution is not proof of
 /// that).
-fn firstparty_owning_pkg_dir(resolved: &Path, workspace_root: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)`, not private: `provider.rs`'s `js_bundle` cross-package
+/// closure walk (`Provider::bundle_closure`) reuses this to find which
+/// sibling package a first-party edge crossed into, so it knows which
+/// package's own `ImportGraph` to fetch next — the exact "which package owns
+/// this resolved path" question [`check_phantom_dependencies`] already
+/// answers for a one-hop edge.
+pub(crate) fn firstparty_owning_pkg_dir(resolved: &Path, workspace_root: &Path) -> Option<PathBuf> {
     let mut dir = if resolved.is_dir() {
         resolved
     } else {
@@ -2175,6 +2196,7 @@ mod tests {
     ) -> PackageManifest {
         PackageManifest {
             name: name.to_string(),
+            main: None,
             dependencies: deps
                 .iter()
                 .map(|d| (d.to_string(), "*".to_string()))
@@ -3391,5 +3413,214 @@ mod tests {
         let refs =
             extract_eslint_module_refs(Path::new(".eslintrc.json"), content).expect("scan config");
         assert!(refs.is_empty(), "{refs:?}");
+    }
+
+    // ---- Ad hoc perf measurement (not a regression test; see task) ----
+    //
+    // Standalone, self-contained timing of `build_package_import_graph`
+    // across a synthetic multi-package workspace. NOT wired into
+    // `crates/bench`'s Tier A/B baseline-vs-candidate harness (that's a
+    // separate, bigger project) — this is a one-off measurement to answer
+    // "is the import-graph build actually fast" for the perf-measurement
+    // task. `#[ignore]`d so `tst` never runs it; run explicitly:
+    //
+    //   cargo test -p plugin-js --lib pluginjs::importgraph::tests::adhoc_bench \
+    //     -- --ignored --nocapture --test-threads=1
+    mod adhoc_bench {
+        use super::*;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        /// Build a synthetic workspace of `n_pkgs` packages, `files_per_pkg`
+        /// source files each. Each file has: 2 relative same-package imports
+        /// (to other files in the same package, wrapping), 1 relative
+        /// cross-package import (first-party edge into a sibling package —
+        /// pnpm/npm workspaces resolve these via `node_modules` symlinks in
+        /// reality, but the resolver doesn't care how it got there, only that
+        /// the specifier resolves to a real path, so a direct relative path
+        /// exercises the same resolution cost), and 1 bare specifier
+        /// (`lodash`, third-party, deliberately left unresolvable since no
+        /// real `node_modules` is staged — this is the worst case for
+        /// resolution cost: `oxc_resolver` must walk every ancestor
+        /// `node_modules` directory before giving up).
+        fn build_corpus(dir: &Path, n_pkgs: usize, files_per_pkg: usize) {
+            for i in 0..n_pkgs {
+                write(
+                    dir,
+                    &format!("packages/pkg{i}/package.json"),
+                    &format!(r#"{{"name":"pkg{i}","dependencies":{{"lodash":"^4.0.0"}}}}"#),
+                );
+                for j in 0..files_per_pkg {
+                    let next_local = (j + 1) % files_per_pkg;
+                    let next_pkg = (i + 1) % n_pkgs;
+                    let content = format!(
+                        "import {{ v{next_local} }} from \"./file{next_local}\";\n\
+                         import {{ x0 }} from \"../pkg{next_pkg}/src/file0\";\n\
+                         import lodash from \"lodash\";\n\
+                         export const v{j} = 1;\n"
+                    );
+                    write(dir, &format!("packages/pkg{i}/src/file{j}.ts"), &content);
+                }
+            }
+        }
+
+        /// Cold (first build) vs warm (`ResolveCache`/graph reused — this
+        /// mimics `Provider::import_graph`'s per-package `OnceCell`, which on
+        /// a warm hit just returns the cached `Arc` with no re-parse/re-resolve
+        /// at all) timings for one workspace size. Prints absolute numbers;
+        /// asserts nothing about wall-clock (perf numbers vary by machine —
+        /// this is a measurement tool, not a regression gate).
+        fn run_cold_warm(label: &str, n_pkgs: usize, files_per_pkg: usize) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            build_corpus(dir.path(), n_pkgs, files_per_pkg);
+            let w = walker();
+
+            // Cold: one fresh Resolvers + ResolveCache per package, exactly
+            // as `Provider::import_graph` does on a graph_cache miss.
+            let cold_start = Instant::now();
+            let mut total_edges = 0usize;
+            for i in 0..n_pkgs {
+                let pkg = format!("packages/pkg{i}");
+                let resolvers = Resolvers::new(None);
+                let resolve_cache = ResolveCache::new();
+                let graph = build_package_import_graph(
+                    &w,
+                    dir.path(),
+                    &pkg,
+                    &resolvers,
+                    &resolve_cache,
+                    None,
+                )
+                .expect("build import graph");
+                total_edges += graph.runtime_edges.len();
+            }
+            let cold = cold_start.elapsed();
+
+            // Warm: what `Provider::import_graph`'s `OnceCell` actually saves
+            // on a second request for the same package is the ENTIRE
+            // parse+resolve pass (it never re-enters `build_package_import_graph`
+            // at all) — so the honest "warm" number here is a second
+            // Arc-cached lookup, which is why we don't even call
+            // `build_package_import_graph` again: that would measure a
+            // *different, uncached* pipeline (fresh `ResolveCache`), not what
+            // M5's cache actually delivers. Instead we time the trivial
+            // `OnceCell::get` re-fetch cost directly against the same graphs
+            // built above, to make the "what does the cache save" comparison
+            // honest rather than re-running the expensive path a second time.
+            let cached: Vec<Arc<ImportGraph>> = (0..n_pkgs)
+                .map(|i| {
+                    let pkg = format!("packages/pkg{i}");
+                    let resolvers = Resolvers::new(None);
+                    let resolve_cache = ResolveCache::new();
+                    Arc::new(
+                        build_package_import_graph(
+                            &w,
+                            dir.path(),
+                            &pkg,
+                            &resolvers,
+                            &resolve_cache,
+                            None,
+                        )
+                        .expect("build import graph"),
+                    )
+                })
+                .collect();
+            let warm_start = Instant::now();
+            let mut warm_edges = 0usize;
+            for g in &cached {
+                warm_edges += g.runtime_edges.len();
+            }
+            let warm = warm_start.elapsed();
+
+            let total_files = n_pkgs * files_per_pkg;
+            println!(
+                "[adhoc-bench] {label}: {n_pkgs} pkgs x {files_per_pkg} files = {total_files} files\n\
+                 \x20 cold total  = {cold:?}  ({:.3} ms/pkg, {:.4} ms/file)\n\
+                 \x20 warm total  = {warm:?}  (Arc-cache re-fetch; ~0 by construction — the real\n\
+                 \x20              saving IS the {cold:?} avoided, not a re-run)\n\
+                 \x20 edges       = {total_edges} cold, {warm_edges} warm (sanity: equal)",
+                cold.as_secs_f64() * 1000.0 / n_pkgs as f64,
+                cold.as_secs_f64() * 1000.0 / total_files as f64,
+            );
+            assert_eq!(total_edges, warm_edges, "sanity: same graphs");
+        }
+
+        #[test]
+        #[ignore]
+        fn adhoc_bench_cold_warm_small() {
+            run_cold_warm("small", 20, 15);
+        }
+
+        #[test]
+        #[ignore]
+        fn adhoc_bench_cold_warm_large() {
+            run_cold_warm("large", 150, 15);
+        }
+
+        /// Splits the cold-build cost into parse time (`importparse::parse_file_imports`,
+        /// pure `oxc_parser`) vs resolve time (`ResolveCache::get_or_resolve`,
+        /// `oxc_resolver`) by manually replicating `build_package_import_graph`'s
+        /// loop with two separate `Instant` accumulators — the production
+        /// function doesn't expose this split itself, so this is a deliberate
+        /// duplicate of its loop body for measurement purposes only.
+        #[test]
+        #[ignore]
+        fn adhoc_bench_parse_vs_resolve_phase() {
+            let n_pkgs = 150;
+            let files_per_pkg = 15;
+            let dir = tempfile::tempdir().expect("tempdir");
+            build_corpus(dir.path(), n_pkgs, files_per_pkg);
+            let w = walker();
+
+            let mut parse_total = std::time::Duration::ZERO;
+            let mut resolve_total = std::time::Duration::ZERO;
+            let mut file_count = 0usize;
+            let mut site_count = 0usize;
+
+            for i in 0..n_pkgs {
+                let pkg = format!("packages/pkg{i}");
+                let resolvers = Resolvers::new(None);
+                let resolve_cache = ResolveCache::new();
+                let files = package_source_files(&w, dir.path(), &pkg).expect("list files");
+                for file in files {
+                    file_count += 1;
+                    let text = std::fs::read_to_string(&file).expect("read file");
+
+                    let t0 = Instant::now();
+                    let parsed =
+                        importparse::parse_file_imports(&file, &text).expect("parse imports");
+                    parse_total += t0.elapsed();
+
+                    let dir_of_file = file.parent().unwrap_or(&file);
+                    let t1 = Instant::now();
+                    for site in &parsed.sites {
+                        site_count += 1;
+                        let flavor = if site.type_only {
+                            CacheFlavor::Types
+                        } else {
+                            match site.context {
+                                ModuleContext::Esm => CacheFlavor::RuntimeEsm,
+                                ModuleContext::Cjs => CacheFlavor::RuntimeCjs,
+                            }
+                        };
+                        let base = if site.type_only { &file } else { dir_of_file };
+                        let _ =
+                            resolve_cache.get_or_resolve(&resolvers, flavor, base, &site.specifier);
+                    }
+                    resolve_total += t1.elapsed();
+                }
+            }
+
+            let total = parse_total + resolve_total;
+            println!(
+                "[adhoc-bench] phase split: {n_pkgs} pkgs x {files_per_pkg} files = {file_count} files, {site_count} import sites\n\
+                 \x20 parse   = {parse_total:?}  ({:.1}% of parse+resolve, {:.4} ms/file)\n\
+                 \x20 resolve = {resolve_total:?}  ({:.1}% of parse+resolve, {:.4} ms/site)",
+                parse_total.as_secs_f64() / total.as_secs_f64() * 100.0,
+                parse_total.as_secs_f64() * 1000.0 / file_count as f64,
+                resolve_total.as_secs_f64() / total.as_secs_f64() * 100.0,
+                resolve_total.as_secs_f64() * 1000.0 / site_count as f64,
+            );
+        }
     }
 }
