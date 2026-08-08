@@ -3518,26 +3518,41 @@ fn default_registry_url(name: &str, version: &str) -> String {
 /// `(name, version)` are consistent enough to treat as "the same package,"
 /// for [`Provider::find_resolved_graph_for`]'s ambiguity check.
 ///
-/// Every field is compared **except** `integrity`/`resolved` each get a
-/// narrow, independent exemption: when either side's `integrity` is empty,
-/// that field alone is skipped; when either side's `resolved` is `None`,
-/// that field alone is skipped. A root whose lockfile never actually pinned
-/// this package's content (a peer-suffixed/deduped graph key folded onto
-/// one node picking up a variant with no resolution data of its own is a
-/// real, observed shape — confirmed live in a real workspace, across
-/// hundreds of packages, before this exemption existed) naturally has
-/// *neither* signal, not just one — a degenerate entry can't confirm or
-/// deny a conflict on a field it never recorded at all.
+/// Compares exactly the fields that feed `js_install`'s own cache key
+/// (`driver_install.rs`'s `JsInstallDef`: `name`/`version` are already
+/// equal by construction — both sides were looked up by the same
+/// `(name, version)` — leaving `integrity`, `resolved`, and
+/// `has_install_script`) — nothing else. `os`/`cpu`/`dependencies` are
+/// deliberately never compared:
 ///
-/// This is not license to skip the *rest* of the entry, nor to skip a field
-/// that genuinely *is* populated on both sides: `os`/`cpu`/`dependencies`/
-/// `has_install_script` always compare, and `resolved` still compares
-/// whenever both sides recorded one (e.g. a root with empty `integrity` but
-/// a real, populated `resolved` pointing at an internal mirror — a
-/// different root's real, differing `resolved` must still conflict). Only
-/// entirely-absent data is exempt; two roots that both genuinely resolved
-/// *different* content, one of them just missing an integrity stamp, must
-/// still fail loudly.
+/// - `os`/`cpu` gate *whether* an install happens at all
+///   (`Provider::thirdparty_install_spec`'s `platform::matches_platform`
+///   check, run separately against whichever root this function returns),
+///   never part of `JsInstallDef` itself — and, being fields of the
+///   published `package.json` `integrity` itself verifies, they cannot
+///   differ between two roots that agree on `integrity` without a lockfile
+///   parser bug, which this check is not the place to catch.
+/// - `dependencies` is pure graph-traversal bookkeeping (which *other*
+///   packages this one's own imports resolve to) — never part of
+///   `JsInstallDef`, and legitimately different between two independently
+///   `npm install`ed lockfiles even for the *exact same* published tarball:
+///   a shared package's own transitive dependency can resolve to a
+///   different patch version depending on what else was installed and
+///   when. Comparing it produced false-positive ambiguity errors across
+///   hundreds of packages in a real workspace — including pairs with
+///   byte-identical `integrity` and `resolved` — before this fix.
+///
+/// `integrity`/`resolved` each get a narrow, independent exemption: when
+/// either side's `integrity` is empty, that field alone is skipped; when
+/// either side's `resolved` is `None`, that field alone is skipped. A root
+/// whose lockfile never actually pinned this package's content (a
+/// peer-suffixed/deduped graph key folded onto one node picking up a
+/// variant with no resolution data of its own is a real, observed shape)
+/// naturally has *neither* signal, not just one, and can't confirm or deny
+/// a conflict on a field it never recorded — but this exemption is
+/// per-field, not per-entry: a root with empty `integrity` but a real,
+/// populated `resolved` pointing at an internal mirror still conflicts
+/// against a different root's real, differing `resolved`.
 fn entries_agree_where_comparable(
     a: &lockfile::ResolvedPackage,
     b: &lockfile::ResolvedPackage,
@@ -3545,12 +3560,7 @@ fn entries_agree_where_comparable(
     let integrity_agrees =
         a.integrity.is_empty() || b.integrity.is_empty() || a.integrity == b.integrity;
     let resolved_agrees = a.resolved.is_none() || b.resolved.is_none() || a.resolved == b.resolved;
-    integrity_agrees
-        && resolved_agrees
-        && a.dependencies == b.dependencies
-        && a.os == b.os
-        && a.cpu == b.cpu
-        && a.has_install_script == b.has_install_script
+    integrity_agrees && resolved_agrees && a.has_install_script == b.has_install_script
 }
 
 /// Recursively enumerate every directory at or below `dir` containing a
@@ -5587,6 +5597,84 @@ mod tests {
         assert!(
             msg.contains("internal-mirror.corp") && msg.contains("registry.npmjs.org"),
             "{msg}"
+        );
+    }
+
+    /// The false positive observed live, right after both prior fixes
+    /// shipped: two independent, unrelated projects both genuinely resolve
+    /// the *identical* published package — same `integrity`, same
+    /// `resolved` URL — but the package's own `dependencies` map differs,
+    /// because each project's `npm install` ran at a different time and
+    /// this shared package's *own* transitive dependency happened to
+    /// resolve to a different patch version. That is not a conflict about
+    /// *this* package's content (`integrity` already proves the tarball
+    /// bytes are identical) — `dependencies` is graph-traversal bookkeeping
+    /// about *other* packages, never part of `js_install`'s own cache key,
+    /// and must never be compared here.
+    #[tokio::test]
+    async fn npm_e2e_same_integrity_different_own_dependencies_resolves_without_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (pkg, is_typed_array_version) in
+            [("mgmt/backoffice", "1.1.13"), ("mgmt/frontend", "1.1.14")]
+        {
+            write(
+                dir.path(),
+                &format!("{pkg}/package.json"),
+                &format!(
+                    r#"{{"name": "{pkg}", "dependencies": {{"typed-array-buffer": "^1.0.3"}}}}"#
+                ),
+            );
+            write(
+                dir.path(),
+                &format!("{pkg}/package-lock.json"),
+                &format!(
+                    r#"{{
+                        "lockfileVersion": 3,
+                        "packages": {{
+                            "": {{ "name": "{pkg}" }},
+                            "node_modules/typed-array-buffer": {{
+                                "version": "1.0.3",
+                                "resolved": "https://registry.npmjs.org/typed-array-buffer/-/typed-array-buffer-1.0.3.tgz",
+                                "integrity": "sha512-same",
+                                "dependencies": {{ "is-typed-array": "{is_typed_array_version}" }}
+                            }},
+                            "node_modules/is-typed-array": {{
+                                "version": "{is_typed_array_version}",
+                                "integrity": "sha512-abc"
+                            }}
+                        }}
+                    }}"#
+                ),
+            );
+        }
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "typed-array-buffer",
+            "1.0.3",
+            &platform::current_goos(),
+            &platform::current_goarch(),
+        );
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect(
+                "must resolve, not error — differing dependencies of the *same* byte-identical \
+                 package is not an ambiguity",
+            );
+        assert_eq!(
+            resp.target_spec.config.get("integrity"),
+            Some(&Value::String("sha512-same".to_string()))
         );
     }
 

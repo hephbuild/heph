@@ -3700,7 +3700,7 @@ impl Engine {
                         let dep_def = Arc::clone(&engine)
                             .get_def(rs.clone(), &input_ref.r#ref)
                             .await
-                            .with_context(|| format!("get def for group: {:?}", input_ref))?;
+                            .with_context(|| format!("get def for group: {input_ref}"))?;
                         dep_def.applied_transitive.clone()
                     } else if spec.transitive.empty() {
                         // Nothing to contribute. Checked before the clone because
