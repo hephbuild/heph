@@ -47,8 +47,8 @@ pub struct ResolvedPackage {
     /// `NpmLockfile`/`PnpmLockfile`'s own `resolved_graph`); a caller that
     /// needs to treat "no integrity" as "nothing here worth comparing" must
     /// check each field it cares about on its own terms, the way
-    /// `Provider::find_resolved_graph_for`'s `entries_agree_where_comparable`
-    /// does, rather than skipping the whole entry on this field alone.
+    /// [`entries_agree_where_comparable`] does, rather than skipping the
+    /// whole entry on this field alone.
     pub integrity: String,
     /// Tarball URL, when the lockfile records one directly (npm always
     /// does). `None` when the lockfile omits it (pnpm's common case for a
@@ -125,6 +125,55 @@ impl ResolvedGraph {
         }
         result
     }
+}
+
+/// Whether two `ResolvedPackage` entries for the same `(name, version)` are
+/// consistent enough to treat as "the same package" — used both across
+/// independent lockfile roots ([`crate::pluginjs::provider::Provider::find_resolved_graph_for`]'s
+/// ambiguity check) and within a single lockfile, when more than one
+/// `packages` path collapses onto the same graph key (a nested npm
+/// dedup/hoisting pointer, or a pnpm peer-suffix variant — see the two
+/// `resolved_graph()` impls below).
+///
+/// Compares exactly the fields that feed `js_install`'s own cache key
+/// (`driver_install.rs`'s `JsInstallDef`: `name`/`version` are already equal
+/// by construction — both sides were looked up by the same `(name,
+/// version)` — leaving `integrity`, `resolved`, and `has_install_script`) —
+/// nothing else. `os`/`cpu`/`dependencies` are deliberately never compared:
+///
+/// - `os`/`cpu` gate *whether* an install happens at all
+///   (`Provider::thirdparty_install_spec`'s `platform::matches_platform`
+///   check, run separately against whichever entry this function accepts),
+///   never part of `JsInstallDef` itself — and, being fields of the
+///   published `package.json` `integrity` itself verifies, they cannot
+///   differ between two entries that agree on `integrity` without a
+///   lockfile parser bug, which this check is not the place to catch.
+/// - `dependencies` is pure graph-traversal bookkeeping (which *other*
+///   packages this one's own imports resolve to) — never part of
+///   `JsInstallDef`, and legitimately different between two independently
+///   `npm install`ed lockfiles even for the *exact same* published tarball:
+///   a shared package's own transitive dependency can resolve to a
+///   different patch version depending on what else was installed and
+///   when. Comparing it produced false-positive ambiguity errors across
+///   hundreds of packages in a real workspace — including pairs with
+///   byte-identical `integrity` and `resolved` — before this fix.
+///
+/// `integrity`/`resolved` each get a narrow, independent exemption: when
+/// either side's `integrity` is empty, that field alone is skipped; when
+/// either side's `resolved` is `None`, that field alone is skipped. An entry
+/// that never actually pinned this package's content on its own (a
+/// peer-suffixed/deduped graph key folded onto one node picking up a
+/// variant with no resolution data of its own is a real, observed shape)
+/// naturally has *neither* signal, not just one, and can't confirm or deny
+/// a conflict on a field it never recorded — but this exemption is
+/// per-field, not per-entry: an entry with empty `integrity` but a real,
+/// populated `resolved` pointing at an internal mirror still conflicts
+/// against a different entry's real, differing `resolved`.
+pub(crate) fn entries_agree_where_comparable(a: &ResolvedPackage, b: &ResolvedPackage) -> bool {
+    let integrity_agrees =
+        a.integrity.is_empty() || b.integrity.is_empty() || a.integrity == b.integrity;
+    let resolved_agrees = a.resolved.is_none() || b.resolved.is_none() || a.resolved == b.resolved;
+    integrity_agrees && resolved_agrees && a.has_install_script == b.has_install_script
 }
 
 /// Graph keys for `manifest`'s own direct dependencies
@@ -242,7 +291,7 @@ impl Lockfile {
         }
     }
 
-    pub fn resolved_graph(&self) -> ResolvedGraph {
+    pub fn resolved_graph(&self) -> anyhow::Result<ResolvedGraph> {
         match self {
             Lockfile::Npm(l) => l.resolved_graph(),
             Lockfile::Pnpm(l) => l.resolved_graph(),
@@ -361,8 +410,8 @@ impl NpmLockfile {
         })
     }
 
-    pub fn resolved_graph(&self) -> ResolvedGraph {
-        let mut packages = BTreeMap::new();
+    pub fn resolved_graph(&self) -> anyhow::Result<ResolvedGraph> {
+        let mut packages: BTreeMap<String, ResolvedPackage> = BTreeMap::new();
         for (path, entry) in &self.packages {
             // Only real `node_modules/…` entries are fetchable third-party
             // packages; the root (`""`) and workspace-member paths (e.g.
@@ -380,21 +429,56 @@ impl NpmLockfile {
             };
             let name = entry.name.clone().unwrap_or_else(|| suffix.to_string());
             let key = graph_key(&name, version);
-            packages.insert(
-                key,
-                ResolvedPackage {
-                    name,
-                    version: version.clone(),
-                    integrity: entry.integrity.clone().unwrap_or_default(),
-                    resolved: entry.resolved.clone(),
-                    dependencies: resolve_npm_edges(self, path, &entry.dependencies),
-                    os: entry.os.clone(),
-                    cpu: entry.cpu.clone(),
-                    has_install_script: entry.has_install_script,
-                },
-            );
+            let resolved = ResolvedPackage {
+                name: name.clone(),
+                version: version.clone(),
+                integrity: entry.integrity.clone().unwrap_or_default(),
+                resolved: entry.resolved.clone(),
+                dependencies: resolve_npm_edges(self, path, &entry.dependencies),
+                os: entry.os.clone(),
+                cpu: entry.cpu.clone(),
+                has_install_script: entry.has_install_script,
+            };
+            // More than one `node_modules/.../<name>` path can resolve to
+            // the same `(name, version)` — npm's own dedup/hoisting can
+            // leave a nested "pointer" entry with no integrity/resolved of
+            // its own (redundant with a real entry elsewhere in the same
+            // lockfile) alongside the genuinely-resolved one (confirmed
+            // live: `js_install` failing to verify an empty integrity
+            // string for a package the lockfile actually does pin,
+            // elsewhere in the same file). Iteration is in path-alphabetical
+            // order, not "real entry first", so this can't just keep
+            // whichever is seen first — it must actively prefer the
+            // non-degenerate side, and hard-fail rather than silently pick
+            // between two *both* non-degenerate entries that disagree
+            // (`entries_agree_where_comparable` — same fields, same
+            // reasoning, as the cross-lockfile-root ambiguity check this
+            // mirrors).
+            match packages.entry(key) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(resolved);
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    anyhow::ensure!(
+                        entries_agree_where_comparable(o.get(), &resolved),
+                        "js provider: {name}@{version} has two disagreeing entries within \
+                         the same lockfile — {:?} at one `node_modules` path records \
+                         integrity {:?} resolved from {:?}, another records integrity {:?} \
+                         resolved from {:?}. This is not a cross-project ambiguity; the \
+                         lockfile itself is inconsistent for this package — regenerate it",
+                        path,
+                        o.get().integrity,
+                        o.get().resolved,
+                        resolved.integrity,
+                        resolved.resolved,
+                    );
+                    if o.get().integrity.is_empty() && !resolved.integrity.is_empty() {
+                        o.insert(resolved);
+                    }
+                }
+            }
         }
-        ResolvedGraph { packages }
+        Ok(ResolvedGraph { packages })
     }
 }
 
@@ -563,8 +647,8 @@ impl PnpmLockfile {
         }))
     }
 
-    pub fn resolved_graph(&self) -> ResolvedGraph {
-        let mut packages = BTreeMap::new();
+    pub fn resolved_graph(&self) -> anyhow::Result<ResolvedGraph> {
+        let mut packages: BTreeMap<String, ResolvedPackage> = BTreeMap::new();
         for (key, meta) in &self.packages {
             let Some((name, version)) = split_pnpm_key(key) else {
                 continue;
@@ -583,21 +667,48 @@ impl PnpmLockfile {
                         .collect()
                 })
                 .unwrap_or_default();
-            packages.insert(
-                graph_key(&name, &version),
-                ResolvedPackage {
-                    name,
-                    version,
-                    integrity: meta.resolution.integrity.clone().unwrap_or_default(),
-                    resolved: meta.resolution.tarball.clone(),
-                    dependencies,
-                    os: meta.os.clone(),
-                    cpu: meta.cpu.clone(),
-                    has_install_script: meta.requires_build,
-                },
-            );
+            let resolved_pkg = ResolvedPackage {
+                name: name.clone(),
+                version: version.clone(),
+                integrity: meta.resolution.integrity.clone().unwrap_or_default(),
+                resolved: meta.resolution.tarball.clone(),
+                dependencies,
+                os: meta.os.clone(),
+                cpu: meta.cpu.clone(),
+                has_install_script: meta.requires_build,
+            };
+            // Peer-dep variants of the same (name, version) — e.g.
+            // `foo@1.2.3(react@18.0.0)` and `foo@1.2.3(react@17.0.0)` —
+            // collapse to the same graph_key via `split_pnpm_key`'s
+            // peer-suffix strip. Same rule, same reasoning, as the npm
+            // side's collision handling: prefer whichever variant actually
+            // has integrity, and hard-fail rather than silently pick
+            // between two non-degenerate variants that disagree.
+            match packages.entry(graph_key(&name, &version)) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(resolved_pkg);
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    anyhow::ensure!(
+                        entries_agree_where_comparable(o.get(), &resolved_pkg),
+                        "js provider: {name}@{version} has two disagreeing peer-dep-variant \
+                         entries within the same lockfile — {:?} records integrity {:?} \
+                         resolved from {:?}, another variant records integrity {:?} resolved \
+                         from {:?}. This is not a cross-project ambiguity; the lockfile \
+                         itself is inconsistent for this package — regenerate it",
+                        key,
+                        o.get().integrity,
+                        o.get().resolved,
+                        resolved_pkg.integrity,
+                        resolved_pkg.resolved,
+                    );
+                    if o.get().integrity.is_empty() && !resolved_pkg.integrity.is_empty() {
+                        o.insert(resolved_pkg);
+                    }
+                }
+            }
         }
-        ResolvedGraph { packages }
+        Ok(ResolvedGraph { packages })
     }
 }
 
@@ -635,7 +746,7 @@ mod tests {
     #[test]
     fn npm_resolved_graph_excludes_root_and_local_and_links() {
         let lock = NpmLockfile::parse(npm_fixture()).unwrap();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         assert_eq!(graph.packages.len(), 2, "{:?}", graph.packages.keys());
         assert!(graph.get("lodash", "4.17.21").is_some());
         assert!(graph.get("@esbuild/darwin-arm64", "0.19.0").is_some());
@@ -644,12 +755,106 @@ mod tests {
     #[test]
     fn npm_resolved_graph_carries_integrity_and_platform() {
         let lock = NpmLockfile::parse(npm_fixture()).unwrap();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         let esbuild = graph.get("@esbuild/darwin-arm64", "0.19.0").unwrap();
         assert_eq!(esbuild.integrity, "sha512-def");
         assert_eq!(esbuild.os, vec!["darwin".to_string()]);
         assert_eq!(esbuild.cpu, vec!["arm64".to_string()]);
         assert!(esbuild.has_install_script);
+    }
+
+    #[test]
+    fn npm_resolved_graph_prefers_real_entry_when_degenerate_path_sorts_after() {
+        // "node_modules/widget" < "zzz/node_modules/widget" alphabetically,
+        // so the degenerate (no integrity) dedup-pointer entry is visited
+        // *second* — exactly the ordering that clobbered a real entry
+        // before this was fixed.
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/widget": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/widget/-/widget-1.0.0.tgz",
+                        "integrity": "sha512-real"
+                    },
+                    "zzz/node_modules/widget": {
+                        "version": "1.0.0"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+        let widget = graph.get("widget", "1.0.0").unwrap();
+        assert_eq!(widget.integrity, "sha512-real");
+        assert_eq!(
+            widget.resolved.as_deref(),
+            Some("https://registry.npmjs.org/widget/-/widget-1.0.0.tgz")
+        );
+    }
+
+    #[test]
+    fn npm_resolved_graph_prefers_real_entry_when_degenerate_path_sorts_before() {
+        // Reverse ordering from the test above — proves the fix isn't
+        // accidentally order-dependent in the other direction.
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "aaa/node_modules/widget": {
+                        "version": "1.0.0"
+                    },
+                    "node_modules/widget": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/widget/-/widget-1.0.0.tgz",
+                        "integrity": "sha512-real"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+        let widget = graph.get("widget", "1.0.0").unwrap();
+        assert_eq!(widget.integrity, "sha512-real");
+        assert_eq!(
+            widget.resolved.as_deref(),
+            Some("https://registry.npmjs.org/widget/-/widget-1.0.0.tgz")
+        );
+    }
+
+    #[test]
+    fn npm_resolved_graph_errors_on_two_real_entries_that_disagree() {
+        // Both paths record real (non-empty) integrity for the same
+        // (name, version), but a different one — a genuinely inconsistent
+        // lockfile, not a degenerate-dedup-pointer shape. Must fail loudly
+        // rather than silently pick whichever path sorts first.
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/widget": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/widget/-/widget-1.0.0.tgz",
+                        "integrity": "sha512-aaa"
+                    },
+                    "packages/b/node_modules/widget": {
+                        "version": "1.0.0",
+                        "resolved": "https://internal-mirror.example/widget-1.0.0.tgz",
+                        "integrity": "sha512-bbb"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let err = lock.resolved_graph().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("widget"),
+            "error should name the conflicting package: {err:#}"
+        );
     }
 
     #[test]
@@ -729,13 +934,108 @@ snapshots:
     #[test]
     fn pnpm_resolved_graph_carries_integrity_and_platform() {
         let lock = PnpmLockfile::parse(pnpm_fixture()).unwrap();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         assert!(graph.get("lodash", "4.17.21").is_some());
         let esbuild = graph.get("@esbuild/darwin-arm64", "0.19.0").unwrap();
         assert_eq!(esbuild.integrity, "sha512-def");
         assert_eq!(esbuild.os, vec!["darwin".to_string()]);
         assert_eq!(esbuild.cpu, vec!["arm64".to_string()]);
         assert!(esbuild.has_install_script);
+    }
+
+    #[test]
+    fn pnpm_resolved_graph_prefers_real_entry_on_peer_suffix_collision() {
+        // Two peer-dep variants of the same (name, version) collapse to one
+        // graph_key via `split_pnpm_key`'s peer-suffix strip; a variant
+        // with no recorded integrity must never win over one that has it.
+        let lock = PnpmLockfile::parse(
+            r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      widget:
+        specifier: ^1.0.0
+        version: 1.0.0
+packages:
+  widget@1.0.0(react@17.0.0):
+    resolution: {}
+  widget@1.0.0(react@18.0.0):
+    resolution: {integrity: sha512-real}
+snapshots:
+  widget@1.0.0(react@17.0.0): {}
+  widget@1.0.0(react@18.0.0): {}
+"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+        let widget = graph.get("widget", "1.0.0").unwrap();
+        assert_eq!(widget.integrity, "sha512-real");
+    }
+
+    #[test]
+    fn pnpm_resolved_graph_prefers_real_entry_regardless_of_peer_suffix_sort_order() {
+        // Mirror image of the test above: the degenerate variant's peer
+        // suffix ("react@99.0.0") sorts lexically *after* the real
+        // variant's ("react@1.0.0") — the ordering under which a plain
+        // `BTreeMap::insert` would already (accidentally) keep the real
+        // entry. Proves the fix's `.entry()`/`and_modify` logic is
+        // order-independent, not just favorably tested once.
+        let lock = PnpmLockfile::parse(
+            r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      widget:
+        specifier: ^1.0.0
+        version: 1.0.0
+packages:
+  widget@1.0.0(react@1.0.0):
+    resolution: {integrity: sha512-real}
+  widget@1.0.0(react@99.0.0):
+    resolution: {}
+snapshots:
+  widget@1.0.0(react@1.0.0): {}
+  widget@1.0.0(react@99.0.0): {}
+"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+        let widget = graph.get("widget", "1.0.0").unwrap();
+        assert_eq!(widget.integrity, "sha512-real");
+    }
+
+    #[test]
+    fn pnpm_resolved_graph_errors_on_two_real_variants_that_disagree() {
+        // Both peer-dep variants record real (non-empty) integrity, but a
+        // different one — a genuinely inconsistent lockfile. Must fail
+        // loudly rather than silently pick one.
+        let lock = PnpmLockfile::parse(
+            r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      widget:
+        specifier: ^1.0.0
+        version: 1.0.0
+packages:
+  widget@1.0.0(react@17.0.0):
+    resolution: {integrity: sha512-aaa}
+  widget@1.0.0(react@18.0.0):
+    resolution: {integrity: sha512-bbb}
+snapshots:
+  widget@1.0.0(react@17.0.0): {}
+  widget@1.0.0(react@18.0.0): {}
+"#,
+        )
+        .unwrap();
+        let err = lock.resolved_graph().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("widget"),
+            "error should name the conflicting package: {err:#}"
+        );
     }
 
     #[test]
@@ -852,7 +1152,7 @@ snapshots:
     #[test]
     fn resolve_transitive_finds_a_pnpm_companion_package() {
         let lock = Lockfile::parse(PkgManager::Pnpm, pnpm_transitive_fixture()).unwrap();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         let manifest = transitive_manifest();
         let got = resolve_transitive(&lock, &graph, "packages/a", &manifest, "@eslint/js")
             .unwrap()
@@ -869,7 +1169,7 @@ snapshots:
     #[test]
     fn resolve_transitive_does_not_find_an_unrelated_pnpm_package() {
         let lock = Lockfile::parse(PkgManager::Pnpm, pnpm_transitive_fixture()).unwrap();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         let manifest = transitive_manifest();
         assert_eq!(
             resolve_transitive(&lock, &graph, "packages/a", &manifest, "unrelated").unwrap(),
@@ -885,7 +1185,7 @@ snapshots:
         // — the transitive fallback must not shadow that with some other
         // resolution path; it only kicks in when the direct lookup misses.
         let lock = Lockfile::parse(PkgManager::Npm, npm_fixture()).unwrap();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         let manifest = PackageManifest {
             name: "a".to_string(),
             main: None,

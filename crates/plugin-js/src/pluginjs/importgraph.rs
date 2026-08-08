@@ -2708,7 +2708,7 @@ mod tests {
     #[test]
     fn transitive_declared_closure_includes_a_dependency_of_a_declared_dependency() {
         let lockfile = transitive_fixture();
-        let resolved_graph = lockfile.resolved_graph();
+        let resolved_graph = lockfile.resolved_graph().unwrap();
         let manifest = manifest("a", &[], &["typescript-eslint"]);
 
         // The narrower, direct-only closure does not know about `@eslint/js`
@@ -2732,7 +2732,7 @@ mod tests {
     #[test]
     fn transitive_declared_closure_does_not_include_an_unrelated_package() {
         let lockfile = transitive_fixture();
-        let resolved_graph = lockfile.resolved_graph();
+        let resolved_graph = lockfile.resolved_graph().unwrap();
         let manifest = manifest("a", &[], &["typescript-eslint"]);
 
         let widened = transitive_declared_closure(
