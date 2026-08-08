@@ -508,18 +508,22 @@ impl Provider {
     ) -> anyhow::Result<Option<(PathBuf, Arc<ResolvedGraph>)>> {
         let lockfile = self.lockfile(pkg_dir).await?;
         let root = lockfile.as_ref().map(|(root, _)| root.clone());
-        let graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let graph = self.resolved_graph_for_lockfile(&lockfile).await?;
         Ok(root.zip(graph))
     }
 
     /// [`Provider::resolved_graph`], but for a `(root, lockfile)` pair the
     /// caller already resolved via [`Provider::lockfile`] — skips repeating
-    /// its ancestor walk. `None` in, `None` out.
+    /// its ancestor walk. `None` in, `Ok(None)` out. `Err` when the
+    /// lockfile itself is internally inconsistent — see
+    /// `lockfile::entries_agree_where_comparable`'s doc.
     async fn resolved_graph_for_lockfile(
         &self,
         lockfile: &Option<(PathBuf, Arc<Lockfile>)>,
-    ) -> Option<Arc<ResolvedGraph>> {
-        let (root, lockfile) = lockfile.as_ref()?;
+    ) -> anyhow::Result<Option<Arc<ResolvedGraph>>> {
+        let Some((root, lockfile)) = lockfile.as_ref() else {
+            return Ok(None);
+        };
         let cell = {
             let mut cache = self.resolved_graph_cache.lock().await;
             Arc::clone(
@@ -530,9 +534,9 @@ impl Provider {
         };
         let lockfile = Arc::clone(lockfile);
         let graph = cell
-            .get_or_init(|| async move { Arc::new(lockfile.resolved_graph()) })
-            .await;
-        Some(Arc::clone(graph))
+            .get_or_try_init(|| async move { lockfile.resolved_graph().map(Arc::new) })
+            .await?;
+        Ok(Some(Arc::clone(graph)))
     }
 
     /// Translate a `self.workspace_root`-relative `pkg` (heph's own package
@@ -719,7 +723,7 @@ impl Provider {
             }
             let entry = graph.get(name, version).expect("just matched above");
             anyhow::ensure!(
-                entries_agree_where_comparable(first_entry, entry),
+                lockfile::entries_agree_where_comparable(first_entry, entry),
                 "js provider: {name}@{version} resolves to different content in two \
                  independent lockfiles this workspace discovered — {first_root:?} records \
                  integrity {:?} resolved from {:?}, {root:?} records integrity {:?} resolved \
@@ -896,7 +900,7 @@ impl Provider {
             self.workspace_root.join(&pkg_str)
         };
         let lockfile = self.lockfile(&pkg_dir).await?;
-        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await?;
         let lockfile_pkg = lockfile
             .as_ref()
             .map(|(root, _)| self.lockfile_relative_pkg(root, &pkg_str))
@@ -1049,7 +1053,7 @@ impl Provider {
             self.workspace_root.join(&pkg_str)
         };
         let lockfile = self.lockfile(&pkg_dir).await?;
-        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await?;
         // See `Provider::lockfile_relative_pkg`'s doc: `lockfile`/`resolved_graph`
         // are workspace-relative-`pkg`-agnostic — they're keyed by whichever
         // ancestor directory actually has a lockfile file, which may not be
@@ -1145,7 +1149,7 @@ impl Provider {
             self.workspace_root.join(&pkg_str)
         };
         let lockfile = self.lockfile(&pkg_dir).await?;
-        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await?;
         let lockfile_pkg = lockfile
             .as_ref()
             .map(|(root, _)| self.lockfile_relative_pkg(root, &pkg_str))
@@ -1226,7 +1230,7 @@ impl Provider {
             self.workspace_root.join(&pkg_str)
         };
         let lockfile = self.lockfile(&pkg_dir).await?;
-        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await?;
         let lockfile_pkg = lockfile
             .as_ref()
             .map(|(root, _)| self.lockfile_relative_pkg(root, &pkg_str))
@@ -1444,7 +1448,7 @@ impl Provider {
             self.workspace_root.join(&pkg_str)
         };
         let lockfile = self.lockfile(&pkg_dir).await?;
-        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await?;
         let lockfile_pkg = lockfile
             .as_ref()
             .map(|(root, _)| self.lockfile_relative_pkg(root, &pkg_str))
@@ -1690,7 +1694,7 @@ impl Provider {
                     workspace_root.join(&cur_pkg)
                 };
                 let lockfile = self.lockfile(&cur_pkg_dir).await?;
-                let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+                let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await?;
                 let lockfile_pkg = lockfile
                     .as_ref()
                     .map(|(root, _)| self.lockfile_relative_pkg(root, &cur_pkg))
@@ -3512,55 +3516,6 @@ fn lint_deps_config(
 fn default_registry_url(name: &str, version: &str) -> String {
     let basename = name.rsplit('/').next().unwrap_or(name);
     format!("https://registry.npmjs.org/{name}/-/{basename}-{version}.tgz")
-}
-
-/// Whether two independent lockfile roots' entries for the same
-/// `(name, version)` are consistent enough to treat as "the same package,"
-/// for [`Provider::find_resolved_graph_for`]'s ambiguity check.
-///
-/// Compares exactly the fields that feed `js_install`'s own cache key
-/// (`driver_install.rs`'s `JsInstallDef`: `name`/`version` are already
-/// equal by construction — both sides were looked up by the same
-/// `(name, version)` — leaving `integrity`, `resolved`, and
-/// `has_install_script`) — nothing else. `os`/`cpu`/`dependencies` are
-/// deliberately never compared:
-///
-/// - `os`/`cpu` gate *whether* an install happens at all
-///   (`Provider::thirdparty_install_spec`'s `platform::matches_platform`
-///   check, run separately against whichever root this function returns),
-///   never part of `JsInstallDef` itself — and, being fields of the
-///   published `package.json` `integrity` itself verifies, they cannot
-///   differ between two roots that agree on `integrity` without a lockfile
-///   parser bug, which this check is not the place to catch.
-/// - `dependencies` is pure graph-traversal bookkeeping (which *other*
-///   packages this one's own imports resolve to) — never part of
-///   `JsInstallDef`, and legitimately different between two independently
-///   `npm install`ed lockfiles even for the *exact same* published tarball:
-///   a shared package's own transitive dependency can resolve to a
-///   different patch version depending on what else was installed and
-///   when. Comparing it produced false-positive ambiguity errors across
-///   hundreds of packages in a real workspace — including pairs with
-///   byte-identical `integrity` and `resolved` — before this fix.
-///
-/// `integrity`/`resolved` each get a narrow, independent exemption: when
-/// either side's `integrity` is empty, that field alone is skipped; when
-/// either side's `resolved` is `None`, that field alone is skipped. A root
-/// whose lockfile never actually pinned this package's content (a
-/// peer-suffixed/deduped graph key folded onto one node picking up a
-/// variant with no resolution data of its own is a real, observed shape)
-/// naturally has *neither* signal, not just one, and can't confirm or deny
-/// a conflict on a field it never recorded — but this exemption is
-/// per-field, not per-entry: a root with empty `integrity` but a real,
-/// populated `resolved` pointing at an internal mirror still conflicts
-/// against a different root's real, differing `resolved`.
-fn entries_agree_where_comparable(
-    a: &lockfile::ResolvedPackage,
-    b: &lockfile::ResolvedPackage,
-) -> bool {
-    let integrity_agrees =
-        a.integrity.is_empty() || b.integrity.is_empty() || a.integrity == b.integrity;
-    let resolved_agrees = a.resolved.is_none() || b.resolved.is_none() || a.resolved == b.resolved;
-    integrity_agrees && resolved_agrees && a.has_install_script == b.has_install_script
 }
 
 /// Recursively enumerate every directory at or below `dir` containing a
@@ -6517,7 +6472,7 @@ mod tests {
             }"#,
         )
         .expect("parse lockfile");
-        let resolved_graph = lockfile.resolved_graph();
+        let resolved_graph = lockfile.resolved_graph().unwrap();
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
@@ -6766,7 +6721,7 @@ mod tests {
             }"#,
         )
         .expect("parse lockfile");
-        let resolved_graph = lockfile.resolved_graph();
+        let resolved_graph = lockfile.resolved_graph().unwrap();
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
@@ -6833,7 +6788,7 @@ mod tests {
             }"#,
         )
         .expect("parse lockfile");
-        let resolved_graph = lockfile.resolved_graph();
+        let resolved_graph = lockfile.resolved_graph().unwrap();
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
@@ -7275,7 +7230,7 @@ mod tests {
             }"#,
         )
         .expect("parse lockfile");
-        let resolved_graph = lockfile.resolved_graph();
+        let resolved_graph = lockfile.resolved_graph().unwrap();
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
@@ -7346,7 +7301,7 @@ mod tests {
             }"#,
         )
         .expect("parse lockfile");
-        let resolved_graph = lockfile.resolved_graph();
+        let resolved_graph = lockfile.resolved_graph().unwrap();
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
@@ -7429,7 +7384,7 @@ mod tests {
             }"#,
         )
         .expect("parse lockfile");
-        let resolved_graph = lockfile.resolved_graph();
+        let resolved_graph = lockfile.resolved_graph().unwrap();
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
@@ -8213,7 +8168,7 @@ mod tests {
             }"#,
         )
         .expect("parse lockfile");
-        let resolved_graph = lockfile.resolved_graph();
+        let resolved_graph = lockfile.resolved_graph().unwrap();
 
         let walker = CachedWalker::disabled();
         let result = lint_deps_config(
