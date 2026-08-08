@@ -37,13 +37,24 @@ pub struct ResolvedPackage {
     pub name: String,
     pub version: String,
     /// Subresource-Integrity-format hash (`"sha512-…"` / `"sha1-…"`)
-    /// verifying the published tarball's bytes. Empty only for a malformed
-    /// lockfile entry — every real registry-resolved entry carries one.
+    /// verifying the published tarball's bytes. Empty for a degenerate
+    /// lockfile entry — a real, observed shape (e.g. a peer-suffixed/deduped
+    /// graph key folded onto one node picking up a variant with no
+    /// resolution data of its own), not merely hypothetical malformed input
+    /// — every genuinely-resolved entry carries one. **Not itself proof that
+    /// `resolved`/`os`/`cpu`/`dependencies`/`has_install_script` are also
+    /// empty/default** — each field is parsed independently (see
+    /// `NpmLockfile`/`PnpmLockfile`'s own `resolved_graph`); a caller that
+    /// needs to treat "no integrity" as "nothing here worth comparing" must
+    /// check each field it cares about on its own terms, the way
+    /// `Provider::find_resolved_graph_for`'s `entries_agree_where_comparable`
+    /// does, rather than skipping the whole entry on this field alone.
     pub integrity: String,
     /// Tarball URL, when the lockfile records one directly (npm always
     /// does). `None` when the lockfile omits it (pnpm's common case for a
-    /// plain registry dependency) — callers derive the default npm registry
-    /// URL from `name`/`version`.
+    /// plain registry dependency, or the same degenerate-entry shape
+    /// `integrity`'s doc describes) — callers derive the default npm
+    /// registry URL from `name`/`version`.
     pub resolved: Option<String>,
     /// Declared dependency edges: name → the [`graph_key`] of the resolved
     /// package it points to.
