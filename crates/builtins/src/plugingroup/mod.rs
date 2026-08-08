@@ -72,6 +72,16 @@ struct GroupSpec {
     /// path; it cannot be combined with `strip_prefix`/`prefix`. A dict maps exact
     /// emitted paths to destinations.
     rename: Rename,
+    /// Codegen mode: `copy` to also materialize the relocated output onto
+    /// real disk (see module docs' "Filter/relocate" mode — this only
+    /// applies there; a plain aggregate group has no artifact of its own to
+    /// materialize). Omit for a normal, sandbox/cache-only group.
+    /// `in_place` is deliberately not accepted here: unlike an `exec`/`bash`
+    /// codegen target, a relocating group's inputs are `deps` addrs, never
+    /// `@heph/fs` file addrs, so it has no way to declare the overwritten
+    /// path as one of its own hashed inputs — the staleness guard `in_place`
+    /// relies on elsewhere would silently not apply.
+    codegen: CodegenMode,
 }
 
 impl GroupSpec {
@@ -137,6 +147,21 @@ impl hplugin::driver::Driver for Driver {
     ) -> anyhow::Result<ParseResponse> {
         let spec = GroupSpec::from(&req.target_spec.config).context("parse group config")?;
         let transform = spec.transform().context("group config")?;
+        anyhow::ensure!(
+            spec.codegen != CodegenMode::InPlace,
+            "group's `codegen` only accepts \"copy\" — a relocating group's inputs are `deps` \
+             addrs, not `@heph/fs` file addrs, so it cannot declare the overwritten path as one \
+             of its own hashed inputs the way `in_place` requires elsewhere for its staleness \
+             guard to apply"
+        );
+        let relocating = !transform.is_identity();
+        anyhow::ensure!(
+            relocating || spec.codegen == CodegenMode::None,
+            "`codegen` requires a relocating group (one of include/exclude/strip_prefix/prefix/\
+             rename set) — a plain aggregate group produces no artifact of its own to \
+             materialize"
+        );
+        let codegen = spec.codegen;
         let deps = spec.deps;
 
         let pkg = req.target_spec.addr.package.clone();
@@ -169,7 +194,6 @@ impl hplugin::driver::Driver for Driver {
         // the digest of an ordinary aggregate group is byte-identical to what
         // it was before transforms existed, and no cached revision is
         // invalidated by this feature landing.
-        let relocating = !transform.is_identity();
         if relocating {
             use std::hash::Hash as _;
             struct Fold<'a>(&'a mut Xxh3);
@@ -184,6 +208,16 @@ impl hplugin::driver::Driver for Driver {
             h.update(b"\0group-transform-v1\0");
             let mut fold = Fold(&mut h);
             transform.hash(&mut fold);
+            // `codegen` changes what materializes onto real disk, not what a
+            // consumer's own `hashin` needs to key on for correctness (it
+            // never changes the bytes/paths a consumer receives) — but
+            // `hashin`/`heph inspect` are still where anything claiming to
+            // be this target's "identity" gets read, and `pluginexec`'s own
+            // `codegen`-affects-`hash` precedent (`test_parse_codegen_change_def_hash`)
+            // means two parses differing only here should not silently
+            // report the identical hash.
+            std::hash::Hasher::write(&mut fold, b"\0group-codegen-v1\0");
+            codegen.hash(&mut fold);
         }
         let hash = format!("{:016x}", h.digest()).into_bytes();
 
@@ -205,7 +239,7 @@ impl hplugin::driver::Driver for Driver {
                     .into_iter()
                     .map(|p| Path {
                         content: PathContent::Glob(p),
-                        codegen_tree: CodegenMode::None,
+                        codegen_tree: codegen.clone(),
                         collect: false,
                     })
                     .collect(),
@@ -419,6 +453,7 @@ mod tests {
             "strip_prefix",
             "prefix",
             "rename",
+            "codegen",
         ] {
             assert!(by_name.contains_key(key), "schema missing field `{key}`");
             assert!(!by_name[key].doc.is_empty(), "field `{key}` has no doc");
@@ -595,6 +630,79 @@ mod tests {
             assert_eq!(def.outputs.len(), 1, "`{key}` must declare an output group");
             assert_eq!(def.outputs[0].group, "");
         }
+    }
+
+    /// `codegen = "copy"` on a relocating group threads through to every
+    /// declared output path's own `codegen_tree` — the field the engine's
+    /// write-back mechanism actually reads.
+    #[tokio::test]
+    async fn codegen_copy_is_threaded_into_declared_output_paths() {
+        let def = parse_group(&[
+            ("prefix", Value::String("lib".into())),
+            ("codegen", Value::String("copy".into())),
+        ])
+        .await;
+        assert_eq!(def.outputs.len(), 1);
+        for p in &def.outputs[0].paths {
+            assert_eq!(p.codegen_tree, CodegenMode::Copy);
+        }
+    }
+
+    /// `in_place` is rejected outright — see `GroupSpec::codegen`'s doc for
+    /// why a relocating group can't offer the same staleness guard an
+    /// `exec`/`bash` codegen target gets for it.
+    #[tokio::test]
+    async fn codegen_in_place_is_rejected() {
+        let config = HashMap::from([
+            ("deps".to_string(), deps_value(&["//pkg:a"])),
+            ("prefix".to_string(), Value::String("lib".into())),
+            ("codegen".to_string(), Value::String("in_place".into())),
+        ]);
+        let err = match Driver
+            .parse(make_parse_req("//pkg:g", config), &ctoken())
+            .await
+        {
+            Ok(_) => panic!("in_place must be rejected"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("\"copy\""));
+    }
+
+    /// `codegen` on a plain aggregate group (no relocating config) is
+    /// rejected rather than silently ignored — there is no artifact of its
+    /// own for it to apply to.
+    #[tokio::test]
+    async fn codegen_on_an_aggregate_group_is_rejected() {
+        let config = HashMap::from([
+            ("deps".to_string(), deps_value(&["//pkg:a"])),
+            ("codegen".to_string(), Value::String("copy".into())),
+        ]);
+        let err = match Driver
+            .parse(make_parse_req("//pkg:g", config), &ctoken())
+            .await
+        {
+            Ok(_) => panic!("codegen on an aggregate group must be rejected"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("relocating"));
+    }
+
+    /// Mirrors `transform_is_folded_into_the_def_hash`: `codegen` changes
+    /// what materializes onto real disk, so two otherwise-identical
+    /// relocating groups differing only in `codegen` must not report the
+    /// same identity.
+    #[tokio::test]
+    async fn codegen_is_folded_into_the_def_hash() {
+        let no_codegen = parse_group(&[("prefix", Value::String("lib".into()))])
+            .await
+            .hash;
+        let copy = parse_group(&[
+            ("prefix", Value::String("lib".into())),
+            ("codegen", Value::String("copy".into())),
+        ])
+        .await
+        .hash;
+        assert_ne!(no_codegen, copy);
     }
 
     /// The cache-key property this whole design rests on: change a transform,
