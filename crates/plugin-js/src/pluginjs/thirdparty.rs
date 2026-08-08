@@ -50,6 +50,105 @@ pub fn parse_thirdparty_pkg(pkg: &str) -> Option<(&str, &str)> {
     Some((rest.get(..at)?, rest.get(at + 1..)?))
 }
 
+/// The fixed package namespace every relocated-`node_modules` `group` target
+/// lives under — see [`node_modules_addr`]'s doc for why this doesn't encode
+/// anything variable in the package string itself.
+pub const NODE_MODULES_PKG: &str = "@heph/js/node_modules";
+
+/// Target name every relocated-`node_modules` target uses — the driver name
+/// this addr always resolves to (see [`crate::pluginjs::provider`]'s
+/// `Provider::get` dispatch).
+pub const NODE_MODULES_TARGET: &str = "group";
+
+/// The full `group` target address that relocates a resolved third-party
+/// `js_install` download into `<consuming_pkg>/node_modules/<local_name>`
+/// inside a consumer's sandbox — see `Provider::get`'s dispatch for this
+/// namespace, and `ai-docs/js-plugin-plan.md`'s "Per-target `node_modules`
+/// reconstruction" note for why this exists at all: `js_install`'s own
+/// output lives at the synthetic path `thirdparty_pkg(resolved_name,
+/// version)`, which nothing else ever visits, so every consumer needs its
+/// own relocated view.
+///
+/// **Every variable part is an `Addr` arg, never folded into the package
+/// string.** An earlier draft of this addr encoded `consuming_pkg`/
+/// `local_name`/`version` positionally inside the package path
+/// (`@heph/js/node_modules/<consuming_pkg>/<local_name>@<version>`) — a
+/// hermeticity review caught that this is only unambiguously splittable
+/// when `consuming_pkg` itself never contains a scoped-looking segment
+/// (e.g. a real package nested at `apps/@special` breaks the split
+/// silently, wiring the wrong dependency with no parse error at all). Args
+/// have no such ambiguity: each is delimited exactly by `parse_addr`'s own
+/// grammar (mirrors this module's existing `goos`/`goarch` args on
+/// [`thirdparty_addr`]).
+///
+/// **`local_name` and `resolved_name` are deliberately two different
+/// strings, not one.** For an ordinary (non-aliased) dependency they're
+/// equal, but an npm/pnpm alias (`"my-alias": "npm:real-pkg@1.0.0"`) makes
+/// them diverge: `local_name` (`"my-alias"`) is what the consumer's own
+/// `package.json`/import actually names — and therefore what
+/// `require`/`import` will look for under `node_modules/` — while
+/// `resolved_name` (`"real-pkg"`) is the published package `js_install`
+/// actually downloads. Using `resolved_name` for the node_modules directory
+/// name would place the files where nothing looks for them; using
+/// `local_name` for the `js_install` dep would ask the registry for a
+/// package that was never published. See [`parse_node_modules_addr`]'s doc
+/// for the reverse operation.
+pub fn node_modules_addr(
+    consuming_pkg: &str,
+    local_name: &str,
+    resolved_name: &str,
+    version: &str,
+    goos: &str,
+    goarch: &str,
+) -> Addr {
+    let mut args = BTreeMap::new();
+    // `pkg` is `""` for the workspace-root consuming package — a plain
+    // empty `Addr` arg value, not a sentinel: `Addr`'s own `Display`
+    // quotes an empty/special value (`pkg=""`) and `parse_addr` reads it
+    // straight back, so this round-trips exactly like every other arg.
+    args.insert("pkg".to_string(), consuming_pkg.to_string());
+    args.insert("local".to_string(), local_name.to_string());
+    args.insert("name".to_string(), resolved_name.to_string());
+    args.insert("version".to_string(), version.to_string());
+    args.insert("goos".to_string(), goos.to_string());
+    args.insert("goarch".to_string(), goarch.to_string());
+    Addr::new(
+        PkgBuf::from(NODE_MODULES_PKG),
+        NODE_MODULES_TARGET.to_string(),
+        args,
+    )
+}
+
+/// One [`node_modules_addr`], parsed back into its parts — see that
+/// function's doc for what each one means and why `local_name`/
+/// `resolved_name` are kept distinct.
+pub struct NodeModulesRelocation {
+    pub consuming_pkg: String,
+    pub local_name: String,
+    pub resolved_name: String,
+    pub version: String,
+    pub goos: String,
+    pub goarch: String,
+}
+
+/// The inverse of [`node_modules_addr`]. `None` if `addr` isn't under
+/// [`NODE_MODULES_PKG`]/[`NODE_MODULES_TARGET`], or is missing a required
+/// arg (a malformed/foreign addr that happens to share the namespace — fail
+/// closed rather than guess).
+pub fn parse_node_modules_addr(addr: &Addr) -> Option<NodeModulesRelocation> {
+    if addr.package.as_str() != NODE_MODULES_PKG || addr.name != NODE_MODULES_TARGET {
+        return None;
+    }
+    Some(NodeModulesRelocation {
+        consuming_pkg: addr.args.get("pkg")?.clone(),
+        local_name: addr.args.get("local")?.clone(),
+        resolved_name: addr.args.get("name")?.clone(),
+        version: addr.args.get("version")?.clone(),
+        goos: addr.args.get("goos")?.clone(),
+        goarch: addr.args.get("goarch")?.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
