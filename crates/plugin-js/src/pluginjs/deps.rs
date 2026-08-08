@@ -12,7 +12,7 @@
 //! only resolves *names* through the lockfile's resolved graph — no
 //! import-statement parsing (oxc) yet; that's M2.
 
-use crate::pluginjs::lockfile::{DepResolution, Lockfile, ResolvedGraph};
+use crate::pluginjs::lockfile::{self, DepResolution, Lockfile, ResolvedGraph};
 use crate::pluginjs::package_json::PackageManifest;
 use crate::pluginjs::{platform, thirdparty};
 use anyhow::Context;
@@ -35,12 +35,14 @@ pub struct ResolvedDep {
 /// Resolve every dependency `manifest` declares (from its own `package.json`)
 /// to a target addr.
 ///
-/// `lockfile_pkg` is the declaring package's path *relative to the lockfile
-/// root that resolves it* (`""` at that root) — see `Provider::lockfile`'s
-/// doc for why this isn't always workspace-relative: a heph workspace can
-/// contain more than one independent npm/pnpm project, each with its own
-/// lockfile nested at a different point. `member_addrs_by_name` maps a
-/// workspace member's package **name**
+/// `consuming_pkg` is the declaring package's workspace-relative path — see
+/// [`resolve_one_dependency`]'s doc for why it's threaded separately from
+/// `lockfile_pkg`. `lockfile_pkg` is that same package's path *relative to
+/// the lockfile root that resolves it* (`""` at that root) — see
+/// `Provider::lockfile`'s doc for why this isn't always workspace-relative: a
+/// heph workspace can contain more than one independent npm/pnpm project,
+/// each with its own lockfile nested at a different point. `member_addrs_by_name`
+/// maps a workspace member's package **name**
 /// to its own `package_info` target addr string — an internal dependency is
 /// recognized by name, the same way Node resolves a workspace-hoisted
 /// sibling. `goos`/`goarch` pin the platform of any third-party `js_install`
@@ -70,7 +72,12 @@ pub struct ResolvedDep {
 /// dependency that resolves to a platform-restricted package which does not
 /// match the current platform stays a hard error — an unresolvable required
 /// dependency is a real, actionable problem, not a case for silent omission.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors resolve_one_dependency's own parameter set — this is its per-manifest loop"
+)]
 pub fn resolve_package_deps(
+    consuming_pkg: &str,
     lockfile_pkg: &str,
     manifest: &PackageManifest,
     lockfile: Option<&Lockfile>,
@@ -83,6 +90,7 @@ pub fn resolve_package_deps(
     for (group, deps) in manifest.dependency_groups() {
         for name in deps.keys() {
             if let Some(addr) = resolve_one_dependency(
+                consuming_pkg,
                 lockfile_pkg,
                 name,
                 manifest,
@@ -115,11 +123,21 @@ pub fn resolve_package_deps(
 /// `None` means "no resolution, and that's fine" (an `optionalDependencies`
 /// entry the package manager never installed, on this platform or at all) —
 /// see [`resolve_package_deps`]'s doc for the full semantics this mirrors.
+///
+/// `consuming_pkg` is the workspace-relative package this dependency is
+/// declared *by* (distinct from `lockfile_pkg`, which is relative to
+/// whichever lockfile root resolves it — see `Provider::lockfile_relative_pkg`'s
+/// doc for why those two differ in a multi-project workspace). A resolved
+/// third-party dependency needs it to build the
+/// [`thirdparty::node_modules_addr`] this fn returns instead of a raw
+/// `js_install` addr — see that fn's doc for why every consumer needs its
+/// own relocated view rather than sharing one.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors resolve_package_deps's own parameter set — this is its per-name primitive"
 )]
 pub fn resolve_one_dependency(
+    consuming_pkg: &str,
     lockfile_pkg: &str,
     name: &str,
     manifest: &PackageManifest,
@@ -182,7 +200,24 @@ pub fn resolve_one_dependency(
                     resolved.cpu
                 );
             }
-            let addr = thirdparty::thirdparty_addr(&resolved_name, &version, goos, goarch);
+            // The addr wired into a consumer's `Input` list is the
+            // *relocated* one, not `js_install`'s own raw addr: nothing
+            // else places a `js_install` download's output at
+            // `node_modules/<name>` inside a sandbox — see
+            // `thirdparty::node_modules_addr`'s doc. `name` (the local
+            // specifier, what this package's own source/config actually
+            // imports), not `resolved_name`, names the node_modules
+            // directory the relocation lands in — they differ for an
+            // npm/pnpm alias, and only `name` is what `require`/`import`
+            // will look for.
+            let addr = thirdparty::node_modules_addr(
+                consuming_pkg,
+                name,
+                &resolved_name,
+                &version,
+                goos,
+                goarch,
+            );
             Ok(Some(addr.format()))
         }
         None => {
@@ -212,6 +247,52 @@ pub fn resolve_one_dependency(
             }
         }
     }
+}
+
+/// Every third-party package reachable from `manifest`'s own direct
+/// dependencies, *transitively* — not just the names first-party source or
+/// config directly imports, which is all [`resolve_one_dependency`]/
+/// [`resolve_package_deps`] alone ever wire. A real published npm package
+/// routinely `require`s/`import`s its own dependencies internally (`axios`
+/// needs `follow-redirects`, say); Node's own module resolution has to find
+/// those too, so each of them needs the exact same
+/// [`thirdparty::node_modules_addr`] relocation a directly-imported name
+/// gets, or the moment a resolved package's *own* code runs, it hits the
+/// identical `Cannot find module` failure this whole mechanism exists to
+/// close — just one dependency edge deeper.
+///
+/// Reuses [`lockfile::direct_dep_seed_keys`]/[`ResolvedGraph::transitive_reachable`]
+/// — the exact same BFS `resolve_transitive`'s on-demand single-name lookup
+/// already runs, just walked to completion and collected instead of probed
+/// for one name. Deterministic for the same reason that BFS is (see its own
+/// doc): a name reachable at more than one version keeps whichever one is
+/// first reached in the fixed, `BTreeMap`-ordered walk.
+///
+/// `consuming_pkg`/`local_name`==`resolved_name`: every entry here comes
+/// from the lockfile's own dependency graph, not from a consumer's
+/// `package.json` (which is the only place an alias — `"my-alias":
+/// "npm:real-pkg@1.0.0"` — can be declared), so there is no local/resolved
+/// name split to make here the way [`resolve_one_dependency`]'s `ThirdParty`
+/// arm has to.
+pub fn resolve_transitive_closure(
+    consuming_pkg: &str,
+    lockfile_pkg: &str,
+    manifest: &PackageManifest,
+    lockfile: &Lockfile,
+    resolved_graph: &ResolvedGraph,
+    goos: &str,
+    goarch: &str,
+) -> anyhow::Result<Vec<String>> {
+    let seeds = lockfile::direct_dep_seed_keys(lockfile, lockfile_pkg, manifest)
+        .with_context(|| format!("seeding transitive third-party closure for {lockfile_pkg:?}"))?;
+    Ok(resolved_graph
+        .transitive_reachable(seeds)
+        .into_iter()
+        .map(|(name, version)| {
+            thirdparty::node_modules_addr(consuming_pkg, &name, &name, &version, goos, goarch)
+                .format()
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -272,6 +353,7 @@ mod tests {
         members.insert("b".to_string(), "//packages/b:package_info".to_string());
         let deps = resolve_package_deps(
             "packages/a",
+            "packages/a",
             &manifest,
             None,
             None,
@@ -292,6 +374,7 @@ mod tests {
         let graph = lock.resolved_graph();
         let deps = resolve_package_deps(
             "packages/a",
+            "packages/a",
             &manifest,
             Some(&lock),
             Some(&graph),
@@ -301,11 +384,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(deps.len(), 1);
+        // The wired addr is the relocated `node_modules` group (places
+        // lodash at `packages/a/node_modules/lodash`), not `js_install`'s
+        // own raw addr — see `thirdparty::node_modules_addr`'s doc.
         assert!(
-            deps[0].addr.contains("@heph/js/thirdparty/lodash@4.17.21"),
+            deps[0].addr.contains("@heph/js/node_modules"),
             "{}",
             deps[0].addr
         );
+        assert!(deps[0].addr.contains("name=lodash"), "{}", deps[0].addr);
+        assert!(deps[0].addr.contains("version=4.17.21"), "{}", deps[0].addr);
+        assert!(deps[0].addr.contains("pkg=packages/a"), "{}", deps[0].addr);
         assert!(deps[0].addr.contains("goos=linux"), "{}", deps[0].addr);
     }
 
@@ -349,6 +438,7 @@ mod tests {
         let graph = lock.resolved_graph();
         let addr = resolve_one_dependency(
             "packages/a",
+            "packages/a",
             "@eslint/js",
             &manifest,
             Some(&lock),
@@ -359,10 +449,9 @@ mod tests {
         )
         .unwrap()
         .expect("transitively reachable through typescript-eslint");
-        assert!(
-            addr.contains("@heph/js/thirdparty/@eslint/js@9.0.0"),
-            "{addr}"
-        );
+        assert!(addr.contains("@heph/js/node_modules"), "{addr}");
+        assert!(addr.contains("name=@eslint/js"), "{addr}");
+        assert!(addr.contains("version=9.0.0"), "{addr}");
     }
 
     /// Unlike npm's ancestor-`node_modules` walk (which finds any name
@@ -411,6 +500,7 @@ snapshots:
         // negative case fails loudly rather than fabricating an addr.
         let err = resolve_one_dependency(
             "packages/a",
+            "packages/a",
             "unrelated",
             &manifest,
             Some(&lock),
@@ -430,6 +520,7 @@ snapshots:
         let graph = lock.resolved_graph();
         let err = resolve_package_deps(
             "packages/a",
+            "packages/a",
             &manifest,
             Some(&lock),
             Some(&graph),
@@ -448,6 +539,7 @@ snapshots:
         let graph = lock.resolved_graph();
         let deps = resolve_package_deps(
             "packages/a",
+            "packages/a",
             &manifest,
             Some(&lock),
             Some(&graph),
@@ -463,6 +555,7 @@ snapshots:
     fn no_lockfile_but_required_deps_declared_is_an_error() {
         let manifest = manifest(&[("lodash", "^4.17.21")], &[], &[]);
         resolve_package_deps(
+            "packages/a",
             "packages/a",
             &manifest,
             None,
@@ -508,6 +601,7 @@ snapshots:
         // native-thing@1.0.0 is restricted to darwin/arm64 — a mismatch.
         let deps = resolve_package_deps(
             "packages/a",
+            "packages/a",
             &manifest,
             Some(&lock),
             Some(&graph),
@@ -532,6 +626,7 @@ snapshots:
         let lock = npm_lockfile_with_platform_restricted_pkg();
         let graph = lock.resolved_graph();
         let err = resolve_package_deps(
+            "packages/a",
             "packages/a",
             &manifest,
             Some(&lock),

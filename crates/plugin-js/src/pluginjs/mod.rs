@@ -65,6 +65,20 @@ pub const LINT_TARGET: &str = "js_lint";
 /// section for why per-file incrementality is explicitly not the goal here).
 pub const BUNDLE_TARGET: &str = "js_bundle";
 
+/// Target name of the on-disk `node_modules` sync target: an aggregating
+/// `group` (see `crates/builtins/src/plugingroup`) over every third-party
+/// dependency this package resolves (direct and transitive — see
+/// `deps::resolve_transitive_closure`), each already relocated to its own
+/// `<pkg>/node_modules/<name>` by `thirdparty::node_modules_addr`, with
+/// `codegen = "copy"` so `heph run //pkg:node_modules` actually materializes
+/// the result onto real disk — the only way an IDE (which reads the real
+/// filesystem, never heph's own sandbox/cache) can see a hermetically
+/// resolved dependency at all. Unlike every other target this provider
+/// lists, nothing else in the graph ever depends on this one; it exists
+/// solely to be requested directly. See `Provider::node_modules_sync_spec`'s
+/// doc for why write-back requires that.
+pub const NODE_MODULES_SYNC_TARGET: &str = "node_modules";
+
 /// Directory names that are never a package boundary or workspace member,
 /// however deep they appear: `node_modules` is third-party/manager-owned
 /// content, never a first-party package this provider should discover, and a

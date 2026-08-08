@@ -1,9 +1,9 @@
 use crate::pluginjs::lockfile::{self, Lockfile, ResolvedGraph};
 use crate::pluginjs::workspace::{self, PkgManager, WorkspaceMember};
 use crate::pluginjs::{
-    BUNDLE_TARGET, LINT_TARGET, PACKAGE_INFO_TARGET, PACKAGE_JSON, TEST_TARGET, TYPECHECK_TARGET,
-    deps, importgraph, is_skipped_dir_name, package_json, platform, resolvers, thirdparty,
-    toolchain,
+    BUNDLE_TARGET, LINT_TARGET, NODE_MODULES_SYNC_TARGET, PACKAGE_INFO_TARGET, PACKAGE_JSON,
+    TEST_TARGET, TYPECHECK_TARGET, deps, importgraph, is_skipped_dir_name, package_json, platform,
+    resolvers, thirdparty, toolchain,
 };
 use anyhow::Context;
 use enclose::enclose;
@@ -1037,6 +1037,7 @@ impl Provider {
                 .with_context(|| format!("reading dependencies of {pkg_str:?}"))?;
 
             let resolved = deps::resolve_package_deps(
+                &pkg_str,
                 &lockfile_pkg,
                 &manifest,
                 lockfile.as_deref(),
@@ -1322,6 +1323,164 @@ impl Provider {
         })
     }
 
+    /// The `TargetSpec` for a [`thirdparty::node_modules_addr`] — a builtin
+    /// `group` target that relocates the underlying `js_install` download
+    /// (`Content::DirPath(thirdparty_pkg(name, version))`, see
+    /// `driver_install.rs`) to `<consuming_pkg>/node_modules/<local_name>`,
+    /// the only path Node's own module resolution ever looks at. Reuses the
+    /// `group` driver (`crates/builtins/src/plugingroup`) rather than
+    /// inventing a relocation mechanism — see that driver's module doc for
+    /// why a path-transform view is zero-copy and already folds into a
+    /// consumer's cache key via its own def hash.
+    ///
+    /// Synchronous and infallible-by-construction: unlike
+    /// `thirdparty_install_spec`, this never touches a lockfile — it only
+    /// re-derives the *addr* of the `js_install` target it relocates, which
+    /// `Provider::get` resolves independently (and lazily) when the engine
+    /// actually walks this target's own `deps`.
+    fn node_modules_group_spec(
+        &self,
+        addr: &Addr,
+        r: &thirdparty::NodeModulesRelocation,
+    ) -> TargetSpec {
+        let install_addr =
+            thirdparty::thirdparty_addr(&r.resolved_name, &r.version, &r.goos, &r.goarch);
+        let node_modules_dir = if r.consuming_pkg.is_empty() {
+            format!("node_modules/{}", r.local_name)
+        } else {
+            format!("{}/node_modules/{}", r.consuming_pkg, r.local_name)
+        };
+
+        let mut config: HashMap<String, Value> = HashMap::new();
+        config.insert(
+            "deps".to_string(),
+            Value::List(vec![Value::String(install_addr.format())]),
+        );
+        config.insert(
+            "strip_prefix".to_string(),
+            Value::String(
+                thirdparty::thirdparty_pkg(&r.resolved_name, &r.version)
+                    .as_str()
+                    .to_string(),
+            ),
+        );
+        config.insert("prefix".to_string(), Value::String(node_modules_dir));
+
+        TargetSpec {
+            addr: addr.clone(),
+            driver: thirdparty::NODE_MODULES_TARGET.to_string(),
+            config,
+            labels: vec![],
+            transitive: Default::default(),
+            approval: Default::default(),
+        }
+    }
+
+    /// The `TargetSpec` for [`crate::pluginjs::NODE_MODULES_SYNC_TARGET`] — an
+    /// aggregating `group` over every third-party dependency `pkg` resolves
+    /// (direct and transitive), each already relocated by
+    /// [`Provider::node_modules_group_spec`] to its own
+    /// `<pkg>/node_modules/<name>`. `include = ["**"]` is enough by itself to
+    /// make this a *relocating* (non-transparent, has-its-own-artifact)
+    /// group — see `plugingroup` module docs — without actually renaming a
+    /// single path, since every dep already landed at its correct final
+    /// destination; this target exists purely to give that already-correct
+    /// content one address `codegen = "copy"` can materialize.
+    ///
+    /// **Why this needs its own target at all**, rather than just tagging
+    /// each per-dependency `group` with `codegen`: `heph`'s codegen
+    /// write-back only fires for the *top-level requested* target (a
+    /// compatibility review's finding on this design) — every one of this
+    /// package's individual relocated-dependency addrs is normally only
+    /// ever reached as a `js_test`/`js_typecheck`/`js_bundle` *input*, never
+    /// requested directly, so `codegen` on those addrs alone would never
+    /// fire. `heph run //pkg:node_modules` makes this the top-level target.
+    async fn node_modules_sync_spec(&self, pkg: &PkgBuf) -> anyhow::Result<TargetSpec> {
+        let addr = Addr::new(
+            pkg.clone(),
+            NODE_MODULES_SYNC_TARGET.to_string(),
+            Default::default(),
+        );
+        let pkg_str = pkg.as_str().to_string();
+        let pkg_dir = if pkg_str.is_empty() {
+            self.workspace_root.clone()
+        } else {
+            self.workspace_root.join(&pkg_str)
+        };
+        let lockfile = self.lockfile(&pkg_dir).await?;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let lockfile_pkg = lockfile
+            .as_ref()
+            .map(|(root, _)| self.lockfile_relative_pkg(root, &pkg_str))
+            .unwrap_or_else(|| pkg_str.clone());
+        let lockfile = lockfile.map(|(_, lf)| lf);
+        let member_addrs_by_name = self.member_addrs_by_name().await?;
+        let workspace_root = self.workspace_root.clone();
+        let goos = platform::current_goos();
+        let goarch = platform::current_goarch();
+
+        let deps_addrs = hcore::blocking::run(move || -> anyhow::Result<Vec<String>> {
+            let package_json_path = workspace_root.join(&pkg_str).join(PACKAGE_JSON);
+            let manifest = package_json::read_package_manifest(&package_json_path)
+                .with_context(|| format!("reading dependencies of {pkg_str:?}"))?;
+
+            // Direct deps, filtered to third-party ones only — a workspace-
+            // sibling `ResolvedDep` addresses that sibling's own
+            // `package_info` target, not a relocated `js_install` download,
+            // and has no place in a `node_modules` sync.
+            let mut addrs: Vec<String> = deps::resolve_package_deps(
+                &pkg_str,
+                &lockfile_pkg,
+                &manifest,
+                lockfile.as_deref(),
+                resolved_graph.as_deref(),
+                &member_addrs_by_name,
+                &goos,
+                &goarch,
+            )?
+            .into_iter()
+            .map(|d| d.addr)
+            .filter(|addr| addr.contains(thirdparty::NODE_MODULES_PKG))
+            .collect();
+
+            if let (Some(lf), Some(rg)) = (lockfile.as_deref(), resolved_graph.as_deref()) {
+                addrs.extend(deps::resolve_transitive_closure(
+                    &pkg_str,
+                    &lockfile_pkg,
+                    &manifest,
+                    lf,
+                    rg,
+                    &goos,
+                    &goarch,
+                )?);
+            }
+            addrs.sort();
+            addrs.dedup();
+            Ok(addrs)
+        })
+        .await?;
+
+        let mut config: HashMap<String, Value> = HashMap::new();
+        config.insert(
+            "deps".to_string(),
+            Value::List(deps_addrs.into_iter().map(Value::String).collect()),
+        );
+        config.insert(
+            "include".to_string(),
+            Value::List(vec![Value::String("**".to_string())]),
+        );
+        config.insert("codegen".to_string(), Value::String("copy".to_string()));
+
+        Ok(TargetSpec {
+            addr,
+            driver: thirdparty::NODE_MODULES_TARGET.to_string(),
+            config,
+            labels: vec![],
+            transitive: Default::default(),
+            approval: Default::default(),
+        })
+    }
+
     /// The workspace-relative path to a package's default `js_bundle` entry
     /// point — its own `package.json` `"main"` field, resolved against the
     /// package directory and checked to actually exist. `None` when the
@@ -1546,10 +1705,11 @@ impl Provider {
             }
 
             let step = hcore::blocking::run(enclose!(
-                (canonical_root, lockfile_pkg, cur_file, graph, manifest, lockfile, resolved_graph,
+                (canonical_root, cur_pkg, lockfile_pkg, cur_file, graph, manifest, lockfile, resolved_graph,
                  member_addrs_by_name, goos, goarch) move || {
                     bundle_closure_step(
                         &canonical_root,
+                        &cur_pkg,
                         &lockfile_pkg,
                         &cur_file,
                         &graph,
@@ -1964,6 +2124,76 @@ struct BundleClosureStep {
     new_external: Vec<(String, String)>,
 }
 
+/// How a resolved import edge landing outside the owning package classifies.
+enum EdgeClassification {
+    /// Not under any `node_modules/` — a genuine first-party edge (a
+    /// workspace sibling), for the caller to handle its own way.
+    FirstParty,
+    /// Landed inside a `node_modules/` tree — only possible when one
+    /// happens to exist ambient on this host (`Provider::get` runs before
+    /// `js_install` ever executes). `Some((name, addr))` when resolution
+    /// found a relocated `js_install` addr to wire; `None` when the name
+    /// resolves to a declared-but-platform-mismatched optional dependency
+    /// (nothing to wire, not an error).
+    ThirdParty(Option<(String, String)>),
+}
+
+/// Classify one resolved import edge and, if it landed inside an ambient
+/// `node_modules`, resolve it the *same* hermetic, lockfile-driven way an
+/// `unresolved_bare_specifiers` site is — never by declaring a raw `fs:file`
+/// Input at the ambient path, which would depend on host filesystem state no
+/// input hashes, and would never even be reached on a fresh checkout with no
+/// `node_modules` installed yet. Shared by `bundle_closure_step`,
+/// `typecheck_deps_config`, and `test_deps_config` — the same fix, previously
+/// duplicated three times (a code-quality review finding: the class of bug
+/// this function exists to prevent had already independently drifted across
+/// those three copies once).
+///
+/// `site` is a human-readable description of what's being resolved (e.g. the
+/// importing file's path) — folded into the error context so a resolution
+/// failure names *which* file/edge caused it, not just the package.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors resolve_one_dependency's own parameter set, plus the resolved path and a \
+              site description for error context"
+)]
+fn classify_resolved_edge(
+    resolved: &Path,
+    site: &str,
+    caller: &str,
+    consuming_pkg: &str,
+    lockfile_pkg: &str,
+    manifest: &package_json::PackageManifest,
+    lockfile: Option<&Lockfile>,
+    resolved_graph: Option<&ResolvedGraph>,
+    member_addrs_by_name: &BTreeMap<String, String>,
+    goos: &str,
+    goarch: &str,
+) -> anyhow::Result<EdgeClassification> {
+    let Some(name) = importgraph::thirdparty_pkg_name_from_path(resolved) else {
+        return Ok(EdgeClassification::FirstParty);
+    };
+    let addr = deps::resolve_one_dependency(
+        consuming_pkg,
+        lockfile_pkg,
+        &name,
+        manifest,
+        lockfile,
+        resolved_graph,
+        member_addrs_by_name,
+        goos,
+        goarch,
+    )
+    .with_context(|| {
+        format!(
+            "resolving {site:?}'s ambient-node_modules-resolved import of `{name}` for {caller}"
+        )
+    })?;
+    Ok(EdgeClassification::ThirdParty(
+        addr.map(|addr| (name, addr)),
+    ))
+}
+
 /// Pure (no async, only what's already loaded) per-file edge walk:
 /// everything [`importgraph::build_test_closure`] does for one file,
 /// generalized to (a) recurse across package boundaries instead of stopping
@@ -1972,6 +2202,16 @@ struct BundleClosureStep {
 /// Split out from [`Provider::bundle_closure`] so the per-file work can run
 /// on the blocking pool without an `async fn` in the way, and so it is
 /// unit-testable without a real bundler binary.
+///
+/// Deliberately does **not** wire [`deps::resolve_transitive_closure`] the
+/// way `typecheck_deps_config`/`test_deps_config` do: a bundler marks every
+/// resolved third-party name `--external` (never bundled, left as a runtime
+/// `require`/`import`) and therefore never descends into that package's own
+/// source to discover *its* further dependencies at build time — unlike
+/// `tsc` (which follows a resolved package's own `.d.ts` chain) or a real
+/// `vitest`/`jest` run (which executes the resolved package's own code), a
+/// bundle's build-time Input set genuinely stops at the directly-referenced
+/// name.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors typecheck_deps_config's/test_deps_config's own lockfile/graph/member/\
@@ -1980,6 +2220,7 @@ struct BundleClosureStep {
 )]
 fn bundle_closure_step(
     canonical_root: &Path,
+    consuming_pkg: &str,
     lockfile_pkg: &str,
     file_rel: &str,
     graph: &importgraph::ImportGraph,
@@ -1994,32 +2235,26 @@ fn bundle_closure_step(
     let mut new_external = Vec::new();
 
     for edge in graph.runtime_edges.iter().filter(|e| e.file == file_rel) {
-        if let Some(name) = importgraph::thirdparty_pkg_name_from_path(&edge.resolved) {
-            // Resolved into `node_modules` — only possible when it happens
-            // to exist ambient on this host (`Provider::get` runs before
-            // `js_install` ever executes; see importgraph.rs module docs'
-            // "Hermeticity" section). Declared as a plain file Input at the
-            // resolved path, mirroring `typecheck_deps_config`'s identical
-            // treatment of an ambient-resolved third-party edge — the
-            // hermetically-correct path (a fresh checkout with no
-            // `node_modules`) instead surfaces this specifier as an
-            // `unresolved_bare_specifiers` site, handled below via the
-            // lockfile-driven mechanism (bug class (b): never resolve
-            // third-party inputs via ambient `node_modules`).
-            let rel = edge
-                .resolved
-                .strip_prefix(canonical_root)
-                .with_context(|| {
-                    format!(
-                        "js_bundle: {:?} imports from {:?}, a third-party path outside the \
-                         workspace root ({:?})",
-                        edge.file, edge.resolved, canonical_root
-                    )
-                })?
-                .to_string_lossy()
-                .replace('\\', "/");
-            new_external.push((name, hbuiltins::pluginfs::file_addr(&rel).format()));
-            continue;
+        match classify_resolved_edge(
+            &edge.resolved,
+            &edge.file,
+            "js_bundle",
+            consuming_pkg,
+            lockfile_pkg,
+            manifest,
+            lockfile,
+            resolved_graph,
+            member_addrs_by_name,
+            goos,
+            goarch,
+        )? {
+            EdgeClassification::ThirdParty(resolved) => {
+                if let Some(pair) = resolved {
+                    new_external.push(pair);
+                }
+                continue;
+            }
+            EdgeClassification::FirstParty => {}
         }
 
         anyhow::ensure!(
@@ -2057,6 +2292,7 @@ fn bundle_closure_step(
         .filter(|s| s.file == file_rel)
     {
         if let Some(addr) = deps::resolve_one_dependency(
+            consuming_pkg,
             lockfile_pkg,
             &site.package_name,
             manifest,
@@ -2282,6 +2518,27 @@ fn typecheck_deps_config(
     // M3 review finding).
     let mut types_addrs: BTreeSet<String> = BTreeSet::new();
     for edge in graph.type_edges.iter().chain(graph.runtime_edges.iter()) {
+        match classify_resolved_edge(
+            &edge.resolved,
+            &edge.file,
+            "js_typecheck",
+            pkg,
+            lockfile_pkg,
+            &manifest,
+            lockfile,
+            resolved_graph,
+            member_addrs_by_name,
+            goos,
+            goarch,
+        )? {
+            EdgeClassification::ThirdParty(resolved) => {
+                if let Some((_, addr)) = resolved {
+                    types_addrs.insert(addr);
+                }
+                continue;
+            }
+            EdgeClassification::FirstParty => {}
+        }
         let rel = edge
             .resolved
             .strip_prefix(&canonical_root)
@@ -2315,6 +2572,7 @@ fn typecheck_deps_config(
     // `deps_config`'s own handling of the same case.
     for site in &graph.unresolved_bare_specifiers {
         if let Some(addr) = deps::resolve_one_dependency(
+            pkg,
             lockfile_pkg,
             &site.package_name,
             &manifest,
@@ -2332,6 +2590,18 @@ fn typecheck_deps_config(
         })? {
             types_addrs.insert(addr);
         }
+    }
+    // A resolved third-party package's own internal dependencies need the
+    // same relocation a directly-imported one gets, or `tsc` reading that
+    // package's own `.d.ts` chain hits an unresolved import one edge deeper
+    // — see `deps::resolve_transitive_closure`'s doc.
+    if let (Some(lf), Some(rg)) = (lockfile, resolved_graph) {
+        types_addrs.extend(
+            deps::resolve_transitive_closure(pkg, lockfile_pkg, &manifest, lf, rg, goos, goarch)
+                .with_context(|| {
+                    format!("resolving {pkg:?}'s transitive third-party closure for js_typecheck")
+                })?,
+        );
     }
 
     let mut deps: HashMap<String, Value> = HashMap::new();
@@ -2685,6 +2955,36 @@ fn test_deps_config(
 
     let mut external_addrs: BTreeSet<String> = BTreeSet::new();
     for f in &closure.external_files {
+        // `build_test_closure` doesn't distinguish a genuine first-party
+        // workspace-sibling file from an edge that only resolved because a
+        // real `node_modules` happens to exist on this host — both land in
+        // `external_files` alike (it just checks "outside my own package
+        // dir"). Classify here, the same way `bundle_closure_step`/
+        // `typecheck_deps_config` already do for their own runtime/type
+        // edges: a `node_modules`-landed path must go through the
+        // lockfile-driven `resolve_one_dependency` resolution, never a raw
+        // `fs:file` at the ambient path.
+        match classify_resolved_edge(
+            Path::new(f),
+            f,
+            "js_test",
+            pkg,
+            lockfile_pkg,
+            &manifest,
+            lockfile,
+            resolved_graph,
+            member_addrs_by_name,
+            goos,
+            goarch,
+        )? {
+            EdgeClassification::ThirdParty(resolved) => {
+                if let Some((_, addr)) = resolved {
+                    external_addrs.insert(addr);
+                }
+                continue;
+            }
+            EdgeClassification::FirstParty => {}
+        }
         external_addrs.insert(hbuiltins::pluginfs::file_addr(f).format());
     }
     // Mirrors `typecheck_deps_config`'s identical on-demand third-party
@@ -2698,6 +2998,7 @@ fn test_deps_config(
         .chain(&runner_config_bare_specifiers)
     {
         if let Some(addr) = deps::resolve_one_dependency(
+            pkg,
             lockfile_pkg,
             &site.package_name,
             &manifest,
@@ -2715,6 +3016,21 @@ fn test_deps_config(
         })? {
             external_addrs.insert(addr);
         }
+    }
+    // Beyond what the test file/runner config directly import: a resolved
+    // third-party package's *own* internal dependencies (`axios` needing
+    // `follow-redirects`) must also be relocated into this package's
+    // `node_modules`, or the moment the real vitest/jest run reaches that
+    // package's own code, it hits the identical `Cannot find module`
+    // failure one edge deeper — see `deps::resolve_transitive_closure`'s
+    // doc.
+    if let (Some(lf), Some(rg)) = (lockfile, resolved_graph) {
+        external_addrs.extend(
+            deps::resolve_transitive_closure(pkg, lockfile_pkg, &manifest, lf, rg, goos, goarch)
+                .with_context(|| {
+                    format!("resolving {pkg:?}'s transitive third-party closure for js_test")
+                })?,
+        );
     }
     if !external_addrs.is_empty() {
         deps.insert(
@@ -2833,6 +3149,14 @@ struct LintDepsConfig {
 /// declared, so an ignored file still costs a declared Input (over-inclusion,
 /// never a missed one). TODO M5+: fold ignore-pattern filtering in, mirroring
 /// `typecheck_deps_config`'s tsconfig-`include`/`exclude` treatment.
+///
+/// Also deliberately does not wire [`deps::resolve_transitive_closure`] the
+/// way `typecheck_deps_config`/`test_deps_config` do: unlike those, this
+/// resolves names extracted from the *config's own text*
+/// (`extends`/`plugins`), never from an oxc-parsed import graph, so a
+/// resolved plugin's own further `require`s are never reachable from this
+/// scan at all — narrower scope than the other three, TODO M5+ if a real
+/// eslint-plugin-with-its-own-third-party-deps case motivates it.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors typecheck_deps_config's/test_deps_config's own lockfile/member/platform \
@@ -3054,6 +3378,7 @@ fn lint_deps_config(
             let mut plugin_addrs: BTreeSet<String> = BTreeSet::new();
             for name in names {
                 if let Some(addr) = deps::resolve_one_dependency(
+                    pkg,
                     lockfile_pkg,
                     &name,
                     &manifest,
@@ -3377,6 +3702,18 @@ impl ProviderTrait for Provider {
                 ),
             }));
 
+            // The on-disk `node_modules` sync target — see
+            // `NODE_MODULES_SYNC_TARGET`'s doc. Always listed alongside
+            // `package_info`; an empty dependency set just produces an empty
+            // sync (harmless, never executed unless requested directly).
+            responses.push(Ok(ListResponse {
+                addr: Addr::new(
+                    req.package.clone(),
+                    NODE_MODULES_SYNC_TARGET.to_string(),
+                    Default::default(),
+                ),
+            }));
+
             // One `js_test` target per matched test file — the milestone's
             // stated per-test-file (not per-package) granularity; see
             // `driver_test.rs` module docs. Test discovery is an optional,
@@ -3508,6 +3845,24 @@ impl ProviderTrait for Provider {
                 return Ok(GetResponse { target_spec });
             }
 
+            // Same treatment for the relocated-`node_modules` namespace —
+            // see `Provider::node_modules_group_spec`'s doc. Also synthetic,
+            // also checked before any real-package handling below.
+            if req.addr.name == thirdparty::NODE_MODULES_TARGET
+                && req.addr.package.as_str() == thirdparty::NODE_MODULES_PKG
+            {
+                let Some(relocation) = thirdparty::parse_node_modules_addr(&req.addr) else {
+                    return Err(GetError::Other(anyhow::anyhow!(
+                        "malformed js node_modules-relocation addr {}: missing a required arg \
+                         (expected pkg/local/name/version/goos/goarch)",
+                        req.addr.format()
+                    )));
+                };
+                return Ok(GetResponse {
+                    target_spec: self.node_modules_group_spec(&req.addr, &relocation),
+                });
+            }
+
             // `js_typecheck` is a second per-package target kind alongside
             // `package_info`, checked before the `PACKAGE_INFO_TARGET` gate
             // below so it isn't rejected as an unknown target name.
@@ -3577,6 +3932,37 @@ impl ProviderTrait for Provider {
                         approval: Default::default(),
                     },
                 });
+            }
+
+            // The on-disk `node_modules` sync target — see
+            // `NODE_MODULES_SYNC_TARGET`'s doc. Checked before the
+            // `PACKAGE_INFO_TARGET` gate below for the same reason
+            // `TYPECHECK_TARGET` is.
+            if req.addr.name == NODE_MODULES_SYNC_TARGET {
+                if self
+                    .skip
+                    .prunes_package(&self.workspace_root, Path::new(req.addr.package.as_str()))
+                {
+                    return Err(GetError::NotFound);
+                }
+                let package_json = self
+                    .workspace_root
+                    .join(req.addr.package.as_str())
+                    .join(PACKAGE_JSON);
+                if !package_json.is_file() {
+                    return Err(GetError::NotFound);
+                }
+                let target_spec = self
+                    .node_modules_sync_spec(&req.addr.package)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "resolving node_modules sync config for {}",
+                            req.addr.format()
+                        )
+                    })
+                    .map_err(GetError::Other)?;
+                return Ok(GetResponse { target_spec });
             }
 
             // `js_test` is a fourth per-package-*file* target kind: one addr
@@ -4164,15 +4550,20 @@ mod tests {
             .await
             .expect("list");
         let addrs: Vec<Addr> = iter.map(|r| r.expect("no per-entry error").addr).collect();
-        // `package_info` + `js_lint` — see `Provider::list`'s doc for why
-        // `js_lint` is listed unconditionally alongside `package_info` (no
-        // `js_test`-style per-file discovery needed for it).
-        assert_eq!(addrs.len(), 2);
+        // `package_info` + `js_lint` + `node_modules` — see `Provider::list`'s
+        // doc for why `js_lint`/`node_modules` are listed unconditionally
+        // alongside `package_info` (no `js_test`-style per-file discovery
+        // needed for either).
+        assert_eq!(addrs.len(), 3);
         assert_eq!(addrs[0].name, PACKAGE_INFO_TARGET);
         assert_eq!(addrs[0].package.as_str(), "packages/a");
         assert!(
             addrs.iter().any(|a| a.name == LINT_TARGET),
             "js_lint must be listed alongside package_info: {addrs:?}"
+        );
+        assert!(
+            addrs.iter().any(|a| a.name == NODE_MODULES_SYNC_TARGET),
+            "node_modules sync must be listed alongside package_info: {addrs:?}"
         );
     }
 
@@ -4394,10 +4785,377 @@ mod tests {
         let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
         let addrs = get_deps_addrs(&provider, "packages/a").await;
         assert_eq!(addrs.len(), 1);
+        // The relocated `node_modules` group addr, not `js_install`'s own
+        // raw addr — see `thirdparty::node_modules_addr`'s doc.
+        assert!(addrs[0].contains("@heph/js/node_modules"), "{}", addrs[0]);
+        assert!(addrs[0].contains("name=lodash"), "{}", addrs[0]);
+        assert!(addrs[0].contains("version=4.17.21"), "{}", addrs[0]);
+        assert!(addrs[0].contains("pkg=packages/a"), "{}", addrs[0]);
+    }
+
+    /// Stands in for a real npm tarball extraction (no network needed) in
+    /// the `group`-relocation e2e tests below — everything downstream of
+    /// this (the `Provider::get` dispatch, the `strip_prefix`/`prefix`
+    /// transform) is the real production code path.
+    struct FakeInstallArtifact {
+        paths: Vec<String>,
+    }
+    impl hcore::hartifactcontent::Content for FakeInstallArtifact {
+        fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+            anyhow::bail!("not used")
+        }
+        fn walk(
+            &self,
+        ) -> anyhow::Result<
+            Box<dyn Iterator<Item = anyhow::Result<hcore::hartifactcontent::WalkEntry>> + '_>,
+        > {
+            Ok(Box::new(self.paths.iter().map(|p| {
+                Ok(hcore::hartifactcontent::WalkEntry {
+                    path: PathBuf::from(p),
+                    kind: hcore::hartifactcontent::WalkEntryKind::File {
+                        data: Box::new(std::io::Cursor::new(Vec::new())),
+                        x: false,
+                        size: 0,
+                    },
+                })
+            })))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok("fake-install-hash".to_string())
+        }
+        fn entry_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+            Ok(self.paths.iter().map(PathBuf::from).collect())
+        }
+    }
+
+    /// The materialization gap this whole fix closes, proven end to end —
+    /// not just that the right addr is *declared*, but that resolving it
+    /// through the real `group` driver actually relocates the underlying
+    /// `js_install` download's files to `<consuming_pkg>/node_modules/<name>/…`,
+    /// the only path Node's own module resolution ever looks at.
+    #[tokio::test]
+    async fn npm_e2e_third_party_dep_materializes_at_consuming_pkg_node_modules() {
+        let dir = npm_e2e_fixture("sha512-abc");
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let addrs = get_deps_addrs(&provider, "packages/a").await;
+        assert_eq!(addrs.len(), 1);
+        let node_modules_addr =
+            hmodel::htaddr::parse_addr(&addrs[0]).expect("parse relocated addr");
+
+        let ct = ctoken();
+        let spec = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: node_modules_addr,
+                    states: vec![],
+                    executor: Arc::new(NoopExecutor),
+                },
+                &ct,
+            )
+            .await
+            .expect("get node_modules group spec")
+            .target_spec;
+        assert_eq!(spec.driver, "group");
+
+        let parsed = hplugin::driver::Driver::parse(
+            &hbuiltins::plugingroup::Driver,
+            hplugin::driver::ParseRequest {
+                request_id: "test".to_string(),
+                target_spec: Arc::new(spec),
+            },
+            &ct,
+        )
+        .await
+        .expect("parse group spec");
+        assert_eq!(parsed.target_def.inputs.len(), 1);
+
+        // The underlying `js_install` download's own synthetic package
+        // path — what its files are packed as, before relocation.
+        let install_pkg = thirdparty::thirdparty_pkg("lodash", "4.17.21");
+        let fake_artifact = FakeInstallArtifact {
+            paths: vec![
+                format!("{}/package.json", install_pkg.as_str()),
+                format!("{}/index.js", install_pkg.as_str()),
+            ],
+        };
+        let run_input = hplugin::driver::RunInput {
+            artifact: hplugin::driver::inputartifact::InputArtifact {
+                r#type: hplugin::driver::inputartifact::Type::Dep,
+                origin_id: "dep0".to_string(),
+                content: Arc::new(fake_artifact),
+            },
+            origin_id: "dep0".to_string(),
+            source_addr: thirdparty::thirdparty_addr(
+                "lodash",
+                "4.17.21",
+                &platform::current_goos(),
+                &platform::current_goarch(),
+            ),
+            filters: vec![],
+            annotations: Default::default(),
+        };
+        let hashin = "test-hashin".to_string();
+        let resp = hplugin::driver::Driver::run(
+            &hbuiltins::plugingroup::Driver,
+            hplugin::driver::RunRequest {
+                request_id: &"test".to_string(),
+                target: &parsed.target_def,
+                tree_root_path: PathBuf::new(),
+                inputs: vec![run_input],
+                hashin: &hashin,
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                sandbox_dir: PathBuf::new(),
+            },
+            &ct,
+        )
+        .await
+        .expect("run group relocation");
+
+        assert_eq!(resp.artifacts.len(), 1);
+        let mut relocated: Vec<String> =
+            hcore::hartifactcontent::Content::entry_paths(&resp.artifacts[0])
+                .expect("relocated entry paths")
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+        relocated.sort();
+        assert_eq!(
+            relocated,
+            vec![
+                "packages/a/node_modules/lodash/index.js".to_string(),
+                "packages/a/node_modules/lodash/package.json".to_string(),
+            ],
+            "js_install's download must land at packages/a/node_modules/lodash, the only path \
+             Node's own module resolution looks at"
+        );
+        for p in &relocated {
+            assert!(
+                !p.contains("@heph/js/thirdparty"),
+                "the synthetic js_install path must not survive relocation: {p}"
+            );
+        }
+    }
+
+    /// The `consuming_pkg == ""` corner case: a single-package repo (or a
+    /// script living directly at the workspace root) with no nested package
+    /// directory at all. `node_modules_addr`'s `pkg` arg is a plain empty
+    /// `Addr` arg value here, not a sentinel (see that fn's doc) — this is
+    /// the one path that would silently break if the empty-value round trip
+    /// or `node_modules_group_spec`'s `consuming_pkg.is_empty()` branch ever
+    /// regressed, and until now nothing exercised it.
+    #[tokio::test]
+    async fn npm_e2e_third_party_dep_materializes_at_workspace_root_node_modules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name": "root", "dependencies": {"lodash": "^4.17.21"}}"#,
+        );
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root", "dependencies": { "lodash": "^4.17.21" } },
+                    "node_modules/lodash": {
+                        "version": "4.17.21",
+                        "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let addrs = get_deps_addrs(&provider, "").await;
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs[0].contains("name=lodash"), "{}", addrs[0]);
+        // The empty consuming-package arg round-trips as a plain, quoted
+        // empty `Addr` value — `pkg=""`, not any sentinel spelling.
+        assert!(addrs[0].contains("pkg=\"\""), "{}", addrs[0]);
+        let node_modules_addr =
+            hmodel::htaddr::parse_addr(&addrs[0]).expect("parse relocated addr");
+
+        let ct = ctoken();
+        let spec = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: node_modules_addr,
+                    states: vec![],
+                    executor: Arc::new(NoopExecutor),
+                },
+                &ct,
+            )
+            .await
+            .expect("get node_modules group spec")
+            .target_spec;
+
+        let parsed = hplugin::driver::Driver::parse(
+            &hbuiltins::plugingroup::Driver,
+            hplugin::driver::ParseRequest {
+                request_id: "test".to_string(),
+                target_spec: Arc::new(spec),
+            },
+            &ct,
+        )
+        .await
+        .expect("parse group spec");
+
+        let install_pkg = thirdparty::thirdparty_pkg("lodash", "4.17.21");
+        let fake_artifact = FakeInstallArtifact {
+            paths: vec![format!("{}/index.js", install_pkg.as_str())],
+        };
+        let run_input = hplugin::driver::RunInput {
+            artifact: hplugin::driver::inputartifact::InputArtifact {
+                r#type: hplugin::driver::inputartifact::Type::Dep,
+                origin_id: "dep0".to_string(),
+                content: Arc::new(fake_artifact),
+            },
+            origin_id: "dep0".to_string(),
+            source_addr: thirdparty::thirdparty_addr(
+                "lodash",
+                "4.17.21",
+                &platform::current_goos(),
+                &platform::current_goarch(),
+            ),
+            filters: vec![],
+            annotations: Default::default(),
+        };
+        let hashin = "test-hashin".to_string();
+        let resp = hplugin::driver::Driver::run(
+            &hbuiltins::plugingroup::Driver,
+            hplugin::driver::RunRequest {
+                request_id: &"test".to_string(),
+                target: &parsed.target_def,
+                tree_root_path: PathBuf::new(),
+                inputs: vec![run_input],
+                hashin: &hashin,
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                sandbox_dir: PathBuf::new(),
+            },
+            &ct,
+        )
+        .await
+        .expect("run group relocation");
+
+        let relocated: Vec<String> =
+            hcore::hartifactcontent::Content::entry_paths(&resp.artifacts[0])
+                .expect("relocated entry paths")
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+        assert_eq!(
+            relocated,
+            vec!["node_modules/lodash/index.js".to_string()],
+            "a workspace-root consumer's node_modules must not be nested under any package \
+             prefix: {relocated:?}"
+        );
+    }
+
+    /// The IDE-visibility target itself, end to end: `//packages/a:node_modules`
+    /// resolves to a `group` spec that (a) is `codegen = "copy"` — the only
+    /// thing that makes `heph run` actually write to real disk — and (b)
+    /// aggregates *both* `a`'s direct dependency (`outer`) and `outer`'s own
+    /// transitive dependency (`inner`), proving this target and
+    /// `test_deps_config`'s transitive-closure wiring agree on what a
+    /// package's full third-party dependency set is.
+    #[tokio::test]
+    async fn npm_e2e_node_modules_sync_target_aggregates_direct_and_transitive_deps_with_codegen_copy()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "dependencies": {"outer": "^1.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "a" },
+                    "node_modules/outer": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-outer",
+                        "dependencies": { "inner": "2.0.0" }
+                    },
+                    "node_modules/inner": {
+                        "version": "2.0.0",
+                        "integrity": "sha512-inner"
+                    }
+                }
+            }"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let addr = Addr::new(
+            PkgBuf::from("packages/a"),
+            NODE_MODULES_SYNC_TARGET.to_string(),
+            Default::default(),
+        );
+        let spec = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor: Arc::new(NoopExecutor),
+                },
+                &ct,
+            )
+            .await
+            .expect("get node_modules sync spec")
+            .target_spec;
+        assert_eq!(spec.driver, "group");
+        assert_eq!(
+            spec.config.get("codegen"),
+            Some(&Value::String("copy".to_string())),
+            "{:?}",
+            spec.config
+        );
+
+        let parsed = hplugin::driver::Driver::parse(
+            &hbuiltins::plugingroup::Driver,
+            hplugin::driver::ParseRequest {
+                request_id: "test".to_string(),
+                target_spec: Arc::new(spec),
+            },
+            &ct,
+        )
+        .await
+        .expect("parse node_modules sync spec");
         assert!(
-            addrs[0].contains("@heph/js/thirdparty/lodash@4.17.21:js_install"),
-            "{}",
-            addrs[0]
+            !parsed.target_def.transparent,
+            "codegen requires a real (non-transparent) target"
+        );
+        assert_eq!(parsed.target_def.outputs.len(), 1);
+        assert_eq!(
+            parsed.target_def.outputs[0].paths[0].codegen_tree,
+            hplugin::driver::targetdef::path::CodegenMode::Copy
+        );
+
+        let dep_names: Vec<String> = parsed
+            .target_def
+            .inputs
+            .iter()
+            .map(|i| i.r#ref.r#ref.format())
+            .collect();
+        assert!(
+            dep_names.iter().any(|a| a.contains("name=outer")),
+            "the direct dependency must be aggregated: {dep_names:?}"
+        );
+        assert!(
+            dep_names.iter().any(|a| a.contains("name=inner")),
+            "outer's own transitive dependency must be aggregated too: {dep_names:?}"
         );
     }
 
@@ -4438,7 +5196,10 @@ mod tests {
         let addrs = get_deps_addrs(&provider, "mgmt/backoffice").await;
         assert_eq!(addrs.len(), 1);
         assert!(
-            addrs[0].contains("@heph/js/thirdparty/lodash@4.17.21:js_install"),
+            addrs[0].contains("@heph/js/node_modules")
+                && addrs[0].contains("name=lodash")
+                && addrs[0].contains("version=4.17.21")
+                && addrs[0].contains("pkg=mgmt/backoffice"),
             "a package with its own independent lockfile, nested anywhere under the heph \
              workspace root, must still resolve its third-party deps: {}",
             addrs[0]
@@ -4495,11 +5256,13 @@ mod tests {
         assert!(
             backoffice_addrs
                 .iter()
-                .any(|a| a.contains("lodash@4.17.21")),
+                .any(|a| a.contains("name=lodash") && a.contains("version=4.17.21")),
             "{backoffice_addrs:?}"
         );
         assert!(
-            frontend_addrs.iter().any(|a| a.contains("lodash@4.17.20")),
+            frontend_addrs
+                .iter()
+                .any(|a| a.contains("name=lodash") && a.contains("version=4.17.20")),
             "{frontend_addrs:?}"
         );
     }
@@ -4799,11 +5562,10 @@ mod tests {
         let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
         let addrs = get_deps_addrs(&provider, "packages/a").await;
         assert_eq!(addrs.len(), 1);
-        assert!(
-            addrs[0].contains("@heph/js/thirdparty/lodash@4.17.21:js_install"),
-            "{}",
-            addrs[0]
-        );
+        assert!(addrs[0].contains("@heph/js/node_modules"), "{}", addrs[0]);
+        assert!(addrs[0].contains("name=lodash"), "{}", addrs[0]);
+        assert!(addrs[0].contains("version=4.17.21"), "{}", addrs[0]);
+        assert!(addrs[0].contains("pkg=packages/a"), "{}", addrs[0]);
     }
 
     /// Resolve the `js_install` `TargetSpec` for `lodash@4.17.21` straight off
@@ -5370,6 +6132,12 @@ mod tests {
     fn typecheck_deps_config_scopes_inputs_to_firstparty_and_resolved_type_edge_not_whole_workspace()
      {
         let dir = tempfile::tempdir().expect("tempdir");
+        // Ambient on disk too (a real host install would leave this behind),
+        // but resolution must go through the lockfile below regardless — see
+        // `bundle_closure_step`'s identical fix: an edge that only resolved
+        // via ambient `node_modules` is still routed through
+        // `resolve_one_dependency`, never wired as a raw `fs:file` at that
+        // path.
         write(
             dir.path(),
             "node_modules/pkg/package.json",
@@ -5404,10 +6172,37 @@ mod tests {
             "export const unrelated = 1;\n",
         );
 
+        let lockfile = Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/pkg": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        )
+        .expect("parse lockfile");
+        let resolved_graph = lockfile.resolved_graph();
+
         let walker = CachedWalker::disabled();
-        let (deps, tsconfig_path, tsconfig_content) =
-            call_typecheck_deps_config(&walker, dir.path(), "packages/a")
-                .expect("build typecheck deps config");
+        let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
+        let (deps, tsconfig_path, tsconfig_content) = typecheck_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a",
+            &graph,
+            Some(&lockfile),
+            Some(&resolved_graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+        .expect("build typecheck deps config");
 
         assert!(
             tsconfig_path.is_empty(),
@@ -5426,7 +6221,7 @@ mod tests {
         let type_addrs = dep_addrs(&deps, "types");
         assert_eq!(type_addrs.len(), 1, "{type_addrs:?}");
         assert!(
-            type_addrs[0].contains("node_modules/pkg/index.d.ts"),
+            type_addrs[0].contains("name=pkg") && type_addrs[0].contains("@heph/js/node_modules"),
             "{type_addrs:?}"
         );
 
@@ -5662,9 +6457,82 @@ mod tests {
         assert!(
             type_addrs
                 .iter()
-                .any(|a| a.contains("zod") && a.contains("js_install")),
-            "an unresolved third-party type import must still declare a js_install Input even \
-             absent ambient node_modules: {type_addrs:?}"
+                .any(|a| a.contains("name=zod") && a.contains("@heph/js/node_modules")),
+            "an unresolved third-party type import must still declare a relocated \
+             node_modules Input even absent ambient node_modules: {type_addrs:?}"
+        );
+    }
+
+    /// The `js_typecheck` analog of `test_deps_config_declares_transitive_third_party_closure_
+    /// not_just_direct_imports`: `a`'s source only reaches `outer` via a
+    /// `.d.ts` chain (`import type`), but the lockfile records `outer`
+    /// itself depending on `inner` — `tsc` follows a resolved package's own
+    /// type-declaration imports transitively, so `inner` must be declared
+    /// too, not just the directly-imported name.
+    #[test]
+    fn typecheck_deps_config_declares_transitive_third_party_closure_not_just_direct_imports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "dependencies": {"outer": "^1.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "import type { x } from 'outer';\nexport const y = 1;\n",
+        );
+
+        let lockfile = Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/outer": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-outer",
+                        "dependencies": { "inner": "2.0.0" }
+                    },
+                    "node_modules/inner": {
+                        "version": "2.0.0",
+                        "integrity": "sha512-inner"
+                    }
+                }
+            }"#,
+        )
+        .expect("parse lockfile");
+        let resolved_graph = lockfile.resolved_graph();
+
+        let walker = CachedWalker::disabled();
+        let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
+        let (deps, _tsconfig_path, _tsconfig_content) = typecheck_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a",
+            &graph,
+            Some(&lockfile),
+            Some(&resolved_graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+        .expect("build typecheck deps config");
+
+        let type_addrs = dep_addrs(&deps, "types");
+        assert!(
+            type_addrs
+                .iter()
+                .any(|a| a.contains("name=outer") && a.contains("@heph/js/node_modules")),
+            "the directly-imported package must still be declared: {type_addrs:?}"
+        );
+        assert!(
+            type_addrs
+                .iter()
+                .any(|a| a.contains("name=inner") && a.contains("@heph/js/node_modules")),
+            "a resolved package's own transitive dependency must also be declared, or `tsc` \
+             hits an unresolved import one edge deeper: {type_addrs:?}"
         );
     }
 
@@ -6035,6 +6903,84 @@ mod tests {
         assert!(!deps.contains_key("runner_config"));
     }
 
+    /// The completeness gap beyond direct imports: `a`'s test file only
+    /// imports `outer`, but the lockfile records `outer` itself depending on
+    /// `inner` — real npm packages routinely `require`/`import` their own
+    /// dependencies internally (`axios` needing `follow-redirects`, the
+    /// motivating real-world case). Both must be declared, or the moment
+    /// `outer`'s own code runs under vitest, it hits `Cannot find module
+    /// 'inner'` one edge deeper than anything a first-party import graph
+    /// alone would ever see.
+    #[test]
+    fn test_deps_config_declares_transitive_third_party_closure_not_just_direct_imports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "dependencies": {"outer": "^1.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import outer from 'outer';\ntest('a', () => outer());\n",
+        );
+
+        let lockfile = Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/outer": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-outer",
+                        "dependencies": { "inner": "2.0.0" }
+                    },
+                    "node_modules/inner": {
+                        "version": "2.0.0",
+                        "integrity": "sha512-inner"
+                    }
+                }
+            }"#,
+        )
+        .expect("parse lockfile");
+        let resolved_graph = lockfile.resolved_graph();
+
+        let walker = CachedWalker::disabled();
+        let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
+        let (deps, _, _) = test_deps_config(
+            dir.path(),
+            "packages/a",
+            "packages/a",
+            "packages/a/src/a.test.ts",
+            &graph,
+            Some(&lockfile),
+            Some(&resolved_graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+            toolchain::VITEST,
+            runner_config_candidates(toolchain::VITEST).expect("vitest is supported"),
+        )
+        .expect("build test deps config");
+
+        let external_addrs = dep_addrs(&deps, "external");
+        assert!(
+            external_addrs
+                .iter()
+                .any(|a| a.contains("name=outer") && a.contains("@heph/js/node_modules")),
+            "the directly-imported package must still be declared: {external_addrs:?}"
+        );
+        assert!(
+            external_addrs
+                .iter()
+                .any(|a| a.contains("name=inner") && a.contains("@heph/js/node_modules")),
+            "a resolved package's own transitive dependency (never directly imported by \
+             first-party code) must also be declared, or the real vitest run hits `Cannot \
+             find module` one edge deeper: {external_addrs:?}"
+        );
+    }
+
     /// Same lesson as `typecheck_deps_config_declares_thirdparty_type_input_with_no_ambient_node_modules`:
     /// an unresolved third-party import (no `node_modules` on disk at all)
     /// must still be resolved to a `js_install` Input via the lockfile —
@@ -6093,9 +7039,9 @@ mod tests {
         assert!(
             external_addrs
                 .iter()
-                .any(|a| a.contains("lodash") && a.contains("js_install")),
-            "an unresolved third-party import must still declare a js_install Input even absent \
-             ambient node_modules: {external_addrs:?}"
+                .any(|a| a.contains("name=lodash") && a.contains("@heph/js/node_modules")),
+            "an unresolved third-party import must still declare a relocated node_modules \
+             Input even absent ambient node_modules: {external_addrs:?}"
         );
     }
 
@@ -6176,9 +7122,10 @@ mod tests {
         assert!(
             external_addrs
                 .iter()
-                .any(|a| a.contains("@vitejs/plugin-react") && a.contains("js_install")),
-            "a plugin only the runner config imports must still declare a js_install Input: \
-             {external_addrs:?}"
+                .any(|a| a.contains("name=@vitejs/plugin-react")
+                    && a.contains("@heph/js/node_modules")),
+            "a plugin only the runner config imports must still declare a relocated \
+             node_modules Input: {external_addrs:?}"
         );
     }
 
@@ -6956,9 +7903,10 @@ mod tests {
         assert!(
             plugin_addrs
                 .iter()
-                .any(|a| a.contains("eslint-plugin-react-hooks") && a.contains("js_install")),
-            "an eslint config's `plugins` import must resolve to a js_install Input via the \
-             lockfile: {plugin_addrs:?}"
+                .any(|a| a.contains("name=eslint-plugin-react-hooks")
+                    && a.contains("@heph/js/node_modules")),
+            "an eslint config's `plugins` import must resolve to a relocated node_modules \
+             Input via the lockfile: {plugin_addrs:?}"
         );
     }
 
@@ -7686,8 +8634,11 @@ mod tests {
             .next()
             .expect("one external addr");
         assert!(
-            addr.contains("@heph/js/thirdparty/lodash@4.17.21"),
-            "must be the lockfile-resolved js_install addr, not an ambient node_modules path: {addr}"
+            addr.contains("@heph/js/node_modules")
+                && addr.contains("name=lodash")
+                && addr.contains("version=4.17.21"),
+            "must be the lockfile-resolved relocated node_modules addr, not an ambient \
+             node_modules path: {addr}"
         );
         assert_eq!(
             closure.external_names,
