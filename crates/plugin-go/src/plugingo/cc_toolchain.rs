@@ -20,23 +20,25 @@ use std::collections::HashMap;
 /// Dep group the C compiler is staged under.
 pub const CC_DEP_GROUP: &str = "cc";
 
-/// Default `cc` provider option: the host's C compiler, exposed as a target by
-/// the hostbin provider. Mirrors how `gotool = "//@heph/bin:go"` reaches the host
-/// toolchain — an explicit, addressable dependency rather than an ambient one.
+/// Default for the `cctool` provider option: the host's C compiler, exposed as a
+/// target by the hostbin provider. Mirrors how `gotool = "//@heph/bin:go"`
+/// reaches the host toolchain — an explicit, addressable dependency rather than
+/// an ambient one, so pointing `cctool` at a hermetic compiler instead is a
+/// one-line config change.
 pub fn default_addr() -> String {
     "//@heph/bin:cc".to_string()
 }
 
-/// `(group, value)` dep entry staging the C compiler for a race build that needs
-/// cgo. `None` when this build does not — an ordinary build, or a race build on
-/// darwin — so no `cc` target is ever resolved for them.
-pub fn cc_dep(cc_addr: &str, goos: &str, race: bool) -> Option<(String, Value)> {
+/// `(group, value)` dep entry staging the `cctool` target for a race build that
+/// needs cgo. `None` when this build does not — an ordinary build, or a race
+/// build on darwin — so no `cctool` target is ever resolved for them.
+pub fn cc_dep(cctool_addr: &str, goos: &str, race: bool) -> Option<(String, Value)> {
     if !crate::plugingo::factors::cgo_required(goos, race) {
         return None;
     }
     Some((
         CC_DEP_GROUP.to_string(),
-        Value::List(vec![Value::String(cc_addr.to_string())]),
+        Value::List(vec![Value::String(cctool_addr.to_string())]),
     ))
 }
 

@@ -55,7 +55,12 @@ fn pkg_subdir(factors: &Factors) -> String {
 /// `$GOROOT` to a writable tree and `go install std` into it (with
 /// `installgoroot=all`), then dump `go list -json std` for downstream metadata.
 /// Reads nothing from the host — `$GOROOT` is the staged toolchain.
-pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str, cc_addr: &str) -> TargetSpec {
+pub fn install_spec(
+    addr: Addr,
+    factors: &Factors,
+    go_version: &str,
+    cctool_addr: &str,
+) -> TargetSpec {
     let subdir = pkg_subdir(factors);
 
     let mut run = go_run_prelude(go_version);
@@ -97,7 +102,8 @@ pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str, cc_addr: &s
     if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
         deps.insert(sdk_group, sdk_val);
     }
-    if let Some((cc_group, cc_val)) = cc_toolchain::cc_dep(cc_addr, &factors.goos, factors.race) {
+    if let Some((cc_group, cc_val)) = cc_toolchain::cc_dep(cctool_addr, &factors.goos, factors.race)
+    {
         deps.insert(cc_group, cc_val);
     }
 

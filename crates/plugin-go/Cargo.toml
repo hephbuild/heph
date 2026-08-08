@@ -43,3 +43,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# `hplugin::config::Options` is a map of `serde_yaml::Value`, so building one to
+# exercise the provider's option parsing needs the same crate hconfig uses.
+serde_yaml = "0.9"
