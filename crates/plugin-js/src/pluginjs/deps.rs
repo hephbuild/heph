@@ -35,8 +35,12 @@ pub struct ResolvedDep {
 /// Resolve every dependency `manifest` declares (from its own `package.json`)
 /// to a target addr.
 ///
-/// `pkg` is the declaring package's workspace-relative path (`""` for the
-/// root). `member_addrs_by_name` maps a workspace member's package **name**
+/// `lockfile_pkg` is the declaring package's path *relative to the lockfile
+/// root that resolves it* (`""` at that root) — see `Provider::lockfile`'s
+/// doc for why this isn't always workspace-relative: a heph workspace can
+/// contain more than one independent npm/pnpm project, each with its own
+/// lockfile nested at a different point. `member_addrs_by_name` maps a
+/// workspace member's package **name**
 /// to its own `package_info` target addr string — an internal dependency is
 /// recognized by name, the same way Node resolves a workspace-hoisted
 /// sibling. `goos`/`goarch` pin the platform of any third-party `js_install`
@@ -67,7 +71,7 @@ pub struct ResolvedDep {
 /// match the current platform stays a hard error — an unresolvable required
 /// dependency is a real, actionable problem, not a case for silent omission.
 pub fn resolve_package_deps(
-    pkg: &str,
+    lockfile_pkg: &str,
     manifest: &PackageManifest,
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
@@ -79,7 +83,7 @@ pub fn resolve_package_deps(
     for (group, deps) in manifest.dependency_groups() {
         for name in deps.keys() {
             if let Some(addr) = resolve_one_dependency(
-                pkg,
+                lockfile_pkg,
                 name,
                 manifest,
                 lockfile,
@@ -116,7 +120,7 @@ pub fn resolve_package_deps(
     reason = "mirrors resolve_package_deps's own parameter set — this is its per-name primitive"
 )]
 pub fn resolve_one_dependency(
-    pkg: &str,
+    lockfile_pkg: &str,
     name: &str,
     manifest: &PackageManifest,
     lockfile: Option<&Lockfile>,
@@ -139,12 +143,12 @@ pub fn resolve_one_dependency(
     // `crate::pluginjs::lockfile::resolve_transitive`'s doc.
     let resolution = match (lockfile, resolved_graph) {
         (Some(lf), Some(rg)) => {
-            crate::pluginjs::lockfile::resolve_transitive(lf, rg, pkg, manifest, name)
-                .with_context(|| format!("resolving `{name}` declared by {pkg:?}"))?
+            crate::pluginjs::lockfile::resolve_transitive(lf, rg, lockfile_pkg, manifest, name)
+                .with_context(|| format!("resolving `{name}` declared by {lockfile_pkg:?}"))?
         }
         (Some(lf), None) => lf
-            .resolve_dependency(pkg, name)
-            .with_context(|| format!("resolving `{name}` declared by {pkg:?}"))?,
+            .resolve_dependency(lockfile_pkg, name)
+            .with_context(|| format!("resolving `{name}` declared by {lockfile_pkg:?}"))?,
         (None, _) => None,
     };
 
@@ -155,7 +159,7 @@ pub fn resolve_one_dependency(
             // fall back to the same hard-error path as an unresolved
             // required dep rather than guessing.
             anyhow::bail!(
-                "{pkg:?}: `{name}` resolves to a workspace link in the lockfile but no \
+                "{lockfile_pkg:?}: `{name}` resolves to a workspace link in the lockfile but no \
                  discovered workspace member has that name — is the workspace-member list \
                  stale?"
             );
@@ -171,7 +175,7 @@ pub fn resolve_one_dependency(
                     return Ok(None);
                 }
                 anyhow::bail!(
-                    "{pkg:?}: `{name}` resolves to {resolved_name}@{version}, which is \
+                    "{lockfile_pkg:?}: `{name}` resolves to {resolved_name}@{version}, which is \
                      restricted to os={:?} cpu={:?} — that does not include the current \
                      platform {goos}/{goarch}",
                     resolved.os,
@@ -201,9 +205,9 @@ pub fn resolve_one_dependency(
                     None => "no lockfile was loaded at all".to_string(),
                 };
                 anyhow::bail!(
-                    "{pkg:?}: `{name}` is declared in package.json but has no lockfile \
-                     resolution ({lockfile_state}) — the lockfile is likely stale; re-run the \
-                     package manager's install to regenerate it"
+                    "{lockfile_pkg:?}: `{name}` is declared in package.json but has no \
+                     lockfile resolution ({lockfile_state}) — the lockfile is likely stale; \
+                     re-run the package manager's install to regenerate it"
                 );
             }
         }
