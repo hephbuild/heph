@@ -108,12 +108,23 @@ pub struct Provider {
     tstool: String,
     testrunner: String,
     test_glob: Vec<String>,
-    /// Lazily parsed lockfile (`None` when the workspace has none) and its
-    /// derived [`ResolvedGraph`] — each `Provider::get` for a third-party
-    /// `js_install` addr or a package's declared deps would otherwise
-    /// re-read and re-parse the whole lockfile from scratch.
-    lockfile_cache: OnceCell<Option<Arc<Lockfile>>>,
-    resolved_graph_cache: OnceCell<Option<Arc<ResolvedGraph>>>,
+    /// Lazily parsed lockfile and its derived [`ResolvedGraph`], keyed by
+    /// discovered lockfile root (see [`Provider::find_lockfile_root`]) —
+    /// each `Provider::get` for a third-party `js_install` addr or a
+    /// package's declared deps would otherwise re-read and re-parse the
+    /// whole lockfile from scratch. Keyed rather than a single cell since a
+    /// workspace may contain more than one independent npm/pnpm project.
+    lockfile_cache: LockfileCache,
+    resolved_graph_cache: ResolvedGraphCache,
+    /// The full set of lockfile roots under `workspace_root`, discovered by
+    /// [`collect_lockfile_roots`] and cached once for the `Provider`'s
+    /// lifetime — same rationale as `tsc_cache`: a `Provider` lifetime maps
+    /// to one build invocation over a presumed-static tree, and
+    /// [`Provider::find_resolved_graph_for`] now walks the whole workspace
+    /// on every third-party `js_install` resolution (see its doc), so this
+    /// is the difference between one real filesystem walk per `Provider`
+    /// and one per distinct `(name, version)` resolved in the run.
+    lockfile_roots_cache: OnceCell<Arc<Vec<PathBuf>>>,
     /// Lazily resolved host `tsc` binary path + queried `tsc --version`,
     /// cached once for the `Provider`'s lifetime — same rationale as
     /// `lockfile_cache`/`resolved_graph_cache`: `typecheck_config` runs once
@@ -214,6 +225,17 @@ pub struct Provider {
 /// shape trips clippy's `type_complexity` inline.
 type BundleClosureCache =
     tokio::sync::Mutex<HashMap<(String, String), Arc<OnceCell<Arc<BundleClosureResult>>>>>;
+
+/// Key: a discovered lockfile root (absolute path). See
+/// [`Provider::lockfile_cache`]'s doc.
+type LockfileCache = tokio::sync::Mutex<HashMap<PathBuf, Arc<OnceCell<Option<Arc<Lockfile>>>>>>;
+/// Key: a discovered lockfile root (absolute path). See
+/// [`Provider::resolved_graph_cache`]'s doc.
+type ResolvedGraphCache = tokio::sync::Mutex<HashMap<PathBuf, Arc<OnceCell<Arc<ResolvedGraph>>>>>;
+
+/// Key: a `js_bundle` closure walk's `cur_pkg`. See
+/// [`Provider::bundle_closure_uncached`]'s per-package lockfile lookup.
+type PkgLockfileInfo = HashMap<String, (String, Option<Arc<Lockfile>>, Option<Arc<ResolvedGraph>>)>;
 
 impl Provider {
     pub fn new(workspace_root: PathBuf, pkgmanager: PkgManager) -> Self {
@@ -335,8 +357,9 @@ impl Provider {
             tstool: config.tstool,
             testrunner: config.testrunner,
             test_glob: config.test_glob,
-            lockfile_cache: OnceCell::new(),
-            resolved_graph_cache: OnceCell::new(),
+            lockfile_cache: tokio::sync::Mutex::new(HashMap::new()),
+            resolved_graph_cache: tokio::sync::Mutex::new(HashMap::new()),
+            lockfile_roots_cache: OnceCell::new(),
             tsc_cache: OnceCell::new(),
             testrunner_cache: OnceCell::new(),
             linter: config.linter,
@@ -392,17 +415,65 @@ impl Provider {
     }
 
     /// The workspace's lockfile, parsed once and cached for the Provider's
-    /// lifetime. `None` when the workspace has no lockfile file at all — not
+    /// lifetime, per discovered root. `None` when no ancestor of `pkg_dir`,
+    /// up to and including `self.workspace_root`, has a lockfile file — not
     /// every workspace needs one (a package with zero third-party
     /// dependencies), so its absence is only an error at the point a
     /// resolution is actually attempted against it (see `deps::resolve_package_deps`).
-    async fn lockfile(&self) -> anyhow::Result<Option<Arc<Lockfile>>> {
+    ///
+    /// `pkg_dir`-relative, not a single fixed `self.workspace_root`-relative
+    /// path: this repo may contain more than one independent npm/pnpm
+    /// project (each with its own lockfile) nested at different points in
+    /// one heph workspace — auto-discovered by lockfile presence via an
+    /// ancestor walk, the exact same pattern `importgraph`'s own
+    /// tsconfig/eslint/bundler-config discovery already uses (see
+    /// `importgraph::find_nearest_file`), rather than requiring every js
+    /// package in the whole workspace to share one lockfile at a single
+    /// configured root. Returns the discovered root alongside the parsed
+    /// lockfile since callers need it to translate a workspace-relative
+    /// `pkg` into a path relative to *this* lockfile's own root before
+    /// calling `Lockfile::resolve_dependency`/`lockfile::resolve_transitive`
+    /// — see `Provider::lockfile_relative_pkg`.
+    async fn lockfile(&self, pkg_dir: &Path) -> anyhow::Result<Option<(PathBuf, Arc<Lockfile>)>> {
+        let Some(root) = self.find_lockfile_root(pkg_dir) else {
+            return Ok(None);
+        };
+        let lf = self.lockfile_at_root(&root).await?;
+        Ok(lf.map(|lf| (root, lf)))
+    }
+
+    /// Ancestor-search from `pkg_dir` (inclusive) up to `self.workspace_root`
+    /// for the nearest directory containing a lockfile file. Cheap (a bounded
+    /// number of `is_file` stats, no directory listing) — not itself cached,
+    /// unlike the lockfile's own parsed content. Delegates to
+    /// `importgraph::find_nearest_file`, the same walk-up-by-presence logic
+    /// tsconfig/eslint/bundler-config discovery already uses.
+    fn find_lockfile_root(&self, pkg_dir: &Path) -> Option<PathBuf> {
+        let filename = Lockfile::filename(self.pkgmanager);
+        let found = importgraph::find_nearest_file(&self.workspace_root, pkg_dir, &[filename])?;
+        // `find_nearest_file` returns `dir.join(filename)` for a directory it
+        // walked to, so `.parent()` is always `Some`.
+        found.parent().map(Path::to_path_buf)
+    }
+
+    /// Load+parse the lockfile at exactly `root` (already discovered by
+    /// [`Provider::find_lockfile_root`]), cached per root so multiple
+    /// packages sharing one npm/pnpm project don't each re-read and
+    /// re-parse the same (potentially large) file.
+    async fn lockfile_at_root(&self, root: &Path) -> anyhow::Result<Option<Arc<Lockfile>>> {
         let pkgmanager = self.pkgmanager;
-        let workspace_root = self.workspace_root.clone();
-        let result = self
-            .lockfile_cache
+        let root = root.to_path_buf();
+        let cell = {
+            let mut cache = self.lockfile_cache.lock().await;
+            Arc::clone(
+                cache
+                    .entry(root.clone())
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+        let result = cell
             .get_or_try_init(|| async move {
-                let path = workspace_root.join(Lockfile::filename(pkgmanager));
+                let path = root.join(Lockfile::filename(pkgmanager));
                 let read = hcore::blocking::run(enclose!((path) move || {
                     if !path.is_file() {
                         return Ok(None);
@@ -423,17 +494,210 @@ impl Provider {
         Ok(result.clone())
     }
 
-    /// The lockfile's flattened [`ResolvedGraph`], parsed once and cached
-    /// alongside the lockfile itself.
-    async fn resolved_graph(&self) -> anyhow::Result<Option<Arc<ResolvedGraph>>> {
-        let lockfile = self.lockfile().await?;
-        let result = self
-            .resolved_graph_cache
-            .get_or_try_init(|| async move {
-                anyhow::Ok(lockfile.as_ref().map(|lf| Arc::new(lf.resolved_graph())))
+    /// [`Provider::lockfile`], plus the flattened [`ResolvedGraph`] — parsed
+    /// once and cached alongside the lockfile itself, per discovered root.
+    ///
+    /// Callers that already hold the result of a prior [`Provider::lockfile`]
+    /// call for the same `pkg_dir` should use
+    /// [`Provider::resolved_graph_for_lockfile`] instead — this fn re-runs
+    /// `lockfile`'s own ancestor walk internally, which is wasted work when
+    /// the caller already paid for it.
+    async fn resolved_graph(
+        &self,
+        pkg_dir: &Path,
+    ) -> anyhow::Result<Option<(PathBuf, Arc<ResolvedGraph>)>> {
+        let lockfile = self.lockfile(pkg_dir).await?;
+        let root = lockfile.as_ref().map(|(root, _)| root.clone());
+        let graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        Ok(root.zip(graph))
+    }
+
+    /// [`Provider::resolved_graph`], but for a `(root, lockfile)` pair the
+    /// caller already resolved via [`Provider::lockfile`] — skips repeating
+    /// its ancestor walk. `None` in, `None` out.
+    async fn resolved_graph_for_lockfile(
+        &self,
+        lockfile: &Option<(PathBuf, Arc<Lockfile>)>,
+    ) -> Option<Arc<ResolvedGraph>> {
+        let (root, lockfile) = lockfile.as_ref()?;
+        let cell = {
+            let mut cache = self.resolved_graph_cache.lock().await;
+            Arc::clone(
+                cache
+                    .entry(root.clone())
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+        let lockfile = Arc::clone(lockfile);
+        let graph = cell
+            .get_or_init(|| async move { Arc::new(lockfile.resolved_graph()) })
+            .await;
+        Some(Arc::clone(graph))
+    }
+
+    /// Translate a `self.workspace_root`-relative `pkg` (heph's own package
+    /// addressing) into a path relative to `lockfile_root` (a lockfile's own
+    /// root, from [`Provider::lockfile`]/[`Provider::resolved_graph`]) — the
+    /// basis every `Lockfile::resolve_dependency`/`lockfile::resolve_transitive`
+    /// call needs, since a lockfile's own `importers`/`node_modules`-ancestor
+    /// lookups are relative to *its* root, not necessarily
+    /// `self.workspace_root`. Identical to `pkg` whenever the lockfile's own
+    /// root *is* `self.workspace_root` (the common single-project case).
+    fn lockfile_relative_pkg(&self, lockfile_root: &Path, pkg: &str) -> String {
+        let pkg_dir = if pkg.is_empty() {
+            self.workspace_root.clone()
+        } else {
+            self.workspace_root.join(pkg)
+        };
+        // `lockfile_root` is always an ancestor of `pkg_dir` by construction
+        // — every caller gets it from `Provider::find_lockfile_root`, which
+        // only ever walks *upward* from `pkg_dir` and returns an ancestor it
+        // found on that walk. `expect`, not a silent same-path fallback: if
+        // that invariant is ever broken by a future refactor, this must fail
+        // loudly rather than hand an absolute, host-specific path into a
+        // `Lockfile`'s importer-relative lookup.
+        pkg_dir
+            .strip_prefix(lockfile_root)
+            .expect(
+                "find_lockfile_root should only ever return an ancestor of pkg_dir, so \
+                 pkg_dir must be under lockfile_root",
+            )
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Search every lockfile root this workspace has, for a [`ResolvedGraph`]
+    /// entry naming `name`/`version`. Used by
+    /// [`Provider::thirdparty_install_spec`], which resolves a bare
+    /// `(name, version)` addr with no originating package to ancestor-search
+    /// from at all.
+    ///
+    /// Always walks the full workspace for lockfile roots — see
+    /// [`collect_lockfile_roots`] — in addition to checking whatever is
+    /// already cached (see [`Provider::lockfile`]). A cache hit alone is not
+    /// sufficient: it proves *one* root resolves this package, but says
+    /// nothing about whether some *other*, not-yet-resolved root resolves it
+    /// differently. Skipping the walk whenever the cache already has a match
+    /// would make the ambiguity check below order-dependent — only firing
+    /// when the conflicting root happened to be resolved first — which
+    /// silently defeats it in the far more common case where roots are
+    /// resolved one at a time as the engine walks the dependency graph.
+    ///
+    /// The walk also covers the fully-cold case: a `js_install` target can be
+    /// requested directly (a user running
+    /// `heph run @heph/js/thirdparty/lodash@4.17.21` with nothing having
+    /// resolved it as a dependency first, or a test exercising the driver in
+    /// isolation) where nothing is cached yet at all.
+    ///
+    /// **Does not stop at the first match.** `thirdparty_addr`'s scheme
+    /// (bare `name`/`version`/`goos`/`goarch`, no project scoping) is only a
+    /// valid cache key when a published package's metadata is genuinely the
+    /// same regardless of which project's lockfile recorded it — true for
+    /// one lockfile, but this `Provider` can now discover *several*
+    /// independent ones (see this module's multi-project support), and
+    /// nothing stops two unrelated projects from validly pinning the same
+    /// `(name, version)` against different registries/mirrors with
+    /// genuinely different content. Picking whichever root happened to
+    /// answer first — process-randomized `HashMap` iteration order for the
+    /// cached case — would silently build one project against another's
+    /// package, differently across runs of the identical command. So every
+    /// discovered root is checked, and a genuine disagreement in the
+    /// resolved record (`integrity`, `resolved`, or any other field — full
+    /// [`ResolvedPackage`] equality, not just `integrity`: `resolved` alone
+    /// feeds `JsInstallDef`'s hash too, see `driver_install.rs`) fails
+    /// loudly naming both roots, rather than picking one.
+    async fn find_resolved_graph_for(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> anyhow::Result<Option<Arc<ResolvedGraph>>> {
+        let mut matches: Vec<(PathBuf, Arc<ResolvedGraph>)> = Vec::new();
+        let mut seen_roots: HashSet<PathBuf> = HashSet::new();
+        {
+            let cache = self.resolved_graph_cache.lock().await;
+            for (root, cell) in cache.iter() {
+                if let Some(graph) = cell.get()
+                    && graph.get(name, version).is_some()
+                {
+                    matches.push((root.clone(), Arc::clone(graph)));
+                    seen_roots.insert(root.clone());
+                }
+            }
+        }
+
+        // Always walk, even when the cache scan above already found a match —
+        // a match served from the cache only proves *one* root resolves this
+        // package; it says nothing about a second, conflicting root that
+        // simply hasn't been resolved (and therefore cached) yet. Skipping
+        // the walk whenever the cache is non-empty would make the ambiguity
+        // check above order-dependent: it would only fire when the
+        // conflicting root happened to be resolved first. See this fn's
+        // doc — the whole point is to check every discovered root.
+        let walker = Arc::clone(&self.walker);
+        let skip = Arc::clone(&self.skip);
+        let workspace_root = self.workspace_root.clone();
+        let filename = Lockfile::filename(self.pkgmanager);
+        let roots = self
+            .lockfile_roots_cache
+            .get_or_init(|| async move {
+                let roots = hcore::blocking::run(move || {
+                    let mut roots = Vec::new();
+                    collect_lockfile_roots(
+                        &walker,
+                        &workspace_root,
+                        &workspace_root,
+                        filename,
+                        &skip,
+                        &mut roots,
+                    );
+                    roots
+                })
+                .await;
+                Arc::new(roots)
             })
-            .await?;
-        Ok(result.clone())
+            .await;
+        for root in roots.iter() {
+            if seen_roots.contains(root) {
+                continue;
+            }
+            if let Some((root, graph)) = self.resolved_graph(root).await?
+                && graph.get(name, version).is_some()
+            {
+                seen_roots.insert(root.clone());
+                matches.push((root, graph));
+            }
+        }
+
+        let Some((first_root, first_graph)) = matches.first() else {
+            return Ok(None);
+        };
+        let first_entry = first_graph.get(name, version).expect("just matched above");
+        for (root, graph) in matches.iter().skip(1) {
+            let entry = graph.get(name, version).expect("just matched above");
+            // Full entry equality, not just `integrity`: `resolved` (the
+            // tarball URL) feeds `JsInstallDef`'s hash directly (see
+            // `driver_install.rs::JsInstallDef`), so two roots agreeing on
+            // `integrity` but recording a different `resolved` (a public
+            // registry vs. an internal mirror serving byte-identical
+            // content, say) would still make `js_install`'s cache key
+            // nondeterministic across runs if picked via `HashMap` iteration
+            // order — the exact defect this check exists to rule out.
+            anyhow::ensure!(
+                entry == first_entry,
+                "js provider: {name}@{version} resolves to different content in two \
+                 independent lockfiles this workspace discovered — {first_root:?} records \
+                 integrity {:?} resolved from {:?}, {root:?} records integrity {:?} resolved \
+                 from {:?}. Both projects declare this dependency, but it is not the same \
+                 package (a different registry/mirror, or a real supply-chain concern) — heph \
+                 cannot pick one silently; rename or otherwise disambiguate so each project's \
+                 own install resolves it unambiguously",
+                first_entry.integrity,
+                first_entry.resolved,
+                entry.integrity,
+                entry.resolved,
+            );
+        }
+        Ok(Some(Arc::clone(first_graph)))
     }
 
     /// The host `tsc` binary path and its queried `--version`, resolved once
@@ -589,13 +853,23 @@ impl Provider {
         let resolved_linter = self.resolved_host_linter().await?;
         let linter_bin = resolved_linter.0.to_string_lossy().into_owned();
         let linter_version = resolved_linter.1.clone();
-        let lockfile = self.lockfile().await?;
-        let resolved_graph = self.resolved_graph().await?;
+        let pkg_str = pkg.as_str().to_string();
+        let pkg_dir = if pkg_str.is_empty() {
+            self.workspace_root.clone()
+        } else {
+            self.workspace_root.join(&pkg_str)
+        };
+        let lockfile = self.lockfile(&pkg_dir).await?;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let lockfile_pkg = lockfile
+            .as_ref()
+            .map(|(root, _)| self.lockfile_relative_pkg(root, &pkg_str))
+            .unwrap_or_else(|| pkg_str.clone());
+        let lockfile = lockfile.map(|(_, lf)| lf);
         let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
         let walker = Arc::clone(&self.walker);
         let linter = self.linter.clone();
-        let pkg_str = pkg.as_str().to_string();
         let goos = platform::current_goos();
         let goarch = platform::current_goarch();
 
@@ -604,6 +878,7 @@ impl Provider {
                 &walker,
                 &workspace_root,
                 &pkg_str,
+                &lockfile_pkg,
                 &linter,
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
@@ -731,12 +1006,28 @@ impl Provider {
     /// `importgraph.rs` module docs for why an *unresolvable* specifier is
     /// deliberately not treated the same way.
     async fn deps_config(&self, pkg: &PkgBuf) -> anyhow::Result<Value> {
-        let lockfile = self.lockfile().await?;
-        let resolved_graph = self.resolved_graph().await?;
+        let pkg_str = pkg.as_str().to_string();
+        let pkg_dir = if pkg_str.is_empty() {
+            self.workspace_root.clone()
+        } else {
+            self.workspace_root.join(&pkg_str)
+        };
+        let lockfile = self.lockfile(&pkg_dir).await?;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        // See `Provider::lockfile_relative_pkg`'s doc: `lockfile`/`resolved_graph`
+        // are workspace-relative-`pkg`-agnostic — they're keyed by whichever
+        // ancestor directory actually has a lockfile file, which may not be
+        // `self.workspace_root` at all in a repo with more than one
+        // independent npm/pnpm project. Every `Lockfile`-touching call below
+        // needs `pkg` translated to be relative to *that* root instead.
+        let lockfile_pkg = lockfile
+            .as_ref()
+            .map(|(root, _)| self.lockfile_relative_pkg(root, &pkg_str))
+            .unwrap_or_else(|| pkg_str.clone());
+        let lockfile = lockfile.map(|(_, lf)| lf);
         let graph = self.import_graph(pkg).await?;
         let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
-        let pkg_str = pkg.as_str().to_string();
         let goos = platform::current_goos();
         let goarch = platform::current_goarch();
 
@@ -746,7 +1037,7 @@ impl Provider {
                 .with_context(|| format!("reading dependencies of {pkg_str:?}"))?;
 
             let resolved = deps::resolve_package_deps(
-                &pkg_str,
+                &lockfile_pkg,
                 &manifest,
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
@@ -762,7 +1053,7 @@ impl Provider {
             // closure was spawned.
             let declared_closure = importgraph::transitive_declared_closure(
                 &manifest,
-                &pkg_str,
+                &lockfile_pkg,
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
             );
@@ -810,13 +1101,23 @@ impl Provider {
         let resolved_tsc = self.resolved_host_tsc().await?;
         let tsc_bin = resolved_tsc.0.to_string_lossy().into_owned();
         let tsc_version = resolved_tsc.1.clone();
-        let lockfile = self.lockfile().await?;
-        let resolved_graph = self.resolved_graph().await?;
+        let pkg_str = pkg.as_str().to_string();
+        let pkg_dir = if pkg_str.is_empty() {
+            self.workspace_root.clone()
+        } else {
+            self.workspace_root.join(&pkg_str)
+        };
+        let lockfile = self.lockfile(&pkg_dir).await?;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let lockfile_pkg = lockfile
+            .as_ref()
+            .map(|(root, _)| self.lockfile_relative_pkg(root, &pkg_str))
+            .unwrap_or_else(|| pkg_str.clone());
+        let lockfile = lockfile.map(|(_, lf)| lf);
         let graph = self.import_graph(pkg).await?;
         let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
         let walker = Arc::clone(&self.walker);
-        let pkg_str = pkg.as_str().to_string();
         let goos = platform::current_goos();
         let goarch = platform::current_goarch();
 
@@ -825,6 +1126,7 @@ impl Provider {
                 &walker,
                 &workspace_root,
                 &pkg_str,
+                &lockfile_pkg,
                 &graph,
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
@@ -880,13 +1182,23 @@ impl Provider {
         let resolved_test_runner = self.resolved_host_test_runner().await?;
         let runner_bin = resolved_test_runner.0.to_string_lossy().into_owned();
         let runner_version = resolved_test_runner.1.clone();
-        let lockfile = self.lockfile().await?;
-        let resolved_graph = self.resolved_graph().await?;
+        let pkg_str = pkg.as_str().to_string();
+        let pkg_dir = if pkg_str.is_empty() {
+            self.workspace_root.clone()
+        } else {
+            self.workspace_root.join(&pkg_str)
+        };
+        let lockfile = self.lockfile(&pkg_dir).await?;
+        let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+        let lockfile_pkg = lockfile
+            .as_ref()
+            .map(|(root, _)| self.lockfile_relative_pkg(root, &pkg_str))
+            .unwrap_or_else(|| pkg_str.clone());
+        let lockfile = lockfile.map(|(_, lf)| lf);
         let graph = self.import_graph(pkg).await?;
         let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
         let testrunner = self.testrunner.clone();
-        let pkg_str = pkg.as_str().to_string();
         let test_file_rel = test_file_rel.to_string();
         let goos = platform::current_goos();
         let goarch = platform::current_goarch();
@@ -895,6 +1207,7 @@ impl Provider {
             let (deps, runner_config_path, runner_config_content) = test_deps_config(
                 &workspace_root,
                 &pkg_str,
+                &lockfile_pkg,
                 &test_file_rel,
                 &graph,
                 lockfile.as_deref(),
@@ -948,13 +1261,21 @@ impl Provider {
             .cloned()
             .unwrap_or_else(platform::current_goarch);
 
-        let graph = self.resolved_graph().await?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "js provider: no {} found at the workspace root — cannot resolve third-party \
-                 package {name}@{version}",
-                Lockfile::filename(self.pkgmanager)
-            )
-        })?;
+        let graph = self
+            .find_resolved_graph_for(name, version)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "js provider: {name}@{version} not found in any {} discovered so far in this \
+                 workspace — cannot resolve this third-party package. This addr has no \
+                 originating package to search from directly; it relies on some other \
+                 target's own dependency resolution having already discovered the relevant \
+                 lockfile (see `Provider::find_resolved_graph_for`'s doc) — if this js_install \
+                 target was requested on its own, without anything actually depending on it, \
+                 that discovery never happened",
+                    Lockfile::filename(self.pkgmanager)
+                )
+            })?;
         let resolved = graph.get(name, version).ok_or_else(|| {
             anyhow::anyhow!(
                 "js provider: {name}@{version} not found in the lockfile — is it stale?"
@@ -1123,8 +1444,6 @@ impl Provider {
         }))
         .await?;
 
-        let lockfile = self.lockfile().await?;
-        let resolved_graph = self.resolved_graph().await?;
         let member_addrs_by_name = self.member_addrs_by_name().await?;
         let goos = platform::current_goos();
         let goarch = platform::current_goarch();
@@ -1134,6 +1453,11 @@ impl Provider {
         let mut external_names: BTreeSet<String> = BTreeSet::new();
         let mut visited_pkgs: HashSet<String> = HashSet::new();
         let mut manifests: HashMap<String, package_json::PackageManifest> = HashMap::new();
+        // Keyed alongside `manifests`, computed once per package rather than
+        // once per file — the ancestor walk in `Provider::lockfile` isn't
+        // free even though its parse result is cached per root, and a
+        // package can own many files in this closure.
+        let mut lockfile_info: PkgLockfileInfo = HashMap::new();
         let mut queue: VecDeque<(String, String)> = VecDeque::new();
         files.insert(entry_file_rel.to_string());
         queue.push_back((entry_pkg.to_string(), entry_file_rel.to_string()));
@@ -1157,11 +1481,36 @@ impl Provider {
                 ))
                 .await?;
                 manifests.insert(cur_pkg.clone(), manifest);
+
+                // Per-`cur_pkg`, computed exactly once here (not per file):
+                // this closure walk crosses package boundaries (a
+                // `js_bundle` entry can pull in a sibling package's own
+                // first-party files), and different packages in one heph
+                // workspace may belong to different, independent npm/pnpm
+                // projects with different lockfiles — see
+                // `Provider::lockfile`'s doc.
+                let cur_pkg_dir = if cur_pkg.is_empty() {
+                    workspace_root.clone()
+                } else {
+                    workspace_root.join(&cur_pkg)
+                };
+                let lockfile = self.lockfile(&cur_pkg_dir).await?;
+                let resolved_graph = self.resolved_graph_for_lockfile(&lockfile).await;
+                let lockfile_pkg = lockfile
+                    .as_ref()
+                    .map(|(root, _)| self.lockfile_relative_pkg(root, &cur_pkg))
+                    .unwrap_or_else(|| cur_pkg.clone());
+                let lockfile = lockfile.map(|(_, lf)| lf);
+                lockfile_info.insert(cur_pkg.clone(), (lockfile_pkg, lockfile, resolved_graph));
             }
             let manifest = manifests
                 .get(&cur_pkg)
                 .expect("just inserted above")
                 .clone();
+            let (lockfile_pkg, lockfile, resolved_graph) = lockfile_info
+                .get(&cur_pkg)
+                .cloned()
+                .expect("just inserted above");
 
             // Defense in depth, mirroring `deps_config`/`typecheck_deps_config`'s
             // identical phantom-dependency cross-check — each package this
@@ -1172,10 +1521,10 @@ impl Provider {
             // not silently skip this.
             if visited_pkgs.insert(cur_pkg.clone()) {
                 hcore::blocking::run(enclose!(
-                    (workspace_root, cur_pkg, graph, manifest, lockfile, resolved_graph) move || -> anyhow::Result<()> {
+                    (workspace_root, cur_pkg, lockfile_pkg, graph, manifest, lockfile, resolved_graph) move || -> anyhow::Result<()> {
                         let declared = importgraph::transitive_declared_closure(
                             &manifest,
-                            &cur_pkg,
+                            &lockfile_pkg,
                             lockfile.as_deref(),
                             resolved_graph.as_deref(),
                         );
@@ -1197,11 +1546,11 @@ impl Provider {
             }
 
             let step = hcore::blocking::run(enclose!(
-                (canonical_root, cur_pkg, cur_file, graph, manifest, lockfile, resolved_graph,
+                (canonical_root, lockfile_pkg, cur_file, graph, manifest, lockfile, resolved_graph,
                  member_addrs_by_name, goos, goarch) move || {
                     bundle_closure_step(
                         &canonical_root,
-                        &cur_pkg,
+                        &lockfile_pkg,
                         &cur_file,
                         &graph,
                         &manifest,
@@ -1631,7 +1980,7 @@ struct BundleClosureStep {
 )]
 fn bundle_closure_step(
     canonical_root: &Path,
-    pkg: &str,
+    lockfile_pkg: &str,
     file_rel: &str,
     graph: &importgraph::ImportGraph,
     manifest: &package_json::PackageManifest,
@@ -1708,7 +2057,7 @@ fn bundle_closure_step(
         .filter(|s| s.file == file_rel)
     {
         if let Some(addr) = deps::resolve_one_dependency(
-            pkg,
+            lockfile_pkg,
             &site.package_name,
             manifest,
             lockfile,
@@ -1807,6 +2156,7 @@ fn typecheck_deps_config(
     walker: &CachedWalker,
     workspace_root: &Path,
     pkg: &str,
+    lockfile_pkg: &str,
     graph: &importgraph::ImportGraph,
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
@@ -1894,7 +2244,7 @@ fn typecheck_deps_config(
     // re-deriving that from scratch. `graph` is the caller-supplied,
     // `Provider::import_graph`-cached graph — see this function's doc.
     let declared_closure =
-        importgraph::transitive_declared_closure(&manifest, pkg, lockfile, resolved_graph);
+        importgraph::transitive_declared_closure(&manifest, lockfile_pkg, lockfile, resolved_graph);
     importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
@@ -1965,7 +2315,7 @@ fn typecheck_deps_config(
     // `deps_config`'s own handling of the same case.
     for site in &graph.unresolved_bare_specifiers {
         if let Some(addr) = deps::resolve_one_dependency(
-            pkg,
+            lockfile_pkg,
             &site.package_name,
             &manifest,
             lockfile,
@@ -2171,6 +2521,7 @@ fn path_under_package(package: &str, path: &str) -> bool {
 fn test_deps_config(
     workspace_root: &Path,
     pkg: &str,
+    lockfile_pkg: &str,
     test_file_rel: &str,
     graph: &importgraph::ImportGraph,
     lockfile: Option<&Lockfile>,
@@ -2288,7 +2639,7 @@ fn test_deps_config(
     // `graph` is the caller-supplied, `Provider::import_graph`-cached graph —
     // see this function's doc.
     let declared_closure =
-        importgraph::transitive_declared_closure(&manifest, pkg, lockfile, resolved_graph);
+        importgraph::transitive_declared_closure(&manifest, lockfile_pkg, lockfile, resolved_graph);
     importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
@@ -2347,7 +2698,7 @@ fn test_deps_config(
         .chain(&runner_config_bare_specifiers)
     {
         if let Some(addr) = deps::resolve_one_dependency(
-            pkg,
+            lockfile_pkg,
             &site.package_name,
             &manifest,
             lockfile,
@@ -2465,7 +2816,12 @@ struct LintDepsConfig {
 /// installed, mirroring `typecheck_deps_config`/`test_deps_config`'s
 /// identical split for the identical reason.
 ///
-/// `pkg` is the package's workspace-relative path (`""` for the root).
+/// `pkg` is the package's workspace-relative path (`""` for the root), used
+/// for reading its own files. `lockfile_pkg` is that same package relative
+/// to `lockfile`'s own root instead — not always the same value, since a
+/// workspace may contain more than one independent npm/pnpm project (see
+/// `Provider::lockfile_relative_pkg`'s doc) — and is what every
+/// `Lockfile`-touching call below actually needs.
 /// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`goos`/`goarch` mirror
 /// `typecheck_deps_config`'s identically-named parameters (only consulted
 /// for eslint's `extends`/`plugins` package resolution).
@@ -2488,6 +2844,7 @@ fn lint_deps_config(
     walker: &CachedWalker,
     workspace_root: &Path,
     pkg: &str,
+    lockfile_pkg: &str,
     linter: &str,
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
@@ -2697,7 +3054,7 @@ fn lint_deps_config(
             let mut plugin_addrs: BTreeSet<String> = BTreeSet::new();
             for name in names {
                 if let Some(addr) = deps::resolve_one_dependency(
-                    pkg,
+                    lockfile_pkg,
                     &name,
                     &manifest,
                     lockfile,
@@ -2794,6 +3151,61 @@ fn lint_deps_config(
 fn default_registry_url(name: &str, version: &str) -> String {
     let basename = name.rsplit('/').next().unwrap_or(name);
     format!("https://registry.npmjs.org/{name}/-/{basename}-{version}.tgz")
+}
+
+/// Recursively enumerate every directory at or below `dir` containing a
+/// lockfile file (`filename`) — every independent npm/pnpm project root in
+/// the workspace, however deeply nested, unlike
+/// [`Provider::find_lockfile_root`]'s ancestor-only search from one known
+/// package. Continues walking *past* a found lockfile root — a heph
+/// workspace can contain more than one independent project side by side or
+/// nested, and this is a full-tree discovery, not a first-match search — but
+/// still prunes `node_modules`/dot-dirs/`skip`, so it never descends into a
+/// project's own installed dependencies looking for more.
+///
+/// [`Provider::find_resolved_graph_for`] runs this walk unconditionally, on
+/// every call — a cache hit for one root proves nothing about whether some
+/// other, not-yet-resolved root also resolves the same `(name, version)`
+/// differently, so a cache-only fast path that skips this walk when a match
+/// already exists would make its ambiguity check order-dependent. Its own
+/// per-`Provider` result cache (`Provider::lockfile_roots_cache`) is what
+/// keeps this cheap across repeated calls, not conditional skipping.
+fn collect_lockfile_roots(
+    walker: &CachedWalker,
+    dir: &Path,
+    workspace_root: &Path,
+    filename: &str,
+    skip: &Ignore,
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(listing) = walker.read_dir(dir) else {
+        return;
+    };
+
+    if listing
+        .entries
+        .iter()
+        .any(|e| e.kind == EntryKind::File && e.name == filename)
+    {
+        out.push(dir.to_path_buf());
+    }
+
+    for entry in &listing.entries {
+        if entry.kind != EntryKind::Dir {
+            continue;
+        }
+        if is_skipped_dir_name(&entry.name) {
+            continue;
+        }
+        let entry_path = dir.join(&entry.name);
+        let rel = entry_path
+            .strip_prefix(workspace_root)
+            .unwrap_or(&entry_path);
+        if skip.prune_dir(&entry_path, rel) {
+            continue;
+        }
+        collect_lockfile_roots(walker, &entry_path, workspace_root, filename, skip, out);
+    }
 }
 
 /// Recursively enumerate `package.json`-anchored directories at or below
@@ -3989,6 +4401,398 @@ mod tests {
         );
     }
 
+    /// The real-world bug report this fix exists for: a repo with more than
+    /// one independent npm project, `mgmt/backoffice` being one of them —
+    /// its own `package.json` *and* `package-lock.json`, not npm
+    /// `workspaces` members of anything at the heph workspace root (which
+    /// has neither file at all here, on purpose). `Provider::workspace_root`
+    /// is `dir.path()` — the *heph* root, not `mgmt/backoffice`'s own — so
+    /// this only passes if the lockfile is discovered by ancestor search
+    /// from the package being resolved, not read from one fixed path.
+    #[tokio::test]
+    async fn npm_e2e_discovers_lockfile_for_an_independent_project_root_not_at_workspace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Deliberately no package.json/package-lock.json at dir.path() itself.
+        write(
+            dir.path(),
+            "mgmt/backoffice/package.json",
+            r#"{"name": "backoffice", "dependencies": {"lodash": "^4.17.21"}}"#,
+        );
+        write(
+            dir.path(),
+            "mgmt/backoffice/package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "backoffice" },
+                    "node_modules/lodash": {
+                        "version": "4.17.21",
+                        "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let addrs = get_deps_addrs(&provider, "mgmt/backoffice").await;
+        assert_eq!(addrs.len(), 1);
+        assert!(
+            addrs[0].contains("@heph/js/thirdparty/lodash@4.17.21:js_install"),
+            "a package with its own independent lockfile, nested anywhere under the heph \
+             workspace root, must still resolve its third-party deps: {}",
+            addrs[0]
+        );
+
+        // And the full addr -> TargetSpec -> TargetDef pipeline resolves too.
+        // Note this runs with `mgmt/backoffice`'s root already warm in
+        // `resolved_graph_cache` from `get_deps_addrs` above — it does not
+        // by itself exercise `find_resolved_graph_for` from a genuinely cold
+        // `Provider`; `npm_e2e_ambiguous_integrity_across_independent_projects_fails_loudly`
+        // below covers that (its error path), and
+        // `npm_e2e_cold_provider_resolves_js_install_via_workspace_walk`
+        // covers it for the success path.
+        let hash = get_js_install_hash(&provider).await;
+        assert!(!hash.is_empty());
+    }
+
+    /// Two independent projects, side by side, each with its own lockfile
+    /// pinning a *different* version of the same package name — proves
+    /// `Provider::lockfile`'s per-root cache doesn't cross-contaminate: each
+    /// package's own deps resolve against its own lockfile, not whichever
+    /// one happened to be discovered/cached first.
+    #[tokio::test]
+    async fn npm_e2e_two_independent_projects_resolve_against_their_own_lockfiles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (pkg, version) in [("mgmt/backoffice", "4.17.21"), ("mgmt/frontend", "4.17.20")] {
+            write(
+                dir.path(),
+                &format!("{pkg}/package.json"),
+                &format!(r#"{{"name": "{pkg}", "dependencies": {{"lodash": "^4.0.0"}}}}"#),
+            );
+            write(
+                dir.path(),
+                &format!("{pkg}/package-lock.json"),
+                &format!(
+                    r#"{{
+                        "lockfileVersion": 3,
+                        "packages": {{
+                            "": {{ "name": "{pkg}" }},
+                            "node_modules/lodash": {{
+                                "version": "{version}",
+                                "resolved": "https://registry.npmjs.org/lodash/-/lodash-{version}.tgz",
+                                "integrity": "sha512-{version}"
+                            }}
+                        }}
+                    }}"#
+                ),
+            );
+        }
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let backoffice_addrs = get_deps_addrs(&provider, "mgmt/backoffice").await;
+        let frontend_addrs = get_deps_addrs(&provider, "mgmt/frontend").await;
+        assert!(
+            backoffice_addrs
+                .iter()
+                .any(|a| a.contains("lodash@4.17.21")),
+            "{backoffice_addrs:?}"
+        );
+        assert!(
+            frontend_addrs.iter().any(|a| a.contains("lodash@4.17.20")),
+            "{frontend_addrs:?}"
+        );
+    }
+
+    /// The hermeticity BLOCKER this fix closes: `thirdparty_addr`'s scheme
+    /// (bare `name@version`, no project scoping) is only a valid cache key
+    /// when a published package's own metadata is genuinely the same
+    /// regardless of which project's lockfile recorded it — no longer
+    /// guaranteed once one `Provider` can discover more than one
+    /// independent lockfile. Two projects here pin the identical
+    /// `lodash@4.17.21` `(name, version)` but with *different* `integrity`
+    /// (a different registry/mirror, or a real supply-chain divergence) —
+    /// resolving the shared `js_install` addr must fail loudly naming both
+    /// roots, never silently pick one (which would build non-deterministically
+    /// across runs, depending on `HashMap` iteration order/walk order).
+    #[tokio::test]
+    async fn npm_e2e_ambiguous_integrity_across_independent_projects_fails_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (pkg, integrity) in [
+            ("mgmt/backoffice", "sha512-aaa"),
+            ("mgmt/frontend", "sha512-bbb"),
+        ] {
+            write(
+                dir.path(),
+                &format!("{pkg}/package.json"),
+                &format!(r#"{{"name": "{pkg}", "dependencies": {{"lodash": "^4.17.21"}}}}"#),
+            );
+            write(
+                dir.path(),
+                &format!("{pkg}/package-lock.json"),
+                &format!(
+                    r#"{{
+                        "lockfileVersion": 3,
+                        "packages": {{
+                            "": {{ "name": "{pkg}" }},
+                            "node_modules/lodash": {{
+                                "version": "4.17.21",
+                                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                                "integrity": "{integrity}"
+                            }}
+                        }}
+                    }}"#
+                ),
+            );
+        }
+
+        // A cold `Provider`, going straight for the shared `js_install` addr
+        // with nothing having cached either root yet — forces
+        // `find_resolved_graph_for`'s full-workspace-walk path, which
+        // unconditionally discovers *both* projects' roots.
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "lodash",
+            "4.17.21",
+            &platform::current_goos(),
+            &platform::current_goarch(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        let msg = match result {
+            Err(GetError::Other(e)) => format!("{e:#}"),
+            Err(GetError::NotFound) => panic!("expected an ambiguity error, got NotFound"),
+            Ok(_) => panic!(
+                "ambiguous integrity across independent projects must be a hard error, got Ok"
+            ),
+        };
+        assert!(msg.contains("lodash@4.17.21"), "{msg}");
+        assert!(
+            msg.contains("sha512-aaa") && msg.contains("sha512-bbb"),
+            "{msg}"
+        );
+    }
+
+    /// Same defect class as `npm_e2e_ambiguous_integrity_across_independent_
+    /// projects_fails_loudly`, but on `resolved` (the tarball URL) rather
+    /// than `integrity`: two projects can validly agree on `integrity`
+    /// (byte-identical content) while recording a different `resolved` — a
+    /// public registry vs. an internal mirror serving the same tarball, say.
+    /// `resolved` still feeds `JsInstallDef`'s hash directly
+    /// (`driver_install.rs`), so picking either root's entry silently would
+    /// make `js_install`'s cache key nondeterministic across runs of an
+    /// unchanged tree. Both roots are resolved (and therefore cached) via
+    /// `get_deps_addrs` *before* the shared addr is requested, mirroring the
+    /// realistic staggered-resolution order — this is exactly the scenario
+    /// the ambiguity check must catch even when a cache hit already exists
+    /// for one root.
+    #[tokio::test]
+    async fn npm_e2e_ambiguous_resolved_url_across_independent_projects_fails_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (pkg, resolved) in [
+            (
+                "mgmt/backoffice",
+                "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            ),
+            (
+                "mgmt/frontend",
+                "https://mirror.example.internal/lodash/-/lodash-4.17.21.tgz",
+            ),
+        ] {
+            write(
+                dir.path(),
+                &format!("{pkg}/package.json"),
+                &format!(r#"{{"name": "{pkg}", "dependencies": {{"lodash": "^4.17.21"}}}}"#),
+            );
+            write(
+                dir.path(),
+                &format!("{pkg}/package-lock.json"),
+                &format!(
+                    r#"{{
+                        "lockfileVersion": 3,
+                        "packages": {{
+                            "": {{ "name": "{pkg}" }},
+                            "node_modules/lodash": {{
+                                "version": "4.17.21",
+                                "resolved": "{resolved}",
+                                "integrity": "sha512-same"
+                            }}
+                        }}
+                    }}"#
+                ),
+            );
+        }
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        // Warm both roots' `resolved_graph_cache` entries first — the
+        // ordering that defeated the pre-fix `if matches.is_empty()` guard.
+        get_deps_addrs(&provider, "mgmt/backoffice").await;
+        get_deps_addrs(&provider, "mgmt/frontend").await;
+
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "lodash",
+            "4.17.21",
+            &platform::current_goos(),
+            &platform::current_goarch(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        let msg = match result {
+            Err(GetError::Other(e)) => format!("{e:#}"),
+            Err(GetError::NotFound) => panic!("expected an ambiguity error, got NotFound"),
+            Ok(_) => panic!(
+                "ambiguous resolved URL across independent projects must be a hard error, got Ok"
+            ),
+        };
+        assert!(msg.contains("lodash@4.17.21"), "{msg}");
+        assert!(
+            msg.contains("registry.npmjs.org") && msg.contains("mirror.example.internal"),
+            "{msg}"
+        );
+    }
+
+    /// The specific regression the BLOCKER fix in `find_resolved_graph_for`
+    /// targets: **one** of the two conflicting roots is already cached (via
+    /// an ordinary `get_deps_addrs` resolution), the other has never been
+    /// touched at all when the shared addr is requested. The removed
+    /// `if matches.is_empty()` gate would see the cache scan's one match,
+    /// treat `matches` as already non-empty, and return early — skipping
+    /// the walk entirely and never discovering (let alone comparing against)
+    /// the untouched second root. This is the scenario the other two
+    /// ambiguity tests don't cover: both leave `matches` either fully empty
+    /// before the walk (cold `Provider`) or fully populated by the cache
+    /// scan alone (both roots pre-warmed) — neither depends on the walk
+    /// running while `matches` is non-empty but incomplete, which is the one
+    /// line this whole fix hinges on.
+    #[tokio::test]
+    async fn npm_e2e_ambiguous_integrity_one_root_cached_other_cold_fails_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (pkg, integrity) in [
+            ("mgmt/backoffice", "sha512-aaa"),
+            ("mgmt/frontend", "sha512-bbb"),
+        ] {
+            write(
+                dir.path(),
+                &format!("{pkg}/package.json"),
+                &format!(r#"{{"name": "{pkg}", "dependencies": {{"lodash": "^4.17.21"}}}}"#),
+            );
+            write(
+                dir.path(),
+                &format!("{pkg}/package-lock.json"),
+                &format!(
+                    r#"{{
+                        "lockfileVersion": 3,
+                        "packages": {{
+                            "": {{ "name": "{pkg}" }},
+                            "node_modules/lodash": {{
+                                "version": "4.17.21",
+                                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                                "integrity": "{integrity}"
+                            }}
+                        }}
+                    }}"#
+                ),
+            );
+        }
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        // Only `mgmt/backoffice`'s root is resolved (and therefore cached)
+        // before the shared addr is requested — `mgmt/frontend`'s lockfile
+        // is never touched by anything else in this test.
+        get_deps_addrs(&provider, "mgmt/backoffice").await;
+
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "lodash",
+            "4.17.21",
+            &platform::current_goos(),
+            &platform::current_goarch(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        let msg = match result {
+            Err(GetError::Other(e)) => format!("{e:#}"),
+            Err(GetError::NotFound) => panic!("expected an ambiguity error, got NotFound"),
+            Ok(_) => panic!(
+                "ambiguous integrity across independent projects must be a hard error even when \
+                 only one of the two conflicting roots was already cached, got Ok"
+            ),
+        };
+        assert!(msg.contains("lodash@4.17.21"), "{msg}");
+        assert!(
+            msg.contains("sha512-aaa") && msg.contains("sha512-bbb"),
+            "{msg}"
+        );
+    }
+
+    /// The success counterpart to
+    /// `npm_e2e_ambiguous_integrity_across_independent_projects_fails_loudly`:
+    /// a single independent project, nested away from the heph workspace
+    /// root, resolved straight off a cold `Provider` with nothing cached —
+    /// `find_resolved_graph_for`'s unconditional workspace walk must find
+    /// this project's lockfile root and return its `js_install` target on
+    /// the very first call, not merely fail to error.
+    #[tokio::test]
+    async fn npm_e2e_cold_provider_resolves_js_install_via_workspace_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "mgmt/backoffice/package.json",
+            r#"{"name": "backoffice", "dependencies": {"lodash": "^4.17.21"}}"#,
+        );
+        write(
+            dir.path(),
+            "mgmt/backoffice/package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "backoffice" },
+                    "node_modules/lodash": {
+                        "version": "4.17.21",
+                        "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let hash = get_js_install_hash(&provider).await;
+        assert!(!hash.is_empty());
+    }
+
     #[tokio::test]
     async fn pnpm_e2e_wires_third_party_dep_to_js_install_addr() {
         let dir = pnpm_e2e_fixture("sha512-abc");
@@ -4552,6 +5356,7 @@ mod tests {
             walker,
             workspace_root,
             pkg,
+            pkg,
             &graph,
             None,
             None,
@@ -4843,6 +5648,7 @@ mod tests {
             &walker,
             dir.path(),
             "packages/a",
+            "packages/a",
             &graph,
             Some(&lockfile),
             Some(&resolved_graph),
@@ -5042,6 +5848,7 @@ mod tests {
         let graph = build_graph_for_test(walker, workspace_root, pkg);
         test_deps_config(
             workspace_root,
+            pkg,
             pkg,
             test_file_rel,
             &graph,
@@ -5269,6 +6076,7 @@ mod tests {
         let (deps, _, _) = test_deps_config(
             dir.path(),
             "packages/a",
+            "packages/a",
             "packages/a/src/a.test.ts",
             &graph,
             Some(&lockfile),
@@ -5351,6 +6159,7 @@ mod tests {
         let (deps, _, _) = test_deps_config(
             dir.path(),
             "packages/a",
+            "packages/a",
             "packages/a/src/a.test.ts",
             &graph,
             Some(&lockfile),
@@ -5400,6 +6209,7 @@ mod tests {
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
         let err = test_deps_config(
             dir.path(),
+            "packages/a",
             "packages/a",
             "packages/a/src/a.test.ts",
             &graph,
@@ -5733,6 +6543,7 @@ mod tests {
         let (deps, runner_config_path, runner_config_content) = test_deps_config(
             dir.path(),
             "packages/a",
+            "packages/a",
             "packages/a/src/a.test.ts",
             &graph,
             None,
@@ -5851,6 +6662,7 @@ mod tests {
         lint_deps_config(
             walker,
             workspace_root,
+            pkg,
             pkg,
             linter,
             None,
@@ -6129,6 +6941,7 @@ mod tests {
         let result = lint_deps_config(
             &walker,
             dir.path(),
+            "packages/a",
             "packages/a",
             toolchain::ESLINT,
             Some(&lockfile),

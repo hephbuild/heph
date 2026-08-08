@@ -442,8 +442,9 @@ fn bare_specifier_guard(tsconfig: Option<&Path>) -> BareSpecifierGuard {
 /// and [`find_nearest_test_runner_config`] — `js_test`'s runner config
 /// (`vitest.config.ts` / `jest.config.js`) is walked up the same way a
 /// package's tsconfig is, per `ai-docs/js-plugin-plan.md`'s `js_test` milestone
-/// note.
-fn find_nearest_file(
+/// note. Also reused by `Provider::find_lockfile_root` for lockfile discovery
+/// — same walk-up-by-presence shape, one candidate.
+pub(crate) fn find_nearest_file(
     workspace_root: &Path,
     pkg_dir: &Path,
     candidates: &[&str],
