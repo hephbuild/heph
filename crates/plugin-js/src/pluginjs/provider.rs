@@ -668,11 +668,36 @@ impl Provider {
             }
         }
 
-        let Some((first_root, first_graph)) = matches.first() else {
+        // An entry with empty `integrity` never had this package's content
+        // genuinely pinned by that root's own lockfile in the first place
+        // (`ResolvedPackage::integrity`'s doc: "empty only for a malformed
+        // lockfile entry" — a peer-suffixed/deduped graph key folded onto
+        // one node picking up a variant with no resolution data of its own
+        // is a real, observed shape, not hypothetical). Comparing such an
+        // entry against another root's genuinely-resolved one is not a real
+        // ambiguity — it produced a false-positive hard error across
+        // hundreds of packages at once in a real workspace, since one
+        // project's lockfile happened to carry a degenerate record for a
+        // name another project resolves normally. Only entries that
+        // actually carry integrity participate in the comparison; fewer
+        // than two such entries means there is nothing to meaningfully
+        // disambiguate, so no comparison runs at all in that case.
+        let with_integrity: Vec<&(PathBuf, Arc<ResolvedGraph>)> = matches
+            .iter()
+            .filter(|(_, graph)| {
+                !graph
+                    .get(name, version)
+                    .expect("just matched above")
+                    .integrity
+                    .is_empty()
+            })
+            .collect();
+        let Some((first_root, first_graph)) = with_integrity.first().copied().or(matches.first())
+        else {
             return Ok(None);
         };
         let first_entry = first_graph.get(name, version).expect("just matched above");
-        for (root, graph) in matches.iter().skip(1) {
+        for (root, graph) in with_integrity.iter().skip(1) {
             let entry = graph.get(name, version).expect("just matched above");
             // Full entry equality, not just `integrity`: `resolved` (the
             // tarball URL) feeds `JsInstallDef`'s hash directly (see
@@ -5344,6 +5369,87 @@ mod tests {
         assert!(
             msg.contains("sha512-aaa") && msg.contains("sha512-bbb"),
             "{msg}"
+        );
+    }
+
+    /// A real, previously-undiscovered false positive of the check above:
+    /// one root's lockfile entry for the shared `(name, version)` has empty
+    /// `integrity`/no `resolved` (a degenerate/dedup record — a real,
+    /// observed npm lockfile shape, not hypothetical; confirmed live in a
+    /// real workspace, across hundreds of packages simultaneously). This is
+    /// *not* a genuine ambiguity — the empty entry never pinned any content
+    /// to disagree with — so resolution must succeed, using the one root
+    /// that actually resolved real content, not hard-fail the way two
+    /// *equally real but differing* entries correctly do above.
+    #[tokio::test]
+    async fn npm_e2e_one_root_has_empty_integrity_entry_resolves_via_the_real_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "mgmt/backoffice/package.json",
+            r#"{"name": "backoffice", "dependencies": {"yup": "^1.7.1"}}"#,
+        );
+        write(
+            dir.path(),
+            "mgmt/backoffice/package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "backoffice" },
+                    "node_modules/yup": {
+                        "version": "1.7.1"
+                    }
+                }
+            }"#,
+        );
+        write(
+            dir.path(),
+            "mgmt/frontend/package.json",
+            r#"{"name": "frontend", "dependencies": {"yup": "^1.7.1"}}"#,
+        );
+        write(
+            dir.path(),
+            "mgmt/frontend/package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "frontend" },
+                    "node_modules/yup": {
+                        "version": "1.7.1",
+                        "resolved": "https://registry.npmjs.org/yup/-/yup-1.7.1.tgz",
+                        "integrity": "sha512-real"
+                    }
+                }
+            }"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "yup",
+            "1.7.1",
+            &platform::current_goos(),
+            &platform::current_goarch(),
+        );
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("must resolve, not error — an empty-integrity entry is not a real conflict");
+        assert_eq!(resp.target_spec.driver, "js_install");
+        assert_eq!(
+            resp.target_spec.config.get("integrity"),
+            Some(&Value::String("sha512-real".to_string())),
+            "must use the root with real content, not the empty-integrity one: {:?}",
+            resp.target_spec.config
         );
     }
 
