@@ -185,10 +185,25 @@ pub fn resolve_one_dependency(
             if manifest.is_optional(name) {
                 Ok(None)
             } else {
+                // Diagnosability: this message alone can't distinguish "no
+                // lockfile was loaded at all" (wrong/absent workspace_root)
+                // from "a lockfile loaded but has no entry for this name"
+                // (genuinely stale) — both produce the same `None`. Report
+                // which one it was, and how many packages the loaded
+                // lockfile (if any) actually parsed, so a report of this
+                // error carries enough to tell the two apart without a
+                // back-and-forth.
+                let lockfile_state = match resolved_graph {
+                    Some(g) => format!(
+                        "a lockfile loaded with {} resolved package(s)",
+                        g.packages.len()
+                    ),
+                    None => "no lockfile was loaded at all".to_string(),
+                };
                 anyhow::bail!(
                     "{pkg:?}: `{name}` is declared in package.json but has no lockfile \
-                     resolution — the lockfile is likely stale; re-run the package manager's \
-                     install to regenerate it"
+                     resolution ({lockfile_state}) — the lockfile is likely stale; re-run the \
+                     package manager's install to regenerate it"
                 );
             }
         }

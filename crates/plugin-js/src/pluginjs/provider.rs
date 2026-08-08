@@ -2263,7 +2263,23 @@ fn test_deps_config(
                     .replace('\\', "/"),
             );
         }
-        runner_config_bare_specifiers = scan.bare_specifiers;
+        // `BareSpecifierSite::file` is workspace-relative everywhere else it's
+        // used (`closure.bare_specifiers`, `graph.unresolved_bare_specifiers`)
+        // — `resolve_runner_config_referenced_files` operates on absolute
+        // paths internally (it has no `workspace_root` of its own to convert
+        // against), so normalize here, matching `runner_config_ref_paths_rel`
+        // above. Only affects error-message diagnostics, not resolution.
+        runner_config_bare_specifiers = scan
+            .bare_specifiers
+            .into_iter()
+            .map(|site| importgraph::BareSpecifierSite {
+                file: Path::new(&site.file)
+                    .strip_prefix(workspace_root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or(site.file),
+                ..site
+            })
+            .collect();
     }
 
     // Phantom-dependency check: a workspace member requesting only `js_test`
