@@ -64,15 +64,19 @@ pub struct Config {
     /// factors (`goos`/`goarch`) are added, since the tool always runs natively
     /// (see [`ProviderInner::govet_tool_addr`]).
     pub govet: String,
-    /// Addr of a target producing a C compiler, used only where a **race** build
-    /// needs cgo — i.e. on linux, where Go's `runtime/race` is a cgo package (see
-    /// [`factors::cgo_required`]). Defaults to [`cc_toolchain::default_addr`], the
-    /// host `cc` exposed by the hostbin provider. Point it at another target
-    /// (a nix-built gcc, say) to avoid depending on the host's.
+    /// C toolchain spec, the `cc` counterpart to [`Config::go_version`]'s
+    /// `gotool`: the addr of a target producing a C compiler. Used only where a
+    /// **race** build needs cgo — i.e. on linux, where Go's `runtime/race` is a
+    /// cgo package (see [`factors::cgo_required`]).
+    ///
+    /// Set via the optional `cctool` provider option. Defaults to
+    /// [`cc_toolchain::default_addr`] — the host `cc` exposed by the hostbin
+    /// provider, mirroring `gotool = "//@heph/bin:go"`. Point it at another
+    /// target (a nix-built gcc, say) to stop depending on the host's.
     ///
     /// Nothing references it unless a race target is built, so an ordinary build
     /// — and a darwin race build — never resolves it.
-    pub cc: String,
+    pub cctool: String,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
     pub skip: Arc<Ignore>,
@@ -99,7 +103,7 @@ impl Default for Config {
             go_version: toolchain::DEFAULT_GO_VERSION.to_string(),
             sdk_checksums: HashMap::new(),
             govet: govet::default_addr(),
-            cc: cc_toolchain::default_addr(),
+            cctool: cc_toolchain::default_addr(),
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
             walker: Arc::new(CachedWalker::disabled()),
@@ -124,8 +128,9 @@ pub(crate) struct ProviderInner {
     sdk_checksums: HashMap<String, String>,
     /// Addr of the `heph-govet` binary lint/format exec (see [`Config::govet`]).
     govet: String,
-    /// Addr of the C compiler a cgo-needing race build stages (see [`Config::cc`]).
-    cc: String,
+    /// Addr of the C compiler a cgo-needing race build stages (see
+    /// [`Config::cctool`]).
+    cctool: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
     /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
@@ -255,7 +260,7 @@ impl Provider {
         hplugin::config::deny_unknown(
             "go provider",
             opts,
-            &["gotool", "govet", "cc", "skip", "checksums"],
+            &["gotool", "govet", "cctool", "skip", "checksums"],
         )?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
             .ok_or_else(|| {
@@ -278,10 +283,12 @@ impl Provider {
         // target (`//tools/heph-govet:build`) to run one built from source.
         let govet: String = hplugin::config::decode_opt(opts, "go provider", "govet")?
             .unwrap_or_else(govet::default_addr);
-        // Optional: the C compiler a race build stages where race needs cgo (linux
-        // only — see `factors::cgo_required`). Unset → the host `cc` via hostbin.
+        // Optional: `cctool` is the C-toolchain counterpart to `gotool` — the
+        // target producing the `cc` a race build stages where race needs cgo
+        // (linux only; see `factors::cgo_required`). Unset → the host `cc` via
+        // the hostbin provider, as `gotool = "//@heph/bin:go"` does for `go`.
         // Never resolved unless a race target is actually built.
-        let cc: String = hplugin::config::decode_opt(opts, "go provider", "cc")?
+        let cctool: String = hplugin::config::decode_opt(opts, "go provider", "cctool")?
             .unwrap_or_else(cc_toolchain::default_addr);
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
@@ -296,7 +303,7 @@ impl Provider {
                 go_version,
                 sdk_checksums,
                 govet,
-                cc,
+                cctool,
                 skip,
                 walker,
                 ..Default::default()
@@ -316,7 +323,7 @@ impl Provider {
                 go_version: config.go_version,
                 sdk_checksums: config.sdk_checksums,
                 govet: config.govet,
-                cc: config.cc,
+                cctool: config.cctool,
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
@@ -1602,7 +1609,8 @@ impl ProviderInner {
                 variant::resolve(addr, &req.states, "", req.executor.as_ref(), true)
                     .await
                     .map_err(GetError::Other)?;
-            let spec = target_std::install_spec(addr.clone(), &factors, &self.go_version, &self.cc);
+            let spec =
+                target_std::install_spec(addr.clone(), &factors, &self.go_version, &self.cctool);
             return Ok(GetResponse { target_spec: spec });
         }
 
@@ -5484,6 +5492,75 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     // ---- race ----
+
+    /// Options a `from_options` test needs beyond the one under test: `gotool` is
+    /// required, everything else is optional.
+    fn opts_with(extra: &[(&str, &str)]) -> hplugin::config::Options {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "gotool".to_string(),
+            serde_yaml::Value::String(toolchain::HOST.to_string()),
+        );
+        for (k, v) in extra {
+            opts.insert(
+                (*k).to_string(),
+                serde_yaml::Value::String((*v).to_string()),
+            );
+        }
+        opts
+    }
+
+    fn cctool_from(opts: &hplugin::config::Options) -> String {
+        let p = Provider::from_options(
+            PathBuf::from("/nonexistent"),
+            &[],
+            &[],
+            opts,
+            Arc::new(CachedWalker::disabled()),
+            test_runtime(),
+        )
+        .expect("provider from options");
+        p.inner.cctool.clone()
+    }
+
+    /// Unset `cctool` falls back to the host `cc` via hostbin — the same shape
+    /// `gotool = "//@heph/bin:go"` uses for the Go toolchain.
+    #[test]
+    fn cctool_defaults_to_hostbin() {
+        assert_eq!(cctool_from(&opts_with(&[])), "//@heph/bin:cc");
+    }
+
+    /// …and can be pointed at any target, so a workspace can supply a hermetic
+    /// compiler instead of the host's.
+    #[test]
+    fn cctool_option_overrides_the_default() {
+        let opts = opts_with(&[("cctool", "//toolchain:gcc")]);
+        assert_eq!(cctool_from(&opts), "//toolchain:gcc");
+    }
+
+    /// A misspelled option must be rejected rather than silently ignored — a
+    /// typo'd `cctool` would otherwise fall back to the host compiler and quietly
+    /// undo the hermeticity the user was configuring.
+    #[test]
+    fn unknown_option_is_rejected() {
+        let opts = opts_with(&[("cctoolz", "//toolchain:gcc")]);
+        let msg = match Provider::from_options(
+            PathBuf::from("/nonexistent"),
+            &[],
+            &[],
+            &opts,
+            Arc::new(CachedWalker::disabled()),
+            test_runtime(),
+        ) {
+            Ok(_) => String::new(),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("cctoolz"),
+            "a misspelled option must be rejected by name (empty means it was \
+             silently accepted); got: {msg}"
+        );
+    }
 
     /// Bare `test_race@v=host` — the user-facing entry point. It must resolve,
     /// and its binary dep must be the *race* flavour of `build_test`: the whole
