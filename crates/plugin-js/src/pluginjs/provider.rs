@@ -668,47 +668,58 @@ impl Provider {
             }
         }
 
-        // An entry with empty `integrity` never had this package's content
-        // genuinely pinned by that root's own lockfile in the first place
-        // (`ResolvedPackage::integrity`'s doc: "empty only for a malformed
-        // lockfile entry" — a peer-suffixed/deduped graph key folded onto
-        // one node picking up a variant with no resolution data of its own
-        // is a real, observed shape, not hypothetical). Comparing such an
-        // entry against another root's genuinely-resolved one is not a real
-        // ambiguity — it produced a false-positive hard error across
-        // hundreds of packages at once in a real workspace, since one
-        // project's lockfile happened to carry a degenerate record for a
-        // name another project resolves normally. Only entries that
-        // actually carry integrity participate in the comparison; fewer
-        // than two such entries means there is nothing to meaningfully
-        // disambiguate, so no comparison runs at all in that case.
-        let with_integrity: Vec<&(PathBuf, Arc<ResolvedGraph>)> = matches
+        // Sorted by root path for deterministic error attribution and a
+        // deterministic pick in the (degenerate) all-empty-integrity
+        // fallback below — `matches` was assembled from two `HashMap`
+        // iterations (the cache scan, and `seen_roots`'s membership order
+        // has no bearing on `roots.iter()`'s own order either), so without
+        // this, which root's data appears first in an ambiguity error — or
+        // gets silently picked when literally nothing has real integrity —
+        // would vary process-to-process for the identical command.
+        matches.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        // Prefer an entry with real (non-empty) `integrity` as the "winner"
+        // returned below — it's the one `js_install`'s own integrity
+        // verification can actually validate against (see
+        // `driver_install.rs`'s `verify_integrity`); an empty-integrity
+        // entry never had this package's content genuinely pinned by that
+        // root's own lockfile in the first place (a peer-suffixed/deduped
+        // graph key folded onto one node picking up a variant with no
+        // resolution data of its own is a real, observed shape, not
+        // hypothetical — confirmed live in a real workspace).
+        //
+        // This is a preference for *which entry to return*, not an excuse to
+        // skip comparing the rest: every discovered root's entry still
+        // participates in the ambiguity check below, via
+        // `entries_agree_where_comparable`, which only exempts the
+        // `integrity` *field* itself when one side is empty — a real
+        // divergence on `resolved`/`os`/`cpu`/`dependencies`/
+        // `has_install_script` still fails loudly regardless of which side's
+        // `integrity` happens to be blank. An earlier version of this fix
+        // dropped the *whole entry* on empty integrity, which would have
+        // silently let a genuinely different `resolved` URL on that root
+        // through unchecked — caught in review before merge.
+        let Some((first_root, first_graph)) = matches
             .iter()
-            .filter(|(_, graph)| {
+            .find(|(_, graph)| {
                 !graph
                     .get(name, version)
                     .expect("just matched above")
                     .integrity
                     .is_empty()
             })
-            .collect();
-        let Some((first_root, first_graph)) = with_integrity.first().copied().or(matches.first())
+            .or(matches.first())
         else {
             return Ok(None);
         };
         let first_entry = first_graph.get(name, version).expect("just matched above");
-        for (root, graph) in with_integrity.iter().skip(1) {
+        for (root, graph) in matches.iter() {
+            if std::ptr::eq(root, first_root) {
+                continue;
+            }
             let entry = graph.get(name, version).expect("just matched above");
-            // Full entry equality, not just `integrity`: `resolved` (the
-            // tarball URL) feeds `JsInstallDef`'s hash directly (see
-            // `driver_install.rs::JsInstallDef`), so two roots agreeing on
-            // `integrity` but recording a different `resolved` (a public
-            // registry vs. an internal mirror serving byte-identical
-            // content, say) would still make `js_install`'s cache key
-            // nondeterministic across runs if picked via `HashMap` iteration
-            // order — the exact defect this check exists to rule out.
             anyhow::ensure!(
-                entry == first_entry,
+                entries_agree_where_comparable(first_entry, entry),
                 "js provider: {name}@{version} resolves to different content in two \
                  independent lockfiles this workspace discovered — {first_root:?} records \
                  integrity {:?} resolved from {:?}, {root:?} records integrity {:?} resolved \
@@ -3503,6 +3514,45 @@ fn default_registry_url(name: &str, version: &str) -> String {
     format!("https://registry.npmjs.org/{name}/-/{basename}-{version}.tgz")
 }
 
+/// Whether two independent lockfile roots' entries for the same
+/// `(name, version)` are consistent enough to treat as "the same package,"
+/// for [`Provider::find_resolved_graph_for`]'s ambiguity check.
+///
+/// Every field is compared **except** `integrity`/`resolved` each get a
+/// narrow, independent exemption: when either side's `integrity` is empty,
+/// that field alone is skipped; when either side's `resolved` is `None`,
+/// that field alone is skipped. A root whose lockfile never actually pinned
+/// this package's content (a peer-suffixed/deduped graph key folded onto
+/// one node picking up a variant with no resolution data of its own is a
+/// real, observed shape — confirmed live in a real workspace, across
+/// hundreds of packages, before this exemption existed) naturally has
+/// *neither* signal, not just one — a degenerate entry can't confirm or
+/// deny a conflict on a field it never recorded at all.
+///
+/// This is not license to skip the *rest* of the entry, nor to skip a field
+/// that genuinely *is* populated on both sides: `os`/`cpu`/`dependencies`/
+/// `has_install_script` always compare, and `resolved` still compares
+/// whenever both sides recorded one (e.g. a root with empty `integrity` but
+/// a real, populated `resolved` pointing at an internal mirror — a
+/// different root's real, differing `resolved` must still conflict). Only
+/// entirely-absent data is exempt; two roots that both genuinely resolved
+/// *different* content, one of them just missing an integrity stamp, must
+/// still fail loudly.
+fn entries_agree_where_comparable(
+    a: &lockfile::ResolvedPackage,
+    b: &lockfile::ResolvedPackage,
+) -> bool {
+    let integrity_agrees =
+        a.integrity.is_empty() || b.integrity.is_empty() || a.integrity == b.integrity;
+    let resolved_agrees = a.resolved.is_none() || b.resolved.is_none() || a.resolved == b.resolved;
+    integrity_agrees
+        && resolved_agrees
+        && a.dependencies == b.dependencies
+        && a.os == b.os
+        && a.cpu == b.cpu
+        && a.has_install_script == b.has_install_script
+}
+
 /// Recursively enumerate every directory at or below `dir` containing a
 /// lockfile file (`filename`) — every independent npm/pnpm project root in
 /// the workspace, however deeply nested, unlike
@@ -5450,6 +5500,93 @@ mod tests {
             Some(&Value::String("sha512-real".to_string())),
             "must use the root with real content, not the empty-integrity one: {:?}",
             resp.target_spec.config
+        );
+    }
+
+    /// A hermeticity review caught a more insidious version of the bug the
+    /// previous test fixes: an earlier draft of that fix dropped the
+    /// *entire* entry from comparison whenever its `integrity` was empty —
+    /// not just the `integrity` field — so a root with empty `integrity`
+    /// but a real, genuinely different `resolved` URL (an internal mirror,
+    /// say) would silently pass unchecked, using an unrelated project's
+    /// `resolved` for this root's own dependency. Empty `integrity` alone
+    /// must never exempt a root from having its *other* real, populated
+    /// fields compared — this must still fail loudly.
+    #[tokio::test]
+    async fn npm_e2e_empty_integrity_with_real_diverging_resolved_still_fails_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "mgmt/backoffice/package.json",
+            r#"{"name": "backoffice", "dependencies": {"yup": "^1.7.1"}}"#,
+        );
+        write(
+            dir.path(),
+            "mgmt/backoffice/package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "backoffice" },
+                    "node_modules/yup": {
+                        "version": "1.7.1",
+                        "resolved": "https://internal-mirror.corp/yup/-/yup-1.7.1.tgz"
+                    }
+                }
+            }"#,
+        );
+        write(
+            dir.path(),
+            "mgmt/frontend/package.json",
+            r#"{"name": "frontend", "dependencies": {"yup": "^1.7.1"}}"#,
+        );
+        write(
+            dir.path(),
+            "mgmt/frontend/package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "frontend" },
+                    "node_modules/yup": {
+                        "version": "1.7.1",
+                        "resolved": "https://registry.npmjs.org/yup/-/yup-1.7.1.tgz",
+                        "integrity": "sha512-real"
+                    }
+                }
+            }"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "yup",
+            "1.7.1",
+            &platform::current_goos(),
+            &platform::current_goarch(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        let msg = match result {
+            Err(GetError::Other(e)) => format!("{e:#}"),
+            Err(GetError::NotFound) => panic!("expected an ambiguity error, got NotFound"),
+            Ok(_) => panic!(
+                "empty integrity on one side must not exempt a real, differing resolved URL \
+                 from the ambiguity check, got Ok"
+            ),
+        };
+        assert!(msg.contains("yup@1.7.1"), "{msg}");
+        assert!(
+            msg.contains("internal-mirror.corp") && msg.contains("registry.npmjs.org"),
+            "{msg}"
         );
     }
 
