@@ -134,6 +134,7 @@
 //! positive. See that type's doc for exactly what it can and can't see.
 
 use crate::pluginjs::importparse::{self, ModuleContext, ParsedImports};
+use crate::pluginjs::lockfile::{self, Lockfile, ResolvedGraph};
 use crate::pluginjs::package_json::PackageManifest;
 use crate::pluginjs::resolvers::{ResolveOutcome, Resolvers};
 use crate::pluginjs::{PACKAGE_JSON, is_skipped_dir_name};
@@ -260,6 +261,46 @@ pub fn declared_closure(manifest: &PackageManifest) -> HashSet<String> {
     set.extend(manifest.dev_dependencies.keys().cloned());
     set.extend(manifest.peer_dependencies.keys().cloned());
     set.insert(manifest.name.clone());
+    set
+}
+
+/// [`declared_closure`], widened to every package name reachable by walking
+/// the lockfile's resolved dependency graph outward from `manifest`'s own
+/// direct dependencies.
+///
+/// A package pulled in this way — e.g. `@eslint/js`, reachable because
+/// `typescript-eslint` (a real, declared `devDependency`) depends on it — is
+/// not a phantom dependency in the sense [`check_phantom_dependencies`]
+/// exists to catch: its presence is fully determined by the lockfile, which
+/// is itself an already-hashed input, not by workspace-wide `node_modules`
+/// hoisting that could place a *different* version (or nothing at all) in
+/// reach on another host or package manager. Only names that aren't
+/// reachable from *anything* this manifest declares still count as phantom.
+///
+/// `lockfile`/`resolved_graph` are `None` for a package with no lockfile
+/// entry yet (nothing installed) — falls back to [`declared_closure`]
+/// unchanged, same as before this widening existed.
+pub fn transitive_declared_closure(
+    manifest: &PackageManifest,
+    pkg: &str,
+    lockfile: Option<&Lockfile>,
+    resolved_graph: Option<&ResolvedGraph>,
+) -> HashSet<String> {
+    let mut set = declared_closure(manifest);
+    let (Some(lockfile), Some(resolved_graph)) = (lockfile, resolved_graph) else {
+        return set;
+    };
+    // Same seed computation `deps::resolve_one_dependency`'s
+    // `lockfile::resolve_transitive` fallback uses, so a package this check
+    // accepts is always one that path can also wire an Input for — see
+    // `resolve_transitive`'s doc for why that agreement matters. A seed
+    // resolution error here just means one fewer package widens the closure
+    // (never a silent-wrong-build either way: a name that stays unwidened
+    // still fails loudly, as a phantom dependency, at this function's own
+    // caller — `Lockfile::resolve_dependency` has no fallible path today,
+    // so this can't actually happen yet regardless).
+    let seed_keys = lockfile::direct_dep_seed_keys(lockfile, pkg, manifest).unwrap_or_default();
+    set.extend(resolved_graph.transitive_reachable(seed_keys).into_keys());
     set
 }
 
@@ -401,8 +442,9 @@ fn bare_specifier_guard(tsconfig: Option<&Path>) -> BareSpecifierGuard {
 /// and [`find_nearest_test_runner_config`] — `js_test`'s runner config
 /// (`vitest.config.ts` / `jest.config.js`) is walked up the same way a
 /// package's tsconfig is, per `ai-docs/js-plugin-plan.md`'s `js_test` milestone
-/// note.
-fn find_nearest_file(
+/// note. Also reused by `Provider::find_lockfile_root` for lockfile discovery
+/// — same walk-up-by-presence shape, one candidate.
+pub(crate) fn find_nearest_file(
     workspace_root: &Path,
     pkg_dir: &Path,
     candidates: &[&str],
@@ -697,27 +739,44 @@ fn resolve_config_import_specifier(config_dir: &Path, specifier: &str) -> Option
     probe_first_party_path(&config_dir.join(specifier))
 }
 
+/// [`resolve_runner_config_referenced_files`]'s result: every additional
+/// first-party file the config transitively names/imports, plus every bare
+/// (third-party) specifier encountered along the way.
+#[derive(Debug)]
+pub struct RunnerConfigScan {
+    pub files: Vec<PathBuf>,
+    /// A bare import/require inside the config file (e.g. `import react
+    /// from '@vitejs/plugin-react'`) — not followed as a file (it names a
+    /// real npm dependency, not another config to recurse into), but
+    /// collected here for the same reason [`build_test_closure`]'s own
+    /// `bare_specifiers` are: a plugin the config itself imports (Vite's
+    /// `@vitejs/plugin-react`, `vite-plugin-svgr`, Lingui's
+    /// `@lingui/vite-plugin`, a browser-mode provider like
+    /// `@vitest/browser-playwright`, …) has to be staged in the sandbox and
+    /// declared as an Input the same as any other third-party dependency
+    /// the test actually needs, or resolving/loading the config itself
+    /// fails the moment vitest/jest tries to import it — regardless of
+    /// whether the test file's own source ever touches it.
+    pub bare_specifiers: Vec<BareSpecifierSite>,
+}
+
 /// Recursively resolve every additional first-party file a test-runner
 /// config's own content names or imports: [`RUNNER_CONFIG_FILE_KEYS`]
 /// entries, plus a relative `import`/`require` of a shared base config
 /// (`import base from '../../vitest.config.base'`) — which may itself name
 /// or import more, so each newly-resolved file is scanned the same way in
 /// turn. Bounded depth + a visited set guard against a cyclic/self-importing
-/// config; in practice a real config chain is one or two files deep.
-///
-/// **Known scope trim, disclosed rather than silent**: only a *relative*
-/// import/require inside the config file is followed — a shared base config
-/// pulled in via a bare package specifier (e.g. an internal
-/// `@myorg/test-config` package) is not, the same "third-party is
-/// `js_install`'s job" boundary `test_deps_config` draws elsewhere for the
-/// test file's own closure.
+/// config; in practice a real config chain is one or two files deep. See
+/// [`RunnerConfigScan::bare_specifiers`] for the config's own third-party
+/// imports, which this also collects but does not recurse into.
 pub fn resolve_runner_config_referenced_files(
     config_path: &Path,
     config_content: &str,
-) -> anyhow::Result<Vec<PathBuf>> {
+) -> anyhow::Result<RunnerConfigScan> {
     const MAX_DEPTH: usize = 4;
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut bare_specifiers: Vec<BareSpecifierSite> = Vec::new();
     let mut queue: VecDeque<(PathBuf, String, usize)> = VecDeque::new();
     seen.insert(config_path.to_path_buf());
     queue.push_back((config_path.to_path_buf(), config_content.to_string(), 0));
@@ -744,12 +803,21 @@ pub fn resolve_runner_config_referenced_files(
                     enqueue_referenced_config_file(
                         resolved, depth, &mut seen, &mut found, &mut queue,
                     );
+                } else if let Some(package_name) = bare_specifier_package_name(&site.specifier) {
+                    bare_specifiers.push(BareSpecifierSite {
+                        file: path.to_string_lossy().replace('\\', "/"),
+                        specifier: site.specifier,
+                        package_name,
+                    });
                 }
             }
         }
     }
 
-    Ok(found.into_iter().collect())
+    Ok(RunnerConfigScan {
+        files: found.into_iter().collect(),
+        bare_specifiers,
+    })
 }
 
 /// Record a newly-resolved referenced-config file (if not already seen) and
@@ -1104,7 +1172,21 @@ pub fn resolve_eslint_config_referenced_files(
 
     // Modern flat config's own relative `import`/`require` chain (recursive
     // — `resolve_runner_config_referenced_files` already walks depth).
-    for f in resolve_runner_config_referenced_files(config_path, config_content)? {
+    // `bare_specifiers` is unused here: `lint_deps_config`'s dedicated
+    // `eslint_plugins` field already resolves the *leaf* config's own
+    // `extends`/`plugins` values through the lockfile, covering the common
+    // case. It does not currently re-scan a relatively-imported *base*
+    // config's own plugin imports (`extract_eslint_module_refs` only ever
+    // runs on the leaf), so a plugin imported only by a shared base config
+    // is a real, pre-existing gap this call doesn't close either — unlike
+    // `test_deps_config`'s equivalent runner-config case, which does
+    // (`resolve_runner_config_referenced_files`'s own `bare_specifiers`
+    // there gets validated and staged). Left as a known gap rather than
+    // silently claimed as covered; fixing it means threading
+    // `bare_specifiers` through the same declared-dependency check/staging
+    // `test_deps_config` now has, for every file in the chain, not just
+    // this one's leaf.
+    for f in resolve_runner_config_referenced_files(config_path, config_content)?.files {
         if seen.insert(f.clone()) {
             found.insert(f);
         }
@@ -2583,6 +2665,96 @@ mod tests {
             .expect("a declared bare specifier must pass even with no node_modules on disk");
     }
 
+    /// A minimal npm `package-lock.json` for `transitive_declared_closure`'s
+    /// own tests: package `a` declares `typescript-eslint`, which the
+    /// lockfile resolves to depend on `@eslint/js` — the exact
+    /// companion-package pattern (a real ESLint flat-config monorepo hitting
+    /// `array_exports_matched_entry_missing_on_disk_hard_fails_no_fallback`'s
+    /// sibling bug report) this closure exists to stop flagging as phantom.
+    /// `unrelated` has no edge from anything `a` declares, so it stays a
+    /// genuine phantom even after the widening.
+    fn transitive_fixture() -> Lockfile {
+        Lockfile::parse(
+            crate::pluginjs::workspace::PkgManager::Npm,
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "packages/a": { "name": "a", "devDependencies": { "typescript-eslint": "^8.0.0" } },
+                    "node_modules/typescript-eslint": {
+                        "version": "8.0.0",
+                        "resolved": "https://registry.npmjs.org/typescript-eslint/-/typescript-eslint-8.0.0.tgz",
+                        "integrity": "sha512-abc",
+                        "dependencies": { "@eslint/js": "9.0.0" }
+                    },
+                    "node_modules/@eslint/js": {
+                        "version": "9.0.0",
+                        "resolved": "https://registry.npmjs.org/@eslint/js/-/js-9.0.0.tgz",
+                        "integrity": "sha512-def",
+                        "dependencies": {}
+                    },
+                    "node_modules/unrelated": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/unrelated/-/unrelated-1.0.0.tgz",
+                        "integrity": "sha512-ghi",
+                        "dependencies": {}
+                    }
+                }
+            }"#,
+        )
+        .expect("parse fixture lockfile")
+    }
+
+    #[test]
+    fn transitive_declared_closure_includes_a_dependency_of_a_declared_dependency() {
+        let lockfile = transitive_fixture();
+        let resolved_graph = lockfile.resolved_graph();
+        let manifest = manifest("a", &[], &["typescript-eslint"]);
+
+        // The narrower, direct-only closure does not know about `@eslint/js`
+        // at all — this is the exact gap `transitive_declared_closure` fills.
+        assert!(!declared_closure(&manifest).contains("@eslint/js"));
+
+        let widened = transitive_declared_closure(
+            &manifest,
+            "packages/a",
+            Some(&lockfile),
+            Some(&resolved_graph),
+        );
+        assert!(
+            widened.contains("@eslint/js"),
+            "a package reachable through a declared dependency's own lockfile-resolved \
+             dependencies must not be flagged as phantom: {widened:?}"
+        );
+        assert!(widened.contains("typescript-eslint"), "{widened:?}");
+    }
+
+    #[test]
+    fn transitive_declared_closure_does_not_include_an_unrelated_package() {
+        let lockfile = transitive_fixture();
+        let resolved_graph = lockfile.resolved_graph();
+        let manifest = manifest("a", &[], &["typescript-eslint"]);
+
+        let widened = transitive_declared_closure(
+            &manifest,
+            "packages/a",
+            Some(&lockfile),
+            Some(&resolved_graph),
+        );
+        assert!(
+            !widened.contains("unrelated"),
+            "a package with no edge from anything `a` declares is still a genuine phantom \
+             dependency, not merely hoisted into reach: {widened:?}"
+        );
+    }
+
+    #[test]
+    fn transitive_declared_closure_falls_back_to_direct_only_without_a_lockfile() {
+        let manifest = manifest("a", &[], &["typescript-eslint"]);
+        let widened = transitive_declared_closure(&manifest, "packages/a", None, None);
+        assert_eq!(widened, declared_closure(&manifest));
+    }
+
     /// A `peerDependencies` entry counts as declared for phantom-check
     /// purposes (a peer dep is a legitimate, common thing to import) even
     /// though it is never wired as a target dependency by `deps.rs`.
@@ -2863,17 +3035,22 @@ mod tests {
 
         let config_path = dir.path().join("vitest.config.ts");
         let content = std::fs::read_to_string(&config_path).expect("read fixture");
-        let mut refs = resolve_runner_config_referenced_files(&config_path, &content)
+        let mut scan = resolve_runner_config_referenced_files(&config_path, &content)
             .expect("resolve referenced files");
-        refs.sort();
+        scan.files.sort();
 
         assert_eq!(
-            refs,
+            scan.files,
             vec![
                 dir.path().join("base.setup.ts"),
                 dir.path().join("leaf.setup.ts"),
                 dir.path().join("vitest.config.base.ts"),
             ]
+        );
+        assert!(
+            scan.bare_specifiers.is_empty(),
+            "{:?}",
+            scan.bare_specifiers
         );
     }
 
@@ -2883,9 +3060,38 @@ mod tests {
         let config_path = dir.path().join("vitest.config.ts");
         let content = "export default { test: {} };\n";
         write(dir.path(), "vitest.config.ts", content);
-        let refs = resolve_runner_config_referenced_files(&config_path, content)
+        let scan = resolve_runner_config_referenced_files(&config_path, content)
             .expect("resolve referenced files");
-        assert!(refs.is_empty(), "{refs:?}");
+        assert!(scan.files.is_empty(), "{:?}", scan.files);
+        assert!(
+            scan.bare_specifiers.is_empty(),
+            "{:?}",
+            scan.bare_specifiers
+        );
+    }
+
+    /// The gap this session's fix closes: a bare (third-party) import inside
+    /// the runner config itself — e.g. vitest.config.ts's own `import react
+    /// from '@vitejs/plugin-react'` — is collected, not silently dropped,
+    /// so `test_deps_config` can stage it in the sandbox the same way it
+    /// already stages the test file's own third-party imports.
+    #[test]
+    fn resolve_runner_config_referenced_files_collects_bare_specifiers_without_following_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("vitest.config.ts");
+        let content = "import react from '@vitejs/plugin-react';\n\
+             export default { plugins: [react()], test: {} };\n";
+        write(dir.path(), "vitest.config.ts", content);
+        let scan = resolve_runner_config_referenced_files(&config_path, content)
+            .expect("resolve referenced files");
+        assert!(
+            scan.files.is_empty(),
+            "a bare specifier must not be followed as a file: {:?}",
+            scan.files
+        );
+        assert_eq!(scan.bare_specifiers.len(), 1);
+        assert_eq!(scan.bare_specifiers[0].package_name, "@vitejs/plugin-react");
+        assert_eq!(scan.bare_specifiers[0].specifier, "@vitejs/plugin-react");
     }
 
     /// The single most important test in this milestone (per the task): the
