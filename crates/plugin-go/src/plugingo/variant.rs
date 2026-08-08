@@ -26,7 +26,7 @@
 //! **same `variants` map** and override selected fields (list fields replace, not
 //! append). `goos`/`goarch` may be omitted when inherited. Cycles are rejected.
 
-use crate::plugingo::factors::{Factors, VariantRef};
+use crate::plugingo::factors::{Factors, VariantRef, race_from_args};
 use anyhow::{Context, bail};
 use hcore::htvalue::{Value, parse_strings};
 use hmodel::htaddr::Addr;
@@ -348,6 +348,14 @@ pub async fn resolve(
             defined_variant_names(req_states).join(", ")
         );
     };
+    // Race is orthogonal to the variant: it comes off the addr, not the
+    // `variants` declaration, and overlays whichever factor set resolves below.
+    let race = race_from_args(&addr.args)?;
+    let apply_race = |(mut f, v): (Factors, VariantRef)| -> (Factors, VariantRef) {
+        f.race = race;
+        (f, v.with_race(race))
+    };
+
     match addr.args.get("vp") {
         // Only honor `vp` when it lies within the target's OWN go module. The
         // variant universe is bounded to the module: a `vp` threaded from a
@@ -365,7 +373,7 @@ pub async fn resolve(
                 .find_map(|s| variant_in_state(s, name).transpose())
                 .transpose()?
             {
-                return Ok((f, vref));
+                return Ok(apply_race((f, vref)));
             }
             // Otherwise fetch `vp`'s own declaration directly. `states_under(vp)`
             // includes `vp`'s package (siblings of the target are reachable this
@@ -376,10 +384,10 @@ pub async fn resolve(
                 .with_context(|| format!("fetching variant declaration at `{vp}`"))?;
             let universe = build_universe(&vp_states)?;
             let f = resolve_in_universe(&vref, &universe)?;
-            Ok((f, vref))
+            Ok(apply_race((f, vref)))
         }
         // No `vp`, or a `vp` outside this module: resolve by module-bounded ancestry.
-        _ => resolve_ancestry(name, req_states, module_root),
+        _ => resolve_ancestry(name, req_states, module_root).map(apply_race),
     }
 }
 

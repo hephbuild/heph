@@ -152,6 +152,11 @@ fn build_spec_inner(
             ),
         );
     }
+    // Set only for a race build, so an ordinary `_golist` spec (and the def hash
+    // derived from it) is exactly what it was before race mode existed.
+    if factors.race {
+        config.insert("race".to_string(), Value::Bool(true));
+    }
     if !deps.is_empty() {
         config.insert("deps".to_string(), Value::Map(deps));
     }

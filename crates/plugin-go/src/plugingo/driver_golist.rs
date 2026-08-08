@@ -57,6 +57,10 @@ struct GoGolistSpec {
     build_tags: Vec<String>,
     /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
     goexperiment: Vec<String>,
+    /// Race-detector build: pass `-race` to `go list`. Changes both the file set
+    /// (`//go:build race`) and the import graph, so the listing must be done in
+    /// the same mode the archives will be compiled in.
+    race: bool,
     /// Pass `-test` to `go list` — needed only when the package has `_test.go`
     /// files whose imports and embed patterns must be resolved. See
     /// [`crate::plugingo::target_golist`] for who sets it.
@@ -111,6 +115,8 @@ struct GoGolistDef {
     go_version: String,
     build_tags: Vec<String>,
     goexperiment: Vec<String>,
+    /// See [`GoGolistSpec::race`].
+    race: bool,
     with_test: bool,
     dep_inputs: Vec<Input>,
     /// For thirdparty packages: the `download` target whose filtered outputs
@@ -141,6 +147,13 @@ impl Hash for GoGolistDef {
         self.go_version.hash(state);
         self.build_tags.hash(state);
         self.goexperiment.hash(state);
+        // Hashed only when set, so introducing race mode left every ordinary
+        // `_golist` def hash — and therefore every cached listing — untouched.
+        // The marker is a distinct string, so it cannot alias a neighbouring
+        // field's contribution.
+        if self.race {
+            "race".hash(state);
+        }
         // Flips the `go list` command line, and with it which fields come back
         // populated — so it must key the cache.
         self.with_test.hash(state);
@@ -219,6 +232,7 @@ impl ManagedDriver for GoGolistDriver {
             go_version: spec.go_version,
             build_tags: spec.build_tags,
             goexperiment: spec.goexperiment,
+            race: spec.race,
             with_test: spec.with_test,
             dep_inputs: dep_inputs.clone(),
             thirdparty_download_addr: spec.thirdparty_download_addr,
@@ -312,6 +326,7 @@ impl ManagedDriver for GoGolistDriver {
                 goarch: def.goarch.clone(),
                 build_tags: def.build_tags.clone(),
                 goexperiment: def.goexperiment.clone(),
+                race: def.race,
             },
             &req.sandbox_pkg_dir.join(".heph-gocache"),
         )?;
@@ -328,12 +343,16 @@ impl ManagedDriver for GoGolistDriver {
         // resolution is reproducible regardless of host config.
         env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
         env.insert("GOWORK".to_string(), "off".to_string());
-        // Pin CGO_ENABLED=0 to keep this list call's view of transitive deps
-        // consistent with the bash-driven compile/link sandboxes. Letting Go
-        // autodetect produces drift across hosts (PATH-dependent) — e.g. an
-        // Ubuntu host with gcc on PATH pulls runtime/cgo here but later link
-        // steps run without it, breaking importcfg.
-        env.insert("CGO_ENABLED".to_string(), "0".to_string());
+        // Pin CGO_ENABLED rather than letting Go autodetect it: autodetection is
+        // PATH-dependent and drifts across hosts — e.g. an Ubuntu host with gcc on
+        // PATH pulls runtime/cgo in here but later link steps run without it,
+        // breaking importcfg. The value must match what the compile/link sandboxes
+        // use, which is `0` for every ordinary build and `1` only for a race build
+        // off darwin (see `factors::cgo_required`).
+        env.insert(
+            "CGO_ENABLED".to_string(),
+            crate::plugingo::factors::cgo_enabled_value(&def.goos, def.race).to_string(),
+        );
         if !def.goexperiment.is_empty() {
             env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
         }
@@ -577,6 +596,12 @@ fn golist_args(def: &GoGolistDef) -> Vec<String> {
     }
     if !def.build_tags.is_empty() {
         args.push(format!("-tags={}", def.build_tags.join(",")));
+    }
+    // `-race` rather than `-tags=race`: besides the build tag it also adds
+    // `runtime/race` to the listed deps, which is how the linker gets told about
+    // the TSan runtime (nothing in the source graph imports it).
+    if def.race {
+        args.push("-race".to_string());
     }
     args.push(def.import_path.clone());
     args
@@ -962,6 +987,7 @@ mod tests {
             go_version: crate::plugingo::toolchain::DEFAULT_GO_VERSION.to_string(),
             build_tags,
             goexperiment: vec![],
+            race: false,
             with_test,
             dep_inputs: vec![],
             thirdparty_download_addr: None,
@@ -980,6 +1006,48 @@ mod tests {
         // the import path stays last.
         assert!(args.iter().any(|a| a == "-e"));
         assert_eq!(args.last().map(String::as_str), Some("example.com/mylib"));
+    }
+
+    /// `-race` (not `-tags=race`): besides the build tag it adds `runtime/race`
+    /// to the listed deps, which is the only reason the listing knows about the
+    /// TSan runtime at all.
+    #[test]
+    fn golist_args_pass_race_when_set() {
+        let mut def = def_with(false, vec![]);
+        assert!(!golist_args(&def).iter().any(|a| a == "-race"));
+        def.race = true;
+        assert!(golist_args(&def).iter().any(|a| a == "-race"));
+    }
+
+    /// Race must key the listing: the file set and the import graph both differ.
+    #[test]
+    fn golist_def_hash_differs_for_race() {
+        let plain = def_with(false, vec![]);
+        let racy = GoGolistDef {
+            race: true,
+            ..plain.clone()
+        };
+        assert_ne!(def_hash(&plain), def_hash(&racy));
+    }
+
+    /// …but adding the field must not have moved the hash for everyone else, or
+    /// every cached `_golist` artifact in existence would be invalidated. The
+    /// constant is the hash this def produced before `race` was introduced.
+    #[test]
+    fn golist_def_hash_unchanged_for_non_race() {
+        assert_eq!(def_hash(&def_with(false, vec![])), NON_RACE_GOLIST_HASH);
+    }
+
+    /// Pinned pre-`race` value of `def_hash(def_with(false, vec![]))`. Update it
+    /// only alongside a deliberate `GO_GOLIST_FORMAT_VERSION` bump — a change
+    /// here means every cached listing is being thrown away.
+    const NON_RACE_GOLIST_HASH: u64 = 642058481220411298;
+
+    fn def_hash(def: &GoGolistDef) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = xxhash_rust::xxh3::Xxh3Default::new();
+        def.hash(&mut h);
+        h.finish()
     }
 
     #[test]
