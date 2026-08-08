@@ -371,7 +371,7 @@ mod tests {
     fn third_party_dep_becomes_js_install_addr() {
         let manifest = manifest(&[("lodash", "^4.17.21")], &[], &[]);
         let lock = npm_lockfile();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         let deps = resolve_package_deps(
             "packages/a",
             "packages/a",
@@ -435,7 +435,7 @@ mod tests {
     fn resolve_one_dependency_falls_back_transitively_through_a_declared_dependency() {
         let manifest = manifest(&[], &[("typescript-eslint", "^8.0.0")], &[]);
         let lock = transitive_npm_lockfile();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         let addr = resolve_one_dependency(
             "packages/a",
             "packages/a",
@@ -491,7 +491,7 @@ snapshots:
 "#,
         )
         .unwrap();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         // Not optional and not declared at all, so a miss here is the same
         // hard-error path `missing_required_dep_resolution_is_a_hard_error`
         // exercises for a direct dependency — this is not a real production
@@ -517,7 +517,7 @@ snapshots:
     fn missing_required_dep_resolution_is_a_hard_error() {
         let manifest = manifest(&[("not-in-lockfile", "^1.0.0")], &[], &[]);
         let lock = npm_lockfile();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         let err = resolve_package_deps(
             "packages/a",
             "packages/a",
@@ -536,7 +536,7 @@ snapshots:
     fn missing_optional_dep_resolution_is_silently_skipped() {
         let manifest = manifest(&[], &[], &[("fsevents", "^2.3.0")]);
         let lock = npm_lockfile();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         let deps = resolve_package_deps(
             "packages/a",
             "packages/a",
@@ -596,7 +596,7 @@ snapshots:
     fn platform_mismatched_optional_dep_is_silently_skipped_even_when_lockfile_resolved() {
         let manifest = manifest(&[], &[], &[("native-thing", "^1.0.0")]);
         let lock = npm_lockfile_with_platform_restricted_pkg();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         // The declaring workspace runs on linux/amd64; the lockfile-resolved
         // native-thing@1.0.0 is restricted to darwin/arm64 — a mismatch.
         let deps = resolve_package_deps(
@@ -624,7 +624,7 @@ snapshots:
         // actionable problem and must still hard-fail.
         let manifest = manifest(&[("native-thing", "^1.0.0")], &[], &[]);
         let lock = npm_lockfile_with_platform_restricted_pkg();
-        let graph = lock.resolved_graph();
+        let graph = lock.resolved_graph().unwrap();
         let err = resolve_package_deps(
             "packages/a",
             "packages/a",
