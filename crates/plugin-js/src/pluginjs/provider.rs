@@ -594,7 +594,7 @@ impl Provider {
     /// isolation) where nothing is cached yet at all.
     ///
     /// **Does not stop at the first match.** `thirdparty_addr`'s scheme
-    /// (bare `name`/`version`/`goos`/`goarch`, no project scoping) is only a
+    /// (bare `name`/`version`/`os`/`arch`, no project scoping) is only a
     /// valid cache key when a published package's metadata is genuinely the
     /// same regardless of which project's lockfile recorded it — true for
     /// one lockfile, but this `Provider` can now discover *several*
@@ -910,8 +910,8 @@ impl Provider {
         let workspace_root = self.workspace_root.clone();
         let walker = Arc::clone(&self.walker);
         let linter = self.linter.clone();
-        let goos = platform::current_goos();
-        let goarch = platform::current_goarch();
+        let os = platform::current_os();
+        let arch = platform::current_arch();
 
         hcore::blocking::run(move || -> anyhow::Result<HashMap<String, Value>> {
             let lint_deps = lint_deps_config(
@@ -923,8 +923,8 @@ impl Provider {
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
                 &member_addrs_by_name,
-                &goos,
-                &goarch,
+                &os,
+                &arch,
             )
             .with_context(|| format!("building js_lint inputs for {pkg_str:?}"))?;
 
@@ -1068,8 +1068,8 @@ impl Provider {
         let graph = self.import_graph(pkg).await?;
         let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
-        let goos = platform::current_goos();
-        let goarch = platform::current_goarch();
+        let os = platform::current_os();
+        let arch = platform::current_arch();
 
         hcore::blocking::run(move || -> anyhow::Result<Value> {
             let package_json_path = workspace_root.join(&pkg_str).join(PACKAGE_JSON);
@@ -1083,8 +1083,8 @@ impl Provider {
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
                 &member_addrs_by_name,
-                &goos,
-                &goarch,
+                &os,
+                &arch,
             )?;
 
             // M2: cross-validate the declared-dependency wiring above against
@@ -1159,8 +1159,8 @@ impl Provider {
         let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
         let walker = Arc::clone(&self.walker);
-        let goos = platform::current_goos();
-        let goarch = platform::current_goarch();
+        let os = platform::current_os();
+        let arch = platform::current_arch();
 
         hcore::blocking::run(move || -> anyhow::Result<HashMap<String, Value>> {
             let (deps, tsconfig_path, tsconfig_content) = typecheck_deps_config(
@@ -1172,8 +1172,8 @@ impl Provider {
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
                 &member_addrs_by_name,
-                &goos,
-                &goarch,
+                &os,
+                &arch,
             )
             .with_context(|| format!("building js_typecheck inputs for {pkg_str:?}"))?;
 
@@ -1241,8 +1241,8 @@ impl Provider {
         let workspace_root = self.workspace_root.clone();
         let testrunner = self.testrunner.clone();
         let test_file_rel = test_file_rel.to_string();
-        let goos = platform::current_goos();
-        let goarch = platform::current_goarch();
+        let os = platform::current_os();
+        let arch = platform::current_arch();
 
         hcore::blocking::run(move || -> anyhow::Result<HashMap<String, Value>> {
             let (deps, runner_config_path, runner_config_content) = test_deps_config(
@@ -1254,8 +1254,8 @@ impl Provider {
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
                 &member_addrs_by_name,
-                &goos,
-                &goarch,
+                &os,
+                &arch,
                 &testrunner,
                 runner_config_candidates(&testrunner)?,
             )
@@ -1291,16 +1291,16 @@ impl Provider {
             thirdparty::parse_thirdparty_pkg(addr.package.as_str()).ok_or_else(|| {
                 anyhow::anyhow!("not a js thirdparty addr: {}", addr.package.as_str())
             })?;
-        let goos = addr
+        let os = addr
             .args
-            .get("goos")
+            .get("os")
             .cloned()
-            .unwrap_or_else(platform::current_goos);
-        let goarch = addr
+            .unwrap_or_else(platform::current_os);
+        let arch = addr
             .args
-            .get("goarch")
+            .get("arch")
             .cloned()
-            .unwrap_or_else(platform::current_goarch);
+            .unwrap_or_else(platform::current_arch);
 
         let graph = self
             .find_resolved_graph_for(name, version)
@@ -1324,9 +1324,9 @@ impl Provider {
         })?;
 
         anyhow::ensure!(
-            platform::matches_platform(&resolved.os, &resolved.cpu, &goos, &goarch),
+            platform::matches_platform(&resolved.os, &resolved.cpu, &os, &arch),
             "js provider: {name}@{version} is restricted to os={:?} cpu={:?}, which does not \
-             include the requested platform {goos}/{goarch}",
+             include the requested platform {os}/{arch}",
             resolved.os,
             resolved.cpu
         );
@@ -1357,8 +1357,8 @@ impl Provider {
             Value::String(resolved.integrity.clone()),
         );
         config.insert("resolved".to_string(), Value::String(resolved_url));
-        config.insert("goos".to_string(), Value::String(goos));
-        config.insert("goarch".to_string(), Value::String(goarch));
+        config.insert("os".to_string(), Value::String(os));
+        config.insert("arch".to_string(), Value::String(arch));
         config.insert(
             "has_install_script".to_string(),
             Value::Bool(resolved.has_install_script),
@@ -1396,7 +1396,7 @@ impl Provider {
         r: &thirdparty::NodeModulesRelocation,
     ) -> TargetSpec {
         let install_addr =
-            thirdparty::thirdparty_addr(&r.resolved_name, &r.version, &r.goos, &r.goarch);
+            thirdparty::thirdparty_addr(&r.resolved_name, &r.version, &r.os, &r.arch);
         let node_modules_dir = if r.consuming_pkg.is_empty() {
             format!("node_modules/{}", r.local_name)
         } else {
@@ -1468,8 +1468,8 @@ impl Provider {
         let lockfile = lockfile.map(|(_, lf)| lf);
         let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
-        let goos = platform::current_goos();
-        let goarch = platform::current_goarch();
+        let os = platform::current_os();
+        let arch = platform::current_arch();
 
         let deps_addrs = hcore::blocking::run(move || -> anyhow::Result<Vec<String>> {
             let package_json_path = workspace_root.join(&pkg_str).join(PACKAGE_JSON);
@@ -1487,8 +1487,8 @@ impl Provider {
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
                 &member_addrs_by_name,
-                &goos,
-                &goarch,
+                &os,
+                &arch,
             )?
             .into_iter()
             .map(|d| d.addr)
@@ -1502,8 +1502,8 @@ impl Provider {
                     &manifest,
                     lf,
                     rg,
-                    &goos,
-                    &goarch,
+                    &os,
+                    &arch,
                 )?);
             }
             addrs.sort();
@@ -1656,8 +1656,8 @@ impl Provider {
         .await?;
 
         let member_addrs_by_name = self.member_addrs_by_name().await?;
-        let goos = platform::current_goos();
-        let goarch = platform::current_goarch();
+        let os = platform::current_os();
+        let arch = platform::current_arch();
 
         let mut files: BTreeSet<String> = BTreeSet::new();
         let mut external_addrs: BTreeSet<String> = BTreeSet::new();
@@ -1758,7 +1758,7 @@ impl Provider {
 
             let step = hcore::blocking::run(enclose!(
                 (canonical_root, cur_pkg, lockfile_pkg, cur_file, graph, manifest, lockfile, resolved_graph,
-                 member_addrs_by_name, goos, goarch) move || {
+                 member_addrs_by_name, os, arch) move || {
                     bundle_closure_step(
                         &canonical_root,
                         &cur_pkg,
@@ -1769,8 +1769,8 @@ impl Provider {
                         lockfile.as_deref(),
                         resolved_graph.as_deref(),
                         &member_addrs_by_name,
-                        &goos,
-                        &goarch,
+                        &os,
+                        &arch,
                     )
                 }
             ))
@@ -2219,8 +2219,8 @@ fn classify_resolved_edge(
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
-    goos: &str,
-    goarch: &str,
+    os: &str,
+    arch: &str,
 ) -> anyhow::Result<EdgeClassification> {
     let Some(name) = importgraph::thirdparty_pkg_name_from_path(resolved) else {
         return Ok(EdgeClassification::FirstParty);
@@ -2233,8 +2233,8 @@ fn classify_resolved_edge(
         lockfile,
         resolved_graph,
         member_addrs_by_name,
-        goos,
-        goarch,
+        os,
+        arch,
     )
     .with_context(|| {
         format!(
@@ -2280,8 +2280,8 @@ fn bundle_closure_step(
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
-    goos: &str,
-    goarch: &str,
+    os: &str,
+    arch: &str,
 ) -> anyhow::Result<BundleClosureStep> {
     let mut new_files = Vec::new();
     let mut new_external = Vec::new();
@@ -2297,8 +2297,8 @@ fn bundle_closure_step(
             lockfile,
             resolved_graph,
             member_addrs_by_name,
-            goos,
-            goarch,
+            os,
+            arch,
         )? {
             EdgeClassification::ThirdParty(resolved) => {
                 if let Some(pair) = resolved {
@@ -2351,8 +2351,8 @@ fn bundle_closure_step(
             lockfile,
             resolved_graph,
             member_addrs_by_name,
-            goos,
-            goarch,
+            os,
+            arch,
         )
         .with_context(|| {
             format!(
@@ -2431,7 +2431,7 @@ fn parse_bundler_config_external(content: &str) -> anyhow::Result<Vec<String>> {
 /// `graph` is `pkg`'s [`importgraph::ImportGraph`] — built once by
 /// `Provider::import_graph` and shared with `deps_config`/`test_deps_config`
 /// rather than rebuilt here; see that method's doc for why.
-/// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`goos`/`goarch` are
+/// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`os`/`arch` are
 /// only consulted when an import names a package that never resolved on
 /// disk — see above — and mirror the identically-named parameters
 /// `deps::resolve_package_deps` already takes for `Provider::deps_config`.
@@ -2449,8 +2449,8 @@ fn typecheck_deps_config(
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
-    goos: &str,
-    goarch: &str,
+    os: &str,
+    arch: &str,
 ) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
     let pkg_dir = if pkg.is_empty() {
         workspace_root.to_path_buf()
@@ -2580,8 +2580,8 @@ fn typecheck_deps_config(
             lockfile,
             resolved_graph,
             member_addrs_by_name,
-            goos,
-            goarch,
+            os,
+            arch,
         )? {
             EdgeClassification::ThirdParty(resolved) => {
                 if let Some((_, addr)) = resolved {
@@ -2631,8 +2631,8 @@ fn typecheck_deps_config(
             lockfile,
             resolved_graph,
             member_addrs_by_name,
-            goos,
-            goarch,
+            os,
+            arch,
         )
         .with_context(|| {
             format!(
@@ -2649,7 +2649,7 @@ fn typecheck_deps_config(
     // — see `deps::resolve_transitive_closure`'s doc.
     if let (Some(lf), Some(rg)) = (lockfile, resolved_graph) {
         types_addrs.extend(
-            deps::resolve_transitive_closure(pkg, lockfile_pkg, &manifest, lf, rg, goos, goarch)
+            deps::resolve_transitive_closure(pkg, lockfile_pkg, &manifest, lf, rg, os, arch)
                 .with_context(|| {
                     format!("resolving {pkg:?}'s transitive third-party closure for js_typecheck")
                 })?,
@@ -2813,7 +2813,7 @@ fn path_under_package(package: &str, path: &str) -> bool {
 /// `pkg`'s [`importgraph::ImportGraph`] — built once by
 /// `Provider::import_graph` and shared with `deps_config`/`typecheck_config`
 /// rather than rebuilt here; see that method's doc for why.
-/// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`goos`/`goarch` mirror
+/// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`os`/`arch` mirror
 /// `typecheck_deps_config`'s identically-named parameters.
 ///
 /// **Known scope trim, disclosed rather than silent — and a real gap, not
@@ -2849,8 +2849,8 @@ fn test_deps_config(
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
-    goos: &str,
-    goarch: &str,
+    os: &str,
+    arch: &str,
     testrunner: &str,
     runner_config_candidates: &[&str],
 ) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
@@ -3026,8 +3026,8 @@ fn test_deps_config(
             lockfile,
             resolved_graph,
             member_addrs_by_name,
-            goos,
-            goarch,
+            os,
+            arch,
         )? {
             EdgeClassification::ThirdParty(resolved) => {
                 if let Some((_, addr)) = resolved {
@@ -3057,8 +3057,8 @@ fn test_deps_config(
             lockfile,
             resolved_graph,
             member_addrs_by_name,
-            goos,
-            goarch,
+            os,
+            arch,
         )
         .with_context(|| {
             format!(
@@ -3078,7 +3078,7 @@ fn test_deps_config(
     // doc.
     if let (Some(lf), Some(rg)) = (lockfile, resolved_graph) {
         external_addrs.extend(
-            deps::resolve_transitive_closure(pkg, lockfile_pkg, &manifest, lf, rg, goos, goarch)
+            deps::resolve_transitive_closure(pkg, lockfile_pkg, &manifest, lf, rg, os, arch)
                 .with_context(|| {
                     format!("resolving {pkg:?}'s transitive third-party closure for js_test")
                 })?,
@@ -3190,7 +3190,7 @@ struct LintDepsConfig {
 /// workspace may contain more than one independent npm/pnpm project (see
 /// `Provider::lockfile_relative_pkg`'s doc) — and is what every
 /// `Lockfile`-touching call below actually needs.
-/// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`goos`/`goarch` mirror
+/// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`os`/`arch` mirror
 /// `typecheck_deps_config`'s identically-named parameters (only consulted
 /// for eslint's `extends`/`plugins` package resolution).
 ///
@@ -3225,8 +3225,8 @@ fn lint_deps_config(
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
-    goos: &str,
-    goarch: &str,
+    os: &str,
+    arch: &str,
 ) -> anyhow::Result<LintDepsConfig> {
     let pkg_dir = if pkg.is_empty() {
         workspace_root.to_path_buf()
@@ -3437,8 +3437,8 @@ fn lint_deps_config(
                     lockfile,
                     resolved_graph,
                     member_addrs_by_name,
-                    goos,
-                    goarch,
+                    os,
+                    arch,
                 )
                 .with_context(|| format!("resolving eslint config package `{name}` for js_lint"))?
                 {
@@ -3906,7 +3906,7 @@ impl ProviderTrait for Provider {
                 let Some(relocation) = thirdparty::parse_node_modules_addr(&req.addr) else {
                     return Err(GetError::Other(anyhow::anyhow!(
                         "malformed js node_modules-relocation addr {}: missing a required arg \
-                         (expected pkg/local/name/version/goos/goarch)",
+                         (expected pkg/local/name/version/os/arch)",
                         req.addr.format()
                     )));
                 };
@@ -4941,8 +4941,8 @@ mod tests {
             source_addr: thirdparty::thirdparty_addr(
                 "lodash",
                 "4.17.21",
-                &platform::current_goos(),
-                &platform::current_goarch(),
+                &platform::current_os(),
+                &platform::current_arch(),
             ),
             filters: vec![],
             annotations: Default::default(),
@@ -5072,8 +5072,8 @@ mod tests {
             source_addr: thirdparty::thirdparty_addr(
                 "lodash",
                 "4.17.21",
-                &platform::current_goos(),
-                &platform::current_goarch(),
+                &platform::current_os(),
+                &platform::current_arch(),
             ),
             filters: vec![],
             annotations: Default::default(),
@@ -5371,8 +5371,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "lodash",
             "4.17.21",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let result = provider
             .get(
@@ -5456,8 +5456,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "yup",
             "1.7.1",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let resp = provider
             .get(
@@ -5520,8 +5520,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "ts-log",
             "2.2.5",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let resp = provider
             .get(
@@ -5602,8 +5602,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "yup",
             "1.7.1",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let result = provider
             .get(
@@ -5685,8 +5685,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "typed-array-buffer",
             "1.0.3",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let resp = provider
             .get(
@@ -5770,8 +5770,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "lodash",
             "4.17.21",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let result = provider
             .get(
@@ -5853,8 +5853,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "lodash",
             "4.17.21",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let result = provider
             .get(
@@ -5940,8 +5940,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "lodash",
             "4.17.21",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let resp = provider
             .get(
@@ -6063,8 +6063,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "native-thing",
             "1.0.0",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let resp = provider
             .get(
@@ -6141,8 +6141,8 @@ mod tests {
         let addr = thirdparty::thirdparty_addr(
             "native-thing",
             "1.0.0",
-            &platform::current_goos(),
-            &platform::current_goarch(),
+            &platform::current_os(),
+            &platform::current_arch(),
         );
         let resp = provider
             .get(
