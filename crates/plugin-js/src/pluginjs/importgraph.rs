@@ -630,8 +630,27 @@ const RUNNER_CONFIG_FILE_KEYS: &[&str] = &[
     "globalTeardown",
 ];
 
+/// Plugin-option keys whose value is an *explicit override path* to a
+/// plugin's own config file, passed at the plugin's own call site inside the
+/// runner config (`lingui({ configPath: './config.lingui.ts' })`) — not a
+/// module specifier (no `./` prefix required to be a real reference, unlike
+/// [`RUNNER_CONFIG_FILE_KEYS`]'s values), a plain filesystem path the plugin
+/// resolves itself. Confirmed live: `@lingui/vite-plugin` forwards its own
+/// options straight to `@lingui/conf`'s `getConfig({ configPath, ... })`,
+/// which uses `configPath` verbatim (`configExists(configPath) ? load
+/// (configPath) : search(...)`) when given, skipping its own default
+/// filename search entirely — so a project using a non-default config
+/// filename (confirmed live: `config.lingui.ts`, not lingui's own default
+/// `lingui.config.ts`) is invisible to both the config's own text-import
+/// scan *and* [`KNOWN_PLUGIN_AMBIENT_CONFIG_FILES`]'s filename guesses,
+/// unless this specific option is read.
+const PLUGIN_CONFIG_PATH_KEYS: &[&str] = &["configPath"];
+
 /// Statically extract every string-literal value named by
-/// [`RUNNER_CONFIG_FILE_KEYS`] anywhere in `content` — a single string
+/// [`RUNNER_CONFIG_FILE_KEYS`] (into `.paths`) or [`PLUGIN_CONFIG_PATH_KEYS`]
+/// (into `.plugin_config_paths` — see
+/// [`RunnerConfigRefVisitor::plugin_config_paths`]'s doc for why these need
+/// separate resolution semantics) anywhere in `content` — a single string
 /// (`setupFiles: './setup.ts'`) or an array of strings (`setupFiles:
 /// ['./setup.ts']`). Deliberately not scoped to "the exported config
 /// object" specifically: this crate doesn't evaluate JS, so rather than
@@ -643,38 +662,42 @@ const RUNNER_CONFIG_FILE_KEYS: &[&str] = &[
 /// the asymmetry is deliberate.
 ///
 /// A config file that fails to parse (invalid syntax, or an extension this
-/// parser doesn't recognize) yields an empty list rather than an error — the
-/// leaf config's own raw bytes are already declared/hashed regardless of
+/// parser doesn't recognize) yields an empty result rather than an error —
+/// the leaf config's own raw bytes are already declared/hashed regardless of
 /// this scan's success (`test_deps_config`), so a parse failure here only
 /// means the extra references go undetected, not that the whole `js_test`
 /// target becomes unbuildable.
-fn extract_runner_config_referenced_paths(path: &Path, content: &str) -> Vec<String> {
+fn extract_runner_config_refs(path: &Path, content: &str) -> RunnerConfigRefVisitor {
     let Ok(source_type) = SourceType::from_path(path) else {
-        return Vec::new();
+        return RunnerConfigRefVisitor::default();
     };
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, content, source_type).parse();
     if ret.panicked {
-        return Vec::new();
+        return RunnerConfigRefVisitor::default();
     }
     let mut visitor = RunnerConfigRefVisitor::default();
     visitor.visit_program(&ret.program);
-    visitor.paths
+    visitor
 }
 
 #[derive(Default)]
 struct RunnerConfigRefVisitor {
     paths: Vec<String>,
+    /// [`PLUGIN_CONFIG_PATH_KEYS`] values — plain filesystem paths (no `./`
+    /// prefix required), resolved differently from `paths` by
+    /// [`resolve_runner_config_referenced_files`] for exactly that reason.
+    plugin_config_paths: Vec<String>,
 }
 
 impl RunnerConfigRefVisitor {
-    fn push_value(&mut self, value: &Expression<'_>) {
+    fn push_value(target: &mut Vec<String>, value: &Expression<'_>) {
         match value {
-            Expression::StringLiteral(s) => self.paths.push(s.value.as_str().to_string()),
+            Expression::StringLiteral(s) => target.push(s.value.as_str().to_string()),
             Expression::ArrayExpression(arr) => {
                 for el in &arr.elements {
                     if let ArrayExpressionElement::StringLiteral(s) = el {
-                        self.paths.push(s.value.as_str().to_string());
+                        target.push(s.value.as_str().to_string());
                     }
                 }
             }
@@ -691,7 +714,10 @@ impl<'a> Visit<'a> for RunnerConfigRefVisitor {
             _ => None,
         };
         if key_name.is_some_and(|name| RUNNER_CONFIG_FILE_KEYS.contains(&name)) {
-            self.push_value(&it.value);
+            Self::push_value(&mut self.paths, &it.value);
+        }
+        if key_name.is_some_and(|name| PLUGIN_CONFIG_PATH_KEYS.contains(&name)) {
+            Self::push_value(&mut self.plugin_config_paths, &it.value);
         }
         walk::walk_object_property(self, it);
     }
@@ -859,9 +885,21 @@ pub fn resolve_runner_config_referenced_files(
         }
         let dir = path.parent().unwrap_or(Path::new(""));
 
-        for raw in extract_runner_config_referenced_paths(&path, &content) {
-            if let Some(resolved) = resolve_config_value_path(dir, &raw) {
+        let refs = extract_runner_config_refs(&path, &content);
+        for raw in &refs.paths {
+            if let Some(resolved) = resolve_config_value_path(dir, raw) {
                 enqueue_referenced_config_file(resolved, depth, &mut seen, &mut found, &mut queue);
+            }
+        }
+        // A plugin's own explicit `configPath` option (see
+        // `PLUGIN_CONFIG_PATH_KEYS`'s doc) is a plain filesystem path, not a
+        // module specifier — resolved directly against `dir`, no `./`
+        // prefix required, and never recursed into (it's a leaf data file
+        // for the plugin to read, not another config that itself imports
+        // more).
+        for raw in &refs.plugin_config_paths {
+            if let Some(resolved) = probe_first_party_path(&dir.join(raw)) {
+                found.insert(resolved);
             }
         }
 
@@ -3107,7 +3145,7 @@ mod tests {
                         globalSetup: './global-setup.ts', \
                         unrelatedKey: './not-collected.ts' \
                         } };\n";
-        let mut found = extract_runner_config_referenced_paths(path, content);
+        let mut found = extract_runner_config_refs(path, content).paths;
         found.sort();
         assert_eq!(
             found,
@@ -3123,7 +3161,7 @@ mod tests {
     #[test]
     fn extract_runner_config_referenced_paths_empty_on_unparseable_content() {
         let path = Path::new("jest.config.js");
-        let found = extract_runner_config_referenced_paths(path, "not valid js {{{");
+        let found = extract_runner_config_refs(path, "not valid js {{{").paths;
         assert!(found.is_empty(), "{found:?}");
     }
 
@@ -3249,6 +3287,33 @@ mod tests {
             .expect("resolve referenced files");
 
         assert!(scan.files.is_empty(), "{:?}", scan.files);
+    }
+
+    /// Confirmed live, the actual real-world failure: a project using a
+    /// non-default config filename (`config.lingui.ts`, not lingui's own
+    /// default `lingui.config.ts`) passes it explicitly via
+    /// `lingui({ configPath: '...' })` — invisible to
+    /// [`KNOWN_PLUGIN_AMBIENT_CONFIG_FILES`]'s filename guesses entirely,
+    /// since the plugin skips its own default search when `configPath` is
+    /// given. This must be read from the plugin's own call-site options.
+    #[test]
+    fn resolve_runner_config_referenced_files_discovers_an_explicit_lingui_config_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = "import { lingui } from '@lingui/vite-plugin';\n\
+             export default { plugins: [lingui({ configPath: './config.lingui.ts' })], test: {} };\n";
+        write(dir.path(), "vitest.config.ts", content);
+        write(dir.path(), "config.lingui.ts", "export default {};\n");
+        let config_path = dir.path().join("vitest.config.ts");
+
+        let scan = resolve_runner_config_referenced_files(&config_path, content)
+            .expect("resolve referenced files");
+
+        assert!(
+            scan.files.contains(&dir.path().join("config.lingui.ts")),
+            "the plugin's own explicit configPath must be discovered even though it doesn't \
+             match any of lingui's default search filenames: {:?}",
+            scan.files
+        );
     }
 
     /// The single most important test in this milestone (per the task): the
