@@ -6,7 +6,7 @@
 //! `@heph/go/thirdparty/<module>@<version>` synthetic-package convention
 //! (see `crates/plugin-go/src/plugingo/thirdparty.rs`).
 //!
-//! The platform is always part of the addr (as `goos`/`goarch` args), unlike
+//! The platform is always part of the addr (as `os`/`arch` args), unlike
 //! Go's per-package variant machinery which only varies when a package
 //! actually needs it — see `ai-docs/js-plugin-plan.md`'s Variants section
 //! ("Cache key MUST include target platform … confirmed, not optional") and
@@ -27,11 +27,11 @@ pub fn thirdparty_pkg(name: &str, version: &str) -> PkgBuf {
 }
 
 /// The full `js_install` target address for a resolved third-party
-/// dependency, pinned to `goos`/`goarch`.
-pub fn thirdparty_addr(name: &str, version: &str, goos: &str, goarch: &str) -> Addr {
+/// dependency, pinned to `os`/`arch`.
+pub fn thirdparty_addr(name: &str, version: &str, os: &str, arch: &str) -> Addr {
     let mut args = BTreeMap::new();
-    args.insert("goos".to_string(), goos.to_string());
-    args.insert("goarch".to_string(), goarch.to_string());
+    args.insert("os".to_string(), os.to_string());
+    args.insert("arch".to_string(), arch.to_string());
     Addr::new(
         thirdparty_pkg(name, version),
         INSTALL_TARGET.to_string(),
@@ -78,7 +78,7 @@ pub const NODE_MODULES_TARGET: &str = "group";
 /// (e.g. a real package nested at `apps/@special` breaks the split
 /// silently, wiring the wrong dependency with no parse error at all). Args
 /// have no such ambiguity: each is delimited exactly by `parse_addr`'s own
-/// grammar (mirrors this module's existing `goos`/`goarch` args on
+/// grammar (mirrors this module's existing `os`/`arch` args on
 /// [`thirdparty_addr`]).
 ///
 /// **`local_name` and `resolved_name` are deliberately two different
@@ -98,8 +98,8 @@ pub fn node_modules_addr(
     local_name: &str,
     resolved_name: &str,
     version: &str,
-    goos: &str,
-    goarch: &str,
+    os: &str,
+    arch: &str,
 ) -> Addr {
     let mut args = BTreeMap::new();
     // `pkg` is `""` for the workspace-root consuming package — a plain
@@ -110,8 +110,8 @@ pub fn node_modules_addr(
     args.insert("local".to_string(), local_name.to_string());
     args.insert("name".to_string(), resolved_name.to_string());
     args.insert("version".to_string(), version.to_string());
-    args.insert("goos".to_string(), goos.to_string());
-    args.insert("goarch".to_string(), goarch.to_string());
+    args.insert("os".to_string(), os.to_string());
+    args.insert("arch".to_string(), arch.to_string());
     Addr::new(
         PkgBuf::from(NODE_MODULES_PKG),
         NODE_MODULES_TARGET.to_string(),
@@ -127,8 +127,8 @@ pub struct NodeModulesRelocation {
     pub local_name: String,
     pub resolved_name: String,
     pub version: String,
-    pub goos: String,
-    pub goarch: String,
+    pub os: String,
+    pub arch: String,
 }
 
 /// The inverse of [`node_modules_addr`]. `None` if `addr` isn't under
@@ -144,8 +144,8 @@ pub fn parse_node_modules_addr(addr: &Addr) -> Option<NodeModulesRelocation> {
         local_name: addr.args.get("local")?.clone(),
         resolved_name: addr.args.get("name")?.clone(),
         version: addr.args.get("version")?.clone(),
-        goos: addr.args.get("goos")?.clone(),
-        goarch: addr.args.get("goarch")?.clone(),
+        os: addr.args.get("os")?.clone(),
+        arch: addr.args.get("arch")?.clone(),
     })
 }
 
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn thirdparty_addr_carries_platform_args() {
         let addr = thirdparty_addr("lodash", "4.17.21", "linux", "amd64");
-        assert_eq!(addr.args.get("goos").map(String::as_str), Some("linux"));
-        assert_eq!(addr.args.get("goarch").map(String::as_str), Some("amd64"));
+        assert_eq!(addr.args.get("os").map(String::as_str), Some("linux"));
+        assert_eq!(addr.args.get("arch").map(String::as_str), Some("amd64"));
     }
 }

@@ -147,11 +147,11 @@
 //!
 //! **Native/optional-dependency platform axis**: not hashed directly on this
 //! `Def` — a third-party dependency resolved through
-//! `deps::resolve_one_dependency` already carries `goos`/`goarch` in its own
+//! `deps::resolve_one_dependency` already carries `os`/`arch` in its own
 //! `js_install` addr args (see `thirdparty.rs`), so a platform-restricted
 //! third-party dependency naturally produces a different declared `Input`
 //! addr, and therefore a different `js_bundle` hash, per platform — mirrors
-//! `js_typecheck`/`js_test`'s identical choice not to hash `goos`/`goarch`
+//! `js_typecheck`/`js_test`'s identical choice not to hash `os`/`arch`
 //! a second time on top of that.
 //!
 //! **Known scope trims, disclosed rather than silent (hermeticity M6
@@ -926,7 +926,7 @@ mod tests {
         let req = make_parse_request_with_deps(vec![
             (
                 "external",
-                vec!["//@heph/js/thirdparty/lodash@4.17.21:js_install@goos=linux,goarch=amd64"],
+                vec!["//@heph/js/thirdparty/lodash@4.17.21:js_install@os=linux,arch=amd64"],
             ),
             ("", vec!["//@heph/fs:file@f=packages/a/src/index.ts"]),
             (
