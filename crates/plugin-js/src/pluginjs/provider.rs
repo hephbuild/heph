@@ -1331,6 +1331,30 @@ impl Provider {
             resolved.cpu
         );
 
+        // `js_install` fetches the tarball and verifies it against this
+        // integrity hash — with none recorded, there is nothing safe to
+        // verify against, so this must fail here with a clear cause rather
+        // than surface as a cryptic "no recognized integrity algorithm in
+        // \"\"" once `js_install` actually tries to parse the empty string.
+        // An empty `integrity` this deep (after `find_resolved_graph_for`
+        // already searched every lockfile discovered in the workspace for a
+        // populated entry) means the *lockfile itself* never recorded one
+        // for this package anywhere — a real, observed npm shape, not a
+        // heph bug: `npm install` (unlike `npm ci`) can satisfy a package
+        // from its local cache and strip `resolved`/`integrity` from an
+        // existing lockfile entry instead of re-populating them (a
+        // long-standing npm CLI bug — npm/cli#4263, #4460, #6301).
+        anyhow::ensure!(
+            !resolved.integrity.is_empty(),
+            "js provider: {name}@{version}'s {} entry has no integrity/resolved recorded, so \
+             there is nothing to verify its download against — this is not a heph bug; it's a \
+             known npm behavior (npm/cli#4263) where `npm install` can strip these fields when \
+             a package is satisfied from npm's local cache instead of the registry. Regenerate \
+             the lockfile to fix it: `npm install {name}@{version}` (repopulates just this \
+             package), or delete node_modules and the lockfile and reinstall from scratch",
+            Lockfile::filename(self.pkgmanager),
+        );
+
         let resolved_url = resolved
             .resolved
             .clone()
@@ -5466,6 +5490,70 @@ mod tests {
             "must use the root with real content, not the empty-integrity one: {:?}",
             resp.target_spec.config
         );
+    }
+
+    /// The other half of the empty-integrity shape: when *no* discovered
+    /// lockfile root has real integrity for this package — a genuinely
+    /// single-project package whose own lockfile never recorded one (a
+    /// real, live npm bug: `npm install`, unlike `npm ci`, can strip
+    /// `resolved`/`integrity` from an existing entry when it's satisfied
+    /// from npm's local cache — npm/cli#4263/#4460/#6301) — there is no
+    /// "real" entry anywhere to fall back to. Must fail with a clear,
+    /// actionable cause naming the npm bug and how to fix it, not the raw
+    /// `no recognized integrity algorithm in ""` `js_install` produces
+    /// once it tries to parse the empty string itself.
+    #[tokio::test]
+    async fn npm_e2e_package_with_no_integrity_anywhere_fails_with_actionable_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "mgmt/backoffice/package.json",
+            r#"{"name": "backoffice", "devDependencies": {"ts-log": "^2.2.3"}}"#,
+        );
+        write(
+            dir.path(),
+            "mgmt/backoffice/package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "backoffice" },
+                    "node_modules/ts-log": {
+                        "version": "2.2.5",
+                        "dev": true,
+                        "license": "MIT"
+                    }
+                }
+            }"#,
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "ts-log",
+            "2.2.5",
+            &platform::current_goos(),
+            &platform::current_goarch(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        let msg = match result {
+            Err(GetError::Other(e)) => format!("{e:#}"),
+            Err(GetError::NotFound) => panic!("expected an actionable error, got NotFound"),
+            Ok(_) => panic!("no integrity anywhere to verify against must be an error, got Ok"),
+        };
+        assert!(msg.contains("ts-log@2.2.5"), "{msg}");
+        assert!(msg.contains("npm/cli#4263"), "{msg}");
+        assert!(msg.contains("npm install ts-log@2.2.5"), "{msg}");
     }
 
     /// A hermeticity review caught a more insidious version of the bug the
