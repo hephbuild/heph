@@ -98,21 +98,20 @@ pub struct ResolvedGraph {
 }
 
 /// One package [`ResolvedGraph::transitive_reachable`] says must be
-/// materialized. `nested_under: None` is the ordinary, overwhelmingly common
-/// case — placed flat, directly in the consuming package's own
-/// `node_modules/<name>`, exactly as before this type existed.
-/// `nested_under: Some(parent_name)` is a depth-1 diamond-dependency
-/// override: `parent_name` names the *flat* package this entry must be
-/// nested inside (`node_modules/<parent_name>/node_modules/<name>`) because
-/// `parent_name`'s own dependency on this name resolves to a different
-/// version than what wins flat elsewhere in the same closure — see
-/// `transitive_reachable`'s doc for the full mechanism and why nesting never
-/// goes deeper than one level.
+/// materialized. `nested_under: []` (empty) is the ordinary, overwhelmingly
+/// common case — placed flat, directly in the consuming package's own
+/// `node_modules/<name>`, exactly as before this type existed. A non-empty
+/// chain is a diamond-dependency override: each element names a package
+/// this entry must be nested one `node_modules/` level deeper inside,
+/// outermost first (`node_modules/<chain[0]>/node_modules/<chain[1]>/…`),
+/// because the innermost chain element's own dependency on this name
+/// resolves to a different version than what wins flat elsewhere in the
+/// same closure — see `transitive_reachable`'s doc for the full mechanism.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TransitiveEntry {
     pub name: String,
     pub version: String,
-    pub nested_under: Option<String>,
+    pub nested_under: Vec<String>,
 }
 
 impl ResolvedGraph {
@@ -144,8 +143,11 @@ impl ResolvedGraph {
     /// the same name to *different* versions for different consumers — npm's
     /// own nested-`node_modules` overrides exist exactly for this (confirmed
     /// live: `estree-walker` resolved to v2.0.2 for most consumers but
-    /// v3.0.3 for `@module-federation/vite`/`@vitest/mocker` specifically).
-    /// Each `ResolvedPackage`'s own `dependencies`/`optional_dependencies`
+    /// v3.0.3 for `@module-federation/vite`/`@vitest/mocker` specifically;
+    /// also confirmed live at depth 2: `@netskope-ui/core`, itself an
+    /// override, has its own dependency on `@floating-ui/react` that
+    /// diverges *again* from that name's own flat default). Each
+    /// `ResolvedPackage`'s own `dependencies`/`optional_dependencies`
     /// already correctly captures this — [`resolve_npm_edges`] resolves each
     /// node's own edges via *that node's own* ancestor-`node_modules` walk,
     /// so two different nodes' own edges for the same declared name can
@@ -158,34 +160,32 @@ impl ResolvedGraph {
     ///    produces the *default* placement for every reachable name and is
     ///    unconditionally correct for the overwhelming majority of names,
     ///    which never conflict.
-    /// 2. **Override pass**: for every reachable node's own edges, compare
-    ///    against the flat pass's choice for that name. Agreement means
-    ///    nothing extra is needed — Node's own ancestor `node_modules` walk
-    ///    from inside that node's own placement naturally continues up to
-    ///    the flat placement. A genuine divergence means this edge's target
-    ///    must be nested one level inside the *visiting* node's own
-    ///    directory — but only when the visiting node is itself a flat
-    ///    (depth-0) placement. If the visiting node is *itself* already a
-    ///    depth-1 override (i.e. it needed nesting to resolve this same
-    ///    conflict one level up), a further divergence on one of *its* own
-    ///    edges would require depth-2 nesting, which this mechanism does not
-    ///    support — that case is a hard, named error rather than a silent
-    ///    mis-placement (a `node_modules` entry that looks resolved but
-    ///    holds the wrong version for one specific occurrence is strictly
-    ///    worse than refusing to build at all). An edge whose target graph
-    ///    key has no entry in this graph at all (an `npm:`-aliased
-    ///    dependency's declaring key diverging from the resolved package's
-    ///    own real name — see [`resolve_npm_edges`]'s "a miss here is not an
-    ///    error at this layer" doc) is skipped here the same way, never a
-    ///    panic: this walk can only materialize a package that's actually in
-    ///    `self.packages`.
-    ///
-    /// This intentionally does *not* attempt to represent a node needing
-    /// different subtrees under different override placements simultaneously
-    /// (deeper cascading conflicts) — confirmed real-world diamond conflicts
-    /// in JS ecosystems are overwhelmingly one level deep (an npm override
-    /// pins one specific package for one specific dependent), matching
-    /// npm/pnpm's own hoisting outcome in practice.
+    /// 2. **Override pass**: starting from every flat (depth-0) node, walk
+    ///    its own edges and compare each against the flat pass's choice for
+    ///    that name. Agreement means nothing extra is needed — Node's own
+    ///    ancestor `node_modules` walk from inside that node's own placement
+    ///    naturally continues up to the flat placement (this is checked only
+    ///    against the *flat* default, not against every intermediate
+    ///    ancestor's own overrides — correct for the overwhelming majority
+    ///    of chains, where each level's divergence is from the ordinary flat
+    ///    default rather than from another override two-or-more levels up).
+    ///    A genuine divergence means this edge's target must be nested one
+    ///    level inside the *visiting* node's own placement, and its own
+    ///    edges are then walked the same way — so a chain of any length is
+    ///    supported, not just one level. A node reached as a divergent
+    ///    target from more than one distinct placement gets its own
+    ///    independently-computed subtree at *each* placement (never
+    ///    deduplicated across placements — two different overriding parents
+    ///    can need genuinely different nested contents below them). Cycles
+    ///    in the "who overrides whom" relation, and any other pathological
+    ///    input, are bounded by [`MAX_NESTED_DEPTH`] — exceeding it is a
+    ///    loud, named error rather than an infinite walk or a silent
+    ///    mis-placement. An edge whose target graph key has no entry in this
+    ///    graph at all (an `npm:`-aliased dependency's declaring key
+    ///    diverging from the resolved package's own real name — see
+    ///    [`resolve_npm_edges`]'s "a miss here is not an error at this
+    ///    layer" doc) is skipped, never a panic: this walk can only
+    ///    materialize a package that's actually in `self.packages`.
     pub fn transitive_reachable(
         &self,
         seed_keys: impl IntoIterator<Item = String>,
@@ -202,13 +202,11 @@ impl ResolvedGraph {
                 queue.push_back(key);
             }
         }
-        let mut reachable: Vec<String> = Vec::new();
         while let Some(key) = queue.pop_front() {
             let Some(pkg) = self.packages.get(&key) else {
                 continue;
             };
             flat.entry(pkg.name.clone()).or_insert_with(|| key.clone());
-            reachable.push(key.clone());
             for dep_key in pkg.dependencies.values() {
                 if seen_keys.insert(dep_key.clone()) {
                     queue.push_back(dep_key.clone());
@@ -226,19 +224,40 @@ impl ResolvedGraph {
             }
         }
 
-        // Pass 2: per-edge divergence detection against the flat map — see
-        // this function's doc. `reachable` is itself in deterministic BFS
-        // order (deterministic seeds + BTreeMap-ordered edges throughout
-        // pass 1), so which conflict a depth-2+ hard error names is
-        // reproducible across hosts/runs, not merely the *existence* of the
-        // error.
-        let mut overrides: BTreeSet<(String, String, String)> = BTreeSet::new();
-        for key in &reachable {
+        let mut entries: BTreeSet<TransitiveEntry> = BTreeSet::new();
+        for (name, key) in &flat {
             let pkg = self
                 .packages
                 .get(key)
-                .expect("every key in `reachable` was looked up from `self.packages` in pass 1");
-            let is_flat = flat.get(&pkg.name).map(String::as_str) == Some(key.as_str());
+                .expect("every value in `flat` was looked up from `self.packages` in pass 1");
+            entries.insert(TransitiveEntry {
+                name: name.clone(),
+                version: pkg.version.clone(),
+                nested_under: Vec::new(),
+            });
+        }
+
+        // Pass 2: per-edge divergence detection against the flat map,
+        // recursed to whatever depth the graph actually needs — see this
+        // function's doc. Work items are (graph_key, placement path) pairs,
+        // not bare graph keys: a node reached as a divergent target from
+        // more than one distinct placement needs its own independently
+        // re-walked subtree at each one (a naive single-visit-per-node walk
+        // would silently drop every occurrence but the first). `visited`
+        // dedupes on the exact (key, path) pair, which — combined with the
+        // `MAX_NESTED_DEPTH` cap below — bounds the walk even for a cyclic
+        // "who overrides whom" relation.
+        let mut work: VecDeque<(String, Vec<String>)> =
+            flat.values().map(|key| (key.clone(), Vec::new())).collect();
+        let mut visited: HashSet<(String, Vec<String>)> = HashSet::new();
+        while let Some((key, path)) = work.pop_front() {
+            if !visited.insert((key.clone(), path.clone())) {
+                continue;
+            }
+            let pkg = self
+                .packages
+                .get(&key)
+                .expect("every key ever pushed onto `work` was confirmed present below");
             let edges = pkg
                 .dependencies
                 .iter()
@@ -256,9 +275,9 @@ impl ResolvedGraph {
                 // skip it the same way pass 1 already tolerates an
                 // unresolvable edge, rather than comparing/recording
                 // something `self.packages.get` can never find later.
-                if !self.packages.contains_key(child_key) {
+                let Some(child_pkg) = self.packages.get(child_key) else {
                     continue;
-                }
+                };
                 let Some(flat_key) = flat.get(child_name) else {
                     // No node anywhere in the closure resolved this name at
                     // all (an entirely-unresolvable edge — `resolve_npm_edges`
@@ -269,52 +288,34 @@ impl ResolvedGraph {
                 if child_key == flat_key {
                     continue;
                 }
-                let own_flat_key = flat
-                    .get(&pkg.name)
-                    .expect("pass 1 inserts a flat entry for every reachable node's own name");
                 anyhow::ensure!(
-                    is_flat,
-                    "js provider: diamond-dependency conflict needs more than one level of \
-                     `node_modules` nesting to resolve, which this milestone's relocation \
-                     doesn't support yet — `{}@{}` is itself only reachable as an override (its \
-                     own name resolves to `{own_flat_key}` by default elsewhere in this \
-                     closure), and its own dependency on `{child_name}` resolves to `{child_key}`, \
-                     which diverges from `{child_name}`'s own default of `{flat_key}`. Regenerate \
-                     the lockfile with a flatter dependency tree, or file this as needing deeper \
-                     nested-`node_modules` support.",
-                    pkg.name,
-                    pkg.version
+                    path.len() < MAX_NESTED_DEPTH,
+                    "js provider: diamond-dependency conflict chain exceeds this milestone's \
+                     {MAX_NESTED_DEPTH}-level nesting limit while resolving `{child_name}` under \
+                     {path:?} — this is almost certainly a cycle in the lockfile's own override \
+                     structure, not a legitimate dependency tree. Regenerate the lockfile."
                 );
-                overrides.insert((pkg.name.clone(), child_name.clone(), child_key.clone()));
+                let mut child_path = path.clone();
+                child_path.push(pkg.name.clone());
+                entries.insert(TransitiveEntry {
+                    name: child_name.clone(),
+                    version: child_pkg.version.clone(),
+                    nested_under: child_path.clone(),
+                });
+                work.push_back((child_key.clone(), child_path));
             }
-        }
-
-        let mut entries: BTreeSet<TransitiveEntry> = BTreeSet::new();
-        for (name, key) in &flat {
-            let pkg = self
-                .packages
-                .get(key)
-                .expect("every value in `flat` was looked up from `self.packages` in pass 1");
-            entries.insert(TransitiveEntry {
-                name: name.clone(),
-                version: pkg.version.clone(),
-                nested_under: None,
-            });
-        }
-        for (parent_name, child_name, child_key) in &overrides {
-            let child_pkg = self.packages.get(child_key).expect(
-                "pass 2 only inserts an override once self.packages.get(child_key) is confirmed \
-                 Some",
-            );
-            entries.insert(TransitiveEntry {
-                name: child_name.clone(),
-                version: child_pkg.version.clone(),
-                nested_under: Some(parent_name.clone()),
-            });
         }
         Ok(entries.into_iter().collect())
     }
 }
+
+/// Safety cap on [`ResolvedGraph::transitive_reachable`]'s override-nesting
+/// depth — real confirmed diamond-dependency chains have been observed up
+/// to depth 2 (`@netskope-ui/core` → `@floating-ui/react`); this is set far
+/// above any legitimate chain, existing only to turn a cyclic or otherwise
+/// pathological "who overrides whom" relation into a loud, named error
+/// instead of unbounded work.
+const MAX_NESTED_DEPTH: usize = 16;
 
 /// Whether two `ResolvedPackage` entries for the same `(name, version)` are
 /// consistent enough to treat as "the same package" — used both across
@@ -445,7 +446,7 @@ pub fn resolve_transitive(
     Ok(resolved_graph
         .transitive_reachable(seed_keys, os, arch)?
         .into_iter()
-        .find(|e| e.nested_under.is_none() && e.name == name)
+        .find(|e| e.nested_under.is_empty() && e.name == name)
         .map(|e| DepResolution::ThirdParty {
             name: e.name,
             version: e.version,
@@ -1707,7 +1708,7 @@ snapshots:
             reachable.contains(&TransitiveEntry {
                 name: "estree-walker".to_string(),
                 version: "2.0.2".to_string(),
-                nested_under: None,
+                nested_under: Vec::new(),
             }),
             "the flat default must stay 2.0.2: {reachable:?}"
         );
@@ -1715,7 +1716,7 @@ snapshots:
             reachable.contains(&TransitiveEntry {
                 name: "estree-walker".to_string(),
                 version: "3.0.3".to_string(),
-                nested_under: Some("@module-federation/vite".to_string()),
+                nested_under: vec!["@module-federation/vite".to_string()],
             }),
             "the override must be nested under @module-federation/vite's own placement: \
              {reachable:?}"
@@ -1785,7 +1786,7 @@ snapshots:
             reachable.contains(&TransitiveEntry {
                 name: "shared".to_string(),
                 version: "2.0.0".to_string(),
-                nested_under: Some("consumer-a".to_string()),
+                nested_under: vec!["consumer-a".to_string()],
             }),
             "{reachable:?}"
         );
@@ -1793,7 +1794,7 @@ snapshots:
             reachable.contains(&TransitiveEntry {
                 name: "shared".to_string(),
                 version: "2.0.0".to_string(),
-                nested_under: Some("consumer-b".to_string()),
+                nested_under: vec!["consumer-b".to_string()],
             }),
             "consumer-b's own identical-version override must not be dropped just because \
              consumer-a's was already recorded: {reachable:?}"
@@ -1852,67 +1853,6 @@ snapshots:
         assert_eq!(first, second);
     }
 
-    /// A conflict that would need a *second* level of nesting (the override
-    /// node's own dependency also diverges from its sibling default) must be
-    /// a loud, named error — never a silent, wrong placement.
-    #[test]
-    fn transitive_reachable_hard_fails_on_a_depth_two_conflict() {
-        let lock = NpmLockfile::parse(
-            r#"{
-                "lockfileVersion": 3,
-                "packages": {
-                    "": { "name": "root" },
-                    "node_modules/other": {
-                        "version": "1.0.0",
-                        "integrity": "sha512-other",
-                        "dependencies": { "estree-walker": "2.0.2", "shared": "1.0.0" }
-                    },
-                    "node_modules/@module-federation/vite": {
-                        "version": "1.0.0",
-                        "integrity": "sha512-mfvite",
-                        "dependencies": { "estree-walker": "3.0.3" }
-                    },
-                    "node_modules/@module-federation/vite/node_modules/estree-walker": {
-                        "version": "3.0.3",
-                        "integrity": "sha512-estree3",
-                        "dependencies": { "shared": "2.0.0" }
-                    },
-                    "node_modules/@module-federation/vite/node_modules/shared": {
-                        "version": "2.0.0",
-                        "integrity": "sha512-shared2"
-                    },
-                    "node_modules/estree-walker": {
-                        "version": "2.0.2",
-                        "integrity": "sha512-estree2"
-                    },
-                    "node_modules/shared": {
-                        "version": "1.0.0",
-                        "integrity": "sha512-shared1"
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-        let graph = lock.resolved_graph().unwrap();
-
-        // `other` seeded first so its edges to the root `estree-walker`/
-        // `shared` establish both flat defaults before
-        // `@module-federation/vite`'s own diverging chain is examined.
-        let err = graph
-            .transitive_reachable(
-                vec![
-                    graph_key("other", "1.0.0"),
-                    graph_key("@module-federation/vite", "1.0.0"),
-                ],
-                "linux",
-                "amd64",
-            )
-            .expect_err("a depth-2 conflict must be a hard error, never a silent mis-placement");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("estree-walker"), "{msg}");
-        assert!(msg.contains("shared"), "{msg}");
-    }
-
     /// An `npm:`-aliased dependency's declaring key can diverge from the
     /// resolved package's real name (`resolve_npm_edges`'s established
     /// "a miss here is not an error at this layer" case), producing an edge
@@ -1966,15 +1906,170 @@ snapshots:
             reachable.contains(&TransitiveEntry {
                 name: "lodash".to_string(),
                 version: "4.17.20".to_string(),
-                nested_under: None,
+                nested_under: Vec::new(),
             }),
             "{reachable:?}"
         );
         assert!(
             !reachable
                 .iter()
-                .any(|e| e.nested_under.as_deref() == Some("foo")),
+                .any(|e| e.nested_under == vec!["foo".to_string()]),
             "foo's own aliased-but-dangling edge must never become an override: {reachable:?}"
         );
+    }
+
+    /// The exact real-world shape reported live: `@netskope-ui/core` is
+    /// itself an override (its own name resolves to a different version by
+    /// default elsewhere in the closure), and `@netskope-ui/core`'s own
+    /// dependency on `@floating-ui/react` *also* diverges from that name's
+    /// flat default — a genuine depth-2 chain. This must resolve, not hard
+    /// fail: the earlier milestone capped nesting at one level and treated
+    /// this as an error, which broke on the first real repo it was tested
+    /// against.
+    #[test]
+    fn transitive_reachable_resolves_a_depth_two_diamond_dependency_chain() {
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/other": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-other",
+                        "dependencies": {
+                            "@netskope-ui/core": "12.2.2",
+                            "@floating-ui/react": "0.27.19"
+                        }
+                    },
+                    "node_modules/@netskope-ui/core": {
+                        "version": "12.2.2",
+                        "integrity": "sha512-core222"
+                    },
+                    "node_modules/@floating-ui/react": {
+                        "version": "0.27.19",
+                        "integrity": "sha512-floating02719"
+                    },
+                    "node_modules/consumer": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-consumer",
+                        "dependencies": { "@netskope-ui/core": "12.2.0" }
+                    },
+                    "node_modules/consumer/node_modules/@netskope-ui/core": {
+                        "version": "12.2.0",
+                        "integrity": "sha512-core220",
+                        "dependencies": { "@floating-ui/react": "0.24.8" }
+                    },
+                    "node_modules/consumer/node_modules/@netskope-ui/core/node_modules/@floating-ui/react": {
+                        "version": "0.24.8",
+                        "integrity": "sha512-floating0248"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+
+        // `other` seeded first so its edges establish both flat defaults
+        // (@netskope-ui/core@12.2.2, @floating-ui/react@0.27.19) before
+        // `consumer`'s own diverging chain is examined.
+        let reachable = graph
+            .transitive_reachable(
+                vec![graph_key("other", "1.0.0"), graph_key("consumer", "1.0.0")],
+                "linux",
+                "amd64",
+            )
+            .expect("a depth-2 chain must resolve, not hard fail");
+
+        assert!(
+            reachable.contains(&TransitiveEntry {
+                name: "@netskope-ui/core".to_string(),
+                version: "12.2.2".to_string(),
+                nested_under: Vec::new(),
+            }),
+            "the flat default must stay 12.2.2: {reachable:?}"
+        );
+        assert!(
+            reachable.contains(&TransitiveEntry {
+                name: "@netskope-ui/core".to_string(),
+                version: "12.2.0".to_string(),
+                nested_under: vec!["consumer".to_string()],
+            }),
+            "the override must be nested under consumer's own placement: {reachable:?}"
+        );
+        assert!(
+            reachable.contains(&TransitiveEntry {
+                name: "@floating-ui/react".to_string(),
+                version: "0.27.19".to_string(),
+                nested_under: Vec::new(),
+            }),
+            "the flat default must stay 0.27.19: {reachable:?}"
+        );
+        assert!(
+            reachable.contains(&TransitiveEntry {
+                name: "@floating-ui/react".to_string(),
+                version: "0.24.8".to_string(),
+                nested_under: vec!["consumer".to_string(), "@netskope-ui/core".to_string()],
+            }),
+            "the depth-2 override must be nested under consumer/node_modules/@netskope-ui/core's \
+             own placement: {reachable:?}"
+        );
+    }
+
+    /// A cyclic "who overrides whom" relation (a pathological, likely
+    /// hand-corrupted lockfile — real npm/pnpm never produce this shape)
+    /// must hit the `MAX_NESTED_DEPTH` safety cap and fail loudly rather
+    /// than loop forever.
+    #[test]
+    fn transitive_reachable_hard_fails_past_the_max_nesting_depth() {
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/other": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-other",
+                        "dependencies": { "a": "1.0.0", "b": "1.0.0" }
+                    },
+                    "node_modules/a": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-a1"
+                    },
+                    "node_modules/b": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-b1"
+                    },
+                    "node_modules/consumer": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-consumer",
+                        "dependencies": { "a": "2.0.0" }
+                    },
+                    "node_modules/consumer/node_modules/a": {
+                        "version": "2.0.0",
+                        "integrity": "sha512-a2",
+                        "dependencies": { "b": "2.0.0" }
+                    },
+                    "node_modules/consumer/node_modules/a/node_modules/b": {
+                        "version": "2.0.0",
+                        "integrity": "sha512-b2",
+                        "dependencies": { "a": "2.0.0" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+
+        let err = graph
+            .transitive_reachable(
+                vec![graph_key("other", "1.0.0"), graph_key("consumer", "1.0.0")],
+                "linux",
+                "amd64",
+            )
+            .expect_err(
+                "a@2.0.0 -> b@2.0.0 -> a@2.0.0 is a genuine cycle in the override relation and \
+                 must hit the depth cap, never loop forever",
+            );
+        assert!(format!("{err:#}").contains("nesting limit"));
     }
 }

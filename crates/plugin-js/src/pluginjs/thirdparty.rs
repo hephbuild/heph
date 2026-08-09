@@ -108,22 +108,23 @@ pub fn node_modules_addr(
         version,
         os,
         arch,
-        None,
+        &[],
     )
 }
 
-/// Like [`node_modules_addr`], but nested one level inside another
-/// `node_modules_addr` relocation's own materialized directory
-/// (`<consuming_pkg>/node_modules/<parent_local_name>/node_modules/<local_name>`)
-/// — used for a depth-1 diamond-dependency override, when `resolved_name`'s
-/// resolution as seen from `parent_local_name`'s own dependencies diverges
+/// Like [`node_modules_addr`], but nested inside one or more other
+/// `node_modules_addr` relocations' own materialized directories —
+/// `<consuming_pkg>/node_modules/<chain[0]>/node_modules/<chain[1]>/.../node_modules/<local_name>`
+/// — used for a diamond-dependency override, when `resolved_name`'s
+/// resolution as seen from `chain`'s own nested dependency chain diverges
 /// from what wins by default elsewhere in the same consuming package's
-/// closure. See `lockfile::TransitiveEntry`'s doc for the full mechanism and
-/// why nesting never goes deeper than one level; `parent_local_name` always
-/// names a *flat* (non-nested) `node_modules_addr` — never another override.
+/// closure. `chain` is never empty (an empty chain is just
+/// [`node_modules_addr`]); each element names a *flat* or previously-nested
+/// `node_modules_addr` this nests one level deeper inside. See
+/// `lockfile::TransitiveEntry`'s doc for the full mechanism.
 pub fn nested_node_modules_addr(
     consuming_pkg: &str,
-    parent_local_name: &str,
+    chain: &[String],
     local_name: &str,
     resolved_name: &str,
     version: &str,
@@ -137,15 +138,23 @@ pub fn nested_node_modules_addr(
         version,
         os,
         arch,
-        Some(parent_local_name),
+        chain,
     )
 }
 
-/// Shared by [`node_modules_addr`]/[`nested_node_modules_addr`] — `nested_under:
-/// None` produces an addr byte-identical to what [`node_modules_addr`]
-/// always has, so the overwhelmingly common flat (no-conflict) case never
-/// changes shape, hashes, or cache key across this addr gaining the nested
-/// case at all.
+/// Shared by [`node_modules_addr`]/[`nested_node_modules_addr`] — an empty
+/// `nested_under` produces an addr byte-identical to what
+/// [`node_modules_addr`] always has, so the overwhelmingly common flat
+/// (no-conflict) case never changes shape, hashes, or cache key across this
+/// addr gaining the nested case at all.
+///
+/// Each chain element gets its own dedicated arg (`n0`, `n1`, …) rather than
+/// being joined into one delimited string — this addr's own doc already
+/// records a prior hermeticity incident from folding a variable part into
+/// one string a scoped package name (embedding its own `/`) could
+/// ambiguously re-split; a separate arg per element has no such ambiguity,
+/// the same reasoning that keeps `pkg`/`local`/`name` as separate args
+/// instead of one joined path.
 fn node_modules_addr_impl(
     consuming_pkg: &str,
     local_name: &str,
@@ -153,7 +162,7 @@ fn node_modules_addr_impl(
     version: &str,
     os: &str,
     arch: &str,
-    nested_under: Option<&str>,
+    nested_under: &[String],
 ) -> Addr {
     let mut args = BTreeMap::new();
     // `pkg` is `""` for the workspace-root consuming package — a plain
@@ -166,8 +175,8 @@ fn node_modules_addr_impl(
     args.insert("version".to_string(), version.to_string());
     args.insert("os".to_string(), os.to_string());
     args.insert("arch".to_string(), arch.to_string());
-    if let Some(parent) = nested_under {
-        args.insert("nested_under".to_string(), parent.to_string());
+    for (i, parent) in nested_under.iter().enumerate() {
+        args.insert(format!("n{i}"), parent.clone());
     }
     Addr::new(
         PkgBuf::from(NODE_MODULES_PKG),
@@ -186,10 +195,10 @@ pub struct NodeModulesRelocation {
     pub version: String,
     pub os: String,
     pub arch: String,
-    /// `Some(parent_local_name)` for a [`nested_node_modules_addr`]
-    /// (depth-1 diamond-dependency override); `None` for an ordinary flat
+    /// Non-empty for a [`nested_node_modules_addr`] (a diamond-dependency
+    /// override, outermost first); empty for an ordinary flat
     /// [`node_modules_addr`].
-    pub nested_under: Option<String>,
+    pub nested_under: Vec<String>,
 }
 
 /// The inverse of [`node_modules_addr`]/[`nested_node_modules_addr`]. `None`
@@ -200,6 +209,13 @@ pub fn parse_node_modules_addr(addr: &Addr) -> Option<NodeModulesRelocation> {
     if addr.package.as_str() != NODE_MODULES_PKG || addr.name != NODE_MODULES_TARGET {
         return None;
     }
+    let mut nested_under = Vec::new();
+    for i in 0.. {
+        let Some(v) = addr.args.get(&format!("n{i}")) else {
+            break;
+        };
+        nested_under.push(v.clone());
+    }
     Some(NodeModulesRelocation {
         consuming_pkg: addr.args.get("pkg")?.clone(),
         local_name: addr.args.get("local")?.clone(),
@@ -207,7 +223,7 @@ pub fn parse_node_modules_addr(addr: &Addr) -> Option<NodeModulesRelocation> {
         version: addr.args.get("version")?.clone(),
         os: addr.args.get("os")?.clone(),
         arch: addr.args.get("arch")?.clone(),
-        nested_under: addr.args.get("nested_under").cloned(),
+        nested_under,
     })
 }
 
@@ -264,25 +280,25 @@ mod tests {
             "amd64",
         );
         assert!(
-            !addr.args.contains_key("nested_under"),
+            !addr.args.contains_key("n0"),
             "the flat (no-conflict) case must never carry this arg at all — its absence is what \
              keeps the flat case's addr, and therefore its cache key, byte-identical to before \
              this arg existed"
         );
     }
 
-    /// Confirmed live: a diamond-dependency override's `parent_local_name`
-    /// is itself a scoped package name (`@module-federation/vite`) — an
+    /// Confirmed live: a diamond-dependency override's chain element is
+    /// itself a scoped package name (`@module-federation/vite`) — an
     /// earlier draft of this addr's own doc records a prior hermeticity
     /// incident from folding a variable part into one delimited string
-    /// where a scoped name could ambiguously re-split. `nested_under` is its
-    /// own dedicated `Addr` arg, not joined with anything, so a scoped
-    /// parent name round-trips with zero ambiguity.
+    /// where a scoped name could ambiguously re-split. Each chain element
+    /// is its own dedicated `Addr` arg (`n0`, `n1`, …), not joined with
+    /// anything, so a scoped parent name round-trips with zero ambiguity.
     #[test]
     fn nested_node_modules_addr_roundtrips_a_scoped_parent_name() {
         let addr = nested_node_modules_addr(
             "packages/a",
-            "@module-federation/vite",
+            &["@module-federation/vite".to_string()],
             "estree-walker",
             "estree-walker",
             "3.0.3",
@@ -295,9 +311,27 @@ mod tests {
         assert_eq!(parsed.resolved_name, "estree-walker");
         assert_eq!(parsed.version, "3.0.3");
         assert_eq!(
-            parsed.nested_under.as_deref(),
-            Some("@module-federation/vite")
+            parsed.nested_under,
+            vec!["@module-federation/vite".to_string()]
         );
+    }
+
+    /// A depth-2+ chain (confirmed live: `@netskope-ui/core`, itself an
+    /// override, has its own dependency on `@floating-ui/react` that
+    /// diverges further) round-trips every element in order.
+    #[test]
+    fn nested_node_modules_addr_roundtrips_a_multi_level_chain() {
+        let addr = nested_node_modules_addr(
+            "mgmt/backoffice",
+            &["@netskope-ui/core".to_string()],
+            "@floating-ui/react",
+            "@floating-ui/react",
+            "0.24.8",
+            "linux",
+            "amd64",
+        );
+        let parsed = parse_node_modules_addr(&addr).expect("parses back");
+        assert_eq!(parsed.nested_under, vec!["@netskope-ui/core".to_string()]);
     }
 
     #[test]
@@ -311,6 +345,6 @@ mod tests {
             "amd64",
         );
         let parsed = parse_node_modules_addr(&addr).expect("parses back");
-        assert_eq!(parsed.nested_under, None);
+        assert!(parsed.nested_under.is_empty());
     }
 }

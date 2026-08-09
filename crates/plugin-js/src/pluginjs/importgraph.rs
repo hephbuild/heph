@@ -321,7 +321,7 @@ pub fn transitive_declared_closure(
             .transitive_reachable(seed_keys, os, arch)
             .with_context(|| format!("widening {pkg:?}'s declared-dependency closure"))?
             .into_iter()
-            .filter(|e| e.nested_under.is_none())
+            .filter(|e| e.nested_under.is_empty())
             .map(|e| e.name),
     );
     Ok(set)

@@ -295,26 +295,29 @@ pub fn resolve_transitive_closure(
         .transitive_reachable(seeds, os, arch)
         .with_context(|| format!("resolving {lockfile_pkg:?}'s transitive third-party closure"))?
         .into_iter()
-        .map(|entry| match &entry.nested_under {
-            None => thirdparty::node_modules_addr(
-                consuming_pkg,
-                &entry.name,
-                &entry.name,
-                &entry.version,
-                os,
-                arch,
-            )
-            .format(),
-            Some(parent) => thirdparty::nested_node_modules_addr(
-                consuming_pkg,
-                parent,
-                &entry.name,
-                &entry.name,
-                &entry.version,
-                os,
-                arch,
-            )
-            .format(),
+        .map(|entry| {
+            if entry.nested_under.is_empty() {
+                thirdparty::node_modules_addr(
+                    consuming_pkg,
+                    &entry.name,
+                    &entry.name,
+                    &entry.version,
+                    os,
+                    arch,
+                )
+                .format()
+            } else {
+                thirdparty::nested_node_modules_addr(
+                    consuming_pkg,
+                    &entry.nested_under,
+                    &entry.name,
+                    &entry.name,
+                    &entry.version,
+                    os,
+                    arch,
+                )
+                .format()
+            }
         })
         .collect())
 }
@@ -611,7 +614,7 @@ snapshots:
         assert!(
             addrs.iter().any(|a| a.contains("name=estree-walker")
                 && a.contains("version=3.0.3")
-                && a.contains("nested_under=@module-federation/vite")),
+                && a.contains("n0=@module-federation/vite")),
             "the override, nested under @module-federation/vite's own placement, must also be \
              wired: {addrs:?}"
         );
