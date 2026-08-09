@@ -293,9 +293,28 @@ pub fn resolve_transitive_closure(
         .with_context(|| format!("seeding transitive third-party closure for {lockfile_pkg:?}"))?;
     Ok(resolved_graph
         .transitive_reachable(seeds, os, arch)
+        .with_context(|| format!("resolving {lockfile_pkg:?}'s transitive third-party closure"))?
         .into_iter()
-        .map(|(name, version)| {
-            thirdparty::node_modules_addr(consuming_pkg, &name, &name, &version, os, arch).format()
+        .map(|entry| match &entry.nested_under {
+            None => thirdparty::node_modules_addr(
+                consuming_pkg,
+                &entry.name,
+                &entry.name,
+                &entry.version,
+                os,
+                arch,
+            )
+            .format(),
+            Some(parent) => thirdparty::nested_node_modules_addr(
+                consuming_pkg,
+                parent,
+                &entry.name,
+                &entry.name,
+                &entry.version,
+                os,
+                arch,
+            )
+            .format(),
         })
         .collect())
 }
@@ -516,6 +535,86 @@ snapshots:
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("unrelated"), "{err:#}");
+    }
+
+    /// Confirmed live: `estree-walker` resolved to v2.0.2 for most consumers
+    /// but v3.0.3 for `@module-federation/vite` specifically, via npm's own
+    /// nested `node_modules` override. `resolve_transitive_closure` must
+    /// produce both: the flat default addr for everyone else, and a nested
+    /// override addr for `@module-federation/vite`'s own placement — never
+    /// just one, which is exactly the failure this closes (a real Node run
+    /// hit `ERR_PACKAGE_PATH_NOT_EXPORTED` because only one version was ever
+    /// materialized before this fix).
+    #[test]
+    fn resolve_transitive_closure_wires_a_diamond_dependency_override() {
+        // `other` declared in `dependencies` (walked before `devDependencies`
+        // by `direct_dep_seed_keys`, regardless of alphabetical name order)
+        // so its edge to the root `estree-walker@2.0.2` establishes the flat
+        // default before `@module-federation/vite`'s own diverging edge is
+        // examined.
+        let manifest = manifest(
+            &[("other", "^1.0.0")],
+            &[("@module-federation/vite", "^1.0.0")],
+            &[],
+        );
+        let lock = Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": {
+                        "name": "a",
+                        "dependencies": { "other": "^1.0.0" },
+                        "devDependencies": { "@module-federation/vite": "^1.0.0" }
+                    },
+                    "node_modules/other": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-other",
+                        "dependencies": { "estree-walker": "2.0.2" }
+                    },
+                    "node_modules/@module-federation/vite": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-mfvite",
+                        "dependencies": { "estree-walker": "3.0.3" }
+                    },
+                    "node_modules/@module-federation/vite/node_modules/estree-walker": {
+                        "version": "3.0.3",
+                        "integrity": "sha512-estree3"
+                    },
+                    "node_modules/estree-walker": {
+                        "version": "2.0.2",
+                        "integrity": "sha512-estree2"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+
+        let addrs = resolve_transitive_closure(
+            "packages/a",
+            "packages/a",
+            &manifest,
+            &lock,
+            &graph,
+            "linux",
+            "amd64",
+        )
+        .unwrap();
+
+        assert!(
+            addrs.iter().any(|a| a.contains("name=estree-walker")
+                && a.contains("version=2.0.2")
+                && !a.contains("nested_under")),
+            "the flat default for everyone else must still be wired: {addrs:?}"
+        );
+        assert!(
+            addrs.iter().any(|a| a.contains("name=estree-walker")
+                && a.contains("version=3.0.3")
+                && a.contains("nested_under=@module-federation/vite")),
+            "the override, nested under @module-federation/vite's own placement, must also be \
+             wired: {addrs:?}"
+        );
     }
 
     #[test]
