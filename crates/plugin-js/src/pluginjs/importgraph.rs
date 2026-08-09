@@ -280,6 +280,20 @@ pub fn declared_closure(manifest: &PackageManifest) -> HashSet<String> {
 /// `lockfile`/`resolved_graph` are `None` for a package with no lockfile
 /// entry yet (nothing installed) — falls back to [`declared_closure`]
 /// unchanged, same as before this widening existed.
+///
+/// Only the *flat* (depth-0) name set from `transitive_reachable` widens
+/// this closure — first-party source is never physically nested inside a
+/// third-party override's own directory, so a name only reachable there
+/// isn't one first-party code could import anyway; see
+/// `lockfile::TransitiveEntry`'s doc. Unlike the seed-computation error just
+/// below (silently treated as "one fewer package widens the closure" —
+/// harmless today per its own comment), a depth-2+ diamond-dependency
+/// conflict `transitive_reachable` itself detects is propagated as a real
+/// error here, never silently absorbed: it's a genuine, actionable problem,
+/// and reporting it as a misleading "phantom dependency" instead — which is
+/// what would happen if this function silently widened less and let
+/// `check_phantom_dependencies` reject the name — would send the user
+/// chasing the wrong error entirely.
 pub fn transitive_declared_closure(
     manifest: &PackageManifest,
     pkg: &str,
@@ -287,10 +301,10 @@ pub fn transitive_declared_closure(
     resolved_graph: Option<&ResolvedGraph>,
     os: &str,
     arch: &str,
-) -> HashSet<String> {
+) -> anyhow::Result<HashSet<String>> {
     let mut set = declared_closure(manifest);
     let (Some(lockfile), Some(resolved_graph)) = (lockfile, resolved_graph) else {
-        return set;
+        return Ok(set);
     };
     // Same seed computation `deps::resolve_one_dependency`'s
     // `lockfile::resolve_transitive` fallback uses, so a package this check
@@ -305,9 +319,12 @@ pub fn transitive_declared_closure(
     set.extend(
         resolved_graph
             .transitive_reachable(seed_keys, os, arch)
-            .into_keys(),
+            .with_context(|| format!("widening {pkg:?}'s declared-dependency closure"))?
+            .into_iter()
+            .filter(|e| e.nested_under.is_none())
+            .map(|e| e.name),
     );
-    set
+    Ok(set)
 }
 
 /// Extract the npm package name a **bare** specifier's own text names, per
@@ -2744,7 +2761,8 @@ mod tests {
             Some(&resolved_graph),
             "linux",
             "amd64",
-        );
+        )
+        .unwrap();
         assert!(
             widened.contains("@eslint/js"),
             "a package reachable through a declared dependency's own lockfile-resolved \
@@ -2766,7 +2784,8 @@ mod tests {
             Some(&resolved_graph),
             "linux",
             "amd64",
-        );
+        )
+        .unwrap();
         assert!(
             !widened.contains("unrelated"),
             "a package with no edge from anything `a` declares is still a genuine phantom \
@@ -2778,7 +2797,8 @@ mod tests {
     fn transitive_declared_closure_falls_back_to_direct_only_without_a_lockfile() {
         let manifest = manifest("a", &[], &["typescript-eslint"]);
         let widened =
-            transitive_declared_closure(&manifest, "packages/a", None, None, "linux", "amd64");
+            transitive_declared_closure(&manifest, "packages/a", None, None, "linux", "amd64")
+                .unwrap();
         assert_eq!(widened, declared_closure(&manifest));
     }
 

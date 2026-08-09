@@ -1099,7 +1099,7 @@ impl Provider {
                 resolved_graph.as_deref(),
                 &os,
                 &arch,
-            );
+            )?;
             importgraph::check_phantom_dependencies(
                 &workspace_root,
                 &pkg_str,
@@ -1573,10 +1573,20 @@ impl Provider {
     ) -> TargetSpec {
         let install_addr =
             thirdparty::thirdparty_addr(&r.resolved_name, &r.version, &r.os, &r.arch);
-        let node_modules_dir = if r.consuming_pkg.is_empty() {
-            format!("node_modules/{}", r.local_name)
+        // A depth-1 diamond-dependency override (`r.nested_under`, see
+        // `lockfile::TransitiveEntry`'s doc) nests one extra
+        // `<parent>/node_modules/` hop inside the consuming package's own
+        // `node_modules` — exactly where npm's own nested override would
+        // put it, and exactly where Node's own ancestor `node_modules` walk
+        // from inside the parent's own placement looks first.
+        let node_modules_root = if r.consuming_pkg.is_empty() {
+            "node_modules".to_string()
         } else {
-            format!("{}/node_modules/{}", r.consuming_pkg, r.local_name)
+            format!("{}/node_modules", r.consuming_pkg)
+        };
+        let node_modules_dir = match &r.nested_under {
+            None => format!("{node_modules_root}/{}", r.local_name),
+            Some(parent) => format!("{node_modules_root}/{parent}/node_modules/{}", r.local_name),
         };
 
         let mut config: HashMap<String, Value> = HashMap::new();
@@ -1916,7 +1926,7 @@ impl Provider {
                             resolved_graph.as_deref(),
                             &os,
                             &arch,
-                        );
+                        )?;
                         importgraph::check_phantom_dependencies(
                             &workspace_root,
                             &cur_pkg,
@@ -2716,7 +2726,7 @@ fn typecheck_deps_config(
         resolved_graph,
         os,
         arch,
-    );
+    )?;
     importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
@@ -3151,7 +3161,7 @@ fn test_deps_config(
         resolved_graph,
         os,
         arch,
-    );
+    )?;
     importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
