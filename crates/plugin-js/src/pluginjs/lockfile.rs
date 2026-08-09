@@ -59,6 +59,19 @@ pub struct ResolvedPackage {
     /// Declared dependency edges: name → the [`graph_key`] of the resolved
     /// package it points to.
     pub dependencies: BTreeMap<String, String>,
+    /// `optionalDependencies` edges — same shape as [`Self::dependencies`],
+    /// but only ever consumed where a miss is expected and tolerated (e.g.
+    /// `Provider::thirdparty_install_spec`'s lifecycle-script sibling
+    /// resolution): a name here that the lockfile never actually resolved
+    /// (the common case — a platform-specific native-binary package for
+    /// every *other* platform) simply doesn't appear as a key, the same way
+    /// `resolve_npm_edges`/`resolved_graph`'s pnpm equivalent already drops
+    /// any edge that doesn't resolve. Kept as a field separate from
+    /// `dependencies` (not merged into it), because the two are consumed
+    /// with opposite failure semantics wherever both matter — see
+    /// `deps::resolve_one_dependency`'s doc for the established required-vs-
+    /// optional asymmetry this mirrors.
+    pub optional_dependencies: BTreeMap<String, String>,
     /// `package.json` `os` restriction (Node `process.platform` values,
     /// e.g. `"darwin"`). Empty = unrestricted.
     pub os: Vec<String>,
@@ -139,7 +152,8 @@ impl ResolvedGraph {
 /// (`driver_install.rs`'s `JsInstallDef`: `name`/`version` are already equal
 /// by construction — both sides were looked up by the same `(name,
 /// version)` — leaving `integrity`, `resolved`, and `has_install_script`) —
-/// nothing else. `os`/`cpu`/`dependencies` are deliberately never compared:
+/// nothing else. `os`/`cpu`/`dependencies`/`optional_dependencies` are
+/// deliberately never compared:
 ///
 /// - `os`/`cpu` gate *whether* an install happens at all
 ///   (`Provider::thirdparty_install_spec`'s `platform::matches_platform`
@@ -148,15 +162,18 @@ impl ResolvedGraph {
 ///   published `package.json` `integrity` itself verifies, they cannot
 ///   differ between two entries that agree on `integrity` without a
 ///   lockfile parser bug, which this check is not the place to catch.
-/// - `dependencies` is pure graph-traversal bookkeeping (which *other*
-///   packages this one's own imports resolve to) — never part of
-///   `JsInstallDef`, and legitimately different between two independently
-///   `npm install`ed lockfiles even for the *exact same* published tarball:
-///   a shared package's own transitive dependency can resolve to a
-///   different patch version depending on what else was installed and
-///   when. Comparing it produced false-positive ambiguity errors across
-///   hundreds of packages in a real workspace — including pairs with
-///   byte-identical `integrity` and `resolved` — before this fix.
+/// - `dependencies`/`optional_dependencies` are pure graph-traversal
+///   bookkeeping (which *other* packages this one's own imports/optional
+///   siblings resolve to) — never part of `JsInstallDef`, and legitimately
+///   different between two independently `npm install`ed lockfiles even for
+///   the *exact same* published tarball: a shared package's own transitive
+///   dependency can resolve to a different patch version depending on what
+///   else was installed and when. Comparing `dependencies` produced
+///   false-positive ambiguity errors across hundreds of packages in a real
+///   workspace — including pairs with byte-identical `integrity` and
+///   `resolved` — before this fix; `optional_dependencies` has the exact
+///   same shape and the exact same divergence property, so it is excluded
+///   for the identical reason, not merely by omission.
 ///
 /// `integrity`/`resolved` each get a narrow, independent exemption: when
 /// either side's `integrity` is empty, that field alone is skipped; when
@@ -340,6 +357,8 @@ struct NpmPackageRaw {
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
     #[serde(default)]
+    optional_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
     os: Vec<String>,
     #[serde(default)]
     cpu: Vec<String>,
@@ -435,6 +454,7 @@ impl NpmLockfile {
                 integrity: entry.integrity.clone().unwrap_or_default(),
                 resolved: entry.resolved.clone(),
                 dependencies: resolve_npm_edges(self, path, &entry.dependencies),
+                optional_dependencies: resolve_npm_edges(self, path, &entry.optional_dependencies),
                 os: entry.os.clone(),
                 cpu: entry.cpu.clone(),
                 has_install_script: entry.has_install_script,
@@ -557,9 +577,12 @@ struct PnpmResolutionRaw {
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PnpmSnapshotRaw {
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    optional_dependencies: BTreeMap<String, String>,
 }
 
 /// Parsed `pnpm-lock.yaml` (modern `importers`/`packages`/`snapshots`
@@ -648,24 +671,34 @@ impl PnpmLockfile {
     }
 
     pub fn resolved_graph(&self) -> anyhow::Result<ResolvedGraph> {
+        // Shared by both `dependencies` and `optional_dependencies` below —
+        // a pnpm snapshot's own edge map (`{dep_name: dep_version}`) resolves
+        // to graph keys identically regardless of which field it came from;
+        // only the *caller* (`resolved_graph` here vs
+        // `Provider::thirdparty_install_spec`, much later) treats a miss
+        // differently.
+        fn resolve_pnpm_edges(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+            declared
+                .iter()
+                .filter_map(|(dep_name, dep_version)| {
+                    let (dep_name2, dep_version2) =
+                        split_pnpm_key(&format!("{dep_name}@{dep_version}"))?;
+                    Some((dep_name.clone(), graph_key(&dep_name2, &dep_version2)))
+                })
+                .collect()
+        }
+
         let mut packages: BTreeMap<String, ResolvedPackage> = BTreeMap::new();
         for (key, meta) in &self.packages {
             let Some((name, version)) = split_pnpm_key(key) else {
                 continue;
             };
-            let dependencies = self
-                .snapshots
-                .get(key)
-                .map(|snap| {
-                    snap.dependencies
-                        .iter()
-                        .filter_map(|(dep_name, dep_version)| {
-                            let (dep_name2, dep_version2) =
-                                split_pnpm_key(&format!("{dep_name}@{dep_version}"))?;
-                            Some((dep_name.clone(), graph_key(&dep_name2, &dep_version2)))
-                        })
-                        .collect()
-                })
+            let snapshot = self.snapshots.get(key);
+            let dependencies = snapshot
+                .map(|snap| resolve_pnpm_edges(&snap.dependencies))
+                .unwrap_or_default();
+            let optional_dependencies = snapshot
+                .map(|snap| resolve_pnpm_edges(&snap.optional_dependencies))
                 .unwrap_or_default();
             let resolved_pkg = ResolvedPackage {
                 name: name.clone(),
@@ -673,6 +706,7 @@ impl PnpmLockfile {
                 integrity: meta.resolution.integrity.clone().unwrap_or_default(),
                 resolved: meta.resolution.tarball.clone(),
                 dependencies,
+                optional_dependencies,
                 os: meta.os.clone(),
                 cpu: meta.cpu.clone(),
                 has_install_script: meta.requires_build,
@@ -761,6 +795,56 @@ mod tests {
         assert_eq!(esbuild.os, vec!["darwin".to_string()]);
         assert_eq!(esbuild.cpu, vec!["arm64".to_string()]);
         assert!(esbuild.has_install_script);
+    }
+
+    #[test]
+    fn npm_resolved_graph_resolves_optional_dependencies_edges_separately_from_dependencies() {
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/esbuild": {
+                        "version": "0.25.12",
+                        "integrity": "sha512-loader",
+                        "dependencies": { "left-pad": "1.0.0" },
+                        "optionalDependencies": { "@esbuild/linux-x64": "0.25.12" }
+                    },
+                    "node_modules/left-pad": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-leftpad"
+                    },
+                    "node_modules/@esbuild/linux-x64": {
+                        "version": "0.25.12",
+                        "integrity": "sha512-native",
+                        "os": ["linux"],
+                        "cpu": ["x64"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+        let esbuild = graph.get("esbuild", "0.25.12").unwrap();
+        assert_eq!(
+            esbuild.dependencies.get("left-pad").map(String::as_str),
+            Some("left-pad@1.0.0"),
+            "required dependencies must still resolve unaffected: {:?}",
+            esbuild.dependencies
+        );
+        assert_eq!(
+            esbuild
+                .optional_dependencies
+                .get("@esbuild/linux-x64")
+                .map(String::as_str),
+            Some("@esbuild/linux-x64@0.25.12"),
+            "optionalDependencies must resolve into their own field: {:?}",
+            esbuild.optional_dependencies
+        );
+        assert!(
+            !esbuild.dependencies.contains_key("@esbuild/linux-x64"),
+            "an optional edge must never leak into the required dependencies map"
+        );
     }
 
     #[test]
@@ -941,6 +1025,60 @@ snapshots:
         assert_eq!(esbuild.os, vec!["darwin".to_string()]);
         assert_eq!(esbuild.cpu, vec!["arm64".to_string()]);
         assert!(esbuild.has_install_script);
+    }
+
+    #[test]
+    fn pnpm_resolved_graph_resolves_optional_dependencies_edges_separately_from_dependencies() {
+        let lock = PnpmLockfile::parse(
+            r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      esbuild:
+        specifier: ^0.25.12
+        version: 0.25.12
+packages:
+  esbuild@0.25.12:
+    resolution: {integrity: sha512-loader}
+  left-pad@1.0.0:
+    resolution: {integrity: sha512-leftpad}
+  '@esbuild/linux-x64@0.25.12':
+    resolution: {integrity: sha512-native}
+    cpu: [x64]
+    os: [linux]
+snapshots:
+  esbuild@0.25.12:
+    dependencies:
+      left-pad: 1.0.0
+    optionalDependencies:
+      '@esbuild/linux-x64': 0.25.12
+  left-pad@1.0.0: {}
+  '@esbuild/linux-x64@0.25.12': {}
+"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+        let esbuild = graph.get("esbuild", "0.25.12").unwrap();
+        assert_eq!(
+            esbuild.dependencies.get("left-pad").map(String::as_str),
+            Some("left-pad@1.0.0"),
+            "required dependencies must still resolve unaffected: {:?}",
+            esbuild.dependencies
+        );
+        assert_eq!(
+            esbuild
+                .optional_dependencies
+                .get("@esbuild/linux-x64")
+                .map(String::as_str),
+            Some("@esbuild/linux-x64@0.25.12"),
+            "optionalDependencies must resolve into their own field: {:?}",
+            esbuild.optional_dependencies
+        );
+        assert!(
+            !esbuild.dependencies.contains_key("@esbuild/linux-x64"),
+            "an optional edge must never leak into the required dependencies map"
+        );
     }
 
     #[test]

@@ -1349,6 +1349,123 @@ impl Provider {
             .unwrap_or_else(|| default_registry_url(name, version));
         let scripts_allowed = self.scripts_allowed_for(name, version);
 
+        // Only resolved when a lifecycle script will actually run — the
+        // overwhelming majority of `js_install` targets have no script at
+        // all, and this must cost them nothing. A package's own postinstall
+        // routinely needs its sibling `dependencies`/`optionalDependencies`
+        // materialized as real `node_modules/<name>` entries next to it
+        // (the flagship shape: a small loader package `require.resolve()`s
+        // a platform-specific `optionalDependencies` sibling for its native
+        // binary — esbuild, sharp, @swc/core, and many more all follow this
+        // exact pattern) — confirmed live, esbuild's own postinstall fails
+        // outright without this. See `thirdparty::node_modules_addr`'s doc:
+        // the *same* relocation mechanism already used for a consumer's own
+        // `node_modules`, reused here with an empty `consuming_pkg` so the
+        // relocated entries land at bare `node_modules/<name>` — the
+        // driver's own sandbox workspace root is already an ancestor of its
+        // package dir, so no separate unpack-root redirection or `cwd`
+        // change is needed for Node's own ancestor `node_modules` walk to
+        // find them (`driver_install.rs`'s `run()` only adds a self-
+        // reference symlink on top of this, for a package that
+        // `require()`s its own name — see that file's doc).
+        let mut deps: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        if resolved.has_install_script && scripts_allowed {
+            // Required: a *platform-mismatched* entry is a real, actionable
+            // problem — never silently drop a sibling this package's own
+            // postinstall may need — mirrors `deps::resolve_one_dependency`'s
+            // established asymmetry between `dependencies` (hard error) and
+            // `optionalDependencies` (silent skip) exactly. An entirely
+            // *unresolvable* required dependency (no lockfile entry
+            // anywhere) can't be distinguished here at all: `resolve_npm_edges`
+            // (which built `resolved.dependencies` from this exact `graph`)
+            // already silently drops any edge it can't resolve — deliberately,
+            // for every consumer of this field, not only this one.
+            //
+            // A graph_key present in `resolved.dependencies` but absent from
+            // this same `graph` is *not* provably impossible, unlike an
+            // earlier draft of this comment claimed: an `npm:`-aliased
+            // dependency (`"foo": "npm:bar@1.2.3"`, `deps.rs`'s own doc
+            // explains why `local`/`resolved` names diverge for these)
+            // computes its edge keyed by the *alias* (`resolve_npm_edges`
+            // keys by the declared name), while `resolved_graph()`'s own
+            // top-level loop keys the same package by its *real* name —
+            // the two can disagree. A hard, diagnosable error here (not a
+            // panic) matches every other lockfile-inconsistency this file
+            // reports (see `entries_agree_where_comparable`'s own "the
+            // lockfile itself is inconsistent" framing) — this specific
+            // shape (an npm-aliased required dependency on a script-bearing
+            // package) just isn't resolvable by this milestone's
+            // edge-tracking yet, which the message says plainly rather
+            // than crashing the whole process over it.
+            for (dep_name, dep_key) in &resolved.dependencies {
+                let dep_pkg = graph.packages.get(dep_key).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "js provider: {name}@{version} declares a required dependency on \
+                         `{dep_name}` ({dep_key}), but that exact package/version has no \
+                         resolved entry in the lockfile — if `{dep_name}` is an npm alias \
+                         (`\"{dep_name}\": \"npm:...\"`), this milestone's sibling-dependency \
+                         resolution for a lifecycle script doesn't yet follow aliases; otherwise \
+                         the lockfile is likely stale — re-run the package manager's install to \
+                         regenerate it"
+                    )
+                })?;
+                anyhow::ensure!(
+                    platform::matches_platform(&dep_pkg.os, &dep_pkg.cpu, &os, &arch),
+                    "js provider: {name}@{version}'s required dependency `{dep_name}` \
+                     ({dep_key}) is restricted to os={:?} cpu={:?}, which does not include the \
+                     requested platform {os}/{arch} — this package's own lifecycle script \
+                     cannot run without it",
+                    dep_pkg.os,
+                    dep_pkg.cpu
+                );
+                deps.push(
+                    thirdparty::node_modules_addr(
+                        "",
+                        dep_name,
+                        &dep_pkg.name,
+                        &dep_pkg.version,
+                        &os,
+                        &arch,
+                    )
+                    .format(),
+                );
+            }
+
+            // Optional: most entries here are for *other* platforms and
+            // never apply — an unresolvable or platform-mismatched one is
+            // expected, silently skipped, and never wired as a dependency
+            // edge (so it can never itself be the cause of a graph cycle or
+            // a hard resolution failure) — but the reason is recorded so a
+            // lifecycle script that *does* fail for lack of it names what
+            // was missing instead of an opaque `Cannot find module`.
+            for (dep_name, dep_key) in &resolved.optional_dependencies {
+                let Some(dep_pkg) = graph.packages.get(dep_key) else {
+                    skipped.push(format!("{dep_name} ({dep_key}: not in the lockfile)"));
+                    continue;
+                };
+                if !platform::matches_platform(&dep_pkg.os, &dep_pkg.cpu, &os, &arch) {
+                    skipped.push(format!(
+                        "{dep_name} ({dep_key}: restricted to os={:?} cpu={:?}, current \
+                         platform is {os}/{arch})",
+                        dep_pkg.os, dep_pkg.cpu
+                    ));
+                    continue;
+                }
+                deps.push(
+                    thirdparty::node_modules_addr(
+                        "",
+                        dep_name,
+                        &dep_pkg.name,
+                        &dep_pkg.version,
+                        &os,
+                        &arch,
+                    )
+                    .format(),
+                );
+            }
+        }
+
         let mut config: HashMap<String, Value> = HashMap::new();
         config.insert("name".to_string(), Value::String(name.to_string()));
         config.insert("version".to_string(), Value::String(version.to_string()));
@@ -1364,6 +1481,14 @@ impl Provider {
             Value::Bool(resolved.has_install_script),
         );
         config.insert("scripts_allowed".to_string(), Value::Bool(scripts_allowed));
+        config.insert(
+            "deps".to_string(),
+            Value::List(deps.into_iter().map(Value::String).collect()),
+        );
+        config.insert(
+            "skipped_deps".to_string(),
+            Value::List(skipped.into_iter().map(Value::String).collect()),
+        );
 
         Ok(TargetSpec {
             addr: addr.clone(),
@@ -5709,6 +5834,81 @@ mod tests {
         );
     }
 
+    /// Same defect class as the `dependencies` test above,
+    /// `optional_dependencies` — added alongside `dependencies` in
+    /// `ResolvedPackage` for lifecycle-script sibling resolution — has the
+    /// exact same divergence property (two independent `npm install`s of
+    /// the identical published tarball can legitimately record different
+    /// resolved optional-dependency versions), so it must be excluded from
+    /// `entries_agree_where_comparable` for the identical reason, not merely
+    /// by omission from the comparison.
+    #[tokio::test]
+    async fn npm_e2e_same_integrity_different_own_optional_dependencies_resolves_without_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (pkg, is_typed_array_version) in
+            [("mgmt/backoffice", "1.1.13"), ("mgmt/frontend", "1.1.14")]
+        {
+            write(
+                dir.path(),
+                &format!("{pkg}/package.json"),
+                &format!(
+                    r#"{{"name": "{pkg}", "dependencies": {{"typed-array-buffer": "^1.0.3"}}}}"#
+                ),
+            );
+            write(
+                dir.path(),
+                &format!("{pkg}/package-lock.json"),
+                &format!(
+                    r#"{{
+                        "lockfileVersion": 3,
+                        "packages": {{
+                            "": {{ "name": "{pkg}" }},
+                            "node_modules/typed-array-buffer": {{
+                                "version": "1.0.3",
+                                "resolved": "https://registry.npmjs.org/typed-array-buffer/-/typed-array-buffer-1.0.3.tgz",
+                                "integrity": "sha512-same",
+                                "optionalDependencies": {{ "is-typed-array": "{is_typed_array_version}" }}
+                            }},
+                            "node_modules/is-typed-array": {{
+                                "version": "{is_typed_array_version}",
+                                "integrity": "sha512-abc"
+                            }}
+                        }}
+                    }}"#
+                ),
+            );
+        }
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "typed-array-buffer",
+            "1.0.3",
+            &platform::current_os(),
+            &platform::current_arch(),
+        );
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect(
+                "must resolve, not error — differing optional_dependencies of the *same* \
+                 byte-identical package is not an ambiguity",
+            );
+        assert_eq!(
+            resp.target_spec.config.get("integrity"),
+            Some(&Value::String("sha512-same".to_string()))
+        );
+    }
+
     /// Same defect class as `npm_e2e_ambiguous_integrity_across_independent_
     /// projects_fails_loudly`, but on `resolved` (the tarball URL) rather
     /// than `integrity`: two projects can validly agree on `integrity`
@@ -6167,6 +6367,533 @@ mod tests {
             )
             .await
             .expect("allow-listed install script must parse successfully");
+    }
+
+    /// A `js_install` target with no lifecycle script at all must never
+    /// resolve sibling dependencies — even when the lockfile records
+    /// `optionalDependencies` for it — the overwhelming common case must
+    /// cost nothing (see `thirdparty_install_spec`'s own doc on this).
+    #[tokio::test]
+    async fn npm_e2e_package_without_lifecycle_script_never_resolves_sibling_deps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/lodash": {
+                        "version": "4.17.21",
+                        "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                        "integrity": "sha512-abc",
+                        "optionalDependencies": { "left-pad": "1.0.0" }
+                    },
+                    "node_modules/left-pad": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-leftpad"
+                    }
+                }
+            }"#,
+        );
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "lodash",
+            "4.17.21",
+            &platform::current_os(),
+            &platform::current_arch(),
+        );
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_install target_spec");
+        assert_eq!(
+            resp.target_spec.config.get("deps"),
+            Some(&Value::List(vec![]))
+        );
+        assert_eq!(
+            resp.target_spec.config.get("skipped_deps"),
+            Some(&Value::List(vec![]))
+        );
+    }
+
+    /// A lifecycle-script package's platform-matching `optionalDependencies`
+    /// sibling must be wired as a relocated `node_modules` dep — the exact
+    /// esbuild/`@esbuild/linux-x64` shape confirmed live.
+    #[tokio::test]
+    async fn npm_e2e_lifecycle_script_package_wires_matching_optional_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/esbuild": {
+                        "version": "0.25.12",
+                        "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.25.12.tgz",
+                        "integrity": "sha512-loader",
+                        "hasInstallScript": true,
+                        "optionalDependencies": { "@esbuild/linux-x64": "0.25.12" }
+                    },
+                    "node_modules/@esbuild/linux-x64": {
+                        "version": "0.25.12",
+                        "resolved": "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.25.12.tgz",
+                        "integrity": "sha512-native",
+                        "os": ["linux"],
+                        "cpu": ["x64"]
+                    }
+                }
+            }"#,
+        );
+        let provider = Provider::with_config(
+            dir.path().to_path_buf(),
+            Config {
+                pkgmanager: PkgManager::Npm,
+                skip: Arc::new(Ignore::default()),
+                walker: Arc::new(CachedWalker::disabled()),
+                allow_scripts: vec!["esbuild".to_string()],
+                tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
+            },
+        );
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr("esbuild", "0.25.12", "linux", "amd64");
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_install target_spec");
+
+        let expected_dep_addr = thirdparty::node_modules_addr(
+            "",
+            "@esbuild/linux-x64",
+            "@esbuild/linux-x64",
+            "0.25.12",
+            "linux",
+            "amd64",
+        )
+        .format();
+        assert_eq!(
+            resp.target_spec.config.get("deps"),
+            Some(&Value::List(vec![Value::String(expected_dep_addr)]))
+        );
+        assert_eq!(
+            resp.target_spec.config.get("skipped_deps"),
+            Some(&Value::List(vec![])),
+            "a matching sibling must not also be recorded as skipped"
+        );
+    }
+
+    /// The other half: a platform-*mismatched* `optionalDependencies`
+    /// sibling must be silently skipped, never wired as a dependency, but
+    /// the reason must still be recorded for later diagnosability — never a
+    /// hard error, since this is the expected, common shape (esbuild
+    /// records a sibling for every platform, only one of which ever
+    /// applies).
+    #[tokio::test]
+    async fn npm_e2e_lifecycle_script_package_skips_platform_mismatched_optional_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/esbuild": {
+                        "version": "0.25.12",
+                        "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.25.12.tgz",
+                        "integrity": "sha512-loader",
+                        "hasInstallScript": true,
+                        "optionalDependencies": { "@esbuild/win32-x64": "0.25.12" }
+                    },
+                    "node_modules/@esbuild/win32-x64": {
+                        "version": "0.25.12",
+                        "integrity": "sha512-native-win",
+                        "os": ["win32"],
+                        "cpu": ["x64"]
+                    }
+                }
+            }"#,
+        );
+        let provider = Provider::with_config(
+            dir.path().to_path_buf(),
+            Config {
+                pkgmanager: PkgManager::Npm,
+                skip: Arc::new(Ignore::default()),
+                walker: Arc::new(CachedWalker::disabled()),
+                allow_scripts: vec!["esbuild".to_string()],
+                tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
+            },
+        );
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr("esbuild", "0.25.12", "linux", "amd64");
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("a platform-mismatched optional sibling must never be a hard error");
+
+        assert_eq!(
+            resp.target_spec.config.get("deps"),
+            Some(&Value::List(vec![])),
+            "a mismatched sibling must never be wired as a dependency"
+        );
+        let Some(Value::List(skipped)) = resp.target_spec.config.get("skipped_deps") else {
+            panic!(
+                "expected skipped_deps to be a List: {:?}",
+                resp.target_spec.config
+            );
+        };
+        assert_eq!(skipped.len(), 1);
+        let Value::String(reason) = &skipped[0] else {
+            panic!("expected a String reason: {skipped:?}");
+        };
+        assert!(reason.contains("@esbuild/win32-x64"), "{reason}");
+    }
+
+    /// A *required* dependency that has no lockfile entry anywhere is
+    /// **not** detectable as a hard error at this layer, and this pins that
+    /// down deliberately rather than leaving it an unstated gap:
+    /// `resolved.dependencies` is built by `resolve_npm_edges`, which
+    /// already silently drops any edge it can't resolve — for *every*
+    /// consumer of that field, not only lifecycle-script sibling
+    /// resolution (a third-party package's own internal `dependencies` can
+    /// legitimately reference git/tarball deps and other shapes this
+    /// milestone's lockfile parsing doesn't resolve). By the time this
+    /// code sees `resolved.dependencies`, an entirely-unresolvable name
+    /// has already vanished — indistinguishable from the package simply
+    /// having no such dependency. Only a *resolved-but-platform-mismatched*
+    /// required dependency (the next test) is actually catchable here.
+    #[tokio::test]
+    async fn npm_e2e_lifecycle_script_required_dependency_missing_from_lockfile_is_silently_absent()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/native-thing": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/native-thing/-/native-thing-1.0.0.tgz",
+                        "integrity": "sha512-xyz",
+                        "hasInstallScript": true,
+                        "dependencies": { "missing-helper": "1.0.0" }
+                    }
+                }
+            }"#,
+        );
+        let provider = Provider::with_config(
+            dir.path().to_path_buf(),
+            Config {
+                pkgmanager: PkgManager::Npm,
+                skip: Arc::new(Ignore::default()),
+                walker: Arc::new(CachedWalker::disabled()),
+                allow_scripts: vec!["native-thing".to_string()],
+                tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
+            },
+        );
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr(
+            "native-thing",
+            "1.0.0",
+            &platform::current_os(),
+            &platform::current_arch(),
+        );
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("must resolve — an entirely-unresolvable required dep can't be caught here");
+        assert_eq!(
+            resp.target_spec.config.get("deps"),
+            Some(&Value::List(vec![])),
+            "the unresolvable dependency was already dropped upstream, before this code ever \
+             sees it"
+        );
+    }
+
+    /// Same required-dependency asymmetry, but for a platform mismatch
+    /// rather than a missing lockfile entry — a required dependency
+    /// restricted away from the current platform is exactly as actionable
+    /// as one that's simply absent.
+    #[tokio::test]
+    async fn npm_e2e_lifecycle_script_package_required_dependency_platform_mismatch_is_a_hard_error()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/native-thing": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/native-thing/-/native-thing-1.0.0.tgz",
+                        "integrity": "sha512-xyz",
+                        "hasInstallScript": true,
+                        "dependencies": { "win-only-helper": "1.0.0" }
+                    },
+                    "node_modules/win-only-helper": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-winhelper",
+                        "os": ["win32"]
+                    }
+                }
+            }"#,
+        );
+        let provider = Provider::with_config(
+            dir.path().to_path_buf(),
+            Config {
+                pkgmanager: PkgManager::Npm,
+                skip: Arc::new(Ignore::default()),
+                walker: Arc::new(CachedWalker::disabled()),
+                allow_scripts: vec!["native-thing".to_string()],
+                tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
+            },
+        );
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr("native-thing", "1.0.0", "linux", "amd64");
+        let err = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .err()
+            .expect(
+                "a required dependency restricted away from the current platform must be a hard \
+                 error",
+            );
+        let msg = match err {
+            GetError::Other(e) => format!("{e:#}"),
+            other => panic!("expected GetError::Other, got {other:?}"),
+        };
+        assert!(msg.contains("win-only-helper"), "{msg}");
+    }
+
+    /// A `code-quality` review caught this live: `resolve_npm_edges`
+    /// (`lockfile.rs`) keys a required-dependency edge by the *declared*
+    /// name, but an `npm:`-aliased entry (`"foo": "npm:bar@1.2.3"`) records
+    /// its *real* name (`bar`) in the lockfile, and `resolved_graph()`'s own
+    /// top-level loop keys `ResolvedGraph::packages` by that real name — the
+    /// two disagree for an alias, so the graph_key `resolved.dependencies`
+    /// computes for `foo` is never actually present in `graph.packages`.
+    /// An earlier draft of this code treated that as an impossible internal
+    /// invariant and `.expect()`-panicked; it must instead be a normal,
+    /// diagnosable `anyhow::Result` error, the same as any other
+    /// lockfile-inconsistency this file reports.
+    #[tokio::test]
+    async fn npm_e2e_lifecycle_script_required_dependency_via_npm_alias_is_a_clean_error_not_a_panic()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/native-thing": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/native-thing/-/native-thing-1.0.0.tgz",
+                        "integrity": "sha512-xyz",
+                        "hasInstallScript": true,
+                        "dependencies": { "foo": "npm:bar@1.2.3" }
+                    },
+                    "node_modules/foo": {
+                        "name": "bar",
+                        "version": "1.2.3",
+                        "resolved": "https://registry.npmjs.org/bar/-/bar-1.2.3.tgz",
+                        "integrity": "sha512-bar"
+                    }
+                }
+            }"#,
+        );
+        let provider = Provider::with_config(
+            dir.path().to_path_buf(),
+            Config {
+                pkgmanager: PkgManager::Npm,
+                skip: Arc::new(Ignore::default()),
+                walker: Arc::new(CachedWalker::disabled()),
+                allow_scripts: vec!["native-thing".to_string()],
+                tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
+            },
+        );
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr("native-thing", "1.0.0", "linux", "amd64");
+        // The point of this test is that `.await` returns an `Err`, not
+        // that the process panics — `tokio::test` would report a panicked
+        // task as a test failure either way, but asserting the specific
+        // `Err` shape is what proves this is `anyhow::Result`'s normal
+        // error path, not a caught panic.
+        let err = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .err()
+            .expect("an npm-aliased required dependency must be a clean error, not a panic");
+        let msg = match err {
+            GetError::Other(e) => format!("{e:#}"),
+            other => panic!("expected GetError::Other, got {other:?}"),
+        };
+        assert!(msg.contains("foo"), "{msg}");
+        assert!(msg.contains("alias"), "{msg}");
+    }
+
+    /// The pnpm-side counterpart to the npm-alias test above, and the
+    /// second reproduction a `code-quality` review found for the same
+    /// underlying bug class: `resolve_pnpm_edges` (`lockfile.rs`) computes
+    /// a snapshot's own dependency edge purely by string-splitting the
+    /// `{name: version}` pair it's given, with no cross-check against
+    /// `packages:` at all — a malformed/stale `pnpm-lock.yaml` (a
+    /// `dependencies:` entry in `snapshots:` with no corresponding
+    /// `packages:` entry) produces a graph_key with nothing behind it. Same
+    /// requirement as the npm case: a clean `anyhow::Result` error, never a
+    /// process panic.
+    #[tokio::test]
+    async fn pnpm_e2e_lifecycle_script_required_dependency_missing_from_packages_is_a_clean_error_not_a_panic()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "pnpm-lock.yaml",
+            r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      native-thing:
+        specifier: ^1.0.0
+        version: 1.0.0
+packages:
+  native-thing@1.0.0:
+    resolution: {integrity: sha512-xyz}
+    requiresBuild: true
+snapshots:
+  native-thing@1.0.0:
+    dependencies:
+      missing-helper: 1.0.0
+"#,
+        );
+        let provider = Provider::with_config(
+            dir.path().to_path_buf(),
+            Config {
+                pkgmanager: PkgManager::Pnpm,
+                skip: Arc::new(Ignore::default()),
+                walker: Arc::new(CachedWalker::disabled()),
+                allow_scripts: vec!["native-thing".to_string()],
+                tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
+            },
+        );
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr("native-thing", "1.0.0", "linux", "amd64");
+        let err = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .err()
+            .expect(
+                "a snapshot dependency edge with no matching packages entry must be a clean \
+                 error, not a panic",
+            );
+        let msg = match err {
+            GetError::Other(e) => format!("{e:#}"),
+            other => panic!("expected GetError::Other, got {other:?}"),
+        };
+        assert!(msg.contains("missing-helper"), "{msg}");
     }
 
     /// An npm workspace where `packages/a` declares a dependency on
