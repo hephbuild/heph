@@ -1573,21 +1573,23 @@ impl Provider {
     ) -> TargetSpec {
         let install_addr =
             thirdparty::thirdparty_addr(&r.resolved_name, &r.version, &r.os, &r.arch);
-        // A depth-1 diamond-dependency override (`r.nested_under`, see
+        // A diamond-dependency override (`r.nested_under`, see
         // `lockfile::TransitiveEntry`'s doc) nests one extra
-        // `<parent>/node_modules/` hop inside the consuming package's own
-        // `node_modules` — exactly where npm's own nested override would
-        // put it, and exactly where Node's own ancestor `node_modules` walk
-        // from inside the parent's own placement looks first.
+        // `<chain-element>/node_modules/` hop per chain element inside the
+        // consuming package's own `node_modules` — exactly where npm's own
+        // nested override would put it, and exactly where Node's own
+        // ancestor `node_modules` walk from inside the innermost chain
+        // element's own placement looks first.
         let node_modules_root = if r.consuming_pkg.is_empty() {
             "node_modules".to_string()
         } else {
             format!("{}/node_modules", r.consuming_pkg)
         };
-        let node_modules_dir = match &r.nested_under {
-            None => format!("{node_modules_root}/{}", r.local_name),
-            Some(parent) => format!("{node_modules_root}/{parent}/node_modules/{}", r.local_name),
-        };
+        let mut node_modules_dir = node_modules_root;
+        for parent in &r.nested_under {
+            node_modules_dir = format!("{node_modules_dir}/{parent}/node_modules");
+        }
+        node_modules_dir = format!("{node_modules_dir}/{}", r.local_name);
 
         let mut config: HashMap<String, Value> = HashMap::new();
         config.insert(
