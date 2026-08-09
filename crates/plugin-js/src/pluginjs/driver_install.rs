@@ -52,6 +52,20 @@
 //! sandboxed action") — that needs a hermetic Node/script-runner sandbox
 //! that does not exist yet. TODO M2+: sandbox this properly; until then it
 //! is flagged loudly (`tracing::warn!`) every time it runs.
+//!
+//! **Empty `integrity` installs unverified, by explicit product decision.**
+//! A real npm `package-lock.json` can have a `packages` entry with no
+//! `integrity`/`resolved` at all — not a heph bug, but a known npm CLI bug
+//! (npm/cli#4263, #4460, #6301): `npm install`, unlike `npm ci`, can satisfy
+//! a package from its local cache and strip these fields from an existing
+//! entry instead of repopulating them. Rather than block every affected
+//! package's install on a lockfile heph didn't write and can't fix, an
+//! empty `integrity` skips `verify_integrity` entirely and extracts
+//! whatever the registry returns — a deliberate hermeticity trade-off (the
+//! cache key still changes if the lockfile is later regenerated with a real
+//! hash, but two unverified fetches of the same URL on different days could
+//! in principle diverge with no error). `fetch_and_extract`'s
+//! `tracing::warn!` is the only trace this leaves.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -312,8 +326,12 @@ impl ManagedDriver for JsInstallDriver {
 /// Compare `bytes`' hash against a Subresource-Integrity string
 /// (`"sha512-BASE64"`, optionally several space-separated entries — SRI
 /// permits multiple algorithms per resource). At least one recognized
-/// (`sha512`/`sha1`) entry must match; an unrecognized-only integrity string
-/// fails closed rather than silently passing.
+/// (`sha512`/`sha1`) entry must match; an unrecognized-only *non-empty*
+/// integrity string fails closed rather than silently passing.
+///
+/// An *empty* `integrity` is a distinct, deliberately-permitted case (see
+/// `fetch_and_extract`'s doc) and never reaches this function — callers
+/// route it to unverified install before calling this at all.
 fn verify_integrity(bytes: &[u8], integrity: &str) -> anyhow::Result<()> {
     let mut checked_any = false;
     for entry in integrity.split_whitespace() {
@@ -450,6 +468,18 @@ fn extract_tarball(bytes: &[u8], dest_dir: &StdPath) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fetch `url`'s tarball and extract it to `dest_dir`. When `integrity` is
+/// non-empty, the download is verified against it before a single byte is
+/// extracted, same as always. When `integrity` is *empty* — the lockfile
+/// itself never recorded one for this package (a real, observed npm shape:
+/// `npm install`, unlike `npm ci`, can satisfy a package from its local
+/// cache and strip `resolved`/`integrity` from an existing
+/// `package-lock.json` entry instead of repopulating them — npm/cli#4263,
+/// #4460, #6301, not a heph bug) — there is nothing to verify against, and
+/// by explicit product decision this installs unverified rather than
+/// blocking the build on a lockfile heph didn't write and can't fix. The
+/// `tracing::warn!` is the only trace this leaves; nothing else in the
+/// pipeline flags an unverified install once this returns.
 fn fetch_and_extract(url: &str, integrity: &str, dest_dir: &StdPath) -> anyhow::Result<()> {
     let client = reqwest::blocking::Client::builder()
         .build()
@@ -463,7 +493,15 @@ fn fetch_and_extract(url: &str, integrity: &str, dest_dir: &StdPath) -> anyhow::
         .bytes()
         .with_context(|| format!("read body of {url}"))?;
 
-    verify_integrity(&bytes, integrity).with_context(|| format!("verify integrity of {url}"))?;
+    if integrity.is_empty() {
+        tracing::warn!(
+            url,
+            "js_install: no integrity recorded for this package in the lockfile (a known npm bug, not a heph one — see fetch_and_extract's doc); installing unverified"
+        );
+    } else {
+        verify_integrity(&bytes, integrity)
+            .with_context(|| format!("verify integrity of {url}"))?;
+    }
     extract_tarball(&bytes, dest_dir).with_context(|| format!("extract tarball from {url}"))
 }
 
@@ -936,6 +974,25 @@ mod tests {
         assert!(
             !dir.path().join("index.js").exists(),
             "no bytes may land on disk when integrity verification fails"
+        );
+    }
+
+    #[test]
+    fn fetch_and_extract_installs_unverified_when_integrity_is_empty() {
+        // The lockfile-omitted-integrity shape (npm/cli#4263) — see
+        // `fetch_and_extract`'s doc. By explicit product decision this must
+        // still succeed, extracting whatever the server returns, not error
+        // the way a *non-empty but unrecognized* integrity string does.
+        let tarball = make_tarball(&[("index.js", b"module.exports = 1;")]);
+        let url = serve_once(tarball);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        fetch_and_extract(&url, "", dir.path())
+            .expect("empty integrity must install unverified, not error");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("index.js")).expect("read extracted file"),
+            "module.exports = 1;"
         );
     }
 
