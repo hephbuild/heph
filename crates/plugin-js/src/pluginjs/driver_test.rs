@@ -84,12 +84,24 @@
 //!
 //! ## Invocation shape
 //!
-//! Both runners are invoked from the sandboxed workspace root (`cwd =
-//! sandbox_ws_dir`), with the test file and (if any) runner config passed as
-//! absolute in-sandbox paths — mirroring `js_typecheck`'s `--project
-//! <tsconfig_abs>` shape, and avoiding the ambiguity of a config-relative or
-//! package-relative cwd in a monorepo where the config may live several
-//! directories up. `vitest` gets `run <file>` (the non-watch, CI-friendly
+//! Both runners are invoked from the target's own package directory (`cwd =
+//! sandbox_pkg_dir`), with the test file and (if any) runner config *also*
+//! passed as absolute in-sandbox paths — mirroring `js_typecheck`'s
+//! `--project <tsconfig_abs>` shape, so nothing about *finding* those two
+//! files depends on `cwd` at all. `cwd` still matters for a third class of
+//! file this driver doesn't control: a plugin loaded by the runner config
+//! that does its *own* ambient, `process.cwd()`-relative config discovery —
+//! confirmed live, `@lingui/vite-plugin` calls `@lingui/conf`'s
+//! `getConfig()`, which (absent an explicit `configPath`) searches upward
+//! from `process.cwd()` for `lingui.config.*`; that search only ever walks
+//! *ancestor* directories, so with the previous `cwd = sandbox_ws_dir`
+//! choice it could never find a config living in the package's own
+//! directory (a *descendant* of the workspace root, never an ancestor) no
+//! matter how correctly this driver staged it. `sandbox_pkg_dir` is also
+//! the cwd a real, non-heph `vitest`/`jest` invocation actually runs
+//! with in practice (`cd package && vitest`, or `pnpm --filter pkg test`) —
+//! matching that convention is what makes ambient discovery work at all.
+//! `vitest` gets `run <file>` (the non-watch, CI-friendly
 //! subcommand — bare `vitest` defaults to interactive watch mode, which would
 //! hang forever under heph); `jest` gets `--runTestsByPath <file>` (an exact
 //! path match, not a `testPathPattern` regex, so the invocation can't
@@ -408,7 +420,7 @@ impl ManagedDriver for JsTestDriver {
             ),
         }
 
-        self.exec_runner(&runner_bin, args, &env, &req.sandbox_ws_dir, ctoken)
+        self.exec_runner(&runner_bin, args, &env, &req.sandbox_pkg_dir, ctoken)
             .await?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
@@ -803,6 +815,63 @@ mod tests {
             sandbox_pkg_dir: pkg_dir,
             inputs: Vec::new(),
         }
+    }
+
+    /// Confirmed live: with `cwd = sandbox_ws_dir` (the previous choice), a
+    /// plugin loaded by the runner config that does its own ambient,
+    /// `process.cwd()`-relative config discovery (`@lingui/vite-plugin` via
+    /// `@lingui/conf`'s `getConfig()`) could never find a config file living
+    /// in the package's own directory — that search only ever walks
+    /// *ancestor* directories, and the package dir is a *descendant* of the
+    /// workspace root, never an ancestor. No real `vitest`/`jest` needed:
+    /// `runner_bin` just has to be an executable that reports its own `cwd`
+    /// — a fake binary that always exits non-zero, whose stderr this
+    /// driver's own failure-detail path already surfaces.
+    #[tokio::test]
+    async fn run_uses_the_packages_own_directory_as_cwd_not_the_workspace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = dir.path().join("fake-runner.sh");
+        std::fs::write(&fake_runner, "#!/bin/sh\necho \"CWD=$PWD\" >&2\nexit 1\n")
+            .expect("write fake runner");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_runner)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_runner, perms).expect("chmod");
+        }
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let pkg_dir_canonical = pkg_dir.canonicalize().expect("canonicalize pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+        let err = driver()
+            .run(run_req, &ct)
+            .await
+            .err()
+            .expect("the fake runner always exits non-zero");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("CWD={}", pkg_dir_canonical.display())),
+            "expected the runner's own cwd to be the package directory, not the workspace root: \
+             {msg}"
+        );
     }
 
     #[tokio::test]
