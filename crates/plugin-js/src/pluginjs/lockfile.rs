@@ -73,6 +73,25 @@ pub struct ResolvedPackage {
     /// `deps::resolve_one_dependency`'s doc for the established required-vs-
     /// optional asymmetry this mirrors.
     pub optional_dependencies: BTreeMap<String, String>,
+    /// `peerDependencies` edges, resolved (npm only — see
+    /// [`resolve_npm_edges`]'s caller) the same way Node itself would
+    /// satisfy a peer once genuinely installed: an ancestor-`node_modules`
+    /// walk from this node's own path, exactly like [`Self::dependencies`].
+    /// npm's package-lock v3 records `peerDependencies` as a bare,
+    /// unresolved copy of the declaring package's own `package.json` range
+    /// (confirmed live: `@vitest/browser-playwright`'s lockfile entry lists
+    /// `"playwright": "*"` here, nowhere in `dependencies`) — the installed
+    /// package satisfying it, if any, is only discoverable by re-deriving
+    /// the same walk `resolve_npm_edges` already performs for regular
+    /// deps. Miss-tolerant like [`Self::optional_dependencies`]: peer not
+    /// installed is the ordinary case (most consumers of a package with an
+    /// optional-integration peer never install it) and simply produces no
+    /// entry for that name, not an error. pnpm already resolves a satisfied
+    /// peer into a concrete edge inside its own snapshot `dependencies`
+    /// (the `(peer@version)`-suffixed key `strip_peer_suffix` folds down),
+    /// so the pnpm side of `resolved_graph` leaves this empty — walking it
+    /// there would be redundant, not incomplete.
+    pub peer_dependencies: BTreeMap<String, String>,
     /// `package.json` `os` restriction (Node `process.platform` values,
     /// e.g. `"darwin"`). Empty = unrestricted.
     pub os: Vec<String>,
@@ -123,16 +142,26 @@ impl ResolvedGraph {
     /// — e.g. a consumer's own direct dependencies, resolved), returning
     /// every reachable package to materialize — see [`TransitiveEntry`].
     ///
-    /// Walks both `dependencies` (unconditionally) and `optional_dependencies`
-    /// (only an entry that resolves in this graph *and* matches `os`/`arch`)
-    /// — confirmed live: `vite` depends on `rolldown`, which ships its native
-    /// binding as an `optionalDependencies` entry per platform
+    /// Walks `dependencies` (unconditionally), `optional_dependencies`, and
+    /// `peer_dependencies` (the latter two only an entry that resolves in
+    /// this graph *and* matches `os`/`arch`) — confirmed live twice over:
+    /// `vite` depends on `rolldown`, which ships its native binding as an
+    /// `optionalDependencies` entry per platform
     /// (`@rolldown/binding-linux-x64-gnu`, say); walking `dependencies` alone
     /// reaches `rolldown` but never its own binding, so the binding is never
     /// relocated into the sandbox and `vite` fails to load at require-time —
     /// not a lifecycle-script failure, an ordinary module-resolution one, one
-    /// edge past what this closure used to declare. An unresolvable or
-    /// platform-mismatched optional entry is expected (a native-binary
+    /// edge past what this closure used to declare. And `@vitest/browser-playwright`
+    /// (itself reached only via `vitest`'s own `optionalDependencies`)
+    /// unconditionally imports `playwright` at module load despite declaring
+    /// it only as a `peerDependencies` entry — walking `dependencies` and
+    /// `optional_dependencies` alone reaches the provider but never its own
+    /// peer, so a real, genuinely-installed `playwright` (npm resolves a
+    /// satisfied peer via the same ancestor-`node_modules` walk as a regular
+    /// dependency — see [`ResolvedPackage::peer_dependencies`]) never gets
+    /// relocated into the sandbox and the import throws
+    /// `ERR_MODULE_NOT_FOUND`. An unresolvable or platform-mismatched
+    /// optional or peer entry is expected (a native-binary
     /// package for another platform) and is silently skipped rather than
     /// walked further, mirroring [`crate::pluginjs::deps::resolve_one_dependency`]'s
     /// established required-vs-optional asymmetry — this is the "expected
@@ -212,7 +241,11 @@ impl ResolvedGraph {
                     queue.push_back(dep_key.clone());
                 }
             }
-            for dep_key in pkg.optional_dependencies.values() {
+            for dep_key in pkg
+                .optional_dependencies
+                .values()
+                .chain(pkg.peer_dependencies.values())
+            {
                 let Some(dep_pkg) = self.packages.get(dep_key) else {
                     continue;
                 };
@@ -258,14 +291,16 @@ impl ResolvedGraph {
                 .packages
                 .get(&key)
                 .expect("every key ever pushed onto `work` was confirmed present below");
-            let edges = pkg
-                .dependencies
-                .iter()
-                .chain(pkg.optional_dependencies.iter().filter(|(_, dep_key)| {
-                    self.packages.get(*dep_key).is_some_and(|dep_pkg| {
-                        platform::matches_platform(&dep_pkg.os, &dep_pkg.cpu, os, arch)
-                    })
-                }));
+            let edges = pkg.dependencies.iter().chain(
+                pkg.optional_dependencies
+                    .iter()
+                    .chain(pkg.peer_dependencies.iter())
+                    .filter(|(_, dep_key)| {
+                        self.packages.get(*dep_key).is_some_and(|dep_pkg| {
+                            platform::matches_platform(&dep_pkg.os, &dep_pkg.cpu, os, arch)
+                        })
+                    }),
+            );
             for (child_name, child_key) in edges {
                 // An edge whose own target isn't in this graph at all (an
                 // `npm:`-aliased dependency's declaring key diverging from
@@ -329,8 +364,8 @@ const MAX_NESTED_DEPTH: usize = 16;
 /// (`driver_install.rs`'s `JsInstallDef`: `name`/`version` are already equal
 /// by construction — both sides were looked up by the same `(name,
 /// version)` — leaving `integrity`, `resolved`, and `has_install_script`) —
-/// nothing else. `os`/`cpu`/`dependencies`/`optional_dependencies` are
-/// deliberately never compared:
+/// nothing else. `os`/`cpu`/`dependencies`/`optional_dependencies`/
+/// `peer_dependencies` are deliberately never compared:
 ///
 /// - `os`/`cpu` gate *whether* an install happens at all
 ///   (`Provider::thirdparty_install_spec`'s `platform::matches_platform`
@@ -339,18 +374,19 @@ const MAX_NESTED_DEPTH: usize = 16;
 ///   published `package.json` `integrity` itself verifies, they cannot
 ///   differ between two entries that agree on `integrity` without a
 ///   lockfile parser bug, which this check is not the place to catch.
-/// - `dependencies`/`optional_dependencies` are pure graph-traversal
-///   bookkeeping (which *other* packages this one's own imports/optional
-///   siblings resolve to) — never part of `JsInstallDef`, and legitimately
-///   different between two independently `npm install`ed lockfiles even for
-///   the *exact same* published tarball: a shared package's own transitive
-///   dependency can resolve to a different patch version depending on what
-///   else was installed and when. Comparing `dependencies` produced
-///   false-positive ambiguity errors across hundreds of packages in a real
-///   workspace — including pairs with byte-identical `integrity` and
-///   `resolved` — before this fix; `optional_dependencies` has the exact
-///   same shape and the exact same divergence property, so it is excluded
-///   for the identical reason, not merely by omission.
+/// - `dependencies`/`optional_dependencies`/`peer_dependencies` are pure
+///   graph-traversal bookkeeping (which *other* packages this one's own
+///   imports/optional/peer siblings resolve to) — never part of
+///   `JsInstallDef`, and legitimately different between two independently
+///   `npm install`ed lockfiles even for the *exact same* published tarball:
+///   a shared package's own transitive dependency can resolve to a
+///   different patch version depending on what else was installed and
+///   when. Comparing `dependencies` produced false-positive ambiguity
+///   errors across hundreds of packages in a real workspace — including
+///   pairs with byte-identical `integrity` and `resolved` — before this
+///   fix; `optional_dependencies` and `peer_dependencies` have the exact
+///   same shape and the exact same divergence property, so both are
+///   excluded for the identical reason, not merely by omission.
 ///
 /// `integrity`/`resolved` each get a narrow, independent exemption: when
 /// either side's `integrity` is empty, that field alone is skipped; when
@@ -544,6 +580,8 @@ struct NpmPackageRaw {
     #[serde(default)]
     optional_dependencies: BTreeMap<String, String>,
     #[serde(default)]
+    peer_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
     os: Vec<String>,
     #[serde(default)]
     cpu: Vec<String>,
@@ -640,6 +678,7 @@ impl NpmLockfile {
                 resolved: entry.resolved.clone(),
                 dependencies: resolve_npm_edges(self, path, &entry.dependencies),
                 optional_dependencies: resolve_npm_edges(self, path, &entry.optional_dependencies),
+                peer_dependencies: resolve_npm_edges(self, path, &entry.peer_dependencies),
                 os: entry.os.clone(),
                 cpu: entry.cpu.clone(),
                 has_install_script: entry.has_install_script,
@@ -873,25 +912,91 @@ impl PnpmLockfile {
                 .collect()
         }
 
-        let mut packages: BTreeMap<String, ResolvedPackage> = BTreeMap::new();
+        // `packages:` records each published tarball's own metadata
+        // (resolution/integrity/os/cpu/`hasInstallScript`) — properties of
+        // the tarball itself, which can't vary by peer context. Confirmed
+        // live against a real `pnpm@9.15.9 install`: this section keys
+        // such an entry by the *bare* `name@version`, even for a package
+        // (`react-dom`) that has its own `peerDependencies` — the suffix
+        // never appears here, only on the `snapshots:` side (below).
+        // Indexed by `graph_key` regardless of whether a given lockfile's
+        // key happens to carry a peer suffix (`split_pnpm_key` strips one
+        // if present), so a lockfile that *did* suffix this key would
+        // still resolve rather than silently losing the entry — and, in
+        // that hypothetical shape, potentially collide two entries onto
+        // the same `graph_key` the same way the pre-existing
+        // `resolved_graph()` collision handling below already tolerates;
+        // same rule here, same reasoning: prefer whichever variant
+        // actually has integrity, hard-fail rather than silently pick
+        // between two non-degenerate variants that disagree.
+        let mut packages_meta: BTreeMap<String, &PnpmPackageMetaRaw> = BTreeMap::new();
         for (key, meta) in &self.packages {
             let Some((name, version)) = split_pnpm_key(key) else {
                 continue;
             };
-            let snapshot = self.snapshots.get(key);
-            let dependencies = snapshot
-                .map(|snap| resolve_pnpm_edges(&snap.dependencies))
-                .unwrap_or_default();
-            let optional_dependencies = snapshot
-                .map(|snap| resolve_pnpm_edges(&snap.optional_dependencies))
-                .unwrap_or_default();
+            match packages_meta.entry(graph_key(&name, &version)) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(meta);
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    let a = o.get().resolution.integrity.as_deref().unwrap_or_default();
+                    let b = meta.resolution.integrity.as_deref().unwrap_or_default();
+                    anyhow::ensure!(
+                        a.is_empty() || b.is_empty() || a == b,
+                        "js provider: {name}@{version} has two disagreeing `packages` metadata \
+                         entries within the same lockfile — {:?} records integrity {a:?}, \
+                         another entry records integrity {b:?}. This is not a cross-project \
+                         ambiguity; the lockfile itself is inconsistent for this package — \
+                         regenerate it",
+                        key,
+                    );
+                    if a.is_empty() && !b.is_empty() {
+                        o.insert(meta);
+                    }
+                }
+            }
+        }
+
+        // `snapshots:` — not `packages:` — is the actual source of
+        // dependency edges, and unlike `packages:` it *is* keyed with a
+        // peer suffix whenever a package's own dependency resolution
+        // varies by peer context (confirmed live:
+        // `react-dom@18.3.1(react@18.2.0)`, `dependencies: { react:
+        // 18.2.0, ... }`). Driving this loop from `packages:` instead (as
+        // before this fix) looked up `snapshots` by the bare key and
+        // always missed for any package with its own peer dependency —
+        // silently leaving `dependencies`/`optional_dependencies` (and so
+        // every downstream `transitive_reachable` walk through such a
+        // package) empty, confirmed live against a real `pnpm install` of
+        // `react-dom` + `@testing-library/react`. Driving from
+        // `snapshots:` instead means the join direction can never miss:
+        // every snapshot key strips down to the exact `graph_key` its own
+        // metadata was indexed under above.
+        let mut packages: BTreeMap<String, ResolvedPackage> = BTreeMap::new();
+        for (key, snapshot) in &self.snapshots {
+            let Some((name, version)) = split_pnpm_key(key) else {
+                continue;
+            };
+            let gkey = graph_key(&name, &version);
+            let Some(meta) = packages_meta.get(&gkey) else {
+                anyhow::bail!(
+                    "js provider: pnpm-lock.yaml has a `snapshots` entry for {key:?} but no \
+                     matching `packages` entry for {name}@{version} — the lockfile is malformed \
+                     or was hand-edited; regenerate it with `pnpm install`"
+                );
+            };
             let resolved_pkg = ResolvedPackage {
                 name: name.clone(),
                 version: version.clone(),
                 integrity: meta.resolution.integrity.clone().unwrap_or_default(),
                 resolved: meta.resolution.tarball.clone(),
-                dependencies,
-                optional_dependencies,
+                dependencies: resolve_pnpm_edges(&snapshot.dependencies),
+                optional_dependencies: resolve_pnpm_edges(&snapshot.optional_dependencies),
+                // pnpm resolves a satisfied peer into a concrete edge
+                // inside the snapshot's own `dependencies` already (see
+                // `ResolvedPackage::peer_dependencies`'s doc) — nothing
+                // separate to parse here.
+                peer_dependencies: BTreeMap::new(),
                 os: meta.os.clone(),
                 cpu: meta.cpu.clone(),
                 has_install_script: meta.requires_build,
@@ -899,11 +1004,18 @@ impl PnpmLockfile {
             // Peer-dep variants of the same (name, version) — e.g.
             // `foo@1.2.3(react@18.0.0)` and `foo@1.2.3(react@17.0.0)` —
             // collapse to the same graph_key via `split_pnpm_key`'s
-            // peer-suffix strip. Same rule, same reasoning, as the npm
-            // side's collision handling: prefer whichever variant actually
-            // has integrity, and hard-fail rather than silently pick
-            // between two non-degenerate variants that disagree.
-            match packages.entry(graph_key(&name, &version)) {
+            // peer-suffix strip. Both variants' metadata now comes from
+            // the *same* shared `packages_meta` entry (real pnpm output
+            // never varies it per peer context), so a collision here is
+            // never a genuine integrity/resolved disagreement in
+            // practice — `entries_agree_where_comparable` still guards
+            // the case where it somehow is (a hand-edited or malformed
+            // lockfile) — and otherwise picks whichever variant's
+            // dependency edges were inserted first, deterministically by
+            // `self.snapshots`'s key order. Full per-peer-context
+            // multi-resolution (keeping every variant's own edges
+            // separately) is out of scope — see module docs' "M2" note.
+            match packages.entry(gkey) {
                 std::collections::btree_map::Entry::Vacant(v) => {
                     v.insert(resolved_pkg);
                 }
@@ -1029,6 +1141,56 @@ mod tests {
         assert!(
             !esbuild.dependencies.contains_key("@esbuild/linux-x64"),
             "an optional edge must never leak into the required dependencies map"
+        );
+    }
+
+    /// Confirmed live: `@vitest/browser-playwright`'s package-lock entry
+    /// lists `"playwright": "*"` under `peerDependencies` only — nowhere in
+    /// `dependencies` — yet `playwright` really is installed, hoisted flat
+    /// at the workspace's top-level `node_modules/playwright`. npm never
+    /// writes a resolved edge for this into the lockfile the way it does
+    /// for `dependencies`/`optionalDependencies`; the only way to find the
+    /// installed package is the same ancestor-`node_modules` walk
+    /// `resolve_npm_edges` already performs for regular deps.
+    #[test]
+    fn npm_resolved_graph_resolves_peer_dependencies_via_ancestor_walk() {
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/@vitest/browser-playwright": {
+                        "version": "4.1.8",
+                        "integrity": "sha512-loader",
+                        "dependencies": { "tinyrainbow": "3.1.0" },
+                        "peerDependencies": { "playwright": "*" }
+                    },
+                    "node_modules/tinyrainbow": {
+                        "version": "3.1.0",
+                        "integrity": "sha512-tinyrainbow"
+                    },
+                    "node_modules/playwright": {
+                        "version": "1.55.0",
+                        "integrity": "sha512-playwright"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+        let provider = graph.get("@vitest/browser-playwright", "4.1.8").unwrap();
+        assert_eq!(
+            provider
+                .peer_dependencies
+                .get("playwright")
+                .map(String::as_str),
+            Some("playwright@1.55.0"),
+            "a genuinely-installed peer must resolve into its own field: {:?}",
+            provider.peer_dependencies
+        );
+        assert!(
+            !provider.dependencies.contains_key("playwright"),
+            "a peer edge must never leak into the required dependencies map"
         );
     }
 
@@ -1263,6 +1425,68 @@ snapshots:
         assert!(
             !esbuild.dependencies.contains_key("@esbuild/linux-x64"),
             "an optional edge must never leak into the required dependencies map"
+        );
+    }
+
+    /// Exact shape captured from a real `pnpm@9.15.9 install` of
+    /// `react-dom@18.3.1` + `@testing-library/react` (which peer-depends on
+    /// react/react-dom): `packages:` keys a package with its own
+    /// `peerDependencies` WITHOUT the peer suffix; `snapshots:` keys the
+    /// same package WITH it. Before this fix, `resolved_graph()` was driven
+    /// by `packages:` and looked up `snapshots` by that same (bare) key —
+    /// which never matches the suffixed snapshot key, so `dependencies`
+    /// silently came back completely empty for any real package with a
+    /// peer dependency, not just the peer edge itself.
+    #[test]
+    fn pnpm_resolved_graph_resolves_dependencies_of_a_real_peer_suffixed_package() {
+        let lock = PnpmLockfile::parse(
+            r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      react-dom:
+        specifier: 18.3.1
+        version: 18.3.1(react@18.2.0)
+packages:
+  react-dom@18.3.1:
+    resolution: {integrity: sha512-reactdom}
+    peerDependencies:
+      react: ^18.3.1
+  react@18.2.0:
+    resolution: {integrity: sha512-react}
+  loose-envify@1.4.0:
+    resolution: {integrity: sha512-looseenvify}
+snapshots:
+  react-dom@18.3.1(react@18.2.0):
+    dependencies:
+      loose-envify: 1.4.0
+      react: 18.2.0
+  react@18.2.0:
+    dependencies:
+      loose-envify: 1.4.0
+  loose-envify@1.4.0: {}
+"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+        let react_dom = graph.get("react-dom", "18.3.1").unwrap();
+        assert_eq!(react_dom.integrity, "sha512-reactdom");
+        assert_eq!(
+            react_dom.dependencies.get("react").map(String::as_str),
+            Some("react@18.2.0"),
+            "react-dom's own dependency edges (including the resolved peer) must not be \
+             empty: {:?}",
+            react_dom.dependencies
+        );
+        assert_eq!(
+            react_dom
+                .dependencies
+                .get("loose-envify")
+                .map(String::as_str),
+            Some("loose-envify@1.4.0"),
+            "{:?}",
+            react_dom.dependencies
         );
     }
 
@@ -1649,6 +1873,249 @@ snapshots:
             !names.contains("missing-binding"),
             "an optional dependency absent from the lockfile entirely must be skipped, not \
              error: {reachable:?}"
+        );
+    }
+
+    /// Confirmed live: `vitest` reaches `@vitest/browser-playwright` only
+    /// via its own `optionalDependencies` (already covered by the platform-
+    /// matching-optional test above); `@vitest/browser-playwright` in turn
+    /// unconditionally imports `playwright` at module load despite
+    /// declaring it only as a `peerDependencies` entry. A genuinely-
+    /// installed `playwright` two hops from the seed must still be walked
+    /// and materialized — the exact real-world shape (`ERR_MODULE_NOT_FOUND`
+    /// for `playwright`, sandbox missing it) this test guards against
+    /// regressing.
+    #[test]
+    fn transitive_reachable_walks_a_resolved_peer_dependency() {
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/vitest": {
+                        "version": "4.1.8",
+                        "integrity": "sha512-vitest",
+                        "optionalDependencies": { "@vitest/browser-playwright": "4.1.8" }
+                    },
+                    "node_modules/@vitest/browser-playwright": {
+                        "version": "4.1.8",
+                        "integrity": "sha512-provider",
+                        "peerDependencies": { "playwright": "*" }
+                    },
+                    "node_modules/playwright": {
+                        "version": "1.55.0",
+                        "integrity": "sha512-playwright"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+
+        let reachable = graph
+            .transitive_reachable(vec![graph_key("vitest", "4.1.8")], "linux", "amd64")
+            .unwrap();
+        let names: BTreeSet<&str> = reachable.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(
+            names.contains("@vitest/browser-playwright"),
+            "{reachable:?}"
+        );
+        assert!(
+            names.contains("playwright"),
+            "a genuinely-installed peer dependency must be walked transitively, two hops past \
+             the seed: {reachable:?}"
+        );
+    }
+
+    /// The unresolvable-peer-edge half of the same guarantee: a
+    /// `peerDependencies` entry with nothing installed to satisfy it
+    /// anywhere in the lockfile (the ordinary case — most consumers of an
+    /// optional-integration peer never install it) must be skipped, not
+    /// treated as a hard failure, mirroring `optionalDependencies`'s own
+    /// established asymmetry.
+    #[test]
+    fn transitive_reachable_skips_an_unresolved_peer_dependency() {
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/@vitest/browser-playwright": {
+                        "version": "4.1.8",
+                        "integrity": "sha512-provider",
+                        "peerDependencies": { "playwright": "*" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+
+        let reachable = graph
+            .transitive_reachable(
+                vec![graph_key("@vitest/browser-playwright", "4.1.8")],
+                "linux",
+                "amd64",
+            )
+            .unwrap();
+        let names: BTreeSet<&str> = reachable.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(
+            names.contains("@vitest/browser-playwright"),
+            "{reachable:?}"
+        );
+        assert!(
+            !names.contains("playwright"),
+            "a peer dependency never installed anywhere in the lockfile must be skipped, not \
+             error: {reachable:?}"
+        );
+    }
+
+    /// Pins a known, pre-existing limitation surfaced (not introduced) by
+    /// this diff: pass 1's flat-reachability BFS treats a `dependencies`
+    /// edge and a `peer_dependencies`/`optional_dependencies` edge for the
+    /// *same name* identically — first dequeued wins, with no bias toward
+    /// the structurally-stronger `dependencies` edge. `optional_dependencies`
+    /// already shared this pool before this diff; peer deps widen exposure
+    /// because, unlike an optional native-binary binding, a peer dep's
+    /// entire purpose is to name a widely-shared library that near-certainly
+    /// *also* has an ordinary `dependencies` edge elsewhere in the graph
+    /// (here: `a` reaches `shared` only via a peer edge, `b` reaches a
+    /// *different* `shared` version via a real dependency edge — `a` is
+    /// seeded first, so its peer edge wins the flat slot even though `b`'s
+    /// edge is the structurally required one).
+    ///
+    /// This does NOT make sandbox materialization wrong: pass 2 re-derives
+    /// the *correct* placement for every explicit edge relative to its own
+    /// consumer (see this function's doc), so `b`'s own dependency on
+    /// `shared@2.0.0` still gets a correct nested-override entry regardless
+    /// of which version won flat — confirmed below. The narrower residual
+    /// risk is `resolve_transitive`'s single-name, flat-only lookup (used
+    /// for a first-party import with no declared edge of its own), which
+    /// has no per-consumer correction and would answer with whichever
+    /// version this test shows wins. That path was already exposed to the
+    /// identical race for `optional_dependencies` before this diff; fixing
+    /// the underlying priority (e.g. processing `dependencies` edges to
+    /// exhaustion before any optional/peer edge) is a real, separate design
+    /// change, not something to bundle into a peer-dependency bugfix — this
+    /// test exists so a future change to that priority is a deliberate,
+    /// visible diff here, not a silent behavior change.
+    #[test]
+    fn transitive_reachable_flat_placement_prefers_whichever_edge_type_is_seeded_first_not_dependencies()
+     {
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/a": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-a",
+                        "peerDependencies": { "shared": "*" }
+                    },
+                    "node_modules/b": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-b",
+                        "dependencies": { "shared": "2.0.0" }
+                    },
+                    "node_modules/shared": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-shared1"
+                    },
+                    "node_modules/b/node_modules/shared": {
+                        "version": "2.0.0",
+                        "integrity": "sha512-shared2"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+
+        let reachable = graph
+            .transitive_reachable(
+                vec![graph_key("a", "1.0.0"), graph_key("b", "1.0.0")],
+                "linux",
+                "amd64",
+            )
+            .unwrap();
+
+        let flat_shared = reachable
+            .iter()
+            .find(|e| e.name == "shared" && e.nested_under.is_empty())
+            .expect("some flat `shared` entry must exist");
+        assert_eq!(
+            flat_shared.version, "1.0.0",
+            "documents current behavior: `a` is seeded first, so its peer edge to \
+             shared@1.0.0 wins the flat slot even though `b`'s dependencies edge to \
+             shared@2.0.0 is the structurally-required one — see this test's doc"
+        );
+
+        // Despite the flat slot going to the peer-reached version, `b`'s
+        // own required edge is still structurally correct via pass 2's
+        // per-consumer override — never silently dropped or left pointing
+        // at the wrong version for `b` specifically.
+        assert!(
+            reachable
+                .iter()
+                .any(|e| e.name == "shared" && e.version == "2.0.0" && e.nested_under == ["b"]),
+            "b's own dependencies edge to shared@2.0.0 must still get a correct nested \
+             override, regardless of which version won the flat slot: {reachable:?}"
+        );
+    }
+
+    /// pnpm end-to-end version of the same guarantee, exercising the
+    /// `packages:`/`snapshots:` key-join fix: before it, `react-dom`'s
+    /// `dependencies` came back completely empty (not just missing its
+    /// peer edge — every edge), so `transitive_reachable` never walked
+    /// past it at all. `loose-envify` (an ordinary *required* dependency
+    /// of `react-dom`, nothing to do with peer deps) must be reachable
+    /// once the join is fixed.
+    #[test]
+    fn transitive_reachable_walks_a_pnpm_peer_suffixed_packages_own_dependencies() {
+        let lock = PnpmLockfile::parse(
+            r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      react-dom:
+        specifier: 18.3.1
+        version: 18.3.1(react@18.2.0)
+packages:
+  react-dom@18.3.1:
+    resolution: {integrity: sha512-reactdom}
+    peerDependencies:
+      react: ^18.3.1
+  react@18.2.0:
+    resolution: {integrity: sha512-react}
+  loose-envify@1.4.0:
+    resolution: {integrity: sha512-looseenvify}
+snapshots:
+  react-dom@18.3.1(react@18.2.0):
+    dependencies:
+      loose-envify: 1.4.0
+      react: 18.2.0
+  react@18.2.0:
+    dependencies:
+      loose-envify: 1.4.0
+  loose-envify@1.4.0: {}
+"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+
+        let reachable = graph
+            .transitive_reachable(vec![graph_key("react-dom", "18.3.1")], "linux", "amd64")
+            .unwrap();
+        let names: BTreeSet<&str> = reachable.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains("react"), "{reachable:?}");
+        assert!(
+            names.contains("loose-envify"),
+            "react-dom's own required dependency must be walked — the pre-fix bug emptied ALL \
+             of react-dom's dependencies, not just its peer edge: {reachable:?}"
         );
     }
 
