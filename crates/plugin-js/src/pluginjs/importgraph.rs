@@ -1896,7 +1896,23 @@ pub fn build_test_closure(
             continue;
         };
         for edge in edges {
-            if edge.resolved.starts_with(&pkg_dir) {
+            // `starts_with(&pkg_dir)` alone isn't enough: a package that has
+            // a real, ambient `node_modules` physically nested inside its
+            // own directory (a common on-disk shape — dedup/version-conflict
+            // nesting, or a stray local install) resolves a third-party
+            // import to a path that's *inside* `pkg_dir` too. That must
+            // still classify as third-party — `Provider::test_deps_config`
+            // sends `external_files` through `classify_resolved_edge`
+            // (lockfile-driven `resolve_one_dependency`, landing on the
+            // relocated `js/node_modules:group` addr) but takes `files`
+            // straight to a raw `fs:file` Input with no such check; letting
+            // a `node_modules`-nested-but-physically-inside-pkg_dir edge
+            // through as `files` means both the raw on-disk file *and* the
+            // relocated group target end up declaring the exact same
+            // sandbox path, an output collision at run time.
+            if edge.resolved.starts_with(&pkg_dir)
+                && thirdparty_pkg_name_from_path(&edge.resolved).is_none()
+            {
                 let rel = edge
                     .resolved
                     .strip_prefix(canonical_workspace_root)
@@ -3252,6 +3268,76 @@ mod tests {
             closure.external_files
         );
         assert!(!closure.files.contains("packages/b/src/index.ts"));
+    }
+
+    /// Confirmed live: a scoped third-party package physically nested
+    /// *inside* the owning package's own `node_modules` (a real on-disk
+    /// shape — version-conflict dedup, or a stray local install) resolves
+    /// to a path that satisfies `starts_with(pkg_dir)` just like a genuine
+    /// first-party file. It must still land in `external_files`, never
+    /// `files` — `files` is turned straight into a raw `fs:file` Input with
+    /// no further classification, while `Provider::test_deps_config` sends
+    /// every `external_files` entry through `classify_resolved_edge`
+    /// (landing on the lockfile-driven relocated `js/node_modules:group`
+    /// addr instead). Landing this edge in `files` produces two different
+    /// targets both declaring the identical sandbox path — an output
+    /// collision at run time, not a test-time symptom.
+    #[test]
+    fn build_test_closure_records_import_from_ambient_nested_node_modules_as_external() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import { x } from '@apollo/client';\ntest('a', () => x);\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/node_modules/@apollo/client/package.json",
+            r#"{"name":"@apollo/client","version":"4.2.3","main":"core/index.js"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/node_modules/@apollo/client/core/index.js",
+            "export const x = 1;\n",
+        );
+
+        let resolvers = Resolvers::new(None);
+        let cache = ResolveCache::new();
+        let graph = build_package_import_graph(
+            &walker(),
+            dir.path(),
+            "packages/a",
+            &resolvers,
+            &cache,
+            None,
+        )
+        .expect("build graph");
+
+        let canonical_root = dir.path().canonicalize().expect("canonicalize");
+        let closure = build_test_closure(
+            &graph,
+            &canonical_root,
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build closure");
+
+        assert!(
+            closure
+                .external_files
+                .contains("packages/a/node_modules/@apollo/client/core/index.js"),
+            "an ambient-nested third-party file must be classified external, not first-party: \
+             {:?}",
+            closure.external_files
+        );
+        assert!(
+            !closure
+                .files
+                .contains("packages/a/node_modules/@apollo/client/core/index.js"),
+            "must never also land in `files` — that's what produces the sandbox collision: {:?}",
+            closure.files
+        );
     }
 
     /// Pins the *boundary* of the accepted "one-hop external" trim (see this
