@@ -51,7 +51,11 @@
 //! calls for (`ai-docs/js-plugin-plan.md`'s "heph's own separate, explicit,
 //! sandboxed action") — that needs a hermetic Node/script-runner sandbox
 //! that does not exist yet. TODO M2+: sandbox this properly; until then it
-//! is flagged loudly (`tracing::warn!`) every time it runs.
+//! is flagged loudly (`tracing::warn!`) every time it runs. Its stdout/stderr
+//! are captured, never inherited from heph's own process — an arbitrary
+//! package's script writing straight to the real terminal would corrupt the
+//! TUI, which owns the alternate screen for the whole run; a captured
+//! failure's output is folded into the error instead.
 //!
 //! **Empty `integrity` installs unverified, by explicit product decision.**
 //! A real npm `package-lock.json` can have a `packages` entry with no
@@ -461,6 +465,26 @@ fn extract_tarball(bytes: &[u8], dest_dir: &StdPath) -> anyhow::Result<()> {
             ensure_extraction_parent_is_safe(dest_dir, parent)
                 .with_context(|| format!("unpack tarball entry to {dest:?}"))?;
         }
+        // A directory entry never gets the archive's own recorded mode —
+        // confirmed live: a real npm tarball (pngjs@7.0.0) ships a
+        // directory entry (`lib/`) with mode 0666 (no execute bit), and
+        // `Entry::unpack` applies that chmod immediately on this entry,
+        // before the *next* entry (a file inside that directory) can be
+        // created — Permission denied, since Unix file creation is gated
+        // on the parent directory's execute bit, not the child's own mode.
+        // Upstream `tar::Archive::unpack` avoids exactly this by deferring
+        // every directory entry's permissions to the very end of
+        // extraction (tar-rs#242); that high-level API is unusable here
+        // (it can't strip npm's `package/` root per-entry, which this loop
+        // must do), so instead directories simply never get their
+        // archive-recorded mode narrowed at all — same discipline this
+        // codebase's own `hartifactcontent::unpack` already follows
+        // (extraction only ever adds permissions to a file, e.g. `+x`;
+        // never narrows one from untrusted archive data).
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&dest).with_context(|| format!("create dir {dest:?}"))?;
+            continue;
+        }
         entry
             .unpack(&dest)
             .with_context(|| format!("unpack tarball entry to {dest:?}"))?;
@@ -533,15 +557,26 @@ fn run_lifecycle_scripts(dest_dir: &StdPath, name: &str) -> anyhow::Result<()> {
             "js_install: running allow-listed lifecycle script via the host shell — not yet \
              sandboxed (TODO M2+); see driver_install.rs module docs"
         );
-        let status = std::process::Command::new("sh")
+        // Captured, not inherited: `Command`'s default stdio is the
+        // parent's own — confirmed live, an arbitrary package's lifecycle
+        // script writing straight to the real terminal corrupts heph's TUI
+        // (which owns the alternate screen the whole run). Capturing here
+        // also means a failing script's own output — often the only real
+        // diagnostic for *why* a native build failed — actually reaches
+        // the error below instead of vanishing into whatever the terminal
+        // happened to be showing at the time.
+        let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(script)
             .current_dir(dest_dir)
-            .status()
+            .output()
             .with_context(|| format!("spawn `{key}` script for {name}"))?;
         anyhow::ensure!(
-            status.success(),
-            "`{key}` script for {name} exited with {status}"
+            output.status.success(),
+            "`{key}` script for {name} exited with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
     Ok(())
@@ -820,6 +855,53 @@ mod tests {
         assert!(dir.path().join("index.js").is_file());
     }
 
+    /// Reproduces a real published tarball's exact shape: `pngjs@7.0.0`
+    /// ships an explicit `package/lib` directory entry with mode `0666` —
+    /// no execute bit — followed by files inside it. A directory missing
+    /// its execute bit can't have anything *created* inside it (Unix file
+    /// creation is gated on the parent directory's execute bit, not the
+    /// child's own mode), so if `extract_tarball` ever applies that
+    /// directory entry's own recorded mode, the very next entry
+    /// (`lib/bitmapper.js`) fails to unpack with a permission error —
+    /// confirmed live, this is not a hypothetical shape.
+    #[test]
+    fn extract_tarball_ignores_restrictive_mode_on_a_directory_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(0o666);
+        dir_header.set_cksum();
+        builder
+            .append_data(&mut dir_header, "package/lib", std::io::empty())
+            .expect("append directory entry");
+
+        let contents = b"module.exports = function bitmap() {};";
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_size(contents.len() as u64);
+        file_header.set_mode(0o644);
+        file_header.set_cksum();
+        builder
+            .append_data(&mut file_header, "package/lib/bitmapper.js", &contents[..])
+            .expect("append file entry inside the restrictive directory");
+
+        let tar_bytes = builder.into_inner().expect("finish tar");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &tar_bytes).expect("gzip write");
+        let bytes = gz.finish().expect("gzip finish");
+
+        extract_tarball(&bytes, dir.path()).expect(
+            "a restrictive directory-entry mode from the archive must never block extracting \
+             the files inside it",
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("lib/bitmapper.js")).expect("read extracted file"),
+            contents
+        );
+    }
+
     /// A symlink entry, followed by a second entry that writes *through*
     /// it — the two-step tar-slip: neither entry's own *path* ever contains
     /// `..` (so [`strip_tarball_root`]'s guard, which only inspects paths,
@@ -1054,6 +1136,34 @@ mod tests {
         let order = std::fs::read_to_string(dir.path().join("order.txt")).expect("read order.txt");
         let lines: Vec<&str> = order.lines().collect();
         assert_eq!(lines, vec!["pre", "install", "post"]);
+    }
+
+    /// The stdio-inheritance bug this fixes: a script's own output must be
+    /// *captured*, not inherited straight through to whatever heph's own
+    /// stdout/stderr happen to be (the real terminal, which the TUI owns
+    /// via the alternate screen — confirmed live, a script writing there
+    /// corrupted it). Captured output is unobservable from a unit test
+    /// process's own stdio, but a *failing* script's captured stdout/stderr
+    /// landing in the returned error is directly observable, and proves
+    /// the same capture mechanism.
+    #[test]
+    fn run_lifecycle_scripts_captures_script_output_into_the_failure_not_the_terminal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_package_json_with_scripts(
+            dir.path(),
+            r#"{"postinstall": "echo building-native-thing; echo compiler-error >&2; exit 1"}"#,
+        );
+        let err = run_lifecycle_scripts(dir.path(), "native-thing")
+            .expect_err("a non-zero exit must still fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("building-native-thing"),
+            "the script's own stdout must be captured into the error: {msg}"
+        );
+        assert!(
+            msg.contains("compiler-error"),
+            "the script's own stderr must be captured into the error: {msg}"
+        );
     }
 
     #[test]
