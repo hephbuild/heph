@@ -331,6 +331,33 @@ pub fn last_n_lines_with_start(s: &str, n: usize) -> (String, usize) {
     (text, start + 1)
 }
 
+/// Bounded rendering of `s` keeping both its first and last lines, with an
+/// omission marker between when it's longer than the combined budget.
+///
+/// A tail-only cap silently drops the head — and real tool output puts the
+/// load-bearing line at either end depending on convention: an uncaught
+/// exception's name/message print first, before a long stack; a test
+/// runner's summary prints last, after long per-case output. Keeping only
+/// one end means guessing which convention produced this particular output;
+/// keeping both costs nothing when `s` is short and never loses the message
+/// that mid-cut a tail-only cap would.
+///
+/// `n` is split roughly a third to the head, the rest to the tail — a stack
+/// trace's leading name/message is usually one or two lines, so it doesn't
+/// need a large head budget to survive.
+pub fn head_and_tail_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= n {
+        return lines.join("\n");
+    }
+    let head = n / 3;
+    let tail = n - head;
+    let head_part = lines.get(..head).unwrap_or(&[]).join("\n");
+    let tail_part = lines.get(lines.len() - tail..).unwrap_or(&[]).join("\n");
+    let omitted = lines.len() - head - tail;
+    format!("{head_part}\n… {omitted} lines omitted …\n{tail_part}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +400,27 @@ mod tests {
     #[test]
     fn last_n_lines_with_start_empty_starts_at_one() {
         assert_eq!(last_n_lines_with_start("", 10), (String::new(), 1));
+    }
+
+    #[test]
+    fn head_and_tail_lines_fewer_than_n_returns_everything_unmarked() {
+        assert_eq!(head_and_tail_lines("a\nb\nc", 10), "a\nb\nc");
+    }
+
+    #[test]
+    fn head_and_tail_lines_keeps_the_leading_message_a_tail_only_cap_would_drop() {
+        // 12 lines, budget 6 -> head 2, tail 4. The leading "Error: boom" line
+        // (what a tail-only cap of 6 would have cut) must survive.
+        let s = "Error: boom\nname: Boom\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12";
+        let out = head_and_tail_lines(s, 6);
+        assert!(out.starts_with("Error: boom\nname: Boom\n"));
+        assert!(out.contains("6 lines omitted"));
+        assert!(out.ends_with("9\n10\n11\n12"));
+    }
+
+    #[test]
+    fn head_and_tail_lines_exactly_n_returns_everything_unmarked() {
+        let s = "1\n2\n3\n4\n5\n6";
+        assert_eq!(head_and_tail_lines(s, 6), s);
     }
 }

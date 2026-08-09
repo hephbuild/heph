@@ -593,8 +593,8 @@ impl JsBundleDriver {
 /// identical reason: a failing bundle's actual output (a syntax error, an
 /// unresolvable import) must reach the user, never come back silently blank.
 fn bundle_failure_detail(stdout: &str, stderr: &str) -> String {
-    let stdout_tail = hplugin::error::last_n_lines(stdout.trim(), 60);
-    let stderr_tail = hplugin::error::last_n_lines(stderr.trim(), 60);
+    let stdout_tail = hplugin::error::head_and_tail_lines(stdout.trim(), 60);
+    let stderr_tail = hplugin::error::head_and_tail_lines(stderr.trim(), 60);
     let mut detail = String::new();
     if !stdout_tail.is_empty() {
         detail.push_str("stdout:\n");
