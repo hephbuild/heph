@@ -1382,8 +1382,8 @@ impl Provider {
             // already silently drops any edge it can't resolve — deliberately,
             // for every consumer of this field, not only this one.
             //
-            // A graph_key present in `resolved.dependencies` but absent from
-            // this same `graph` is *not* provably impossible, unlike an
+            // A graph_key present in a package's `dependencies` but absent
+            // from this same `graph` is *not* provably impossible, unlike an
             // earlier draft of this comment claimed: an `npm:`-aliased
             // dependency (`"foo": "npm:bar@1.2.3"`, `deps.rs`'s own doc
             // explains why `local`/`resolved` names diverge for these)
@@ -1398,71 +1398,120 @@ impl Provider {
             // package) just isn't resolvable by this milestone's
             // edge-tracking yet, which the message says plainly rather
             // than crashing the whole process over it.
-            for (dep_name, dep_key) in &resolved.dependencies {
-                let dep_pkg = graph.packages.get(dep_key).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "js provider: {name}@{version} declares a required dependency on \
-                         `{dep_name}` ({dep_key}), but that exact package/version has no \
-                         resolved entry in the lockfile — if `{dep_name}` is an npm alias \
-                         (`\"{dep_name}\": \"npm:...\"`), this milestone's sibling-dependency \
-                         resolution for a lifecycle script doesn't yet follow aliases; otherwise \
-                         the lockfile is likely stale — re-run the package manager's install to \
-                         regenerate it"
-                    )
-                })?;
-                anyhow::ensure!(
-                    platform::matches_platform(&dep_pkg.os, &dep_pkg.cpu, &os, &arch),
-                    "js provider: {name}@{version}'s required dependency `{dep_name}` \
-                     ({dep_key}) is restricted to os={:?} cpu={:?}, which does not include the \
-                     requested platform {os}/{arch} — this package's own lifecycle script \
-                     cannot run without it",
-                    dep_pkg.os,
-                    dep_pkg.cpu
-                );
-                deps.push(
-                    thirdparty::node_modules_addr(
-                        "",
-                        dep_name,
-                        &dep_pkg.name,
-                        &dep_pkg.version,
-                        &os,
-                        &arch,
-                    )
-                    .format(),
-                );
-            }
-
-            // Optional: most entries here are for *other* platforms and
-            // never apply — an unresolvable or platform-mismatched one is
-            // expected, silently skipped, and never wired as a dependency
-            // edge (so it can never itself be the cause of a graph cycle or
-            // a hard resolution failure) — but the reason is recorded so a
-            // lifecycle script that *does* fail for lack of it names what
-            // was missing instead of an opaque `Cannot find module`.
-            for (dep_name, dep_key) in &resolved.optional_dependencies {
-                let Some(dep_pkg) = graph.packages.get(dep_key) else {
-                    skipped.push(format!("{dep_name} ({dep_key}: not in the lockfile)"));
-                    continue;
-                };
-                if !platform::matches_platform(&dep_pkg.os, &dep_pkg.cpu, &os, &arch) {
-                    skipped.push(format!(
-                        "{dep_name} ({dep_key}: restricted to os={:?} cpu={:?}, current \
-                         platform is {os}/{arch})",
-                        dep_pkg.os, dep_pkg.cpu
-                    ));
-                    continue;
+            //
+            // Not just the script package's *direct* dependencies: a
+            // lifecycle script routinely `require()`s a package two or more
+            // hops away in the graph (confirmed live: `@sentry/cli`'s
+            // postinstall requires `which`, and `which` itself requires
+            // `isexe` — a dependency of a dependency, never a direct edge of
+            // `@sentry/cli` at all). Real npm/pnpm hoist the whole
+            // transitive closure into one flat `node_modules` so any
+            // ancestor-walk `require()` finds it; this walks the resolved
+            // graph the same way, breadth over the queue below, so every
+            // reachable `dependencies`/`optionalDependencies` edge — at any
+            // depth — gets its own sibling `node_modules/<name>` entry.
+            // `seen_names` both dedupes (a diamond dependency is not fetched
+            // or declared as an `Input` twice) and bounds the walk (a
+            // circular edge back to an already-visited name is simply not
+            // re-queued, so a dependency cycle in the graph can't loop this
+            // forever).
+            let mut seen_names: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let mut frontier: Vec<&lockfile::ResolvedPackage> = vec![resolved];
+            while let Some(pkg) = frontier.pop() {
+                for (dep_name, dep_key) in &pkg.dependencies {
+                    if seen_names.contains(dep_name) {
+                        continue;
+                    }
+                    let dep_pkg = graph.packages.get(dep_key).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "js provider: {}@{} declares a required dependency on `{dep_name}` \
+                             ({dep_key}), but that exact package/version has no resolved entry \
+                             in the lockfile — if `{dep_name}` is an npm alias \
+                             (`\"{dep_name}\": \"npm:...\"`), this milestone's sibling-dependency \
+                             resolution for a lifecycle script doesn't yet follow aliases; \
+                             otherwise the lockfile is likely stale — re-run the package \
+                             manager's install to regenerate it",
+                            pkg.name,
+                            pkg.version
+                        )
+                    })?;
+                    // A circular edge back to the script-owning package
+                    // itself: already reachable via `driver_install.rs`'s
+                    // own self-reference symlink, and must never become a
+                    // second `Input` — that would be this exact `js_install`
+                    // target depending on itself.
+                    if dep_pkg.name == name && dep_pkg.version == version {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        platform::matches_platform(&dep_pkg.os, &dep_pkg.cpu, &os, &arch),
+                        "js provider: {}@{}'s required dependency `{dep_name}` ({dep_key}) is \
+                         restricted to os={:?} cpu={:?}, which does not include the requested \
+                         platform {os}/{arch} — {name}@{version}'s lifecycle script cannot run \
+                         without it",
+                        pkg.name,
+                        pkg.version,
+                        dep_pkg.os,
+                        dep_pkg.cpu
+                    );
+                    seen_names.insert(dep_name.clone());
+                    deps.push(
+                        thirdparty::node_modules_addr(
+                            "",
+                            dep_name,
+                            &dep_pkg.name,
+                            &dep_pkg.version,
+                            &os,
+                            &arch,
+                        )
+                        .format(),
+                    );
+                    frontier.push(dep_pkg);
                 }
-                deps.push(
-                    thirdparty::node_modules_addr(
-                        "",
-                        dep_name,
-                        &dep_pkg.name,
-                        &dep_pkg.version,
-                        &os,
-                        &arch,
-                    )
-                    .format(),
-                );
+
+                // Optional: most entries here are for *other* platforms and
+                // never apply — an unresolvable or platform-mismatched one
+                // is expected, silently skipped, and never wired as a
+                // dependency edge (so it can never itself be the cause of a
+                // graph cycle or a hard resolution failure, and its own
+                // subtree is never walked) — but the reason is recorded so
+                // a lifecycle script that *does* fail for lack of it names
+                // what was missing instead of an opaque `Cannot find
+                // module`.
+                for (dep_name, dep_key) in &pkg.optional_dependencies {
+                    if seen_names.contains(dep_name) {
+                        continue;
+                    }
+                    let Some(dep_pkg) = graph.packages.get(dep_key) else {
+                        skipped.push(format!("{dep_name} ({dep_key}: not in the lockfile)"));
+                        continue;
+                    };
+                    if dep_pkg.name == name && dep_pkg.version == version {
+                        continue;
+                    }
+                    if !platform::matches_platform(&dep_pkg.os, &dep_pkg.cpu, &os, &arch) {
+                        skipped.push(format!(
+                            "{dep_name} ({dep_key}: restricted to os={:?} cpu={:?}, current \
+                             platform is {os}/{arch})",
+                            dep_pkg.os, dep_pkg.cpu
+                        ));
+                        continue;
+                    }
+                    seen_names.insert(dep_name.clone());
+                    deps.push(
+                        thirdparty::node_modules_addr(
+                            "",
+                            dep_name,
+                            &dep_pkg.name,
+                            &dep_pkg.version,
+                            &os,
+                            &arch,
+                        )
+                        .format(),
+                    );
+                    frontier.push(dep_pkg);
+                }
             }
         }
 
@@ -6509,6 +6558,94 @@ mod tests {
         );
     }
 
+    /// Confirmed live: `@sentry/cli`'s postinstall requires `which`, and
+    /// `which` itself `require()`s `isexe` — a dependency of a dependency,
+    /// never a *direct* edge of `@sentry/cli` at all. Sibling resolution
+    /// must walk the whole transitive closure, not just the script-owning
+    /// package's own `dependencies`, or the second hop (`isexe`) is simply
+    /// never materialized and the script fails with `Cannot find module`.
+    #[tokio::test]
+    async fn npm_e2e_lifecycle_script_package_wires_transitive_required_dependency_two_hops_deep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/@sentry/cli": {
+                        "version": "3.5.0",
+                        "resolved": "https://registry.npmjs.org/@sentry/cli/-/cli-3.5.0.tgz",
+                        "integrity": "sha512-cli",
+                        "hasInstallScript": true,
+                        "dependencies": { "which": "2.0.2" }
+                    },
+                    "node_modules/which": {
+                        "version": "2.0.2",
+                        "resolved": "https://registry.npmjs.org/which/-/which-2.0.2.tgz",
+                        "integrity": "sha512-which",
+                        "dependencies": { "isexe": "2.0.0" }
+                    },
+                    "node_modules/isexe": {
+                        "version": "2.0.0",
+                        "resolved": "https://registry.npmjs.org/isexe/-/isexe-2.0.0.tgz",
+                        "integrity": "sha512-isexe"
+                    }
+                }
+            }"#,
+        );
+        let provider = Provider::with_config(
+            dir.path().to_path_buf(),
+            Config {
+                pkgmanager: PkgManager::Npm,
+                skip: Arc::new(Ignore::default()),
+                walker: Arc::new(CachedWalker::disabled()),
+                allow_scripts: vec!["@sentry/cli".to_string()],
+                tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
+            },
+        );
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr("@sentry/cli", "3.5.0", "linux", "amd64");
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_install target_spec");
+
+        let expected_which =
+            thirdparty::node_modules_addr("", "which", "which", "2.0.2", "linux", "amd64").format();
+        let expected_isexe =
+            thirdparty::node_modules_addr("", "isexe", "isexe", "2.0.0", "linux", "amd64").format();
+        let Some(Value::List(deps)) = resp.target_spec.config.get("deps") else {
+            panic!(
+                "expected deps to be a List: {:?}",
+                resp.target_spec.config.get("deps")
+            );
+        };
+        assert!(
+            deps.contains(&Value::String(expected_which)),
+            "direct dependency `which` must be wired: {deps:?}"
+        );
+        assert!(
+            deps.contains(&Value::String(expected_isexe)),
+            "transitive dependency `isexe` (which's own dependency) must be wired: {deps:?}"
+        );
+    }
+
     /// The other half: a platform-*mismatched* `optionalDependencies`
     /// sibling must be silently skipped, never wired as a dependency, but
     /// the reason must still be recorded for later diagnosability — never a
@@ -6736,6 +6873,121 @@ mod tests {
             other => panic!("expected GetError::Other, got {other:?}"),
         };
         assert!(msg.contains("win-only-helper"), "{msg}");
+    }
+
+    /// The transitive walk must terminate and never declare a package as
+    /// its own `Input`: a dependency cycle back to the script-owning
+    /// package by name (`helper` depends on `root-script`, its own
+    /// consumer — a real, if unusual, npm graph shape) must be silently
+    /// dropped rather than producing a second `node_modules/root-script`
+    /// `Input` pointing at this exact `js_install` target — that would be
+    /// the target depending on itself. A diamond (`helper-a` and `helper-b`
+    /// both depending on `shared`) must also resolve `shared` exactly once.
+    #[tokio::test]
+    async fn npm_e2e_lifecycle_script_package_transitive_walk_dedupes_diamond_and_skips_cycle_back_to_root()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/root-script": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/root-script/-/root-script-1.0.0.tgz",
+                        "integrity": "sha512-rootscript",
+                        "hasInstallScript": true,
+                        "dependencies": { "helper-a": "1.0.0", "helper-b": "1.0.0" }
+                    },
+                    "node_modules/helper-a": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/helper-a/-/helper-a-1.0.0.tgz",
+                        "integrity": "sha512-helpera",
+                        "dependencies": { "shared": "1.0.0", "root-script": "1.0.0" }
+                    },
+                    "node_modules/helper-b": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/helper-b/-/helper-b-1.0.0.tgz",
+                        "integrity": "sha512-helperb",
+                        "dependencies": { "shared": "1.0.0" }
+                    },
+                    "node_modules/shared": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/shared/-/shared-1.0.0.tgz",
+                        "integrity": "sha512-shared"
+                    }
+                }
+            }"#,
+        );
+        let provider = Provider::with_config(
+            dir.path().to_path_buf(),
+            Config {
+                pkgmanager: PkgManager::Npm,
+                skip: Arc::new(Ignore::default()),
+                walker: Arc::new(CachedWalker::disabled()),
+                allow_scripts: vec!["root-script".to_string()],
+                tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
+            },
+        );
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = thirdparty::thirdparty_addr("root-script", "1.0.0", "linux", "amd64");
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_install target_spec — a cycle back to the root must never error");
+
+        let Some(Value::List(deps)) = resp.target_spec.config.get("deps") else {
+            panic!(
+                "expected deps to be a List: {:?}",
+                resp.target_spec.config.get("deps")
+            );
+        };
+        let root_addr = thirdparty::node_modules_addr(
+            "",
+            "root-script",
+            "root-script",
+            "1.0.0",
+            "linux",
+            "amd64",
+        )
+        .format();
+        assert!(
+            !deps.contains(&Value::String(root_addr)),
+            "a cycle back to the script-owning package must never become a second Input \
+             pointing at this exact target: {deps:?}"
+        );
+        let shared_count = deps
+            .iter()
+            .filter(|d| {
+                d == &&Value::String(
+                    thirdparty::node_modules_addr(
+                        "", "shared", "shared", "1.0.0", "linux", "amd64",
+                    )
+                    .format(),
+                )
+            })
+            .count();
+        assert_eq!(
+            shared_count, 1,
+            "a diamond dependency (shared via both helper-a and helper-b) must resolve once: \
+             {deps:?}"
+        );
     }
 
     /// A `code-quality` review caught this live: `resolve_npm_edges`
