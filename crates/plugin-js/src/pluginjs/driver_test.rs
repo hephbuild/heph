@@ -113,7 +113,11 @@
 //! are additionally pinned (constants, not read from the host) rather than
 //! left ambient: absent both, Node/ICU falls back to the host's own
 //! timezone/locale, so a `Date`/`Intl`-sensitive test could otherwise pass on
-//! one machine and fail on another with a byte-identical cache key.
+//! one machine and fail on another with a byte-identical cache key. `CI=1` is
+//! also set: this invocation is headless by construction (no TTY, no human
+//! to answer a prompt), which is exactly what `CI` conventionally signals to
+//! a well-behaved CLI tool, and vitest/jest both gate interactive behavior
+//! beyond just watch-mode selection on `isCI`/`isTTY` checks.
 //!
 //! ## Failure reporting
 //!
@@ -122,6 +126,20 @@
 //! `driver_typecheck.rs`'s `tsc_failure_detail`) — the runner's actual
 //! output (assertion diffs, stack traces) must reach the user, never be
 //! swallowed into a bare "failed" with no detail.
+//!
+//! **A wedged runner is also a failure, eventually.** vitest (and jest) are
+//! known to sometimes not exit after finishing their own work — a failed
+//! dependency-optimizer scan leaving a background esbuild service alive is
+//! a confirmed live trigger — and nothing about `proc_exec::output` bounds
+//! how long it waits on the child's own exit. [`RUNNER_TIMEOUT`] (20
+//! minutes, generous on purpose — a safety net against a wedged child, not
+//! a performance budget) kills a runner that outlives it and reports a
+//! named timeout failure, via [`DeadlineCancellable`] composed with the
+//! caller's own cancellation token rather than a bare `tokio::time::timeout`
+//! around the subprocess future — the latter would just drop the future on
+//! expiry and leak the orphaned child; composing tokens instead reuses
+//! `proc_exec`'s existing SIGINT→grace→SIGKILL teardown, the same one a
+//! real user cancellation already goes through.
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -137,7 +155,9 @@ use hplugin::htspec::Spec;
 use hproc::proc_exec;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::pin::Pin;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
@@ -437,6 +457,55 @@ impl ManagedDriver for JsTestDriver {
     }
 }
 
+/// How long a test-runner subprocess gets before it's killed and reported
+/// as a timeout rather than left to hang the whole `heph run`. vitest (and
+/// jest) are known to sometimes not exit after finishing their work — a
+/// failed dependency-optimizer scan leaving a background esbuild service
+/// alive is a confirmed live trigger — and `proc_exec::output` otherwise
+/// waits on the child's own exit with no bound at all. Generous on purpose:
+/// this is a safety net against a wedged child, not a performance budget: a
+/// real, large, slow-but-working suite must never spuriously trip it.
+const RUNNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// A [`Cancellable`] that fires either when `inner` does or once `deadline`
+/// elapses — whichever comes first — without otherwise changing `inner`'s
+/// own semantics. Composing this way (rather than wrapping the subprocess
+/// future in a bare `tokio::time::timeout`) reuses `proc_exec`'s existing
+/// SIGINT→grace→SIGKILL teardown (see `imp_linux.rs`/`imp_macos.rs`), so a
+/// deadline-triggered kill cleans up the child exactly like a real
+/// cancellation does — a raw `timeout` would just drop the future and leak
+/// the orphaned process. The *original* `ctoken` a caller already had is
+/// left untouched: only the derived, request-local copy passed to
+/// `proc_exec::output` ever observes the deadline, so a target that merely
+/// timed out is never mistaken upstream for a user-cancelled run (which
+/// engine code separately keys off the real, unwrapped token).
+struct DeadlineCancellable {
+    inner: Arc<dyn Cancellable + Send + Sync>,
+    deadline: tokio::time::Instant,
+}
+
+impl Cancellable for DeadlineCancellable {
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled() || tokio::time::Instant::now() >= self.deadline
+    }
+
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            tokio::select! {
+                () = self.inner.cancelled() => {}
+                () = tokio::time::sleep_until(self.deadline) => {}
+            }
+        })
+    }
+
+    fn clone_arc(&self) -> Arc<dyn Cancellable + Send + Sync> {
+        Arc::new(DeadlineCancellable {
+            inner: self.inner.clone(),
+            deadline: self.deadline,
+        })
+    }
+}
+
 impl JsTestDriver {
     async fn exec_runner(
         &self,
@@ -461,9 +530,35 @@ impl JsTestDriver {
             setsid: false,
             ctty: false,
         };
-        let output = proc_exec::output(spec, ctoken)
-            .await
-            .with_context(|| format!("wait for test runner ({runner_bin:?})"))?;
+        let deadline = tokio::time::Instant::now() + RUNNER_TIMEOUT;
+        let bounded = DeadlineCancellable {
+            inner: ctoken.clone_arc(),
+            deadline,
+        };
+        // `proc_exec::output` itself errors (rather than returning a
+        // killed-but-`Ok` status) once its cancellable fires — confirmed
+        // live, not assumed. A deadline-triggered kill must be reported as
+        // a clear timeout, not the generic "cancelled" `io::Error` a real
+        // user cancellation would also produce through the same path —
+        // distinguished by checking the *original* `ctoken`, which the
+        // deadline branch never touches.
+        let output = match proc_exec::output(spec, &bounded).await {
+            Ok(output) => output,
+            Err(e) => {
+                if !ctoken.is_cancelled() && tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "js_test: test runner ({runner_bin:?}) did not exit within {}s and was \
+                         killed — this is a known vitest/jest failure mode (a failed \
+                         dependency-optimizer scan can leave a background service alive after \
+                         the test run itself finished); fix whatever the runner's own \
+                         diagnostics reported before this point, or disable its dependency \
+                         optimizer",
+                        RUNNER_TIMEOUT.as_secs(),
+                    );
+                }
+                return Err(e).with_context(|| format!("wait for test runner ({runner_bin:?})"));
+            }
+        };
         if !output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -931,6 +1026,68 @@ mod tests {
             "the test runner must see CI=1 in its environment — heph's execution model is \
              headless by construction, and vitest/jest both gate interactive behavior beyond \
              just watch-mode selection on isCI/isTTY checks: {msg}"
+        );
+    }
+
+    /// Reproduces the real failure mode this session's report described:
+    /// vitest finishing its work but never exiting on its own. Tests
+    /// `DeadlineCancellable` directly against a real subprocess that
+    /// actively ignores `SIGINT` (`trap '' INT`) and sleeps far past any
+    /// reasonable test budget — exactly the shape of a wedged child that
+    /// won't respond to the plain interrupt `proc_exec`'s cancellation
+    /// already sends. Bypasses `exec_runner`'s real (20-minute)
+    /// `RUNNER_TIMEOUT` on purpose — this asserts the *mechanism* works,
+    /// not that the production constant is short. The whole test is
+    /// wrapped in its own outer deadline so a regression here fails loudly
+    /// instead of hanging the suite.
+    #[tokio::test]
+    async fn deadline_cancellable_kills_a_child_that_ignores_sigint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("ignores-sigint.sh");
+        std::fs::write(&script, "#!/bin/sh\ntrap '' INT\nsleep 100\n").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        let spec = proc_exec::Spec {
+            program: script,
+            args: vec![],
+            env: vec![],
+            cwd: dir.path().to_path_buf(),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Piped,
+            stderr: proc_exec::StdioSpec::Piped,
+            setsid: false,
+            ctty: false,
+        };
+        let bounded = DeadlineCancellable {
+            inner: ctoken().clone_arc(),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_millis(200),
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proc_exec::output(spec, &bounded),
+        )
+        .await;
+
+        let inner = result.expect(
+            "DeadlineCancellable must make proc_exec::output return well within the test's own \
+             10s outer budget (200ms deadline + proc_exec's ~2s SIGINT grace) — a hang here \
+             means the deadline-kill path itself is broken",
+        );
+        assert!(
+            inner.is_err(),
+            "a child killed via the deadline must surface as an error, not a normal exit: \
+             {inner:?}"
+        );
+        assert!(
+            bounded.is_cancelled(),
+            "the deadline must have been observed as elapsed"
         );
     }
 
