@@ -376,12 +376,22 @@ impl ManagedDriver for JsTestDriver {
         // Pinning both makes the child's environment part of what the cache
         // key actually reflects (identical on every host), rather than a
         // silent, unhashed source of divergence.
+        // `CI=1`: this invocation is headless by construction — no TTY, no
+        // human able to answer a prompt or press a key — which is exactly
+        // what `CI` conventionally signals to a well-behaved CLI tool.
+        // Defense-in-depth alongside the explicit `run` subcommand above
+        // (which already defeats vitest's *own* interactive-watch-mode
+        // default): vitest and jest both gate other interactive behavior
+        // (reporter live-redraw, keypress handling) on `isCI`/`isTTY`
+        // checks beyond just the watch/run selection, and neither driver
+        // nor its child should ever assume an interactive terminal exists.
         let mut env: HashMap<String, String> = HashMap::new();
         if let Ok(v) = std::env::var("PATH") {
             env.insert("PATH".to_string(), v);
         }
         env.insert("TZ".to_string(), "UTC".to_string());
         env.insert("LANG".to_string(), "C.UTF-8".to_string());
+        env.insert("CI".to_string(), "1".to_string());
 
         let mut args: Vec<OsString> = Vec::new();
         match def.testrunner.as_str() {
@@ -874,6 +884,53 @@ mod tests {
             msg.contains(&format!("CWD={}", pkg_dir_canonical.display())),
             "expected the runner's own cwd to be the package directory, not the workspace root: \
              {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sets_ci_1_in_the_runners_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = dir.path().join("fake-runner.sh");
+        std::fs::write(&fake_runner, "#!/bin/sh\necho \"CI=$CI\" >&2\nexit 1\n")
+            .expect("write fake runner");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_runner)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_runner, perms).expect("chmod");
+        }
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+        let err = driver()
+            .run(run_req, &ct)
+            .await
+            .err()
+            .expect("the fake runner always exits non-zero");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CI=1"),
+            "the test runner must see CI=1 in its environment — heph's execution model is \
+             headless by construction, and vitest/jest both gate interactive behavior beyond \
+             just watch-mode selection on isCI/isTTY checks: {msg}"
         );
     }
 
