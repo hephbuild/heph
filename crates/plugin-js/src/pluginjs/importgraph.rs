@@ -3271,6 +3271,36 @@ mod tests {
         assert_eq!(scan.bare_specifiers[0].package_name, "@lingui/vite-plugin");
     }
 
+    /// Reproduces the exact real-world shape reported live, verbatim (a
+    /// multi-named import, a second plugin call on the next line, and a
+    /// `.ts` config file rather than `.js`) — confirms the special case
+    /// isn't sensitive to import-statement shape.
+    #[test]
+    fn resolve_runner_config_referenced_files_discovers_lingui_ambient_config_ts_multi_import_shape()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = "import { lingui, linguiTransformerBabelPreset } from \"@lingui/vite-plugin\";\n\
+             export default {\n  \
+             plugins: [\n    \
+             lingui(),\n    \
+             babel({ presets: [linguiTransformerBabelPreset()] }),\n  \
+             ],\n  \
+             test: {},\n\
+             };\n";
+        write(dir.path(), "vitest.config.ts", content);
+        write(dir.path(), "lingui.config.ts", "export default {};\n");
+        let config_path = dir.path().join("vitest.config.ts");
+
+        let scan = resolve_runner_config_referenced_files(&config_path, content)
+            .expect("resolve referenced files");
+
+        assert!(
+            scan.files.contains(&dir.path().join("lingui.config.ts")),
+            "{:?}",
+            scan.files
+        );
+    }
+
     /// The other half: when no `lingui.config.*` exists on disk, nothing is
     /// declared — this special case never invents a file or errors, it only
     /// discovers one that's actually there.

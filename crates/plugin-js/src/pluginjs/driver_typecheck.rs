@@ -359,7 +359,17 @@ impl ManagedDriver for JsTypecheckDriver {
             args.push(tsconfig_abs.into_os_string());
         }
 
-        self.exec_tsc(&tsc_bin, args, &env, &req.sandbox_ws_dir, ctoken)
+        // `cwd = sandbox_pkg_dir`, not `sandbox_ws_dir`: every path argument
+        // above is already absolute (`tsconfig_abs`, and `srcs` — sourced
+        // from `group_staged_paths`' list files, themselves always absolute
+        // per `hartifactcontent::unpack`'s `dest = dst.join(...)`), so `cwd`
+        // only matters for `tsc`'s own ambient, `process.cwd()`-relative
+        // behavior (module/type resolution fallbacks) — the package's own
+        // directory is what a real, non-heph `tsc` invocation runs with in
+        // practice. See `driver_test.rs`'s module docs for the confirmed
+        // live bug (`sandbox_ws_dir` broke a plugin's own ambient config
+        // discovery) this mirrors the fix for.
+        self.exec_tsc(&tsc_bin, args, &env, &req.sandbox_pkg_dir, ctoken)
             .await?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })

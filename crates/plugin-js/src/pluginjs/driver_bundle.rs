@@ -533,7 +533,14 @@ impl ManagedDriver for JsBundleDriver {
             args.push(OsString::from(format!("--external:{name}")));
         }
 
-        self.exec_bundler(&bundler_bin, args, &env, &req.sandbox_ws_dir, ctoken)
+        // `cwd = sandbox_pkg_dir`, not `sandbox_ws_dir` — every path
+        // argument above is already absolute (`entry_abs`/`outdir_abs`/
+        // `tsconfig_abs`), so `cwd` only matters for esbuild's own ambient,
+        // `process.cwd()`-relative behavior — the package's own directory is
+        // what a real, non-heph invocation runs with in practice. See
+        // `driver_test.rs`'s module docs for the confirmed live bug this
+        // mirrors the fix for.
+        self.exec_bundler(&bundler_bin, args, &env, &req.sandbox_pkg_dir, ctoken)
             .await?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
