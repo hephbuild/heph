@@ -783,6 +783,55 @@ pub struct RunnerConfigScan {
     pub bare_specifiers: Vec<BareSpecifierSite>,
 }
 
+/// Known third-party plugin packages that do their *own* ambient config-file
+/// discovery at plugin-load time — a cosmiconfig/lilconfig-style filesystem
+/// walk from the project root, independent of anything named in the runner
+/// config's own text — mapped to the exact filenames the plugin's own loader
+/// searches, in search order. Confirmed live: `@lingui/vite-plugin` calls
+/// `@lingui/conf`'s `getConfig()`, which uses `lilconfig("lingui", {
+/// searchPlaces: ["lingui.config.js", "lingui.config.cjs", "lingui.config.ts",
+/// "lingui.config.mjs", "package.json", ".linguirc", …] })` — throwing "No
+/// Lingui config found" at config-*load* time if none exists, even though
+/// nothing in `vitest.config.ts`'s own text ever names `lingui.config.js`.
+/// Every other check in this module scans the config's own bytes; this is
+/// structurally invisible to that by construction, so it's the one class of
+/// missing-Input this file can't discover any other way.
+///
+/// Deliberately a narrow, precedented special case for the one plugin
+/// actually confirmed to need it — a general escape hatch for arbitrary
+/// cosmiconfig-based tools (postcss, tailwind, babel, …) is a bigger,
+/// separate design decision: heph has no user-facing mechanism today to
+/// declare an Input static analysis can't discover, and inventing one is a
+/// CLI-surface/ergonomics call, not something to fold into this scan.
+/// Extend this list only when another confirmed real failure names a new
+/// plugin — don't speculatively add tools nobody's hit yet.
+const KNOWN_PLUGIN_AMBIENT_CONFIG_FILES: &[(&str, &[&str])] = &[(
+    "@lingui/vite-plugin",
+    &[
+        "lingui.config.js",
+        "lingui.config.cjs",
+        "lingui.config.ts",
+        "lingui.config.mjs",
+    ],
+)];
+
+/// If `package_name` is a [`KNOWN_PLUGIN_AMBIENT_CONFIG_FILES`] entry, the
+/// first of its conventional config filenames that actually exists in
+/// `dir` — `None` if the package isn't in the list, or none of its
+/// candidate filenames exist (the plugin has no config yet, or configures
+/// itself another way this narrow special case doesn't cover; either way,
+/// declaring nothing here is no worse than today's behavior, so this never
+/// errors).
+fn known_plugin_ambient_config_file(package_name: &str, dir: &Path) -> Option<PathBuf> {
+    let (_, candidates) = KNOWN_PLUGIN_AMBIENT_CONFIG_FILES
+        .iter()
+        .find(|(name, _)| *name == package_name)?;
+    candidates
+        .iter()
+        .map(|filename| dir.join(filename))
+        .find(|candidate| candidate.is_file())
+}
+
 /// Recursively resolve every additional first-party file a test-runner
 /// config's own content names or imports: [`RUNNER_CONFIG_FILE_KEYS`]
 /// entries, plus a relative `import`/`require` of a shared base config
@@ -827,6 +876,22 @@ pub fn resolve_runner_config_referenced_files(
                         resolved, depth, &mut seen, &mut found, &mut queue,
                     );
                 } else if let Some(package_name) = bare_specifier_package_name(&site.specifier) {
+                    // A handful of known plugins do their *own* ambient
+                    // config-file discovery at plugin-load time (a
+                    // cosmiconfig/lilconfig-style filesystem walk from the
+                    // project root), entirely independent of anything named
+                    // in this config file's own text — invisible to every
+                    // other check in this function by construction. Only
+                    // probed at `depth == 0` (this config's own directory,
+                    // which is the project root in the ordinary case those
+                    // tools document — see
+                    // `KNOWN_PLUGIN_AMBIENT_CONFIG_FILES`'s doc for why this
+                    // is a narrow special case, not a general mechanism.
+                    if depth == 0
+                        && let Some(filename) = known_plugin_ambient_config_file(&package_name, dir)
+                    {
+                        found.insert(filename);
+                    }
                     bare_specifiers.push(BareSpecifierSite {
                         file: path.to_string_lossy().replace('\\', "/"),
                         specifier: site.specifier,
@@ -3139,6 +3204,51 @@ mod tests {
         assert_eq!(scan.bare_specifiers.len(), 1);
         assert_eq!(scan.bare_specifiers[0].package_name, "@vitejs/plugin-react");
         assert_eq!(scan.bare_specifiers[0].specifier, "@vitejs/plugin-react");
+    }
+
+    /// Confirmed live: `@lingui/vite-plugin` calls `@lingui/conf`'s
+    /// `getConfig()` at plugin-*load* time, which does its own ambient
+    /// filesystem walk for `lingui.config.js` — never named anywhere in
+    /// `vitest.config.ts`'s own text, so it's invisible to every other check
+    /// in this scan. `resolve_runner_config_referenced_files` must still
+    /// discover and declare it when the plugin is imported and the file
+    /// exists next to the config.
+    #[test]
+    fn resolve_runner_config_referenced_files_discovers_lingui_ambient_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = "import { lingui } from '@lingui/vite-plugin';\n\
+             export default { plugins: [lingui()], test: {} };\n";
+        write(dir.path(), "vitest.config.ts", content);
+        write(dir.path(), "lingui.config.js", "module.exports = {};\n");
+        let config_path = dir.path().join("vitest.config.ts");
+
+        let scan = resolve_runner_config_referenced_files(&config_path, content)
+            .expect("resolve referenced files");
+
+        assert!(
+            scan.files.contains(&dir.path().join("lingui.config.js")),
+            "the plugin's own ambient config must be discovered: {:?}",
+            scan.files
+        );
+        assert_eq!(scan.bare_specifiers[0].package_name, "@lingui/vite-plugin");
+    }
+
+    /// The other half: when no `lingui.config.*` exists on disk, nothing is
+    /// declared — this special case never invents a file or errors, it only
+    /// discovers one that's actually there.
+    #[test]
+    fn resolve_runner_config_referenced_files_lingui_plugin_without_a_config_file_declares_nothing()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = "import { lingui } from '@lingui/vite-plugin';\n\
+             export default { plugins: [lingui()], test: {} };\n";
+        write(dir.path(), "vitest.config.ts", content);
+        let config_path = dir.path().join("vitest.config.ts");
+
+        let scan = resolve_runner_config_referenced_files(&config_path, content)
+            .expect("resolve referenced files");
+
+        assert!(scan.files.is_empty(), "{:?}", scan.files);
     }
 
     /// The single most important test in this milestone (per the task): the
