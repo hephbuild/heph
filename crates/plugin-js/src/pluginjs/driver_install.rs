@@ -23,7 +23,7 @@
 //!   tracked as part of the not-yet-built package-manager-toolchain
 //!   milestone (the design doc's `pkgmanager=host` escape hatch).
 //!
-//! **Platform in the cache key.** `goos`/`goarch` are hashed (and carried as
+//! **Platform in the cache key.** `os`/`arch` are hashed (and carried as
 //! addr args, see `thirdparty::thirdparty_addr`) for *every* third-party
 //! package, not only ones the lockfile marks `os`/`cpu`-restricted. A plain
 //! source npm package is byte-identical across platforms so this costs a
@@ -115,11 +115,11 @@ struct JsInstallSpec {
     /// Building machine's OS (canonical Go/OCI naming) — part of the cache
     /// key, see module docs.
     #[spec(required)]
-    goos: String,
+    os: String,
     /// Building machine's architecture (canonical Go/OCI naming) — part of
     /// the cache key, see module docs.
     #[spec(required)]
-    goarch: String,
+    arch: String,
     /// Whether the package declares an install/preinstall/postinstall
     /// lifecycle script (from the lockfile: npm's `hasInstallScript` /
     /// pnpm's `requiresBuild`).
@@ -136,8 +136,8 @@ struct JsInstallDef {
     version: String,
     integrity: String,
     resolved: String,
-    goos: String,
-    goarch: String,
+    os: String,
+    arch: String,
     has_install_script: bool,
     scripts_allowed: bool,
 }
@@ -211,8 +211,8 @@ impl ManagedDriver for JsInstallDriver {
             version: spec.version,
             integrity: spec.integrity,
             resolved: spec.resolved,
-            goos: spec.goos,
-            goarch: spec.goarch,
+            os: spec.os,
+            arch: spec.arch,
             has_install_script: spec.has_install_script,
             scripts_allowed: run_script,
         };
@@ -613,8 +613,8 @@ mod tests {
                 "resolved".to_string(),
                 Value::String("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
             ),
-            ("goos".to_string(), Value::String("linux".to_string())),
-            ("goarch".to_string(), Value::String("amd64".to_string())),
+            ("os".to_string(), Value::String("linux".to_string())),
+            ("arch".to_string(), Value::String("amd64".to_string())),
         ]);
         for (k, v) in extra {
             c.insert((*k).to_string(), v.clone());
@@ -725,8 +725,8 @@ mod tests {
         let resp_darwin = driver()
             .parse(
                 make_parse_request(&[
-                    ("goos", Value::String("darwin".to_string())),
-                    ("goarch", Value::String("arm64".to_string())),
+                    ("os", Value::String("darwin".to_string())),
+                    ("arch", Value::String("arm64".to_string())),
                 ]),
                 &ct,
             )

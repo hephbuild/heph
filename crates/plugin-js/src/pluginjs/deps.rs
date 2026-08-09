@@ -45,7 +45,7 @@ pub struct ResolvedDep {
 /// maps a workspace member's package **name**
 /// to its own `package_info` target addr string — an internal dependency is
 /// recognized by name, the same way Node resolves a workspace-hoisted
-/// sibling. `goos`/`goarch` pin the platform of any third-party `js_install`
+/// sibling. `os`/`arch` pin the platform of any third-party `js_install`
 /// addr this package's deps resolve to (see `thirdparty` module docs).
 ///
 /// A required dependency (`"dependencies"`/`"devDependencies"`) with no
@@ -83,8 +83,8 @@ pub fn resolve_package_deps(
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
-    goos: &str,
-    goarch: &str,
+    os: &str,
+    arch: &str,
 ) -> anyhow::Result<Vec<ResolvedDep>> {
     let mut out = Vec::new();
     for (group, deps) in manifest.dependency_groups() {
@@ -97,8 +97,8 @@ pub fn resolve_package_deps(
                 lockfile,
                 resolved_graph,
                 member_addrs_by_name,
-                goos,
-                goarch,
+                os,
+                arch,
             )? {
                 out.push(ResolvedDep {
                     group,
@@ -144,8 +144,8 @@ pub fn resolve_one_dependency(
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
-    goos: &str,
-    goarch: &str,
+    os: &str,
+    arch: &str,
 ) -> anyhow::Result<Option<String>> {
     if let Some(addr) = member_addrs_by_name.get(name) {
         return Ok(Some(addr.clone()));
@@ -187,7 +187,7 @@ pub fn resolve_one_dependency(
             version,
         }) => {
             if let Some(resolved) = resolved_graph.and_then(|g| g.get(&resolved_name, &version))
-                && !platform::matches_platform(&resolved.os, &resolved.cpu, goos, goarch)
+                && !platform::matches_platform(&resolved.os, &resolved.cpu, os, arch)
             {
                 if manifest.is_optional(&resolved_name) {
                     return Ok(None);
@@ -195,7 +195,7 @@ pub fn resolve_one_dependency(
                 anyhow::bail!(
                     "{lockfile_pkg:?}: `{name}` resolves to {resolved_name}@{version}, which is \
                      restricted to os={:?} cpu={:?} — that does not include the current \
-                     platform {goos}/{goarch}",
+                     platform {os}/{arch}",
                     resolved.os,
                     resolved.cpu
                 );
@@ -215,8 +215,8 @@ pub fn resolve_one_dependency(
                 name,
                 &resolved_name,
                 &version,
-                goos,
-                goarch,
+                os,
+                arch,
             );
             Ok(Some(addr.format()))
         }
@@ -280,8 +280,8 @@ pub fn resolve_transitive_closure(
     manifest: &PackageManifest,
     lockfile: &Lockfile,
     resolved_graph: &ResolvedGraph,
-    goos: &str,
-    goarch: &str,
+    os: &str,
+    arch: &str,
 ) -> anyhow::Result<Vec<String>> {
     let seeds = lockfile::direct_dep_seed_keys(lockfile, lockfile_pkg, manifest)
         .with_context(|| format!("seeding transitive third-party closure for {lockfile_pkg:?}"))?;
@@ -289,8 +289,7 @@ pub fn resolve_transitive_closure(
         .transitive_reachable(seeds)
         .into_iter()
         .map(|(name, version)| {
-            thirdparty::node_modules_addr(consuming_pkg, &name, &name, &version, goos, goarch)
-                .format()
+            thirdparty::node_modules_addr(consuming_pkg, &name, &name, &version, os, arch).format()
         })
         .collect())
 }
@@ -395,7 +394,7 @@ mod tests {
         assert!(deps[0].addr.contains("name=lodash"), "{}", deps[0].addr);
         assert!(deps[0].addr.contains("version=4.17.21"), "{}", deps[0].addr);
         assert!(deps[0].addr.contains("pkg=packages/a"), "{}", deps[0].addr);
-        assert!(deps[0].addr.contains("goos=linux"), "{}", deps[0].addr);
+        assert!(deps[0].addr.contains("os=linux"), "{}", deps[0].addr);
     }
 
     /// A minimal npm `package-lock.json` where `a` declares
