@@ -351,7 +351,16 @@ impl ManagedDriver for JsLintDriver {
         }
         args.extend(srcs.into_iter().map(OsString::from));
 
-        self.exec_linter(&linter_bin, args, &env, &req.sandbox_ws_dir, ctoken)
+        // `cwd = sandbox_pkg_dir`, not `sandbox_ws_dir` — every path
+        // argument above is already absolute (`config_abs`, and `srcs`,
+        // both `sandbox_ws_dir.join(...)`/`group_staged_paths`-sourced), so
+        // `cwd` only matters for the linter's own ambient,
+        // `process.cwd()`-relative behavior (eslint's own config-cascade
+        // walk, a plugin's ambient config discovery) — the package's own
+        // directory is what a real, non-heph invocation runs with in
+        // practice. See `driver_test.rs`'s module docs for the confirmed
+        // live bug this mirrors the fix for.
+        self.exec_linter(&linter_bin, args, &env, &req.sandbox_pkg_dir, ctoken)
             .await?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
