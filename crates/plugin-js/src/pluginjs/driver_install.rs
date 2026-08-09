@@ -70,7 +70,37 @@
 //! hash, but two unverified fetches of the same URL on different days could
 //! in principle diverge with no error). `fetch_and_extract`'s
 //! `tracing::warn!` is the only trace this leaves.
+//!
+//! **Sibling `node_modules` for lifecycle scripts.** A package's own
+//! `postinstall` routinely needs its sibling `dependencies`/
+//! `optionalDependencies` present as real `node_modules/<name>` entries —
+//! the flagship shape: a small loader package (`esbuild`, `sharp`,
+//! `@swc/core`, and many more) `require.resolve()`s a platform-specific
+//! `optionalDependencies` sibling to find its own native binary. Confirmed
+//! live: `esbuild`'s own postinstall fails outright without this, on a
+//! *self*-reference (`downloadedBinPath()`'s `require.resolve("esbuild")`)
+//! before it ever reaches its own network-fallback logic for the missing
+//! sibling. `Provider::thirdparty_install_spec` resolves these (only when a
+//! lifecycle script will actually run — zero cost otherwise) and wires each
+//! as a `Standard` `Input`, reusing the *same* `group`-relocation mechanism
+//! (`thirdparty::node_modules_addr` with an empty `consuming_pkg`) already
+//! used for a consumer's own `node_modules` — not a bespoke mechanism, and
+//! not throwaway relative to the eventual M2+ sandboxed script-runner,
+//! which will need the identical input-declaration shape. Default
+//! placement (no `unpack_root` redirection): the sandbox workspace root is
+//! already an ancestor of `sandbox_pkg_dir`, so the relocated siblings land
+//! at `sandbox_ws_dir/node_modules/<name>/...`, reachable by Node's own
+//! ancestor `node_modules` resolution walk from a script running with
+//! `current_dir` unchanged (`dest_dir`) — no `cwd` redirection needed.
+//! `run()`'s only extra step is one imperative filesystem symlink,
+//! `sandbox_ws_dir/node_modules/<own-name> -> dest_dir`, for the
+//! self-reference case (can't be a declared `Input` — that would be a
+//! self-referential dependency edge) — skipped outright if a resolved
+//! sibling already claims that exact name (see
+//! `prepare_node_modules_for_scripts`'s doc for why this collision must
+//! never be resolved silently by filesystem-write-ordering luck).
 
+use crate::pluginjs::thirdparty;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -78,10 +108,10 @@ use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
-use hplugin::driver::targetdef::{CacheConfig, Output, TargetDef};
+use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse,
+    ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
 use sha1::Sha1;
@@ -128,6 +158,24 @@ struct JsInstallSpec {
     /// script for this exact package. Computed by `Provider::get`, not by
     /// this driver — it stays a context-free executor of what it's told.
     scripts_allowed: bool,
+    /// Relocated `node_modules/<name>` addrs for this package's own
+    /// resolved `dependencies`/`optionalDependencies` — only non-empty when
+    /// a lifecycle script will actually run. See module docs' "Sibling
+    /// `node_modules` for lifecycle scripts" section. Each addr's own
+    /// `local` arg (`thirdparty::parse_node_modules_addr`) already carries
+    /// the bare `node_modules` entry name it lands at — a `code-quality`
+    /// review found that a *second*, separately-serialized `sibling_names`
+    /// field here (matched to this one only by both sides pushing in the
+    /// same loop order in `provider.rs`) was redundant and could
+    /// theoretically desync across the `TargetSpec.config` wire boundary;
+    /// `run()` derives sibling names from these addrs directly instead.
+    deps: Vec<String>,
+    /// Human-readable reasons an optional sibling was not wired as a
+    /// dependency (platform mismatch, or simply absent from the lockfile) —
+    /// folded into the error if a lifecycle script subsequently fails, so
+    /// the failure names what wasn't available instead of leaving that to
+    /// an opaque `Cannot find module`.
+    skipped_deps: Vec<String>,
 }
 
 #[derive(Clone, Hash, serde::Serialize, serde::Deserialize)]
@@ -140,12 +188,18 @@ struct JsInstallDef {
     arch: String,
     has_install_script: bool,
     scripts_allowed: bool,
+    deps: Vec<String>,
+    skipped_deps: Vec<String>,
 }
 
 /// Bump to invalidate every cached `js_install` artifact whenever the
 /// on-disk artifact layout (extracted tree shape, stripped tarball root,
-/// lifecycle-script handling) changes.
-const JS_INSTALL_FORMAT_VERSION: u32 = 1;
+/// lifecycle-script handling) changes. Bumped for the sibling-`node_modules`
+/// materialization: a package with a lifecycle script now runs it with
+/// different files present around it than before (siblings notably,
+/// including for packages that previously produced a *broken* install with
+/// no error — a real, deliberate re-fetch cost, not a bug).
+const JS_INSTALL_FORMAT_VERSION: u32 = 2;
 
 pub struct JsInstallDriver;
 
@@ -206,6 +260,24 @@ impl ManagedDriver for JsInstallDriver {
         // bust its cache for zero behavior change.
         let run_script = spec.has_install_script && spec.scripts_allowed;
 
+        // Each `deps` addr becomes a `Standard` Input at default placement —
+        // no `unpack_root` annotation, so the engine materializes it at
+        // `sandbox_ws_dir/node_modules/<name>/...` (see module docs). Only
+        // ever non-empty when `Provider::thirdparty_install_spec` resolved
+        // siblings for a lifecycle script that will actually run.
+        let mut inputs = Vec::with_capacity(spec.deps.len());
+        for (i, addr_str) in spec.deps.iter().enumerate() {
+            inputs.push(Input {
+                r#ref: TargetAddr::parse(addr_str, &addr.package)
+                    .with_context(|| format!("parse node_modules dep addr {addr_str}"))?,
+                mode: InputMode::Standard,
+                origin_id: format!("dep|node_modules|{i}"),
+                annotations: Default::default(),
+                hashed: true,
+                runtime: true,
+            });
+        }
+
         let def = JsInstallDef {
             name: spec.name,
             version: spec.version,
@@ -215,6 +287,8 @@ impl ManagedDriver for JsInstallDriver {
             arch: spec.arch,
             has_install_script: spec.has_install_script,
             scripts_allowed: run_script,
+            deps: spec.deps,
+            skipped_deps: spec.skipped_deps,
         };
 
         let hash = {
@@ -233,9 +307,13 @@ impl ManagedDriver for JsInstallDriver {
                 addr: addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                // No inputs: the bytes come from the network, not from
-                // other targets — same as `http_fetch`.
-                inputs: vec![],
+                // Empty for the overwhelming majority of `js_install`
+                // targets (the bytes come from the network, not from other
+                // targets — same as `http_fetch`); non-empty only for a
+                // package whose lifecycle script needs sibling
+                // `node_modules` entries materialized — see module docs'
+                // "Sibling `node_modules` for lifecycle scripts" section.
+                inputs,
                 outputs: vec![Output {
                     group: String::new(),
                     paths: vec![Path {
@@ -289,12 +367,39 @@ impl ManagedDriver for JsInstallDriver {
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<JsInstallDef>();
         let dest_dir = req.sandbox_pkg_dir.clone();
+        let sandbox_ws_dir = req.sandbox_ws_dir.clone();
 
         let resolved = def.resolved.clone();
         let integrity = def.integrity.clone();
         let name = def.name.clone();
         let version = def.version.clone();
+        let skipped_deps = def.skipped_deps.clone();
         let run_script = def.has_install_script && def.scripts_allowed;
+
+        // Derived from `deps` itself, not a second stored field: each addr
+        // already carries its own bare `node_modules` entry name (see
+        // `JsInstallDef::deps`'s doc for why a separate `sibling_names`
+        // field was removed). These addrs are always our own construction
+        // (`Provider::thirdparty_install_spec`), never user input, so a
+        // parse failure here is this driver's own bug, not a runtime
+        // condition to tolerate.
+        let sibling_names: Vec<String> = def
+            .deps
+            .iter()
+            .map(|addr_str| {
+                let addr = hmodel::htaddr::parse_addr(addr_str)
+                    .with_context(|| format!("parse own node_modules dep addr {addr_str}"))?;
+                thirdparty::parse_node_modules_addr(&addr)
+                    .map(|r| r.local_name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "addr {addr_str} is not a node_modules relocation addr — this \
+                             driver only ever constructs `deps` from those"
+                        )
+                    })
+            })
+            .collect::<anyhow::Result<Vec<String>>>()
+            .context("derive sibling names from deps")?;
 
         // Download + verify + extract (+ maybe run an allow-listed script) is
         // blocking IO/CPU; keep it off the async runtime, same as
@@ -303,9 +408,12 @@ impl ManagedDriver for JsInstallDriver {
         let work = tokio::task::spawn_blocking(move || {
             fetch_and_extract(&resolved, &integrity, &dest_dir)?;
             if run_script {
-                run_lifecycle_scripts(&dest_dir, &name).with_context(|| {
-                    format!("run allow-listed lifecycle scripts for {name}@{version}")
-                })?;
+                prepare_node_modules_for_scripts(&sandbox_ws_dir, &dest_dir, &name, &sibling_names)
+                    .with_context(|| {
+                        format!("prepare node_modules for {name}@{version}'s lifecycle scripts")
+                    })?;
+                run_lifecycle_scripts(&dest_dir, &name)
+                    .with_context(|| lifecycle_failure_context(&name, &version, &skipped_deps))?;
             }
             anyhow::Ok(())
         });
@@ -529,6 +637,83 @@ fn fetch_and_extract(url: &str, integrity: &str, dest_dir: &StdPath) -> anyhow::
     extract_tarball(&bytes, dest_dir).with_context(|| format!("extract tarball from {url}"))
 }
 
+/// Give a lifecycle script a real, npm-shaped `node_modules` to resolve
+/// against: `Provider::thirdparty_install_spec` already declared this
+/// package's resolved siblings as `Standard` `Input`s, so by the time this
+/// runs the engine has materialized them at
+/// `sandbox_ws_dir/node_modules/<name>/...` — reachable from a script
+/// running at `dest_dir` via Node's own ancestor `node_modules` walk, no
+/// action needed here. The one thing that *can't* come from a declared
+/// Input is this package resolving its *own* name (a package that
+/// `require()`s itself — see module docs' `esbuild` example): that would be
+/// a self-referential dependency edge, so instead this creates one plain
+/// filesystem symlink, `sandbox_ws_dir/node_modules/<name> -> dest_dir`,
+/// directly.
+///
+/// **Skipped outright, not overwritten, on any name collision with an
+/// already-resolved sibling.** A package whose own bare name happens to
+/// match one of its resolved `dependencies`/`optionalDependencies` (legal
+/// npm, if unusual) would otherwise have this symlink and the sibling's own
+/// materialized directory both target the identical
+/// `node_modules/<name>` path — and a hermeticity review found that the two
+/// supported sandbox backends resolve that collision *differently*: the
+/// OS-copy backend's plain `symlink()` call fails loudly (`AlreadyExists`,
+/// since the sibling's directory is already there), but the FUSE backend's
+/// overlay `symlink` handler succeeds and silently shadows the sibling's
+/// entire directory in `readdir` (upper-wins-on-name-collision). Two
+/// backends producing different behavior — one loud, one silent — for
+/// identical input is exactly what this codebase's `.claude/rust.md`
+/// portability rules exist to catch; skipping unconditionally on collision
+/// (favoring the real, already-resolved sibling over an unnecessary
+/// self-reference) sidesteps the divergence rather than leaning on either
+/// backend's specific error behavior.
+fn prepare_node_modules_for_scripts(
+    sandbox_ws_dir: &StdPath,
+    dest_dir: &StdPath,
+    own_name: &str,
+    sibling_names: &[String],
+) -> anyhow::Result<()> {
+    if sibling_names.iter().any(|n| n == own_name) {
+        return Ok(());
+    }
+    // `own_name` is lockfile-recorded package.json content, the same
+    // untrusted-input class `extract_tarball`'s own `strip_tarball_root`
+    // zip-slip-guards for tarball entry paths — reject a `..` component or
+    // an absolute path before it ever reaches `Path::join`, the same way,
+    // rather than trust a registry-published name can't misbehave.
+    anyhow::ensure!(
+        StdPath::new(own_name)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_))),
+        "js_install: package name {own_name:?} contains a path component that escapes \
+         node_modules — refusing to create a self-reference symlink for it"
+    );
+    let own_entry = sandbox_ws_dir.join("node_modules").join(own_name);
+    if let Some(parent) = own_entry.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create dir {parent:?}"))?;
+    }
+    std::os::unix::fs::symlink(dest_dir, &own_entry)
+        .with_context(|| format!("create self-reference symlink {own_entry:?} -> {dest_dir:?}"))
+}
+
+/// Error context for a failed lifecycle script — names which optional
+/// siblings (if any) were skipped, so a failure that's actually "a missing
+/// module" doesn't read as opaque: `Provider::thirdparty_install_spec`
+/// already computed *why* each one was skipped (platform mismatch, or
+/// simply absent from the lockfile), and that reasoning is otherwise
+/// invisible once it silently didn't become a dependency edge.
+fn lifecycle_failure_context(name: &str, version: &str, skipped_deps: &[String]) -> String {
+    let mut msg = format!("run allow-listed lifecycle scripts for {name}@{version}");
+    if !skipped_deps.is_empty() {
+        msg.push_str(&format!(
+            "\n\nnote: the following optional siblings were not available and were skipped — \
+             if the script above fails because of a missing module, this is likely why:\n  - {}",
+            skipped_deps.join("\n  - ")
+        ));
+    }
+    msg
+}
+
 /// Best-effort execution of an allow-listed package's own
 /// `preinstall`/`install`/`postinstall` scripts (npm's lifecycle order), via
 /// the host's `sh` and `PATH`. **Not hermetic or sandboxed** — see module
@@ -745,6 +930,40 @@ mod tests {
             &resp.target_def.outputs[0].paths[0].content,
             Content::DirPath(p) if p == "@heph/js/thirdparty/lodash@4.17.21"
         ));
+    }
+
+    /// The engine-facing half of the sibling-`node_modules` design: each
+    /// `deps` addr `Provider::thirdparty_install_spec` resolved must become
+    /// a `Standard`, `hashed`, `runtime` `Input` at *default* placement (no
+    /// `unpack_root` annotation) — see module docs for why default
+    /// placement (not a redirected `exec_` area) is exactly what makes
+    /// these siblings reachable from a lifecycle script without any `cwd`
+    /// change.
+    #[tokio::test]
+    async fn parse_declares_inputs_for_deps_when_present() {
+        let ct = ctoken();
+        let dep_addr = crate::pluginjs::thirdparty::node_modules_addr(
+            "", "left-pad", "left-pad", "1.0.0", "linux", "amd64",
+        )
+        .format();
+        let req =
+            make_parse_request(&[("deps", Value::List(vec![Value::String(dep_addr.clone())]))]);
+        let resp = driver().parse(req, &ct).await.unwrap();
+        assert_eq!(resp.target_def.inputs.len(), 1);
+        let input = &resp.target_def.inputs[0];
+        assert_eq!(input.r#ref.r#ref.format(), dep_addr);
+        assert!(matches!(input.mode, InputMode::Standard));
+        assert!(input.hashed, "a sibling's content must feed the cache key");
+        assert!(
+            input.runtime,
+            "must actually be materialized before run(), not just hashed"
+        );
+        assert_eq!(
+            input.annotations,
+            Default::default(),
+            "default placement — no unpack_root redirection — is what makes ws_dir/node_modules \
+             an ancestor of sandbox_pkg_dir, reachable with no cwd change"
+        );
     }
 
     #[tokio::test]
@@ -1076,6 +1295,129 @@ mod tests {
             std::fs::read_to_string(dir.path().join("index.js")).expect("read extracted file"),
             "module.exports = 1;"
         );
+    }
+
+    // ---- prepare_node_modules_for_scripts / lifecycle_failure_context ----
+
+    #[test]
+    fn prepare_node_modules_for_scripts_creates_self_reference_symlink() {
+        let ws_dir = tempfile::tempdir().expect("tempdir");
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dest_dir.path().join("index.js"), b"module.exports = 1;")
+            .expect("write marker file in dest_dir");
+
+        prepare_node_modules_for_scripts(ws_dir.path(), dest_dir.path(), "esbuild", &[])
+            .expect("must create the self-reference symlink");
+
+        let entry = ws_dir.path().join("node_modules").join("esbuild");
+        assert!(
+            entry.is_symlink(),
+            "node_modules/<own-name> must be a symlink, not a copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(entry.join("index.js")).expect("read through the symlink"),
+            "module.exports = 1;",
+            "the symlink must resolve to dest_dir's own content"
+        );
+    }
+
+    #[test]
+    fn prepare_node_modules_for_scripts_handles_a_scoped_own_name() {
+        let ws_dir = tempfile::tempdir().expect("tempdir");
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+
+        prepare_node_modules_for_scripts(ws_dir.path(), dest_dir.path(), "@esbuild/linux-x64", &[])
+            .expect("a scoped own-name must create its parent scope dir first");
+
+        assert!(
+            ws_dir
+                .path()
+                .join("node_modules/@esbuild/linux-x64")
+                .is_symlink()
+        );
+    }
+
+    /// The hermeticity finding this guards: if a resolved sibling already
+    /// claims this exact `node_modules` entry name, creating the
+    /// self-symlink anyway resolves the collision differently on the two
+    /// supported sandbox backends (loud `AlreadyExists` on one, a silent
+    /// shadow on the other) — skipping unconditionally sidesteps the
+    /// divergence rather than depending on either backend's behavior.
+    #[test]
+    fn prepare_node_modules_for_scripts_skips_self_symlink_on_sibling_name_collision() {
+        let ws_dir = tempfile::tempdir().expect("tempdir");
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+        // Simulate the sibling's own materialized directory already being
+        // there (as the engine's Input machinery would have put it).
+        std::fs::create_dir_all(ws_dir.path().join("node_modules/esbuild"))
+            .expect("simulate sibling materialization");
+        std::fs::write(
+            ws_dir.path().join("node_modules/esbuild/real-sibling.js"),
+            b"real",
+        )
+        .expect("write sibling marker");
+
+        prepare_node_modules_for_scripts(
+            ws_dir.path(),
+            dest_dir.path(),
+            "esbuild",
+            &["esbuild".to_string()],
+        )
+        .expect("collision must be a silent skip, not an error");
+
+        let entry = ws_dir.path().join("node_modules/esbuild");
+        assert!(
+            !entry.is_symlink(),
+            "the real sibling directory must be left alone, not replaced by a symlink"
+        );
+        assert!(
+            entry.join("real-sibling.js").is_file(),
+            "the sibling's own content must survive untouched"
+        );
+    }
+
+    /// A `code-quality` review caught this: `own_name` is lockfile-recorded
+    /// `package.json` content — the same untrusted-input class
+    /// `extract_tarball`'s `strip_tarball_root` already zip-slip-guards for
+    /// tarball entry paths — and nothing stopped it being joined straight
+    /// onto a real sandbox path via `Path::join`.
+    #[test]
+    fn prepare_node_modules_for_scripts_rejects_a_path_escaping_name() {
+        let ws_dir = tempfile::tempdir().expect("tempdir");
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+        let escape_dir = tempfile::tempdir().expect("tempdir");
+
+        let err = prepare_node_modules_for_scripts(
+            ws_dir.path(),
+            dest_dir.path(),
+            &format!("../../../{}/pwned", escape_dir.path().display()),
+            &[],
+        )
+        .expect_err("a `..`-containing name must be rejected, not joined onto a real path");
+        assert!(format!("{err:#}").contains("escapes"), "{err:#}");
+        assert!(
+            !escape_dir.path().join("pwned").exists(),
+            "no symlink may land outside sandbox_ws_dir via the name"
+        );
+    }
+
+    #[test]
+    fn lifecycle_failure_context_names_skipped_siblings() {
+        let msg = lifecycle_failure_context(
+            "esbuild",
+            "0.25.12",
+            &["@esbuild/win32-x64 (restricted to os=[\"win32\"], current platform is linux/amd64)"
+                .to_string()],
+        );
+        assert!(msg.contains("esbuild@0.25.12"));
+        assert!(msg.contains("@esbuild/win32-x64"));
+        assert!(msg.contains("skipped"));
+    }
+
+    #[test]
+    fn lifecycle_failure_context_omits_the_note_when_nothing_was_skipped() {
+        let msg = lifecycle_failure_context("lodash", "4.17.21", &[]);
+        assert!(!msg.contains("skipped"));
     }
 
     // ---- run_lifecycle_scripts ----
