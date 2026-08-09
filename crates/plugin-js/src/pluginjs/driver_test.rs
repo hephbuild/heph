@@ -468,13 +468,16 @@ impl JsTestDriver {
 }
 
 /// Build the human-readable detail for a failed test-runner invocation —
-/// both stdout and stderr tails included, mirroring
+/// both stdout and stderr included (head and tail, see
+/// [`hplugin::error::head_and_tail_lines`]), mirroring
 /// `driver_typecheck.rs`'s `tsc_failure_detail` for the identical reason: a
 /// failing test's actual output (assertion diffs, stack traces) must reach
-/// the user, never come back silently blank.
+/// the user, never come back silently blank — including an exception's
+/// leading name/message when a long serialized stack would otherwise push
+/// it out of a tail-only cap.
 fn test_failure_detail(stdout: &str, stderr: &str) -> String {
-    let stdout_tail = hplugin::error::last_n_lines(stdout.trim(), 60);
-    let stderr_tail = hplugin::error::last_n_lines(stderr.trim(), 60);
+    let stdout_tail = hplugin::error::head_and_tail_lines(stdout.trim(), 60);
+    let stderr_tail = hplugin::error::head_and_tail_lines(stderr.trim(), 60);
     let mut detail = String::new();
     if !stdout_tail.is_empty() {
         detail.push_str("stdout:\n");
@@ -951,5 +954,27 @@ mod tests {
             .expect("a real failing test must fail the driver, not succeed silently");
         let msg = format!("{err:#}");
         assert!(msg.contains("js_test failed"), "{msg}");
+    }
+
+    #[test]
+    fn test_failure_detail_keeps_the_leading_exception_past_a_long_stack_dump() {
+        // Reproduces a real report: vitest's own error dump prints the
+        // exception name/message first, then a JSON-serialized stack with
+        // one multi-line frame per entry — easily 60+ lines on its own. A
+        // tail-only cap silently dropped the name/message and left only
+        // trailing frames, so the user saw no error at all, just orphaned
+        // `file:`/`line:`/`column:` fields.
+        let mut stderr = String::from("Error: Failed to resolve entry for package\n");
+        for i in 0..80 {
+            stderr.push_str(&format!(
+                "    {{\n      method: 'frame{i}',\n      file: 'f{i}.js',\n      line: {i},\n      column: 3\n    }},\n"
+            ));
+        }
+        let detail = test_failure_detail("", &stderr);
+        assert!(
+            detail.contains("Error: Failed to resolve entry for package"),
+            "{detail}"
+        );
+        assert!(detail.contains("lines omitted"), "{detail}");
     }
 }
