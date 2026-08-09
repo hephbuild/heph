@@ -1331,30 +1331,18 @@ impl Provider {
             resolved.cpu
         );
 
-        // `js_install` fetches the tarball and verifies it against this
-        // integrity hash — with none recorded, there is nothing safe to
-        // verify against, so this must fail here with a clear cause rather
-        // than surface as a cryptic "no recognized integrity algorithm in
-        // \"\"" once `js_install` actually tries to parse the empty string.
-        // An empty `integrity` this deep (after `find_resolved_graph_for`
+        // Empty `integrity` this deep (after `find_resolved_graph_for`
         // already searched every lockfile discovered in the workspace for a
         // populated entry) means the *lockfile itself* never recorded one
         // for this package anywhere — a real, observed npm shape, not a
         // heph bug: `npm install` (unlike `npm ci`) can satisfy a package
         // from its local cache and strip `resolved`/`integrity` from an
         // existing lockfile entry instead of re-populating them (a
-        // long-standing npm CLI bug — npm/cli#4263, #4460, #6301).
-        anyhow::ensure!(
-            !resolved.integrity.is_empty(),
-            "js provider: {name}@{version}'s {} entry has no integrity/resolved recorded, so \
-             there is nothing to verify its download against — this is not a heph bug; it's a \
-             known npm behavior (npm/cli#4263) where `npm install` can strip these fields when \
-             a package is satisfied from npm's local cache instead of the registry. Regenerate \
-             the lockfile to fix it: `npm install {name}@{version}` (repopulates just this \
-             package), or delete node_modules and the lockfile and reinstall from scratch",
-            Lockfile::filename(self.pkgmanager),
-        );
-
+        // long-standing npm CLI bug — npm/cli#4263, #4460, #6301). Rather
+        // than block the install on a lockfile heph didn't write and can't
+        // fix, `js_install` proceeds unverified in that case — see
+        // `driver_install::fetch_and_extract`'s doc for the tracing
+        // breadcrumb this leaves.
         let resolved_url = resolved
             .resolved
             .clone()
@@ -5498,12 +5486,12 @@ mod tests {
     /// real, live npm bug: `npm install`, unlike `npm ci`, can strip
     /// `resolved`/`integrity` from an existing entry when it's satisfied
     /// from npm's local cache — npm/cli#4263/#4460/#6301) — there is no
-    /// "real" entry anywhere to fall back to. Must fail with a clear,
-    /// actionable cause naming the npm bug and how to fix it, not the raw
-    /// `no recognized integrity algorithm in ""` `js_install` produces
-    /// once it tries to parse the empty string itself.
+    /// "real" entry anywhere to fall back to. `Provider::get` still resolves
+    /// the `js_install` spec (with an empty `integrity`) rather than block
+    /// the install on a lockfile heph didn't write; `driver_install`'s own
+    /// tests cover what happens with that empty value at fetch time.
     #[tokio::test]
-    async fn npm_e2e_package_with_no_integrity_anywhere_fails_with_actionable_message() {
+    async fn npm_e2e_package_with_no_integrity_anywhere_still_resolves() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(
             dir.path(),
@@ -5535,7 +5523,7 @@ mod tests {
             &platform::current_goos(),
             &platform::current_goarch(),
         );
-        let result = provider
+        let resp = provider
             .get(
                 GetRequest {
                     request_id: "test".to_string(),
@@ -5545,15 +5533,15 @@ mod tests {
                 },
                 &ct,
             )
-            .await;
-        let msg = match result {
-            Err(GetError::Other(e)) => format!("{e:#}"),
-            Err(GetError::NotFound) => panic!("expected an actionable error, got NotFound"),
-            Ok(_) => panic!("no integrity anywhere to verify against must be an error, got Ok"),
-        };
-        assert!(msg.contains("ts-log@2.2.5"), "{msg}");
-        assert!(msg.contains("npm/cli#4263"), "{msg}");
-        assert!(msg.contains("npm install ts-log@2.2.5"), "{msg}");
+            .await
+            .expect("must resolve — proceed unverified rather than block on a lockfile heph didn't write");
+        assert_eq!(resp.target_spec.driver, "js_install");
+        assert_eq!(
+            resp.target_spec.config.get("integrity"),
+            Some(&Value::String(String::new())),
+            "no integrity anywhere means the spec carries an empty one through, not a fabricated one: {:?}",
+            resp.target_spec.config
+        );
     }
 
     /// A hermeticity review caught a more insidious version of the bug the
