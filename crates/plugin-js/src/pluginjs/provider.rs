@@ -1410,8 +1410,9 @@ impl Provider {
             // transitive closure into one flat `node_modules` so any
             // ancestor-walk `require()` finds it; this walks the resolved
             // graph the same way, breadth over the queue below, so every
-            // reachable `dependencies`/`optionalDependencies` edge — at any
-            // depth — gets its own sibling `node_modules/<name>` entry.
+            // reachable `dependencies`/`optionalDependencies`/
+            // `peerDependencies` edge — at any depth — gets its own
+            // sibling `node_modules/<name>` entry.
             // `seen_names` both dedupes (a diamond dependency is not fetched
             // or declared as an `Input` twice) and bounds the walk (a
             // circular edge back to an already-visited name is simply not
@@ -1472,16 +1473,27 @@ impl Provider {
                     frontier.push(dep_pkg);
                 }
 
-                // Optional: most entries here are for *other* platforms and
-                // never apply — an unresolvable or platform-mismatched one
-                // is expected, silently skipped, and never wired as a
-                // dependency edge (so it can never itself be the cause of a
-                // graph cycle or a hard resolution failure, and its own
-                // subtree is never walked) — but the reason is recorded so
-                // a lifecycle script that *does* fail for lack of it names
-                // what was missing instead of an opaque `Cannot find
-                // module`.
-                for (dep_name, dep_key) in &pkg.optional_dependencies {
+                // Optional and peer: most entries here are for *other*
+                // platforms, or a peer nobody installed, and never apply —
+                // an unresolvable or platform-mismatched one is expected,
+                // silently skipped, and never wired as a dependency edge
+                // (so it can never itself be the cause of a graph cycle or
+                // a hard resolution failure, and its own subtree is never
+                // walked) — but the reason is recorded so a lifecycle
+                // script that *does* fail for lack of it names what was
+                // missing instead of an opaque `Cannot find module`. Peer
+                // deps get identical treatment to optional ones here: a
+                // script's own `require()` doesn't distinguish why a
+                // sibling wasn't a *required* dependency edge, only
+                // whether it's actually present — see
+                // `lockfile::ResolvedPackage::peer_dependencies`'s doc for
+                // why a resolved peer edge is exactly as real as a
+                // resolved optional one once it exists at all.
+                for (dep_name, dep_key) in pkg
+                    .optional_dependencies
+                    .iter()
+                    .chain(pkg.peer_dependencies.iter())
+                {
                     if seen_names.contains(dep_name) {
                         continue;
                     }
@@ -6578,6 +6590,89 @@ mod tests {
         assert_eq!(
             resp.target_spec.config.get("deps"),
             Some(&Value::List(vec![Value::String(expected_dep_addr)]))
+        );
+        assert_eq!(
+            resp.target_spec.config.get("skipped_deps"),
+            Some(&Value::List(vec![])),
+            "a matching sibling must not also be recorded as skipped"
+        );
+    }
+
+    /// Same defect class as the optional-sibling case above, for
+    /// `peerDependencies`: a lifecycle script's `require()` doesn't care
+    /// *why* a sibling wasn't a required dependency edge, only whether it's
+    /// actually installed. A resolved peer sibling must be wired exactly
+    /// like a resolved optional one.
+    #[tokio::test]
+    async fn npm_e2e_lifecycle_script_package_wires_resolved_peer_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name": "root"}"#);
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/@vitest/browser-playwright": {
+                        "version": "4.1.8",
+                        "resolved": "https://registry.npmjs.org/@vitest/browser-playwright/-/browser-playwright-4.1.8.tgz",
+                        "integrity": "sha512-provider",
+                        "hasInstallScript": true,
+                        "peerDependencies": { "playwright": "*" }
+                    },
+                    "node_modules/playwright": {
+                        "version": "1.55.0",
+                        "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.55.0.tgz",
+                        "integrity": "sha512-playwright"
+                    }
+                }
+            }"#,
+        );
+        let provider = Provider::with_config(
+            dir.path().to_path_buf(),
+            Config {
+                pkgmanager: PkgManager::Npm,
+                skip: Arc::new(Ignore::default()),
+                walker: Arc::new(CachedWalker::disabled()),
+                allow_scripts: vec!["@vitest/browser-playwright".to_string()],
+                tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
+                linter: toolchain::OXLINT.to_string(),
+                bundler: toolchain::ESBUILD.to_string(),
+            },
+        );
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr =
+            thirdparty::thirdparty_addr("@vitest/browser-playwright", "4.1.8", "linux", "amd64");
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_install target_spec");
+
+        let expected_dep_addr = thirdparty::node_modules_addr(
+            "",
+            "playwright",
+            "playwright",
+            "1.55.0",
+            "linux",
+            "amd64",
+        )
+        .format();
+        assert_eq!(
+            resp.target_spec.config.get("deps"),
+            Some(&Value::List(vec![Value::String(expected_dep_addr)])),
+            "a genuinely-installed peer sibling must be wired the same as a resolved optional one"
         );
         assert_eq!(
             resp.target_spec.config.get("skipped_deps"),
