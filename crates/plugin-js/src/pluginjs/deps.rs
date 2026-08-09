@@ -160,10 +160,16 @@ pub fn resolve_one_dependency(
     // `TargetDef` missing the Input the real toolchain run needs. See
     // `crate::pluginjs::lockfile::resolve_transitive`'s doc.
     let resolution = match (lockfile, resolved_graph) {
-        (Some(lf), Some(rg)) => {
-            crate::pluginjs::lockfile::resolve_transitive(lf, rg, lockfile_pkg, manifest, name)
-                .with_context(|| format!("resolving `{name}` declared by {lockfile_pkg:?}"))?
-        }
+        (Some(lf), Some(rg)) => crate::pluginjs::lockfile::resolve_transitive(
+            lf,
+            rg,
+            lockfile_pkg,
+            manifest,
+            name,
+            os,
+            arch,
+        )
+        .with_context(|| format!("resolving `{name}` declared by {lockfile_pkg:?}"))?,
         (Some(lf), None) => lf
             .resolve_dependency(lockfile_pkg, name)
             .with_context(|| format!("resolving `{name}` declared by {lockfile_pkg:?}"))?,
@@ -286,7 +292,7 @@ pub fn resolve_transitive_closure(
     let seeds = lockfile::direct_dep_seed_keys(lockfile, lockfile_pkg, manifest)
         .with_context(|| format!("seeding transitive third-party closure for {lockfile_pkg:?}"))?;
     Ok(resolved_graph
-        .transitive_reachable(seeds)
+        .transitive_reachable(seeds, os, arch)
         .into_iter()
         .map(|(name, version)| {
             thirdparty::node_modules_addr(consuming_pkg, &name, &name, &version, os, arch).format()

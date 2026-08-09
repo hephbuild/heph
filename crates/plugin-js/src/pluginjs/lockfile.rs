@@ -27,6 +27,7 @@ use anyhow::Context;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use crate::pluginjs::package_json::PackageManifest;
+use crate::pluginjs::platform;
 use crate::pluginjs::workspace::PkgManager;
 
 /// One resolved node: an exact `(name, version)` with the bytes that make it
@@ -105,15 +106,34 @@ impl ResolvedGraph {
     /// — e.g. a consumer's own direct dependencies, resolved), mapping every
     /// reachable package's name to its resolved version.
     ///
+    /// Walks both `dependencies` (unconditionally) and `optional_dependencies`
+    /// (only an entry that resolves in this graph *and* matches `os`/`arch`)
+    /// — confirmed live: `vite` depends on `rolldown`, which ships its native
+    /// binding as an `optionalDependencies` entry per platform
+    /// (`@rolldown/binding-linux-x64-gnu`, say); walking `dependencies` alone
+    /// reaches `rolldown` but never its own binding, so the binding is never
+    /// relocated into the sandbox and `vite` fails to load at require-time —
+    /// not a lifecycle-script failure, an ordinary module-resolution one, one
+    /// edge past what this closure used to declare. An unresolvable or
+    /// platform-mismatched optional entry is expected (a native-binary
+    /// package for another platform) and is silently skipped rather than
+    /// walked further, mirroring [`crate::pluginjs::deps::resolve_one_dependency`]'s
+    /// established required-vs-optional asymmetry — this is the "expected
+    /// and tolerated" consumer [`ResolvedPackage::optional_dependencies`]'s
+    /// own doc already names.
+    ///
     /// Deterministic given a deterministic seed order: each
-    /// `ResolvedPackage::dependencies` is itself a `BTreeMap`, so sibling
-    /// edges are always walked in the same (sorted) order regardless of
-    /// process/host — a name reachable at more than one version keeps the
-    /// one first reached in that fixed BFS order (`entry().or_insert`),
-    /// never an arbitrary or ambient-filesystem-dependent pick.
+    /// `ResolvedPackage::dependencies`/`optional_dependencies` is itself a
+    /// `BTreeMap`, so sibling edges are always walked in the same (sorted)
+    /// order regardless of process/host — a name reachable at more than one
+    /// version keeps the one first reached in that fixed BFS order
+    /// (`entry().or_insert`), never an arbitrary or ambient-filesystem-
+    /// dependent pick.
     pub fn transitive_reachable(
         &self,
         seed_keys: impl IntoIterator<Item = String>,
+        os: &str,
+        arch: &str,
     ) -> BTreeMap<String, String> {
         let mut result: BTreeMap<String, String> = BTreeMap::new();
         let mut seen_keys: HashSet<String> = HashSet::new();
@@ -132,6 +152,16 @@ impl ResolvedGraph {
                 .or_insert_with(|| pkg.version.clone());
             for dep_key in pkg.dependencies.values() {
                 if seen_keys.insert(dep_key.clone()) {
+                    queue.push_back(dep_key.clone());
+                }
+            }
+            for dep_key in pkg.optional_dependencies.values() {
+                let Some(dep_pkg) = self.packages.get(dep_key) else {
+                    continue;
+                };
+                if platform::matches_platform(&dep_pkg.os, &dep_pkg.cpu, os, arch)
+                    && seen_keys.insert(dep_key.clone())
+                {
                     queue.push_back(dep_key.clone());
                 }
             }
@@ -254,13 +284,15 @@ pub fn resolve_transitive(
     from_pkg: &str,
     manifest: &PackageManifest,
     name: &str,
+    os: &str,
+    arch: &str,
 ) -> anyhow::Result<Option<DepResolution>> {
     if let Some(direct) = lockfile.resolve_dependency(from_pkg, name)? {
         return Ok(Some(direct));
     }
     let seed_keys = direct_dep_seed_keys(lockfile, from_pkg, manifest)?;
     Ok(resolved_graph
-        .transitive_reachable(seed_keys)
+        .transitive_reachable(seed_keys, os, arch)
         .get(name)
         .map(|version| DepResolution::ThirdParty {
             name: name.to_string(),
@@ -1292,9 +1324,17 @@ snapshots:
         let lock = Lockfile::parse(PkgManager::Pnpm, pnpm_transitive_fixture()).unwrap();
         let graph = lock.resolved_graph().unwrap();
         let manifest = transitive_manifest();
-        let got = resolve_transitive(&lock, &graph, "packages/a", &manifest, "@eslint/js")
-            .unwrap()
-            .expect("reachable through the declared typescript-eslint");
+        let got = resolve_transitive(
+            &lock,
+            &graph,
+            "packages/a",
+            &manifest,
+            "@eslint/js",
+            "linux",
+            "amd64",
+        )
+        .unwrap()
+        .expect("reachable through the declared typescript-eslint");
         assert_eq!(
             got,
             DepResolution::ThirdParty {
@@ -1310,7 +1350,16 @@ snapshots:
         let graph = lock.resolved_graph().unwrap();
         let manifest = transitive_manifest();
         assert_eq!(
-            resolve_transitive(&lock, &graph, "packages/a", &manifest, "unrelated").unwrap(),
+            resolve_transitive(
+                &lock,
+                &graph,
+                "packages/a",
+                &manifest,
+                "unrelated",
+                "linux",
+                "amd64"
+            )
+            .unwrap(),
             None,
             "a package with no edge from anything `a` declares is still a genuine phantom, \
              not merely present somewhere in the lockfile"
@@ -1332,13 +1381,117 @@ snapshots:
             optional_dependencies: BTreeMap::new(),
             peer_dependencies: BTreeMap::new(),
         };
-        let got = resolve_transitive(&lock, &graph, "packages/a", &manifest, "lodash").unwrap();
+        let got = resolve_transitive(
+            &lock,
+            &graph,
+            "packages/a",
+            &manifest,
+            "lodash",
+            "linux",
+            "amd64",
+        )
+        .unwrap();
         assert_eq!(
             got,
             Some(DepResolution::ThirdParty {
                 name: "lodash".to_string(),
                 version: "4.17.21".to_string()
             })
+        );
+    }
+
+    /// Confirmed live: `vite` depends on `rolldown`, which ships its native
+    /// binding as an `optionalDependencies` entry per platform
+    /// (`@rolldown/binding-linux-x64-gnu`, say) — `dependencies` alone
+    /// reaches `rolldown` but never its own binding, so the binding was
+    /// never relocated into the sandbox and `vite` failed to load at
+    /// require-time. `transitive_reachable` must walk a platform-*matching*
+    /// `optionalDependencies` edge exactly like a `dependencies` one.
+    #[test]
+    fn transitive_reachable_walks_a_platform_matching_optional_dependency() {
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/vite": {
+                        "version": "6.0.0",
+                        "integrity": "sha512-vite",
+                        "dependencies": { "rolldown": "1.0.0" }
+                    },
+                    "node_modules/rolldown": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-rolldown",
+                        "optionalDependencies": {
+                            "@rolldown/binding-linux-x64-gnu": "1.0.0",
+                            "@rolldown/binding-darwin-arm64": "1.0.0"
+                        }
+                    },
+                    "node_modules/@rolldown/binding-linux-x64-gnu": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-linux",
+                        "os": ["linux"],
+                        "cpu": ["x64"]
+                    },
+                    "node_modules/@rolldown/binding-darwin-arm64": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-darwin",
+                        "os": ["darwin"],
+                        "cpu": ["arm64"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+
+        let reachable =
+            graph.transitive_reachable(vec![graph_key("vite", "6.0.0")], "linux", "amd64");
+
+        assert!(reachable.contains_key("rolldown"), "{reachable:?}");
+        assert!(
+            reachable.contains_key("@rolldown/binding-linux-x64-gnu"),
+            "the current-platform optional binding must be walked transitively, two hops past \
+             the seed: {reachable:?}"
+        );
+        assert!(
+            !reachable.contains_key("@rolldown/binding-darwin-arm64"),
+            "an optional dependency restricted to a different platform must never be walked: \
+             {reachable:?}"
+        );
+    }
+
+    /// The unresolvable-optional-edge half of the same guarantee: an
+    /// `optionalDependencies` entry with no resolved graph entry at all
+    /// (never installed on any platform, or a stale lockfile) must be
+    /// skipped, not treated as a hard failure — mirrors every other
+    /// `optionalDependencies` consumer's asymmetry in this crate.
+    #[test]
+    fn transitive_reachable_skips_an_unresolvable_optional_dependency() {
+        let lock = NpmLockfile::parse(
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root" },
+                    "node_modules/rolldown": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-rolldown",
+                        "optionalDependencies": { "missing-binding": "1.0.0" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let graph = lock.resolved_graph().unwrap();
+
+        let reachable =
+            graph.transitive_reachable(vec![graph_key("rolldown", "1.0.0")], "linux", "amd64");
+
+        assert!(reachable.contains_key("rolldown"), "{reachable:?}");
+        assert!(
+            !reachable.contains_key("missing-binding"),
+            "an optional dependency absent from the lockfile entirely must be skipped, not \
+             error: {reachable:?}"
         );
     }
 }
