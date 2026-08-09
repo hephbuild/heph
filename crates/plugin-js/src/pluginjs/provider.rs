@@ -1097,6 +1097,8 @@ impl Provider {
                 &lockfile_pkg,
                 lockfile.as_deref(),
                 resolved_graph.as_deref(),
+                &os,
+                &arch,
             );
             importgraph::check_phantom_dependencies(
                 &workspace_root,
@@ -1906,12 +1908,14 @@ impl Provider {
             // not silently skip this.
             if visited_pkgs.insert(cur_pkg.clone()) {
                 hcore::blocking::run(enclose!(
-                    (workspace_root, cur_pkg, lockfile_pkg, graph, manifest, lockfile, resolved_graph) move || -> anyhow::Result<()> {
+                    (workspace_root, cur_pkg, lockfile_pkg, graph, manifest, lockfile, resolved_graph, os, arch) move || -> anyhow::Result<()> {
                         let declared = importgraph::transitive_declared_closure(
                             &manifest,
                             &lockfile_pkg,
                             lockfile.as_deref(),
                             resolved_graph.as_deref(),
+                            &os,
+                            &arch,
                         );
                         importgraph::check_phantom_dependencies(
                             &workspace_root,
@@ -2705,8 +2709,14 @@ fn typecheck_deps_config(
     // `member_addrs_by_name`/the lockfile as genuinely declared, rather than
     // re-deriving that from scratch. `graph` is the caller-supplied,
     // `Provider::import_graph`-cached graph — see this function's doc.
-    let declared_closure =
-        importgraph::transitive_declared_closure(&manifest, lockfile_pkg, lockfile, resolved_graph);
+    let declared_closure = importgraph::transitive_declared_closure(
+        &manifest,
+        lockfile_pkg,
+        lockfile,
+        resolved_graph,
+        os,
+        arch,
+    );
     importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
@@ -3134,8 +3144,14 @@ fn test_deps_config(
     // rationale `typecheck_deps_config` documents for its own identical call.
     // `graph` is the caller-supplied, `Provider::import_graph`-cached graph —
     // see this function's doc.
-    let declared_closure =
-        importgraph::transitive_declared_closure(&manifest, lockfile_pkg, lockfile, resolved_graph);
+    let declared_closure = importgraph::transitive_declared_closure(
+        &manifest,
+        lockfile_pkg,
+        lockfile,
+        resolved_graph,
+        os,
+        arch,
+    );
     importgraph::check_phantom_dependencies(workspace_root, pkg, graph, &declared_closure)
         .with_context(|| {
             format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
@@ -8319,6 +8335,105 @@ snapshots:
             "a resolved package's own transitive dependency (never directly imported by \
              first-party code) must also be declared, or the real vitest run hits `Cannot \
              find module` one edge deeper: {external_addrs:?}"
+        );
+    }
+
+    /// Confirmed live: `vitest` (a `devDependency`, never imported by the
+    /// test file's own source at all — reachable only via
+    /// `resolve_transitive_closure`'s manifest-declared seed) depends on
+    /// `vite`, which depends on `rolldown`, which ships its native binding
+    /// as an `optionalDependencies` entry per platform. The current-platform
+    /// binding must be declared even though it's three hops from the seed
+    /// and the intermediate edge is optional, not required; the
+    /// other-platform sibling must never be, so the sandbox never collides
+    /// on it.
+    #[test]
+    fn test_deps_config_declares_transitive_optional_dependency_matching_current_platform() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "devDependencies": {"vitest": "^1.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let lockfile = Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/vitest": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-vitest",
+                        "dependencies": { "vite": "6.0.0" }
+                    },
+                    "node_modules/vite": {
+                        "version": "6.0.0",
+                        "integrity": "sha512-vite",
+                        "dependencies": { "rolldown": "1.0.0" }
+                    },
+                    "node_modules/rolldown": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-rolldown",
+                        "optionalDependencies": {
+                            "@rolldown/binding-linux-x64-gnu": "1.0.0",
+                            "@rolldown/binding-darwin-arm64": "1.0.0"
+                        }
+                    },
+                    "node_modules/@rolldown/binding-linux-x64-gnu": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-linux",
+                        "os": ["linux"],
+                        "cpu": ["x64"]
+                    },
+                    "node_modules/@rolldown/binding-darwin-arm64": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-darwin",
+                        "os": ["darwin"],
+                        "cpu": ["arm64"]
+                    }
+                }
+            }"#,
+        )
+        .expect("parse lockfile");
+        let resolved_graph = lockfile.resolved_graph().unwrap();
+
+        let walker = CachedWalker::disabled();
+        let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
+        let (deps, _, _) = test_deps_config(
+            dir.path(),
+            "packages/a",
+            "packages/a",
+            "packages/a/src/a.test.ts",
+            &graph,
+            Some(&lockfile),
+            Some(&resolved_graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+            toolchain::VITEST,
+            runner_config_candidates(toolchain::VITEST).expect("vitest is supported"),
+        )
+        .expect("build test deps config");
+
+        let external_addrs = dep_addrs(&deps, "external");
+        assert!(
+            external_addrs
+                .iter()
+                .any(|a| a.contains("name=@rolldown/binding-linux-x64-gnu")),
+            "the current-platform optional binding, three hops from the devDependency seed, \
+             must be declared: {external_addrs:?}"
+        );
+        assert!(
+            !external_addrs
+                .iter()
+                .any(|a| a.contains("name=@rolldown/binding-darwin-arm64")),
+            "the other-platform sibling must never be declared: {external_addrs:?}"
         );
     }
 

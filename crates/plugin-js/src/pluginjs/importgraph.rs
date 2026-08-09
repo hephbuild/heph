@@ -285,6 +285,8 @@ pub fn transitive_declared_closure(
     pkg: &str,
     lockfile: Option<&Lockfile>,
     resolved_graph: Option<&ResolvedGraph>,
+    os: &str,
+    arch: &str,
 ) -> HashSet<String> {
     let mut set = declared_closure(manifest);
     let (Some(lockfile), Some(resolved_graph)) = (lockfile, resolved_graph) else {
@@ -300,7 +302,11 @@ pub fn transitive_declared_closure(
     // caller — `Lockfile::resolve_dependency` has no fallible path today,
     // so this can't actually happen yet regardless).
     let seed_keys = lockfile::direct_dep_seed_keys(lockfile, pkg, manifest).unwrap_or_default();
-    set.extend(resolved_graph.transitive_reachable(seed_keys).into_keys());
+    set.extend(
+        resolved_graph
+            .transitive_reachable(seed_keys, os, arch)
+            .into_keys(),
+    );
     set
 }
 
@@ -2736,6 +2742,8 @@ mod tests {
             "packages/a",
             Some(&lockfile),
             Some(&resolved_graph),
+            "linux",
+            "amd64",
         );
         assert!(
             widened.contains("@eslint/js"),
@@ -2756,6 +2764,8 @@ mod tests {
             "packages/a",
             Some(&lockfile),
             Some(&resolved_graph),
+            "linux",
+            "amd64",
         );
         assert!(
             !widened.contains("unrelated"),
@@ -2767,7 +2777,8 @@ mod tests {
     #[test]
     fn transitive_declared_closure_falls_back_to_direct_only_without_a_lockfile() {
         let manifest = manifest("a", &[], &["typescript-eslint"]);
-        let widened = transitive_declared_closure(&manifest, "packages/a", None, None);
+        let widened =
+            transitive_declared_closure(&manifest, "packages/a", None, None, "linux", "amd64");
         assert_eq!(widened, declared_closure(&manifest));
     }
 
