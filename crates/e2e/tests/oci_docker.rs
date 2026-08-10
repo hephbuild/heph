@@ -616,8 +616,9 @@ target(
     Ok(())
 }
 
-/// Both tagging paths must actually land in the daemon: the tag a BUILD file
-/// names, and the content-addressed one derived when it does not.
+/// All three tagging paths must actually land in the daemon: the full ref a
+/// BUILD file names, the content-addressed one derived when it names nothing,
+/// and the mix — a repository from the BUILD file with the tag still derived.
 ///
 /// Only a daemon can confirm either. The archive carries `RepoTags`, but a
 /// containerd-backed daemon ignores them in favour of the OCI path, so the
@@ -634,6 +635,8 @@ async fn test_real_docker_load_tags_the_image_in_the_daemon() -> anyhow::Result<
     // docker read the first segment as a registry host.
     let repo = format!("{pkg}_img");
     let tag = format!("heph-e2e-oci-load:{}", std::process::id());
+    // A ref naming a repository and no tag: the tag stays derived.
+    let named_repo = format!("heph-e2e-oci-named{}", std::process::id());
 
     let ws = workspace();
     ws.write_build_file(
@@ -656,6 +659,7 @@ target(
 )
 target(name = "load", driver = "oci_load", image = ":img", tag = "{tag}")
 target(name = "autoload", driver = "oci_load", image = ":img")
+target(name = "namedload", driver = "oci_load", image = ":img", tag = "{named_repo}")
 "#,
             builder = builder_attr(&builder),
         ),
@@ -663,6 +667,7 @@ target(name = "autoload", driver = "oci_load", image = ":img")
 
     let loaded = ws.run(&format!("//{pkg}:load")).await;
     let autoloaded = ws.run(&format!("//{pkg}:autoload")).await;
+    let namedloaded = ws.run(&format!("//{pkg}:namedload")).await;
     // Read the daemon's state, then clean up, then assert: the daemon is shared
     // and a failed assertion must not leave images behind.
     let explicit = Command::new("docker")
@@ -682,13 +687,27 @@ target(name = "autoload", driver = "oci_load", image = ":img")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
+    // Same treatment for the repository-only ref: found by its repository, so a
+    // wrong *tag* fails on the assertion with the name it actually used.
+    let named = Command::new("docker")
+        .args([
+            "images",
+            "--format",
+            "{{.Repository}}:{{.Tag}}",
+            "--filter",
+            &format!("reference={named_repo}"),
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
     drop(Command::new("docker").args(["rmi", "-f", &tag]).output());
-    for line in derived.lines() {
+    for line in derived.lines().chain(named.lines()) {
         drop(Command::new("docker").args(["rmi", "-f", line]).output());
     }
 
     let loaded = loaded?;
     let autoloaded = autoloaded?;
+    let namedloaded = namedloaded?;
     assert!(
         explicit.is_ok_and(|o| o.status.success()),
         "the tag {tag} must exist in the daemon after oci_load"
@@ -727,6 +746,29 @@ target(name = "autoload", driver = "oci_load", image = ":img")
     assert_eq!(
         autoloaded_ref, derived[0],
         "the ref the target outputs must be the one the daemon reports"
+    );
+
+    // A ref naming only a repository keeps the user's name and derives the tag —
+    // and the daemon has to agree, since a repository heph fails to honour is
+    // one the user's `docker run` will not find.
+    let named: Vec<&str> = named.lines().collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "exactly one image under {named_repo}, got: {named:?}"
+    );
+    let named_ref = String::from_utf8(common::artifact_bytes(&namedloaded))?;
+    assert_eq!(
+        named_ref, named[0],
+        "the repository is the one the BUILD file gave, the tag the derived one"
+    );
+    let (got_repo, got_tag) = named_ref.rsplit_once(':').unwrap_or((&named_ref, ""));
+    assert_eq!(got_repo, named_repo, "the repository is carried as written");
+    // Its own input hash, not the untagged target's: the repository is part of
+    // the def, so these are two different targets.
+    assert!(
+        !got_tag.is_empty() && got_tag.chars().all(|c| c.is_ascii_hexdigit()),
+        "the tag must still be derived, got: {named_ref:?}"
     );
     Ok(())
 }
