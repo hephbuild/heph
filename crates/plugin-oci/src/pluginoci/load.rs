@@ -41,7 +41,19 @@
 //! the image changes, two people on the same commit get the same string, and it
 //! can be predicted from the graph rather than read out of a log.
 //!
-//! `tag` overrides it, for when a human has to type something.
+//! `tag` overrides it — either half of it, independently:
+//!
+//! ```python
+//! oci_load(image = ":img")                        # app_img:9f2c4e1b7a0d3856
+//! oci_load(image = ":img", tag = "ghcr.io/me/app")# ghcr.io/me/app:9f2c4e1b7a0d3856
+//! oci_load(image = ":img", tag = "app:dev")       # app:dev
+//! ```
+//!
+//! A ref with no tag on it names the repository and keeps the derived tag, which
+//! is the combination most BUILD files want: the repository is what a human
+//! reads, and no address heph can derive one from will ever be the name that
+//! team calls the service — while the tag is what nobody should be writing by
+//! hand. Naming both is for when a human has to type the whole thing.
 //!
 //! A daemon tag holds one image, so loading a **multi-platform** archive means
 //! choosing an instance: `platform` (default Linux on the host's architecture).
@@ -79,21 +91,28 @@ struct OciLoadSpec {
     /// archive output (group `""`) is consumed.
     #[spec(required)]
     image: String,
-    /// Local tag to give the loaded image, e.g. `app:dev`.
+    /// Local ref to give the loaded image, e.g. `app:dev`.
     ///
-    /// Optional. Left unset, the tag is derived from the image target and this
-    /// load's input hash:
+    /// Optional, and it takes either half of a ref:
     ///
-    /// ```console
-    /// $ heph run --cat-out //app:load
-    /// app_img:9f2c4e1b7a0d3856
-    /// ```
+    /// | `tag` | loads as |
+    /// |---|---|
+    /// | unset | `app_img:9f2c4e1b7a0d3856` |
+    /// | `"app"` | `app:9f2c4e1b7a0d3856` |
+    /// | `"ghcr.io/me/app"` | `ghcr.io/me/app:9f2c4e1b7a0d3856` |
+    /// | `"app:dev"` | `app:dev` |
     ///
-    /// The derived one is what anything automated wants: it names exactly what
-    /// was built, it changes when and only when the image changes, and two
-    /// people running the same commit get the same string. A name written here
-    /// can do none of that — it says which image was loaded *last*, not which
-    /// one is which — so set it only when a human has to type it. Either way the
+    /// A value with no tag on it names the **repository** and leaves the tag
+    /// derived — the middle ground between the two ends. The derived tag is what
+    /// anything automated wants: it names exactly what was built, it changes when
+    /// and only when the image changes, and two people running the same commit
+    /// get the same string. The repository is the opposite — it is the part a
+    /// human reads, and no address heph can derive one from will ever be the
+    /// name that team calls the service. Splitting them lets a BUILD file fix the
+    /// name without giving up the property.
+    ///
+    /// Naming the tag too says which image was loaded *last*, not which one is
+    /// which, so do that only when a human has to type it. Either way the full
     /// ref is the target's output, so a script reads it rather than guessing.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     tag: Option<String>,
@@ -113,10 +132,11 @@ struct OciLoadSpec {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciLoadDef {
-    /// The tag the BUILD file asked for. `None` derives one from `repo` and the
-    /// input hash at run time.
+    /// The tag half of the ref. `None` derives one from the input hash at run
+    /// time, which is the only part of the ref `parse` cannot settle.
     tag: Option<String>,
-    /// Docker repository name derived from the **image** target's address —
+    /// The repository half of the ref: what `tag` named, or — when it named
+    /// nothing — a name derived from the **image** target's address, where
     /// `//cmd/server:img` becomes `cmd_server_img`.
     ///
     /// The image target's, not this load target's: the repository names what
@@ -140,7 +160,9 @@ struct OciLoadDef {
 /// v4: `tag` is optional and defaults to a content-addressed name, so the
 /// derived repository is part of the def.
 /// v5: the ref the image was tagged with is written out as the target's output.
-const OCI_LOAD_FORMAT_VERSION: u32 = 5;
+/// v6: `tag` is split into repository and tag at parse, so `repo` is whichever
+/// of the two the ref named and `tag` is only ever the tag.
+const OCI_LOAD_FORMAT_VERSION: u32 = 6;
 
 impl Hash for OciLoadDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -150,6 +172,47 @@ impl Hash for OciLoadDef {
         self.platform.hash(state);
         self.ref_out.hash(state);
     }
+}
+
+/// Split a ref written in a BUILD file into its repository and, if it carries
+/// one, its tag. `("app", None)` means "tag this repository, derive the tag".
+///
+/// The `:` that separates a tag is not simply the last one: `localhost:5000/app`
+/// is a repository on a port, with no tag at all, and splitting it at that colon
+/// would tag a repository called `localhost` with `5000/app`. A tag can only
+/// live in the ref's final path component, so a `:` before the last `/` is a
+/// port and belongs to the repository.
+///
+/// Everything left of the tag is carried through **as written**. The
+/// registry-host reading that [`docker_repo`] goes out of its way to avoid is
+/// exactly what someone typing `ghcr.io/me/app` is asking for; the caution
+/// belongs to names heph invents, not to names it was handed.
+fn split_ref(r: &str) -> anyhow::Result<(String, Option<String>)> {
+    anyhow::ensure!(!r.is_empty(), "`tag` is empty; drop it to derive the ref");
+    // A digest names an image that already exists by content — there is nothing
+    // to move a tag onto, and `docker tag` rejects it.
+    anyhow::ensure!(
+        !r.contains('@'),
+        "`tag` {r:?} is pinned to a digest; a load tags an image, so give it a `repository` or a \
+         `repository:tag`"
+    );
+
+    let (repo, tag) = match r.rsplit_once(':') {
+        // Anything after the last `:` that still holds a `/` means that colon
+        // was a registry port and the ref carries no tag at all.
+        Some((repo, tag)) if !tag.contains('/') => (repo, Some(tag)),
+        _ => (r, None),
+    };
+
+    anyhow::ensure!(
+        !repo.is_empty(),
+        "`tag` {r:?} has no repository before the `:`"
+    );
+    anyhow::ensure!(
+        tag != Some(""),
+        "`tag` {r:?} ends in a `:` with no tag after it; drop the `:` to derive the tag"
+    );
+    Ok((repo.to_string(), tag.map(str::to_string)))
 }
 
 /// A docker repository name derived from a target address.
@@ -205,7 +268,7 @@ fn docker_repo(addr: &hmodel::htaddr::Addr) -> anyhow::Result<String> {
     anyhow::ensure!(
         !name.is_empty(),
         "the image target's name {:?} has no character a docker repository name can hold \
-         (it takes `a-z0-9`); give `oci_load` an explicit `tag`",
+         (it takes `a-z0-9`); name the repository yourself with `tag = \"my-app\"`",
         addr.name
     );
     parts.push(name);
@@ -318,10 +381,19 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("parse image ref {:?}", spec.image))?;
         super::pin_archive_group(&mut image_ref, &spec.image)?;
 
+        // Only the half the BUILD file left out is derived. `docker_repo` is
+        // reached only when it named no repository at all — which is what makes
+        // its "name the repository yourself" advice something the user can act
+        // on, rather than a way out that fails identically.
+        let (repo, tag) = match &spec.tag {
+            Some(r) => split_ref(r)?,
+            None => (docker_repo(&image_ref.r#ref)?, None),
+        };
+
         let ref_out = ws_path(addr.package.as_str(), &format!("{}.ref", addr.name));
         let def = OciLoadDef {
-            tag: spec.tag,
-            repo: docker_repo(&image_ref.r#ref)?,
+            tag,
+            repo,
             platform,
             ref_out: ref_out.clone(),
         };
@@ -386,13 +458,11 @@ impl ManagedDriver for Driver {
         // handing the daemon a manifest list it may or may not understand.
         let (manifest, manifest_digest) = super::select_platform(&layout, &def.platform)?;
 
-        // Unset, the tag is derived: what was built, and nothing about when.
-        // `hashin` is only known here — the engine computes it after `parse` —
-        // so this is materialized at run time rather than carried in the def.
-        let image = def
-            .tag
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", def.repo, req.request.hashin));
+        // `parse` settled the repository and, if the BUILD file gave one, the
+        // tag. A derived tag can only be filled in here: `hashin` is the engine's
+        // answer, computed after `parse` has run.
+        let tag = def.tag.as_deref().unwrap_or(req.request.hashin);
+        let image = format!("{}:{}", def.repo, tag);
 
         let docker_tar = req.sandbox_dir.join("oci-load-docker.tar");
         super::archive::write_docker_archive(
@@ -441,12 +511,15 @@ impl ManagedDriver for Driver {
         // containerd-backed daemon takes the OCI path and ignores RepoTags,
         // leaving a `<none>:<none>` image the user cannot run.
         //
-        let (repo, tag) = image.rsplit_once(':').unwrap_or((image.as_str(), "latest"));
+        // The two halves are handed over as `parse` separated them, never
+        // re-split out of `image`: the last `:` of `localhost:5000/app` is a
+        // registry port, and splitting there would tag a repository called
+        // `localhost` with `5000/app`.
         docker
             .tag_image(
                 &loaded,
                 Some(bollard::query_parameters::TagImageOptions {
-                    repo: Some(repo.to_string()),
+                    repo: Some(def.repo.clone()),
                     tag: Some(tag.to_string()),
                 }),
             )
@@ -589,7 +662,23 @@ mod tests {
     fn an_unrepresentable_name_is_a_build_file_error() {
         let addr = parse_addr("//app:___").expect("addr");
         let err = format!("{:#}", docker_repo(&addr).expect_err("unrepresentable"));
-        assert!(err.contains("explicit `tag`"), "got: {err}");
+        assert!(err.contains("`tag = \"my-app\"`"), "got: {err}");
+    }
+
+    /// …and taking the way out it names has to actually work. A repository is
+    /// only derived when the BUILD file supplies none, so naming one rescues an
+    /// image target whose address holds no legal repository name.
+    #[tokio::test]
+    async fn naming_the_repository_rescues_an_unrepresentable_image_name() {
+        let resp = parse(
+            "//app:load",
+            cfg(&[
+                ("image", Value::String(":___".to_string())),
+                ("tag", Value::String("my-app".to_string())),
+            ]),
+        )
+        .await;
+        assert_eq!(resp.target_def.def::<OciLoadDef>().repo, "my-app");
     }
 
     /// `tag` is optional now: one is derived, so an `oci_load` without it is a
@@ -607,6 +696,56 @@ mod tests {
             "the repo follows the image, not the load"
         );
         assert!(def.tag.is_none());
+    }
+
+    /// A `tag` with no tag in it names the *repository* and leaves the tag
+    /// derived — the half a BUILD file has an opinion about, without giving up
+    /// the half it should not be writing by hand.
+    #[tokio::test]
+    async fn a_ref_without_a_tag_keeps_the_derived_tag() {
+        for r in ["app", "ghcr.io/me/app", "localhost:5000/app"] {
+            let resp = parse(
+                "//app:load",
+                cfg(&[
+                    ("image", Value::String(":img".to_string())),
+                    ("tag", Value::String(r.to_string())),
+                ]),
+            )
+            .await;
+            let def = resp.target_def.def::<OciLoadDef>();
+            assert_eq!(def.repo, r, "the repository is carried through as written");
+            assert!(def.tag.is_none(), "{r} names no tag, so it stays derived");
+        }
+    }
+
+    /// The `:` that separates a tag lives in the ref's last component. The one in
+    /// `localhost:5000/app` is a registry port, and splitting there would tag a
+    /// repository called `localhost` with `5000/app`.
+    #[test]
+    fn a_registry_port_is_not_a_tag() {
+        let split = |r: &str| split_ref(r).expect("ref");
+        assert_eq!(split("app:dev"), ("app".into(), Some("dev".into())));
+        assert_eq!(split("app"), ("app".into(), None));
+        assert_eq!(
+            split("localhost:5000/app"),
+            ("localhost:5000/app".into(), None)
+        );
+        assert_eq!(
+            split("localhost:5000/app:dev"),
+            ("localhost:5000/app".into(), Some("dev".into()))
+        );
+    }
+
+    /// Halves that cannot be tagged are BUILD-file errors, named at parse rather
+    /// than rejected by the daemon after the image has already been loaded.
+    #[test]
+    fn a_ref_that_cannot_be_tagged_is_rejected() {
+        for r in ["", ":dev", "app:", "app@sha256:abc"] {
+            let Err(err) = split_ref(r) else {
+                panic!("{r:?} names no image the daemon can tag; it must be rejected");
+            };
+            assert!(format!("{err:#}").contains("`tag`"), "{r:?}: {err:#}");
+        }
     }
 
     /// The tag is part of the def: naming the image differently is a different
