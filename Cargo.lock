@@ -4579,6 +4579,7 @@ dependencies = [
  "oxc_resolver",
  "oxc_span",
  "plugin",
+ "plugin-query",
  "proc",
  "reqwest",
  "serde",

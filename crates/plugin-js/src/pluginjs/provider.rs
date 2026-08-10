@@ -2218,6 +2218,16 @@ impl Provider {
         let mut external_set: BTreeSet<String> = closure.external_names.clone();
         external_set.extend(ancillary.config_external.iter().cloned());
 
+        // `js_src`-labelled codegen targets in scope — see
+        // `js_src_query_addr`'s doc (`test_deps_config` carries the
+        // identical group, same reasoning).
+        deps.insert(
+            "codegen".to_string(),
+            Value::List(vec![Value::String(
+                js_src_query_addr(pkg.as_str()).format(),
+            )]),
+        );
+
         Ok(BundleDepsConfig {
             deps,
             bundler_config_path: ancillary.bundler_config_path,
@@ -2891,6 +2901,12 @@ fn typecheck_deps_config(
             ),
         );
     }
+    // `js_src`-labelled codegen targets in scope — see `js_src_query_addr`'s
+    // doc (`test_deps_config` carries the identical group, same reasoning).
+    deps.insert(
+        "codegen".to_string(),
+        Value::List(vec![Value::String(js_src_query_addr(pkg).format())]),
+    );
 
     Ok((deps, tsconfig_path_rel, tsconfig_content))
 }
@@ -3042,6 +3058,101 @@ fn path_under_package(package: &str, path: &str) -> bool {
 /// review). Accepted as a known trim for this milestone rather than fixed —
 /// mirroring `js_typecheck`'s `tsconfig_content` fix is the natural
 /// follow-up. TODO M4+.
+/// Query-language pattern selecting exactly the package `pkg` (`//` for root).
+fn js_pkg_pattern(pkg: &str) -> String {
+    format!("//{pkg}")
+}
+
+/// Query-language pattern selecting every package under `pkg` (`//...` for root).
+fn js_pkg_prefix_pattern(pkg: &str) -> String {
+    if pkg.is_empty() {
+        "//...".to_string()
+    } else {
+        format!("//{pkg}/...")
+    }
+}
+
+/// Default query scope for the `js_src` codegen lane: the package's
+/// **subtree**, mirroring `plugin-go`'s `go_src` default scope exactly (see
+/// `plugin-go/src/plugingo/provider.rs`'s `default_scope`) — a generator
+/// commonly sits in a sub-package of the package that consumes its output,
+/// and Go's own history is *why* this is the floor rather than the bare
+/// package: `go_src`'s original bare-package scope shipped a real bug (an
+/// embed that resolved on some runs and failed with "pattern(s) matched no
+/// files" on others), fixed by widening to the subtree. `tree_output` still
+/// gates membership, so the wider scope can never admit a target whose
+/// output lands outside this package's own tree.
+///
+/// The root package is the exception, for the identical reason `go_src`
+/// documents: its subtree is the entire workspace, including synthetic
+/// provider namespaces that are not source packages at all.
+fn js_codegen_default_scope(pkg: &str) -> String {
+    if pkg.is_empty() {
+        js_pkg_pattern(pkg)
+    } else {
+        js_pkg_prefix_pattern(pkg)
+    }
+}
+
+/// The `@heph/query` addr selecting `js_src`-labelled codegen targets whose
+/// output lands in `pkg`'s own tree — the JS analogue of `plugin-go`'s
+/// `go_src` lane (see that crate's `compute_pkg_src_addrs`). A BUILD author
+/// marks an ordinary codegen target `labels = ["js_src"]` (e.g. a GraphQL
+/// codegen step producing `.ts` files at real, deterministic source-tree
+/// paths); every caller below wires the resulting addr in as a declared
+/// `Input`, so the engine runs the codegen target automatically before
+/// whichever js_test/js_typecheck/js_lint/js_bundle target needs it, and
+/// stages its output into the sandbox the same way any other declared Input
+/// already is. No further code needs to resolve the generated import
+/// specifically: once the file physically exists in the sandbox, the real
+/// tool (tsc/vitest/eslint/esbuild) resolves it itself, exactly as `go list`
+/// already does for `go_src`.
+///
+/// A **pure function of `pkg`** deliberately: every caller must format the
+/// identical addr string for the same package, or the engine's own per-addr
+/// result memoization can't dedupe the query's resolution across this
+/// package's own N test-file targets and all 4 drivers into the one
+/// resolution it should be — a second, independently-built query string for
+/// the same package would mint a second memoizer cell and a second
+/// `tree_output` walk. Route every call through this one function; never
+/// re-derive the expression at a call site.
+///
+/// Applied unconditionally within scope, not per-consumer: every js_test/
+/// typecheck/lint/bundle target for a package in scope gets every `js_src`-
+/// labelled codegen target in that scope as an Input, whether or not that
+/// specific target's own import graph reaches the generated files. This is
+/// a deliberate safety-over-precision trade — the same one `go_src` already
+/// makes — because there is no way to statically resolve an import to a
+/// file that doesn't exist in the sandbox yet, without running the codegen
+/// first regardless. Cost: a `js_src` codegen edit invalidates every
+/// consuming target in the package, even ones that never import its output.
+///
+/// **v1 scope trim, disclosed rather than silent**: no `go_codegen_root`-
+/// equivalent ancestor-scope-widening exists yet — a codegen target must
+/// land somewhere in the consuming package's own subtree. A workspace-root-
+/// declared generator producing output for a *sibling* (not descendant)
+/// package is out of scope until that's built. TODO M4+.
+///
+/// **v1 scope trim, disclosed rather than silent**: a genuine dependency
+/// cycle through a labelled codegen target (the target itself depending,
+/// even transitively, on the package it generates into) is silently
+/// dropped from the query match by the engine's own query-cycle handling —
+/// inherited from `go_src`'s identical, already-shipped behavior, not new
+/// here. No dedicated diagnostic exists for this case; it manifests as the
+/// generated import simply never resolving, indistinguishable from an
+/// unlabelled codegen target.
+///
+/// Excludes the `js` provider from the query: `js_src` only ever labels
+/// buildfile-emitted codegen targets, never js_test/js_typecheck/js_lint/
+/// js_bundle targets themselves — without this exclusion, every JS target
+/// in scope (per-*test-file*, not per-package, for `js_test`) would pay a
+/// full `get_spec` just to be rejected by the label check.
+fn js_src_query_addr(pkg: &str) -> Addr {
+    let scope = js_codegen_default_scope(pkg);
+    let expr = format!("{scope} && label(js_src) && tree_output({pkg})");
+    hplugin_query::pluginquery::query_addr(&expr, "", &["js"])
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors typecheck_deps_config's own lockfile/graph/member/platform parameter set, \
@@ -3316,6 +3427,15 @@ fn test_deps_config(
             Value::List(runner_config_addrs),
         );
     }
+    // `js_src`-labelled codegen targets in scope (see `js_src_query_addr`'s
+    // doc) — inserted unconditionally, mirroring `go_src`: the query itself
+    // resolves to nothing when no target in scope carries the label, cheaply
+    // (scope/label are the two cheapest resolution tiers), so there's
+    // nothing to gain by skipping the reference for a package that has none.
+    deps.insert(
+        "codegen".to_string(),
+        Value::List(vec![Value::String(js_src_query_addr(pkg).format())]),
+    );
 
     Ok((deps, runner_config_path_rel, runner_config_content))
 }
@@ -3722,6 +3842,12 @@ fn lint_deps_config(
             ),
         );
     }
+    // `js_src`-labelled codegen targets in scope — see `js_src_query_addr`'s
+    // doc (`test_deps_config` carries the identical group, same reasoning).
+    deps.insert(
+        "codegen".to_string(),
+        Value::List(vec![Value::String(js_src_query_addr(pkg).format())]),
+    );
 
     Ok(LintDepsConfig {
         deps,
@@ -9183,6 +9309,106 @@ snapshots:
         )
     }
 
+    // A non-root package scopes its `js_src` query to its own subtree, so a
+    // generator in a sub-package is reachable — mirrors `plugin-go`'s
+    // identical `default_scope_is_the_subtree_except_at_the_root` guarantee,
+    // for the identical reason (see `js_codegen_default_scope`'s doc). The
+    // root package is the exception: its subtree is the whole workspace.
+    #[test]
+    fn js_src_query_addr_scope_is_the_subtree_except_at_the_root() {
+        assert_eq!(js_codegen_default_scope("app"), "//app/...");
+        assert_eq!(
+            js_codegen_default_scope("mgmt/backoffice"),
+            "//mgmt/backoffice/..."
+        );
+        assert_eq!(js_codegen_default_scope(""), "//");
+    }
+
+    // Cheapest-first by resolution tier: the engine evaluates `&&` left-to-
+    // right and resolves each term at its cheapest tier — scope (addr, no
+    // IO) < label (spec/`get_spec`) < `tree_output` (def/`get_def`, the most
+    // expensive). Freezing `label` before `tree_output` in the expression
+    // itself is what lets the engine bail at the cheapest possible tier for
+    // a package with no `js_src`-labelled target at all.
+    #[test]
+    fn js_src_query_addr_orders_label_before_tree_output() {
+        let addr = js_src_query_addr("pkg").format();
+        assert!(
+            addr.find("label(js_src)").unwrap() < addr.find("tree_output(").unwrap(),
+            "js_src query must check label before tree_output: {addr}"
+        );
+    }
+
+    // `js_src` only ever labels buildfile-emitted codegen targets, never
+    // js_test/js_typecheck/js_lint/js_bundle targets themselves. Without
+    // this exclusion, every JS target in scope — per *test file*, not per
+    // package, for `js_test` — would pay a full `get_spec` just to be
+    // rejected by the label check (the cost class `plugin-go`'s identical
+    // `label_queries_exclude_the_go_provider` test guards for the go
+    // provider).
+    #[test]
+    fn js_src_query_addr_excludes_the_js_provider() {
+        let addr = js_src_query_addr("pkg").format();
+        assert!(
+            addr.contains(&format!(
+                "{}=js",
+                hplugin_query::pluginquery::EXCLUDE_PROVIDER_ARG
+            )),
+            "js_src query must exclude the js provider: {addr}"
+        );
+    }
+
+    /// The memoization-by-construction guarantee `js_src_query_addr`'s own
+    /// doc requires: every one of the four independently-computed
+    /// `_deps_config` functions must produce the *exact same* codegen query
+    /// addr for the same package, or the engine mints a separate memoizer
+    /// cell — and a separate `tree_output` walk — per driver (and, for
+    /// `js_test`, per test file) instead of the one resolution per package
+    /// this design's whole cost argument depends on. Exercises three of the
+    /// four real call sites (test/typecheck/lint — `js_bundle`'s own
+    /// `bundle_deps_config` needs a full async `Provider`, not these plain-
+    /// function helpers, but calls the identical shared function with the
+    /// identical `pkg` argument, so this is representative of all four).
+    #[test]
+    fn codegen_query_addr_is_identical_across_all_deps_config_functions_for_the_same_package() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+        write(dir.path(), "packages/a/src/a.ts", "export const x = 1;\n");
+
+        let walker = CachedWalker::disabled();
+        let expected = js_src_query_addr("packages/a").format();
+
+        let (test_deps, _, _) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+        let (typecheck_deps, _, _) = call_typecheck_deps_config(&walker, dir.path(), "packages/a")
+            .expect("build typecheck deps config");
+        let lint_deps = call_lint_deps_config(&walker, dir.path(), "packages/a", toolchain::OXLINT)
+            .expect("build lint deps config");
+
+        for (label, deps) in [
+            ("js_test", &test_deps),
+            ("js_typecheck", &typecheck_deps),
+            ("js_lint", &lint_deps.deps),
+        ] {
+            assert_eq!(
+                deps.get("codegen"),
+                Some(&Value::List(vec![Value::String(expected.clone())])),
+                "{label}'s codegen query addr must exactly match js_src_query_addr's own output \
+                 for the same package, or the engine can't share one resolution across drivers"
+            );
+        }
+    }
+
     #[test]
     fn lint_deps_config_declares_first_party_source_files() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10275,6 +10501,39 @@ snapshots:
         assert_eq!(result.bundler_config_content, "");
         assert!(result.external.is_empty());
         assert!(dep_addrs(&result.deps, "bundler_config").is_empty());
+    }
+
+    /// `js_bundle`'s own call site: the fourth of the four `_deps_config`
+    /// functions, exercised through the real async `Provider` (unlike
+    /// test/typecheck/lint's plain-function helpers) — completes the
+    /// `codegen_query_addr_is_identical_across_all_deps_config_functions_for_the_same_package`
+    /// coverage across all four drivers.
+    #[tokio::test]
+    async fn bundle_deps_config_declares_codegen_query_addr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let result = provider
+            .bundle_deps_config(&PkgBuf::from("packages/a"), "packages/a/src/index.ts")
+            .await
+            .expect("bundle_deps_config");
+
+        assert_eq!(
+            result.deps.get("codegen"),
+            Some(&Value::List(vec![Value::String(
+                js_src_query_addr("packages/a").format()
+            )])),
+        );
     }
 
     /// Feature-quality M6 review BLOCKER: `--external` bundler flags were
