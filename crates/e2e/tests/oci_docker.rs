@@ -687,11 +687,19 @@ target(name = "autoload", driver = "oci_load", image = ":img")
         drop(Command::new("docker").args(["rmi", "-f", line]).output());
     }
 
-    loaded?;
-    autoloaded?;
+    let loaded = loaded?;
+    let autoloaded = autoloaded?;
     assert!(
         explicit.is_ok_and(|o| o.status.success()),
         "the tag {tag} must exist in the daemon after oci_load"
+    );
+    // The output is the ref, and the claim it makes is that this exact string
+    // resolves in the daemon — so it is checked against the daemon's own view
+    // below, not against the string the driver assembled.
+    let loaded_ref = String::from_utf8(common::artifact_bytes(&loaded))?;
+    assert_eq!(
+        loaded_ref, tag,
+        "an explicit `tag` is the ref the target outputs"
     );
     // The derived tag is the one a caller can predict from the graph, and the
     // only one the untagged target produced.
@@ -711,6 +719,14 @@ target(name = "autoload", driver = "oci_load", image = ":img")
         !hash.is_empty() && hash != "<none>" && hash.chars().all(|c| c.is_ascii_hexdigit()),
         "the derived tag must be the input hash, got: {:?}",
         derived[0]
+    );
+    // The point of the output: the derived ref cannot be written down by hand —
+    // it carries an input hash — so what the target emits has to be exactly what
+    // the daemon ended up holding, or reading it is worse than useless.
+    let autoloaded_ref = String::from_utf8(common::artifact_bytes(&autoloaded))?;
+    assert_eq!(
+        autoloaded_ref, derived[0],
+        "the ref the target outputs must be the one the daemon reports"
     );
     Ok(())
 }

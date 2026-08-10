@@ -17,10 +17,21 @@
 //! With no `tag`, the image is tagged by **content**: the image target's address
 //! as the repository, this load's input hash as the tag.
 //!
+//! The ref it settled on is the target's **output**, so nothing downstream has
+//! to reconstruct it — a derived tag holds an input hash, which is knowable from
+//! the graph but not by hand:
+//!
 //! ```console
-//! $ heph run //app:load
+//! $ heph run --cat-out //app:load
 //! app_img:9f2c4e1b7a0d3856
+//! $ docker run --rm "$(heph run --cat-out //app:load)"
 //! ```
+//!
+//! The ref rather than a digest-pinned `repo@sha256:…`: a `docker load` fills in
+//! `RepoDigests` only under the containerd image store, so on the classic one a
+//! digest ref sends `docker run` to a registry for an image that is already
+//! sitting in the daemon. The ref was just handed to that daemon and resolves on
+//! either — and with no explicit `tag` it is content-addressed anyway.
 //!
 //! A default is possible here at all because the useful property is not a name,
 //! it is *which image is this*. A tag written in a BUILD file is a moving
@@ -43,7 +54,8 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, TargetDef};
+use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
+use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
@@ -54,7 +66,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use super::{archive::Layout, dep_single_file};
+use super::{archive::Layout, basename, dep_single_file, ws_path};
 
 pub const DRIVER_NAME: &str = "oci_load";
 
@@ -73,7 +85,7 @@ struct OciLoadSpec {
     /// load's input hash:
     ///
     /// ```console
-    /// $ heph run //app:load
+    /// $ heph run --cat-out //app:load
     /// app_img:9f2c4e1b7a0d3856
     /// ```
     ///
@@ -81,7 +93,8 @@ struct OciLoadSpec {
     /// was built, it changes when and only when the image changes, and two
     /// people running the same commit get the same string. A name written here
     /// can do none of that — it says which image was loaded *last*, not which
-    /// one is which — so set it only when a human has to type it.
+    /// one is which — so set it only when a human has to type it. Either way the
+    /// ref is the target's output, so a script reads it rather than guessing.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     tag: Option<String>,
     /// Which instance to load out of a **multi-platform** archive, as `os/arch`
@@ -115,6 +128,9 @@ struct OciLoadDef {
     /// "whatever the host is": a multi-arch archive has no `darwin` instance to
     /// match on macOS.
     platform: String,
+    /// Workspace-relative path of the output file holding the ref the image was
+    /// tagged with. Derived from the target name; not settable.
+    ref_out: String,
 }
 
 /// v2: the skopeo path pins the loaded instance instead of following the host's
@@ -123,7 +139,8 @@ struct OciLoadDef {
 /// the way in; `tool` and `format` are gone, so neither is in the key.
 /// v4: `tag` is optional and defaults to a content-addressed name, so the
 /// derived repository is part of the def.
-const OCI_LOAD_FORMAT_VERSION: u32 = 4;
+/// v5: the ref the image was tagged with is written out as the target's output.
+const OCI_LOAD_FORMAT_VERSION: u32 = 5;
 
 impl Hash for OciLoadDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -131,6 +148,7 @@ impl Hash for OciLoadDef {
         self.tag.hash(state);
         self.repo.hash(state);
         self.platform.hash(state);
+        self.ref_out.hash(state);
     }
 }
 
@@ -300,10 +318,12 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("parse image ref {:?}", spec.image))?;
         super::pin_archive_group(&mut image_ref, &spec.image)?;
 
+        let ref_out = ws_path(addr.package.as_str(), &format!("{}.ref", addr.name));
         let def = OciLoadDef {
             tag: spec.tag,
             repo: docker_repo(&image_ref.r#ref)?,
             platform,
+            ref_out: ref_out.clone(),
         };
         let hash = {
             let mut h =
@@ -325,7 +345,14 @@ impl ManagedDriver for Driver {
                     hashed: true,
                     runtime: true,
                 }],
-                outputs: vec![],
+                outputs: vec![Output {
+                    group: String::new(),
+                    paths: vec![OutPath {
+                        content: Content::FilePath(ref_out),
+                        codegen_tree: CodegenMode::None,
+                        collect: true,
+                    }],
+                }],
                 support_files: vec![],
                 cache: CacheConfig::off(),
                 pty: false,
@@ -425,6 +452,22 @@ impl ManagedDriver for Driver {
             )
             .await
             .with_context(|| format!("tag the loaded image as {image}"))?;
+
+        // Written only once the tag is in the daemon: the output is a promise
+        // that this ref resolves, and a file naming an image that failed to tag
+        // would send whoever reads it at nothing.
+        //
+        // The ref, not the digest. `repo:tag` is what the daemon was just told;
+        // it resolves on any daemon, whichever image store it runs. A
+        // digest-pinned `repo@sha256:…` would only resolve under the containerd
+        // image store — a `docker load` leaves `RepoDigests` empty on the
+        // classic one, so `docker run` would go to a registry for an image that
+        // is already local. Immutability is not lost by taking the ref: with no
+        // explicit `tag` it is content-addressed already.
+        let ref_path = req.sandbox_pkg_dir.join(basename(&def.ref_out)?);
+        tokio::fs::write(&ref_path, &image)
+            .await
+            .with_context(|| format!("write the loaded image ref to {ref_path:?}"))?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -603,6 +646,47 @@ mod tests {
         .await;
         assert_eq!(a.target_def.def::<OciLoadDef>().repo, "svc_api_img");
         assert_eq!(b.target_def.def::<OciLoadDef>().repo, "svc_web_img");
+    }
+
+    /// The ref the image was tagged with is the target's output. Without it the
+    /// derived tag — an input hash — is knowable from the graph but not by hand,
+    /// so nothing downstream can name the image that was just loaded.
+    #[tokio::test]
+    async fn parse_declares_the_loaded_ref_as_its_output() {
+        let resp = parse(
+            "//app:load",
+            cfg(&[("image", Value::String(":img".to_string()))]),
+        )
+        .await;
+
+        let outputs = &resp.target_def.outputs;
+        assert_eq!(outputs.len(), 1);
+        // The default group: the ref is the whole of what this target produces.
+        assert_eq!(outputs[0].group, "");
+        assert!(
+            matches!(&outputs[0].paths[0].content, Content::FilePath(p) if p == "app/load.ref"),
+            "got: {:?}",
+            outputs[0].paths[0].content
+        );
+    }
+
+    /// The output file is named after the *load* target, not the image — two
+    /// loads of one image in a package would otherwise write to one path and
+    /// collect each other's ref.
+    #[tokio::test]
+    async fn each_load_target_writes_its_own_ref_file() {
+        async fn path(addr: &str) -> String {
+            let resp = parse(addr, cfg(&[("image", Value::String(":img".to_string()))])).await;
+            match &resp.target_def.outputs[0].paths[0].content {
+                Content::FilePath(p) => p.clone(),
+                other => panic!("expected a file path, got: {other:?}"),
+            }
+        }
+        assert_eq!(path("//app:load_amd64").await, "app/load_amd64.ref");
+        assert_ne!(
+            path("//app:load_amd64").await,
+            path("//app:load_arm64").await
+        );
     }
 
     /// Handing skopeo the `digest` group would give it a text file where it
