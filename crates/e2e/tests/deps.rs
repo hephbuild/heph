@@ -293,6 +293,203 @@ target(
     Ok(())
 }
 
+/// Build `addr` through a *fresh* engine over `ws`'s root — a second `heph`
+/// invocation's view of the same on-disk cache — and wait for the cache write to
+/// land. A fresh engine is the point: everything memoized per-engine (the spec,
+/// the def, and every `HashMap` built while producing them) is rebuilt, which is
+/// what a per-process hash instability needs in order to show.
+async fn run_in_a_fresh_engine(ws: &Workspace, addr_str: &str) -> anyhow::Result<()> {
+    use heph::engine::{Engine, OutputMatcher, ResultOptions};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let addr = heph::htaddr::parse_addr(addr_str)?;
+    let engine = ws.reopen()?;
+    let bg: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let rs = engine.new_state_full(
+        true,
+        None,
+        Arc::clone(&bg),
+        Engine::DEFAULT_LOG_TAIL_LINES,
+        None,
+    );
+    let result = engine
+        .clone()
+        .result_addr(
+            rs.clone(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    drop(result);
+    drop(rs);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while bg.load(Ordering::Acquire) > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background work never drained"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
+/// Revisions the cache holds for `addr`, read destructively via `clean` — the
+/// count of distinct `hashin`s the runs above produced. A stable hash means one
+/// revision no matter how many times it ran; one revision per run means the
+/// cache never hits and every build is cold.
+///
+/// The targets under test must raise `cache.history`: it defaults to 1, and the
+/// post-write GC enforces it, so a target left at the default keeps exactly one
+/// revision whether or not its hash is stable — an oracle that reads "stable"
+/// for every input.
+async fn revisions(ws: &Workspace, addr_str: &str) -> anyhow::Result<usize> {
+    let engine = ws.reopen()?;
+    let m = heph::htmatcher::Matcher::Addr(heph::htaddr::parse_addr(addr_str)?);
+    Ok(engine
+        .clone()
+        .clean(engine.new_state(), &m)
+        .await?
+        .revisions_removed)
+}
+
+// A transitive sandbox with more than one dep group must hash the same in every
+// process. The group ids are built by enumerating the parsed `{group: [dep]}`
+// map, whose iteration order is randomized per `HashMap` instance, and each id
+// reaches this consumer's def hash as an `Input::origin_id`. One group is always
+// index 0 — hence stable, and hence why every other fixture here misses this.
+#[tokio::test]
+async fn test_multi_group_transitive_hashes_the_same_every_run() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "mgt",
+        r#"
+target(name = "p", driver = "bash", run = "printf p > $OUT", out = "p.txt")
+target(name = "q", driver = "bash", run = "printf q > $OUT", out = "q.txt")
+target(name = "r", driver = "bash", run = "printf r > $OUT", out = "r.txt")
+target(name = "s", driver = "bash", run = "printf s > $OUT", out = "s.txt")
+target(
+    name = "carrier",
+    driver = "bash",
+    run = "printf carrier > $OUT",
+    out = "c.txt",
+    transitive = {"deps": {"gp": ["//mgt:p"], "gq": ["//mgt:q"],
+                           "gr": ["//mgt:r"], "gs": ["//mgt:s"]}},
+)
+target(
+    name = "consumer",
+    driver = "bash",
+    run = "printf consumed > $OUT",
+    out = "out.txt",
+    cache = {"history": 8},
+    deps = {"carrier": ["//mgt:carrier"]},
+)
+"#,
+    );
+
+    for _ in 0..4 {
+        run_in_a_fresh_engine(&ws, "//mgt:consumer").await?;
+    }
+    assert_eq!(
+        revisions(&ws, "//mgt:consumer").await?,
+        1,
+        "consumer's hashin moved between runs: every build is a cold cache"
+    );
+    Ok(())
+}
+
+// The same property for the *consumer* side: the transitive collector numbers
+// each merged sandbox by its position in the consumer's input list, and that
+// number lands in the merged ids. With more than one dep group, that list is
+// assembled by iterating a `HashMap`, so the position — and the hash — is drawn
+// from a per-process random order.
+#[tokio::test]
+async fn test_multi_group_consumer_hashes_the_same_every_run() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "mgc",
+        r#"
+target(name = "hidden", driver = "bash", run = "printf hidden > $OUT", out = "h.txt")
+target(
+    name = "carrier",
+    driver = "bash",
+    run = "printf carrier > $OUT",
+    out = "c.txt",
+    transitive = {"deps": {"hidden": ["//mgc:hidden"]}},
+)
+target(name = "a", driver = "bash", run = "printf a > $OUT", out = "a.txt")
+target(name = "b", driver = "bash", run = "printf b > $OUT", out = "b.txt")
+target(name = "c", driver = "bash", run = "printf c > $OUT", out = "cc.txt")
+target(
+    name = "consumer",
+    driver = "bash",
+    run = "printf consumed > $OUT",
+    out = "out.txt",
+    cache = {"history": 8},
+    deps = {"ga": ["//mgc:a"], "gb": ["//mgc:b"], "gc": ["//mgc:c"],
+            "carrier": ["//mgc:carrier"]},
+)
+"#,
+    );
+
+    for _ in 0..4 {
+        run_in_a_fresh_engine(&ws, "//mgc:consumer").await?;
+    }
+    assert_eq!(
+        revisions(&ws, "//mgc:consumer").await?,
+        1,
+        "consumer's hashin moved between runs: every build is a cold cache"
+    );
+    Ok(())
+}
+
+// Two deps in one transitive group each need their own `origin_id`: it names the
+// per-input list file (`list/input_<origin_id>.list`) that the exec driver reads
+// back to build `$SRC_<group>`, and the lookup is a `find` on that id. Sharing an
+// id makes both deps append to one list file and the first input answer for both,
+// so every path lands in `$SRC_G` twice.
+#[tokio::test]
+async fn test_transitive_group_with_two_deps_lists_each_once() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "dupsrc",
+        r#"
+target(name = "x", driver = "bash", run = "printf x > $OUT", out = "x.txt")
+target(name = "y", driver = "bash", run = "printf y > $OUT", out = "y.txt")
+target(
+    name = "carrier",
+    driver = "bash",
+    run = "printf carrier > $OUT",
+    out = "c.txt",
+    transitive = {"deps": {"g": ["//dupsrc:x", "//dupsrc:y"]}},
+)
+target(
+    name = "consumer",
+    driver = "bash",
+    run = "printf '%s' \"$SRC_G\" > $OUT",
+    out = "out.txt",
+    deps = {"carrier": ["//dupsrc:carrier"]},
+)
+"#,
+    );
+
+    let result = ws.run("//dupsrc:consumer").await?;
+    let content = common::artifact_string(&result);
+    let paths: Vec<&str> = content.split_whitespace().collect();
+    let mut uniq: Vec<&str> = paths.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(
+        paths.len(),
+        uniq.len(),
+        "$SRC_G repeats a path, got: {content:?}"
+    );
+    assert_eq!(paths.len(), 2, "expected x.txt and y.txt, got: {content:?}");
+    Ok(())
+}
+
 // Direct cycle A → B → A must be rejected
 #[tokio::test]
 async fn test_direct_cyclic_dep_detected() -> anyhow::Result<()> {

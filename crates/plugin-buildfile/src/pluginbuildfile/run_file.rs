@@ -505,6 +505,20 @@ fn approval_from(v: htvalue::Value) -> anyhow::Result<Approval> {
     }
 }
 
+/// A parsed `{group: [dep]}` attribute, ordered by group name.
+///
+/// `parse_map_string_strings` returns a `HashMap`, whose iteration order is
+/// randomized per instance — so anything derived from that order differs between
+/// two parses of the same BUILD file, in the same process or across processes.
+/// Everything built below reaches a dependent's def hash (dep/tool ids become
+/// `Input::origin_id`), so it has to be derived from the content, never from the
+/// map's order.
+fn sorted_groups(m: &HashMap<String, Vec<String>>) -> Vec<(&String, &Vec<String>)> {
+    let mut groups: Vec<(&String, &Vec<String>)> = m.iter().collect();
+    groups.sort_by(|a, b| a.0.cmp(b.0));
+    groups
+}
+
 /// Parse a BUILD-file `sandbox`/`transitive` value (Starlark → `htvalue`) into a
 /// [`Sandbox`]. Free function rather than an inherent `impl` because `Sandbox`
 /// now lives in the `heph-plugin` contract crate (orphan rule).
@@ -523,8 +537,8 @@ fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
 
     if let Some(v) = m.remove("deps") {
         let parsed = parse_map_string_strings(v).with_context(|| "parse `deps`")?;
-        for (i, (k, ss)) in parsed.iter().enumerate() {
-            for s in ss {
+        for (k, ss) in sorted_groups(&parsed) {
+            for (i, s) in ss.iter().enumerate() {
                 sandbox.push_dep(Dep {
                     r#ref: TargetAddr::parse(s, pkg).with_context(|| "parse `deps`")?,
                     mode: Mode::None,
@@ -557,8 +571,8 @@ fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
 
     if let Some(v) = m.remove("tools") {
         let parsed = parse_map_string_strings(v).with_context(|| "parse `tools`")?;
-        for (i, (k, ss)) in parsed.iter().enumerate() {
-            for s in ss {
+        for (k, ss) in sorted_groups(&parsed) {
+            for (i, s) in ss.iter().enumerate() {
                 sandbox.push_tool(Tool {
                     r#ref: TargetAddr::parse(s, pkg).with_context(|| "parse `tools`")?,
                     group: k.to_string(),
@@ -2461,6 +2475,61 @@ target(
             .collect();
         assert!(names.contains(&"a"));
         assert!(names.contains(&"b"));
+        // Each dep in the group gets its own id. The id names the per-input list
+        // file the exec driver reads back to build `$SRC_<group>`, and that
+        // lookup takes the *first* input with a matching id — so two deps
+        // sharing one id makes both answer with the same (shared) list file and
+        // every path lands in `$SRC_G` twice.
+        let ids: Vec<&str> = sandbox.deps.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["dep|g|0", "dep|g|1"], "ids must be per-dep");
+    }
+
+    /// `deps`/`tools` parse into a `HashMap` whose iteration order is randomized
+    /// per instance, so an id derived from that order differs between two parses
+    /// of the same BUILD file — and every id reaches a dependent's def hash
+    /// through `Input::origin_id`. Two groups are enough to fire it; one is
+    /// always index 0, which is why the single-group fixtures above never did.
+    #[test]
+    fn test_sandbox_ids_stable_across_group_order() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    transitive = {
+        "deps": {"a": ["//mypkg:a"], "b": ["//mypkg:b"], "c": ["//mypkg:c"],
+                 "d": ["//mypkg:d"], "e": ["//mypkg:e"], "f": ["//mypkg:f"]},
+        "tools": {"ta": ["//mypkg:ta"], "tb": ["//mypkg:tb"], "tc": ["//mypkg:tc"],
+                  "td": ["//mypkg:td"], "te": ["//mypkg:te"], "tf": ["//mypkg:tf"]},
+    },
+)
+"#;
+        // Keyed by ref so the comparison is order-independent: what must be
+        // stable is the id each dep gets, not the order they were pushed in.
+        let ids = |sb: &Sandbox| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = sb
+                .deps()
+                .iter()
+                .map(|d| (d.r#ref.r#ref.name.clone(), d.id.clone()))
+                .chain(
+                    sb.tools()
+                        .iter()
+                        .map(|t| (t.r#ref.r#ref.name.clone(), t.id.clone())),
+                )
+                .collect();
+            v.sort();
+            v
+        };
+
+        let first = ids(&run_transitive(content).unwrap());
+        for i in 0..8 {
+            let again = ids(&run_transitive(content).unwrap());
+            assert_eq!(
+                first,
+                again,
+                "ids differ between parse 0 and parse {}",
+                i + 1
+            );
+        }
     }
 
     #[test]
