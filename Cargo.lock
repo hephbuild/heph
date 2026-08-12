@@ -4302,6 +4302,7 @@ dependencies = [
  "futures",
  "heph",
  "model",
+ "object 0.37.3",
  "plugin",
  "plugin-go",
  "tempfile",

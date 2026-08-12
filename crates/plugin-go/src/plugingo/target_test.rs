@@ -184,8 +184,11 @@ pub fn build_test_spec(
     } else {
         format!(" {}", factors.ldflags.join(" "))
     };
+    // Same coupling as the binary link (see `target_bin::generate_link_script`):
+    // the mode here must match what the archives were compiled under.
+    let mode = factors.buildmode.as_str();
     script.push(format!(
-        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode=pie{ldflags} -o test_binary \"$SRC_TESTMAIN\""
+        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode={mode}{ldflags} -o test_binary \"$SRC_TESTMAIN\""
     ));
 
     let mut deps: BTreeMap<String, Value> = BTreeMap::new();
@@ -603,6 +606,34 @@ mod tests {
             !run.contains("test -c"),
             "build_test run must NOT use go test -c: {run}"
         );
+    }
+
+    // The test binary links from the same archives as the `build` binary, so its
+    // buildmode must track the variant too — a `pie` link over `exe`-compiled
+    // archives (or the reverse) is a link failure, not a slower test.
+    #[test]
+    fn test_build_test_spec_link_follows_the_variant_buildmode() {
+        let testmain_lib = mk_addr("pkg", "build_testmain_lib");
+        let exe = run_str(&build_test_spec(
+            mk_addr("pkg", "build_test"),
+            &test_factors(),
+            &testmain_lib,
+            &[],
+            V,
+        ));
+        assert!(exe.contains("-buildmode=exe"), "{exe}");
+
+        let pie = run_str(&build_test_spec(
+            mk_addr("pkg", "build_test"),
+            &Factors {
+                buildmode: crate::plugingo::factors::BuildMode::Pie,
+                ..test_factors()
+            },
+            &testmain_lib,
+            &[],
+            V,
+        ));
+        assert!(pie.contains("-buildmode=pie"), "{pie}");
     }
 
     #[test]

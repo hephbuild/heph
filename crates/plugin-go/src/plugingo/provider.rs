@@ -476,6 +476,7 @@ impl ProviderTrait for Provider {
             ("goexperiment", ParamType::list(ParamType::String)),
             ("gcflags", ParamType::list(ParamType::String)),
             ("ldflags", ParamType::list(ParamType::String)),
+            ("buildmode", ParamType::String),
         ]);
         Some(StateSchema {
             fields: vec![
@@ -485,8 +486,14 @@ impl ProviderTrait for Provider {
                     "Named Go build variants for this package (and its descendants, via \
                      closest-ancestor lookup). Maps a variant name to a static factor set: \
                      `goos`/`goarch` (required), plus optional `tags` (build tags), \
-                     `goexperiment` (GOEXPERIMENT), `gcflags` (extra `go tool compile` flags) \
-                     and `ldflags` (extra `go tool link` flags). \
+                     `goexperiment` (GOEXPERIMENT), `gcflags` (extra `go tool compile` flags), \
+                     `ldflags` (extra `go tool link` flags) and `buildmode` \
+                     (`exe`, the default, or `pie`). `exe` matches plain `go build`: on \
+                     Linux it links a static binary with no interpreter, so it runs in a \
+                     `FROM scratch` image; `pie` produces a position-independent executable, \
+                     which on Linux always needs `/lib/ld-linux-<arch>.so.1` present. On \
+                     darwin/arm64 the Go linker makes every executable PIE, so both modes \
+                     land in the same place there. \
                      A user-facing target selects one with `@v=NAME`, resolving the closest \
                      ancestor package that defines that name; variants do NOT compound across \
                      the tree (each definition is self-contained).",
