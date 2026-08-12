@@ -3835,10 +3835,26 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Skipping is fine on a dev machine without Go; in CI it is a broken job.
+    ///
+    /// A runner without `go` turns every test behind this macro green instantly
+    /// — indistinguishable from a suite that passed. That is how these 463 tests
+    /// came to finish in 0.55s on CI's macOS leg (62s on linux) with nobody
+    /// noticing. Under `CI` a missing `go` is a hard failure instead.
+    fn no_go_or_panic() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "go is not on PATH, so this test would silently skip. In CI that is \
+             a broken job, not a skip: the devenv shell provides `pkgs.go` (see \
+             devenv.nix), so reaching this means the test is not running inside it."
+        );
+        eprintln!("skipping: go not in PATH");
+    }
+
     macro_rules! require_go {
         () => {
             if !go_available() {
-                eprintln!("skipping: go not in PATH");
+                no_go_or_panic();
                 return;
             }
         };

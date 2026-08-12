@@ -24,7 +24,7 @@ pub use htestkit::{artifact_bytes, artifact_paths, artifact_string};
 macro_rules! require_go {
     () => {
         if !crate::common::go_available() {
-            eprintln!("skipping: go not in PATH");
+            crate::common::no_go_or_panic();
             return Ok(());
         }
     };
@@ -37,6 +37,22 @@ pub fn go_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Skipping is fine on a dev machine without Go; in CI it is a broken job.
+///
+/// Every test in this crate needs `go` on PATH, so a runner without it turns the
+/// whole suite green in a quarter of a second — indistinguishable from a suite
+/// that passed, and exactly how the macOS leg went untested for as long as it
+/// did. Under `CI` this is a hard failure instead.
+pub fn no_go_or_panic() {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "go is not on PATH, so this test would silently skip. In CI that is a \
+         broken job, not a skip: the devenv shell provides `pkgs.go` (see \
+         devenv.nix), so reaching this means the test is not running inside it."
+    );
+    eprintln!("skipping: go not in PATH");
 }
 
 /// Whether a linked ELF executable declares a `PT_INTERP` program header — i.e.
