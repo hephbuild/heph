@@ -27,12 +27,19 @@ pub struct ConfigYaml {
     /// expects. When set and it differs from the running binary, the self-upgrade
     /// check downloads the pinned release and re-execs into it. Omit to disable
     /// self-upgrade for the workspace.
+    ///
+    /// **Mirrored in [`VersionPin`]**, which is what self-upgrade actually reads —
+    /// change this field's name or type and you must change that one too, or the
+    /// pin silently reads as absent and the workspace stays on the wrong binary.
+    /// It is a frozen wire contract; see [`VersionPin`] before retyping it.
     #[serde(default)]
     pub version: Option<String>,
     /// Release flavour to pin `version` to, e.g. `debug`. Selects which published
     /// artifact self-upgrade downloads: empty/omitted is the default "std" build
     /// (`heph_<os>_<arch>`); a non-empty flavour downloads `heph_<flavour>_<os>_<arch>`
     /// (e.g. `heph_debug_darwin_arm64`) instead.
+    ///
+    /// Mirrored in [`VersionPin`] — see the note on [`version`](Self::version).
     #[serde(default)]
     pub version_flavour: Option<String>,
     #[serde(default)]
@@ -506,7 +513,12 @@ pub const PROFILES_ENV: &str = "HEPH_PROFILES";
 
 /// Profiles requested via `HEPH_PROFILES`, in order. Empty/whitespace entries are
 /// dropped, so `HEPH_PROFILES=a,,b ` yields `["a", "b"]`.
-fn profiles_from_env() -> Vec<String> {
+///
+/// Public so a caller that must stay testable — the self-upgrade check, which
+/// reads the version pin before anything else — can take the profile list as an
+/// argument and read the environment once, at its edge, rather than deep inside
+/// the loader.
+pub fn profiles_from_env() -> Vec<String> {
     std::env::var(PROFILES_ENV)
         .ok()
         .map(|v| {
@@ -536,28 +548,106 @@ pub fn load_from_root(root: &Path) -> anyhow::Result<ConfigYaml> {
 /// Core of [`load_from_root`], with the profile list passed in so it can be
 /// exercised without touching the process environment.
 fn load_with_profiles(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Result<ConfigYaml> {
+    load_layered(root, profiles, ConfigYaml::merge)
+}
+
+/// The version pin alone, parsed **leniently**: every other key — known,
+/// unknown, or malformed-for-this-binary — is skipped.
+///
+/// This is what the pre-engine self-upgrade check reads, and the leniency is the
+/// whole point. The full [`ConfigYaml`] is `deny_unknown_fields` (a typo in a
+/// config key should be an error, not a silently ignored setting), which makes it
+/// unusable for deciding *which binary should be running*. The binary that reads
+/// the pin is, by definition, the one that may not understand the config the
+/// pinned version was written for:
+///
+/// - **upgrade** — the workspace pins version N and uses a key N introduced. N-1
+///   cannot parse it, and N-1 is exactly the binary that has to read the pin to
+///   hand over to N.
+/// - **downgrade** — the workspace pins N-1 and uses a key N *dropped*. The
+///   running N cannot parse it, and N is the one that has to hand over to N-1.
+///
+/// So the pin is read through a struct that knows only `version` /
+/// `versionFlavour` and ignores the rest of the file. Once the right binary is
+/// running, any command that builds the engine loads the config in full and
+/// reports what it doesn't understand — the strictness is deferred, not dropped.
+///
+/// These two fields are a **frozen wire contract**: every heph that will ever run
+/// against this workspace has to read them, so they must stay plain YAML strings.
+/// Retyping either one (a mapping, say) leaves older binaries hard-erroring at
+/// startup with no upgrade path out of it.
+#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionPin {
+    /// See [`ConfigYaml::version`].
+    #[serde(default)]
+    pub version: Option<String>,
+    /// See [`ConfigYaml::version_flavour`].
+    #[serde(default)]
+    pub version_flavour: Option<String>,
+}
+
+impl VersionPin {
+    /// Apply `other` on top of `self` — each field present in `other` wins.
+    /// Mirrors [`ConfigYaml::merge`] for the two fields it carries, so a profile
+    /// re-pins the version for the lenient loader exactly as it does for the full
+    /// one.
+    pub fn merge(&mut self, other: VersionPin) {
+        if other.version.is_some() {
+            self.version = other.version;
+        }
+        if other.version_flavour.is_some() {
+            self.version_flavour = other.version_flavour;
+        }
+    }
+}
+
+/// Read just the version pin from the workspace, with the same base-file choice
+/// and profile layering as [`load_from_root`] — see [`VersionPin`] for why this
+/// exists as a separate, lenient path.
+///
+/// `profiles` is passed in rather than read from `HEPH_PROFILES` here (callers
+/// use [`profiles_from_env`]) so the self-upgrade path that depends on it stays
+/// testable without touching the process environment.
+pub fn load_version_pin(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Result<VersionPin> {
+    load_layered(root, profiles, VersionPin::merge)
+}
+
+/// The base-file + profile layering shared by the full config loader and the
+/// lenient [`VersionPin`] one, so the two can never disagree about *which* files
+/// make up the config or in what order they apply. `merge` is how the shape being
+/// loaded applies an overlay.
+fn load_layered<T: serde::de::DeserializeOwned + Default>(
+    root: &Path,
+    profiles: &[impl AsRef<str>],
+    merge: fn(&mut T, T),
+) -> anyhow::Result<T> {
     let base_name = config_file_name_at(root);
-    let mut cfg = load(&root.join(base_name))?;
+    let mut cfg: T = load_file(&root.join(base_name))?;
     for profile in profiles {
         let profile = profile.as_ref();
         // base_name carries the leading dot, so this is `<profile>.hephconfig`
         // (or `<profile>.hephconfig2` for a legacy workspace).
         let file_name = format!("{profile}{base_name}");
         tracing::debug!(profile, file = %file_name, "applying config profile");
-        let overlay = load(&root.join(&file_name))
+        let overlay: T = load_file(&root.join(&file_name))
             .with_context(|| format!("loading config profile {file_name}"))?;
-        cfg.merge(overlay);
+        merge(&mut cfg, overlay);
     }
     Ok(cfg)
 }
 
 pub fn load(path: &Path) -> anyhow::Result<ConfigYaml> {
+    load_file(path)
+}
+
+fn load_file<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
     let bytes =
         std::fs::read(path).with_context(|| format!("reading config file {}", path.display()))?;
     if bytes.is_empty() {
-        return Ok(ConfigYaml::default());
+        return Ok(T::default());
     }
-    let cfg: ConfigYaml = serde_yaml::from_slice(&bytes)
+    let cfg: T = serde_yaml::from_slice(&bytes)
         .with_context(|| format!("parsing YAML config {}", path.display()))?;
     Ok(cfg)
 }
@@ -1126,6 +1216,175 @@ caches:
 
         let cfg = load_with_profiles(root, &["a"]).expect("load");
         assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".a")));
+    }
+
+    // The lenient version-pin loader. It exists so the running binary can always
+    // find out *which* binary should be running, even when it cannot parse the
+    // config the pinned version was written for — see [`VersionPin`].
+
+    #[test]
+    fn version_pin_ignores_fields_this_binary_does_not_know() {
+        // Everything below `version`/`versionFlavour` is a config this binary has
+        // no idea about: an unknown top-level key, an unknown key nested inside a
+        // block it *does* know, and an unknown key in a plugin entry (whose
+        // hand-rolled deserializer rejects extras on its own).
+        let yaml = r#"
+version: v2.0.0
+versionFlavour: debug
+fromTheFuture:
+  deeply:
+    nested: [1, 2, {a: b}]
+cache:
+  aKeyThisBinaryDropped: 1
+plugins:
+  - builtin: buildfile
+    futureKnob: true
+"#;
+        // The strict shape is what would have blocked the upgrade.
+        assert!(
+            serde_yaml::from_str::<ConfigYaml>(yaml).is_err(),
+            "fixture must be rejected by the strict shape, else it proves nothing"
+        );
+
+        let pin: VersionPin = serde_yaml::from_str(yaml).expect("pin parses leniently");
+        assert_eq!(pin.version.as_deref(), Some("v2.0.0"));
+        assert_eq!(pin.version_flavour.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn version_pin_absent_fields_are_none() {
+        let pin: VersionPin = serde_yaml::from_str("fromTheFuture: 1\n").expect("parse");
+        assert_eq!(pin, VersionPin::default());
+    }
+
+    #[test]
+    fn version_pin_reads_the_same_keys_as_the_full_config() {
+        // `VersionPin` restates two of `ConfigYaml`'s fields, and nothing in the
+        // type system ties them together: rename or retype either one on
+        // `ConfigYaml` and the pin loader would quietly start reading `None` —
+        // self-upgrade silently becomes a no-op and the workspace stays on the
+        // wrong binary. Parse one document through both shapes so that drift
+        // fails here instead.
+        let yaml = "version: v1.2.3\nversionFlavour: debug\n";
+        let full: ConfigYaml = serde_yaml::from_str(yaml).expect("full parse");
+        let pin: VersionPin = serde_yaml::from_str(yaml).expect("pin parse");
+
+        assert_eq!(pin.version, full.version);
+        assert_eq!(pin.version_flavour, full.version_flavour);
+        assert_eq!(pin.version.as_deref(), Some("v1.2.3"));
+        assert_eq!(pin.version_flavour.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn version_pin_merges_like_the_full_config() {
+        // Same for the overlay rule: an omitted field must not clobber the base,
+        // a present one must win. Drift here would make a profile re-pin the
+        // version for the engine but not for the self-upgrade check.
+        let base_yaml = "version: v1.0.0\nversionFlavour: debug\n";
+        let overlay_yaml = "version: v2.0.0\n";
+
+        let mut full: ConfigYaml = serde_yaml::from_str(base_yaml).expect("full base");
+        full.merge(serde_yaml::from_str(overlay_yaml).expect("full overlay"));
+        let mut pin: VersionPin = serde_yaml::from_str(base_yaml).expect("pin base");
+        pin.merge(serde_yaml::from_str(overlay_yaml).expect("pin overlay"));
+
+        assert_eq!(pin.version, full.version);
+        assert_eq!(pin.version_flavour, full.version_flavour);
+        assert_eq!(pin.version.as_deref(), Some("v2.0.0"));
+        assert_eq!(pin.version_flavour.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn version_pin_layered_load_ignores_unknown_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join(".hephconfig"),
+            "version: v1.2.3\nfromTheFuture: 1\n",
+        )
+        .expect("write base");
+
+        let pin = load_version_pin(root, &[] as &[&str]).expect("load pin");
+        assert_eq!(pin.version.as_deref(), Some("v1.2.3"));
+        // …while the strict loader on the same tree still rejects it, naming the
+        // offending key — check the message, so this can't pass on some other
+        // error and quietly stop proving anything.
+        let err = load_with_profiles(root, &[] as &[&str]).expect_err("strict loader must reject");
+        assert!(format!("{err:#}").contains("fromTheFuture"), "{err:#}");
+    }
+
+    #[test]
+    fn version_pin_empty_config_is_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".hephconfig"), b"").expect("write base");
+
+        let pin = load_version_pin(root, &[] as &[&str]).expect("load pin");
+        assert_eq!(pin, VersionPin::default());
+    }
+
+    #[test]
+    fn version_pin_layers_profiles_like_the_full_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join(".hephconfig"),
+            "version: v1.0.0\nversionFlavour: debug\nfromTheFuture: 1\n",
+        )
+        .expect("write base");
+        // Profile re-pins the version and leaves the flavour alone; it also
+        // carries its own unknown key.
+        std::fs::write(
+            root.join("ci.hephconfig"),
+            "version: v2.0.0\nalsoFromTheFuture: [1]\n",
+        )
+        .expect("write profile");
+
+        let pin = load_version_pin(root, &["ci"]).expect("load pin");
+        assert_eq!(pin.version.as_deref(), Some("v2.0.0"));
+        assert_eq!(pin.version_flavour.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn version_pin_follows_the_legacy_base_and_its_profile_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // `.hephconfig2` wins over `.hephconfig`, and profiles follow the chosen
+        // base — the pin loader must not diverge from the full loader here.
+        std::fs::write(root.join(".hephconfig"), "version: v1.0.0\n").expect("write canonical");
+        std::fs::write(root.join(".hephconfig2"), "version: v2.0.0\nfuture: 1\n")
+            .expect("write legacy");
+        std::fs::write(root.join("a.hephconfig2"), "version: v3.0.0\n").expect("write profile");
+
+        let pin = load_version_pin(root, &["a"]).expect("load pin");
+        assert_eq!(pin.version.as_deref(), Some("v3.0.0"));
+    }
+
+    #[test]
+    fn version_pin_still_reports_broken_yaml() {
+        // Leniency is about *unknown fields*, not about a file that isn't YAML —
+        // silently pretending there is no pin would strand the workspace on the
+        // wrong binary. The error must name the file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".hephconfig"), "version: [unterminated\n").expect("write base");
+
+        let err = load_version_pin(root, &[] as &[&str]).expect_err("must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(".hephconfig"), "{msg}");
+    }
+
+    #[test]
+    fn version_pin_missing_profile_errors() {
+        // Same as the full loader: a named profile that isn't there is a hard
+        // error, since the pin it would have set is unknowable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".hephconfig"), "version: v1.0.0\n").expect("write base");
+
+        let err = load_version_pin(root, &["missing"]).expect_err("must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing.hephconfig"), "{msg}");
     }
 
     #[test]
