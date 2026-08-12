@@ -902,7 +902,7 @@ pub fn render_stall(r: &StallReport) -> String {
     // cost a round trip on exactly the incident this paragraph exists for.
     out.push_str(&format!(
         "\nheph {}: no progress for {}\n",
-        hcore::version::VERSION,
+        hcore::version::current(),
         secs(r.quiet_for)
     ));
 
@@ -1989,7 +1989,7 @@ mod tests {
         s.op_start(Op::Result, "//a:b", 0);
         let text = render_stall(&s.evaluate(61_000, T).expect("stalled"));
         assert!(
-            text.contains(hcore::version::VERSION),
+            text.contains(hcore::version::current()),
             "the report must name its build: {text}"
         );
         assert!(text.contains("no progress for"), "{text}");

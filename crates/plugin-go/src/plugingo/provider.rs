@@ -4030,7 +4030,7 @@ mod tests {
     async fn test_get_govet_dev_default_target_is_a_config_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let p = Provider::new(tmp.path().to_path_buf(), test_runtime()).expect("provider");
-        let dev = govet::govet_addr(hcore::version::VERSION);
+        let dev = govet::govet_addr(hcore::version::current());
         let err = match provider_get(&p, dev).await {
             Err(GetError::Other(e)) => e,
             Err(other) => panic!("expected a config error, got {other:?}"),
