@@ -602,7 +602,7 @@ fn matrix_include(body: &str) -> Vec<Vec<(String, String)>> {
 
 /// The step blocks of a job body, each starting at a `      - ` line.
 ///
-/// Some invariants are per *step*, not per job: the `sccache stats` step
+/// Some invariants are per *step*, not per job: the `kache stats` step
 /// legitimately carries `if: always()`, so "the Lint step has no `if:`" cannot
 /// be checked by scanning the whole job.
 fn job_steps(body: &str) -> Vec<String> {
@@ -721,7 +721,7 @@ fn a_lint_leg_cannot_report_success_without_running_the_lint() {
             .find(|step| job_run_steps(step).contains(&"lint"))
             .unwrap_or_else(|| panic!("`{id}` has a step running the `lint` script"));
 
-        // Scoped to this step: `sccache stats` legitimately has `if: always()`.
+        // Scoped to this step: `kache stats` legitimately has `if: always()`.
         assert!(
             !lint_step.lines().any(|line| line.trim().starts_with("if:")),
             "the Lint step of the `{id}` leg carries an `if:`. A skipped step \

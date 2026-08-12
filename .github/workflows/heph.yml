@@ -24,13 +24,21 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# sccache config shared by every compiling job. RUSTC_WRAPPER=sccache is set by
-# the devenv shell; the storage backend (R2, or local disk on fork PRs) is wired
-# up by the setup-nix action. Incremental compilation is off because sccache
-# cannot cache incremental units, and fresh runners have no warm incremental dir
-# to reuse. SCCACHE_CACHE_SIZE bounds only the local-disk fallback.
+# kache config shared by every compiling job. RUSTC_WRAPPER=kache is set by the
+# devenv shell; the storage backend (R2, or local disk on fork PRs) and the
+# daemon that talks to it are wired up by the setup-nix action. Incremental
+# compilation is off because kache caches whole artifacts rather than
+# incremental units, and fresh runners have no warm incremental dir to reuse.
+#
+# KACHE_MAX_SIZE bounds the runner's local store. Well under kache's own 50GiB
+# default, which is sized for a workstation: a runner only needs this build's
+# artifacts, and on Linux (ext4, no reflink) kache *copies* rather than
+# hardlinks the mutable outputs — bin, dylib, cdylib, proc-macro — so those
+# cost their bytes twice, once in the store and once in target/. macOS (APFS)
+# reflinks them for free. Overshooting here is a disk-full test failure, which
+# this repo has hit before, not a slow build.
 env:
-  SCCACHE_CACHE_SIZE: "2G"
+  KACHE_MAX_SIZE: "10GiB"
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -353,11 +361,6 @@ jobs:
           rust-strip --strip-all $BIN_NAME
           bash scripts/patch-flavour.sh $BIN_NAME ""
 
-      - name: sccache stats
-        if: always()
-        shell: devenv shell bash -- -e {0}
-        run: sccache --show-stats
-
       # Runs wherever this runner can actually execute what it just built: the
       # darwin leg and the linux/amd64 leg both build for the runner's own
       # arch. linux/arm64 cross-compiles on an amd64 runner (see the zigbuild
@@ -424,6 +427,39 @@ jobs:
         with:
           name: ${{steps.build.outputs.plugin_oci_name}}
           path: ${{steps.build.outputs.plugin_oci_name}}
+
+      # Last, deliberately. This is the only job with steps after its compile,
+      # and the drain must not sit in front of them: it would still be correct
+      # today (nothing after `Build` compiles) but only by accident, and a
+      # compiling step appended later would silently stop being published.
+      - name: kache stats + drain uploads
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: |
+          kache stats
+
+          # Resolve the log path from the daemon itself rather than hardcoding
+          # it. Both OSes run this same step and they do not agree: Linux puts
+          # it at `~/.cache/kache/kache.log`, macOS at
+          # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
+          # directory the upstream docs name, which is where hardcoding it
+          # would have silently produced nothing on the darwin legs.
+          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+
+          kache daemon stop || true
+
+          # Upload outcomes exist *only* in this log. `kache stats` reports what
+          # was read, never what was published, so without this the difference
+          # between "uploaded" and "still queued when the 30s drain cap fired"
+          # is invisible — which is precisely the question a low hit rate on a
+          # re-run raises, and which cost a round trip to answer once already.
+          if [ -n "${log:-}" ] && [ -f "$log" ]; then
+            echo "::group::kache daemon log (tail)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          else
+            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
 
   upload_artifacts:
     name: Pre-release
@@ -521,12 +557,18 @@ jobs:
   # The gate check-builds every workspace member's libs *and* test targets,
   # three times (default features, --all-features, --no-default-features),
   # where it used to build the root package alone in ~1m35s. A fork PR gets no
-  # R2 sccache credentials and runs every pass stone cold — and clippy's work is
-  # not sccache-cacheable at all (`sccache` does not cache `clippy-driver`,
-  # which is why these jobs' own stats report ~200 "non-cacheable calls"), so a
-  # warm cache only saves the dependency compiles. A timeout renders as a red
-  # lint leg indistinguishable from a real lint failure, so the 30min headroom
-  # is deliberate.
+  # R2 credentials and runs every pass stone cold, so the headroom is sized for
+  # that case. Under sccache this job was uncacheable on top of that — it did
+  # not cache `clippy-driver` at all, which is why these legs used to report
+  # ~200 "non-cacheable calls". kache does: cargo runs workspace members as
+  # `$RUSTC_WRAPPER $RUSTC_WORKSPACE_WRAPPER $RUSTC`, so the wrapper sees the
+  # clippy invocation and keys it on clippy-driver's own compiler identity,
+  # separately from the equivalent `cargo build` unit. Measured on a workspace
+  # member: `cargo clean -p <crate>` then `cargo clippy -p <crate>
+  # --all-targets` restores from cache rather than re-linting.
+  #
+  # A timeout renders as a red lint leg indistinguishable from a real lint
+  # failure, so the 30min headroom is deliberate.
   #
   # Both platforms, because macOS-only code was clippy-linted nowhere.
   # `Test darwin/arm64` compiles it, but nothing there passes `-D warnings`, so
@@ -618,10 +660,44 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: lint
 
-      - name: sccache stats
+      # Also the upload barrier, which is why it is `always()` and why every
+      # compiling job needs one. The daemon uploads to R2 in the background so
+      # no rustc invocation waits on the network — but an ephemeral runner is
+      # torn down the moment the job ends, taking any queued upload with it.
+      # `daemon stop` drains the queue (up to 30s) before returning, so what
+      # this job compiled is actually published. Without it the cache still
+      # reads correctly, it just never fills.
+      #
+      # `|| true`: fork PRs run with no remote and therefore no daemon (see
+      # setup-nix), and this must not turn a green build red on the way out.
+      - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
-        run: sccache --show-stats
+        run: |
+          kache stats
+
+          # Resolve the log path from the daemon itself rather than hardcoding
+          # it. Both OSes run this same step and they do not agree: Linux puts
+          # it at `~/.cache/kache/kache.log`, macOS at
+          # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
+          # directory the upstream docs name, which is where hardcoding it
+          # would have silently produced nothing on the darwin legs.
+          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+
+          kache daemon stop || true
+
+          # Upload outcomes exist *only* in this log. `kache stats` reports what
+          # was read, never what was published, so without this the difference
+          # between "uploaded" and "still queued when the 30s drain cap fired"
+          # is invisible — which is precisely the question a low hit rate on a
+          # re-run raises, and which cost a round trip to answer once already.
+          if [ -n "${log:-}" ] && [ -f "$log" ]; then
+            echo "::group::kache daemon log (tail)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          else
+            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
 
   test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
@@ -689,10 +765,44 @@ jobs:
           RUST_BACKTRACE: "1"
         run: tst
 
-      - name: sccache stats
+      # Also the upload barrier, which is why it is `always()` and why every
+      # compiling job needs one. The daemon uploads to R2 in the background so
+      # no rustc invocation waits on the network — but an ephemeral runner is
+      # torn down the moment the job ends, taking any queued upload with it.
+      # `daemon stop` drains the queue (up to 30s) before returning, so what
+      # this job compiled is actually published. Without it the cache still
+      # reads correctly, it just never fills.
+      #
+      # `|| true`: fork PRs run with no remote and therefore no daemon (see
+      # setup-nix), and this must not turn a green build red on the way out.
+      - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
-        run: sccache --show-stats
+        run: |
+          kache stats
+
+          # Resolve the log path from the daemon itself rather than hardcoding
+          # it. Both OSes run this same step and they do not agree: Linux puts
+          # it at `~/.cache/kache/kache.log`, macOS at
+          # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
+          # directory the upstream docs name, which is where hardcoding it
+          # would have silently produced nothing on the darwin legs.
+          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+
+          kache daemon stop || true
+
+          # Upload outcomes exist *only* in this log. `kache stats` reports what
+          # was read, never what was published, so without this the difference
+          # between "uploaded" and "still queued when the 30s drain cap fired"
+          # is invisible — which is precisely the question a low hit rate on a
+          # re-run raises, and which cost a round trip to answer once already.
+          if [ -n "${log:-}" ] && [ -f "$log" ]; then
+            echo "::group::kache daemon log (tail)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          else
+            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
 
   # Compile `bin_e2e`'s test binaries ahead of the job that runs them. `tst`
   # excludes the crate (it needs staged artifacts to run) and nothing else in
@@ -701,8 +811,9 @@ jobs:
   # downloading the artifacts, on the critical path to `release`.
   #
   # This job needs only `gen`, so it runs concurrently with `build` and `test`
-  # and is long finished before `bin_e2e` starts. sccache is shared across jobs
-  # through R2, and the registry cache key is the same `-bin-e2e` suffix, so
+  # and is long finished before `bin_e2e` starts. The kache store is shared
+  # across jobs through R2, and the registry cache key is the same `-bin-e2e`
+  # suffix, so
   # `bin_e2e` restores both and starts running tests instead of compiling.
   #
   # Its own job rather than a step in `test`: both compile the test profile, so
@@ -750,10 +861,44 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: cargo test --locked -p bin-e2e --no-run
 
-      - name: sccache stats
+      # Also the upload barrier, which is why it is `always()` and why every
+      # compiling job needs one. The daemon uploads to R2 in the background so
+      # no rustc invocation waits on the network — but an ephemeral runner is
+      # torn down the moment the job ends, taking any queued upload with it.
+      # `daemon stop` drains the queue (up to 30s) before returning, so what
+      # this job compiled is actually published. Without it the cache still
+      # reads correctly, it just never fills.
+      #
+      # `|| true`: fork PRs run with no remote and therefore no daemon (see
+      # setup-nix), and this must not turn a green build red on the way out.
+      - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
-        run: sccache --show-stats
+        run: |
+          kache stats
+
+          # Resolve the log path from the daemon itself rather than hardcoding
+          # it. Both OSes run this same step and they do not agree: Linux puts
+          # it at `~/.cache/kache/kache.log`, macOS at
+          # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
+          # directory the upstream docs name, which is where hardcoding it
+          # would have silently produced nothing on the darwin legs.
+          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+
+          kache daemon stop || true
+
+          # Upload outcomes exist *only* in this log. `kache stats` reports what
+          # was read, never what was published, so without this the difference
+          # between "uploaded" and "still queued when the 30s drain cap fired"
+          # is invisible — which is precisely the question a low hit rate on a
+          # re-run raises, and which cost a round trip to answer once already.
+          if [ -n "${log:-}" ] && [ -f "$log" ]; then
+            echo "::group::kache daemon log (tail)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          else
+            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
 
   # Black-box tests against the artifacts the `build` job just produced — the
   # exact bytes that get published. Covers only what `test` structurally cannot:
@@ -769,7 +914,7 @@ jobs:
     timeout-minutes: 30
     # bin_e2e_warm is a hard dependency, not just an optimisation running
     # nearby: both jobs pay the same nix-store restore before compiling
-    # anything, so on a run where `build` is mostly sccache hits it can finish
+    # anything, so on a run where `build` is mostly cache hits it can finish
     # first and this job would start while the warm is still going — compiling
     # the same crates concurrently, with neither seeing the other's objects.
     # Waiting makes the cache hit deterministic. The warm needs only `gen`, so
@@ -825,10 +970,44 @@ jobs:
           HEPH_E2E_FROM: dist
         run: e2e
 
-      - name: sccache stats
+      # Also the upload barrier, which is why it is `always()` and why every
+      # compiling job needs one. The daemon uploads to R2 in the background so
+      # no rustc invocation waits on the network — but an ephemeral runner is
+      # torn down the moment the job ends, taking any queued upload with it.
+      # `daemon stop` drains the queue (up to 30s) before returning, so what
+      # this job compiled is actually published. Without it the cache still
+      # reads correctly, it just never fills.
+      #
+      # `|| true`: fork PRs run with no remote and therefore no daemon (see
+      # setup-nix), and this must not turn a green build red on the way out.
+      - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
-        run: sccache --show-stats
+        run: |
+          kache stats
+
+          # Resolve the log path from the daemon itself rather than hardcoding
+          # it. Both OSes run this same step and they do not agree: Linux puts
+          # it at `~/.cache/kache/kache.log`, macOS at
+          # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
+          # directory the upstream docs name, which is where hardcoding it
+          # would have silently produced nothing on the darwin legs.
+          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+
+          kache daemon stop || true
+
+          # Upload outcomes exist *only* in this log. `kache stats` reports what
+          # was read, never what was published, so without this the difference
+          # between "uploaded" and "still queued when the 30s drain cap fired"
+          # is invisible — which is precisely the question a low hit rate on a
+          # re-run raises, and which cost a round trip to answer once already.
+          if [ -n "${log:-}" ] && [ -f "$log" ]; then
+            echo "::group::kache daemon log (tail)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          else
+            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
 
   # Perf-regression check (own workflow: .github/workflows/perf.yml) —
   # generates one synthetic corpus, times a fixed scenario set against N and

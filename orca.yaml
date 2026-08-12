@@ -1,0 +1,53 @@
+# Orca project defaults.
+#
+# `scripts.setup` runs in a new worktree whenever Orca creates one. It lives
+# here rather than in Orca's per-repo settings because this file is shared with
+# the team through git — the settings-pane equivalent is "local settings",
+# stored per-machine, so a teammate's worktrees would not get any of this.
+#
+# Orca prompts to trust this file the first time it appears; neither the hook
+# nor these tabs run until that is accepted.
+
+# Terminal tabs opened in every new worktree.
+#
+# Wrapped in `devenv shell`, not bare `claude`: all development in this repo
+# happens inside the devenv shell (see CLAUDE.md), and an agent started outside
+# it gets a different — usually absent — toolchain. It would find no `cargo`, no
+# `buf`, no `gen`/`tst`/`lint`/`e2e` scripts, and no `kache`, so builds would
+# either fail outright or silently bypass the build cache by running an ambient
+# rustc with no `RUSTC_WRAPPER`. Wrapping the agent is what makes "just run
+# `lint`" work in a fresh worktree.
+#
+# The `--` matters: it ends devenv's own option parsing, so `--permission-mode`
+# reaches claude instead of being eaten as a devenv flag.
+defaultTabs:
+  - title: claude
+    command: devenv shell -- claude --permission-mode auto
+
+scripts:
+  setup: |
+    set -euo pipefail
+
+    # Protobuf codegen. `gen/proto` is generated and not committed, so a fresh
+    # worktree cannot build — and `cargo test` cannot even resolve the
+    # workspace, because `gen/proto` is a declared member whose Cargo.toml does
+    # not exist yet. This is the one step a new worktree genuinely requires
+    # (see the `gen` note in CLAUDE.md), so it is fatal if it fails.
+    #
+    # This also warms the devenv shell for the worktree, which is what puts the
+    # Rust toolchain, buf, and kache on PATH.
+    devenv shell bash -- -e -c gen
+
+    # Code intelligence index. `.codegraph/` is per-worktree state (gitignored),
+    # so it has to be built per worktree rather than inherited. Non-fatal: a
+    # missing index costs search quality, not a working checkout.
+    codegraph init || echo "orca setup: codegraph init failed — run it by hand"
+
+    # kache — the RUSTC_WRAPPER, see CLAUDE.md — deliberately has no step here.
+    # Its store is one machine-global directory (`~/.cache/kache`, or
+    # `~/Library/Caches/kache` on macOS) shared by every worktree, and the
+    # wrapper binary and its env come from devenv.nix, which the `gen` line
+    # above already warmed. A new worktree therefore starts with a fully warm
+    # cache and nothing to install or initialize. Locally there is no remote
+    # and so no daemon to start either; CI is where the R2 remote and its
+    # daemon get wired up (.github/actions/setup-nix).
