@@ -19,7 +19,7 @@ use plugin_go::plugingo;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-pub use htestkit::{artifact_paths, artifact_string};
+pub use htestkit::{artifact_bytes, artifact_paths, artifact_string};
 
 macro_rules! require_go {
     () => {
@@ -37,6 +37,29 @@ pub fn go_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Whether a linked ELF executable declares a `PT_INTERP` program header — i.e.
+/// needs a dynamic loader (`/lib/ld-linux-<arch>.so.1`) present at exec time.
+///
+/// This is the distinction `file(1)` reports as `dynamically linked, interpreter
+/// …` vs `statically linked`, and the one that decides whether the binary runs
+/// in a `FROM scratch` image. A pure-Go `-buildmode=pie` link has no `DT_NEEDED`
+/// entries yet still carries `PT_INTERP`, so "does it link against libc" is the
+/// wrong question — this is the right one.
+///
+/// Mach-O has no equivalent (every darwin executable is dynamically linked
+/// against libSystem), so callers gate this on a Linux host.
+pub fn has_interp(data: &[u8]) -> anyhow::Result<bool> {
+    use object::read::elf::{FileHeader as _, ProgramHeader as _};
+    let header =
+        object::elf::FileHeader64::<object::Endianness>::parse(data).context("parse as ELF64")?;
+    let endian = header.endian().context("ELF endianness")?;
+    Ok(header
+        .program_headers(endian, data)
+        .context("read ELF program headers")?
+        .iter()
+        .any(|ph| ph.p_type(endian) == object::elf::PT_INTERP))
 }
 
 pub fn testdata(name: &str) -> PathBuf {
@@ -105,9 +128,14 @@ fn sdk_checksums_for(gotool: &str) -> std::collections::HashMap<String, String> 
 
 /// A minimal provider that injects the Go build *variants* every e2e workspace
 /// needs, without editing each fixture's BUILD file. Its `probe` returns, for the
-/// root package, a `provider="go"` state declaring two variants:
+/// root package, a `provider="go"` state declaring three variants:
 ///   - `host`: the build host's own GOOS/GOARCH (the default the suite uses),
-///   - `linux_amd64`: pinned linux/amd64 (for the build-tag cross-compile tests).
+///   - `linux_amd64`: pinned linux/amd64 (for the build-tag cross-compile tests),
+///   - `linux_amd64_pie`: as `linux_amd64`, but `buildmode = "pie"`.
+///
+/// The buildmode tests use the pinned pair rather than `host` so they assert on
+/// an ELF whatever the build host is — the distinction they care about
+/// (`PT_INTERP` or not) has no Mach-O equivalent.
 ///
 /// Every other endpoint is empty — targets/packages come from the real providers.
 struct VariantInjector;
@@ -121,12 +149,18 @@ impl VariantInjector {
                 ("goarch".to_string(), Value::String(goarch.to_string())),
             ]))
         };
+        let linux_amd64_pie = Value::Map(std::collections::HashMap::from([
+            ("goos".to_string(), Value::String("linux".to_string())),
+            ("goarch".to_string(), Value::String("amd64".to_string())),
+            ("buildmode".to_string(), Value::String("pie".to_string())),
+        ]));
         let variants = Value::Map(std::collections::HashMap::from([
             (
                 "host".to_string(),
                 variant(hcore::htplatform::os(), hcore::htplatform::arch()),
             ),
             ("linux_amd64".to_string(), variant("linux", "amd64")),
+            ("linux_amd64_pie".to_string(), linux_amd64_pie),
         ]));
         hplugin::provider::State {
             package: hmodel::htpkg::PkgBuf::from(""),

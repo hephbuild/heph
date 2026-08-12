@@ -2,7 +2,7 @@ use crate::plugingo::addr_util::{
     go_build_env, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
     import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
-use crate::plugingo::factors::Factors;
+use crate::plugingo::factors::{BuildMode, Factors};
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hplugin::provider::TargetSpec;
@@ -69,6 +69,7 @@ pub fn build_spec(
         &binary_name,
         transitive_libs,
         &link_flags,
+        factors.buildmode,
     ));
 
     let mut deps: BTreeMap<String, Value> = transitive_libs
@@ -154,6 +155,7 @@ fn generate_link_script(
     binary_name: &str,
     transitive_libs: &[(String, Addr)],
     link_flags: &[String],
+    buildmode: BuildMode,
 ) -> Vec<String> {
     // The main package is passed as a positional arg to the linker, not via importcfg.
     let mut lines = write_importcfg_script(transitive_libs, Some(self_import_path));
@@ -165,11 +167,14 @@ fn generate_link_script(
     } else {
         format!(" {}", link_flags.join(" "))
     };
-    // -buildmode=pie matches Go's default on darwin/arm64 (and most modern
-    // platforms). Libs were compiled with -shared, so the link must agree on
-    // PIE — otherwise asm relocations from transitive deps fail to resolve.
+    // The variant's buildmode, defaulting to `exe` — same as plain `go build`,
+    // so on Linux the binary comes out statically linked with no PT_INTERP. It
+    // must agree with whether the libs were compiled `-shared`
+    // (`BuildMode::needs_shared`): a `-shared` archive cannot be linked into a
+    // non-PIE executable, its asm relocations fail to resolve.
+    let mode = buildmode.as_str();
     lines.push(format!(
-        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode=pie{flags} -o {} \"${}\"",
+        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode={mode}{flags} -o {} \"${}\"",
         binary_name, self_env_var
     ));
     lines
@@ -270,6 +275,61 @@ mod tests {
         let run = run_str(&spec);
         assert!(run.contains("tool link"));
         assert!(run.contains("importcfg"));
+    }
+
+    // heph used to hardcode `-buildmode=pie`, which on Linux emits a PT_INTERP
+    // even with cgo off — the binary then fails to exec in a scratch image. The
+    // default must be `exe`, what plain `go build` does.
+    #[test]
+    fn test_link_defaults_to_buildmode_exe() {
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
+        let run = run_str(&spec);
+        assert!(run.contains("-buildmode=exe"), "{run}");
+        assert!(!run.contains("-buildmode=pie"), "{run}");
+    }
+
+    #[test]
+    fn test_link_honors_the_pie_buildmode() {
+        let factors = Factors {
+            buildmode: BuildMode::Pie,
+            ..test_factors()
+        };
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &factors,
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
+        assert!(run_str(&spec).contains("-buildmode=pie"));
+    }
+
+    // The buildmode must precede the user's ldflags, so a variant can still pass
+    // linker flags without them being swallowed by the mode argument.
+    #[test]
+    fn test_ldflags_follow_the_buildmode() {
+        let factors = Factors {
+            ldflags: vec!["-X".to_string(), "main.v=1".to_string()],
+            ..test_factors()
+        };
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &factors,
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
+        let run = run_str(&spec);
+        assert!(run.contains("-buildmode=exe -X main.v=1 -o"), "{run}");
     }
 
     #[test]

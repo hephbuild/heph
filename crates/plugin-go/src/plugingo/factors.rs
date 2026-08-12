@@ -1,5 +1,62 @@
 use std::collections::BTreeMap;
 
+/// Link buildmode — the `go build -buildmode=` equivalent, narrowed to the two
+/// modes that make sense for an executable heph links itself.
+///
+/// [`BuildMode::Exe`] is the default, matching what plain `go build` produces:
+/// on Linux the binary is **statically linked** with no `PT_INTERP`, so it runs
+/// in a `FROM scratch` image. [`BuildMode::Pie`] asks for a position-independent
+/// executable, which on Linux always carries an interpreter
+/// (`/lib/ld-linux-<arch>.so.1`) even with cgo disabled and internal linking —
+/// that is Go's behaviour, not a heph choice.
+///
+/// Uniform across the supported targets: on darwin/arm64 the Go linker upgrades
+/// `exe` to PIE unconditionally (`cmd/link`: "on these platforms, everything is
+/// PIE"), so both modes link and both produce a PIE Mach-O. The knob is honored
+/// everywhere; darwin simply has one possible answer.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum BuildMode {
+    #[default]
+    Exe,
+    Pie,
+}
+
+impl BuildMode {
+    /// Accepted spellings, for schema docs and "allowed: [...]" errors.
+    pub const NAMES: &'static [&'static str] = &["exe", "pie"];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "exe" => Some(Self::Exe),
+            "pie" => Some(Self::Pie),
+            _ => None,
+        }
+    }
+
+    /// The `-buildmode=` value handed to `go tool link`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exe => "exe",
+            Self::Pie => "pie",
+        }
+    }
+
+    /// Whether `go tool compile` / `go tool asm` need `-shared`.
+    ///
+    /// Mirrors cmd/go (`internal/work/init.go`): `-buildmode=pie` adds `-shared`
+    /// to the codegen flags, `-buildmode=exe` does not. The two **must** agree —
+    /// a `-shared` archive fails a non-PIE internal link with `cannot handle
+    /// R_ARM64_TLS_IE (sym runtime.load_g) when linking internally`. The reverse
+    /// (plain archives into a PIE link) is fine, which is why the std library —
+    /// built by `go install std`, i.e. under cmd/go's own defaults — links into
+    /// either mode.
+    pub fn needs_shared(self) -> bool {
+        matches!(self, Self::Pie)
+    }
+}
+
 /// Resolved build variant: the concrete set of Go toolchain factors a target
 /// compiles/links under. Produced by resolving a [`VariantRef`] (`v`/`vp` addr
 /// args) against the `variants` provider_state (see
@@ -10,7 +67,9 @@ use std::collections::BTreeMap;
 /// functions). GOOS/GOARCH/GOEXPERIMENT/CGO are set as process env in the driver
 /// `run()` (never as hashed config keys), so they are hashed via those `Def`s;
 /// gcflags land on the `go tool compile` command line; ldflags land on the link
-/// script (hashed transitively by the exec driver's run-script hash).
+/// script (hashed transitively by the exec driver's run-script hash); `buildmode`
+/// lands on both — `-shared` on the compile (hashed by `GoCompileDef`) and
+/// `-buildmode=` on the link script.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Factors {
     pub goos: String,
@@ -25,6 +84,10 @@ pub struct Factors {
     /// Flags passed verbatim to `go tool link` (the `-ldflags` equivalent).
     /// Order preserved.
     pub ldflags: Vec<String>,
+    /// Link buildmode. Drives both `go tool link -buildmode=` and whether the
+    /// compile steps get `-shared` — the two are coupled, see
+    /// [`BuildMode::needs_shared`].
+    pub buildmode: BuildMode,
 }
 
 impl Factors {
@@ -99,6 +162,32 @@ mod tests {
         let vref = VariantRef::new("release", "");
         let args = vref.to_args();
         assert_eq!(args.get("vp").map(String::as_str), Some(""));
+    }
+
+    // The compile-side `-shared` and the link-side `-buildmode=` are a single
+    // decision expressed twice. A `-shared` archive cannot be linked into a
+    // non-PIE executable — the link dies on `cannot handle R_ARM64_TLS_IE (sym
+    // runtime.load_g)`. If these two ever disagree, every Go binary stops linking.
+    #[test]
+    fn shared_is_required_exactly_for_pie() {
+        assert!(BuildMode::Pie.needs_shared());
+        assert!(!BuildMode::Exe.needs_shared());
+    }
+
+    // `NAMES` feeds the "allowed: …" errors and the state schema; it must stay in
+    // step with what `parse` accepts and what `as_str` emits.
+    #[test]
+    fn buildmode_names_roundtrip_through_parse() {
+        for name in BuildMode::NAMES {
+            let mode = BuildMode::parse(name).unwrap_or_else(|| panic!("`{name}` must parse"));
+            assert_eq!(mode.as_str(), *name);
+        }
+        assert!(BuildMode::parse("c-archive").is_none());
+    }
+
+    #[test]
+    fn buildmode_defaults_to_exe() {
+        assert_eq!(Factors::default().buildmode, BuildMode::Exe);
     }
 
     #[test]

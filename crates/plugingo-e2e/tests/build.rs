@@ -159,6 +159,44 @@ async fn test_with_dep_cmd_build() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The default buildmode (`exe`) must produce a Linux binary with **no**
+/// `PT_INTERP` — a static executable that runs in a `FROM scratch` image. heph
+/// used to hardcode `-buildmode=pie`, which emits an interpreter even with cgo
+/// off and internal linking, so a scratch container failed at `execve`.
+///
+/// Cross-compiled to linux/amd64 so the assertion holds on every build host; the
+/// link itself is the other half of the test, since `exe` mode also drops
+/// `-shared` from the compile and a mismatch between the two fails the link.
+#[tokio::test]
+async fn test_default_buildmode_links_a_static_binary() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_dep")?;
+    let ws = make_workspace_hermetic(dir)?;
+    let result = ws.run("//cmd:build@v=linux_amd64").await?;
+    assert!(
+        !common::has_interp(&common::artifact_bytes(&result))?,
+        "default (buildmode=exe) must link statically — no PT_INTERP"
+    );
+    Ok(())
+}
+
+/// The `buildmode = "pie"` knob is the escape hatch, and it must still work: the
+/// compile side has to put `-shared` back, otherwise the PIE link fails on the
+/// asm relocations of transitive deps. The result carries `PT_INTERP` — the very
+/// thing `exe` avoids — so the two tests together pin both directions.
+#[tokio::test]
+async fn test_pie_buildmode_links_a_position_independent_binary() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_dep")?;
+    let ws = make_workspace_hermetic(dir)?;
+    let result = ws.run("//cmd:build@v=linux_amd64_pie").await?;
+    assert!(
+        common::has_interp(&common::artifact_bytes(&result))?,
+        "buildmode=pie must produce a PIE with an interpreter"
+    );
+    Ok(())
+}
+
 /// End-to-end proof of the cross-subtree variant universe: the `release` variant
 /// is declared ONLY at `//cmd` (via its BUILD `provider_state`). Building
 /// `//cmd:build@v=release` threads `vp=cmd` onto the `//lib` dependency, whose own

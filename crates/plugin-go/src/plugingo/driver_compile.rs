@@ -13,6 +13,7 @@
 //! byte-compatible.
 
 use crate::plugingo::embed;
+use crate::plugingo::factors::BuildMode;
 use crate::plugingo::pkg_analysis::decode_go_package;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -100,6 +101,10 @@ struct GoCompileSpec {
     goexperiment: Vec<String>,
     /// Extra flags passed verbatim to `go tool compile` (the variant's gcflags).
     gcflags: Vec<String>,
+    /// Variant buildmode (`exe`/`pie`); empty → `exe`. Decides whether the
+    /// compile/asm steps get `-shared`, which must agree with the link's
+    /// `-buildmode=` (see `BuildMode::needs_shared`).
+    buildmode: String,
     /// Import paths of the transitive libs, in deterministic order — each maps to
     /// a `lib_<sanitized>` dep group carrying that archive, used to build
     /// importcfg.
@@ -124,6 +129,7 @@ struct GoCompileDef {
     go_version: String,
     goexperiment: Vec<String>,
     gcflags: Vec<String>,
+    buildmode: BuildMode,
     import_paths: Vec<String>,
     s_files: Vec<String>,
     embed_variant: Option<EmbedVariant>,
@@ -135,7 +141,7 @@ struct GoCompileDef {
 
 /// Bump to invalidate every cached `go_compile` archive whenever the compile
 /// command shape or embed resolution semantics change.
-const GO_COMPILE_FORMAT_VERSION: u32 = 3;
+const GO_COMPILE_FORMAT_VERSION: u32 = 4;
 
 impl Hash for GoCompileDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -150,6 +156,9 @@ impl Hash for GoCompileDef {
         // `gcflags` order is semantically meaningful, so hash as-is.
         self.goexperiment.hash(state);
         self.gcflags.hash(state);
+        // `-shared` presence hangs off this, and a `-shared` archive is not
+        // interchangeable with a plain one.
+        self.buildmode.hash(state);
         // `import_paths` order is not semantically meaningful — it comes from a
         // closure walk that dedups through a per-process-randomized `HashSet`,
         // and `run()` re-sorts before writing importcfg, so the archive is
@@ -249,6 +258,21 @@ impl ManagedDriver for GoCompileDriver {
             .first()
             .and_then(|s| EmbedVariant::parse(s));
 
+        // Absent (or empty) means the default `exe`; an unrecognized spelling is
+        // a hard error rather than a silent fallback — it would change the
+        // linkage of the produced binary.
+        let buildmode = if spec.buildmode.is_empty() {
+            BuildMode::default()
+        } else {
+            BuildMode::parse(&spec.buildmode).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown `buildmode` `{}` (allowed: {})",
+                    spec.buildmode,
+                    BuildMode::NAMES.join(", ")
+                )
+            })?
+        };
+
         let def = GoCompileDef {
             p_flag: spec.p_flag,
             out_file: spec.out_file,
@@ -257,6 +281,7 @@ impl ManagedDriver for GoCompileDriver {
             go_version: spec.go_version,
             goexperiment: spec.goexperiment,
             gcflags: spec.gcflags,
+            buildmode,
             import_paths: spec.import_paths,
             s_files: spec.s_files,
             embed_variant,
@@ -404,7 +429,9 @@ impl ManagedDriver for GoCompileDriver {
         };
 
         let has_asm = !def.s_files.is_empty();
-        let shared = "-shared";
+        // `-shared` iff the link is PIE — cmd/go couples them the same way, and a
+        // mismatch is a link failure, not a slower binary.
+        let shared: Option<&str> = def.buildmode.needs_shared().then_some("-shared");
         let trimpath = format!("-trimpath={ws_root}");
         let goinc = format!("{}/pkg/include", goroot.to_string_lossy());
 
@@ -428,11 +455,13 @@ impl ManagedDriver for GoCompileDriver {
                 format!("GOOS_{}", def.goos),
                 "-D".to_string(),
                 format!("GOARCH_{}", def.goarch),
-                shared.to_string(),
+            ];
+            args.extend(shared.map(str::to_string));
+            args.extend([
                 "-gensymabis".to_string(),
                 "-o".to_string(),
                 "symabis".to_string(),
-            ];
+            ]);
             for s in &def.s_files {
                 args.push(format!("./{s}"));
             }
@@ -471,7 +500,7 @@ impl ManagedDriver for GoCompileDriver {
             cargs.push("-embedcfg".to_string());
             cargs.push("embedcfg".to_string());
         }
-        cargs.push(shared.to_string());
+        cargs.extend(shared.map(str::to_string));
         cargs.push("-o".to_string());
         cargs.push(def.out_file.clone());
         cargs.push(format!("@{}", rsp_path.to_string_lossy()));
@@ -482,7 +511,7 @@ impl ManagedDriver for GoCompileDriver {
         if has_asm {
             for s in &def.s_files {
                 let obj = format!("{}.o", s.trim_end_matches(".s"));
-                let args = vec![
+                let mut args = vec![
                     "tool".to_string(),
                     "asm".to_string(),
                     "-p".to_string(),
@@ -496,11 +525,9 @@ impl ManagedDriver for GoCompileDriver {
                     format!("GOOS_{}", def.goos),
                     "-D".to_string(),
                     format!("GOARCH_{}", def.goarch),
-                    shared.to_string(),
-                    "-o".to_string(),
-                    obj,
-                    format!("./{s}"),
                 ];
+                args.extend(shared.map(str::to_string));
+                args.extend(["-o".to_string(), obj, format!("./{s}")]);
                 self.exec_go(&go_bin, run_go(args), &env, pkg_dir, ctoken, "asm")
                     .await?;
             }
@@ -821,6 +848,10 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         str_list(&p.factors.goexperiment),
     );
     config.insert("gcflags".to_string(), str_list(&p.factors.gcflags));
+    config.insert(
+        "buildmode".to_string(),
+        Value::String(p.factors.buildmode.as_str().to_string()),
+    );
     config.insert("import_paths".to_string(), Value::List(import_paths));
     config.insert("s_files".to_string(), str_list(p.s_files));
     config.insert(
@@ -1021,6 +1052,75 @@ mod driver_tests {
         );
     }
 
+    fn spec_with_buildmode(buildmode: BuildMode) -> TargetSpec {
+        build_compile_spec(CompileParams {
+            addr: Addr::new(
+                PkgBuf::from("mylib"),
+                "build_lib".to_string(),
+                Default::default(),
+            ),
+            p_flag: "example.com/mylib".to_string(),
+            out_file: "x.a".to_string(),
+            factors: &Factors {
+                buildmode,
+                ..factors()
+            },
+            go_version: V,
+            transitive_libs: &[],
+            src_addrs: &["//mylib:a.go".to_string()],
+            s_files: &[],
+            s_file_addrs: &[],
+            hdr_addrs: &[],
+            golist_addr: None,
+            embed_variant: "",
+            embed_file_addrs: &[],
+            embed_src_addrs: &[],
+        })
+    }
+
+    // A `pie` archive is compiled `-shared` and an `exe` one is not; the two are
+    // NOT interchangeable (a `-shared` archive fails a non-PIE link). Serving one
+    // from a cache entry keyed by the other is a build that cannot link.
+    #[tokio::test]
+    async fn buildmode_keys_the_compile_cache() {
+        let exe = parse_def(spec_with_buildmode(BuildMode::Exe)).await;
+        let pie = parse_def(spec_with_buildmode(BuildMode::Pie)).await;
+        assert_eq!(exe.def::<GoCompileDef>().buildmode, BuildMode::Exe);
+        assert_eq!(pie.def::<GoCompileDef>().buildmode, BuildMode::Pie);
+        assert_ne!(
+            exe.hash, pie.hash,
+            "exe and pie archives must not share a cache key"
+        );
+    }
+
+    // An unparseable buildmode must fail the parse rather than quietly linking a
+    // different kind of binary than the author asked for.
+    #[tokio::test]
+    async fn unknown_buildmode_is_rejected() {
+        let mut spec = spec_with_buildmode(BuildMode::Exe);
+        spec.config.insert(
+            "buildmode".to_string(),
+            Value::String("c-archive".to_string()),
+        );
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let Err(err) = GoCompileDriver::new()
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: std::sync::Arc::new(spec),
+                },
+                &ct,
+            )
+            .await
+        else {
+            panic!("an unknown buildmode must not parse");
+        };
+        assert!(
+            format!("{err:#}").contains("unknown `buildmode` `c-archive`"),
+            "{err:#}"
+        );
+    }
+
     fn def_hash(def: &GoCompileDef) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         def.hash(&mut h);
@@ -1105,6 +1205,7 @@ mod driver_tests {
             go_version: "1.26.4".to_string(),
             goexperiment: vec![],
             gcflags: vec![],
+            buildmode: BuildMode::default(),
             import_paths: ips.iter().map(|s| s.to_string()).collect(),
             s_files: vec![],
             embed_variant: None,

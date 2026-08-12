@@ -26,7 +26,7 @@
 //! **same `variants` map** and override selected fields (list fields replace, not
 //! append). `goos`/`goarch` may be omitted when inherited. Cycles are rejected.
 
-use crate::plugingo::factors::{Factors, VariantRef};
+use crate::plugingo::factors::{BuildMode, Factors, VariantRef};
 use anyhow::{Context, bail};
 use hcore::htvalue::{Value, parse_strings};
 use hmodel::htaddr::Addr;
@@ -46,6 +46,7 @@ const VARIANT_KEYS: &[&str] = &[
     "goexperiment",
     "gcflags",
     "ldflags",
+    "buildmode",
     "inherit",
 ];
 
@@ -60,6 +61,7 @@ struct RawVariant {
     goexperiment: Option<Vec<String>>,
     gcflags: Option<Vec<String>>,
     ldflags: Option<Vec<String>>,
+    buildmode: Option<BuildMode>,
     inherit: Option<String>,
 }
 
@@ -101,6 +103,15 @@ fn parse_raw(name: &str, v: &Value) -> anyhow::Result<RawVariant> {
             None => Ok(None),
         }
     };
+    let buildmode = match opt_str("buildmode")? {
+        Some(s) => Some(BuildMode::parse(&s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "go variant `{name}`: unknown `buildmode` `{s}` (allowed: {})",
+                BuildMode::NAMES.join(", ")
+            )
+        })?),
+        None => None,
+    };
     Ok(RawVariant {
         goos: opt_str("goos")?,
         goarch: opt_str("goarch")?,
@@ -108,6 +119,7 @@ fn parse_raw(name: &str, v: &Value) -> anyhow::Result<RawVariant> {
         goexperiment: opt_list("goexperiment")?,
         gcflags: opt_list("gcflags")?,
         ldflags: opt_list("ldflags")?,
+        buildmode,
         inherit: opt_str("inherit")?,
     })
 }
@@ -175,6 +187,9 @@ fn resolve_in_map(
     }
     if let Some(v) = &def.ldflags {
         f.ldflags = v.clone();
+    }
+    if let Some(v) = def.buildmode {
+        f.buildmode = v;
     }
 
     if f.goos.is_empty() || f.goarch.is_empty() {
@@ -469,6 +484,91 @@ mod tests {
         assert_eq!(f.goexperiment, vec!["arenas"]);
         assert_eq!(f.gcflags, vec!["-l", "-N"]); // order preserved
         assert_eq!(f.ldflags, vec!["-s", "-w"]);
+    }
+
+    #[test]
+    fn buildmode_defaults_to_exe() {
+        let st = go_state("", &[("v", linux_amd64())]);
+        let f = variant_in_state(&st, "v").unwrap().unwrap();
+        assert_eq!(
+            f.buildmode,
+            BuildMode::Exe,
+            "an undeclared buildmode must match plain `go build`, not PIE"
+        );
+    }
+
+    #[test]
+    fn buildmode_pie_is_parsed() {
+        let st = go_state(
+            "",
+            &[(
+                "v",
+                variant_val(&[
+                    ("goos", s("linux")),
+                    ("goarch", s("amd64")),
+                    ("buildmode", s("pie")),
+                ]),
+            )],
+        );
+        let f = variant_in_state(&st, "v").unwrap().unwrap();
+        assert_eq!(f.buildmode, BuildMode::Pie);
+    }
+
+    // An unrecognized buildmode silently falling back to the default would change
+    // the linkage of the shipped binary without saying so.
+    #[test]
+    fn buildmode_unknown_value_errors() {
+        let st = go_state(
+            "",
+            &[(
+                "v",
+                variant_val(&[
+                    ("goos", s("linux")),
+                    ("goarch", s("amd64")),
+                    ("buildmode", s("c-shared")),
+                ]),
+            )],
+        );
+        let err = variant_in_state(&st, "v").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown `buildmode` `c-shared`"), "{msg}");
+        assert!(
+            msg.contains("exe, pie"),
+            "must list the allowed modes: {msg}"
+        );
+    }
+
+    #[test]
+    fn buildmode_is_inherited_and_overridable() {
+        let st = go_state(
+            "",
+            &[
+                (
+                    "base",
+                    variant_val(&[
+                        ("goos", s("linux")),
+                        ("goarch", s("amd64")),
+                        ("buildmode", s("pie")),
+                    ]),
+                ),
+                ("child", variant_val(&[("inherit", s("base"))])),
+                (
+                    "child_exe",
+                    variant_val(&[("inherit", s("base")), ("buildmode", s("exe"))]),
+                ),
+            ],
+        );
+        assert_eq!(
+            variant_in_state(&st, "child").unwrap().unwrap().buildmode,
+            BuildMode::Pie
+        );
+        assert_eq!(
+            variant_in_state(&st, "child_exe")
+                .unwrap()
+                .unwrap()
+                .buildmode,
+            BuildMode::Exe
+        );
     }
 
     #[test]
