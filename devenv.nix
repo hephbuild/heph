@@ -428,17 +428,21 @@ in
     cargo test --locked -p bin-e2e --no-fail-fast "''${@}"
   '';
 
-  # Cargo's target directory for the workspace enclosing $PWD — the one cargo
-  # will actually write to, asked rather than assumed.
+  # Cargo's target directory for *this checkout* — the one cargo writes to,
+  # asked rather than assumed.
   #
-  # `$DEVENV_ROOT/target` would be wrong: `$DEVENV_ROOT` is where the shell was
-  # started, so a shell opened in one checkout and `cd`'d into a worktree would
-  # send every script below looking in the first checkout's target dir while
-  # cargo built into the second's — a mismatch that reads as a stale binary,
-  # silently. `locate-project` resolves no dependencies, so this is cheap.
+  # Anchored at `$DEVENV_ROOT`, not `$PWD`. Every caller means "the heph I
+  # built", and heph is a build tool you deliberately run against some other
+  # project: `cd ~/someproject && run-release build //...`. Resolving from
+  # `$PWD` breaks that outright outside a cargo workspace, and does something
+  # worse inside one — it silently resolves to *that* project's `target/` and
+  # looks for heph there.
+  #
+  # `locate-project` rather than a bare `$DEVENV_ROOT/target` so the answer
+  # still comes from cargo; it resolves no dependencies, so this is cheap.
   scripts.target-dir.exec = ''
     set -euo pipefail
-    root="$(cargo locate-project --workspace --message-format plain)"
+    root="$(cd "$DEVENV_ROOT" && cargo locate-project --workspace --message-format plain)"
     echo "''${root%/Cargo.toml}/target"
   '';
 
