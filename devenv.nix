@@ -333,14 +333,16 @@ in
       *)             arch=amd64 ;;
     esac
 
-    # Stage into a directory unique to THIS run. CARGO_TARGET_DIR is inherited
-    # from the environment (see enterShell) and worktrees routinely share one,
-    # so a fixed path under it is not private to this run: a second `e2e` — in
-    # another worktree, or just another terminal — would `rm -rf` the binaries
-    # the first one is still running tests against, and the failure would
-    # surface as an unrelated test blowing up somewhere else. mktemp costs one
-    # copy of three files and removes the whole class.
-    dist_root="$CARGO_TARGET_DIR/e2e-dist"
+    target="$(target-dir)"
+
+    # Stage into a directory unique to THIS run. Worktrees no longer share one
+    # target dir, but two `e2e` runs in the *same* worktree — another terminal,
+    # or a re-run started before the first finished — still collide: a fixed
+    # path would let the second `rm -rf` the binaries the first is still running
+    # tests against, and the failure would surface as an unrelated test blowing
+    # up somewhere else. mktemp costs one copy of three files and removes the
+    # whole class.
+    dist_root="$target/e2e-dist"
     mkdir -p "$dist_root"
     dist="$(mktemp -d "$dist_root/run.XXXXXXXX")"
     # Keep the staged artifacts for inspection with HEPH_E2E_KEEP_DIST=1.
@@ -362,14 +364,15 @@ in
       # Local: build the same artifacts the build job builds, the same way (one
       # invocation so cargo overlaps their LTO tails — see heph.yml).
       cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib
-      out="$CARGO_TARGET_DIR/release"
+      out="$target/release"
 
-      # `release/` is shared across worktrees too, and cargo's build lock only
-      # covers the build — not the gap between it and the copy below. A build in
-      # another worktree landing in that gap would hand this run some other
-      # branch's binary, and every assertion would still pass. Fingerprint the
-      # artifacts around the copy so that becomes a loud failure instead of a
-      # green run against the wrong bytes.
+      # cargo's build lock covers the build but not the gap between it and the
+      # copy below. Worktrees no longer share `release/`, which removes the
+      # cross-worktree case — but a second build in *this* worktree (another
+      # terminal, an editor's check-on-save, a rust-analyzer run) landing in
+      # that gap still hands this run different bytes, and every assertion would
+      # still pass. Fingerprint the artifacts around the copy so that becomes a
+      # loud failure instead of a green run against the wrong binary.
       # Selected by which `stat` is on PATH, not by `$os`: the devenv shell puts
       # GNU coreutils ahead of /usr/bin on macOS too, so keying this off `darwin`
       # ran BSD syntax against GNU stat (`-f` there means "filesystem") and every
@@ -386,8 +389,8 @@ in
 
       after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext")"
       if [ "$before" != "$after" ]; then
-        echo "e2e: $out changed while staging — another build (likely another" >&2
-        echo "e2e: worktree sharing CARGO_TARGET_DIR) raced this one. Re-run." >&2
+        echo "e2e: $out changed while staging — another build in this" >&2
+        echo "e2e: worktree raced this one. Re-run." >&2
         exit 1
       fi
 
@@ -425,12 +428,30 @@ in
     cargo test --locked -p bin-e2e --no-fail-fast "''${@}"
   '';
 
+  # Cargo's target directory for *this checkout* — the one cargo writes to,
+  # asked rather than assumed.
+  #
+  # Anchored at `$DEVENV_ROOT`, not `$PWD`. Every caller means "the heph I
+  # built", and heph is a build tool you deliberately run against some other
+  # project: `cd ~/someproject && run-release build //...`. Resolving from
+  # `$PWD` breaks that outright outside a cargo workspace, and does something
+  # worse inside one — it silently resolves to *that* project's `target/` and
+  # looks for heph there.
+  #
+  # `locate-project` rather than a bare `$DEVENV_ROOT/target` so the answer
+  # still comes from cargo; it resolves no dependencies, so this is cheap.
+  scripts.target-dir.exec = ''
+    set -euo pipefail
+    root="$(cd "$DEVENV_ROOT" && cargo locate-project --workspace --message-format plain)"
+    echo "''${root%/Cargo.toml}/target"
+  '';
+
   scripts.build-profile.exec = ''cargo build --profile profiling'';
-  scripts.run-profile.exec = ''$CARGO_TARGET_DIR/profiling/heph "''${@}"'';
-  scripts.run-samply-profile.exec = ''samply record --unstable-presymbolicate $CARGO_TARGET_DIR/profiling/heph "''${@}"'';
+  scripts.run-profile.exec = ''"$(target-dir)"/profiling/heph "''${@}"'';
+  scripts.run-samply-profile.exec = ''samply record --unstable-presymbolicate "$(target-dir)"/profiling/heph "''${@}"'';
 
   scripts.build-release.exec = ''cargo build --profile release'';
-  scripts.run-release.exec = ''$CARGO_TARGET_DIR/release/heph "''${@}"'';
+  scripts.run-release.exec = ''"$(target-dir)"/release/heph "''${@}"'';
 
   scripts.rheph.exec = ''cargo run -q --profile release -- "''${@}"'';
   scripts.pheph.exec = ''cargo run -q --profile profiling -- "''${@}"'';
@@ -458,12 +479,13 @@ in
   # path = the sibling cdylib) is emitted by tools/pluginmanifest.
   scripts.install-go-plugin.exec = ''
     cargo build --release -p plugin-go-cdylib
+    target="$(target-dir)"
     if [ "$(uname -s)" = "Darwin" ]; then
-      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.dylib"
+      lib="$target/release/libplugin_go_cdylib.dylib"
       name="heph-go-plugin.dylib"
       bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
     else
-      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.so"
+      lib="$target/release/libplugin_go_cdylib.so"
       name="heph-go-plugin.so"
     fi
     dest="$HOME/.heph/plugins/go"
@@ -484,12 +506,13 @@ in
   # entry (e.g. in a `ci.hephconfig` profile overlay, enabled via HEPH_PROFILES).
   scripts.install-gha-plugin.exec = ''
     cargo build --release -p plugin-gha-cdylib
+    target="$(target-dir)"
     if [ "$(uname -s)" = "Darwin" ]; then
-      lib="$CARGO_TARGET_DIR/release/libplugin_gha_cdylib.dylib"
+      lib="$target/release/libplugin_gha_cdylib.dylib"
       name="heph-gha-plugin.dylib"
       bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
     else
-      lib="$CARGO_TARGET_DIR/release/libplugin_gha_cdylib.so"
+      lib="$target/release/libplugin_gha_cdylib.so"
       name="heph-gha-plugin.so"
     fi
     dest="$HOME/.heph/plugins/gha"
@@ -506,14 +529,14 @@ in
     mkdir -p $(dirname "${binLocation}")
     # Atomic replace (new inode) — overwriting the binary in place leaves macOS
     # holding the previous code-signature for that path and SIGKILLs the next run.
-    cp $CARGO_TARGET_DIR/debug/heph "${binLocation}.new"
+    cp "$(target-dir)"/debug/heph "${binLocation}.new"
     mv -f "${binLocation}.new" "${binLocation}"
     install-go-plugin
   '';
 
   scripts.install-release-build.exec = ''
     cargo build --release
-    bin="$CARGO_TARGET_DIR/release/heph"
+    bin="$(target-dir)/release/heph"
     if [ "$(uname -s)" = "Darwin" ]; then
       # The nix toolchain hard-links libiconv against its /nix/store path, which
       # dyld aborts on once that store path is GC'd ("Killed"). Rewrite to the
@@ -532,14 +555,23 @@ in
 
 
   # https://devenv.sh/basics/
-  enterShell = ''
-    # All git worktrees share one cargo target dir (deps stored once, not
-    # duplicated per worktree). The shell is rooted at the MAIN checkout, so
-    # $DEVENV_ROOT is stable across every worktree a tool call cd's into; the
-    # exported var is inherited by all subprocesses. Respect an externally-set
-    # value (CI pins ./target).
-    export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$DEVENV_ROOT/target}"
-  '';
+  #
+  # No `CARGO_TARGET_DIR` export. Every worktree used to be pointed at one
+  # shared target dir so dependencies were compiled once rather than per
+  # worktree — a job kache now does properly: it keys on content rather than on
+  # a directory, shares across worktrees *and* machines through R2, and on a
+  # copy-on-write filesystem (APFS, btrfs, XFS-with-reflink) a restored
+  # `target/` costs almost no additional disk. Cargo's own per-workspace
+  # default is what runs now.
+  #
+  # The override was not free. One directory written by concurrent builds from
+  # different worktrees is a race: `scripts.e2e` still fingerprints `release/`
+  # around its copy because a build from elsewhere landing in that window would
+  # otherwise hand it another branch's binary with every assertion still
+  # passing. It also left `target-verify/` behind as a workaround for the same
+  # poisoning. Scripts locate the target dir with `target-dir` instead, which
+  # asks cargo rather than assuming.
+  enterShell = "";
 
   # https://devenv.sh/tests/
   enterTest = ''
