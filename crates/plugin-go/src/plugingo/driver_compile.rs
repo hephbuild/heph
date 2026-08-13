@@ -105,6 +105,10 @@ struct GoCompileSpec {
     /// compile/asm steps get `-shared`, which must agree with the link's
     /// `-buildmode=` (see `BuildMode::needs_shared`).
     buildmode: String,
+    /// Race-detector build: pass `-race` to `go tool compile`, instrumenting every
+    /// memory access in this package. Whole-program — every archive in the link
+    /// must agree — so it rides the address and keys this archive's cache.
+    race: bool,
     /// Import paths of the transitive libs, in deterministic order — each maps to
     /// a `lib_<sanitized>` dep group carrying that archive, used to build
     /// importcfg.
@@ -130,6 +134,8 @@ struct GoCompileDef {
     goexperiment: Vec<String>,
     gcflags: Vec<String>,
     buildmode: BuildMode,
+    /// See [`GoCompileSpec::race`].
+    race: bool,
     import_paths: Vec<String>,
     s_files: Vec<String>,
     embed_variant: Option<EmbedVariant>,
@@ -159,6 +165,12 @@ impl Hash for GoCompileDef {
         // `-shared` presence hangs off this, and a `-shared` archive is not
         // interchangeable with a plain one.
         self.buildmode.hash(state);
+        // Hashed only when set, so introducing race mode left every ordinary
+        // archive's def hash — and the caches holding them — untouched. The
+        // marker is a distinct string, so it cannot alias a neighbouring field.
+        if self.race {
+            "race".hash(state);
+        }
         // `import_paths` order is not semantically meaningful — it comes from a
         // closure walk that dedups through a per-process-randomized `HashSet`,
         // and `run()` re-sorts before writing importcfg, so the archive is
@@ -282,6 +294,7 @@ impl ManagedDriver for GoCompileDriver {
             goexperiment: spec.goexperiment,
             gcflags: spec.gcflags,
             buildmode,
+            race: spec.race,
             import_paths: spec.import_paths,
             s_files: spec.s_files,
             embed_variant,
@@ -383,7 +396,14 @@ impl ManagedDriver for GoCompileDriver {
         );
         env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
         env.insert("GOWORK".to_string(), "off".to_string());
-        env.insert("CGO_ENABLED".to_string(), "0".to_string());
+        // `1` only for a race build off darwin, matching the golist and link
+        // sandboxes — see `factors::cgo_required`. The archives this driver
+        // produces are pure Go either way; the setting exists so `go tool
+        // compile`'s view of the build config matches everyone else's.
+        env.insert(
+            "CGO_ENABLED".to_string(),
+            crate::plugingo::factors::cgo_enabled_value(&def.goos, def.race).to_string(),
+        );
         if !def.goexperiment.is_empty() {
             env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
         }
@@ -430,7 +450,10 @@ impl ManagedDriver for GoCompileDriver {
 
         let has_asm = !def.s_files.is_empty();
         // `-shared` iff the link is PIE — cmd/go couples them the same way, and a
-        // mismatch is a link failure, not a slower binary.
+        // mismatch is a link failure, not a slower binary. A race build on linux
+        // already had its buildmode forced to `exe` at variant resolution
+        // (`BuildMode::for_race`), so it lands here as a plain archive — matching
+        // the stdlib `go install -race` produced for that mode.
         let shared: Option<&str> = def.buildmode.needs_shared().then_some("-shared");
         let trimpath = format!("-trimpath={ws_root}");
         let goinc = format!("{}/pkg/include", goroot.to_string_lossy());
@@ -487,6 +510,12 @@ impl ManagedDriver for GoCompileDriver {
             "-importcfg".to_string(),
             importcfg_path.to_string_lossy().into_owned(),
         ];
+        // Race instrumentation. Before the variant gcflags so a variant can still
+        // override it if it ever needs to, and so the flag order matches what
+        // `go build -race` itself emits.
+        if def.race {
+            cargs.push("-race".to_string());
+        }
         // Variant gcflags — raw `go tool compile` flags (what `-gcflags` forwards),
         // in declared order, before the source responses.
         cargs.extend(def.gcflags.iter().cloned());
@@ -852,6 +881,11 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         "buildmode".to_string(),
         Value::String(p.factors.buildmode.as_str().to_string()),
     );
+    // Set only for a race build, so an ordinary archive's spec (and def hash) is
+    // exactly what it was before race mode existed.
+    if p.factors.race {
+        config.insert("race".to_string(), Value::Bool(true));
+    }
     config.insert("import_paths".to_string(), Value::List(import_paths));
     config.insert("s_files".to_string(), str_list(p.s_files));
     config.insert(
@@ -1195,6 +1229,90 @@ mod driver_tests {
     // bypassing `build_compile_spec`'s own sort — the regression the HEPH_DEBUG_HASH
     // dumps revealed: import_paths reached the hash in HashSet order and flipped
     // the cache key run-to-run.
+    /// The spec only carries `race` when it is on, so an ordinary archive's spec
+    /// is exactly what it was before race mode existed.
+    #[test]
+    fn compile_spec_carries_race_only_when_set() {
+        let racy = Factors {
+            race: true,
+            ..factors()
+        };
+        assert!(!spec_with_factors(&factors()).config.contains_key("race"));
+        assert!(matches!(
+            spec_with_factors(&racy).config.get("race"),
+            Some(Value::Bool(true))
+        ));
+    }
+
+    fn spec_with_factors(f: &Factors) -> TargetSpec {
+        build_compile_spec(CompileParams {
+            addr: Addr::new(
+                hmodel::htpkg::PkgBuf::from("mylib"),
+                "build_lib".to_string(),
+                Default::default(),
+            ),
+            p_flag: "example.com/mylib".to_string(),
+            out_file: "mylib.a".to_string(),
+            factors: f,
+            go_version: crate::plugingo::toolchain::DEFAULT_GO_VERSION,
+            transitive_libs: &[],
+            src_addrs: &[],
+            s_files: &[],
+            s_file_addrs: &[],
+            hdr_addrs: &[],
+            golist_addr: None,
+            embed_variant: "",
+            embed_file_addrs: &[],
+            embed_src_addrs: &[],
+        })
+    }
+
+    /// Race must key the archive: the same source compiled with and without
+    /// instrumentation is two different `.a` files, and mixing them in one link
+    /// is a fingerprint mismatch at best.
+    #[test]
+    fn compile_def_hash_differs_for_race() {
+        let plain = compile_def(false);
+        let racy = compile_def(true);
+        assert_ne!(def_hash(&plain), def_hash(&racy));
+    }
+
+    /// …and adding the field must not have moved the hash for ordinary archives,
+    /// or every cached Go archive in existence would be invalidated. With
+    /// `race: false` the hasher is fed exactly the byte sequence it was fed
+    /// before race mode existed, because the new contribution sits behind
+    /// `if self.race`.
+    ///
+    /// Update the constant only alongside a deliberate
+    /// `GO_COMPILE_FORMAT_VERSION` bump — an unexplained change here means the
+    /// whole archive cache is being thrown away.
+    #[test]
+    fn compile_def_hash_unchanged_for_non_race() {
+        assert_eq!(def_hash(&compile_def(false)), NON_RACE_COMPILE_HASH);
+    }
+
+    /// Pinned at `GO_COMPILE_FORMAT_VERSION` 4 (the `buildmode` field's version).
+    const NON_RACE_COMPILE_HASH: u64 = 11506013216469835997;
+
+    fn compile_def(race: bool) -> GoCompileDef {
+        GoCompileDef {
+            p_flag: "example.com/mylib".to_string(),
+            out_file: "x.a".to_string(),
+            goos: "linux".to_string(),
+            goarch: "amd64".to_string(),
+            go_version: "1.26.4".to_string(),
+            goexperiment: vec![],
+            gcflags: vec![],
+            buildmode: BuildMode::default(),
+            race,
+            import_paths: vec!["fmt".to_string()],
+            s_files: vec![],
+            embed_variant: None,
+            golist_origin_id: None,
+            embed_src_origin_ids: vec![],
+        }
+    }
+
     #[test]
     fn compile_def_hash_invariant_under_import_path_permutation() {
         let mk = |ips: &[&str]| GoCompileDef {
@@ -1206,6 +1324,7 @@ mod driver_tests {
             goexperiment: vec![],
             gcflags: vec![],
             buildmode: BuildMode::default(),
+            race: false,
             import_paths: ips.iter().map(|s| s.to_string()).collect(),
             s_files: vec![],
             embed_variant: None,

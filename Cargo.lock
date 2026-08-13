@@ -4134,6 +4134,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.11.0",
  "tar",
  "tempfile",
@@ -4308,6 +4309,7 @@ dependencies = [
  "tempfile",
  "testkit",
  "tokio",
+ "which",
 ]
 
 [[package]]

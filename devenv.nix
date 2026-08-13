@@ -61,6 +61,17 @@ in
   # https://devenv.sh/packages/
   packages = [
     pkgs.git
+    # The Go toolchain the go-plugin tests build against. Everything that calls
+    # `require_go!` runs `go` from PATH (`gotool = "host"`), so without this the
+    # whole suite depends on whatever the machine happens to have — and CI's
+    # macOS runner has none, which silently skipped every Go test there: 463
+    # `plugin-go` unit tests finished in 0.55s instead of 62s, and all 33
+    # `plugingo-e2e` tests in 0.25s instead of ~10min. Pinning it here fixes
+    # that for CI and local runs at once, and `gen-go-large` gets a `go` too.
+    #
+    # A `gotool = "<version>"` workspace downloads its own hermetic SDK and is
+    # unaffected by this; only the `host` toolchain reads it.
+    pkgs.go
     pkgs.buf
     pkgs.protoc-gen-prost
     pkgs.protoc-gen-prost-serde

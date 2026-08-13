@@ -424,8 +424,23 @@ pub fn go_run_prelude(go_version: &str) -> Vec<String> {
 /// GOOS/GOARCH stay in `runtime_env` (the target addr's factor args already key
 /// the cache per platform).
 pub fn go_build_env() -> Value {
+    build_env("0")
+}
+
+/// [`go_build_env`] for a target that builds under a concrete factor set: same
+/// map, but `CGO_ENABLED` follows the factors — `1` for a race build off darwin,
+/// which needs cgo to pull in `runtime/race` (see
+/// [`crate::plugingo::factors::cgo_required`]), `0` for everything else.
+pub fn go_build_env_for(factors: &crate::plugingo::factors::Factors) -> Value {
+    build_env(factors.cgo_enabled_value())
+}
+
+fn build_env(cgo_enabled: &str) -> Value {
     Value::Map(HashMap::from([
-        ("CGO_ENABLED".to_string(), Value::String("0".to_string())),
+        (
+            "CGO_ENABLED".to_string(),
+            Value::String(cgo_enabled.to_string()),
+        ),
         (
             "GOTOOLCHAIN".to_string(),
             Value::String("local".to_string()),

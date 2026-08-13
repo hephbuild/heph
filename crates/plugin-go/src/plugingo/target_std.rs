@@ -1,6 +1,7 @@
 use crate::plugingo::addr_util::{
     go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config, to_run_value,
 };
+use crate::plugingo::cc_toolchain;
 use crate::plugingo::factors::{Factors, VariantRef};
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
@@ -37,8 +38,15 @@ pub fn install_addr(vref: &VariantRef) -> Addr {
 /// `goroot/pkg/linux_amd64`. The install target's package (`@heph/go/std`) is
 /// prepended by the engine, so consumers read from
 /// `$WORKSPACE_ROOT/@heph/go/std/goroot/pkg/<goos>_<goarch>`.
+///
+/// A race build installs alongside under `<goos>_<goarch>_race` — the
+/// `-installsuffix race` layout `go install -race` writes and `go tool link`
+/// expects. The two sets are genuinely different archives (every std package is
+/// instrumented, and `//go:build race` files change the sources), so they must
+/// not share a directory.
 fn pkg_subdir(factors: &Factors) -> String {
-    format!("goroot/pkg/{}_{}", factors.goos, factors.goarch)
+    let suffix = if factors.race { "_race" } else { "" };
+    format!("goroot/pkg/{}_{}{}", factors.goos, factors.goarch, suffix)
 }
 
 /// Build the `@heph/go/std:install` target: compile the *entire* standard
@@ -47,10 +55,19 @@ fn pkg_subdir(factors: &Factors) -> String {
 /// `$GOROOT` to a writable tree and `go install std` into it (with
 /// `installgoroot=all`), then dump `go list -json std` for downstream metadata.
 /// Reads nothing from the host — `$GOROOT` is the staged toolchain.
-pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str) -> TargetSpec {
+pub fn install_spec(
+    addr: Addr,
+    factors: &Factors,
+    go_version: &str,
+    cctool_addr: &str,
+) -> TargetSpec {
     let subdir = pkg_subdir(factors);
 
     let mut run = go_run_prelude(go_version);
+    // A race build that needs cgo compiles C here (`runtime/cgo`, and the cgo
+    // half of `runtime/race`), so point `go` at the staged compiler. No-op for
+    // every other build — see `cc_toolchain`.
+    run.extend(cc_toolchain::cc_prelude(&factors.goos, factors.race));
     run.extend([
         // Copy the staged GOROOT into a writable tree so `go install` can
         // populate pkg/. `-L` dereferences symlinks: staged dep files may be
@@ -71,13 +88,23 @@ pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str) -> TargetSp
         "chmod -R u+w \"$GOROOT\"".to_string(),
         // A throwaway module keeps `go` from reading the workspace go.mod.
         "echo 'module heph_std' > go.mod".to_string(),
-        "\"$GOROOT/bin/go\" install --trimpath std".to_string(),
-        format!("\"$GOROOT/bin/go\" list -json std > \"{subdir}/list.json\""),
+        format!(
+            "\"$GOROOT/bin/go\" install --trimpath{} std",
+            if factors.race { " -race" } else { "" }
+        ),
+        format!(
+            "\"$GOROOT/bin/go\" list{} -json std > \"{subdir}/list.json\"",
+            if factors.race { " -race" } else { "" }
+        ),
     ]);
 
     let mut deps: HashMap<String, Value> = HashMap::new();
     if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
         deps.insert(sdk_group, sdk_val);
+    }
+    if let Some((cc_group, cc_val)) = cc_toolchain::cc_dep(cctool_addr, &factors.goos, factors.race)
+    {
+        deps.insert(cc_group, cc_val);
     }
 
     let mut config: HashMap<String, Value> = HashMap::new();
@@ -89,6 +116,11 @@ pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str) -> TargetSp
     if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
         config.insert(pe_k, pe_v);
     }
+    // A staged C compiler still needs `PATH` to reach its own subprograms (`as`,
+    // `ld`); without it cgo fails with `cannot execute 'as'`. Merged rather than
+    // set so a non-hermetic toolchain's passthrough above survives. No-op unless
+    // this build needs a compiler.
+    cc_toolchain::merge_runtime_pass_env(&mut config, &factors.goos, factors.race);
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([
@@ -109,7 +141,10 @@ pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str) -> TargetSp
         Value::Map(HashMap::from([
             ("GOOS".to_string(), Value::String(factors.goos.clone())),
             ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-            ("CGO_ENABLED".to_string(), Value::String("0".to_string())),
+            (
+                "CGO_ENABLED".to_string(),
+                Value::String(factors.cgo_enabled_value().to_string()),
+            ),
             (
                 "GOTOOLCHAIN".to_string(),
                 Value::String("local".to_string()),
@@ -223,7 +258,12 @@ mod tests {
 
     #[test]
     fn test_install_builds_std_from_source() {
-        let spec = install_spec(install_addr(&test_vref()), &test_factors(), V);
+        let spec = install_spec(
+            install_addr(&test_vref()),
+            &test_factors(),
+            V,
+            "//@heph/bin:cc",
+        );
         let run = run_str(&spec);
         assert!(
             run.contains("install --trimpath std"),
@@ -235,7 +275,12 @@ mod tests {
 
     #[test]
     fn test_install_reads_no_host_go() {
-        let spec = install_spec(install_addr(&test_vref()), &test_factors(), V);
+        let spec = install_spec(
+            install_addr(&test_vref()),
+            &test_factors(),
+            V,
+            "//@heph/bin:cc",
+        );
         let run = run_str(&spec);
         // GOROOT must come from the staged hermetic SDK, never the host.
         assert!(
@@ -258,7 +303,12 @@ mod tests {
 
     #[test]
     fn test_install_out_has_pkg_dir_and_list() {
-        let spec = install_spec(install_addr(&test_vref()), &test_factors(), V);
+        let spec = install_spec(
+            install_addr(&test_vref()),
+            &test_factors(),
+            V,
+            "//@heph/bin:cc",
+        );
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!("out must be map"),
@@ -278,7 +328,7 @@ mod tests {
             build_tags: vec![],
             ..Default::default()
         };
-        let spec = install_spec(install_addr(&test_vref()), &factors, V);
+        let spec = install_spec(install_addr(&test_vref()), &factors, V, "//@heph/bin:cc");
         let env = match spec.config.get("env").unwrap() {
             Value::Map(m) => m,
             _ => panic!("env must be map"),
@@ -341,5 +391,129 @@ mod tests {
             archive_filename("internal/chacha8rand"),
             "internal_chacha8rand.a"
         );
+    }
+
+    // ---- race ----
+
+    fn race_factors(goos: &str) -> Factors {
+        Factors {
+            goos: goos.into(),
+            goarch: "arm64".into(),
+            race: true,
+            ..Default::default()
+        }
+    }
+
+    const CC: &str = "//@heph/bin:cc";
+
+    /// A race build installs std with `-race`, into the `_race` directory
+    /// `go install -race` writes and the linker expects. The two archive sets are
+    /// genuinely different, so they must not share a directory.
+    #[test]
+    fn race_install_uses_race_flag_and_its_own_pkg_dir() {
+        let spec = install_spec(install_addr(&test_vref()), &race_factors("linux"), V, CC);
+        let run = run_str(&spec);
+        assert!(
+            run.contains("install --trimpath -race std"),
+            "std must be compiled with -race: {run}"
+        );
+        assert!(
+            run.contains("goroot/pkg/linux_arm64_race"),
+            "race archives belong in their own pkg dir: {run}"
+        );
+        // `go list` has to agree with the install, or it reports the non-race
+        // file set and import graph for archives that were built racy.
+        assert!(run.contains("list -race -json std"), "{run}");
+    }
+
+    #[test]
+    fn non_race_install_is_unchanged() {
+        let spec = install_spec(install_addr(&test_vref()), &test_factors(), V, CC);
+        let run = run_str(&spec);
+        assert!(run.contains("install --trimpath std"), "{run}");
+        assert!(
+            !run.contains("-race"),
+            "no race flag on an ordinary build: {run}"
+        );
+        assert!(!run.contains("_race"), "{run}");
+    }
+
+    /// `build_lib` extracts from whichever pkg dir its factors name, so a race
+    /// consumer reads the race archive rather than silently getting the ordinary
+    /// one.
+    #[test]
+    fn race_build_lib_reads_the_race_archive() {
+        let vref = test_vref().with_race(true);
+        let spec = build_spec(
+            build_lib_addr(),
+            "runtime/race",
+            &race_factors("linux"),
+            &vref,
+        );
+        let run = run_str(&spec);
+        assert!(
+            run.contains("goroot/pkg/linux_arm64_race/runtime/race.a"),
+            "{run}"
+        );
+        // …and it deps on the race flavour of the install, not the ordinary one.
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m.clone(),
+            other => panic!("expected deps map: {other:?}"),
+        };
+        let install = match deps.get("install").unwrap() {
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.clone(),
+                other => panic!("expected string: {other:?}"),
+            },
+            other => panic!("expected list: {other:?}"),
+        };
+        assert!(install.contains("race=1"), "{install}");
+    }
+
+    /// linux race needs cgo, so the compiler is staged and `CC` points at it.
+    #[test]
+    fn linux_race_install_stages_a_c_compiler() {
+        let spec = install_spec(install_addr(&test_vref()), &race_factors("linux"), V, CC);
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m.clone(),
+            other => panic!("expected deps map: {other:?}"),
+        };
+        assert!(
+            deps.contains_key(crate::plugingo::cc_toolchain::CC_DEP_GROUP),
+            "linux race must dep on a C compiler: {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+        assert!(run_str(&spec).contains("export CC"), "{}", run_str(&spec));
+        let env = match spec.config.get("env").unwrap() {
+            Value::Map(m) => m.clone(),
+            other => panic!("expected env map: {other:?}"),
+        };
+        assert!(matches!(env.get("CGO_ENABLED"), Some(Value::String(s)) if s == "1"));
+        // The compiler finds `as`/`ld` through PATH; without it cgo dies with
+        // `cannot execute 'as'`.
+        let pass = match spec.config.get("runtime_pass_env") {
+            Some(Value::List(v)) => v.clone(),
+            other => panic!("expected runtime_pass_env list: {other:?}"),
+        };
+        assert!(pass.contains(&Value::String("PATH".to_string())));
+    }
+
+    /// darwin race stays hermetic: `runtime/race` is pure Go plus a syso there,
+    /// so no compiler dep, no cgo, no PATH passthrough.
+    #[test]
+    fn darwin_race_install_needs_no_c_compiler() {
+        let spec = install_spec(install_addr(&test_vref()), &race_factors("darwin"), V, CC);
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m.clone(),
+            other => panic!("expected deps map: {other:?}"),
+        };
+        assert!(!deps.contains_key(crate::plugingo::cc_toolchain::CC_DEP_GROUP));
+        assert!(!run_str(&spec).contains("export CC"));
+        let env = match spec.config.get("env").unwrap() {
+            Value::Map(m) => m.clone(),
+            other => panic!("expected env map: {other:?}"),
+        };
+        assert!(matches!(env.get("CGO_ENABLED"), Some(Value::String(s)) if s == "0"));
+        assert!(!spec.config.contains_key("runtime_pass_env"));
     }
 }

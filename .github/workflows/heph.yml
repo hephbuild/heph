@@ -749,7 +749,17 @@ jobs:
   test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 30
+    # 30 was sized when the macOS leg silently skipped every Go test (`go` was
+    # absent from the runner and `require_go!` returned Ok — the whole go-plugin
+    # suite "passed" in under a second). Now that devenv supplies a Go, darwin
+    # does the work it was always meant to: 480 `plugin-go` unit tests in 150s,
+    # ~11min of `plugingo-e2e` on top. It landed at 30m19s and got cancelled
+    # while running out the last few crates.
+    #
+    # 45 covers that with room for a cold kache. The linux legs sit near 24min,
+    # so this is headroom for them too rather than a licence to grow — if a leg
+    # starts approaching it, find out what got slower.
+    timeout-minutes: 45
     needs: gen
     strategy:
       fail-fast: false

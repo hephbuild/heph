@@ -24,7 +24,7 @@ pub use htestkit::{artifact_bytes, artifact_paths, artifact_string};
 macro_rules! require_go {
     () => {
         if !crate::common::go_available() {
-            eprintln!("skipping: go not in PATH");
+            crate::common::no_go_or_panic();
             return Ok(());
         }
     };
@@ -37,6 +37,22 @@ pub fn go_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Skipping is fine on a dev machine without Go; in CI it is a broken job.
+///
+/// Every test in this crate needs `go` on PATH, so a runner without it turns the
+/// whole suite green in a quarter of a second — indistinguishable from a suite
+/// that passed, and exactly how the macOS leg went untested for as long as it
+/// did. Under `CI` this is a hard failure instead.
+pub fn no_go_or_panic() {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "go is not on PATH, so this test would silently skip. In CI that is a \
+         broken job, not a skip: the devenv shell provides `pkgs.go` (see \
+         devenv.nix), so reaching this means the test is not running inside it."
+    );
+    eprintln!("skipping: go not in PATH");
 }
 
 /// Whether a linked ELF executable declares a `PT_INTERP` program header — i.e.
@@ -70,6 +86,17 @@ pub fn testdata(name: &str) -> PathBuf {
 
 pub fn fixture(name: &str) -> anyhow::Result<TempDir> {
     copy_dir_to_tempdir(&testdata(name))
+}
+
+/// Absolute path to the host C compiler, or `None` if there isn't one.
+///
+/// Only a race build that needs cgo (linux — see `plugingo::factors::cgo_required`)
+/// ever resolves the `cc` target this backs; on darwin nothing asks for it.
+fn cc_bin_path() -> Option<String> {
+    ["cc", "gcc", "clang"]
+        .iter()
+        .find_map(|name| which::which(name).ok())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn go_bin_path() -> String {
@@ -299,6 +326,7 @@ fn make_workspace_ordered(
 ) -> anyhow::Result<Workspace> {
     let gotool = gotool.to_string();
     let go_bin = go_bin_path();
+    let cc_bin = cc_bin_path();
     // `fs` is auto-registered by `Engine::new`.
     let mut b = WorkspaceBuilder::from_dir(dir).with_fs_skip(fs_skip.iter().copied());
 
@@ -334,19 +362,35 @@ fn make_workspace_ordered(
             ))
         })
         .with_provider(move |_| {
-            Box::new(
-                pluginstatictarget::Provider::new(vec![pluginstatictarget::Target {
-                    addr: "//@heph/bin:go".to_string(),
+            let mut targets = vec![pluginstatictarget::Target {
+                addr: "//@heph/bin:go".to_string(),
+                driver: "bash".to_string(),
+                run: Some(format!("cp -p \"{go_bin}\" go")),
+                out: std::collections::HashMap::from([(String::new(), vec!["go".to_string()])]),
+                codegen: None,
+                deps: Default::default(),
+                labels: vec![],
+                ..Default::default()
+            }];
+            // Stand-in for the hostbin `//@heph/bin:cc` a real workspace uses,
+            // which a race build stages where race needs cgo. A *shim* rather
+            // than a copy of the binary: gcc locates its own subprograms
+            // relative to argv[0], so a copied driver can't find `cc1`.
+            if let Some(cc_bin) = &cc_bin {
+                targets.push(pluginstatictarget::Target {
+                    addr: "//@heph/bin:cc".to_string(),
                     driver: "bash".to_string(),
-                    run: Some(format!("cp -p \"{go_bin}\" go")),
-                    out: std::collections::HashMap::from([(String::new(), vec!["go".to_string()])]),
+                    run: Some(format!(
+                        "printf '#!/bin/sh\\nexec \"{cc_bin}\" \"$@\"\\n' > cc\nchmod +x cc"
+                    )),
+                    out: std::collections::HashMap::from([(String::new(), vec!["cc".to_string()])]),
                     codegen: None,
                     deps: Default::default(),
                     labels: vec![],
                     ..Default::default()
-                }])
-                .expect("static provider"),
-            )
+                });
+            }
+            Box::new(pluginstatictarget::Provider::new(targets).expect("static provider"))
         });
 
     if !go_first {
