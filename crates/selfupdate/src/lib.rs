@@ -12,6 +12,11 @@
 //! `debug`, a build kept unstripped for backtraces) picks
 //! `heph_<flavour>_<os>_<arch>`.
 //!
+//! The pin is read through the *lenient* [`hconfig::VersionPin`] loader, not the
+//! full config shape: the binary that reads the pin is by definition the one that
+//! may not understand the config the pinned version was written for. See
+//! [`read_pin`].
+//!
 //! Only **exact** version pins are acted on today; a constraint expression (e.g.
 //! `>=1.2, <2`) is recognized and skipped with a warning until resolution against
 //! the release index is implemented.
@@ -112,26 +117,64 @@ pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
     // Not inside a heph workspace: no config, nothing to pin against. Surfaced as
     // a distinct error so the caller can tolerate it for `heph version`.
     let root = hconfig::get_root().map_err(|_e| SelfUpgradeError::NoConfig)?;
-    let cfg = hconfig::load_from_root(&root)?;
-    let Some(desired_version) = cfg.version.as_deref() else {
-        return Ok(());
-    };
-    let flavour = cfg.version_flavour.as_deref().unwrap_or("");
+    let pin = read_pin(&root, &hconfig::profiles_from_env())?;
     let current_flavour = version::flavour();
 
-    match decide(current, &current_flavour, desired_version, flavour) {
+    match plan(&pin, current, &current_flavour) {
         Decision::UpToDate => Ok(()),
         Decision::Unsupported { reason } => {
+            let desired_version = pin.version.as_deref().unwrap_or_default();
             tracing::warn!(desired_version, current, %reason, "ignoring .hephconfig version pin");
             Ok(())
         }
         Decision::Upgrade { target } => {
-            let binary = imp::ensure_binary(&target, flavour)?;
+            let binary = imp::ensure_binary(&target, pin_flavour(&pin))?;
             // Replaces the process image; only returns on failure.
             imp::exec_into(&binary)?;
             Ok(())
         }
     }
+}
+
+/// Read the workspace's version pin, tolerating a config this binary cannot
+/// fully parse.
+///
+/// The pin decides *which binary should be running*, so reading it must not
+/// depend on the running binary understanding the rest of the file — which is
+/// exactly what the full (`deny_unknown_fields`) config shape would require. A
+/// workspace pinning version N while using a key N introduced is unparseable by
+/// N-1, and N-1 is precisely the binary that has to read the pin to hand over to
+/// N; a downgrade pinning N-1 while using a key N *dropped* is the mirror image.
+/// `hconfig::load_version_pin` looks at `version`/`versionFlavour` and skips
+/// everything else, so the handover happens either way.
+///
+/// The strictness is deferred, not dropped: once the right binary is running, any
+/// command that builds the engine loads the config in full and reports what it
+/// doesn't understand. Commands that never build one (`heph version`) now run
+/// against an unparseable config instead of failing the whole process on it.
+///
+/// `profiles` is threaded in rather than read from the environment here so this
+/// path stays testable — see `hconfig::profiles_from_env`.
+#[cfg(any(unix, test))]
+fn read_pin(root: &std::path::Path, profiles: &[String]) -> anyhow::Result<hconfig::VersionPin> {
+    hconfig::load_version_pin(root, profiles)
+}
+
+/// The pinned flavour, defaulting to the std (empty) build when unset.
+#[cfg(any(unix, test))]
+fn pin_flavour(pin: &hconfig::VersionPin) -> &str {
+    pin.version_flavour.as_deref().unwrap_or("")
+}
+
+/// Turn a pin plus the running version/flavour into a [`Decision`]. The glue
+/// [`maybe_self_upgrade`] runs, minus the filesystem and the exec — an unset
+/// `version` means nothing to do, and an unset flavour means the std build.
+#[cfg(any(unix, test))]
+fn plan(pin: &hconfig::VersionPin, current: &str, current_flavour: &str) -> Decision {
+    let Some(desired_version) = pin.version.as_deref() else {
+        return Decision::UpToDate;
+    };
+    decide(current, current_flavour, desired_version, pin_flavour(pin))
 }
 
 #[cfg(not(unix))]
@@ -554,6 +597,87 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pin(version: Option<&str>, flavour: Option<&str>) -> hconfig::VersionPin {
+        hconfig::VersionPin {
+            version: version.map(str::to_string),
+            version_flavour: flavour.map(str::to_string),
+        }
+    }
+
+    /// A workspace whose config this binary cannot fully parse must still hand
+    /// over to the version it pins — otherwise the upgrade that would *fix* the
+    /// parse error can never run. This is the seam that regressed: reading the pin
+    /// through the strict loader made the whole run fatal. Covers an unknown
+    /// top-level key (from a newer heph), an unknown *nested* key, and an unknown
+    /// plugin field — the last two are rejected by their own deserializers rather
+    /// than by the top-level struct.
+    #[test]
+    fn reads_the_pin_through_a_config_this_binary_cannot_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join(".hephconfig"),
+            "version: v9.9.9\n\
+             versionFlavour: debug\n\
+             fromTheFuture: { deeply: [nested, 1, true] }\n\
+             cache:\n  aKeyThisBinaryDropped: 1\n\
+             plugins:\n  - builtin: buildfile\n    futureKnob: yes\n",
+        )
+        .expect("write config");
+
+        // Sanity: the strict loader is exactly what would have blocked the
+        // upgrade — if this ever stops erroring, the lenient path lost its point.
+        assert!(
+            hconfig::load_from_root(root).is_err(),
+            "fixture must be unparseable under the full config shape"
+        );
+
+        let pin = read_pin(root, &[]).expect("pin must be readable regardless");
+        assert_eq!(pin.version.as_deref(), Some("v9.9.9"));
+        assert_eq!(pin.version_flavour.as_deref(), Some("debug"));
+    }
+
+    /// The pin read from such a config drives the decision the same as any other —
+    /// the point of reading it is to act on it.
+    #[test]
+    fn plan_upgrades_from_a_pin() {
+        assert_eq!(
+            plan(&pin(Some("v2.0.0"), None), "v1.0.0", ""),
+            Decision::Upgrade {
+                target: "v2.0.0".to_string()
+            }
+        );
+    }
+
+    /// No pin is still no pin: a config without `version` must not invent one —
+    /// the run continues on the current binary.
+    #[test]
+    fn plan_without_a_pin_is_a_noop() {
+        assert_eq!(plan(&pin(None, None), "v1.0.0", ""), Decision::UpToDate);
+        // …even when a flavour is pinned on its own: with no version there is no
+        // release to fetch it from.
+        assert_eq!(
+            plan(&pin(None, Some("debug")), "v1.0.0", ""),
+            Decision::UpToDate
+        );
+    }
+
+    /// An omitted `versionFlavour` means the std build, so a std binary on a
+    /// matching version has nothing to do — and a `debug` one does.
+    #[test]
+    fn plan_treats_an_omitted_flavour_as_std() {
+        assert_eq!(
+            plan(&pin(Some("v1.2.3"), None), "v1.2.3", ""),
+            Decision::UpToDate
+        );
+        assert_eq!(
+            plan(&pin(Some("v1.2.3"), None), "v1.2.3", "debug"),
+            Decision::Upgrade {
+                target: "v1.2.3".to_string()
+            }
+        );
+    }
 
     /// `decide` with flavour held constant (both empty) — for tests that only
     /// care about version-number comparison; flavour comparison is covered
