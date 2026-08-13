@@ -133,6 +133,19 @@ fn env_key_segment(group: &str) -> String {
         .collect()
 }
 
+/// A `{group: [addr]}` spec attribute as a list ordered by group name.
+///
+/// Every such attribute arrives as a `HashMap`, whose iteration order is
+/// randomized per instance. Consuming one in map order makes the resulting
+/// `def.inputs` order — and anything derived from an input's position in it —
+/// differ between processes, which is a moved def hash and a cache that can
+/// never hit. Order by the group name instead, which is content, not layout.
+fn sorted_by_group(m: HashMap<String, Vec<String>>) -> Vec<(String, Vec<String>)> {
+    let mut v: Vec<(String, Vec<String>)> = m.into_iter().collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
 fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
     let cmds = (!run.is_empty()).then(|| run.join("\n"));
 
@@ -801,7 +814,14 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                                 runtime: bool|
          -> anyhow::Result<Vec<(String, Input)>> {
             let read_only_groups = &read_only_groups;
-            deps.into_iter()
+            // Sorted, not `HashMap` order: this is the order of `def.inputs`,
+            // and the transitive collector numbers each merged sandbox by an
+            // input's *position* in that list — a number that ends up in the
+            // merged dep/tool ids, and so in this target's def hash. Left in
+            // map order, a target with two or more dep groups hashes
+            // differently in every process and never hits its cache.
+            sorted_by_group(deps)
+                .into_iter()
                 .flat_map(|(k, v)| {
                     let pkg = pkg.clone();
                     let read_only = read_only_groups.contains(&k);
@@ -852,8 +872,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 .push(input.clone());
         }
 
-        let tool_inputs = spec
-            .tools
+        let tool_inputs = sorted_by_group(spec.tools)
             .into_iter()
             .flat_map(|(k, v)| {
                 let pkg = pkg.clone();
@@ -3620,6 +3639,53 @@ mod tests {
         )]))
         .await?;
         assert_eq!(base.hash, with_hash.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_input_order_stable_across_group_order() -> anyhow::Result<()> {
+        // `deps`/`tools` arrive as `HashMap`s, so two parses of the same spec
+        // iterate their groups in different orders. `def.inputs` order must not
+        // follow: the engine's transitive collector numbers each merged sandbox
+        // by an input's *position* in this list, and that number lands in the
+        // merged dep ids — i.e. in the def hash of a target that depends on
+        // this one. One group is always position 0; it takes two to show.
+        let groups = |prefix: &str| {
+            hcore::htvalue::Value::Map(
+                ["a", "b", "c", "d", "e", "f", "g", "h"]
+                    .iter()
+                    .map(|g| {
+                        (
+                            format!("{prefix}{g}"),
+                            hcore::htvalue::Value::List(vec![hcore::htvalue::Value::String(
+                                format!("//some:{prefix}{g}"),
+                            )]),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let parse = || async {
+            parse_with(HashMap::from([
+                ("deps".to_string(), groups("d")),
+                ("tools".to_string(), groups("t")),
+            ]))
+            .await
+        };
+        let origin_ids = |def: &hplugin::driver::targetdef::TargetDef| -> Vec<String> {
+            def.inputs.iter().map(|i| i.origin_id.clone()).collect()
+        };
+
+        let first = parse().await?;
+        for _ in 0..8 {
+            let again = parse().await?;
+            assert_eq!(
+                origin_ids(&first),
+                origin_ids(&again),
+                "input order follows HashMap order"
+            );
+            assert_eq!(first.hash, again.hash, "def hash moved between parses");
+        }
         Ok(())
     }
 
