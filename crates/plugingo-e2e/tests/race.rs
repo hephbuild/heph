@@ -57,16 +57,36 @@ async fn race_detects_a_real_data_race() -> anyhow::Result<()> {
         .err()
         .map(|e| format!("{e:#}"))
         .unwrap_or_default();
-    // `testing`'s own summary line, not the detector's `WARNING: DATA RACE`
-    // banner: heph reports only the tail of the log, and the banner sits above
-    // the goroutine stacks that fill it.
     assert!(
-        err.contains("race detected during execution of test"),
+        RACE_MARKERS.iter().any(|m| err.contains(m)),
         "test_race must fail with the race detector's report on a package with a \
          real data race (empty means it wrongly passed); got: {err}"
     );
     Ok(())
 }
+
+/// Strings that only a ThreadSanitizer report produces, any one of which proves
+/// the binary was instrumented and fired.
+///
+/// It has to be a set rather than one line, because all we get is the **last 10
+/// lines** of the process log (`Engine::DEFAULT_LOG_TAIL_LINES`) and which part
+/// of the report lands in that window varies with how deep the goroutine stacks
+/// in the final report happen to be — deeper stacks on a CI runner pushed
+/// `race detected during execution of test` out of it, failing this test while
+/// the feature worked perfectly.
+///
+/// `==================` is the load-bearing one: it delimits every report, so it
+/// is always within the last few lines of a race-failing binary. The other two
+/// are friendlier to read when they do survive.
+const RACE_MARKERS: &[&str] = &[
+    // The report's own delimiter — always at or near the end of the output.
+    "==================",
+    // The banner, when the report is short enough to fit.
+    "DATA RACE",
+    // `testing`'s summary, when the race is caught during the test rather than
+    // at exit.
+    "race detected during execution of test",
+];
 
 /// The control for [`race_detects_a_real_data_race`]: the *same* racy package
 /// passes under the ordinary `test` target. Without this, that test would also
