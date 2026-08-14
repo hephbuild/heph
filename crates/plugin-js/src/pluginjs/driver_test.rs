@@ -125,21 +125,41 @@
 //! and stderr tails surfaced (`test_failure_detail`, identical shape to
 //! `driver_typecheck.rs`'s `tsc_failure_detail`) — the runner's actual
 //! output (assertion diffs, stack traces) must reach the user, never be
-//! swallowed into a bare "failed" with no detail.
+//! swallowed into a bare "failed" with no detail. This is the fallback path
+//! only — see the next section for the primary one.
 //!
-//! **A wedged runner is also a failure, eventually.** vitest (and jest) are
-//! known to sometimes not exit after finishing their own work — a failed
-//! dependency-optimizer scan leaving a background esbuild service alive is
-//! a confirmed live trigger — and nothing about `proc_exec::output` bounds
-//! how long it waits on the child's own exit. [`RUNNER_TIMEOUT`] (20
-//! minutes, generous on purpose — a safety net against a wedged child, not
-//! a performance budget) kills a runner that outlives it and reports a
-//! named timeout failure, via [`DeadlineCancellable`] composed with the
-//! caller's own cancellation token rather than a bare `tokio::time::timeout`
-//! around the subprocess future — the latter would just drop the future on
-//! expiry and leak the orphaned child; composing tokens instead reuses
-//! `proc_exec`'s existing SIGINT→grace→SIGKILL teardown, the same one a
-//! real user cancellation already goes through.
+//! ## Detecting real completion, not waiting for exit
+//!
+//! vitest (and jest) are known to sometimes not exit after finishing their
+//! own work — a failed dependency-optimizer scan leaving a background
+//! esbuild service alive is a confirmed live trigger — and nothing about a
+//! plain subprocess wait bounds how long that takes to notice. Waiting on
+//! *exit* was always the wrong signal: the runner's own results are final
+//! the moment it finishes writing them, regardless of whether the process
+//! then goes on to hang. So both runners are asked for a second, structured
+//! report alongside their normal human-readable one — vitest gets
+//! `--reporter=default --reporter=json --outputFile=<path>`, jest gets
+//! `--json --outputFile=<path>` — written to [`RESULT_FILE_NAME`] inside the
+//! target's own sandbox package dir, deliberately never a declared `Input`
+//! or `Output` (see `_golist`'s `.heph-gocache` for the identical pattern:
+//! `driver_golist.rs`'s use of `GOCACHE`). `exec_runner` polls for that file
+//! concurrently with draining the child's stdout/stderr, and the instant it
+//! appears and parses, treats the run as **over** — the verdict comes from
+//! its `success` field, not from the process's eventual exit code — and
+//! forces the child to exit right then via the same manually-triggerable
+//! [`hcore::hasync::StdCancellationToken`] mechanism a real user Ctrl-C
+//! already goes through (SIGINT → grace → SIGKILL, never a bare
+//! `tokio::time::timeout` around the subprocess future, which would just
+//! drop the future and leak the orphaned child). A well-behaved runner that
+//! simply exits on its own is unaffected — the file is checked one last time
+//! right after end-of-stream, so the richer JSON-derived detail is used
+//! whenever it exists, whichever path got there first.
+//!
+//! [`RUNNER_TIMEOUT`] (20 minutes) still exists, but only as the last-resort
+//! backstop for a runner that produces *neither* a usable exit *nor* a
+//! parseable result file — a genuinely wedged process with no signal to key
+//! off at all. It is not, any more, the mechanism that makes a completed run
+//! end promptly; that is now the JSON-file detection above.
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -226,7 +246,14 @@ struct JsTestDef {
 /// shape (flags, runner-config-lookup rule, what counts as a hashed config
 /// field) changes in a way the declared `Input` content hash alone would not
 /// already capture.
-const JS_TEST_FORMAT_VERSION: u32 = 1;
+///
+/// `2`: added `--reporter=json --outputFile=<path>` (vitest) /
+/// `--json --outputFile=<path>` (jest) to every invocation — see module
+/// docs' "Detecting real completion, not waiting for exit". Both flags are
+/// designed by their respective tools to be additive/non-invasive, but a
+/// cached result from before this change never actually ran with them, so a
+/// stale cache hit must not stand in for having done so.
+const JS_TEST_FORMAT_VERSION: u32 = 2;
 
 impl Hash for JsTestDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -413,6 +440,13 @@ impl ManagedDriver for JsTestDriver {
         env.insert("LANG".to_string(), "C.UTF-8".to_string());
         env.insert("CI".to_string(), "1".to_string());
 
+        // Where the runner is asked to write its own structured, JSON
+        // completion signal — see module docs' "Detecting real completion,
+        // not waiting for exit". `exec_runner` polls this same path
+        // (derived the same way, from the same `cwd`), so the two can never
+        // disagree about where to look.
+        let result_path = req.sandbox_pkg_dir.join(RESULT_FILE_NAME);
+
         let mut args: Vec<OsString> = Vec::new();
         match def.testrunner.as_str() {
             toolchain::VITEST => {
@@ -428,6 +462,13 @@ impl ManagedDriver for JsTestDriver {
                             .into_os_string(),
                     );
                 }
+                // `--reporter=default` keeps the normal human-readable
+                // output (still captured for the fallback failure detail);
+                // `--reporter=json` + `--outputFile` is the completion
+                // signal `exec_runner` polls for.
+                args.push(OsString::from("--reporter=default"));
+                args.push(OsString::from("--reporter=json"));
+                args.push(outputfile_arg(&result_path));
                 args.push(test_file_abs.into_os_string());
             }
             toolchain::JEST => {
@@ -439,6 +480,14 @@ impl ManagedDriver for JsTestDriver {
                             .into_os_string(),
                     );
                 }
+                // `--json` writes the same Jest-compatible structured
+                // result `exec_runner` polls for (vitest's own `json`
+                // reporter is explicitly modeled on it); jest additionally
+                // redirects its normal human output to stderr in this mode
+                // (its own documented `--json` behavior), which is still
+                // captured for the fallback failure detail.
+                args.push(OsString::from("--json"));
+                args.push(outputfile_arg(&result_path));
                 // An exact path match, not a `testPathPattern` regex — see
                 // module docs' "Invocation shape".
                 args.push(OsString::from("--runTestsByPath"));
@@ -457,14 +506,30 @@ impl ManagedDriver for JsTestDriver {
     }
 }
 
+/// Relative filename (joined onto the target's own sandbox package dir —
+/// the runner's `cwd`) that the runner is asked to write its structured JSON
+/// completion report to, alongside its normal human-readable output. Never a
+/// declared `Input` or `Output` — purely `exec_runner`'s own completion-
+/// detection bookkeeping, gone once `run()` returns along with the rest of
+/// the sandbox. Mirrors `driver_golist.rs`'s identically-undeclared
+/// `.heph-gocache`. See module docs' "Detecting real completion, not
+/// waiting for exit".
+const RESULT_FILE_NAME: &str = ".heph-js-test-result.json";
+
+/// How often `exec_runner` checks for [`RESULT_FILE_NAME`] while the runner
+/// is still producing output. Cheap enough (one `stat`+maybe-`read` of a
+/// small file) that a short interval costs nothing over a whole run, and
+/// short enough that detection reads as immediate to a human waiting on it.
+const RESULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// How long a test-runner subprocess gets before it's killed and reported
-/// as a timeout rather than left to hang the whole `heph run`. vitest (and
-/// jest) are known to sometimes not exit after finishing their work — a
-/// failed dependency-optimizer scan leaving a background esbuild service
-/// alive is a confirmed live trigger — and `proc_exec::output` otherwise
-/// waits on the child's own exit with no bound at all. Generous on purpose:
-/// this is a safety net against a wedged child, not a performance budget: a
-/// real, large, slow-but-working suite must never spuriously trip it.
+/// as a timeout, when it produces *neither* a normal exit *nor* a parseable
+/// [`RESULT_FILE_NAME`] — the last-resort backstop for a runner with no
+/// signal to key off at all. Generous on purpose: this guards against a
+/// truly wedged child, not a performance budget — a real, large,
+/// slow-but-working suite must never spuriously trip it. See module docs'
+/// "Detecting real completion, not waiting for exit" for why this is no
+/// longer the primary mechanism that ends a completed run.
 const RUNNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// A [`Cancellable`] that fires either when `inner` does or once `deadline`
@@ -475,10 +540,10 @@ const RUNNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 
 /// deadline-triggered kill cleans up the child exactly like a real
 /// cancellation does — a raw `timeout` would just drop the future and leak
 /// the orphaned process. The *original* `ctoken` a caller already had is
-/// left untouched: only the derived, request-local copy passed to
-/// `proc_exec::output` ever observes the deadline, so a target that merely
-/// timed out is never mistaken upstream for a user-cancelled run (which
-/// engine code separately keys off the real, unwrapped token).
+/// left untouched: only the derived, request-local copy passed to the
+/// runner ever observes the deadline, so a target that merely timed out is
+/// never mistaken upstream for a user-cancelled run (which engine code
+/// separately keys off the real, unwrapped token).
 struct DeadlineCancellable {
     inner: Arc<dyn Cancellable + Send + Sync>,
     deadline: tokio::time::Instant,
@@ -506,6 +571,128 @@ impl Cancellable for DeadlineCancellable {
     }
 }
 
+/// A [`Cancellable`] that fires the moment either `a` or `b` does. Used to
+/// layer `exec_runner`'s own manually-triggered "the runner's structured
+/// result appeared" signal on top of the caller's real cancellation token,
+/// so both feed the same [`DeadlineCancellable`]-driven kill path.
+struct EitherCancellable {
+    a: Arc<dyn Cancellable + Send + Sync>,
+    b: Arc<dyn Cancellable + Send + Sync>,
+}
+
+impl Cancellable for EitherCancellable {
+    fn is_cancelled(&self) -> bool {
+        self.a.is_cancelled() || self.b.is_cancelled()
+    }
+
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            tokio::select! {
+                () = self.a.cancelled() => {}
+                () = self.b.cancelled() => {}
+            }
+        })
+    }
+
+    fn clone_arc(&self) -> Arc<dyn Cancellable + Send + Sync> {
+        Arc::new(EitherCancellable {
+            a: self.a.clone(),
+            b: self.b.clone(),
+        })
+    }
+}
+
+/// Builds the `--outputFile=<path>` argument as a single `OsString`,
+/// concatenated rather than formatted through `Path::display` so a
+/// non-UTF-8 sandbox path (rare, but the sandbox root is host-controlled,
+/// not guaranteed ASCII) survives intact instead of being lossily rendered.
+fn outputfile_arg(path: &std::path::Path) -> OsString {
+    let mut s = OsString::from("--outputFile=");
+    s.push(path.as_os_str());
+    s
+}
+
+/// A single test file's entry in the runner's Jest-compatible JSON report —
+/// only the fields this driver actually reads. `message` is the same
+/// preformatted failure text (assertion diffs, stack traces) a human would
+/// see in the console reporter for this file, already assembled by the
+/// runner itself — richer and more precise than scraping it back out of
+/// captured stdout.
+#[derive(serde::Deserialize)]
+struct RunnerTestFileResult {
+    #[serde(default)]
+    message: String,
+}
+
+/// The runner's own structured completion report — the Jest `--json`
+/// shape, which vitest's `json` reporter is explicitly modeled on (both
+/// exist for exactly this kind of external-tooling consumption). `success`
+/// is the sole source of truth for the target's pass/fail verdict once this
+/// file has been seen — never the process's eventual exit code, which is
+/// exactly the signal that can't be trusted here (see module docs).
+#[derive(serde::Deserialize)]
+struct RunnerJsonResult {
+    success: bool,
+    #[serde(default, rename = "testResults")]
+    test_results: Vec<RunnerTestFileResult>,
+}
+
+/// Polls-once: `None` means "not ready yet" (missing, or present but not
+/// yet valid JSON — a partial write in progress) and the caller should keep
+/// waiting; `Some` means the runner is done producing it, either with the
+/// expected shape (`Ok`) or something else entirely (`Err`, a human-readable
+/// diagnostic) — schema drift must surface as a named, fast error, never a
+/// silent mis-report of pass as fail or vice versa (see `[[Fail or fix,
+/// never ignore]]`).
+fn try_read_runner_result(path: &std::path::Path) -> Option<Result<RunnerJsonResult, String>> {
+    let bytes = std::fs::read(path).ok()?;
+    // Not yet valid JSON at all — almost certainly a partial write still in
+    // flight (the runner's own `writeFileSync`-style call hasn't landed the
+    // last byte yet), not a schema problem. Keep polling.
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    match serde_json::from_value::<RunnerJsonResult>(value) {
+        Ok(r) => Some(Ok(r)),
+        Err(e) => Some(Err(format!(
+            "runner wrote {path:?} but its content didn't have the expected shape (missing/\
+             invalid `success`): {e} — got: {}",
+            hplugin::error::head_and_tail_lines(&String::from_utf8_lossy(&bytes), 20)
+        ))),
+    }
+}
+
+/// Build the failure detail for a `RunnerJsonResult` with `success: false`.
+/// Prefers each failing test file's own `message` (the runner's own
+/// preformatted diagnostic — see `RunnerTestFileResult` doc); falls back to
+/// the captured raw stdout/stderr tail when no structured message exists at
+/// all (e.g. a crash before any test file was even collected), and always
+/// appends that raw tail as a supplement otherwise — a warning printed
+/// outside any test result (a Vite dependency-scan failure, say) lives only
+/// in the raw stream, never in `testResults`, and must not be lost just
+/// because a structured message was also available.
+fn failure_detail_from_json(result: &RunnerJsonResult, stdout: &str, stderr: &str) -> String {
+    let mut structured = String::new();
+    for tr in &result.test_results {
+        let msg = tr.message.trim();
+        if msg.is_empty() {
+            continue;
+        }
+        if !structured.is_empty() {
+            structured.push_str("\n\n");
+        }
+        structured.push_str(msg);
+    }
+    if structured.is_empty() {
+        return test_failure_detail(stdout, stderr);
+    }
+    if stdout.trim().is_empty() && stderr.trim().is_empty() {
+        return structured;
+    }
+    format!(
+        "{structured}\n\n--- raw stdout/stderr ---\n{}",
+        test_failure_detail(stdout, stderr)
+    )
+}
+
 impl JsTestDriver {
     async fn exec_runner(
         &self,
@@ -519,6 +706,12 @@ impl JsTestDriver {
             .iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect();
+        let result_path = cwd.join(RESULT_FILE_NAME);
+        // A stale file from a prior invocation that reused this sandbox
+        // path (e.g. a retry after a build-system-level failure) must never
+        // be mistaken for this run's own result.
+        drop(std::fs::remove_file(&result_path));
+
         let spec = proc_exec::Spec {
             program: runner_bin.to_path_buf(),
             args,
@@ -530,42 +723,157 @@ impl JsTestDriver {
             setsid: false,
             ctty: false,
         };
+
         let deadline = tokio::time::Instant::now() + RUNNER_TIMEOUT;
-        let bounded = DeadlineCancellable {
-            inner: ctoken.clone_arc(),
+        // Manually fired the instant this function itself decides the run
+        // is over (a parseable result file appeared) — composed alongside
+        // the caller's real cancellation token and the deadline backstop so
+        // all three feed the same kill path.
+        let done = hcore::hasync::StdCancellationToken::new();
+        let bounded: Arc<dyn Cancellable + Send + Sync> = Arc::new(DeadlineCancellable {
+            inner: Arc::new(EitherCancellable {
+                a: ctoken.clone_arc(),
+                b: done.clone_arc(),
+            }),
             deadline,
+        });
+
+        let mut handle = proc_exec::spawn(spec).context("spawn test runner")?;
+        let mut reader = handle
+            .take_output()
+            .context("test runner spawned with neither stdout nor stderr piped")?;
+        let wait = handle.spawn_wait(bounded);
+
+        // Poll for the runner's own completion signal on a *separate* task
+        // from the one draining stdout/stderr below — never a `select!`
+        // racing the two in one task. `OutputReader::recv`'s macOS backend
+        // parks the calling task in `block_in_place` while waiting for a
+        // chunk, which is never `Pending`: a `select!` arm alongside it
+        // cannot be polled until `recv` itself returns, so a poll timer in
+        // the same task would starve for as long as the runner stays
+        // silent — exactly the wedged-runner case this mechanism exists to
+        // catch (confirmed live: reproduced the resulting hang under the
+        // `multi_thread` flavor every production runtime actually uses).
+        // Two independent tasks keep the poll ticking regardless of what
+        // the drain side is doing, matching the already-safe shape
+        // `pluginexec` and `plugin-oci`'s `docker_build.rs` use for the
+        // same `OutputReader`.
+        let poll_result_path = result_path.clone();
+        let poll_done = done.clone();
+        let poll_task = tokio::spawn(async move {
+            let mut poll = tokio::time::interval(RESULT_POLL_INTERVAL);
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                poll.tick().await;
+                let path = poll_result_path.clone();
+                if let Some(found) =
+                    hcore::blocking::run(move || try_read_runner_result(&path)).await
+                {
+                    poll_done.cancel();
+                    return found;
+                }
+            }
+        });
+
+        // Drain both streams — required, an unread 64 KiB pipe blocks the
+        // child in `write()` forever. A plain loop, deliberately not raced
+        // against anything else in this task (see the poll task above).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut read_error: Option<std::io::Error> = None;
+        loop {
+            match reader.recv().await {
+                Ok(Some((proc_exec::StreamId::Stdout, bytes))) => stdout.extend_from_slice(&bytes),
+                Ok(Some((proc_exec::StreamId::Stderr, bytes))) => stderr.extend_from_slice(&bytes),
+                Ok(None) => break,
+                Err(e) => {
+                    read_error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        // The streams are closed — the process has exited, or `poll_task`
+        // already found the result and triggered the kill. Stop the
+        // poller (a no-op if it had already returned) and see whether it
+        // found anything; one more direct check covers the race where the
+        // result file appeared and EOF landed in the same instant the
+        // poller's next tick hadn't yet fired.
+        poll_task.abort();
+        let detection = match poll_task.await {
+            Ok(found) => Some(found),
+            Err(join_err) if join_err.is_cancelled() => None,
+            Err(join_err) => return Err(join_err).context("result-file poll task panicked"),
         };
-        // `proc_exec::output` itself errors (rather than returning a
-        // killed-but-`Ok` status) once its cancellable fires — confirmed
-        // live, not assumed. A deadline-triggered kill must be reported as
-        // a clear timeout, not the generic "cancelled" `io::Error` a real
-        // user cancellation would also produce through the same path —
-        // distinguished by checking the *original* `ctoken`, which the
-        // deadline branch never touches.
-        let output = match proc_exec::output(spec, &bounded).await {
-            Ok(output) => output,
-            Err(e) => {
+        let detection = detection.or_else(|| try_read_runner_result(&result_path));
+
+        if let Some(found) = detection {
+            // Either outcome means the runner is done as far as this driver
+            // is concerned — force it to exit now rather than trust its own
+            // teardown. A no-op if the process had already exited on its
+            // own (the common, well-behaved case).
+            done.cancel();
+            // Bounded by the composed cancellable (SIGINT → CANCEL_GRACE →
+            // SIGKILL); the outcome below never depends on how this
+            // resolves.
+            drop(wait.await);
+            return match found {
+                Ok(r) if r.success => Ok(()),
+                Ok(r) => anyhow::bail!(
+                    "js_test failed:\n{}",
+                    failure_detail_from_json(
+                        &r,
+                        &String::from_utf8_lossy(&stdout),
+                        &String::from_utf8_lossy(&stderr)
+                    )
+                ),
+                Err(msg) => anyhow::bail!("js_test: {msg}"),
+            };
+        }
+
+        // No structured result ever appeared — fall back to the plain
+        // exit-code-based verdict this driver always used.
+        let status = match wait.await {
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => {
                 if !ctoken.is_cancelled() && tokio::time::Instant::now() >= deadline {
                     anyhow::bail!(
-                        "js_test: test runner ({runner_bin:?}) did not exit within {}s and was \
-                         killed — this is a known vitest/jest failure mode (a failed \
-                         dependency-optimizer scan can leave a background service alive after \
-                         the test run itself finished); fix whatever the runner's own \
-                         diagnostics reported before this point, or disable its dependency \
-                         optimizer",
+                        "js_test: test runner ({runner_bin:?}) did not exit within {}s and \
+                         produced no usable result — this is a known vitest/jest failure mode \
+                         (a failed dependency-optimizer scan can leave a background service \
+                         alive after the test run itself finished); fix whatever the runner's \
+                         own diagnostics reported before this point, or disable its dependency \
+                         optimizer:\n{}",
                         RUNNER_TIMEOUT.as_secs(),
+                        test_failure_detail(
+                            &String::from_utf8_lossy(&stdout),
+                            &String::from_utf8_lossy(&stderr)
+                        ),
                     );
                 }
                 return Err(e).with_context(|| format!("wait for test runner ({runner_bin:?})"));
             }
+            Err(join_err) => {
+                return Err(join_err).context("test runner's wait task panicked");
+            }
         };
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // A genuine stream-read error (as opposed to plain EOF) with no
+        // usable result to fall back on must stay visible — surfacing it
+        // as a bare exit-code failure would silently shorten the captured
+        // output tail with no indication why.
+        if let Some(e) = read_error {
+            return Err(e).with_context(|| {
+                format!("reading output from test runner ({runner_bin:?}) while it was running")
+            });
+        }
+        if !status.success() {
             anyhow::bail!(
                 "js_test failed ({}):\n{}",
-                output.status,
-                test_failure_detail(&stdout, &stderr)
+                status,
+                test_failure_detail(
+                    &String::from_utf8_lossy(&stdout),
+                    &String::from_utf8_lossy(&stderr)
+                )
             );
         }
         Ok(())
@@ -1088,6 +1396,370 @@ mod tests {
         assert!(
             bounded.is_cancelled(),
             "the deadline must have been observed as elapsed"
+        );
+    }
+
+    /// Writes a fake runner script into `dir` that unconditionally drops
+    /// `body` at its top, ignoring whatever CLI args `run()` actually built
+    /// (it never reads `$@`) — matching how every other fake-runner test in
+    /// this module already stands in for vitest/jest.
+    fn write_fake_runner(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let script = dir.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write fake runner");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+        script
+    }
+
+    /// The bug report this mechanism exists to fix, reproduced exactly:
+    /// the runner finishes and reports success, then hangs (here: ignores
+    /// `SIGINT` and sleeps far past any reasonable budget, mirroring the
+    /// real "esbuild service left alive" trigger). `RUNNER_TIMEOUT` is 20
+    /// minutes — this asserts the target still completes in well under a
+    /// second past `CANCEL_GRACE`, proving the JSON-file detection is what
+    /// ended it, not the timeout backstop.
+    ///
+    /// `flavor = "multi_thread"`, not the default current-thread flavor:
+    /// production always runs multi-threaded (`bootstrap.rs`), and only
+    /// under that flavor does `OutputReader::recv`'s macOS backend take the
+    /// `block_in_place` path this mechanism's poll task must stay
+    /// responsive through — the same reason `proc_exec`'s own tests opt
+    /// into it wherever the macOS backend's behavior matters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_ends_promptly_once_the_result_file_appears_even_if_the_process_then_hangs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            "echo '{\"success\":true}' > .heph-js-test-result.json\ntrap '' INT\nsleep 100",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            driver().run(run_req, &ct),
+        )
+        .await
+        .expect(
+            "run() must return well within 15s — a hang here means completion is still \
+                 keyed off the process's own exit, not the result file",
+        );
+        let elapsed = started.elapsed();
+
+        result.expect(
+            "a runner reporting success=true must succeed, whatever the process does afterward",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "run() took {elapsed:?} — expected roughly one poll interval plus the ~2s SIGINT \
+             grace, nowhere near RUNNER_TIMEOUT",
+        );
+    }
+
+    /// Mirror of the success case: the runner reports `success: false` via
+    /// its structured result and then hangs. The failure and its detail
+    /// must come from that JSON, not from a generic "did not exit" timeout
+    /// message the user already rejected as insufficient.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_reports_the_json_failure_message_even_though_the_process_then_hangs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            "cat > .heph-js-test-result.json <<'EOF'\n\
+             {\"success\":false,\"testResults\":[{\"message\":\"AssertionError: expected 1 to be 2\"}]}\n\
+             EOF\ntrap '' INT\nsleep 100",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            driver().run(run_req, &ct),
+        )
+        .await
+        .expect("run() must return well within 15s");
+        let elapsed = started.elapsed();
+
+        let err = result
+            .err()
+            .expect("success=false in the structured result must fail the target");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("AssertionError: expected 1 to be 2"),
+            "expected the runner's own structured failure message, not a generic timeout: {msg}"
+        );
+        assert!(!msg.contains("did not exit within"), "{msg}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "run() took {elapsed:?} — expected roughly one poll interval plus the ~2s SIGINT \
+             grace, nowhere near RUNNER_TIMEOUT",
+        );
+    }
+
+    /// If the assumption behind `RunnerJsonResult`'s shape is ever wrong —
+    /// a runner version whose `--json`/`--reporter=json` output doesn't
+    /// carry `success` where expected — this must surface as a fast, named
+    /// diagnostic, never a silent mis-report of pass as fail (or the
+    /// reverse) and never another 20-minute wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_reports_a_malformed_result_file_diagnosably_rather_than_hanging() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            "echo '{\"unexpected\":\"shape\"}' > .heph-js-test-result.json\ntrap '' INT\nsleep 100",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            driver().run(run_req, &ct),
+        )
+        .await
+        .expect("run() must return well within 15s even for a malformed result file");
+        let elapsed = started.elapsed();
+
+        let err = result
+            .err()
+            .expect("a result file with no `success` field must fail the target, not pass it");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("expected shape"), "{msg}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "run() took {elapsed:?} — a malformed result file must still end the run promptly",
+        );
+    }
+
+    /// The headline claim of this whole mechanism — "the verdict comes from
+    /// the JSON, not the process's exit code" — proven for the *ordinary*
+    /// case: a runner that writes the result file and then exits
+    /// immediately (no hang), with a `success: false` verdict directly
+    /// contradicting its own `exit 0`. Every other test in this module has
+    /// the runner hang after writing the file, which only exercises the
+    /// in-loop `poll.tick()` detection branch — this one exercises the
+    /// separate post-EOF fallback check, the path an ordinary, well-behaved
+    /// run actually takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_uses_the_json_verdict_over_a_contradicting_zero_exit_code() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            "echo '{\"success\":false,\"testResults\":[{\"message\":\"boom\"}]}' > \
+             .heph-js-test-result.json\nexit 0",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        let err = driver().run(run_req, &ct).await.err().expect(
+            "success=false in the JSON must fail the target even though the process exited 0",
+        );
+        assert!(format!("{err:#}").contains("boom"));
+    }
+
+    /// The mirror case: `success: true` in the JSON, but the process itself
+    /// exits non-zero (e.g. a runner whose own exit code is unreliable, or
+    /// a post-report crash unrelated to the tests themselves). The target
+    /// must still succeed — the JSON, once present, is authoritative in
+    /// both directions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_uses_the_json_verdict_over_a_contradicting_nonzero_exit_code() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            "echo '{\"success\":true}' > .heph-js-test-result.json\nexit 1",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        driver().run(run_req, &ct).await.expect(
+            "success=true in the JSON must pass the target even though the process exited \
+             non-zero",
+        );
+    }
+
+    /// A stale result file left behind by an earlier attempt in a reused
+    /// sandbox path must never be mistaken for the *current* run's
+    /// verdict — the whole reason `exec_runner` removes it up front. This
+    /// pre-seeds exactly that file with the opposite verdict from what the
+    /// current (slower) runner will actually report, so the test would
+    /// spuriously pass almost instantly if the stale-file guard were ever
+    /// removed or the result path miscomputed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_ignores_a_stale_result_file_left_by_a_previous_invocation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(dir.path(), "fake-vitest.sh", "sleep 0.3\nexit 1");
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        std::fs::write(pkg_dir.join(RESULT_FILE_NAME), "{\"success\":true}")
+            .expect("seed stale result file");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        let err = driver().run(run_req, &ct).await.err().expect(
+            "a stale success=true file from a previous run must not mask this run's own failure",
+        );
+        assert!(
+            format!("{err:#}").contains("js_test failed"),
+            "expected the exit-code-based failure path (no fresh result file was written), got: \
+             {err:#}"
+        );
+    }
+
+    /// `run()`'s jest branch (`--json --outputFile=<path>` insertion) has
+    /// its own argument-building code path, entirely separate from
+    /// vitest's — every other test in this module defaults to vitest (see
+    /// `config()`), so nothing else here proves jest's args are
+    /// well-formed or that detection works for it at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_detects_completion_via_the_result_file_for_jest_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-jest.sh",
+            "echo '{\"success\":true}' > .heph-js-test-result.json\ntrap '' INT\nsleep 100",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[
+            ("testrunner", Value::String("jest".to_string())),
+            (
+                "runner_bin",
+                Value::String(fake_runner.to_string_lossy().into_owned()),
+            ),
+        ]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            driver().run(run_req, &ct),
+        )
+        .await
+        .expect("run() must return well within 15s for jest too");
+        let elapsed = started.elapsed();
+
+        result.expect("a jest runner reporting success=true must succeed");
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "run() took {elapsed:?} — jest's detection must be just as prompt as vitest's",
         );
     }
 
