@@ -1247,23 +1247,24 @@ impl Provider {
         let arch = platform::current_arch();
 
         hcore::blocking::run(move || -> anyhow::Result<HashMap<String, Value>> {
-            let (deps, runner_config_path, runner_config_content) = test_deps_config(
-                &workspace_root,
-                &pkg_str,
-                &lockfile_pkg,
-                &test_file_rel,
-                &graph,
-                lockfile.as_deref(),
-                resolved_graph.as_deref(),
-                &member_addrs_by_name,
-                &os,
-                &arch,
-                &testrunner,
-                runner_config_candidates(&testrunner)?,
-            )
-            .with_context(|| {
-                format!("building js_test inputs for {pkg_str:?} test file {test_file_rel:?}")
-            })?;
+            let (deps, runner_config_path, runner_config_content, tsconfig_path, tsconfig_content) =
+                test_deps_config(
+                    &workspace_root,
+                    &pkg_str,
+                    &lockfile_pkg,
+                    &test_file_rel,
+                    &graph,
+                    lockfile.as_deref(),
+                    resolved_graph.as_deref(),
+                    &member_addrs_by_name,
+                    &os,
+                    &arch,
+                    &testrunner,
+                    runner_config_candidates(&testrunner)?,
+                )
+                .with_context(|| {
+                    format!("building js_test inputs for {pkg_str:?} test file {test_file_rel:?}")
+                })?;
 
             let mut config: HashMap<String, Value> = HashMap::new();
             config.insert("testrunner".to_string(), Value::String(testrunner));
@@ -1277,6 +1278,11 @@ impl Provider {
             config.insert(
                 "runner_config_content".to_string(),
                 Value::String(runner_config_content),
+            );
+            config.insert("tsconfig_path".to_string(), Value::String(tsconfig_path));
+            config.insert(
+                "tsconfig_content".to_string(),
+                Value::String(tsconfig_content),
             );
             config.insert("deps".to_string(), Value::Map(deps));
             Ok(config)
@@ -3040,24 +3046,20 @@ fn path_under_package(package: &str, path: &str) -> bool {
 /// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`os`/`arch` mirror
 /// `typecheck_deps_config`'s identically-named parameters.
 ///
-/// **Known scope trim, disclosed rather than silent — and a real gap, not
-/// merely a narrower one**: the tsconfig that shaped how `graph` resolved
-/// `paths`/`baseUrl`/`extends`-aware specifiers is not declared as its own
-/// `js_test` Input, nor hashed, the way `js_typecheck`'s
-/// `"tsconfig"`/`tsconfig_content` pair is. It is tempting to reason that
-/// `js_test` runs source directly (not through `tsc`) so this only affects
-/// import *resolution*, not behavior — but that reasoning is wrong: the
-/// recommended default runner, vitest, transforms TS via Vite's
-/// esbuild-based transform, which reads the nearest `tsconfig.json` itself at
-/// transform time for options
-/// (`jsx`/`jsxFactory`/`target`/`useDefineForClassFields`/
-/// `experimentalDecorators`) that change the *emitted, executed* JS — not
-/// just which file a specifier resolves to. Toggling one of those between
-/// two commits, with the resolved import/closure addr set unchanged, is
-/// silently invisible to this target's cache key today (M4 hermeticity
-/// review). Accepted as a known trim for this milestone rather than fixed —
-/// mirroring `js_typecheck`'s `tsconfig_content` fix is the natural
-/// follow-up. TODO M4+.
+/// The tsconfig that shapes how `graph` resolved `paths`/`baseUrl`/
+/// `extends`-aware specifiers is declared as its own `js_test` Input under
+/// `"tsconfig"`, and its content hashed directly, mirroring `js_typecheck`'s
+/// `"tsconfig"`/`tsconfig_content` pair exactly (fixed M4, confirmed live: a
+/// `paths` alias like `@/*` failed to resolve at runtime — a real
+/// `tsconfig-paths`-style Vite plugin reads `tsconfig.json` directly and had
+/// nothing to read, even though the aliased file itself was correctly
+/// staged via the first-party closure). This also closes the narrower gap
+/// the same fix closes for `js_typecheck`: vitest transforms TS via Vite's
+/// esbuild-based transform, which reads the nearest `tsconfig.json` itself
+/// at transform time for options (`jsx`/`jsxFactory`/`target`/
+/// `useDefineForClassFields`/`experimentalDecorators`) that change the
+/// *emitted, executed* JS, not just specifier resolution — those are now
+/// part of the cache key too.
 /// Query-language pattern selecting exactly the package `pkg` (`//` for root).
 fn js_pkg_pattern(pkg: &str) -> String {
     format!("//{pkg}")
@@ -3153,6 +3155,10 @@ fn js_src_query_addr(pkg: &str) -> Addr {
     hplugin_query::pluginquery::query_addr(&expr, "", &["js"])
 }
 
+/// `test_deps_config`'s return: `(deps, runner_config_path,
+/// runner_config_content, tsconfig_path, tsconfig_content)`.
+type TestDepsConfig = (HashMap<String, Value>, String, String, String, String);
+
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors typecheck_deps_config's own lockfile/graph/member/platform parameter set, \
@@ -3172,7 +3178,7 @@ fn test_deps_config(
     arch: &str,
     testrunner: &str,
     runner_config_candidates: &[&str],
-) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
+) -> anyhow::Result<TestDepsConfig> {
     let pkg_dir = if pkg.is_empty() {
         workspace_root.to_path_buf()
     } else {
@@ -3188,6 +3194,53 @@ fn test_deps_config(
     let canonical_root = workspace_root
         .canonicalize()
         .with_context(|| format!("canonicalize workspace root {workspace_root:?}"))?;
+
+    // The resolved tsconfig (if any) and its whole `extends` chain, staged
+    // into the sandbox under `"tsconfig"` below and hashed directly —
+    // mirrors `typecheck_deps_config`'s identical handling exactly (see that
+    // function's doc). Not merely a cache-key nicety: vitest transforms TS
+    // via Vite's own esbuild-based transform, and a `tsconfig-paths`-style
+    // Vite plugin reads `tsconfig.json` directly, at runtime, inside the
+    // sandbox — heph's own import-graph resolver already uses this same
+    // tsconfig to resolve a `paths`-aliased specifier (e.g. `@/gqlv3`) into
+    // a concrete first-party file, correctly declaring and staging *that*
+    // file, but that resolution happens on the host and never told Vite
+    // anything — without the tsconfig file itself physically present, Vite's
+    // own alias resolution has nothing to read and the import fails to
+    // resolve even though the target file is right there in the sandbox
+    // (confirmed live: exactly this symptom, M4 review).
+    let tsconfig = importgraph::find_nearest_tsconfig(workspace_root, &pkg_dir);
+    let (tsconfig_path_rel, mut tsconfig_content) = match &tsconfig {
+        Some(p) => {
+            let rel = p
+                .strip_prefix(workspace_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content =
+                std::fs::read_to_string(p).with_context(|| format!("reading tsconfig {p:?}"))?;
+            (rel, content)
+        }
+        None => (String::new(), String::new()),
+    };
+    let mut tsconfig_rel: BTreeSet<String> = BTreeSet::new();
+    if let Some(leaf) = &tsconfig {
+        tsconfig_rel.insert(tsconfig_path_rel.clone());
+        let chain = importgraph::resolve_tsconfig_extends_chain(&canonical_root, leaf)
+            .with_context(|| format!("resolving tsconfig extends chain for {pkg:?}"))?;
+        for ancestor in &chain {
+            let rel = ancestor
+                .strip_prefix(&canonical_root)
+                .unwrap_or(ancestor)
+                .to_string_lossy()
+                .replace('\\', "/");
+            tsconfig_rel.insert(rel);
+            let content = std::fs::read_to_string(ancestor)
+                .with_context(|| format!("reading extended tsconfig {ancestor:?}"))?;
+            tsconfig_content.push('\n');
+            tsconfig_content.push_str(&content);
+        }
+    }
 
     // Dedicated filenames first (`vitest.config.*`/`vite.config.*`, or
     // `jest.config.*`); jest's other documented config location —
@@ -3436,8 +3489,25 @@ fn test_deps_config(
         "codegen".to_string(),
         Value::List(vec![Value::String(js_src_query_addr(pkg).format())]),
     );
+    if !tsconfig_rel.is_empty() {
+        deps.insert(
+            "tsconfig".to_string(),
+            Value::List(
+                tsconfig_rel
+                    .iter()
+                    .map(|p| Value::String(hbuiltins::pluginfs::file_addr(p).format()))
+                    .collect(),
+            ),
+        );
+    }
 
-    Ok((deps, runner_config_path_rel, runner_config_content))
+    Ok((
+        deps,
+        runner_config_path_rel,
+        runner_config_content,
+        tsconfig_path_rel,
+        tsconfig_content,
+    ))
 }
 
 /// Candidate config filenames for `linter`'s ancestor-chain walk (see
@@ -8302,7 +8372,7 @@ snapshots:
         workspace_root: &Path,
         pkg: &str,
         test_file_rel: &str,
-    ) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
+    ) -> anyhow::Result<TestDepsConfig> {
         let graph = build_graph_for_test(walker, workspace_root, pkg);
         test_deps_config(
             workspace_root,
@@ -8343,14 +8413,14 @@ snapshots:
         );
 
         let walker = CachedWalker::disabled();
-        let (deps_a, _, _) = call_test_deps_config(
+        let (deps_a, _, _, _, _) = call_test_deps_config(
             &walker,
             dir.path(),
             "packages/a",
             "packages/a/src/a.test.ts",
         )
         .expect("build test deps config for a.test.ts");
-        let (deps_b, _, _) = call_test_deps_config(
+        let (deps_b, _, _, _, _) = call_test_deps_config(
             &walker,
             dir.path(),
             "packages/a",
@@ -8415,7 +8485,7 @@ snapshots:
         );
 
         let walker = CachedWalker::disabled();
-        let (deps, _, _) = call_test_deps_config(
+        let (deps, _, _, _, _) = call_test_deps_config(
             &walker,
             dir.path(),
             "packages/a",
@@ -8454,7 +8524,7 @@ snapshots:
         );
 
         let walker = CachedWalker::disabled();
-        let (deps, runner_config_path, runner_config_content) = call_test_deps_config(
+        let (deps, runner_config_path, runner_config_content, _, _) = call_test_deps_config(
             &walker,
             dir.path(),
             "packages/a",
@@ -8480,7 +8550,7 @@ snapshots:
         );
 
         let walker = CachedWalker::disabled();
-        let (deps, runner_config_path, runner_config_content) = call_test_deps_config(
+        let (deps, runner_config_path, runner_config_content, _, _) = call_test_deps_config(
             &walker,
             dir.path(),
             "packages/a",
@@ -8491,6 +8561,131 @@ snapshots:
         assert!(runner_config_path.is_empty());
         assert!(runner_config_content.is_empty());
         assert!(!deps.contains_key("runner_config"));
+    }
+
+    /// M4 review finding, confirmed live against a real repo: `js_test` used
+    /// to build its import graph against the package's tsconfig (so a
+    /// `paths`-aliased import resolved correctly into a declared, staged
+    /// first-party file) but never declared the tsconfig *itself* as an
+    /// Input — so it was never staged into the sandbox at all, and a real
+    /// `tsconfig-paths`-style Vite plugin (which reads `tsconfig.json`
+    /// directly, at runtime) had nothing to read: the aliased import failed
+    /// to resolve even though the target file was correctly present.
+    /// Mirrors `typecheck_deps_config_includes_tsconfig_group_and_content_
+    /// when_present` exactly — same mechanism, same test shape.
+    #[test]
+    fn test_deps_config_includes_tsconfig_group_and_content_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/tsconfig.json",
+            r#"{"compilerOptions":{"strict":true}}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _, _, tsconfig_path, tsconfig_content) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        assert_eq!(tsconfig_path, "packages/a/tsconfig.json");
+        assert_eq!(tsconfig_content, r#"{"compilerOptions":{"strict":true}}"#);
+        let tsconfig_addrs = dep_addrs(&deps, "tsconfig");
+        assert_eq!(tsconfig_addrs.len(), 1);
+        assert!(tsconfig_addrs[0].contains("packages/a/tsconfig.json"));
+    }
+
+    #[test]
+    fn test_deps_config_no_tsconfig_group_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _, _, tsconfig_path, tsconfig_content) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config with no tsconfig.json");
+
+        assert!(tsconfig_path.is_empty());
+        assert!(tsconfig_content.is_empty());
+        assert!(!deps.contains_key("tsconfig"));
+    }
+
+    /// The `extends` chain must be declared and hashed too — `tsc`/Vite's
+    /// own tsconfig resolution merges an ancestor's `compilerOptions`
+    /// (including `paths`) into the effective config, so a `paths` alias
+    /// declared only in the *extended* file must still be readable by a
+    /// runtime tsconfig-paths resolver, and an edit to it must still bust
+    /// the cache. Mirrors `typecheck_deps_config_declares_and_hashes_
+    /// tsconfig_extends_chain`.
+    #[test]
+    fn test_deps_config_declares_and_hashes_tsconfig_extends_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"paths":{"@/*":["src/*"]}}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/tsconfig.json",
+            r#"{"extends":"../../tsconfig.base.json","compilerOptions":{"strict":true}}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _, _, tsconfig_path, tsconfig_content) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        assert_eq!(tsconfig_path, "packages/a/tsconfig.json");
+        assert!(tsconfig_content.contains("strict"));
+        assert!(
+            tsconfig_content.contains("paths"),
+            "the extended base config's content must be folded in too: {tsconfig_content}"
+        );
+        let tsconfig_addrs = dep_addrs(&deps, "tsconfig");
+        assert_eq!(
+            tsconfig_addrs.len(),
+            2,
+            "the leaf and its one extended ancestor"
+        );
+        assert!(
+            tsconfig_addrs
+                .iter()
+                .any(|a| a.contains("packages/a/tsconfig.json"))
+        );
+        assert!(
+            tsconfig_addrs
+                .iter()
+                .any(|a| a.contains("tsconfig.base.json"))
+        );
     }
 
     /// The completeness gap beyond direct imports: `a`'s test file only
@@ -8538,7 +8733,7 @@ snapshots:
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
-        let (deps, _, _) = test_deps_config(
+        let (deps, _, _, _, _) = test_deps_config(
             dir.path(),
             "packages/a",
             "packages/a",
@@ -8638,7 +8833,7 @@ snapshots:
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
-        let (deps, _, _) = test_deps_config(
+        let (deps, _, _, _, _) = test_deps_config(
             dir.path(),
             "packages/a",
             "packages/a",
@@ -8708,7 +8903,7 @@ snapshots:
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
-        let (deps, _, _) = test_deps_config(
+        let (deps, _, _, _, _) = test_deps_config(
             dir.path(),
             "packages/a",
             "packages/a",
@@ -8791,7 +8986,7 @@ snapshots:
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
-        let (deps, _, _) = test_deps_config(
+        let (deps, _, _, _, _) = test_deps_config(
             dir.path(),
             "packages/a",
             "packages/a",
@@ -9147,7 +9342,7 @@ snapshots:
         );
 
         let walker = CachedWalker::disabled();
-        let (_, runner_config_path, runner_config_content) = call_test_deps_config(
+        let (_, runner_config_path, runner_config_content, _, _) = call_test_deps_config(
             &walker,
             dir.path(),
             "packages/a",
@@ -9176,7 +9371,7 @@ snapshots:
 
         let walker = CachedWalker::disabled();
         let graph = build_graph_for_test(&walker, dir.path(), "packages/a");
-        let (deps, runner_config_path, runner_config_content) = test_deps_config(
+        let (deps, runner_config_path, runner_config_content, _, _) = test_deps_config(
             dir.path(),
             "packages/a",
             "packages/a",
@@ -9220,7 +9415,7 @@ snapshots:
         );
 
         let walker = CachedWalker::disabled();
-        let (deps, _, _) = call_test_deps_config(
+        let (deps, _, _, _, _) = call_test_deps_config(
             &walker,
             dir.path(),
             "packages/a",
@@ -9265,7 +9460,7 @@ snapshots:
         );
 
         let walker = CachedWalker::disabled();
-        let (deps, _, _) = call_test_deps_config(
+        let (deps, _, _, _, _) = call_test_deps_config(
             &walker,
             dir.path(),
             "packages/a",
@@ -9383,7 +9578,7 @@ snapshots:
         let walker = CachedWalker::disabled();
         let expected = js_src_query_addr("packages/a").format();
 
-        let (test_deps, _, _) = call_test_deps_config(
+        let (test_deps, _, _, _, _) = call_test_deps_config(
             &walker,
             dir.path(),
             "packages/a",
