@@ -742,7 +742,7 @@ impl JsTestDriver {
         let mut reader = handle
             .take_output()
             .context("test runner spawned with neither stdout nor stderr piped")?;
-        let wait = handle.spawn_wait(bounded);
+        let mut wait = handle.spawn_wait(bounded);
 
         // Poll for the runner's own completion signal on a *separate* task
         // from the one draining stdout/stderr below — never a `select!`
@@ -776,29 +776,75 @@ impl JsTestDriver {
         });
 
         // Drain both streams — required, an unread 64 KiB pipe blocks the
-        // child in `write()` forever. A plain loop, deliberately not raced
-        // against anything else in this task (see the poll task above).
+        // child in `write()` forever — raced against the child being
+        // reaped, mirroring `proc_exec::output()`'s own structure and for
+        // the identical reason: this driver always spawns with `setsid:
+        // false` (matching a real vitest/jest invocation, never made a
+        // session leader), so `killpg` cannot reach a descendant the
+        // runner backgrounds that inherits its stdout/stderr — vitest's
+        // dependency-optimizer esbuild service is exactly this. Killing
+        // the direct child does not close that descendant's copy of the
+        // write end, so an *unbounded* drain here would just trade the
+        // original "process never exits" hang for "the drain never
+        // reaches EOF" — the same symptom, reached through the new
+        // mechanism instead of the old one (confirmed live: this is
+        // exactly what the first version of this fix did, and it still
+        // hung). `DRAIN_DEADLINE` bounds it exactly as it already bounds
+        // `output()`'s identical situation.
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut read_error: Option<std::io::Error> = None;
-        loop {
-            match reader.recv().await {
-                Ok(Some((proc_exec::StreamId::Stdout, bytes))) => stdout.extend_from_slice(&bytes),
-                Ok(Some((proc_exec::StreamId::Stderr, bytes))) => stderr.extend_from_slice(&bytes),
-                Ok(None) => break,
-                Err(e) => {
-                    read_error = Some(e);
-                    break;
+        // Scoped so the pinned `drain` future — which mutably borrows
+        // `stdout`/`stderr`/`read_error` for as long as it's alive — is
+        // dropped before those are read again below.
+        let wait_outcome = {
+            let drain = async {
+                loop {
+                    match reader.recv().await {
+                        Ok(Some((proc_exec::StreamId::Stdout, bytes))) => {
+                            stdout.extend_from_slice(&bytes);
+                        }
+                        Ok(Some((proc_exec::StreamId::Stderr, bytes))) => {
+                            stderr.extend_from_slice(&bytes);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            read_error = Some(e);
+                            break;
+                        }
+                    }
                 }
+            };
+            tokio::pin!(drain);
+            // The drain reaching EOF does not end the wait, and the wait
+            // ending does not (yet) end the drain — whichever lands first,
+            // we keep polling the other.
+            let mut all_drained = false;
+            let wait_outcome = loop {
+                tokio::select! {
+                    () = &mut drain, if !all_drained => all_drained = true,
+                    res = &mut wait => break res,
+                }
+            };
+            if !all_drained
+                && tokio::time::timeout(proc_exec::DRAIN_DEADLINE, &mut drain)
+                    .await
+                    .is_err()
+            {
+                tracing::warn!(
+                    deadline_ms = proc_exec::DRAIN_DEADLINE.as_millis(),
+                    "js_test: stdout/stderr drain did not reach EOF after the test runner was \
+                     reaped — a descendant it spawned likely inherited the pipe; using whatever \
+                     was captured so far",
+                );
             }
-        }
+            wait_outcome
+        };
 
-        // The streams are closed — the process has exited, or `poll_task`
-        // already found the result and triggered the kill. Stop the
-        // poller (a no-op if it had already returned) and see whether it
-        // found anything; one more direct check covers the race where the
-        // result file appeared and EOF landed in the same instant the
-        // poller's next tick hadn't yet fired.
+        // The child is reaped either way now. Stop the poller (a no-op if
+        // it had already returned) and see whether it found anything; one
+        // more direct check covers the race where the result file appeared
+        // in the same instant the poller's next tick hadn't yet fired.
         poll_task.abort();
         let detection = match poll_task.await {
             Ok(found) => Some(found),
@@ -808,15 +854,6 @@ impl JsTestDriver {
         let detection = detection.or_else(|| try_read_runner_result(&result_path));
 
         if let Some(found) = detection {
-            // Either outcome means the runner is done as far as this driver
-            // is concerned — force it to exit now rather than trust its own
-            // teardown. A no-op if the process had already exited on its
-            // own (the common, well-behaved case).
-            done.cancel();
-            // Bounded by the composed cancellable (SIGINT → CANCEL_GRACE →
-            // SIGKILL); the outcome below never depends on how this
-            // resolves.
-            drop(wait.await);
             return match found {
                 Ok(r) if r.success => Ok(()),
                 Ok(r) => anyhow::bail!(
@@ -833,7 +870,7 @@ impl JsTestDriver {
 
         // No structured result ever appeared — fall back to the plain
         // exit-code-based verdict this driver always used.
-        let status = match wait.await {
+        let status = match wait_outcome {
             Ok(Ok(status)) => status,
             Ok(Err(e)) => {
                 if !ctoken.is_cancelled() && tokio::time::Instant::now() >= deadline {
@@ -1476,6 +1513,69 @@ mod tests {
             elapsed < std::time::Duration::from_secs(8),
             "run() took {elapsed:?} — expected roughly one poll interval plus the ~2s SIGINT \
              grace, nowhere near RUNNER_TIMEOUT",
+        );
+    }
+
+    /// The real bug this mechanism actually shipped with, caught by CI and
+    /// by a real-world report — not by any test written before this one.
+    /// This driver always spawns with `setsid: false` (matching a real
+    /// vitest/jest invocation), so `killpg` can never reach a descendant
+    /// the runner backgrounds that inherits its stdout/stderr — exactly
+    /// what vitest's own dependency-optimizer esbuild service does. The
+    /// first version of this fix drained stdout/stderr in a plain unbounded
+    /// loop; once the direct child exited (or was killed), a backgrounded
+    /// descendant still holding the pipe's write end open made the drain
+    /// wait for an EOF that was never coming — trading the original
+    /// "process never exits" hang for the identical symptom reached through
+    /// the new mechanism instead of the old one. This reproduces that shape
+    /// directly: the runner writes the result file, backgrounds a
+    /// long-lived descendant that inherits the pipe, and exits normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_ends_promptly_when_a_backgrounded_descendant_still_holds_the_pipe_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            "echo '{\"success\":true}' > .heph-js-test-result.json\n( sleep 30 ) &\nexit 0",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            driver().run(run_req, &ct),
+        )
+        .await
+        .expect(
+            "run() must return well within 15s — a hang here means the drain is waiting on a \
+             backgrounded descendant's pipe instead of being bounded by DRAIN_DEADLINE",
+        );
+        let elapsed = started.elapsed();
+
+        result.expect(
+            "a runner reporting success=true must succeed regardless of a lingering descendant",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "run() took {elapsed:?} — the drain must be bounded by DRAIN_DEADLINE (500ms), not \
+             wait on the backgrounded sleep",
         );
     }
 
