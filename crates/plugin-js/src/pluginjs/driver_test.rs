@@ -42,23 +42,30 @@
 //! / `importgraph::find_nearest_jest_package_json_config`), plus every
 //! additional file that config's own content names or imports, recursively
 //! (`importgraph::resolve_runner_config_referenced_files`), plus the queried
-//! runner version. See `provider.rs`'s `test_deps_config` for the pure,
-//! runner-free Input-scoping function this driver's `deps`/`test_file` config
-//! comes from — deliberately split out the same way `typecheck_deps_config`
-//! is, so the per-test-file scoping is unit-testable without a real
-//! `vitest`/`jest` binary (this is the task's "single most important test in
-//! this milestone").
+//! runner version, plus the resolved tsconfig (the package's own, or the
+//! nearest scoped ancestor's) and its whole `extends` chain, if any —
+//! mirroring `js_typecheck`'s identical `"tsconfig"` group (fixed M4,
+//! confirmed live: without it staged, a real `tsconfig-paths`-style Vite
+//! plugin has no `tsconfig.json` to read at runtime, so a `paths` alias
+//! like `@/*` fails to resolve even though the aliased file itself is
+//! correctly staged via the closure above). See `provider.rs`'s
+//! `test_deps_config` for the pure, runner-free Input-scoping function this
+//! driver's `deps`/`test_file` config comes from — deliberately split out
+//! the same way `typecheck_deps_config` is, so the per-test-file scoping is
+//! unit-testable without a real `vitest`/`jest` binary (this is the task's
+//! "single most important test in this milestone").
 //!
 //! Beyond the declared `Input`s (content-hashed automatically by the
 //! engine), [`JsTestDef::hash`] additionally hashes `test_file` itself (so
 //! *which* test file this target is for is part of the key, not just its
 //! transitive content — two different test files with byte-identical
 //! closures must still be different cache entries), `runner_config_content`
-//! directly (same deliberate redundancy with its declared Input that
-//! `js_typecheck`'s `tsconfig_content` has — see that struct's doc), and
-//! `runner_version`. `runner_bin` (an absolute host path) is deliberately
-//! **excluded**, mirroring `tsc_bin`'s exclusion — see that field's doc in
-//! `driver_typecheck.rs` for the identical cache-portability rationale.
+//! and `tsconfig_content` directly (same deliberate redundancy with their
+//! declared Inputs that `js_typecheck`'s `tsconfig_content` has — see that
+//! struct's doc), and `runner_version`. `runner_bin` (an absolute host
+//! path) is deliberately **excluded**, mirroring `tsc_bin`'s exclusion —
+//! see that field's doc in `driver_typecheck.rs` for the identical
+//! cache-portability rationale.
 //!
 //! **Known scope trim, disclosed rather than silent**: `build_test_closure`
 //! only recurses within the *owning package's* own import graph — a file
@@ -215,6 +222,22 @@ struct JsTestSpec {
     /// module docs' "Inputs / cache key" section for why this is not purely
     /// redundant with the declared `"runner_config"` dep group.
     runner_config_content: String,
+    /// Workspace-root-relative path to the tsconfig in effect for this
+    /// package (the package's own, or the nearest ancestor's — see
+    /// `importgraph::find_nearest_tsconfig`), or empty when none exists on
+    /// the ancestor chain. Mirrors `js_typecheck`'s identically-named field.
+    tsconfig_path: String,
+    /// The resolved tsconfig's own raw bytes (plus its whole `extends`
+    /// chain), hashed directly — same deliberate redundancy with the
+    /// declared `"tsconfig"` dep group that `runner_config_content` has with
+    /// `"runner_config"`. Not merely a cache-key nicety here: vitest
+    /// transforms TS via Vite's own esbuild-based transform, and a
+    /// `tsconfig-paths`-style Vite plugin reads `tsconfig.json` directly at
+    /// runtime — without it staged into the sandbox at all, a `paths` alias
+    /// (`@/*`) fails to resolve even though the aliased file itself is
+    /// correctly staged via the `""` closure group (confirmed live, M4
+    /// review: this was a real, shipped gap, not a hypothetical one).
+    tsconfig_content: String,
     /// Dependencies, grouped by name → target addresses: `""` = the test
     /// file's own runtime-transitive first-party closure (always includes
     /// the test file itself), `"external"` = every file that closure reaches
@@ -226,7 +249,8 @@ struct JsTestSpec {
     /// `globalTeardown`) or imports (a relative `import`/`require` of a
     /// shared base config), recursively — see
     /// `importgraph::resolve_runner_config_referenced_files` and module
-    /// docs' "Inputs / cache key" section.
+    /// docs' "Inputs / cache key" section, `"tsconfig"` = the resolved
+    /// tsconfig file and its whole `extends` chain.
     deps: HashMap<String, Vec<String>>,
 }
 
@@ -237,6 +261,8 @@ struct JsTestDef {
     test_file: String,
     runner_config_path: String,
     runner_config_content: String,
+    tsconfig_path: String,
+    tsconfig_content: String,
     /// Absolute host runner path — carried through so `run()` can exec it,
     /// but see `Hash` impl below: deliberately excluded from the cache key.
     runner_bin: String,
@@ -253,7 +279,14 @@ struct JsTestDef {
 /// designed by their respective tools to be additive/non-invasive, but a
 /// cached result from before this change never actually ran with them, so a
 /// stale cache hit must not stand in for having done so.
-const JS_TEST_FORMAT_VERSION: u32 = 2;
+///
+/// `3`: added `tsconfig_path`/`tsconfig_content` and the `"tsconfig"` dep
+/// group — a resolved tsconfig previously wasn't declared as an Input at
+/// all, so it was never staged into the sandbox; a cached result from
+/// before this change ran without it physically present, which a real
+/// `tsconfig-paths`-style Vite plugin depends on to resolve `paths`
+/// aliases (confirmed live, M4 review).
+const JS_TEST_FORMAT_VERSION: u32 = 3;
 
 impl Hash for JsTestDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -263,6 +296,8 @@ impl Hash for JsTestDef {
         self.test_file.hash(state);
         self.runner_config_path.hash(state);
         self.runner_config_content.hash(state);
+        self.tsconfig_path.hash(state);
+        self.tsconfig_content.hash(state);
         // `runner_bin` is deliberately NOT hashed — an absolute host
         // filesystem path that differs across machines/checkouts for the
         // exact same effective toolchain; see `JsTypecheckDef::hash`'s
@@ -344,6 +379,8 @@ impl ManagedDriver for JsTestDriver {
             test_file: spec.test_file,
             runner_config_path: spec.runner_config_path,
             runner_config_content: spec.runner_config_content,
+            tsconfig_path: spec.tsconfig_path,
+            tsconfig_content: spec.tsconfig_content,
             runner_bin: spec.runner_bin,
         };
 
@@ -1118,6 +1155,26 @@ mod tests {
                 make_parse_request(&[(
                     "runner_config_content",
                     Value::String("export default { test: {} };".to_string()),
+                )]),
+                &ct,
+            )
+            .await
+            .unwrap();
+        assert_ne!(a.target_def.hash, b.target_def.hash);
+    }
+
+    /// Same requirement as `runner_config_content` above, for the tsconfig
+    /// that shapes how a `paths` alias (`@/*`) resolves — see this module's
+    /// doc note on `JS_TEST_FORMAT_VERSION = 3`.
+    #[tokio::test]
+    async fn parse_hash_changes_when_tsconfig_content_changes() {
+        let ct = ctoken();
+        let a = driver().parse(make_parse_request(&[]), &ct).await.unwrap();
+        let b = driver()
+            .parse(
+                make_parse_request(&[(
+                    "tsconfig_content",
+                    Value::String(r#"{"compilerOptions":{"strict":true}}"#.to_string()),
                 )]),
                 &ct,
             )
