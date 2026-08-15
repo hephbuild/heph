@@ -315,3 +315,40 @@ async fn cache_history_is_enforced_by_the_end_of_the_run() -> anyhow::Result<()>
     }
     Ok(())
 }
+
+/// A pipeline whose *producer* fails must fail the target. Without `-o
+/// pipefail` the status is the last stage's — `cat`'s 0 — so the run
+/// "succeeds" and the engine caches a revision for a build that failed. This
+/// is why the shell drivers are `bash` and not POSIX `sh`, which has no
+/// portable pipefail (dash rejects the option outright).
+#[tokio::test]
+async fn pipeline_producer_failure_fails_the_target() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "pipe",
+        r#"target(name = "t", driver = "bash", run = "echo before\n(echo x; exit 1) | cat")"#,
+    );
+    let r = ws.run("//pipe:t").await;
+    assert!(
+        r.is_err(),
+        "a failing pipeline producer must fail the target"
+    );
+    Ok(())
+}
+
+/// `driver = "sh"` is gone: a target naming it must fail to resolve, not
+/// silently fall back to another shell.
+#[tokio::test]
+async fn sh_driver_no_longer_exists() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("gone", r#"target(name = "t", driver = "sh", run = "true")"#);
+    let err = match ws.run("//gone:t").await {
+        Ok(_) => panic!("expected `sh` to be an unknown driver"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("driver not found: sh"),
+        "error must name the missing driver, got: {err}"
+    );
+    Ok(())
+}

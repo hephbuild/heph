@@ -205,7 +205,7 @@ pub fn build_spec(
 
     TargetSpec {
         addr,
-        driver: "sh".to_string(),
+        driver: "bash".to_string(),
         config,
         labels: vec!["go-build".to_string()],
         ..Default::default()
@@ -346,7 +346,7 @@ mod tests {
             run.contains("@heph/go/std/goroot/pkg/linux_amd64/fmt.a"),
             "build_lib must mv the archive from the install output: {run}"
         );
-        assert_eq!(spec.driver, "sh");
+        assert_eq!(spec.driver, "bash");
     }
 
     #[test]

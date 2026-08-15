@@ -144,7 +144,7 @@ pub fn build_spec(
 
     TargetSpec {
         addr,
-        driver: "sh".to_string(),
+        driver: "bash".to_string(),
         config,
         ..Default::default()
     }
@@ -234,7 +234,7 @@ mod tests {
             &LinkConfig::default(),
             V,
         );
-        assert_eq!(spec.driver, "sh");
+        assert_eq!(spec.driver, "bash");
     }
 
     #[test]

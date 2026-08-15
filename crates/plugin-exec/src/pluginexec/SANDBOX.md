@@ -72,6 +72,12 @@ Commands are joined with newlines and passed to `bash` with:
 - `-e` — exit on first error
 - `-o pipefail` — pipeline fails if any stage fails
 
+There is deliberately no POSIX `sh` mode. `pipefail` is not in POSIX.1-2017 and
+implementations disagree — macOS `/bin/sh` (bash in POSIX mode) accepts it,
+Linux `/bin/sh` (dash) rejects it — so an `sh` mode would report only a
+pipeline's *last* stage status. A failing producer would then be a silent
+success, and the engine would cache a revision for a build that failed.
+
 ## Process Lifecycle
 
 - `kill_on_drop(true)`: process is terminated if the driver is dropped.
