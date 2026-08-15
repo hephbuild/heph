@@ -46,7 +46,7 @@
 //! so the driver itself stays a dumb, context-free executor. A
 //! script-requiring package that isn't allow-listed fails **in `parse`**
 //! (before any network fetch), naming the package — never a silent skip.
-//! When allowed, the script is best-effort: run via the host's `sh`/PATH,
+//! When allowed, the script is best-effort: run via the host's `bash`/PATH,
 //! **not** sandboxed or declared-input the way the design doc's end state
 //! calls for (`ai-docs/js-plugin-plan.md`'s "heph's own separate, explicit,
 //! sandboxed action") — that needs a hermetic Node/script-runner sandbox
@@ -326,7 +326,7 @@ impl ManagedDriver for JsInstallDriver {
                 // Content-addressed (pinned by `integrity`) — safe to share
                 // across the local and remote cache tiers, UNLESS an
                 // allow-listed lifecycle script actually runs: `run_script`
-                // then shells out to the host's ambient `sh`/`PATH`/compiler/
+                // then shells out to the host's ambient `bash`/`PATH`/compiler/
                 // Node headers (see `run_lifecycle_scripts`'s module docs),
                 // none of which are in this hash. Caching that output
                 // (locally or remotely) under a key that never covers the
@@ -716,9 +716,11 @@ fn lifecycle_failure_context(name: &str, version: &str, skipped_deps: &[String])
 
 /// Best-effort execution of an allow-listed package's own
 /// `preinstall`/`install`/`postinstall` scripts (npm's lifecycle order), via
-/// the host's `sh` and `PATH`. **Not hermetic or sandboxed** — see module
-/// docs' TODO. Only reached when `Provider::get` has already stamped
-/// `scripts_allowed = true` for this exact package.
+/// the host's `bash` and `PATH` — matching every other shell-out in this
+/// codebase (`pluginexec`'s own `bash` driver, `Driver::new_bash`), never
+/// plain `sh`. **Not hermetic or sandboxed** — see module docs' TODO. Only
+/// reached when `Provider::get` has already stamped `scripts_allowed = true`
+/// for this exact package.
 fn run_lifecycle_scripts(dest_dir: &StdPath, name: &str) -> anyhow::Result<()> {
     let package_json = dest_dir.join("package.json");
     if !package_json.is_file() {
@@ -750,7 +752,7 @@ fn run_lifecycle_scripts(dest_dir: &StdPath, name: &str) -> anyhow::Result<()> {
         // diagnostic for *why* a native build failed — actually reaches
         // the error below instead of vanishing into whatever the terminal
         // happened to be showing at the time.
-        let output = std::process::Command::new("sh")
+        let output = std::process::Command::new("bash")
             .arg("-c")
             .arg(script)
             .current_dir(dest_dir)
@@ -1025,6 +1027,36 @@ mod tests {
             "allow-listing a package before it ever declares an install script must not change \
              its cache key"
         );
+    }
+
+    /// `run_lifecycle_scripts` must run a package's own scripts through
+    /// `bash`, matching every other shell-out in this codebase
+    /// (`pluginexec`'s `bash` driver, `Driver::new_bash`) — never plain `sh`.
+    ///
+    /// Asserts on `$0` (what the shell was invoked *as*), not on a
+    /// bash-specific language feature (`[[ ]]`, `$BASH_VERSION`, etc.):
+    /// those don't actually discriminate everywhere — macOS's `/bin/sh` is
+    /// literally the same bash 3.2 binary as `/bin/bash` (confirmed live:
+    /// `/bin/sh -c 'echo $BASH_VERSION'` prints a real version, and `[[ ]]`
+    /// still works), so a feature-based check silently passes on macOS
+    /// whichever command name is used, proving nothing there. `$0` reflects
+    /// the literal `argv[0]` `std::process::Command::new(...)` set —
+    /// `"bash"` or `"sh"` — regardless of what binary that name happens to
+    /// resolve to on a given host, so it discriminates everywhere.
+    #[test]
+    fn run_lifecycle_scripts_uses_bash_not_posix_sh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"pkg","scripts":{"postinstall":"echo \"$0\" > marker.txt"}}"#,
+        )
+        .expect("write package.json");
+
+        run_lifecycle_scripts(dir.path(), "pkg").expect("lifecycle script must run");
+
+        let marker =
+            std::fs::read_to_string(dir.path().join("marker.txt")).expect("read marker.txt");
+        assert_eq!(marker.trim(), "bash");
     }
 
     // ---- integrity / extraction ----
