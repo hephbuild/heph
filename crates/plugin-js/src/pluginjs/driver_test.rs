@@ -184,11 +184,14 @@
 //! live terminal sink (`ManagedRunRequest`'s `stdout`/`stderr` — handed to
 //! the single named target of an interactive run regardless of `--shell`,
 //! see `run()`'s doc comment) when one is wired, and a `log.txt` file in the
-//! sandbox root always, mirroring the fixed convention `pluginexec` and
-//! `plugin-oci`'s `docker_build.rs` already use (`crates/engine`'s
-//! `extract_log_tail`/`ProcessFailed` know how to read it). This makes the
-//! output visible the instant the runner prints it, independent of whether —
-//! or when — the process itself ever finishes.
+//! sandbox root always, under the same `log.txt` filename `pluginexec` and
+//! `plugin-oci`'s `docker_build.rs` use for their own equivalent file (this
+//! driver does not yet wire it into `crates/engine`'s
+//! `extract_log_tail`/`ProcessFailed` framed-box renderer the way those two
+//! do — see [`RUNNER_LOG_FILE_NAME`]'s doc for what would still need to
+//! change for that). This makes the output visible the instant the runner
+//! prints it, independent of whether — or when — the process itself ever
+//! finishes.
 //!
 //! ## Ending a specific, confirmed-unrecoverable hang without a timeout
 //!
@@ -622,13 +625,21 @@ impl ManagedDriver for JsTestDriver {
 const RESULT_FILE_NAME: &str = ".heph-js-test-result.json";
 
 /// Where `exec_runner` tees the runner's merged stdout+stderr, live, as it
-/// arrives — the fixed convention `crates/engine`'s failure renderer
-/// (`extract_log_tail`/`ProcessFailed`) and `--cat-out`/`--copy-out` already
-/// know how to read for every other driver (`pluginexec`, `docker_build`).
-/// Unlike [`RESULT_FILE_NAME`] this is not a heph-internal scratch file: it
-/// is what makes a failing (or hung) run's output visible without needing
-/// `heph run --shell` to attach a real terminal and reproduce it by hand —
-/// see module docs' "Surfacing output live, not just on completion".
+/// arrives — the same filename `pluginexec` and `docker_build.rs` use for
+/// their own equivalent file. Unlike [`RESULT_FILE_NAME`] this is not a
+/// heph-internal scratch file: it is what makes a failing (or hung) run's
+/// output inspectable on disk without needing `heph run --shell` to attach
+/// a real terminal and reproduce it by hand — see module docs' "Surfacing
+/// output live, not just on completion". **Not** currently wired into
+/// `crates/engine`'s `extract_log_tail`/`ProcessFailed` framed-box renderer
+/// or `--cat-out`/`--copy-out` the way `pluginexec`'s/`docker_build`'s own
+/// `log.txt` are — those require the driver to return a `ProcessFailed{
+/// log, .. }` error and declare a matching `Output`, neither of which this
+/// driver does (`js_test` deliberately declares no outputs at all, see
+/// `parse_no_outputs_and_caches_locally_and_remotely`). This file's value
+/// today is the live tee to `stdout_sink`/`stderr_sink` above, plus being
+/// left on disk in the sandbox for manual inspection on failure (the engine
+/// preserves a failed target's sandbox for diagnostics either way).
 const RUNNER_LOG_FILE_NAME: &str = "log.txt";
 
 /// How often `exec_runner` checks for [`RESULT_FILE_NAME`] while the runner
@@ -648,8 +659,13 @@ const RESULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 const RUNNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// The exact line Vite's logger prints, to either stream, the instant its
-/// dependency-optimizer scan fails. Confirmed, unfixed upstream as of this
-/// writing: the scan's error path returns early and never resolves the
+/// dependency-optimizer scan fails — always led by Vite's own `(!) ` warning
+/// glyph, which this deliberately includes rather than matching the bare
+/// phrase: a code-quality review flagged that an unanchored substring could
+/// false-match a project's own unrelated log/assertion text containing the
+/// same words, killing an otherwise-passing run before it ever gets a
+/// chance to write [`RESULT_FILE_NAME`]. Confirmed, unfixed upstream as of
+/// this writing: the scan's error path returns early and never resolves the
 /// `depOptimizationProcessing` promise every subsequent module load is
 /// awaiting, so the runner hangs **forever** — not slow, not eventually
 /// self-resolving — with no exit and no [`RESULT_FILE_NAME`] ever coming
@@ -665,8 +681,25 @@ const RUNNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 
 /// [`RUNNER_TIMEOUT`]: unlike a generic idle/stall heuristic (which would
 /// risk misfiring on a legitimately slow-but-silent single test file), this
 /// only fires on the literal, versions-stable diagnostic text for a bug with
-/// no other outcome.
-const DEPENDENCY_SCAN_HANG_MARKER: &str = "Failed to run dependency scan";
+/// no other outcome. Not part of the hash: this is runtime driver control
+/// flow, not a declared `Input` — if a future vitest/jest ever changes this
+/// wording, the fast path just silently stops firing and every target falls
+/// back to the pre-existing, already-accepted [`RUNNER_TIMEOUT`] backstop
+/// (slower, never wrong).
+const DEPENDENCY_SCAN_HANG_MARKER: &str = "(!) Failed to run dependency scan";
+
+/// How long [`DEPENDENCY_SCAN_HANG_MARKER`] alone is trusted before the poll
+/// task acts on it — a real result file discovered during this window still
+/// wins (checked first, every tick; see the poll loop below). This is what
+/// keeps the marker match itself safely broad (any occurrence, either
+/// stream, no stricter anchoring than the `(!) ` prefix): even a coincidental
+/// or borderline match costs the run at most this much extra latency, never
+/// a wrong verdict, because a run that was always going to finish on its own
+/// still gets to. Short relative to [`RUNNER_TIMEOUT`] on purpose — the
+/// confirmed real trigger produces no further progress at all once printed,
+/// so there is nothing to lose by not waiting long, and a lot to lose (the
+/// original 20-minute complaint) by waiting anywhere near as long as that.
+const DEPENDENCY_SCAN_HANG_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Feed `chunk` through a small rolling window (bounded to `marker.len() -
 /// 1` bytes of carry-over between calls) and report whether `marker`
@@ -681,6 +714,27 @@ fn rolling_window_contains(tail: &mut Vec<u8>, chunk: &[u8], marker: &[u8]) -> b
     let keep_from = tail.len().saturating_sub(marker.len().saturating_sub(1));
     tail.drain(..keep_from);
     found
+}
+
+/// The explanation surfaced when [`DEPENDENCY_SCAN_HANG_GRACE`] elapses
+/// after [`DEPENDENCY_SCAN_HANG_MARKER`] with no result file — shared by the
+/// poll task's primary path and `exec_runner`'s own fallback net for the
+/// (rare) race where the child is reaped for an unrelated reason before the
+/// poll task itself gets to conclude.
+fn dependency_scan_hang_error(stdout: &str, stderr: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "js_test: the test runner hit Vite's dependency-optimizer scan failure and then hung — \
+         this is a confirmed, unfixed upstream bug: the failed scan leaves an internal promise \
+         permanently unresolved, so every subsequent module load blocks forever \
+         (vitejs/vite#22934, vitest-dev/vitest#9799). heph killed the runner rather than waiting \
+         out the {}-minute timeout. Fix the resolution error the runner reported below, or \
+         disable the dependency optimizer in this project's vitest config \
+         (`test.deps.optimizer.web.enabled = false` and `...ssr.enabled = false` — `web` is \
+         named `client` in vitest v4 — vitest has defaulted this off since v1.3.0, so it is very \
+         likely explicitly re-enabled here):\n{}",
+        RUNNER_TIMEOUT.as_secs() / 60,
+        test_failure_detail(stdout, stderr),
+    )
 }
 
 /// A [`Cancellable`] that fires either when `inner` does or once `deadline`
@@ -788,6 +842,15 @@ struct RunnerJsonResult {
     test_results: Vec<RunnerTestFileResult>,
 }
 
+/// What `exec_runner`'s poll task concluded: either the runner produced its
+/// structured result (the normal case, whatever its verdict), or
+/// [`DEPENDENCY_SCAN_HANG_GRACE`] elapsed after [`DEPENDENCY_SCAN_HANG_MARKER`]
+/// with no result ever appearing (the confirmed-unrecoverable case).
+enum PollOutcome {
+    Result(Result<RunnerJsonResult, String>),
+    DependencyScanHang,
+}
+
 /// Polls-once: `None` means "not ready yet" (missing, or present but not
 /// yet valid JSON — a partial write in progress) and the caller should keep
 /// waiting; `Some` means the runner is done producing it, either with the
@@ -872,12 +935,12 @@ impl JsTestDriver {
         // be mistaken for this run's own result.
         drop(std::fs::remove_file(&result_path));
 
-        // Merged stdout+stderr, in arrival order — the same `log.txt`
-        // convention `pluginexec`/`docker_build.rs` use, so a failed run gets
-        // the same framed "[log]" box every other driver's failure gets (see
-        // `extract_log_tail`/`ProcessFailed` in `crates/engine`). Truncated
-        // fresh each run: a stale tail from a previous invocation of this
-        // same sandbox path must never be read as this run's own output.
+        // Merged stdout+stderr, in arrival order — see
+        // `RUNNER_LOG_FILE_NAME`'s doc for exactly what reads this today
+        // (the live sink tee below, and manual inspection of the preserved
+        // sandbox) versus what it does not yet plug into. Truncated fresh
+        // each run: a stale tail from a previous invocation of this same
+        // sandbox path must never be read as this run's own output.
         let log_path = sandbox_dir.join(RUNNER_LOG_FILE_NAME);
         let log = std::sync::Mutex::new(
             std::fs::File::create(&log_path).context("create js_test log file")?,
@@ -929,8 +992,17 @@ impl JsTestDriver {
         // the drain side is doing, matching the already-safe shape
         // `pluginexec` and `plugin-oci`'s `docker_build.rs` use for the
         // same `OutputReader`.
+        // Set once (`Some(Instant)`), from the drain loop below, the moment
+        // `DEPENDENCY_SCAN_HANG_MARKER` is seen on either stream. Shared
+        // rather than acted on immediately by the drain loop itself so a
+        // result file appearing within `DEPENDENCY_SCAN_HANG_GRACE` still
+        // wins — checked first, every tick, below.
+        let marker_seen_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
         let poll_result_path = result_path.clone();
         let poll_done = done.clone();
+        let poll_marker_seen_at = Arc::clone(&marker_seen_at);
         let poll_task = tokio::spawn(async move {
             let mut poll = tokio::time::interval(RESULT_POLL_INTERVAL);
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -941,7 +1013,15 @@ impl JsTestDriver {
                     hcore::blocking::run(move || try_read_runner_result(&path)).await
                 {
                     poll_done.cancel();
-                    return found;
+                    return PollOutcome::Result(found);
+                }
+                let hang_confirmed = poll_marker_seen_at
+                    .lock()
+                    .expect("marker_seen_at poisoned")
+                    .is_some_and(|seen_at| seen_at.elapsed() >= DEPENDENCY_SCAN_HANG_GRACE);
+                if hang_confirmed {
+                    poll_done.cancel();
+                    return PollOutcome::DependencyScanHang;
                 }
             }
         });
@@ -965,11 +1045,11 @@ impl JsTestDriver {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut read_error: Option<std::io::Error> = None;
-        // Set the instant `DEPENDENCY_SCAN_HANG_MARKER` is seen on either
-        // stream — read after the drain/wait below to give that specific,
-        // known-unrecoverable condition its own clear error message instead
-        // of falling through to the generic "no usable result" one.
-        let mut dependency_scan_hang_detected = false;
+        // Local skip-optimization only — avoids re-scanning every
+        // subsequent chunk once the marker has already been recorded into
+        // `marker_seen_at`; the actual cross-task signal is that `Mutex`,
+        // not this `bool`.
+        let mut marker_seen_locally = false;
         // Scoped so the pinned `drain` future — which mutably borrows
         // `stdout`/`stderr`/`read_error` for as long as it's alive — is
         // dropped before those are read again below.
@@ -1000,11 +1080,13 @@ impl JsTestDriver {
                                 drop(out.write_all(&bytes).await);
                                 drop(out.flush().await);
                             }
-                            if !dependency_scan_hang_detected
+                            if !marker_seen_locally
                                 && rolling_window_contains(&mut marker_scan_tail, &bytes, marker)
                             {
-                                dependency_scan_hang_detected = true;
-                                done.cancel();
+                                marker_seen_locally = true;
+                                if let Ok(mut seen_at) = marker_seen_at.lock() {
+                                    *seen_at = Some(tokio::time::Instant::now());
+                                }
                             }
                             stdout.extend_from_slice(&bytes);
                         }
@@ -1016,11 +1098,13 @@ impl JsTestDriver {
                                 drop(out.write_all(&bytes).await);
                                 drop(out.flush().await);
                             }
-                            if !dependency_scan_hang_detected
+                            if !marker_seen_locally
                                 && rolling_window_contains(&mut marker_scan_tail, &bytes, marker)
                             {
-                                dependency_scan_hang_detected = true;
-                                done.cancel();
+                                marker_seen_locally = true;
+                                if let Ok(mut seen_at) = marker_seen_at.lock() {
+                                    *seen_at = Some(tokio::time::Instant::now());
+                                }
                             }
                             stderr.extend_from_slice(&bytes);
                         }
@@ -1068,12 +1152,13 @@ impl JsTestDriver {
             Err(join_err) if join_err.is_cancelled() => None,
             Err(join_err) => return Err(join_err).context("result-file poll task panicked"),
         };
-        let detection = detection.or_else(|| try_read_runner_result(&result_path));
+        let detection =
+            detection.or_else(|| try_read_runner_result(&result_path).map(PollOutcome::Result));
 
         if let Some(found) = detection {
             return match found {
-                Ok(r) if r.success => Ok(()),
-                Ok(r) => anyhow::bail!(
+                PollOutcome::Result(Ok(r)) if r.success => Ok(()),
+                PollOutcome::Result(Ok(r)) => anyhow::bail!(
                     "js_test failed:\n{}",
                     failure_detail_from_json(
                         &r,
@@ -1081,35 +1166,31 @@ impl JsTestDriver {
                         &String::from_utf8_lossy(&stderr)
                     )
                 ),
-                Err(msg) => anyhow::bail!("js_test: {msg}"),
+                PollOutcome::Result(Err(msg)) => anyhow::bail!("js_test: {msg}"),
+                PollOutcome::DependencyScanHang => Err(dependency_scan_hang_error(
+                    &String::from_utf8_lossy(&stdout),
+                    &String::from_utf8_lossy(&stderr),
+                )),
             };
         }
 
-        // A real result file always wins over the hang-marker verdict above
-        // (defense in depth — if the runner somehow still produced one
-        // despite the marker, prefer the richer, tool-authored detail), but
-        // once we reach here neither exists: give this specific,
-        // known-unrecoverable condition its own clear explanation instead of
-        // falling through to the generic exit-code/timeout message below,
-        // which would otherwise be the only thing a user sees for up to
-        // `RUNNER_TIMEOUT` (20 minutes) — see [`DEPENDENCY_SCAN_HANG_MARKER`].
-        if dependency_scan_hang_detected {
-            anyhow::bail!(
-                "js_test: the test runner hit Vite's dependency-optimizer scan failure and then \
-                 hung — this is a confirmed, unfixed upstream bug: the failed scan leaves an \
-                 internal promise permanently unresolved, so every subsequent module load blocks \
-                 forever (vitejs/vite#22934, vitest-dev/vitest#9799). heph killed the runner \
-                 rather than waiting out the {}-minute timeout. Fix the resolution error the \
-                 runner reported below, or disable the dependency optimizer in this project's \
-                 vitest config (`test.deps.optimizer.web.enabled = false` and `...ssr.enabled = \
-                 false` — `web` is named `client` in vitest v4 — vitest has defaulted this off \
-                 since v1.3.0, so it is very likely explicitly re-enabled here):\n{}",
-                RUNNER_TIMEOUT.as_secs() / 60,
-                test_failure_detail(
-                    &String::from_utf8_lossy(&stdout),
-                    &String::from_utf8_lossy(&stderr)
-                ),
-            );
+        // Fallback net for the rare race where the child was reaped for an
+        // unrelated reason (the caller's own cancellation, or
+        // `DRAIN_DEADLINE`) before the poll task's own grace window had a
+        // chance to elapse and conclude `DependencyScanHang` on its own: the
+        // marker was still seen, so this still gives that specific
+        // explanation rather than falling through to the generic
+        // exit-code/timeout message below, which would otherwise be the
+        // only thing a user sees for up to `RUNNER_TIMEOUT` (20 minutes).
+        if marker_seen_at
+            .lock()
+            .expect("marker_seen_at poisoned")
+            .is_some()
+        {
+            return Err(dependency_scan_hang_error(
+                &String::from_utf8_lossy(&stdout),
+                &String::from_utf8_lossy(&stderr),
+            ));
         }
 
         // No structured result ever appeared — fall back to the plain
@@ -1594,9 +1675,9 @@ mod tests {
     /// Even with no live terminal at all (`stdout`/`stderr` both `None` —
     /// the common CI/batch shape, per `run()`'s doc comment), the runner's
     /// merged output must still land on disk in `log.txt` so it is
-    /// inspectable without `--shell` — the same fixed convention
-    /// `pluginexec`/`docker_build.rs` use, which `crates/engine`'s failure
-    /// renderer already knows how to read.
+    /// inspectable by hand without `--shell` (see `RUNNER_LOG_FILE_NAME`'s
+    /// doc for the scope of that — this file is not yet wired into the
+    /// engine's own failure-box renderer).
     #[tokio::test]
     async fn run_writes_the_runners_merged_output_to_log_txt_in_the_sandbox() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2075,9 +2156,9 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < std::time::Duration::from_secs(8),
-            "run() took {elapsed:?} — expected roughly one poll interval plus the ~2s SIGINT \
-             grace, nowhere near the 100s the fake runner sleeps for or RUNNER_TIMEOUT",
+            elapsed < DEPENDENCY_SCAN_HANG_GRACE + std::time::Duration::from_secs(5),
+            "run() took {elapsed:?} — expected roughly DEPENDENCY_SCAN_HANG_GRACE plus the ~2s \
+             SIGINT grace, nowhere near the 100s the fake runner sleeps for or RUNNER_TIMEOUT",
         );
         let msg = format!("{err:#}");
         assert!(
@@ -2085,6 +2166,58 @@ mod tests {
             "expected the specific known-bug explanation plus the runner's own captured output, \
              got: {msg}"
         );
+    }
+
+    /// A code-quality review flagged the real risk `DEPENDENCY_SCAN_HANG_MARKER`
+    /// introduces: it is a substring match over unstructured output, so a
+    /// project's own unrelated test/log text could coincidentally contain
+    /// it (even with the `(!) ` anchor: a project could be asserting on that
+    /// exact string, or piping through a tool that reproduces it verbatim).
+    /// `DEPENDENCY_SCAN_HANG_GRACE` is the mitigation — the marker alone is
+    /// never immediately fatal; a real result file discovered within the
+    /// grace window still wins the race (checked first, every poll tick).
+    /// This fake runner prints the marker text and then legitimately
+    /// finishes and reports success, well inside `DEPENDENCY_SCAN_HANG_GRACE`
+    /// — proving that race is won by the result file, not by the marker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_lets_a_coincidental_marker_match_finish_normally_within_the_grace_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            "echo '(!) Failed to run dependency scan: unrelated to this run, just the same \
+             wording' >&2\necho '{\"success\":true}' > .heph-js-test-result.json",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        tokio::time::timeout(DEPENDENCY_SCAN_HANG_GRACE, driver().run(run_req, &ct))
+            .await
+            .expect(
+                "run() must succeed well within DEPENDENCY_SCAN_HANG_GRACE — a hang/timeout here \
+             means a coincidental marker match was treated as fatal instead of losing the race \
+             to the result file the runner actually wrote",
+            )
+            .expect(
+                "success=true plus a coincidental marker-text match must still succeed, not be \
+             killed as a false dependency-scan hang",
+            );
     }
 
     /// Mirror of the success case: the runner reports `success: false` via
