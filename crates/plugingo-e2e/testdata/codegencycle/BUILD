@@ -35,7 +35,7 @@ target(
 # query (run for its `_golist`) re-enters it, closing the false cycle.
 target(
     name = "a-dist",
-    driver = "sh",
+    driver = "bash",
     run = "mv ${SRC} ${OUT}",
     deps = ["//cmd/a:build@v=host"],
     out = "dist/a",
@@ -44,7 +44,7 @@ target(
 
 target(
     name = "b-dist",
-    driver = "sh",
+    driver = "bash",
     run = "mv ${SRC} ${OUT}",
     deps = ["//cmd/b:build@v=host"],
     out = "dist/b",

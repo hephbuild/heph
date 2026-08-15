@@ -117,7 +117,7 @@ pub fn build_download_spec(
 
     TargetSpec {
         addr,
-        driver: "sh".to_string(),
+        driver: "bash".to_string(),
         config,
         ..Default::default()
     }
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn test_download_spec_driver() {
         let spec = build_download_spec(download_addr(), "github.com/go-logr/logr", "v1.4.2", V);
-        assert_eq!(spec.driver, "sh");
+        assert_eq!(spec.driver, "bash");
     }
 
     #[test]

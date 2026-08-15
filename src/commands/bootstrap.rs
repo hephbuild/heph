@@ -159,9 +159,6 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_managed_driver_factory("bash", |_init, opts| {
         Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
     })?;
-    e.register_managed_driver_factory("sh", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
-    })?;
 
     // Apply every `plugins:` entry: a `builtin:` instantiates the matching
     // factory above; a `path:`/`url:` resolves a manifest, loads the cdylib, and

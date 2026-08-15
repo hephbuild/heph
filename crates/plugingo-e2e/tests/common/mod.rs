@@ -414,7 +414,6 @@ fn make_workspace_ordered(
     }
 
     b.with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginexec::Driver::new_sh()))
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
         .with_managed_driver(Box::new(plugingo::GoGolistDriver::new()))
         .with_managed_driver(Box::new(plugingo::GoToolchainDriver))

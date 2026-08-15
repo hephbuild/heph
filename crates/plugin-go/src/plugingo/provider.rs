@@ -5436,7 +5436,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("with_dep");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("cmd", "build")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "bash");
         let out = match resp.target_spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!(),
@@ -5458,7 +5458,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("@heph/go/std/fmt", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "bash");
     }
 
     #[tokio::test]
@@ -5480,7 +5480,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("pkg", "build_test"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "bash");
         let out = match resp.target_spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!(),
@@ -6342,7 +6342,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("pkg", "build_xtest"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "bash");
         let out = match resp.target_spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!(),
