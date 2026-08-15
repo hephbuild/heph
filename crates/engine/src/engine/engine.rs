@@ -354,8 +354,45 @@ pub struct Driver {
 }
 
 impl Engine {
-    pub fn new(cfg: Config) -> anyhow::Result<Engine> {
-        let root = cfg.root.clone();
+    pub fn new(mut cfg: Config) -> anyhow::Result<Engine> {
+        // Canonicalized once, here, rather than left as whatever the caller
+        // passed: every absolute path a managed driver builds for a child
+        // process (a test file, a `--config`/`--project` path) is derived
+        // from this root via `sandbox_dir`/`sandbox_ws_dir`/`sandbox_pkg_dir`
+        // (`execute.rs`'s `self.home.join("sandbox")...`). On macOS, `/tmp`
+        // and `/var` are symlinks to `/private/tmp`/`/private/var` — the
+        // default `TMPDIR` a test harness's `tempfile::tempdir()` resolves
+        // into — so an uncanonicalized root there produces sandbox paths
+        // like `/var/folders/.../ws/foo.test.ts`, while a real subprocess
+        // that does its own filesystem walk (vitest's test-file discovery,
+        // confirmed live) resolves the *same* file to
+        // `/private/var/folders/.../ws/foo.test.ts`. The two strings never
+        // match, so a path passed as a CLI argument silently fails to
+        // correlate with what the child discovers on its own — "No test
+        // files found" with the file plainly sitting right there. Canonical
+        // once at construction means every path built from `root`/`home`
+        // downstream already agrees with what any well-behaved subprocess's
+        // own `realpath`-following walk would produce.
+        let root = std::fs::canonicalize(&cfg.root)
+            .with_context(|| format!("canonicalize workspace root {}", cfg.root.display()))?;
+        // Written back into `cfg` (not just a local used for `home` below):
+        // `cfg` is stored verbatim as `self.cfg`, and `self.root()`,
+        // `PluginInit.root` (handed to every provider/driver factory), and
+        // `RunRequest.tree_root_path` (the ABI field a managed driver sees as
+        // "the workspace root") all read it from there. Left un-updated, only
+        // `home`-derived paths (sandbox_dir and everything built from it)
+        // would have been canonical while this one, equally reachable,
+        // silently stayed the raw, possibly-symlinked value.
+        cfg.root = root.clone();
+        // `resolve()` (the production config-loading path, `bootstrap.rs` →
+        // `ConfigYamlExt::resolve`) always derives `home_dir` from the same
+        // root passed to it, so by the time it reaches here it is already
+        // canonical too, now that `crate::root::get_cwd` (the ultimate
+        // source, `crates/config/src/root.rs`) canonicalizes first. A caller
+        // that constructs `Config` directly with its own unrelated,
+        // independently-symlinked `home_dir` (bypassing both `resolve()` and
+        // `root`) is not covered here — narrow enough, and no known caller
+        // does it, that it isn't worth guessing at at construction time.
         let home = if cfg.home_dir.as_os_str().is_empty() {
             root.join(".heph3")
         } else {
