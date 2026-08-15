@@ -13,7 +13,7 @@ Default to the closest-in unit that can prove the behavior. Reach outward only w
 | Where | What | Run with |
 |---|---|---|
 | `#[cfg(test)]` in the crate | pure logic, parsing, a single type's contract | `cargo test <name>` |
-| `crates/e2e`, `crates/plugingo-e2e` | engine semantics end to end — providers, drivers, caching, hashing, the graph. Links `heph` in-process and drives the real `Engine`. | `cargo test <name>` |
+| `crates/e2e`, `crates/plugingo-e2e`, `crates/pluginjs-e2e` | engine semantics end to end — providers, drivers, caching, hashing, the graph. Links `heph` in-process and drives the real `Engine`. | `cargo test <name>` |
 | `crates/bin-e2e` | **only** what has no in-process form. Spawns the release binary; links no workspace crate. | `e2e` |
 
 ### The `crates/bin-e2e` bar

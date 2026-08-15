@@ -4745,6 +4745,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pluginjs-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core",
+ "futures",
+ "heph",
+ "model",
+ "plugin",
+ "plugin-js",
+ "tempfile",
+ "testkit",
+ "tokio",
+ "walk",
+]
+
+[[package]]
 name = "pori"
 version = "0.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

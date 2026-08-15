@@ -72,6 +72,15 @@ in
     # A `gotool = "<version>"` workspace downloads its own hermetic SDK and is
     # unaffected by this; only the `host` toolchain reads it.
     pkgs.go
+    # The Node toolchain `pluginjs-e2e` (and `plugin-js`'s own `#[ignore]`d
+    # subprocess tests) build against. `js_test`/`js_typecheck`/`js_bundle`/
+    # `js_lint` deliberately resolve their tool from
+    # `<workspace_root>/node_modules/.bin/<tool>` then `PATH` — a disclosed
+    # non-hermetic escape hatch (see `crates/plugin-js/src/pluginjs/driver_test.rs`'s
+    # module doc) mirroring the go toolchain comment just above this one, and
+    # for the identical reason: without `npm` on PATH, every js e2e test
+    # would silently skip rather than fail loudly.
+    pkgs.nodejs_24
     pkgs.buf
     pkgs.protoc-gen-prost
     pkgs.protoc-gen-prost-serde

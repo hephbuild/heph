@@ -1,0 +1,21 @@
+[package]
+name = "pluginjs-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+heph = { path = "../.." }
+plugin-js = { path = "../plugin-js" }
+htestkit = { package = "testkit", path = "../testkit" }
+hcore = { package = "core", path = "../core" }
+hmodel = { package = "model", path = "../model" }
+hplugin = { package = "plugin", path = "../plugin" }
+hwalk = { package = "walk", path = "../walk" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+anyhow = "1"
+tempfile = "3"
+futures = "0.3"
