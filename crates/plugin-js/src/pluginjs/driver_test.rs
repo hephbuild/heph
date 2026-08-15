@@ -163,10 +163,60 @@
 //! whenever it exists, whichever path got there first.
 //!
 //! [`RUNNER_TIMEOUT`] (20 minutes) still exists, but only as the last-resort
-//! backstop for a runner that produces *neither* a usable exit *nor* a
-//! parseable result file — a genuinely wedged process with no signal to key
-//! off at all. It is not, any more, the mechanism that makes a completed run
-//! end promptly; that is now the JSON-file detection above.
+//! backstop for a runner that produces *neither* a usable exit, *nor* a
+//! parseable result file, *nor* the specific known-unrecoverable condition
+//! [`DEPENDENCY_SCAN_HANG_MARKER`] detects — a genuinely wedged process with
+//! no signal to key off at all. It is not, any more, the mechanism that
+//! makes a completed (or confirmed-unrecoverable) run end promptly; that is
+//! the JSON-file detection above and the marker detection below.
+//!
+//! ## Surfacing output live, not just on completion
+//!
+//! A wedged runner producing none of the signals above used to also be
+//! invisible *while* it was happening: `exec_runner` only ever reported
+//! captured stdout/stderr once it returned, so a run stuck in the
+//! [`RUNNER_TIMEOUT`] backstop showed nothing at all for up to 20 minutes —
+//! the runner's own diagnostic (e.g. a dependency-scan resolution error,
+//! printed the instant it happens) was already sitting in memory, just not
+//! shown to anyone, forcing `heph run --shell` to reproduce by hand what had
+//! already run. `exec_runner` now tees every chunk, as it arrives, to two
+//! places alongside the existing in-memory accumulation: the engine's own
+//! live terminal sink (`ManagedRunRequest`'s `stdout`/`stderr` — handed to
+//! the single named target of an interactive run regardless of `--shell`,
+//! see `run()`'s doc comment) when one is wired, and a `log.txt` file in the
+//! sandbox root always, mirroring the fixed convention `pluginexec` and
+//! `plugin-oci`'s `docker_build.rs` already use (`crates/engine`'s
+//! `extract_log_tail`/`ProcessFailed` know how to read it). This makes the
+//! output visible the instant the runner prints it, independent of whether —
+//! or when — the process itself ever finishes.
+//!
+//! ## Ending a specific, confirmed-unrecoverable hang without a timeout
+//!
+//! Visibility alone does not end the run: a runner that never writes
+//! [`RESULT_FILE_NAME`] and never exits was still only actually ended by
+//! [`RUNNER_TIMEOUT`], and 20 minutes is far too long to sit
+//! failed-but-not-yet-reported. The single confirmed live trigger for this
+//! (a failed Vite dependency-optimizer scan) is not a "still working, just
+//! slow" case — it is a confirmed, unfixed upstream bug: the scan's error
+//! path returns without ever resolving the internal promise every
+//! subsequent module load is awaiting, so the process is not merely quiet,
+//! it is provably never going to produce a result (vitejs/vite#22934,
+//! vitest-dev/vitest#9799). Because Vite always prints the same
+//! [`DEPENDENCY_SCAN_HANG_MARKER`] line the instant this happens, seeing it
+//! is as reliable a completion signal as [`RESULT_FILE_NAME`] itself — the
+//! same manually-triggered [`hcore::hasync::StdCancellationToken`] mechanism
+//! (SIGINT → grace → SIGKILL) fires the moment it appears on either stream.
+//!
+//! This is deliberately narrower than a generic idle/stall heuristic (e.g.
+//! "no output for N seconds"), which this module's own per-test-file
+//! granularity makes an easy trap: a single test file legitimately produces
+//! long stretches of silence (most reporters only print at the very end),
+//! so time-since-last-byte is not a trustworthy signal here the way it might
+//! be for a whole-suite run. Matching the *specific, versions-stable text*
+//! of a *specific, confirmed-terminal* upstream bug avoids that false-positive
+//! risk entirely — at the cost of only covering the one trigger this module
+//! has actually seen live. A different wedge with no recognizable signal is
+//! still only caught by [`RUNNER_TIMEOUT`].
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -422,7 +472,7 @@ impl ManagedDriver for JsTestDriver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<JsTestDef>();
@@ -536,8 +586,26 @@ impl ManagedDriver for JsTestDriver {
             ),
         }
 
-        self.exec_runner(&runner_bin, args, &env, &req.sandbox_pkg_dir, ctoken)
-            .await?;
+        // Taken regardless of `--shell`: the engine hands the single named
+        // target a live terminal whenever the run is interactive (see
+        // `hplugin::driver::RunRequest`'s doc and `docker_build.rs`'s
+        // `ToolIo`) — `--shell` only additionally wires stdin. Without this,
+        // the sinks are simply `None` and `exec_runner`'s tee below is a
+        // no-op, exactly like every other consumer of this field.
+        let stdout_sink = req.request.stdout.take();
+        let stderr_sink = req.request.stderr.take();
+
+        self.exec_runner(
+            &runner_bin,
+            args,
+            &env,
+            &req.sandbox_pkg_dir,
+            &req.sandbox_dir,
+            stdout_sink,
+            stderr_sink,
+            ctoken,
+        )
+        .await?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -552,6 +620,16 @@ impl ManagedDriver for JsTestDriver {
 /// `.heph-gocache`. See module docs' "Detecting real completion, not
 /// waiting for exit".
 const RESULT_FILE_NAME: &str = ".heph-js-test-result.json";
+
+/// Where `exec_runner` tees the runner's merged stdout+stderr, live, as it
+/// arrives — the fixed convention `crates/engine`'s failure renderer
+/// (`extract_log_tail`/`ProcessFailed`) and `--cat-out`/`--copy-out` already
+/// know how to read for every other driver (`pluginexec`, `docker_build`).
+/// Unlike [`RESULT_FILE_NAME`] this is not a heph-internal scratch file: it
+/// is what makes a failing (or hung) run's output visible without needing
+/// `heph run --shell` to attach a real terminal and reproduce it by hand —
+/// see module docs' "Surfacing output live, not just on completion".
+const RUNNER_LOG_FILE_NAME: &str = "log.txt";
 
 /// How often `exec_runner` checks for [`RESULT_FILE_NAME`] while the runner
 /// is still producing output. Cheap enough (one `stat`+maybe-`read` of a
@@ -568,6 +646,42 @@ const RESULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// "Detecting real completion, not waiting for exit" for why this is no
 /// longer the primary mechanism that ends a completed run.
 const RUNNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// The exact line Vite's logger prints, to either stream, the instant its
+/// dependency-optimizer scan fails. Confirmed, unfixed upstream as of this
+/// writing: the scan's error path returns early and never resolves the
+/// `depOptimizationProcessing` promise every subsequent module load is
+/// awaiting, so the runner hangs **forever** — not slow, not eventually
+/// self-resolving — with no exit and no [`RESULT_FILE_NAME`] ever coming
+/// (vitejs/vite#22934, vitest-dev/vitest#9799; also vite#19364, #19316).
+/// Vitest has defaulted this optimizer *off* since v1.3.0, so hitting this
+/// at all means a project's own `vitest.config` explicitly re-enabled it
+/// (`test.deps.optimizer.{web,ssr}.enabled = true`, `client` replacing `web`
+/// in v4) — commonly for CJS/ESM interop, not for speed (heph's hermetic,
+/// cold-cache-every-run sandbox gets no benefit from the optimizer either
+/// way). Because this is a *confirmed-unrecoverable* condition rather than
+/// mere silence, seeing this exact line is treated as a positive completion
+/// signal — same as [`RESULT_FILE_NAME`] appearing — instead of relying on
+/// [`RUNNER_TIMEOUT`]: unlike a generic idle/stall heuristic (which would
+/// risk misfiring on a legitimately slow-but-silent single test file), this
+/// only fires on the literal, versions-stable diagnostic text for a bug with
+/// no other outcome.
+const DEPENDENCY_SCAN_HANG_MARKER: &str = "Failed to run dependency scan";
+
+/// Feed `chunk` through a small rolling window (bounded to `marker.len() -
+/// 1` bytes of carry-over between calls) and report whether `marker`
+/// appears anywhere in the combined bytes — catching an occurrence split
+/// across a chunk boundary without ever rescanning more than one chunk's
+/// worth of previously-seen bytes (i.e. O(chunk length), not O(bytes seen so
+/// far) — load-bearing since this runs on every chunk of a stream that is
+/// otherwise unbounded for the life of the run).
+fn rolling_window_contains(tail: &mut Vec<u8>, chunk: &[u8], marker: &[u8]) -> bool {
+    tail.extend_from_slice(chunk);
+    let found = tail.windows(marker.len()).any(|w| w == marker);
+    let keep_from = tail.len().saturating_sub(marker.len().saturating_sub(1));
+    tail.drain(..keep_from);
+    found
+}
 
 /// A [`Cancellable`] that fires either when `inner` does or once `deadline`
 /// elapses — whichever comes first — without otherwise changing `inner`'s
@@ -731,12 +845,21 @@ fn failure_detail_from_json(result: &RunnerJsonResult, stdout: &str, stderr: &st
 }
 
 impl JsTestDriver {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "runner_bin/args/env/cwd/sandbox_dir/stdout/stderr/ctoken are each independently \
+                  needed by the spawn below; bundling them into a struct would just move the same \
+                  fields one level down for no reduction in what a caller has to supply"
+    )]
     async fn exec_runner(
         &self,
         runner_bin: &std::path::Path,
         args: Vec<OsString>,
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
+        sandbox_dir: &std::path::Path,
+        mut stdout_sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+        mut stderr_sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<()> {
         let env_pairs: Vec<(OsString, OsString)> = env
@@ -748,6 +871,17 @@ impl JsTestDriver {
         // path (e.g. a retry after a build-system-level failure) must never
         // be mistaken for this run's own result.
         drop(std::fs::remove_file(&result_path));
+
+        // Merged stdout+stderr, in arrival order — the same `log.txt`
+        // convention `pluginexec`/`docker_build.rs` use, so a failed run gets
+        // the same framed "[log]" box every other driver's failure gets (see
+        // `extract_log_tail`/`ProcessFailed` in `crates/engine`). Truncated
+        // fresh each run: a stale tail from a previous invocation of this
+        // same sandbox path must never be read as this run's own output.
+        let log_path = sandbox_dir.join(RUNNER_LOG_FILE_NAME);
+        let log = std::sync::Mutex::new(
+            std::fs::File::create(&log_path).context("create js_test log file")?,
+        );
 
         let spec = proc_exec::Spec {
             program: runner_bin.to_path_buf(),
@@ -831,17 +965,63 @@ impl JsTestDriver {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut read_error: Option<std::io::Error> = None;
+        // Set the instant `DEPENDENCY_SCAN_HANG_MARKER` is seen on either
+        // stream — read after the drain/wait below to give that specific,
+        // known-unrecoverable condition its own clear error message instead
+        // of falling through to the generic "no usable result" one.
+        let mut dependency_scan_hang_detected = false;
         // Scoped so the pinned `drain` future — which mutably borrows
         // `stdout`/`stderr`/`read_error` for as long as it's alive — is
         // dropped before those are read again below.
         let wait_outcome = {
+            // Tee, not buffer-then-report: every chunk lands in `log.txt` and
+            // (when the engine handed this target a live terminal — see
+            // `run()`) the caller's own stdout/stderr *as it arrives*, not
+            // only once this function eventually returns. A wedged runner
+            // (the vitest/esbuild case module docs describe) may never
+            // return at all within any reasonable bound; what it already
+            // printed before wedging must not wait on that. Mirrors
+            // `pluginexec::tee_output`/`docker_build.rs::tee`, simplified to
+            // this driver's single-reader shape (no absorption-time
+            // accounting: a test runner's output is orders of magnitude
+            // smaller than a container build's).
+            use std::io::Write as _;
+            use tokio::io::AsyncWriteExt as _;
+            let marker = DEPENDENCY_SCAN_HANG_MARKER.as_bytes();
+            let mut marker_scan_tail: Vec<u8> = Vec::new();
             let drain = async {
                 loop {
                     match reader.recv().await {
                         Ok(Some((proc_exec::StreamId::Stdout, bytes))) => {
+                            if let Ok(mut f) = log.lock() {
+                                drop(f.write_all(&bytes));
+                            }
+                            if let Some(out) = stdout_sink.as_mut() {
+                                drop(out.write_all(&bytes).await);
+                                drop(out.flush().await);
+                            }
+                            if !dependency_scan_hang_detected
+                                && rolling_window_contains(&mut marker_scan_tail, &bytes, marker)
+                            {
+                                dependency_scan_hang_detected = true;
+                                done.cancel();
+                            }
                             stdout.extend_from_slice(&bytes);
                         }
                         Ok(Some((proc_exec::StreamId::Stderr, bytes))) => {
+                            if let Ok(mut f) = log.lock() {
+                                drop(f.write_all(&bytes));
+                            }
+                            if let Some(out) = stderr_sink.as_mut() {
+                                drop(out.write_all(&bytes).await);
+                                drop(out.flush().await);
+                            }
+                            if !dependency_scan_hang_detected
+                                && rolling_window_contains(&mut marker_scan_tail, &bytes, marker)
+                            {
+                                dependency_scan_hang_detected = true;
+                                done.cancel();
+                            }
                             stderr.extend_from_slice(&bytes);
                         }
                         Ok(None) => break,
@@ -903,6 +1083,33 @@ impl JsTestDriver {
                 ),
                 Err(msg) => anyhow::bail!("js_test: {msg}"),
             };
+        }
+
+        // A real result file always wins over the hang-marker verdict above
+        // (defense in depth — if the runner somehow still produced one
+        // despite the marker, prefer the richer, tool-authored detail), but
+        // once we reach here neither exists: give this specific,
+        // known-unrecoverable condition its own clear explanation instead of
+        // falling through to the generic exit-code/timeout message below,
+        // which would otherwise be the only thing a user sees for up to
+        // `RUNNER_TIMEOUT` (20 minutes) — see [`DEPENDENCY_SCAN_HANG_MARKER`].
+        if dependency_scan_hang_detected {
+            anyhow::bail!(
+                "js_test: the test runner hit Vite's dependency-optimizer scan failure and then \
+                 hung — this is a confirmed, unfixed upstream bug: the failed scan leaves an \
+                 internal promise permanently unresolved, so every subsequent module load blocks \
+                 forever (vitejs/vite#22934, vitest-dev/vitest#9799). heph killed the runner \
+                 rather than waiting out the {}-minute timeout. Fix the resolution error the \
+                 runner reported below, or disable the dependency optimizer in this project's \
+                 vitest config (`test.deps.optimizer.web.enabled = false` and `...ssr.enabled = \
+                 false` — `web` is named `client` in vitest v4 — vitest has defaulted this off \
+                 since v1.3.0, so it is very likely explicitly re-enabled here):\n{}",
+                RUNNER_TIMEOUT.as_secs() / 60,
+                test_failure_detail(
+                    &String::from_utf8_lossy(&stdout),
+                    &String::from_utf8_lossy(&stderr)
+                ),
+            );
         }
 
         // No structured result ever appeared — fall back to the plain
@@ -1384,6 +1591,52 @@ mod tests {
         );
     }
 
+    /// Even with no live terminal at all (`stdout`/`stderr` both `None` —
+    /// the common CI/batch shape, per `run()`'s doc comment), the runner's
+    /// merged output must still land on disk in `log.txt` so it is
+    /// inspectable without `--shell` — the same fixed convention
+    /// `pluginexec`/`docker_build.rs` use, which `crates/engine`'s failure
+    /// renderer already knows how to read.
+    #[tokio::test]
+    async fn run_writes_the_runners_merged_output_to_log_txt_in_the_sandbox() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            "echo 'stdout line' \necho 'stderr line' >&2\nexit 1",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        driver()
+            .run(run_req, &ct)
+            .await
+            .err()
+            .expect("the fake runner always exits non-zero");
+
+        let log = std::fs::read_to_string(dir.path().join("log.txt")).expect("read log.txt");
+        assert!(
+            log.contains("stdout line") && log.contains("stderr line"),
+            "log.txt must carry both streams even when no live sink was wired: {log:?}"
+        );
+    }
+
     #[tokio::test]
     async fn run_sets_ci_1_in_the_runners_environment() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1490,6 +1743,139 @@ mod tests {
         assert!(
             bounded.is_cancelled(),
             "the deadline must have been observed as elapsed"
+        );
+    }
+
+    /// Same shape as [`make_run_request`], but with `stderr` wired to a
+    /// caller-supplied live sink — what the engine hands the single named
+    /// target of an interactive run (see `run()`'s doc comment on why this
+    /// is unconditional on `--shell`).
+    fn make_run_request_with_stderr<'a>(
+        target: &'a TargetDef,
+        request_id: &'a String,
+        ws_dir: std::path::PathBuf,
+        pkg_dir: std::path::PathBuf,
+        hashin: &'a str,
+        stderr: &'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin),
+    ) -> ManagedRunRequest<'a, 'a> {
+        use hplugin::driver::{RunInput, RunRequest};
+        ManagedRunRequest {
+            request: RunRequest {
+                request_id,
+                target,
+                tree_root_path: ws_dir.clone(),
+                inputs: Vec::<RunInput>::new(),
+                hashin,
+                stdin: None,
+                stdout: None,
+                stderr: Some(stderr),
+                sandbox_dir: ws_dir.clone(),
+            },
+            sandbox_dir: ws_dir.clone(),
+            sandbox_ws_dir: ws_dir,
+            sandbox_pkg_dir: pkg_dir,
+            inputs: Vec::new(),
+        }
+    }
+
+    /// The actual complaint this mechanism exists to fix: a real user could
+    /// not see *why* a run was stuck without `heph run --shell`, because
+    /// `exec_runner` used to only ever report captured output once it
+    /// returned — and a wedged runner (the vitest/esbuild dependency-scan
+    /// case) may not return for a very long time. The fix is a live tee, not
+    /// faster detection: what the runner already printed must reach the
+    /// caller's sink as it's printed, independent of whether — or when —
+    /// the process itself ever finishes.
+    ///
+    /// Proven by racing the read side against the runner's own sleep, not by
+    /// asserting on `run()`'s total elapsed time (that would only show the
+    /// eventual JSON-file detection still works, which other tests already
+    /// cover): the diagnostic must arrive well before the sleep — which
+    /// stands in for a hang of arbitrary length — elapses, not merely
+    /// before `run()` itself returns.
+    ///
+    /// Deliberately NOT the real dependency-scan diagnostic text — that has
+    /// its own fast-kill path now (see `DEPENDENCY_SCAN_HANG_MARKER` /
+    /// `run_fails_fast_on_the_dependency_scan_hang_marker_instead_of_the_20_minute_timeout`)
+    /// and this test wants a hang the tee has to survive for its own
+    /// (unrelated) reason, not one heph now recognizes and kills early.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_streams_output_live_to_the_callers_sink_not_only_on_completion() {
+        use tokio::io::AsyncReadExt as _;
+
+        const MARKER: &str = "some unrelated diagnostic: cannot resolve @/gqlv3";
+        const HANG_SECS: u64 = 5;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            &format!(
+                "echo '{MARKER}' >&2\nsleep {HANG_SECS}\necho '{{\"success\":true}}' > \
+                 .heph-js-test-result.json\n"
+            ),
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+
+        let (mut read_half, mut write_half) = tokio::io::duplex(4096);
+        let run_req = make_run_request_with_stderr(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+            &mut write_half,
+        );
+
+        let started = std::time::Instant::now();
+        // Spawned onto its own task, not raced via `select!`/`join!` in
+        // `run()`'s own task: `OutputReader::recv`'s macOS backend parks its
+        // caller in `block_in_place`, which blocks the whole task it runs
+        // in — including any other future joined into that same task. A
+        // `join!` here would starve this reader for exactly the reason
+        // `exec_runner`'s own `poll_task` had to move to a separate spawned
+        // task (see module docs). Only `read_half` needs to be `'static`
+        // here, so the spawn is straightforward.
+        let read_task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 256];
+            loop {
+                let n = read_half.read(&mut buf).await.expect("read live sink");
+                assert_ne!(
+                    n, 0,
+                    "sink closed (runner exited) before the marker ever arrived"
+                );
+                seen.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&seen).contains(MARKER) {
+                    return started.elapsed();
+                }
+            }
+        });
+
+        driver()
+            .run(run_req, &ct)
+            .await
+            .expect("the fake runner eventually reports success");
+
+        let marker_at = tokio::time::timeout(std::time::Duration::from_secs(1), read_task)
+            .await
+            .expect("marker must have already arrived well before run() itself returned")
+            .expect("read task panicked");
+        assert!(
+            marker_at < std::time::Duration::from_secs(HANG_SECS - 1),
+            "the marker took {marker_at:?} to arrive — it must reach the live sink almost \
+             immediately after the runner prints it, not only once the {HANG_SECS}s sleep (a \
+             stand-in for an indefinite hang) finishes"
         );
     }
 
@@ -1633,6 +2019,71 @@ mod tests {
             elapsed < std::time::Duration::from_secs(3),
             "run() took {elapsed:?} — the drain must be bounded by DRAIN_DEADLINE (500ms), not \
              wait on the backgrounded sleep",
+        );
+    }
+
+    /// The real-world trigger this whole mechanism exists for (see module
+    /// docs' "Surfacing output live, not just on completion" and
+    /// `DEPENDENCY_SCAN_HANG_MARKER`): a failed Vite dependency-optimizer
+    /// scan leaves an internal promise permanently unresolved, so the
+    /// runner never writes [`RESULT_FILE_NAME`] and never exits — nothing
+    /// short of `RUNNER_TIMEOUT` (20 minutes) would otherwise end this run.
+    /// `trap '' INT` makes the fake runner ignore the initial SIGINT, so a
+    /// pass here proves the full SIGINT → grace → SIGKILL path actually
+    /// runs off the marker detection, not just that the *drain* stopped
+    /// early.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_fails_fast_on_the_dependency_scan_hang_marker_instead_of_the_20_minute_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_runner = write_fake_runner(
+            dir.path(),
+            "fake-vitest.sh",
+            "trap '' INT\necho '(!) Failed to run dependency scan. Skipping dependency \
+             pre-bundling. Error: cannot resolve @/gqlv3' >&2\nsleep 100",
+        );
+
+        let ct = ctoken();
+        let req = make_parse_request(&[(
+            "runner_bin",
+            Value::String(fake_runner.to_string_lossy().into_owned()),
+        )]);
+        let parsed = driver().parse(req, &ct).await.unwrap();
+
+        let request_id = "test".to_string();
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let run_req = make_run_request(
+            &parsed.target_def,
+            &request_id,
+            dir.path().to_path_buf(),
+            pkg_dir,
+            "deadbeef",
+        );
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            driver().run(run_req, &ct),
+        )
+        .await
+        .expect(
+            "run() must return well within 15s — a hang here means the marker was never \
+             detected and this fell through to RUNNER_TIMEOUT",
+        )
+        .err()
+        .expect("a dependency-scan hang must be reported as a failure, not silently succeed");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "run() took {elapsed:?} — expected roughly one poll interval plus the ~2s SIGINT \
+             grace, nowhere near the 100s the fake runner sleeps for or RUNNER_TIMEOUT",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vite#22934") && msg.contains("cannot resolve @/gqlv3"),
+            "expected the specific known-bug explanation plus the runner's own captured output, \
+             got: {msg}"
         );
     }
 
