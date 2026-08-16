@@ -70,6 +70,75 @@ async fn test_missing_build_file_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── glob() ───────────────────────────────────────────────────────────────────
+
+// A package-relative `exclude` must exclude. The fs driver matches pattern and
+// excludes against the same workspace-root-relative paths, so a raw
+// `vendor/**` written in `//pkg` used to be tested against `pkg/vendor/x.txt`,
+// match nothing, and silently source the very files it named.
+#[tokio::test]
+async fn test_glob_exclude_is_package_relative() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("pkg/keep.txt", "keep");
+    ws.write_file("pkg/sub/nested.txt", "nested");
+    ws.write_file("pkg/vendor/skip.txt", "skip");
+    ws.write_file("pkg/vendor/deep/skip.txt", "skip");
+    ws.write_build_file(
+        "pkg",
+        r#"
+target(
+    name = "t",
+    driver = "bash",
+    deps = {"src": [glob("**/*.txt", exclude = ["vendor/**"])]},
+    out = "out.txt",
+    run = 'for f in $SRC_SRC; do echo "$f"; done | sort > $OUT',
+)
+"#,
+    );
+
+    let result = ws.run("//pkg:t").await?;
+    let listed = common::artifact_string(&result);
+
+    assert!(listed.contains("keep.txt"), "sourced files: {listed:?}");
+    assert!(listed.contains("nested.txt"), "sourced files: {listed:?}");
+    assert!(
+        !listed.contains("vendor"),
+        "package-relative exclude must drop pkg/vendor/**, got: {listed:?}"
+    );
+    Ok(())
+}
+
+// `abs = True` opts both sides out of the package prefix, so a
+// workspace-rooted exclude stays expressible.
+#[tokio::test]
+async fn test_glob_exclude_abs_is_root_relative() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("pkg/keep.txt", "keep");
+    ws.write_file("vendor/skip.txt", "skip");
+    ws.write_build_file(
+        "pkg",
+        r#"
+target(
+    name = "t",
+    driver = "bash",
+    deps = {"src": [glob("**/*.txt", exclude = ["vendor/**"], abs = True)]},
+    out = "out.txt",
+    run = 'for f in $SRC_SRC; do echo "$f"; done | sort > $OUT',
+)
+"#,
+    );
+
+    let result = ws.run("//pkg:t").await?;
+    let listed = common::artifact_string(&result);
+
+    assert!(listed.contains("keep.txt"), "sourced files: {listed:?}");
+    assert!(
+        !listed.contains("vendor"),
+        "abs exclude must drop the root-level vendor/**, got: {listed:?}"
+    );
+    Ok(())
+}
+
 // ── Spec assertions ──────────────────────────────────────────────────────────
 
 #[tokio::test]
