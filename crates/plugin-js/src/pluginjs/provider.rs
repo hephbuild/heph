@@ -3422,6 +3422,17 @@ fn test_deps_config(
         }
         external_addrs.insert(hbuiltins::pluginfs::file_addr(f).format());
     }
+    // A dynamic `import()` shaped like Vite's own "dynamic import with a
+    // variable" pattern (`importgraph::ResolvedGlobSite` — see
+    // `importparse.rs` module docs) doesn't name a single file: Vite globs
+    // the whole directory at dev-server time and needs every matching file
+    // present, not just the one the running test happens to pick. Declare
+    // the whole match set as one glob Input, mirroring how `plugin-go`
+    // declares a static-embed subtree (`pkg_static_embed_glob_addr`).
+    for glob in &closure.glob_sites {
+        let pattern = format!("{}/*{}", glob.dir, glob.suffix);
+        external_addrs.insert(hbuiltins::pluginfs::glob_addr(&pattern, &[]).format());
+    }
     // Mirrors `typecheck_deps_config`'s identical on-demand third-party
     // handling for an unresolved bare specifier: `check_phantom_dependencies`
     // above already proved every one of these names is declared; a `None`
@@ -8510,6 +8521,46 @@ snapshots:
         assert!(
             !src_addrs.iter().any(|a| a.contains("unrelated")),
             "an unrelated workspace file must not be a declared input: {src_addrs:?}"
+        );
+    }
+
+    /// `` import(`./catalogs/${locale}.po`) `` — Vite's own dynamic-import-
+    /// with-variable pattern — must declare the whole `catalogs/` directory
+    /// as a glob Input, not just the file that contains the `import()` call.
+    /// Regression test for a real report: this file resolved fine outside
+    /// heph (a real Vite dev server enumerates the directory itself), but
+    /// failed inside the sandbox because nothing had staged `catalogs/`.
+    #[test]
+    fn test_deps_config_declares_directory_glob_for_dynamic_import_with_variable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(dir.path(), "packages/a/src/catalogs/en-US.po", "msgid \"\"\n");
+        write(
+            dir.path(),
+            "packages/a/src/locale.ts",
+            "export async function loadMessages(locale) {\n  return import(`./catalogs/${locale}.po`);\n}\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import { loadMessages } from './locale';\ntest('a', () => loadMessages('en-US'));\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _, _, _, _) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        let external_addrs = dep_addrs(&deps, "external");
+        assert!(
+            external_addrs
+                .iter()
+                .any(|a| a.contains("glob") && a.contains("packages/a/src/catalogs")),
+            "the whole catalogs/ directory must be declared as a glob Input: {external_addrs:?}"
         );
     }
 

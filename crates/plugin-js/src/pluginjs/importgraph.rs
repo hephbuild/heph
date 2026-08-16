@@ -177,6 +177,19 @@ pub struct BareSpecifierSite {
     pub package_name: String,
 }
 
+/// A resolved [`importparse::GlobImportSite`] — the directory prefix has
+/// been located on disk and turned into a workspace-relative directory path;
+/// `suffix` is carried through unchanged. See module docs and
+/// `importparse.rs`'s "dynamic import with a variable" section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGlobSite {
+    /// Workspace-relative path of the file containing the dynamic import.
+    pub file: String,
+    /// Workspace-relative directory the glob is rooted at (no trailing `/`).
+    pub dir: String,
+    pub suffix: String,
+}
+
 /// The two separate graphs for one package — see module docs and
 /// `resolvers.rs` for why they're kept apart.
 #[derive(Debug, Clone, Default)]
@@ -190,6 +203,10 @@ pub struct ImportGraph {
     /// against the declared closure by name — see module docs' "Hermeticity"
     /// section and [`BareSpecifierGuard`].
     pub unresolved_bare_specifiers: Vec<BareSpecifierSite>,
+    /// Directory-glob dependencies from `import()` calls shaped like Vite's
+    /// own dynamic-import-with-variable pattern — see
+    /// [`ResolvedGlobSite`].
+    pub glob_sites: Vec<ResolvedGlobSite>,
 }
 
 /// Which resolution flavor a cache entry belongs to — the fourth element of
@@ -2028,6 +2045,11 @@ pub struct TestClosure {
     /// `test_deps_config`), mirroring `typecheck_deps_config`'s identical
     /// on-demand third-party handling.
     pub bare_specifiers: Vec<BareSpecifierSite>,
+    /// Directory-glob dependencies reached from a member of `files` — see
+    /// [`ResolvedGlobSite`]. Like `external_files`/`bare_specifiers`, a
+    /// one-hop leaf: the matched directory's own files are declared as an
+    /// Input glob by `provider.rs::test_deps_config`, not recursed into.
+    pub glob_sites: Vec<ResolvedGlobSite>,
 }
 
 /// BFS `test_file_rel`'s own `ImportGraph::runtime_edges` closure, bounded to
@@ -2068,6 +2090,13 @@ pub fn build_test_closure(
             .or_default()
             .push(site);
     }
+    let mut glob_by_file: HashMap<&str, Vec<&ResolvedGlobSite>> = HashMap::new();
+    for site in &graph.glob_sites {
+        glob_by_file
+            .entry(site.file.as_str())
+            .or_default()
+            .push(site);
+    }
 
     let mut closure = TestClosure::default();
     closure.files.insert(test_file_rel.to_string());
@@ -2078,6 +2107,11 @@ pub fn build_test_closure(
         if let Some(sites) = bare_by_file.get(current.as_str()) {
             for site in sites {
                 closure.bare_specifiers.push((*site).clone());
+            }
+        }
+        if let Some(sites) = glob_by_file.get(current.as_str()) {
+            for site in sites {
+                closure.glob_sites.push((*site).clone());
             }
         }
         let Some(edges) = edges_by_file.get(current.as_str()) else {
@@ -2219,9 +2253,63 @@ pub fn build_package_import_graph(
                 ),
             }
         }
+
+        for glob in parsed.glob_sites {
+            match resolve_glob_dir(dir, &glob.dir_prefix, workspace_root) {
+                Some(glob_dir_rel) => {
+                    graph.glob_sites.push(ResolvedGlobSite {
+                        file: file_rel.clone(),
+                        dir: glob_dir_rel,
+                        suffix: glob.suffix,
+                    });
+                }
+                None => {
+                    // Directory doesn't exist, or the prefix walks above
+                    // `workspace_root` — nothing to glob. Same coarsening
+                    // policy as an ordinary unresolved dynamic import
+                    // (module docs): visible via the counter, not an error.
+                    graph.unresolved_dynamic_imports += 1;
+                    tracing::debug!(
+                        file = %file_rel,
+                        dir_prefix = %glob.dir_prefix,
+                        "js import graph: dynamic-import glob directory not found, coarsened"
+                    );
+                }
+            }
+        }
     }
 
     Ok(graph)
+}
+
+/// Resolve a [`importparse::GlobImportSite`]'s `dir_prefix` (e.g.
+/// `"./catalogs/"` or `"../locales/"`) relative to `dir` (the importing
+/// file's own directory) into a workspace-relative directory path.
+/// Lexically joins rather than `Path::join`-ing the raw prefix so the result
+/// never carries embedded `.`/`..` components — those would survive
+/// `strip_prefix` literally and corrupt the glob pattern built from it.
+/// Returns `None` if the prefix walks above `workspace_root`, if the
+/// resulting path isn't inside `workspace_root`, or if it isn't an existing
+/// directory on disk.
+fn resolve_glob_dir(dir: &Path, dir_prefix: &str, workspace_root: &Path) -> Option<String> {
+    let mut resolved = dir.to_path_buf();
+    for component in Path::new(dir_prefix.trim_end_matches('/')).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !resolved.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(seg) => resolved.push(seg),
+            _ => return None,
+        }
+    }
+    if !resolved.is_dir() {
+        return None;
+    }
+    let rel = resolved.strip_prefix(workspace_root).ok()?;
+    Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// If `specifier` names an npm package by its own text ([`bare_specifier_package_name`])
@@ -3649,6 +3737,60 @@ mod tests {
             "a transitively-reached file must be in the closure: {:?}",
             closure.files
         );
+    }
+
+    /// `` import(`./catalogs/${locale}.po`) `` — Vite's own dynamic-import-
+    /// with-variable pattern — resolves to a directory glob, not a coarsened
+    /// unresolved import, and that glob site propagates through the test
+    /// closure's BFS the same way `bare_specifiers` does.
+    #[test]
+    fn build_test_closure_declares_directory_glob_for_dynamic_import_with_variable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        write(dir.path(), "packages/a/src/catalogs/en-US.po", "msgid \"\"\n");
+        write(
+            dir.path(),
+            "packages/a/src/locale.ts",
+            "export async function loadMessages(locale) {\n  return import(`./catalogs/${locale}.po`);\n}\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import { loadMessages } from './locale';\ntest('a', () => loadMessages('en-US'));\n",
+        );
+
+        let resolvers = Resolvers::new(None);
+        let cache = ResolveCache::new();
+        let graph = build_package_import_graph(
+            &walker(),
+            dir.path(),
+            "packages/a",
+            &resolvers,
+            &cache,
+            None,
+        )
+        .expect("build graph");
+
+        assert_eq!(
+            graph.unresolved_dynamic_imports, 0,
+            "a directory-glob-shaped dynamic import must not be coarsened"
+        );
+        assert_eq!(graph.glob_sites.len(), 1);
+        assert_eq!(graph.glob_sites[0].dir, "packages/a/src/catalogs");
+        assert_eq!(graph.glob_sites[0].suffix, ".po");
+
+        let canonical_root = dir.path().canonicalize().expect("canonicalize");
+        let closure = build_test_closure(
+            &graph,
+            &canonical_root,
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build closure");
+
+        assert_eq!(closure.glob_sites.len(), 1);
+        assert_eq!(closure.glob_sites[0].dir, "packages/a/src/catalogs");
+        assert_eq!(closure.glob_sites[0].suffix, ".po");
     }
 
     /// An import that resolves outside the owning package (a workspace
