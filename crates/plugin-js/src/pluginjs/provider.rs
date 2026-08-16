@@ -4424,7 +4424,10 @@ impl ProviderTrait for Provider {
                         addr: req.addr.clone(),
                         driver: "js_lint".to_string(),
                         config,
-                        labels: vec![],
+                        // Mirrors plugin-go's `lint`/`go-lint` pairing (generic
+                        // cross-language label + tool-family-specific one) — see
+                        // `plugin-go/src/plugingo/driver_lint.rs`.
+                        labels: vec!["lint".to_string(), "js-lint".to_string()],
                         transitive: Default::default(),
                         approval: Default::default(),
                     },
@@ -4518,7 +4521,10 @@ impl ProviderTrait for Provider {
                         addr: req.addr.clone(),
                         driver: "js_test".to_string(),
                         config,
-                        labels: vec![],
+                        // Mirrors plugin-go's `test`/`go-test` pairing (generic
+                        // cross-language label + tool-family-specific one) — see
+                        // `plugin-go/src/plugingo/target_test.rs`.
+                        labels: vec!["test".to_string(), "js-test".to_string()],
                         transitive: Default::default(),
                         approval: Default::default(),
                     },
@@ -10271,6 +10277,7 @@ snapshots:
             .expect("get js_lint target_spec");
         assert_eq!(resp.target_spec.driver, "js_lint");
         assert!(resp.target_spec.config.contains_key("linter_version"));
+        assert_eq!(resp.target_spec.labels, vec!["lint", "js-lint"]);
     }
 
     // ---- `Provider::get` end to end for `js_test` — gated on a real
@@ -10332,6 +10339,7 @@ snapshots:
             .expect("get js_test target_spec");
         assert_eq!(resp.target_spec.driver, "js_test");
         assert!(resp.target_spec.config.contains_key("runner_version"));
+        assert_eq!(resp.target_spec.labels, vec!["test", "js-test"]);
     }
 
     // ---- M6: `js_bundle` entry-point validation, cross-package closure, ----
