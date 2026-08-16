@@ -633,9 +633,11 @@ const RUNNER_CONFIG_FILE_KEYS: &[&str] = &[
 /// Plugin-option keys whose value is an *explicit override path* to a
 /// plugin's own config file, passed at the plugin's own call site inside the
 /// runner config (`lingui({ configPath: './config.lingui.ts' })`) — not a
-/// module specifier (no `./` prefix required to be a real reference, unlike
-/// [`RUNNER_CONFIG_FILE_KEYS`]'s values), a plain filesystem path the plugin
-/// resolves itself. Confirmed live: `@lingui/vite-plugin` forwards its own
+/// module specifier, a plain filesystem path the plugin resolves itself,
+/// probed directly with no `<rootDir>`-token handling (unlike
+/// [`RUNNER_CONFIG_FILE_KEYS`]'s values, which also don't require a `./`
+/// prefix — see [`resolve_config_value_path`]'s doc — but do go through that
+/// token handling). Confirmed live: `@lingui/vite-plugin` forwards its own
 /// options straight to `@lingui/conf`'s `getConfig({ configPath, ... })`,
 /// which uses `configPath` verbatim (`configExists(configPath) ? load
 /// (configPath) : search(...)`) when given, skipping its own default
@@ -762,10 +764,20 @@ fn probe_first_party_path(candidate_no_ext: &Path) -> Option<PathBuf> {
 
 /// Resolve one `RUNNER_CONFIG_FILE_KEYS` value (`raw`) against `config_dir` —
 /// handling jest's `<rootDir>/...` token (approximated as `config_dir`,
-/// jest's own default when no explicit `rootDir` override exists) as well as
-/// a plain relative path. `None` for anything else (a bare module specifier
-/// naming a third-party setup package — not this scan's job; see
-/// [`RUNNER_CONFIG_FILE_KEYS`]'s doc).
+/// jest's own default when no explicit `rootDir` override exists), a plain
+/// `./`/`../`-prefixed relative path, and — confirmed live against a real
+/// report — a *bare* relative path with no prefix at all
+/// (`setupFiles: ["src/tests/browser.setup.tsx"]`): both jest and vitest
+/// resolve `setupFiles`-family entries relative to the project root
+/// regardless of a leading `./`, so requiring the prefix here silently
+/// dropped the file from the declared Input set — it was never staged, and
+/// the runner's own later fetch/require of it failed with no resolution
+/// error at all (a missing static asset, not an unresolved import
+/// specifier). Falls back to `None` only when no file exists at that path
+/// either, which is what actually distinguishes a real bare module
+/// specifier (`"@testing-library/jest-dom"` won't coincidentally exist as a
+/// file relative to the config's own directory) — not this scan's job; see
+/// [`RUNNER_CONFIG_FILE_KEYS`]'s doc.
 fn resolve_config_value_path(config_dir: &Path, raw: &str) -> Option<PathBuf> {
     if let Some(rest) = raw.strip_prefix("<rootDir>") {
         return probe_first_party_path(&config_dir.join(rest.trim_start_matches('/')));
@@ -773,7 +785,7 @@ fn resolve_config_value_path(config_dir: &Path, raw: &str) -> Option<PathBuf> {
     if raw.starts_with("./") || raw.starts_with("../") {
         return probe_first_party_path(&config_dir.join(raw));
     }
-    None
+    probe_first_party_path(&config_dir.join(raw))
 }
 
 /// Resolve one relative `import`/`require` specifier found *inside* a config
@@ -889,6 +901,21 @@ pub fn resolve_runner_config_referenced_files(
         for raw in &refs.paths {
             if let Some(resolved) = resolve_config_value_path(dir, raw) {
                 enqueue_referenced_config_file(resolved, depth, &mut seen, &mut found, &mut queue);
+            } else if let Some(package_name) = bare_specifier_package_name(raw) {
+                // Neither a `<rootDir>`/relative path nor a file that exists
+                // on disk — the remaining real case is a bare npm package
+                // name (`setupFilesAfterEnv: ["@testing-library/jest-dom"]`
+                // is a common real-world shape). Collected the same way the
+                // config's own `import`/`require` bare specifiers are below,
+                // so it reaches `test_deps_config`'s dependency resolution
+                // and gets declared/staged — silently dropping it here would
+                // leave the runner unable to `require` it, with nothing in
+                // the declared Input set to explain why.
+                bare_specifiers.push(BareSpecifierSite {
+                    file: path.to_string_lossy().replace('\\', "/"),
+                    specifier: raw.clone(),
+                    package_name,
+                });
             }
         }
         // A plugin's own explicit `configPath` option (see
@@ -3201,6 +3228,72 @@ mod tests {
             scan.bare_specifiers.is_empty(),
             "{:?}",
             scan.bare_specifiers
+        );
+    }
+
+    /// Reproduces a real report: `setupFiles: ["src/tests/browser.setup.tsx"]`
+    /// — a bare relative path, no `./` prefix — silently resolved to nothing,
+    /// so the setup file was never declared as an Input, never staged, and
+    /// vitest's own later fetch of it failed with no resolution error to
+    /// explain why (see `resolve_config_value_path`'s doc). Both jest and
+    /// vitest resolve `setupFiles`-family entries relative to root regardless
+    /// of a leading `./`, so heph must too.
+    #[test]
+    fn resolve_runner_config_referenced_files_resolves_bare_relative_path_with_no_dot_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "export default { test: { setupFiles: ['src/tests/browser.setup.tsx'] } };\n",
+        );
+        write(
+            dir.path(),
+            "src/tests/browser.setup.tsx",
+            "globalThis.__setup = true;\n",
+        );
+
+        let config_path = dir.path().join("vitest.config.ts");
+        let content = std::fs::read_to_string(&config_path).expect("read fixture");
+        let scan = resolve_runner_config_referenced_files(&config_path, &content)
+            .expect("resolve referenced files");
+
+        assert_eq!(
+            scan.files,
+            vec![dir.path().join("src/tests/browser.setup.tsx")]
+        );
+        assert!(
+            scan.bare_specifiers.is_empty(),
+            "{:?}",
+            scan.bare_specifiers
+        );
+    }
+
+    /// A `setupFiles`-family value that resolves to neither `<rootDir>` nor
+    /// an on-disk file must be a bare npm package name
+    /// (`setupFilesAfterEnv: ["@testing-library/jest-dom"]` is a common
+    /// real-world shape) — it must be collected as a bare specifier, not
+    /// silently dropped, or the sandbox never gets it staged and the runner
+    /// fails to `require` it with nothing in the declared Input set to
+    /// explain why.
+    #[test]
+    fn resolve_runner_config_referenced_files_collects_bare_package_name_in_setup_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "jest.config.js",
+            "module.exports = { setupFilesAfterEnv: ['@testing-library/jest-dom'] };\n",
+        );
+
+        let config_path = dir.path().join("jest.config.js");
+        let content = std::fs::read_to_string(&config_path).expect("read fixture");
+        let scan = resolve_runner_config_referenced_files(&config_path, &content)
+            .expect("resolve referenced files");
+
+        assert!(scan.files.is_empty(), "{:?}", scan.files);
+        assert_eq!(scan.bare_specifiers.len(), 1, "{:?}", scan.bare_specifiers);
+        assert_eq!(
+            scan.bare_specifiers[0].package_name,
+            "@testing-library/jest-dom"
         );
     }
 
