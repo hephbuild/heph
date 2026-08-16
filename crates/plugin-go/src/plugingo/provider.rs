@@ -34,7 +34,7 @@ use hmodel::htpkg::{PkgBuf, join_rel_checked_pkg};
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
     ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
-    ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
+    ProviderExecutor, ProviderFn, ProviderFunctionDef, State, applicable_states,
 };
 use hwalk::{CachedWalker, EntryKind, Ignore};
 use parking_lot::RwLock;
@@ -1216,32 +1216,6 @@ const TEST_STATE_KEYS: &[&str] = &[
     "runtime_pass_env",
     "pre_run",
 ];
-
-/// Whether a state opts its per-package config into descendant packages via
-/// `recursive = True`. Engine pre-filters states to ancestors-of-or-equal-to the
-/// target package, so a `recursive` state is always a valid ancestor (or self).
-fn state_is_recursive(state: &State) -> bool {
-    matches!(state.state.get("recursive"), Some(Value::Bool(true)))
-}
-
-/// Whether a state's per-package config (the `test = {...}` struct and
-/// `link = {...}`) applies to `addr_pkg`. By default config applies only to the
-/// exact declaring package; `recursive = True` extends it to all descendants.
-fn state_applies_to(state: &State, addr_pkg: &str) -> bool {
-    state.package.as_str() == addr_pkg || state_is_recursive(state)
-}
-
-/// Return the `states` that apply to `addr_pkg` (exact package, or `recursive`
-/// ancestors) and carry `key`, sorted shallow->deep so the closest declaration
-/// is applied last and wins on conflicting map keys.
-fn applicable_states<'a>(states: &'a [State], addr_pkg: &str, key: &str) -> Vec<&'a State> {
-    let mut out: Vec<&State> = states
-        .iter()
-        .filter(|s| state_applies_to(s, addr_pkg) && s.state.contains_key(key))
-        .collect();
-    out.sort_by_key(|s| s.package.as_str().len());
-    out
-}
 
 fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test::TestEnv> {
     let mut out = target_test::TestEnv::default();

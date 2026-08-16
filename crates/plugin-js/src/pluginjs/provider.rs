@@ -10,12 +10,13 @@ use enclose::enclose;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::Value;
+use hcore::htvalue::signature::ParamType;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
-    Provider as ProviderTrait, TargetSpec,
+    Provider as ProviderTrait, State, TargetSpec, applicable_states,
 };
 use hwalk::{CachedWalker, EntryKind, Ignore};
 use std::collections::BTreeSet;
@@ -3326,8 +3327,7 @@ fn test_deps_config(
                 .to_string_lossy()
                 .replace('\\', "/");
             let pattern = format!("{dir_rel}/*{}", glob.suffix);
-            runner_config_glob_addrs
-                .push(hbuiltins::pluginfs::glob_addr(&pattern, &[]).format());
+            runner_config_glob_addrs.push(hbuiltins::pluginfs::glob_addr(&pattern, &[]).format());
         }
         // `BareSpecifierSite::file` is workspace-relative everywhere else it's
         // used (`closure.bare_specifiers`, `graph.unresolved_bare_specifiers`)
@@ -4148,6 +4148,27 @@ fn empty_list_package_responses()
     Box::new(std::iter::empty())
 }
 
+/// Whether the closest `provider_state(provider="js", ...)` setting `key`
+/// for `addr_pkg` sets it to the bool `False`. `True` (or the key being
+/// unset anywhere in the ancestry) leaves it enabled — a closer `= True`
+/// re-enables what a farther `recursive` ancestor disabled.
+fn pick_bool_disabled(states: &[State], addr_pkg: &str, key: &str) -> bool {
+    let Some(state) = applicable_states(states, addr_pkg, key).into_iter().last() else {
+        return false;
+    };
+    matches!(state.state.get(key), Some(Value::Bool(false)))
+}
+
+/// `provider_state(provider="js", enabled=False)` opts a package (and its
+/// descendants, via `recursive = True`) out of *every* js target kind —
+/// `package_info`, `js_typecheck`, `js_lint`, `js_test`, `js_bundle`, and the
+/// `node_modules` sync target. The complete-disable knob, as opposed to
+/// [`pick_bool_disabled`] with `"test"`/`"lint"`, which disable one target
+/// kind at a time.
+fn pick_js_disabled(states: &[State], addr_pkg: &str) -> bool {
+    pick_bool_disabled(states, addr_pkg, "enabled")
+}
+
 impl ProviderTrait for Provider {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
@@ -4179,6 +4200,13 @@ impl ProviderTrait for Provider {
                 return Ok(empty_list_responses());
             }
 
+            // provider_state(provider="js", enabled=False) opts this package
+            // (and descendants, via recursive=True) out of every js target
+            // kind — see `pick_js_disabled`'s doc.
+            if pick_js_disabled(&req.states, req.package.as_str()) {
+                return Ok(empty_list_responses());
+            }
+
             let addr = Addr::new(
                 req.package.clone(),
                 PACKAGE_INFO_TARGET.to_string(),
@@ -4190,14 +4218,17 @@ impl ProviderTrait for Provider {
             // `package_info` — always present once the package exists (no
             // additional discovery needed, unlike `js_test`'s per-file
             // globbing), same as `js_typecheck` would be if it were listed
-            // here too.
-            responses.push(Ok(ListResponse {
-                addr: Addr::new(
-                    req.package.clone(),
-                    LINT_TARGET.to_string(),
-                    Default::default(),
-                ),
-            }));
+            // here too. Suppressed by `provider_state(provider="js",
+            // lint=False)` — see `pick_bool_disabled`'s doc.
+            if !pick_bool_disabled(&req.states, req.package.as_str(), "lint") {
+                responses.push(Ok(ListResponse {
+                    addr: Addr::new(
+                        req.package.clone(),
+                        LINT_TARGET.to_string(),
+                        Default::default(),
+                    ),
+                }));
+            }
 
             // The on-disk `node_modules` sync target — see
             // `NODE_MODULES_SYNC_TARGET`'s doc. Always listed alongside
@@ -4221,22 +4252,25 @@ impl ProviderTrait for Provider {
             // package) down with it, so a failure here is surfaced as its
             // own per-entry error — mirroring `collect_js_packages`'s
             // identical per-entry error handling — rather than propagated
-            // with `?`.
-            match self.discover_test_files(&req.package).await {
-                Ok(test_files) => {
-                    for file in test_files {
-                        let mut args = BTreeMap::new();
-                        args.insert("file".to_string(), file);
-                        responses.push(Ok(ListResponse {
-                            addr: Addr::new(req.package.clone(), TEST_TARGET.to_string(), args),
-                        }));
+            // with `?`. Suppressed by `provider_state(provider="js",
+            // test=False)` — see `pick_bool_disabled`'s doc.
+            if !pick_bool_disabled(&req.states, req.package.as_str(), "test") {
+                match self.discover_test_files(&req.package).await {
+                    Ok(test_files) => {
+                        for file in test_files {
+                            let mut args = BTreeMap::new();
+                            args.insert("file".to_string(), file);
+                            responses.push(Ok(ListResponse {
+                                addr: Addr::new(req.package.clone(), TEST_TARGET.to_string(), args),
+                            }));
+                        }
                     }
-                }
-                Err(e) => {
-                    responses.push(Err(e.context(format!(
-                        "discovering js_test files for {}",
-                        req.package.as_str()
-                    ))));
+                    Err(e) => {
+                        responses.push(Err(e.context(format!(
+                            "discovering js_test files for {}",
+                            req.package.as_str()
+                        ))));
+                    }
                 }
             }
 
@@ -4360,6 +4394,16 @@ impl ProviderTrait for Provider {
                 });
             }
 
+            // provider_state(provider="js", enabled=False) opts this package
+            // (and descendants, via recursive=True) out of every js target
+            // kind — checked once here, before any per-target-kind branch,
+            // so a disabled package short-circuits before any filesystem or
+            // config work. See `pick_js_disabled`'s doc; mirrors
+            // plugin-go's `test=False` gate ordering.
+            if pick_js_disabled(&req.states, req.addr.package.as_str()) {
+                return Err(GetError::NotFound);
+            }
+
             // `js_typecheck` is a second per-package target kind alongside
             // `package_info`, checked before the `PACKAGE_INFO_TARGET` gate
             // below so it isn't rejected as an unknown target name.
@@ -4401,6 +4445,9 @@ impl ProviderTrait for Provider {
             // `PACKAGE_INFO_TARGET` gate below for the same reason
             // `TYPECHECK_TARGET` is.
             if req.addr.name == LINT_TARGET {
+                if pick_bool_disabled(&req.states, req.addr.package.as_str(), "lint") {
+                    return Err(GetError::NotFound);
+                }
                 if self
                     .skip
                     .prunes_package(&self.workspace_root, Path::new(req.addr.package.as_str()))
@@ -4471,6 +4518,9 @@ impl ProviderTrait for Provider {
             // `PACKAGE_INFO_TARGET` gate below for the same reason
             // `TYPECHECK_TARGET` is.
             if req.addr.name == TEST_TARGET {
+                if pick_bool_disabled(&req.states, req.addr.package.as_str(), "test") {
+                    return Err(GetError::NotFound);
+                }
                 if self
                     .skip
                     .prunes_package(&self.workspace_root, Path::new(req.addr.package.as_str()))
@@ -4699,10 +4749,63 @@ impl ProviderTrait for Provider {
         _req: ProbeRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
-        // No provider-state axis exists yet (no variants in M0's scope — see
-        // ai-docs/js-plugin-plan.md's "Variants" section: module format/target
-        // env only apply to bundle targets, a later milestone).
+        // `probe` reports states this provider itself asserts about a
+        // package (there are none — no variants in M0's scope; see
+        // ai-docs/js-plugin-plan.md's "Variants" section). The
+        // `enabled`/`test`/`lint`/`recursive` provider_state axis (see
+        // `state_schema`) is BUILD-file-declared config the engine hands
+        // back via `req.states` in `list`/`get`, not something this
+        // provider generates on its own.
         Box::pin(async move { Ok(ProbeResponse { states: vec![] }) })
+    }
+
+    fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
+        use hplugin::provider::{StateField, StateSchema};
+        let field = |name: &str, ty: ParamType, doc: &str| StateField {
+            name: name.to_string(),
+            ty,
+            doc: doc.to_string(),
+            required: false,
+        };
+        Some(StateSchema {
+            fields: vec![
+                field(
+                    "enabled",
+                    ParamType::Bool,
+                    "Enable/disable every js target kind for this package — `package_info`, \
+                     `js_typecheck`, `js_lint`, `js_test`, `js_bundle`, and the `node_modules` \
+                     sync target. `enabled = False` disables them all; unset (or `True`) leaves \
+                     them enabled. By default applies only to this package; set \
+                     `recursive = True` to apply to descendant packages too. Unlike the \
+                     provider's `skip` config option (which excludes a directory from js's \
+                     package discovery entirely, workspace-wide, so no provider ever sees it), \
+                     `enabled = False` leaves the package visible to `list_packages` and to \
+                     every other provider — it only removes js's own targets for it.",
+                ),
+                field(
+                    "test",
+                    ParamType::Bool,
+                    "Enable/disable `js_test` targets for this package, independent of \
+                     `enabled`. `test = False` stops test files from being discovered/built; \
+                     unset (or `True`) leaves them enabled. By default applies only to this \
+                     package; set `recursive = True` to apply to descendant packages too.",
+                ),
+                field(
+                    "lint",
+                    ParamType::Bool,
+                    "Enable/disable the `js_lint` target for this package, independent of \
+                     `enabled`. `lint = False` stops it from being listed/resolved; unset (or \
+                     `True`) leaves it enabled. By default applies only to this package; set \
+                     `recursive = True` to apply to descendant packages too.",
+                ),
+                field(
+                    "recursive",
+                    ParamType::Bool,
+                    "Apply this state's `enabled`/`test`/`lint` settings to descendant \
+                     packages, not just the exact declaring package.",
+                ),
+            ],
+        })
     }
 }
 
@@ -4779,6 +4882,403 @@ mod tests {
             r#"{"name": "dep"}"#,
         );
         dir
+    }
+
+    // ---- provider_state: enabled/test/lint/recursive ----
+    //
+    // A per-package disable axis mirroring plugin-go's `test = False` /
+    // `recursive = True` mechanism (see `plugingo::provider::pick_test_skip`)
+    // — `enabled = False` disables every js target kind, `test`/`lint`
+    // disable one target kind each, and `recursive = True` extends whichever
+    // key it's set alongside to descendant packages.
+
+    fn js_state(pkg: &str, key: &str, val: Value) -> State {
+        State {
+            package: PkgBuf::from(pkg),
+            provider: "js".to_string(),
+            state: HashMap::from([(key.to_string(), val)]),
+        }
+    }
+
+    fn with_recursive(mut s: State) -> State {
+        s.state.insert("recursive".to_string(), Value::Bool(true));
+        s
+    }
+
+    #[test]
+    fn pick_js_disabled_false_when_no_states() {
+        assert!(!pick_js_disabled(&[], "packages/a"));
+    }
+
+    #[test]
+    fn pick_js_disabled_true_when_state_disables_own_package() {
+        let states = vec![js_state("packages/a", "enabled", Value::Bool(false))];
+        assert!(pick_js_disabled(&states, "packages/a"));
+    }
+
+    #[test]
+    fn pick_js_disabled_non_recursive_does_not_reach_descendants() {
+        let states = vec![js_state("packages", "enabled", Value::Bool(false))];
+        assert!(pick_js_disabled(&states, "packages"));
+        assert!(!pick_js_disabled(&states, "packages/a"));
+    }
+
+    #[test]
+    fn pick_js_disabled_recursive_reaches_descendants() {
+        let states = vec![with_recursive(js_state(
+            "packages",
+            "enabled",
+            Value::Bool(false),
+        ))];
+        assert!(pick_js_disabled(&states, "packages/a"));
+        assert!(pick_js_disabled(&states, "packages/a/nested"));
+    }
+
+    #[test]
+    fn pick_js_disabled_deeper_state_overrides_recursive_ancestor() {
+        let states = vec![
+            with_recursive(js_state("", "enabled", Value::Bool(false))),
+            js_state("packages/a", "enabled", Value::Bool(true)),
+        ];
+        assert!(pick_js_disabled(&states, "packages/b"));
+        assert!(!pick_js_disabled(&states, "packages/a"));
+    }
+
+    #[test]
+    fn pick_bool_disabled_test_and_lint_are_independent_keys() {
+        let states = vec![js_state("packages/a", "test", Value::Bool(false))];
+        assert!(pick_bool_disabled(&states, "packages/a", "test"));
+        assert!(!pick_bool_disabled(&states, "packages/a", "lint"));
+        assert!(!pick_js_disabled(&states, "packages/a"));
+    }
+
+    #[tokio::test]
+    async fn list_excludes_every_js_target_when_enabled_false() {
+        let dir = pnpm_fixture();
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('x', () => {})",
+        );
+        // A resolvable "main" so `js_bundle` would otherwise be listed too —
+        // without this the package has no usable entry point and `js_bundle`
+        // is never listed regardless of `enabled`, which would let this
+        // test's `iter.count() == 0` assertion pass even if the `js_bundle`
+        // listing branch ignored `enabled` entirely (code-quality review
+        // finding).
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let iter = provider
+            .list(
+                ListRequest {
+                    request_id: "test".to_string(),
+                    package: PkgBuf::from("packages/a"),
+                    states: vec![js_state("packages/a", "enabled", Value::Bool(false))],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("list");
+        assert_eq!(
+            iter.count(),
+            0,
+            "enabled=False must suppress every js target kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_excludes_only_test_target_when_test_false() {
+        let dir = pnpm_fixture();
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('x', () => {})",
+        );
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let iter = provider
+            .list(
+                ListRequest {
+                    request_id: "test".to_string(),
+                    package: PkgBuf::from("packages/a"),
+                    states: vec![js_state("packages/a", "test", Value::Bool(false))],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("list");
+        let addrs: Vec<Addr> = iter.map(|r| r.expect("no per-entry error").addr).collect();
+        assert!(
+            !addrs.iter().any(|a| a.name == TEST_TARGET),
+            "test=False must suppress js_test: {addrs:?}"
+        );
+        assert!(
+            addrs.iter().any(|a| a.name == LINT_TARGET),
+            "test=False must not suppress js_lint: {addrs:?}"
+        );
+        assert!(
+            addrs.iter().any(|a| a.name == PACKAGE_INFO_TARGET),
+            "test=False must not suppress package_info: {addrs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_excludes_only_lint_target_when_lint_false() {
+        let dir = pnpm_fixture();
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('x', () => {})",
+        );
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let iter = provider
+            .list(
+                ListRequest {
+                    request_id: "test".to_string(),
+                    package: PkgBuf::from("packages/a"),
+                    states: vec![js_state("packages/a", "lint", Value::Bool(false))],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("list");
+        let addrs: Vec<Addr> = iter.map(|r| r.expect("no per-entry error").addr).collect();
+        assert!(
+            !addrs.iter().any(|a| a.name == LINT_TARGET),
+            "lint=False must suppress js_lint: {addrs:?}"
+        );
+        assert!(
+            addrs.iter().any(|a| a.name == TEST_TARGET),
+            "lint=False must not suppress js_test: {addrs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recursive_enabled_false_reaches_descendant_package() {
+        let dir = pnpm_fixture();
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let states = vec![with_recursive(js_state(
+            "packages",
+            "enabled",
+            Value::Bool(false),
+        ))];
+        let iter = provider
+            .list(
+                ListRequest {
+                    request_id: "test".to_string(),
+                    package: PkgBuf::from("packages/a"),
+                    states,
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("list");
+        assert_eq!(
+            iter.count(),
+            0,
+            "recursive=True must propagate enabled=False to descendant packages"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_not_found_for_package_info_when_enabled_false() {
+        let dir = pnpm_fixture();
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = Addr::new(
+            PkgBuf::from("packages/a"),
+            PACKAGE_INFO_TARGET.to_string(),
+            Default::default(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![js_state("packages/a", "enabled", Value::Bool(false))],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GetError::NotFound)),
+            "enabled=False must make package_info resolve to NotFound"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_not_found_for_lint_target_when_lint_false() {
+        let dir = pnpm_fixture();
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = Addr::new(
+            PkgBuf::from("packages/a"),
+            LINT_TARGET.to_string(),
+            Default::default(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![js_state("packages/a", "lint", Value::Bool(false))],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GetError::NotFound)),
+            "lint=False must make js_lint resolve to NotFound"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_not_found_for_test_target_when_test_false() {
+        let dir = pnpm_fixture();
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('x', () => {})",
+        );
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert("file".to_string(), "packages/a/src/a.test.ts".to_string());
+        let addr = Addr::new(PkgBuf::from("packages/a"), TEST_TARGET.to_string(), args);
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![js_state("packages/a", "test", Value::Bool(false))],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GetError::NotFound)),
+            "test=False must make js_test resolve to NotFound"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_not_found_for_typecheck_target_when_enabled_false() {
+        let dir = pnpm_fixture();
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = Addr::new(
+            PkgBuf::from("packages/a"),
+            TYPECHECK_TARGET.to_string(),
+            Default::default(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![js_state("packages/a", "enabled", Value::Bool(false))],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GetError::NotFound)),
+            "enabled=False must make js_typecheck resolve to NotFound"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_not_found_for_node_modules_sync_target_when_enabled_false() {
+        let dir = pnpm_fixture();
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Pnpm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = Addr::new(
+            PkgBuf::from("packages/a"),
+            NODE_MODULES_SYNC_TARGET.to_string(),
+            Default::default(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![js_state("packages/a", "enabled", Value::Bool(false))],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GetError::NotFound)),
+            "enabled=False must make the node_modules sync target resolve to NotFound"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_not_found_for_bundle_target_when_enabled_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "main": "src/index.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let addr = Addr::new(
+            PkgBuf::from("packages/a"),
+            BUNDLE_TARGET.to_string(),
+            Default::default(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr,
+                    states: vec![js_state("packages/a", "enabled", Value::Bool(false))],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GetError::NotFound)),
+            "enabled=False must make js_bundle resolve to NotFound"
+        );
     }
 
     // ---- graph_cache: Provider::import_graph memoization ----
@@ -8559,7 +9059,11 @@ snapshots:
     fn test_deps_config_declares_directory_glob_for_dynamic_import_with_variable() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
-        write(dir.path(), "packages/a/src/catalogs/en-US.po", "msgid \"\"\n");
+        write(
+            dir.path(),
+            "packages/a/src/catalogs/en-US.po",
+            "msgid \"\"\n",
+        );
         write(
             dir.path(),
             "packages/a/src/locale.ts",
