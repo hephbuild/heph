@@ -878,11 +878,15 @@ fn try_read_runner_result(path: &std::path::Path) -> Option<Result<RunnerJsonRes
 /// Prefers each failing test file's own `message` (the runner's own
 /// preformatted diagnostic — see `RunnerTestFileResult` doc); falls back to
 /// the captured raw stdout/stderr tail when no structured message exists at
-/// all (e.g. a crash before any test file was even collected), and always
-/// appends that raw tail as a supplement otherwise — a warning printed
-/// outside any test result (a Vite dependency-scan failure, say) lives only
-/// in the raw stream, never in `testResults`, and must not be lost just
-/// because a structured message was also available.
+/// all (e.g. a crash before any test file was even collected), and appends
+/// that raw tail as a supplement otherwise — a warning printed outside any
+/// test result (a Vite dependency-scan failure, say) lives only in the raw
+/// stream, never in `testResults`, and must not be lost just because a
+/// structured message was also available. Skipped when the raw tail already
+/// contains the structured message verbatim (the common case: vitest's own
+/// `Error:`-prefixed terminal dump and the JSON reporter's `message` field
+/// both derive from the same underlying error) — appending it there would
+/// just print the same failure twice, once terse and once in full.
 fn failure_detail_from_json(result: &RunnerJsonResult, stdout: &str, stderr: &str) -> String {
     let mut structured = String::new();
     for tr in &result.test_results {
@@ -901,10 +905,11 @@ fn failure_detail_from_json(result: &RunnerJsonResult, stdout: &str, stderr: &st
     if stdout.trim().is_empty() && stderr.trim().is_empty() {
         return structured;
     }
-    format!(
-        "{structured}\n\n--- raw stdout/stderr ---\n{}",
-        test_failure_detail(stdout, stderr)
-    )
+    let raw = test_failure_detail(stdout, stderr);
+    if raw.contains(structured.as_str()) {
+        return raw;
+    }
+    format!("{structured}\n\n--- raw stdout/stderr ---\n{raw}")
 }
 
 impl JsTestDriver {
@@ -2603,5 +2608,53 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("lines omitted"), "{detail}");
+    }
+
+    /// Reproduces a real report: the structured `testResults[].message` is a
+    /// terse prefix ("Failed to import test file ...") of the full error
+    /// vitest already printed to stderr (which additionally carries the
+    /// `Caused by:` chain) — appending the raw tail as a "supplement" then
+    /// printed the same failure twice, once terse and once in full.
+    #[test]
+    fn failure_detail_from_json_skips_raw_supplement_when_it_already_contains_the_message() {
+        let result = RunnerJsonResult {
+            success: false,
+            test_results: vec![RunnerTestFileResult {
+                message: "Failed to import test file /ws/browser.setup.tsx".to_string(),
+            }],
+        };
+        let stderr = "Error: Failed to import test file /ws/browser.setup.tsx\n\
+                       Caused by: TypeError: Failed to fetch dynamically imported module\n";
+        let detail = failure_detail_from_json(&result, "", stderr);
+        assert_eq!(
+            detail
+                .matches("Failed to import test file /ws/browser.setup.tsx")
+                .count(),
+            1,
+            "{detail}"
+        );
+        assert!(detail.contains("Caused by"), "{detail}");
+        assert!(!detail.contains("--- raw stdout/stderr ---"), "{detail}");
+    }
+
+    /// The opposite case: the raw stream carries a warning the structured
+    /// message never mentions (e.g. printed outside any test result) — that
+    /// must still reach the user, so the supplement is kept.
+    #[test]
+    fn failure_detail_from_json_keeps_raw_supplement_when_it_adds_new_information() {
+        let result = RunnerJsonResult {
+            success: false,
+            test_results: vec![RunnerTestFileResult {
+                message: "some test assertion failed".to_string(),
+            }],
+        };
+        let stderr = "unrelated warning printed outside any test result\n";
+        let detail = failure_detail_from_json(&result, "", stderr);
+        assert!(detail.contains("some test assertion failed"), "{detail}");
+        assert!(detail.contains("--- raw stdout/stderr ---"), "{detail}");
+        assert!(
+            detail.contains("unrelated warning printed outside any test result"),
+            "{detail}"
+        );
     }
 }
