@@ -47,6 +47,23 @@
 //! instruction. No graph edge is produced for it (there is nothing to
 //! resolve it to), so it cannot trip phantom-dependency detection either.
 //!
+//! **One shape of "non-literal" is not actually unresolvable**, though:
+//! `` import(`./catalogs/${locale}.po`) `` — a single interpolated
+//! expression sandwiched between a literal directory prefix and a literal
+//! suffix. This is exactly Vite's own "dynamic import with a variable"
+//! feature: Vite's import-analysis plugin statically globs the prefix
+//! directory for every file matching the suffix and builds a runtime lookup
+//! table from it (equivalent to `import.meta.glob('./catalogs/*.po')`) — it
+//! needs every matching file present on disk, not just the one the running
+//! test happens to pick. Real bug this fixes: a locale-catalog directory
+//! whose `index.ts` did exactly this, resolved fine outside heph (real
+//! `node_modules`/Vite on the host), but failed inside the sandbox because
+//! nothing had ever told heph the whole `catalogs/` directory was a runtime
+//! dependency — the file that imports it doesn't name any of the `.po`
+//! files directly, only the directory-and-suffix pattern. `import()` with
+//! this shape is recognized as [`GlobImportSite`] instead of being coarsened
+//! — see [`ImportSite`] vs. `GlobImportSite`'s doc for the split.
+//!
 //! **`import type` / `export type`** (TypeScript type-only syntax) are
 //! extracted the same way as their value counterparts but flagged
 //! `type_only: true` — `importgraph.rs` routes these into the separate type
@@ -80,13 +97,32 @@ pub struct ImportSite {
     pub type_only: bool,
 }
 
+/// A dynamic `import()` call shaped like Vite's own "dynamic import with a
+/// variable" pattern — see module docs. Not a resolved specifier (there is
+/// no single file), but a directory + suffix pattern the caller must expand
+/// into every matching file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobImportSite {
+    /// The literal text before the interpolated expression — always
+    /// starting with `./` or `../` and ending in `/`, e.g. `"./catalogs/"`.
+    pub dir_prefix: String,
+    /// The literal text after the interpolated expression — never contains
+    /// `/` (a suffix with `/` would mean a nested path, not a single
+    /// directory listing, which Vite itself can't glob either).
+    pub suffix: String,
+}
+
 /// Everything statically extracted from one source file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedImports {
     pub sites: Vec<ImportSite>,
+    /// `import()` calls recognized as Vite's directory-glob shape — see
+    /// [`GlobImportSite`].
+    pub glob_sites: Vec<GlobImportSite>,
     /// Count of `import()` call sites whose argument was not a string
-    /// literal — see module docs' "Dynamic import with a non-literal
-    /// argument" section. Never resolved, never silently dropped.
+    /// literal and not a [`GlobImportSite`] shape — see module docs'
+    /// "Dynamic import with a non-literal argument" section. Never resolved,
+    /// never silently dropped.
     pub unresolved_dynamic_imports: usize,
 }
 
@@ -131,6 +167,7 @@ pub fn parse_file_imports(path: &Path, source_text: &str) -> anyhow::Result<Pars
     visitor.visit_program(&ret.program);
     Ok(ParsedImports {
         sites: visitor.sites,
+        glob_sites: visitor.glob_sites,
         unresolved_dynamic_imports: visitor.unresolved_dynamic_imports,
     })
 }
@@ -138,6 +175,7 @@ pub fn parse_file_imports(path: &Path, source_text: &str) -> anyhow::Result<Pars
 #[derive(Default)]
 struct ImportVisitor {
     sites: Vec<ImportSite>,
+    glob_sites: Vec<GlobImportSite>,
     unresolved_dynamic_imports: usize,
 }
 
@@ -221,6 +259,19 @@ impl<'a> Visit<'a> for ImportVisitor {
             Expression::StringLiteral(s) => {
                 self.push(s.value.as_str(), ModuleContext::Esm, false);
             }
+            Expression::TemplateLiteral(tpl) => {
+                if let Some(glob) = glob_site_from_template_literal(tpl) {
+                    self.glob_sites.push(glob);
+                } else {
+                    self.unresolved_dynamic_imports += 1;
+                    tracing::debug!(
+                        span = ?it.span,
+                        "js import parse: dynamic import() with a template-literal argument \
+                         that isn't a single-directory glob shape, coarsened (no static edge — \
+                         see importparse.rs module docs)"
+                    );
+                }
+            }
             _ => {
                 self.unresolved_dynamic_imports += 1;
                 tracing::debug!(
@@ -232,6 +283,35 @@ impl<'a> Visit<'a> for ImportVisitor {
         }
         walk::walk_import_expression(self, it);
     }
+}
+
+/// Recognize Vite's own "dynamic import with a variable" shape in a template
+/// literal: exactly one interpolated expression, with a literal prefix
+/// (relative, ending in `/`) and a literal suffix (no further `/`) around
+/// it — see module docs. Anything wider (more than one interpolation, an
+/// absolute or bare prefix, a suffix that names a nested path) is not a
+/// shape any bundler can enumerate without a runtime value either, so it's
+/// left to the caller's normal coarsening.
+fn glob_site_from_template_literal(tpl: &oxc_ast::ast::TemplateLiteral) -> Option<GlobImportSite> {
+    if tpl.expressions.len() != 1 {
+        return None;
+    }
+    let quasis: &[_] = &tpl.quasis;
+    let [prefix, suffix] = quasis else {
+        return None;
+    };
+    let prefix = prefix.value.raw.as_str();
+    let suffix = suffix.value.raw.as_str();
+    if !(prefix.starts_with("./") || prefix.starts_with("../")) || !prefix.ends_with('/') {
+        return None;
+    }
+    if suffix.contains('/') {
+        return None;
+    }
+    Some(GlobImportSite {
+        dir_prefix: prefix.to_string(),
+        suffix: suffix.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -316,7 +396,11 @@ mod tests {
     }
 
     #[test]
-    fn coarsens_dynamic_import_with_non_literal_argument() {
+    fn dynamic_import_with_directory_glob_template_is_recognized_not_coarsened() {
+        // The exact shape named in the module docs' "Dynamic import with a
+        // non-literal argument" section — now recognized as a
+        // `GlobImportSite`, not coarsened, since it's Vite's own
+        // enumerable dynamic-import-with-variable pattern.
         let p = parse(
             "js",
             "const lang = 'en'; const x = import(`./locales/${lang}.js`);",
@@ -326,7 +410,10 @@ mod tests {
             "a non-literal dynamic import must not produce a resolved edge: {:?}",
             p.sites
         );
-        assert_eq!(p.unresolved_dynamic_imports, 1);
+        assert_eq!(p.unresolved_dynamic_imports, 0);
+        assert_eq!(p.glob_sites.len(), 1);
+        assert_eq!(p.glob_sites[0].dir_prefix, "./locales/");
+        assert_eq!(p.glob_sites[0].suffix, ".js");
     }
 
     #[test]
@@ -334,6 +421,50 @@ mod tests {
         let p = parse("js", "function load(mod) { return import(mod); }");
         assert_eq!(p.unresolved_dynamic_imports, 1);
         assert!(p.sites.is_empty());
+    }
+
+    #[test]
+    fn recognizes_dynamic_import_single_directory_glob_template() {
+        let p = parse(
+            "js",
+            "const locale = 'en-US'; const x = import(`./catalogs/${locale}.po`);",
+        );
+        assert_eq!(p.unresolved_dynamic_imports, 0);
+        assert!(p.sites.is_empty());
+        assert_eq!(p.glob_sites.len(), 1);
+        assert_eq!(p.glob_sites[0].dir_prefix, "./catalogs/");
+        assert_eq!(p.glob_sites[0].suffix, ".po");
+    }
+
+    #[test]
+    fn recognizes_dynamic_import_glob_template_with_parent_dir_prefix() {
+        let p = parse("js", "const x = import(`../locales/${lang}.json`);");
+        assert_eq!(p.unresolved_dynamic_imports, 0);
+        assert_eq!(p.glob_sites.len(), 1);
+        assert_eq!(p.glob_sites[0].dir_prefix, "../locales/");
+        assert_eq!(p.glob_sites[0].suffix, ".json");
+    }
+
+    #[test]
+    fn coarsens_dynamic_import_glob_template_with_multiple_expressions() {
+        let p = parse("js", "const x = import(`./${a}/${b}.po`);");
+        assert_eq!(p.unresolved_dynamic_imports, 1);
+        assert!(p.glob_sites.is_empty());
+        assert!(p.sites.is_empty());
+    }
+
+    #[test]
+    fn coarsens_dynamic_import_glob_template_with_nested_suffix_path() {
+        let p = parse("js", "const x = import(`./catalogs/${locale}/index.po`);");
+        assert_eq!(p.unresolved_dynamic_imports, 1);
+        assert!(p.glob_sites.is_empty());
+    }
+
+    #[test]
+    fn coarsens_dynamic_import_glob_template_with_bare_prefix() {
+        let p = parse("js", "const x = import(`catalogs/${locale}.po`);");
+        assert_eq!(p.unresolved_dynamic_imports, 1);
+        assert!(p.glob_sites.is_empty());
     }
 
     #[test]
