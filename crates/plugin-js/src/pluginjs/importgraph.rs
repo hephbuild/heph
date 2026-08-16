@@ -879,15 +879,34 @@ fn known_plugin_ambient_config_file(package_name: &str, dir: &Path) -> Option<Pa
 /// config; in practice a real config chain is one or two files deep. See
 /// [`RunnerConfigScan::bare_specifiers`] for the config's own third-party
 /// imports, which this also collects but does not recurse into.
+///
+/// `tsconfig` (the same one `test_deps_config` already resolves via
+/// `find_nearest_tsconfig`) is used to resolve a setupFiles-referenced
+/// file's own tsconfig `paths` aliases (`import { x } from "@/locale"`) —
+/// reproduces a real report: a bare, non-relative specifier that is neither
+/// `./`/`../`-prefixed nor a valid npm scope shape (see
+/// `bare_specifier_package_name`'s doc) fell through *both* existing
+/// branches and was silently dropped, so the aliased file was never
+/// declared as an Input, never staged, and the runner's own later resolve
+/// of it failed with no diagnostic pointing at why. Resolved via the same
+/// `Resolvers`/`oxc_resolver` machinery [`build_test_closure`] already uses
+/// for the test file's own graph — but only a result that lands *outside*
+/// `node_modules` counts here: a specifier that happens to also resolve
+/// into an installed package is left to the existing bare-specifier/
+/// lockfile-driven path below, never decided by walking `oxc_resolver`
+/// against ambient `node_modules` (the M3-review lesson this crate already
+/// learned once — see this module's top-of-file doc).
 pub fn resolve_runner_config_referenced_files(
     config_path: &Path,
     config_content: &str,
+    tsconfig: Option<&Path>,
 ) -> anyhow::Result<RunnerConfigScan> {
     const MAX_DEPTH: usize = 4;
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut found: BTreeSet<PathBuf> = BTreeSet::new();
     let mut bare_specifiers: Vec<BareSpecifierSite> = Vec::new();
     let mut queue: VecDeque<(PathBuf, String, usize)> = VecDeque::new();
+    let resolvers = Resolvers::new(tsconfig);
     seen.insert(config_path.to_path_buf());
     queue.push_back((config_path.to_path_buf(), config_content.to_string(), 0));
 
@@ -937,6 +956,18 @@ pub fn resolve_runner_config_referenced_files(
         if let Ok(imports) = importparse::parse_file_imports(&path, &content) {
             for site in imports.sites {
                 if let Some(resolved) = resolve_config_import_specifier(dir, &site.specifier) {
+                    enqueue_referenced_config_file(
+                        resolved, depth, &mut seen, &mut found, &mut queue,
+                    );
+                } else if let ResolveOutcome::Resolved(resolved) =
+                    resolvers.resolve_runtime(site.context, dir, &site.specifier)
+                    && thirdparty_pkg_name_from_path(&resolved).is_none()
+                {
+                    // A non-relative specifier that resolved to a first-party
+                    // file — a tsconfig `paths` alias (`@/locale`), not a
+                    // real npm package (see this function's doc). Recursed
+                    // into like any other referenced file: the aliased
+                    // file's own further imports must be discovered too.
                     enqueue_referenced_config_file(
                         resolved, depth, &mut seen, &mut found, &mut queue,
                     );
@@ -1339,7 +1370,11 @@ pub fn resolve_eslint_config_referenced_files(
     // `bare_specifiers` through the same declared-dependency check/staging
     // `test_deps_config` now has, for every file in the chain, not just
     // this one's leaf.
-    for f in resolve_runner_config_referenced_files(config_path, config_content)?.files {
+    // `None`: an eslint flat config importing app code via a tsconfig `paths`
+    // alias would be unusual (unlike a test's `setupFiles`, which routinely
+    // does), and threading a tsconfig through here is out of scope for the
+    // gap this function's own doc already discloses above.
+    for f in resolve_runner_config_referenced_files(config_path, config_content, None)?.files {
         if seen.insert(f.clone()) {
             found.insert(f);
         }
@@ -3212,7 +3247,7 @@ mod tests {
 
         let config_path = dir.path().join("vitest.config.ts");
         let content = std::fs::read_to_string(&config_path).expect("read fixture");
-        let mut scan = resolve_runner_config_referenced_files(&config_path, &content)
+        let mut scan = resolve_runner_config_referenced_files(&config_path, &content, None)
             .expect("resolve referenced files");
         scan.files.sort();
 
@@ -3254,12 +3289,81 @@ mod tests {
 
         let config_path = dir.path().join("vitest.config.ts");
         let content = std::fs::read_to_string(&config_path).expect("read fixture");
-        let scan = resolve_runner_config_referenced_files(&config_path, &content)
+        let scan = resolve_runner_config_referenced_files(&config_path, &content, None)
             .expect("resolve referenced files");
 
         assert_eq!(
             scan.files,
             vec![dir.path().join("src/tests/browser.setup.tsx")]
+        );
+        assert!(
+            scan.bare_specifiers.is_empty(),
+            "{:?}",
+            scan.bare_specifiers
+        );
+    }
+
+    /// Reproduces a second, deeper real report on the same target: a
+    /// setupFiles-referenced file that itself imports via a tsconfig
+    /// `paths` alias (`import { loadMessages } from "@/locale"`) pointing
+    /// at a *directory* (`@/locale` -> `src/locale/index.ts`) — a bare,
+    /// non-relative specifier that is neither `./`/`../`-prefixed nor a
+    /// valid npm scope shape (`bare_specifier_package_name("@/locale")` is
+    /// `None`, same as `"@/components/Foo"`), so it fell through every
+    /// existing branch and was silently dropped: `src/locale/index.ts` was
+    /// never declared as an Input, never staged, and Vite's own runtime
+    /// resolution of `@/locale` failed with "does the file exist?" even
+    /// though the aliased file was right there on the real host tree.
+    #[test]
+    fn resolve_runner_config_referenced_files_resolves_tsconfig_paths_alias_to_a_directory_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./src/*"]}}}"#,
+        );
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "export default { test: { setupFiles: ['src/tests/browser.setup.tsx'] } };\n",
+        );
+        write(
+            dir.path(),
+            "src/tests/browser.setup.tsx",
+            "import { loadMessages } from \"@/locale\";\n\
+             beforeAll(() => loadMessages());\n",
+        );
+        write(
+            dir.path(),
+            "src/locale/index.ts",
+            "export function loadMessages() {}\n",
+        );
+
+        let config_path = dir.path().join("vitest.config.ts");
+        let content = std::fs::read_to_string(&config_path).expect("read fixture");
+        let tsconfig = dir.path().join("tsconfig.json");
+        let mut scan =
+            resolve_runner_config_referenced_files(&config_path, &content, Some(&tsconfig))
+                .expect("resolve referenced files");
+        scan.files.sort();
+
+        // `@/locale` is resolved via `oxc_resolver`, which follows symlinks
+        // the way Node's own runtime resolution does (`resolvers.rs`'s tests
+        // hit the identical requirement) — on macOS `$TMPDIR` itself sits
+        // behind one (`/tmp` -> `/private/tmp`), so *that* expected path
+        // must be canonicalized. `browser.setup.tsx` itself is resolved via
+        // the plain `probe_first_party_path`/`is_file()` check the
+        // `setupFiles` value goes through, which does not canonicalize —
+        // matching production's own already-known need to canonicalize
+        // `workspace_root` before comparing (see `test_deps_config`'s
+        // `canonical_root`).
+        let root = dir.path().canonicalize().expect("canonicalize tempdir");
+        assert_eq!(
+            scan.files,
+            vec![
+                root.join("src/locale/index.ts"),
+                dir.path().join("src/tests/browser.setup.tsx"),
+            ]
         );
         assert!(
             scan.bare_specifiers.is_empty(),
@@ -3286,7 +3390,7 @@ mod tests {
 
         let config_path = dir.path().join("jest.config.js");
         let content = std::fs::read_to_string(&config_path).expect("read fixture");
-        let scan = resolve_runner_config_referenced_files(&config_path, &content)
+        let scan = resolve_runner_config_referenced_files(&config_path, &content, None)
             .expect("resolve referenced files");
 
         assert!(scan.files.is_empty(), "{:?}", scan.files);
@@ -3303,7 +3407,7 @@ mod tests {
         let config_path = dir.path().join("vitest.config.ts");
         let content = "export default { test: {} };\n";
         write(dir.path(), "vitest.config.ts", content);
-        let scan = resolve_runner_config_referenced_files(&config_path, content)
+        let scan = resolve_runner_config_referenced_files(&config_path, content, None)
             .expect("resolve referenced files");
         assert!(scan.files.is_empty(), "{:?}", scan.files);
         assert!(
@@ -3325,7 +3429,7 @@ mod tests {
         let content = "import react from '@vitejs/plugin-react';\n\
              export default { plugins: [react()], test: {} };\n";
         write(dir.path(), "vitest.config.ts", content);
-        let scan = resolve_runner_config_referenced_files(&config_path, content)
+        let scan = resolve_runner_config_referenced_files(&config_path, content, None)
             .expect("resolve referenced files");
         assert!(
             scan.files.is_empty(),
@@ -3353,7 +3457,7 @@ mod tests {
         write(dir.path(), "lingui.config.js", "module.exports = {};\n");
         let config_path = dir.path().join("vitest.config.ts");
 
-        let scan = resolve_runner_config_referenced_files(&config_path, content)
+        let scan = resolve_runner_config_referenced_files(&config_path, content, None)
             .expect("resolve referenced files");
 
         assert!(
@@ -3384,7 +3488,7 @@ mod tests {
         write(dir.path(), "lingui.config.ts", "export default {};\n");
         let config_path = dir.path().join("vitest.config.ts");
 
-        let scan = resolve_runner_config_referenced_files(&config_path, content)
+        let scan = resolve_runner_config_referenced_files(&config_path, content, None)
             .expect("resolve referenced files");
 
         assert!(
@@ -3406,7 +3510,7 @@ mod tests {
         write(dir.path(), "vitest.config.ts", content);
         let config_path = dir.path().join("vitest.config.ts");
 
-        let scan = resolve_runner_config_referenced_files(&config_path, content)
+        let scan = resolve_runner_config_referenced_files(&config_path, content, None)
             .expect("resolve referenced files");
 
         assert!(scan.files.is_empty(), "{:?}", scan.files);
@@ -3428,7 +3532,7 @@ mod tests {
         write(dir.path(), "config.lingui.ts", "export default {};\n");
         let config_path = dir.path().join("vitest.config.ts");
 
-        let scan = resolve_runner_config_referenced_files(&config_path, content)
+        let scan = resolve_runner_config_referenced_files(&config_path, content, None)
             .expect("resolve referenced files");
 
         assert!(
