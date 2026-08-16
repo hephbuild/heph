@@ -2057,16 +2057,19 @@ impl Provider {
                             .replace('\\', "/");
                         let content = std::fs::read_to_string(p)
                             .with_context(|| format!("reading bundler config {p:?}"))?;
-                        let refs = importgraph::resolve_runner_config_referenced_files(p, &content)
-                            .with_context(|| {
-                                format!("resolving files referenced by bundler config {p:?}")
-                            })?;
-                        // `bare_specifiers` is deliberately unused here:
                         // `esbuild.config.json` is JSON, which
-                        // `resolve_runner_config_referenced_files` (via
-                        // `importparse::parse_file_imports`) never parses as
-                        // a module in the first place, so this is always
-                        // empty in practice — unlike `test_deps_config`'s
+                        // `importparse::parse_file_imports` never parses as a
+                        // module, so the tsconfig-paths-alias resolution
+                        // branch this function's `tsconfig` param feeds never
+                        // fires here in practice — `None` is correct, not
+                        // merely convenient.
+                        let refs =
+                            importgraph::resolve_runner_config_referenced_files(p, &content, None)
+                                .with_context(|| {
+                                    format!("resolving files referenced by bundler config {p:?}")
+                                })?;
+                        // `bare_specifiers` is deliberately unused here: see
+                        // above — unlike `test_deps_config`'s
                         // real JS/TS runner configs, which do need it (see
                         // that call site).
                         //
@@ -3296,10 +3299,12 @@ fn test_deps_config(
     // ever imported it.
     let mut runner_config_bare_specifiers: Vec<importgraph::BareSpecifierSite> = Vec::new();
     if let Some(p) = &runner_config {
-        let scan = importgraph::resolve_runner_config_referenced_files(p, &runner_config_content)
-            .with_context(|| {
-            format!("scanning test-runner config {p:?} for referenced files")
-        })?;
+        let scan = importgraph::resolve_runner_config_referenced_files(
+            p,
+            &runner_config_content,
+            tsconfig.as_deref(),
+        )
+        .with_context(|| format!("scanning test-runner config {p:?} for referenced files"))?;
         for f in scan.files {
             runner_config_ref_paths_rel.push(
                 f.strip_prefix(workspace_root)
