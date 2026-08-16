@@ -271,11 +271,11 @@ pub struct RequestStateData {
     /// Speculative `RequestState`s alive on this request — see
     /// [`RequestState::speculative_live`].
     speculative_live: std::sync::atomic::AtomicUsize,
-    // Key includes `is_top`: top-level vs dependency resolution of the same
-    // (addr, outputs) must not share a cell, because only the top-level frame
-    // rewrites an `in_place` codegen target's own sources / stores its fixpoint.
-    // (A `copy` target's tree write-back is is_top-independent and single-flights
-    // on `mem_codegen_copy` instead.)
+    // Key includes `is_top`: a top-level frame surfaces a failure as the run's own
+    // (`surface_top`) where a dependency frame reports it as collateral, so the two
+    // do not produce interchangeable results and must not share a cell. The codegen
+    // tree write-back used to be the reason and no longer is — it is
+    // is_top-independent and single-flights on `mem_codegen_tree`.
     pub mem_result: Memoizer<
         (AddrKey, OutputMatcher, bool),
         Result<Arc<crate::engine::result::EResult>, ArcErr>,
@@ -288,12 +288,14 @@ pub struct RequestStateData {
     /// addr can never both hold the non-reentrant per-addr lock — the
     /// self-deadlock this prevents.
     pub(crate) mem_locked_result: Memoizer<AddrKey, Result<Arc<LockedResolution>, ArcErr>>,
-    /// Single-flights the `codegen = "copy"` tree write-back, keyed by `Addr`
-    /// alone. Every frame that resolves the target offers it — the top-level one,
-    /// each dependent that reads an output group, and the `meta` walk that only
-    /// hashes it — and exactly one performs it, so the tree is written once per
-    /// addr per request no matter how many ways the target was reached.
-    pub(crate) mem_codegen_copy: Memoizer<AddrKey, Result<(), ArcErr>>,
+    /// Single-flights the codegen tree write-back, keyed by `Addr` alone. Every
+    /// frame that resolves the target offers it — the top-level one, each
+    /// dependent that reads an output group, and the `meta` walk that only hashes
+    /// it — and exactly one performs it, so the tree is written once per addr per
+    /// request no matter how many ways the target was reached. The in_place
+    /// write-back guard and the fixpoint registration ride inside it, for the same
+    /// reason: one write, one guard, one fixpoint.
+    pub(crate) mem_codegen_tree: Memoizer<AddrKey, Result<(), ArcErr>>,
     /// Single-flights the lazy pull of one remote blob, keyed by
     /// `(addr, hashin, blob name)`. Two `outputs` cells of the same addr both need
     /// its support files, so without this they would download and write the same
@@ -1075,7 +1077,7 @@ impl Engine {
             speculative_live: std::sync::atomic::AtomicUsize::new(0),
             mem_execute_cache: Memoizer::with_tag_task("execute_cache", self.runtime.clone()),
             mem_locked_result: Memoizer::with_tag_task("locked_result", self.runtime.clone()),
-            mem_codegen_copy: Memoizer::with_tag_task("codegen_copy", self.runtime.clone()),
+            mem_codegen_tree: Memoizer::with_tag_task("codegen_tree", self.runtime.clone()),
             mem_remote_blob: Memoizer::with_tag_task("remote_blob", self.runtime.clone()),
             mem_result: Memoizer::with_tag_task("result", self.runtime.clone()),
             mem_meta: Memoizer::with_tag_task("meta", self.runtime.clone()),

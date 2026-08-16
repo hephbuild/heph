@@ -788,6 +788,23 @@ fn is_passthrough(use_tmp_cache: bool, content: &outputartifact::Content) -> boo
         }
 }
 
+/// The output groups a codegen target reconciles with the tree — every group with
+/// at least one non-`None` codegen path, in either mode.
+fn codegen_groups(def: &LinkedTargetDef) -> Vec<String> {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
+    def.target
+        .outputs
+        .iter()
+        .filter(|o| {
+            o.paths
+                .iter()
+                .any(|p| !matches!(p.codegen_tree, CodegenMode::None))
+        })
+        .map(|o| o.group.clone())
+        .collect()
+}
+
 /// The `@heph/fs` addrs covering every `codegen = in_place` output path.
 ///
 /// Uses the same path→addr mapping as [`crate::engine::expand`]'s synthesized fs
@@ -885,38 +902,6 @@ fn stamp_codegen_xattr(path: &std::path::Path, value: &str) -> anyhow::Result<()
     })
 }
 
-/// Which codegen groups one write-back pass handles.
-///
-/// The two modes land in the tree on different terms, so they are written back by
-/// different passes rather than sharing one gate:
-///
-/// - `copy` owns paths that are not tracked sources. The generated file belongs to
-///   the target, and the provenance xattr it carries is what stops a later
-///   `glob()` from double-sourcing it — so it must land whenever the target is
-///   part of the run, however it was reached.
-/// - `in_place` rewrites the user's own committed files, which only the target the
-///   user actually asked for may do.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CodegenPass {
-    /// `copy` groups only — every frame, single-flighted per addr per request.
-    Copy,
-    /// `in_place` groups only — top-level frames.
-    InPlace,
-    /// Both — the frozen check, which writes nothing and must diff every group.
-    All,
-}
-
-impl CodegenPass {
-    fn covers(self, mode: &crate::engine::driver::targetdef::path::CodegenMode) -> bool {
-        use crate::engine::driver::targetdef::path::CodegenMode;
-        match self {
-            CodegenPass::Copy => matches!(mode, CodegenMode::Copy),
-            CodegenPass::InPlace => matches!(mode, CodegenMode::InPlace),
-            CodegenPass::All => !matches!(mode, CodegenMode::None),
-        }
-    }
-}
-
 pub type InteractiveInner = Box<
     dyn for<'io> FnOnce(
             Option<&'io mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
@@ -956,11 +941,6 @@ struct ExecuteOptions<'a> {
     force: bool,
     interactive: Option<InteractiveWrapper>,
     shell: bool,
-    frozen: bool,
-    /// True only for the directly-requested (top-level) target. Gates codegen
-    /// tree write-back so a codegen target pulled in as a *dependency* doesn't
-    /// materialize its output into the workspace.
-    is_top: bool,
 }
 
 /// Output-independent result of the per-addr lock dance, single-flighted by
@@ -1512,13 +1492,15 @@ impl Engine {
         }
         // `is_top` is part of the key: the same target can be reached both
         // top-level (is_top=true) and as a transparent-group member (is_top=false)
-        // in one request. Both produce identical artifacts, but only the top-level
-        // frame rewrites its own sources (`in_place`) / stores the fixpoint, so
-        // each is_top variant needs its own memoizer cell or a race could bake the
-        // wrong is_top into the shared computation. The second variant hits the
-        // on-disk cache (keyed by hashin, not is_top), so there is no re-execute.
-        // (The `copy` write-back is is_top-independent and single-flights on its
-        // own per-addr key instead — see `materialize_codegen_copy`.)
+        // in one request, and a shared cell would have baked whichever frame won
+        // the race into the result.
+        //
+        // What made the two frames differ was the codegen tree write-back, and it
+        // no longer does: the write-back is is_top-independent and single-flights
+        // on its own per-addr key (`materialize_codegen`). The key is kept
+        // conservative rather than collapsed — the second variant hits the on-disk
+        // cache (keyed by hashin, not is_top) so it costs a re-filter, not a
+        // re-execute. Collapsing it is a separate simplification.
         let key = (AddrKey(addr.clone()), key_outputs, is_top);
         let opts = opts.clone();
         let interactive = opts.interactive.is_some();
@@ -1528,7 +1510,7 @@ impl Engine {
             .once(
                 key,
                 enclose!((self => engine, rs, addr, outputs) move || async move {
-                    match engine.inner_result_addr(rs.clone(), &addr, outputs, &opts, is_top).await {
+                    match engine.inner_result_addr(rs.clone(), &addr, outputs, &opts).await {
                         Ok(v) => Ok(Arc::new(v)),
                         Err(e) => Err(classify_failure(&rs, &addr, interactive, e)),
                     }
@@ -1939,7 +1921,6 @@ impl Engine {
         addr: &Addr,
         outputs: OutputMatcher,
         opts: &ResultOptions,
-        is_top: bool,
     ) -> anyhow::Result<EResult> {
         let addr_str = addr.format();
         crate::engine::event::emit_scope(
@@ -2010,8 +1991,6 @@ impl Engine {
                             force: opts.force,
                             interactive: opts.interactive.clone(),
                             shell: opts.shell,
-                            frozen: opts.frozen,
-                            is_top,
                         },
                     )
                     .await?;
@@ -2075,16 +2054,14 @@ impl Engine {
     /// it — so a partial/remote cache pulls only the blobs each caller asked for,
     /// never the whole output set.
     ///
-    /// The codegen write-back + fixpoint registration live here (not in the
-    /// shared cell) because they are per-`(outputs, is_top)`: `materialize_codegen`
-    /// is is_top-gated, and both run under this caller's shared riding read. This
-    /// matches the pre-single-flight placement — `materialize_codegen` on every
-    /// path, `maybe_store_fixpoint` only on the cacheable path (never force/shell).
-    /// The `copy` half is the exception: it is not is_top-gated (see
-    /// [`materialize_codegen_copy`]), so it carries its own per-addr single-flight
-    /// rather than riding this cell's key.
+    /// The codegen write-back is invoked from here — under this caller's shared
+    /// riding read, and with this caller's artifacts as its starting point — but it
+    /// is not *scoped* to this cell: it single-flights on its own per-addr key, so
+    /// it runs once however many `(outputs, is_top)` frames of the addr reach it.
+    /// See [`materialize_codegen`], which also carries the in_place write-back
+    /// guard and the fixpoint registration.
     ///
-    /// [`materialize_codegen_copy`]: Self::materialize_codegen_copy
+    /// [`materialize_codegen`]: Self::materialize_codegen
     async fn execute_and_cache(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -2270,38 +2247,15 @@ impl Engine {
             }
         };
 
-        // Guard the write-back against a tree that moved under us — an in_place
-        // target is about to overwrite the very files it hashed as inputs.
-        self.clone()
-            .check_in_place_inputs_unchanged(&rs, opts)
+        // Codegen tree reconcile: not is_top-gated — what a codegen target says
+        // the tree should hold does not depend on how the run reached it. Runs on
+        // every path (a cache hit on an in_place fmt must still materialize),
+        // single-flighted per addr, and it fetches any codegen group this caller
+        // did not ask for, so it does not depend on which frame gets here first.
+        // Carries the write-back guard and the fixpoint registration, which belong
+        // with the write.
+        self.materialize_codegen(&rs, opts, &locked, &cached)
             .await?;
-        // `copy` write-back: not is_top-gated — the generated file is the
-        // target's wherever the run reached it from, and only the stamp keeps a
-        // later glob off it. Single-flighted per addr, and it fetches any copy
-        // group this caller did not ask for, so it does not depend on which frame
-        // gets here first.
-        self.materialize_codegen_copy(&rs, opts, &locked, &cached)
-            .await?;
-        // `in_place` write-back (and, on a frozen run, the whole check):
-        // is_top-gated, idempotent, runs on every path (a cache hit on an in_place
-        // fmt must still materialize). Uses this caller's `cached`, so the is_top
-        // requester must have asked for the codegen output groups — exactly as
-        // before the single-flight split.
-        let wrote = self
-            .materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
-            .await?;
-        // Fixpoint registration only on the cacheable path (force/shell never
-        // cache a fixpoint). Idempotent across hit/miss; a no-op unless this is a
-        // top-level in_place codegen target whose tree just moved — and when the
-        // write-back moved nothing, the guard above already established that the
-        // tree hashes to `opts.hashin`, so the fixpoint would recompute that same
-        // key and early-return. Skip it and save a full input re-hash on the
-        // steady-state path (an already-formatted tree), where it is the common
-        // case.
-        let can_cache = !opts.force && opts.def.target.cache.enabled && !opts.shell;
-        if can_cache && wrote {
-            self.clone().maybe_store_fixpoint(&rs, opts).await?;
-        }
 
         Ok(build_eresult(cached, meta, &outputs, locked.guard.clone()))
     }
@@ -2492,11 +2446,11 @@ impl Engine {
             .once(
                 AddrKey(addr),
                 enclose!((self => engine, rs) move || async move {
-                    // is_top/frozen are deliberately fixed here: the shared cell
-                    // is addr-keyed and output/is_top-agnostic. It never runs
-                    // codegen write-back or fixpoint storage (those are per-caller,
-                    // in `execute_and_cache`), and neither `execute_and_cache_inner`
-                    // nor `execute` reads these fields — so the values are inert.
+                    // The shared cell is addr-keyed and output/is_top-agnostic: it
+                    // decides build-vs-hit and nothing else. The codegen write-back
+                    // and fixpoint storage are not here (they hang off
+                    // `execute_and_cache`, single-flighted on their own per-addr
+                    // key), so nothing this cell runs is frame-dependent.
                     let opts = ExecuteOptions {
                         hashin: &hashin,
                         spec: &spec,
@@ -2504,8 +2458,6 @@ impl Engine {
                         force,
                         interactive,
                         shell,
-                        frozen: false,
-                        is_top: false,
                     };
                     engine.resolve_locked_inner(rs, &opts).await
                 }),
@@ -2753,64 +2705,52 @@ impl Engine {
         }))
     }
 
-    /// Land a `codegen = "copy"` target's outputs in the tree, however the target
-    /// was reached.
+    /// Reconcile a codegen target's outputs with the tree, however the target was
+    /// reached.
     ///
-    /// A `copy` group's paths are not tracked sources — the generated file belongs
-    /// to the target, and the provenance xattr it carries is the only thing that
-    /// stops a later `glob()` from picking it up as a source alongside the target
-    /// that produces it. That ownership is a property of the graph, not of how the
-    /// user happened to phrase the run: a build that merely *depends* on the
-    /// generator leaves the same file sitting in the tree, and leaving it unstamped
-    /// is what makes the tree disagree with the graph. So this runs on every frame
-    /// that resolves the target — the top-level one, a dependent reading an output
-    /// group, and the `meta` walk that only hashes it (the whole of a fully-cached
-    /// build) — single-flighted per addr per request so the tree is written once.
+    /// A codegen target's contract is about the *tree*, not about the invocation:
+    /// `copy` says "this generated file lives here, and the provenance xattr keeps
+    /// `glob()` off it", `in_place` says "these committed files are the transform's
+    /// output". Neither claim is weaker because the run reached the target through
+    /// a dependent or a group instead of naming it — that only changes what the
+    /// user typed, not what the graph says the tree should hold. So this runs on
+    /// every frame that resolves the target: the top-level one, a dependent, and
+    /// the `meta` walk that only hashes it (the whole of a fully-cached build).
     ///
-    /// `in_place` is deliberately not part of this: it rewrites the user's own
-    /// committed files, which stays the privilege of the target they asked for
-    /// (see [`Self::materialize_codegen`]).
+    /// Single-flighted per addr per request, so the tree is written once however
+    /// many frames offer it — and so the guard below and the fixpoint registration,
+    /// which belong with the write, run once too.
     ///
-    /// Skipped on a frozen run (which writes nothing — the top-level frame diffs
-    /// instead) and on a hash-only request (nested inside a live resolution, and
-    /// never a run the user asked for).
-    async fn materialize_codegen_copy(
+    /// Skipped on a hash-only request: those are nested inside a live resolution
+    /// (the write-back guard, the fixpoint recompute) and must not touch the tree.
+    /// A frozen run does not write but still runs — that is where it diffs.
+    async fn materialize_codegen(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
         opts: &ExecuteOptions<'_>,
         locked: &Arc<LockedResolution>,
         cached: &[ResultArtifact],
     ) -> anyhow::Result<()> {
-        if rs.frozen() || rs.hash_only() || rs.ctoken().is_cancelled() {
+        if rs.hash_only() || rs.ctoken().is_cancelled() {
             return Ok(());
         }
-        if !Self::has_codegen_pass(opts.def, CodegenPass::Copy) {
+        if codegen_groups(opts.def).is_empty() {
             return Ok(());
         }
-        let copy_groups: Vec<String> = opts
-            .def
-            .target
-            .outputs
-            .iter()
-            .filter(|o| {
-                o.paths
-                    .iter()
-                    .any(|p| CodegenPass::Copy.covers(&p.codegen_tree))
-            })
-            .map(|o| o.group.clone())
-            .collect();
 
+        // force/shell never cache, so they never register a fixpoint.
+        let can_cache = !opts.force && opts.def.target.cache.enabled && !opts.shell;
         let engine = Arc::clone(self);
         let def = opts.def.clone();
         let hashin = opts.hashin.clone();
         let cached = cached.to_vec();
         rs.data
-            .mem_codegen_copy
+            .mem_codegen_tree
             .once(
                 AddrKey(opts.def.target.addr.clone()),
                 enclose!((rs, locked) move || async move {
                     engine
-                        .materialize_codegen_copy_inner(rs, &def, &hashin, &locked, cached, copy_groups)
+                        .materialize_codegen_inner(rs, &def, &hashin, &locked, cached, can_cache)
                         .await
                 }),
             )
@@ -2818,23 +2758,25 @@ impl Engine {
             .map_err(unwrap_arc_err)
     }
 
-    /// The body of [`Self::materialize_codegen_copy`], run once per addr per
-    /// request.
-    async fn materialize_codegen_copy_inner(
+    /// The body of [`Self::materialize_codegen`], run once per addr per request.
+    async fn materialize_codegen_inner(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         def: &LinkedTargetDef,
         hashin: &str,
         locked: &LockedResolution,
         mut cached: Vec<ResultArtifact>,
-        copy_groups: Vec<String>,
+        can_cache: bool,
     ) -> anyhow::Result<()> {
-        // The calling frame's artifacts cover the copy groups when it executed the
-        // target (that hands back the full output set) or asked for them itself.
-        // Otherwise fetch exactly what is missing: a dependent reads one group, and
-        // the `meta` walk reads none at all — neither is a reason to leave the rest
-        // of the target's generated files out of the tree.
-        let missing: Vec<String> = copy_groups
+        let frozen = rs.frozen();
+        let groups = codegen_groups(def);
+
+        // The calling frame's artifacts cover the codegen groups when it executed
+        // the target (that hands back the full output set) or asked for them
+        // itself. Otherwise fetch exactly what is missing: a dependent reads one
+        // group and the `meta` walk reads none at all — neither is a reason to
+        // leave the rest of the target's files unreconciled.
+        let missing: Vec<String> = groups
             .iter()
             .filter(|g| {
                 !cached
@@ -2858,18 +2800,38 @@ impl Engine {
                     tracing::debug!(
                         addr = %def.target.addr,
                         groups = ?missing,
-                        "codegen copy write-back skipped: outputs unavailable",
+                        "codegen write-back skipped: outputs unavailable",
                     );
                     return Ok(());
                 }
             }
         }
 
+        // Guard the write against a tree that moved under us — an in_place target
+        // is about to overwrite the very files it hashed as inputs. It lives here,
+        // inside the single flight, because it exists to protect this write: one
+        // write, one guard, whichever frame got here first.
+        if !frozen {
+            Arc::clone(&self)
+                .check_in_place_inputs_unchanged(&rs, def)
+                .await?;
+        }
+
         let (target, root) = (Arc::clone(&def.target), self.cfg.root.clone());
-        hcore::blocking::run(move || {
-            Self::materialize_codegen_tree(&target, &cached, &root, false, CodegenPass::Copy)
+        let wrote = hcore::blocking::run(move || {
+            Self::materialize_codegen_tree(&target, &cached, &root, frozen)
         })
         .await?;
+
+        // Fixpoint registration: idempotent, and a no-op unless this is an in_place
+        // target whose tree just moved — when the write-back moved nothing, the
+        // guard above already established that the tree hashes to `hashin`, so the
+        // fixpoint would recompute that same key and early-return. Skipping it
+        // there saves a full input re-hash on the steady-state path (an
+        // already-formatted tree), which is the common case.
+        if !frozen && can_cache && wrote {
+            self.maybe_store_fixpoint(&rs, def, hashin).await?;
+        }
         Ok(())
     }
 
@@ -2920,89 +2882,33 @@ impl Engine {
         ))
     }
 
-    /// Materialize the codegen output tree for a freshly-resolved target.
-    ///
-    /// Gated to top-level requested targets (`rs.parent.is_none()`) with at least
-    /// one output group this pass covers. For each such group:
+    /// The byte-moving half of [`Self::materialize_codegen`]. For each codegen
+    /// output group:
     /// - `frozen`: build a unified diff between the generated bytes and the tree
     ///   file, accumulate per-file diffs, and on any divergence return a
     ///   [`FrozenCheckError`] without writing anything.
     /// - otherwise: unpack the cached artifact into the workspace root (copy
-    ///   semantics).
+    ///   semantics). `Copy` (net-new) groups additionally stamp every written file
+    ///   with the codegen xattr so a later fs glob excludes them; `InPlace` groups
+    ///   are not stamped (they overwrite tracked source files).
     ///
-    /// Only `in_place` groups are written back here — `copy` groups land in
-    /// [`Self::materialize_codegen_copy`], which is not top-level-gated. The frozen
-    /// check covers both, because it writes nothing.
+    /// This walks every generated file, reads its bytes out of the cache, reads the
+    /// tree file back and (when frozen) diffs the two — the heaviest synchronous
+    /// read on the result path, and one that parks on any queued sqlite write to
+    /// the artifact it is walking. It does not belong on a runtime worker, so it is
+    /// synchronous and called only through `hcore::blocking::run`.
     ///
-    /// The gates are cheap and stay here; everything past them runs on
-    /// `hcore::blocking` (see [`Self::materialize_codegen_tree`]).
-    async fn materialize_codegen(
-        &self,
-        is_top: bool,
-        def: &LinkedTargetDef,
-        cached: &[ResultArtifact],
-        frozen: bool,
-    ) -> anyhow::Result<bool> {
-        // Gate: only the top-level requested target rewrites its own sources, and
-        // only when it declares a group this pass covers. `copy` groups are landed
-        // by [`Self::materialize_codegen_copy`] instead, on whichever frame brought
-        // the target into the run — except on a frozen run, which writes nothing
-        // and so does its whole check here, in the one frame that knows the user
-        // asked for it.
-        let pass = if frozen {
-            CodegenPass::All
-        } else {
-            CodegenPass::InPlace
-        };
-        if !is_top {
-            return Ok(false);
-        }
-        if !Self::has_codegen_pass(def, pass) {
-            return Ok(false);
-        }
-
-        // Past the gates this walks every generated file, reads its bytes out of
-        // the cache, reads the tree file back and (when frozen) diffs the two —
-        // the heaviest synchronous read on the result path, and one that parks
-        // on any queued sqlite write to the artifact it is walking. It does not
-        // belong on a runtime worker. Cloned rather than borrowed because a pool
-        // job outlives a dropped caller future: an `Arc<TargetDef>` bump and a
-        // `Vec` of `ResultArtifact` (an `Arc` plus two short strings each).
-        //
-        // Outliving the caller is the accepted cost here. A run cancelled mid
-        // write-back reports cancelled while the job finishes rewriting the
-        // tree, where before it could only be interrupted by a signal. Stopping
-        // half way would be worse: the write-back is per-file and the tree is
-        // the user's source, so an abandoned job leaves a *partial* codegen tree
-        // either way, and letting it finish at least leaves a consistent one.
-        let (target, cached, root) = (
-            Arc::clone(&def.target),
-            cached.to_vec(),
-            self.cfg.root.clone(),
-        );
-        hcore::blocking::run(move || {
-            Self::materialize_codegen_tree(&target, &cached, &root, frozen, pass)
-        })
-        .await
-    }
-
-    /// Whether `def` declares any output group this pass would write back.
-    fn has_codegen_pass(def: &LinkedTargetDef, pass: CodegenPass) -> bool {
-        def.target
-            .outputs
-            .iter()
-            .any(|o| o.paths.iter().any(|p| pass.covers(&p.codegen_tree)))
-    }
-
-    /// The body of [`Self::materialize_codegen`], past its gates.
-    ///
-    /// Synchronous and byte-moving: called only through `hcore::blocking::run`.
+    /// A pool job outliving a cancelled caller is the accepted cost: a run
+    /// cancelled mid write-back reports cancelled while the job finishes rewriting
+    /// the tree. Stopping half way would be worse — the write-back is per-file and
+    /// the tree is the user's source, so an abandoned job leaves a *partial*
+    /// codegen tree either way, and letting it finish at least leaves a consistent
+    /// one.
     fn materialize_codegen_tree(
         target: &crate::engine::driver::targetdef::TargetDef,
         cached: &[ResultArtifact],
         root: &std::path::Path,
         frozen: bool,
-        pass: CodegenPass,
     ) -> anyhow::Result<bool> {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
@@ -3039,11 +2945,6 @@ impl Engine {
             let Some(mode) = group_mode.get(artifact.group.as_str()).copied() else {
                 continue;
             };
-            // Groups this pass does not own belong to the other one — skipping
-            // them here is what keeps the two passes from writing the same file.
-            if !pass.covers(mode) {
-                continue;
-            }
             let group = artifact.group.as_str();
 
             if frozen {
@@ -3495,29 +3396,27 @@ impl Engine {
     /// this guard exists to prevent. Only the files being overwritten are
     /// irreplaceable.
     ///
-    /// Gated exactly like the write-back it guards: top-level only (nothing else
-    /// writes), in_place only (nothing else overwrites its own inputs), and never
-    /// on a frozen run (which writes nothing at all).
+    /// Called from inside the write-back's single flight, so it is scoped exactly
+    /// like the write it guards: once per addr per request, never on a frozen run
+    /// (which writes nothing at all), and a no-op for a target with no in_place
+    /// output (nothing else overwrites its own inputs).
     ///
     /// A failure to re-read is *not* waved through: not being able to confirm the
     /// tree is precisely the case where overwriting it is unsafe.
     async fn check_in_place_inputs_unchanged(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
-        opts: &ExecuteOptions<'_>,
+        def: &LinkedTargetDef,
     ) -> anyhow::Result<()> {
-        if opts.frozen || !opts.is_top {
-            return Ok(());
-        }
         // The `@heph/fs` addrs covering the paths about to be overwritten. Same
         // path→addr mapping `expand::synthesized_fs_inputs` uses, so a declared
         // in_place output and the input that reads it land on the same addr.
-        let guarded = in_place_fs_addrs(&opts.def.target.outputs);
+        let guarded = in_place_fs_addrs(&def.target.outputs);
         if guarded.is_empty() {
             return Ok(());
         }
 
-        let addr = &opts.def.target.addr;
+        let addr = &def.target.addr;
         // Memoized on this request — the run already expanded these.
         let inputs = Arc::clone(&self)
             .expanded_inputs_for(rs.clone(), addr)
@@ -3622,16 +3521,11 @@ impl Engine {
     async fn maybe_store_fixpoint(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
-        opts: &ExecuteOptions<'_>,
+        def: &LinkedTargetDef,
+        hashin: &str,
     ) -> anyhow::Result<()> {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
-        // Only top-level targets write their tree back, and only in_place targets
-        // mutate their own inputs (so only they can reach a fixpoint). Frozen runs
-        // never write, hence never cache a fixpoint.
-        if opts.frozen || !opts.is_top {
-            return Ok(());
-        }
         // The fresh request below runs on its own cancellation token (unlinked
         // from this build), so refuse to start once the original build is
         // cancelled — the fixpoint is a pure optimization and must never delay a
@@ -3639,7 +3533,9 @@ impl Engine {
         if rs.ctoken().is_cancelled() {
             return Ok(());
         }
-        let is_in_place = opts.def.target.outputs.iter().any(|o| {
+        // Only in_place targets mutate their own inputs, so only they can reach a
+        // fixpoint. (Frozen runs never write, hence never get here.)
+        let is_in_place = def.target.outputs.iter().any(|o| {
             o.paths
                 .iter()
                 .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
@@ -3648,7 +3544,7 @@ impl Engine {
             return Ok(());
         }
 
-        let addr = opts.def.target.addr.clone();
+        let addr = def.target.addr.clone();
         // Fresh request → fs inputs re-stat the post-write-back tree, yielding the
         // exact hashin the NEXT run will compute.
         let fresh = self.new_hash_only_state(addr.clone());
@@ -3667,13 +3563,13 @@ impl Engine {
                 return Ok(());
             }
         };
-        if fixpoint == *opts.hashin {
+        if fixpoint == hashin {
             // Tree already at the fixpoint (idempotent run changed nothing).
             return Ok(());
         }
         // Blob copy is synchronous IO — run it off the async poll like every
         // other cache write (see `cache_artifact_locally`).
-        let primary = opts.hashin.clone();
+        let primary = hashin.to_string();
         let dup = hcore::blocking::run(enclose!(
             (self => engine, addr, fixpoint, primary) move || {
                 engine.duplicate_cache_revision(&addr, &primary, &fixpoint)
@@ -10381,14 +10277,17 @@ mod tests {
         Ok(())
     }
 
-    /// is_top gate: an `in_place` codegen target reached only as a DEPENDENCY (not
-    /// the directly-requested target) must NOT write its tree back — it rewrites
-    /// the user's own committed files, which stays the privilege of the target
-    /// they asked for. Locks the `is_top` memoizer-key fix — only the top-level
-    /// frame materializes. (`copy` is the opposite rule; see
-    /// [`copy_dep_is_written_back_and_stamped`].)
+    /// An `in_place` codegen target reached only as a DEPENDENCY still writes its
+    /// tree back. What a codegen target says the tree should hold does not depend
+    /// on whether the user named it or reached it through something else — the
+    /// same rule `copy` follows (see [`copy_dep_is_written_back_and_stamped`]).
+    ///
+    /// This used to assert the opposite, gated on `is_top`. The gate was never
+    /// justified in its commit, and it made tree state depend on how the run was
+    /// phrased: `heph run //pkg:fmt` formatted, `heph run //pkg:consumer` (which
+    /// depends on fmt) did not.
     #[tokio::test]
-    async fn in_place_dep_is_not_written_back() -> anyhow::Result<()> {
+    async fn in_place_dep_is_written_back() -> anyhow::Result<()> {
         let (engine, root) = engine_with_home_fs(vec![
             codegen_run_target(
                 "//pkg:fmt",
@@ -10414,25 +10313,26 @@ mod tests {
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
 
-        // Resolve the consumer (top-level). fmt is pulled in only as a dep
-        // (is_top=false), so its tree must remain untouched.
+        // Resolve the consumer (top-level). fmt is pulled in only as a dep, and
+        // its transform must still land on the tree.
         let consumer = hmodel::htaddr::parse_addr("//pkg:consumer")?;
         let (res, _ev) = resolve_collecting_events(&engine, &consumer).await;
         res.expect("consumer must resolve");
         assert_eq!(
             std::fs::read(pkg_dir.join("in.txt"))?,
-            b"hello",
-            "an in_place target reached only as a dependency must NOT write its tree back"
+            b"HELLO\n",
+            "an in_place target reached as a dependency must write its tree back"
         );
 
-        // Sanity: requesting fmt directly DOES write it back.
+        // And requesting fmt directly is now a no-op on an already-transformed
+        // tree — the fixpoint the dep frame registered, not a re-execution.
         let fmt = hmodel::htaddr::parse_addr("//pkg:fmt")?;
         let (res, _ev) = resolve_collecting_events(&engine, &fmt).await;
         res.expect("fmt must resolve");
         assert_eq!(
             std::fs::read(pkg_dir.join("in.txt"))?,
             b"HELLO\n",
-            "a directly-requested in_place target must write its tree back"
+            "a directly-requested in_place target must leave the transformed tree alone"
         );
         Ok(())
     }
@@ -10564,19 +10464,27 @@ mod tests {
         Ok(())
     }
 
-    /// A frozen run writes nothing — including from the dependency frames the copy
-    /// write-back now runs on. `--frozen` reaches those frames through the request
-    /// (they resolve with `ResultOptions::default()`), which is the whole reason
-    /// the flag is request-scoped rather than per-call.
+    /// `--frozen` follows the write-back: it reports a codegen divergence reached
+    /// through a *dependency*, and still writes nothing.
+    ///
+    /// This is what keeps `--frozen` meaning "this run would not touch the tree".
+    /// Once a dep frame materializes, a frozen check that only looked at top-level
+    /// frames would pass while the real run rewrote the tree underneath it — a CI
+    /// gate that reports clean on a dirty tree.
+    ///
+    /// `--frozen` reaches those frames through the request (they resolve with
+    /// `ResultOptions::default()`), which is why the flag is request-scoped rather
+    /// than per-call.
     #[tokio::test]
-    async fn frozen_run_does_not_write_back_a_copy_dep() -> anyhow::Result<()> {
+    async fn frozen_run_reports_a_dep_codegen_divergence_and_writes_nothing() -> anyhow::Result<()>
+    {
         let (engine, root) = engine_with_home_fs(copy_target_with_consumer())?;
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
 
         let rs = engine.new_state();
         let consumer = hmodel::htaddr::parse_addr("//pkg:consumer")?;
-        engine
+        let res = engine
             .clone()
             .result_addr(
                 rs,
@@ -10587,8 +10495,23 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
-            .expect("consumer must resolve under --frozen");
+            .await;
+        let err = match res {
+            Ok(_) => {
+                panic!("a frozen run must fail when a dep's codegen output is not in the tree")
+            }
+            Err(e) => e,
+        };
+        // Asserted on the rendered chain, not by downcast: the error crossed a
+        // dependency boundary, so `classify_failure` has already wrapped it as a
+        // recorded target failure and `downcast_chain_ref` (which walks only the
+        // memoizer's `SharedAnyhow` links) no longer reaches the typed error. The
+        // sentence is what the user sees either way.
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("frozen check failed: //pkg:cp"),
+            "frozen failure must name the diverging codegen target, got: {rendered}"
+        );
 
         assert!(
             !pkg_dir.join("out.gen").exists(),
@@ -11977,9 +11900,10 @@ mod tests {
             ..Default::default()
         })?);
 
-        // One def + artifact pair per codegen mode: the two modes are written back
-        // by different passes (`copy` on every frame, `in_place` top-level only),
-        // and both must hop off the runtime.
+        // Both codegen modes go through one pass, so one witness covers both.
+        // `copy` is the one exercised here: `in_place` would also run the
+        // write-back guard, which re-resolves the target's inputs and needs a real
+        // provider behind the addr — beside the point of this test.
         let build = |mode: path::CodegenMode, name: &str| -> anyhow::Result<_> {
             let mut packer = hcore::hartifactcontent::tar::TarPacker::new();
             packer.create_raw(b"generated\n".to_vec(), name, false);
@@ -12019,24 +11943,7 @@ mod tests {
             Ok((def, cached, in_job))
         };
 
-        // `in_place`: the top-level write-back.
-        let (def, cached, in_job) = build(path::CodegenMode::InPlace, "fmt.txt")?;
-        let wrote = engine
-            .materialize_codegen(true, &def, &cached, false)
-            .await?;
-        assert!(wrote, "the tree must actually be written back");
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("fmt.txt"))?,
-            "generated\n",
-        );
-        assert_eq!(
-            *in_job.lock().expect("witness slot"),
-            Some(true),
-            "the in_place write-back must run inside a blocking::run job (None = never walked)"
-        );
-
-        // `copy`: the pass every frame runs. Its artifacts are supplied, so the
-        // `LockedResolution` is never consulted.
+        // The artifacts are supplied, so the `LockedResolution` is never consulted.
         let (def, cached, in_job) = build(path::CodegenMode::Copy, "gen.txt")?;
         let locked = LockedResolution {
             guard: None,
@@ -12045,23 +11952,17 @@ mod tests {
             remote: RemoteCell::new(),
         };
         Arc::clone(&engine)
-            .materialize_codegen_copy_inner(
-                engine.new_state(),
-                &def,
-                "hashin",
-                &locked,
-                cached,
-                vec!["out".to_string()],
-            )
+            .materialize_codegen_inner(engine.new_state(), &def, "hashin", &locked, cached, false)
             .await?;
         assert_eq!(
             std::fs::read_to_string(root.path().join("gen.txt"))?,
             "generated\n",
+            "the tree must actually be written back",
         );
         assert_eq!(
             *in_job.lock().expect("witness slot"),
             Some(true),
-            "the copy write-back must run inside a blocking::run job (None = never walked)"
+            "the codegen write-back must run inside a blocking::run job (None = never walked)"
         );
         Ok(())
     }
