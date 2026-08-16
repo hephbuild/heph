@@ -3298,6 +3298,11 @@ fn test_deps_config(
     // the sandbox at all, regardless of whether the test file's own source
     // ever imported it.
     let mut runner_config_bare_specifiers: Vec<importgraph::BareSpecifierSite> = Vec::new();
+    // Directory-glob Inputs from a dynamic `import()` inside a setupFiles-
+    // referenced file (e.g. a locale loader's own `` import(`./catalogs/${l}.po`) ``)
+    // — declared straight into `external_addrs` below, the same as the test
+    // file's own `closure.glob_sites` (see that loop's comment).
+    let mut runner_config_glob_addrs: Vec<String> = Vec::new();
     if let Some(p) = &runner_config {
         let scan = importgraph::resolve_runner_config_referenced_files(
             p,
@@ -3312,6 +3317,17 @@ fn test_deps_config(
                     .to_string_lossy()
                     .replace('\\', "/"),
             );
+        }
+        for glob in scan.glob_sites {
+            let dir_rel = glob
+                .dir
+                .strip_prefix(workspace_root)
+                .unwrap_or(&glob.dir)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let pattern = format!("{dir_rel}/*{}", glob.suffix);
+            runner_config_glob_addrs
+                .push(hbuiltins::pluginfs::glob_addr(&pattern, &[]).format());
         }
         // `BareSpecifierSite::file` is workspace-relative everywhere else it's
         // used (`closure.bare_specifiers`, `graph.unresolved_bare_specifiers`)
@@ -3432,6 +3448,9 @@ fn test_deps_config(
     for glob in &closure.glob_sites {
         let pattern = format!("{}/*{}", glob.dir, glob.suffix);
         external_addrs.insert(hbuiltins::pluginfs::glob_addr(&pattern, &[]).format());
+    }
+    for addr in runner_config_glob_addrs {
+        external_addrs.insert(addr);
     }
     // Mirrors `typecheck_deps_config`'s identical on-demand third-party
     // handling for an unresolved bare specifier: `check_phantom_dependencies`
@@ -9492,6 +9511,69 @@ snapshots:
                 .any(|a| a.contains("vitest.setup.ts")),
             "a setupFiles-referenced file must be declared as its own Input too, or editing it \
              would produce a stale cache hit: {runner_config_addrs:?}"
+        );
+    }
+
+    /// End-to-end regression test for a real report: `setupFiles` names a
+    /// browser-mode setup file that itself imports a tsconfig `paths` alias
+    /// (`@/locale`), and that aliased module dynamically imports a locale
+    /// catalog directory (`` import(`./catalogs/${locale}.po`) ``). Both the
+    /// alias resolution and the directory-glob declaration must work
+    /// together for the whole chain to be staged in the sandbox.
+    #[test]
+    fn test_deps_config_declares_directory_glob_reached_through_a_setup_files_tsconfig_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["./src/*"]}}}"#,
+        );
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "export default { test: { setupFiles: ['./src/tests/browser.setup.tsx'] } };\n",
+        );
+        write(
+            dir.path(),
+            "src/tests/browser.setup.tsx",
+            "import { loadMessages } from '@/locale';\nloadMessages('en-US');\n",
+        );
+        write(
+            dir.path(),
+            "src/locale/index.ts",
+            "export async function loadMessages(locale) {\n  return import(`./catalogs/${locale}.po`);\n}\n",
+        );
+        write(dir.path(), "src/locale/catalogs/en-US.po", "msgid \"\"\n");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _, _, _, _) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        let runner_config_addrs = dep_addrs(&deps, "runner_config");
+        assert!(
+            runner_config_addrs
+                .iter()
+                .any(|a| a.contains("locale/index.ts")),
+            "the setup file's tsconfig-aliased import must be declared: {runner_config_addrs:?}"
+        );
+        let external_addrs = dep_addrs(&deps, "external");
+        assert!(
+            external_addrs
+                .iter()
+                .any(|a| a.contains("glob") && a.contains("locale/catalogs")),
+            "the whole catalogs/ directory reached through the setup file must be declared as a \
+             glob Input: {external_addrs:?}"
         );
     }
 

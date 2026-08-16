@@ -836,6 +836,20 @@ pub struct RunnerConfigScan {
     /// fails the moment vitest/jest tries to import it — regardless of
     /// whether the test file's own source ever touches it.
     pub bare_specifiers: Vec<BareSpecifierSite>,
+    /// Directory-glob dependencies from a dynamic `import()` inside one of
+    /// `files` — see [`importparse::GlobImportSite`] and `ResolvedGlobSite`.
+    /// `dir` is absolute, unlike `ResolvedGlobSite::dir`: this scan has no
+    /// `workspace_root` of its own to convert against (see `files`' own
+    /// doc) — `test_deps_config` normalizes it the same way.
+    pub glob_sites: Vec<RunnerConfigGlobSite>,
+}
+
+/// One directory-glob dependency found while scanning a test-runner config's
+/// referenced files — see [`RunnerConfigScan::glob_sites`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerConfigGlobSite {
+    pub dir: PathBuf,
+    pub suffix: String,
 }
 
 /// Known third-party plugin packages that do their *own* ambient config-file
@@ -922,6 +936,7 @@ pub fn resolve_runner_config_referenced_files(
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut found: BTreeSet<PathBuf> = BTreeSet::new();
     let mut bare_specifiers: Vec<BareSpecifierSite> = Vec::new();
+    let mut glob_sites: Vec<RunnerConfigGlobSite> = Vec::new();
     let mut queue: VecDeque<(PathBuf, String, usize)> = VecDeque::new();
     let resolvers = Resolvers::new(tsconfig);
     seen.insert(config_path.to_path_buf());
@@ -1012,12 +1027,37 @@ pub fn resolve_runner_config_referenced_files(
                     });
                 }
             }
+            for glob in imports.glob_sites {
+                match join_glob_dir(dir, &glob.dir_prefix) {
+                    Some(resolved_dir) => {
+                        glob_sites.push(RunnerConfigGlobSite {
+                            dir: resolved_dir,
+                            suffix: glob.suffix,
+                        });
+                    }
+                    None => {
+                        // Same coarsening policy as the test file's own
+                        // closure (`build_package_import_graph`'s doc):
+                        // visible via a debug log, not an error — this
+                        // function has no dedicated unresolved-count field,
+                        // since a setupFiles-chain file is already a much
+                        // narrower scan than a whole package's.
+                        tracing::debug!(
+                            file = %path.display(),
+                            dir_prefix = %glob.dir_prefix,
+                            "js runner-config scan: dynamic-import glob directory not found, \
+                             coarsened"
+                        );
+                    }
+                }
+            }
         }
     }
 
     Ok(RunnerConfigScan {
         files: found.into_iter().collect(),
         bare_specifiers,
+        glob_sites,
     })
 }
 
@@ -2282,17 +2322,18 @@ pub fn build_package_import_graph(
     Ok(graph)
 }
 
-/// Resolve a [`importparse::GlobImportSite`]'s `dir_prefix` (e.g.
-/// `"./catalogs/"` or `"../locales/"`) relative to `dir` (the importing
-/// file's own directory) into a workspace-relative directory path.
-/// Lexically joins rather than `Path::join`-ing the raw prefix so the result
-/// never carries embedded `.`/`..` components — those would survive
-/// `strip_prefix` literally and corrupt the glob pattern built from it.
-/// Returns `None` if the prefix walks above `workspace_root`, if the
-/// resulting path isn't inside `workspace_root`, or if it isn't an existing
-/// directory on disk.
-fn resolve_glob_dir(dir: &Path, dir_prefix: &str, workspace_root: &Path) -> Option<String> {
-    let mut resolved = dir.to_path_buf();
+/// Lexically join a [`importparse::GlobImportSite`]'s `dir_prefix` (e.g.
+/// `"./catalogs/"` or `"../locales/"`) onto `base` (the importing file's own
+/// directory), without leaving embedded `.`/`..` path components in the
+/// result — those would survive a later `strip_prefix` literally and corrupt
+/// the glob pattern built from it. Returns `None` if the prefix walks above
+/// `base`'s own root, or if the resulting path isn't an existing directory
+/// on disk. Shared by both [`build_package_import_graph`] (a package's own
+/// runtime closure, workspace-relative) and
+/// [`resolve_runner_config_referenced_files`] (a setupFiles-referenced
+/// file's own dynamic imports, absolute — see that function's doc for why).
+fn join_glob_dir(base: &Path, dir_prefix: &str) -> Option<PathBuf> {
+    let mut resolved = base.to_path_buf();
     for component in Path::new(dir_prefix.trim_end_matches('/')).components() {
         match component {
             std::path::Component::CurDir => {}
@@ -2305,9 +2346,13 @@ fn resolve_glob_dir(dir: &Path, dir_prefix: &str, workspace_root: &Path) -> Opti
             _ => return None,
         }
     }
-    if !resolved.is_dir() {
-        return None;
-    }
+    resolved.is_dir().then_some(resolved)
+}
+
+/// [`join_glob_dir`], then converted to a workspace-relative directory path
+/// — `None` if the resolved directory isn't inside `workspace_root` either.
+fn resolve_glob_dir(dir: &Path, dir_prefix: &str, workspace_root: &Path) -> Option<String> {
+    let resolved = join_glob_dir(dir, dir_prefix)?;
     let rel = resolved.strip_prefix(workspace_root).ok()?;
     Some(rel.to_string_lossy().replace('\\', "/"))
 }
@@ -3487,6 +3532,61 @@ mod tests {
             scan.bare_specifiers[0].package_name,
             "@testing-library/jest-dom"
         );
+    }
+
+    /// Regression test for a real report: `setupFiles: ['./src/tests/browser.setup.tsx']`
+    /// where the setup file itself dynamically imports a locale catalog
+    /// directory (`` import(`./catalogs/${locale}.po`) ``). Bug #1 (a bare
+    /// relative path) and Bug #2 (a tsconfig `paths` alias inside the setup
+    /// file) were fixed in earlier commits; this is the third gap in the
+    /// same chain — the setup file's own directory-glob dynamic import was
+    /// discovered by `importparse` but never surfaced by this scan, so
+    /// `test_deps_config` never declared the directory as an Input and the
+    /// sandbox was missing it even after both prior fixes.
+    #[test]
+    fn resolve_runner_config_referenced_files_declares_directory_glob_from_a_setup_files_dynamic_import()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "export default { test: { setupFiles: ['./src/tests/browser.setup.tsx'] } };\n",
+        );
+        write(
+            dir.path(),
+            "src/tests/browser.setup.tsx",
+            "import { loadMessages } from '../locale';\nloadMessages('en-US');\n",
+        );
+        write(
+            dir.path(),
+            "src/locale/index.ts",
+            "export async function loadMessages(locale) {\n  return import(`./catalogs/${locale}.po`);\n}\n",
+        );
+        write(dir.path(), "src/locale/catalogs/en-US.po", "msgid \"\"\n");
+
+        let config_path = dir.path().join("vitest.config.ts");
+        let content = std::fs::read_to_string(&config_path).expect("read fixture");
+        let scan = resolve_runner_config_referenced_files(&config_path, &content, None)
+            .expect("resolve referenced files");
+
+        assert!(
+            scan.files
+                .iter()
+                .any(|f| f.to_string_lossy().replace('\\', "/").contains("locale/index.ts")),
+            "the setup file's own relatively-imported file must still be discovered: {:?}",
+            scan.files
+        );
+        assert_eq!(scan.glob_sites.len(), 1, "{:?}", scan.glob_sites);
+        assert!(
+            scan.glob_sites[0]
+                .dir
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("locale/catalogs"),
+            "{:?}",
+            scan.glob_sites[0]
+        );
+        assert_eq!(scan.glob_sites[0].suffix, ".po");
     }
 
     #[test]
