@@ -786,7 +786,7 @@ impl ProviderInner {
                     // that would resolve to NotFound.
                     let lint_enabled = self.golangci_config_addr(module_root).is_some();
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
-                    push_names(&mut addrs, &["_golist", "build_lib", "build", "embed"]);
+                    push_names(&mut addrs, &["_golist", "build_lib", "build"]);
                     // Magic host-default `build` (bare, no `@v`): a `group`
                     // forwarding to the first host-matching variant. Listed only
                     // when such a variant exists in ancestry.
@@ -821,7 +821,6 @@ impl ProviderInner {
                         push_names(
                             &mut addrs,
                             &[
-                                "embed_xtest",
                                 "build_test",
                                 "test",
                                 "build_xtest",
@@ -940,8 +939,6 @@ const TEST_TARGET_NAMES: &[&str] = &[
     "build_xtestmain_lib",
     "testmain",
     "xtestmain",
-    "embed_test",
-    "embed_xtest",
 ];
 
 fn is_test_target_name(name: &str) -> bool {
@@ -1070,7 +1067,7 @@ const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
 
 /// Non-test first-party/thirdparty target names this provider owns and resolves
 /// through `_golist` (see the `match addr.name` arms in `handle_get`).
-const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed", "_lint-analyze"];
+const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "_lint-analyze"];
 
 /// Target names this provider owns that are **variant-free**: they carry no `@v`
 /// / `@vp` and are handled before variant resolution.
@@ -2572,7 +2569,9 @@ impl ProviderInner {
                 Ok(GetResponse { target_spec: spec })
             }
             // `embed` / `embed_test` / `embed_xtest` targets are gone — the
-            // `go_compile` driver resolves the embedcfg in-process.
+            // `go_compile` driver resolves the embedcfg in-process. They are also
+            // out of `is_known_go_target_name`, so those names now decline before
+            // the `_golist` resolve rather than paying for one to land here.
             _ => Err(GetError::NotFound),
         }
     }
@@ -7119,6 +7118,30 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         // Non-test targets still emitted.
         assert!(names.iter().any(|n| n == "build_lib"));
         assert!(names.iter().any(|n| n == "_golist"));
+    }
+
+    /// `list` is deliberately a *candidate* set — which targets a package really
+    /// has is only known once `go list` has run, so `get` narrows it. But every
+    /// candidate must at least be a name this provider **owns**: a name `get`
+    /// declines outright is a phantom that shows up in `heph query //...` and can
+    /// never be built, whatever the package contains. `embed` / `embed_xtest`
+    /// were exactly that after the `go_compile` driver absorbed the embedcfg —
+    /// listed for every first-party package, resolvable for none.
+    #[tokio::test]
+    async fn list_only_emits_names_the_provider_owns() {
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let names = provider_list(&p, "pkg").await;
+        assert!(
+            !names.is_empty(),
+            "list must emit something for a go package"
+        );
+        for name in &names {
+            assert!(
+                is_known_go_target_name(name),
+                "list emitted `{name}`, which `get` does not own: {names:?}"
+            );
+        }
     }
 
     /// Runnable `test`/`xtest` targets execute the built binary, so `list` emits

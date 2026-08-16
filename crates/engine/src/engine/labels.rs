@@ -1,6 +1,5 @@
 use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
-use enclose::enclose;
 use futures::TryStreamExt;
 use hmodel::htmatcher;
 use std::collections::BTreeSet;
@@ -9,33 +8,19 @@ use std::sync::Arc;
 impl Engine {
     /// Collect the unique set of labels declared by every target matching `m`.
     ///
-    /// Enumerates the matching targets via `query` and folds each target's spec
-    /// `labels` into a sorted `BTreeSet`. Specs are resolved off the query stream
-    /// with a bounded in-flight set, so only the label set — never the full spec
-    /// list — is held in memory.
+    /// Enumerates the matching targets via `query_spec` — so a listed candidate
+    /// that doesn't resolve is skipped rather than fatal — and folds each spec's
+    /// `labels` into a sorted `BTreeSet`. Specs arrive off a bounded in-flight
+    /// set and are dropped as they are folded, so only the label set — never the
+    /// full spec list — is held in memory.
     pub async fn labels(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         m: &htmatcher::Matcher,
     ) -> anyhow::Result<BTreeSet<String>> {
-        // Cap in-flight spec resolutions; the engine's own semaphores gate the
-        // real work, this just bounds the orchestration set held off the stream.
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .saturating_mul(2);
-
-        let specs = Arc::clone(&self)
-            .query(rs.clone(), m)
-            .map_ok(move |addr| {
-                enclose!((self => engine, rs) async move {
-                    engine.get_spec(rs, &addr).await
-                })
-            })
-            .try_buffer_unordered(concurrency);
+        let specs = self.query_spec(rs, m);
         tokio::pin!(specs);
 
-        // Fold labels in as each spec resolves; the spec is dropped immediately.
         let mut labels = BTreeSet::new();
         while let Some(spec) = specs.try_next().await? {
             for label in &spec.labels {

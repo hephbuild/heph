@@ -51,7 +51,7 @@ mod remote_cache_objstore;
 pub use hplugin::provider;
 pub use remote_cache::{RemoteCacheDef, RemoteCacheSet};
 mod deppath;
-mod query;
+pub mod query;
 pub mod request_state;
 mod revdeps;
 pub mod spec;
