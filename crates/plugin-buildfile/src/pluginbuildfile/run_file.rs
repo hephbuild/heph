@@ -961,6 +961,10 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
     /// Reference files matching a glob `pattern` (with optional `exclude`) as a
     /// dependency address. Package-relative unless `abs = True`. Returns an `fs`
     /// provider address.
+    ///
+    /// `exclude` resolves exactly like `pattern` — the fs driver matches both
+    /// against workspace-root-relative paths, so a package-relative pattern with
+    /// a raw exclude would silently exclude nothing.
     fn glob<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         pattern: &str,
@@ -980,6 +984,10 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             }
             None => vec![],
         };
+        let excludes = excludes
+            .iter()
+            .map(|e| resolve_fs_path(eval, e, abs))
+            .collect::<anyhow::Result<Vec<String>>>()?;
         let excludes_ref: Vec<&str> = excludes.iter().map(String::as_str).collect();
         Ok(hbuiltins::pluginfs::glob_addr(&resolved, &excludes_ref).format())
     }
@@ -2732,6 +2740,20 @@ target(
         result.targets.first().unwrap().config.clone()
     }
 
+    /// [`run_target_config`] for a BUILD file expected to fail: returns the full
+    /// error chain, so a test can assert on the cause rather than the top frame.
+    fn run_target_config_err(build_content: &str) -> String {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_name = "mypkg";
+        let pkg_path = tmp_dir.path().join(pkg_name);
+        fs::create_dir_all(&pkg_path).unwrap();
+        fs::write(pkg_path.join("BUILD"), build_content).unwrap();
+        let provider = make_provider(&tmp_dir);
+        let err =
+            run_pkg_blocking(&provider, pkg_name).expect_err("expected BUILD evaluation to fail");
+        format!("{err:#}")
+    }
+
     #[test]
     fn test_starlark_file_pkg_relative_by_default() {
         // run_target_config runs in pkg "mypkg" — file("src/main.rs") should resolve
@@ -2785,18 +2807,63 @@ target(
         }
     }
 
+    // The fs driver matches pattern and excludes against the same
+    // workspace-root-relative paths, so a package-relative `exclude` must be
+    // prefixed exactly like the pattern — left raw, `vendor/**` in `//mypkg`
+    // matches `vendor/x.go` at the root and excludes nothing from the glob.
     #[test]
     fn test_starlark_glob_with_exclude_pkg_relative() {
         let content = r#"
 target(
     name = "t",
     driver = "d",
-    srcs = glob("**/*.go", exclude = ["vendor/**", "gen/**"]),
+    srcs = glob("**/*.go", exclude = ["vendor/**", "./gen/**"]),
 )
 "#;
         let config = run_target_config(content);
         let expected =
-            hbuiltins::pluginfs::glob_addr("mypkg/**/*.go", &["vendor/**", "gen/**"]).format();
+            hbuiltins::pluginfs::glob_addr("mypkg/**/*.go", &["mypkg/vendor/**", "mypkg/gen/**"])
+                .format();
+        match config.get("srcs") {
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
+            other => panic!("expected glob addr string, got {:?}", other),
+        }
+    }
+
+    // A bare-string `exclude` takes the same path as the list form.
+    #[test]
+    fn test_starlark_glob_with_string_exclude_pkg_relative() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    srcs = glob("**/*.go", exclude = "vendor/**"),
+)
+"#;
+        let config = run_target_config(content);
+        let expected =
+            hbuiltins::pluginfs::glob_addr("mypkg/**/*.go", &["mypkg/vendor/**"]).format();
+        match config.get("srcs") {
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
+            other => panic!("expected glob addr string, got {:?}", other),
+        }
+    }
+
+    // `**/…` keeps matching anywhere under the package: the prefixed
+    // `mypkg/**/*.pb.go` still matches `mypkg/x.pb.go` (`**` spans zero
+    // components), so the common idiom is unaffected.
+    #[test]
+    fn test_starlark_glob_exclude_doublestar_prefixed() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    srcs = glob("**/*.go", exclude = ["**/*.pb.go"]),
+)
+"#;
+        let config = run_target_config(content);
+        let expected =
+            hbuiltins::pluginfs::glob_addr("mypkg/**/*.go", &["mypkg/**/*.pb.go"]).format();
         match config.get("srcs") {
             Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
@@ -2818,6 +2885,43 @@ target(
             Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
         }
+    }
+
+    // `abs = True` governs both sides: neither pattern nor excludes are
+    // prefixed, so a workspace-rooted exclude stays writable.
+    #[test]
+    fn test_starlark_glob_abs_skips_pkg_prefix_for_exclude() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    srcs = glob("**/*.rs", exclude = ["vendor/**"], abs = True),
+)
+"#;
+        let config = run_target_config(content);
+        let expected = hbuiltins::pluginfs::glob_addr("**/*.rs", &["vendor/**"]).format();
+        match config.get("srcs") {
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
+            other => panic!("expected glob addr string, got {:?}", other),
+        }
+    }
+
+    // A `..` in an exclude escapes the workspace root exactly as it does in the
+    // pattern, rather than being silently accepted and matching nothing.
+    #[test]
+    fn test_starlark_glob_exclude_escaping_root_errors() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    srcs = glob("**/*.go", exclude = ["../../../etc/**"]),
+)
+"#;
+        let err = run_target_config_err(content);
+        assert!(
+            err.contains("escapes workspace root"),
+            "expected escape error, got: {err}"
+        );
     }
 
     #[test]
