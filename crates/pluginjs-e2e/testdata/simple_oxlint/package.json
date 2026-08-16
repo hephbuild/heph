@@ -1,0 +1,7 @@
+{
+  "name": "simple",
+  "private": true,
+  "devDependencies": {
+    "oxlint": "0.15.13"
+  }
+}

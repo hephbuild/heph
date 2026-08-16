@@ -96,6 +96,7 @@
 //! rules, and why is the whole point of a lint failure, so nothing here
 //! swallows the linter's own output — see [`lint_failure_detail`].
 
+use crate::pluginjs::toolchain;
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
@@ -343,7 +344,7 @@ impl ManagedDriver for JsLintDriver {
             env.insert("PATH".to_string(), v);
         }
 
-        let mut args: Vec<OsString> = Vec::new();
+        let mut args: Vec<OsString> = deny_warnings_args(&def.linter)?;
         if !def.config_path.is_empty() {
             let config_abs = req.sandbox_ws_dir.join(&def.config_path);
             args.push(OsString::from("-c"));
@@ -431,6 +432,21 @@ impl JsLintDriver {
     }
 }
 
+/// CLI args that make `linter` treat a warning-severity finding as fatal
+/// (nonzero exit). Both oxlint and eslint otherwise exit 0 on warnings, only
+/// failing on error-severity findings by default — a `js_lint` run that only
+/// ever fails on that default would silently pass real, reported lint
+/// problems (confirmed live bug: a real `no-debugger` warning, oxlint's own
+/// default severity for it, did not fail the target). "The lint target is
+/// red" must mean any finding, warning or error alike.
+fn deny_warnings_args(linter: &str) -> anyhow::Result<Vec<OsString>> {
+    Ok(match linter {
+        toolchain::OXLINT => vec![OsString::from("--deny-warnings")],
+        toolchain::ESLINT => vec![OsString::from("--max-warnings"), OsString::from("0")],
+        other => anyhow::bail!("js_lint: unsupported linter {other:?} in resolved def"),
+    })
+}
+
 /// Build the human-readable detail for a failed lint invocation. Both oxlint
 /// and eslint print findings to stdout by default; stderr is included too
 /// (a config/fatal error commonly lands there instead) — mirrors
@@ -471,6 +487,29 @@ mod tests {
 
     fn driver() -> JsLintDriver {
         JsLintDriver::new()
+    }
+
+    // ---- deny_warnings_args: both tools must fail on warnings, not just errors ----
+
+    #[test]
+    fn deny_warnings_args_for_oxlint() {
+        assert_eq!(
+            deny_warnings_args(toolchain::OXLINT).expect("oxlint is supported"),
+            vec![OsString::from("--deny-warnings")]
+        );
+    }
+
+    #[test]
+    fn deny_warnings_args_for_eslint() {
+        assert_eq!(
+            deny_warnings_args(toolchain::ESLINT).expect("eslint is supported"),
+            vec![OsString::from("--max-warnings"), OsString::from("0")]
+        );
+    }
+
+    #[test]
+    fn deny_warnings_args_rejects_an_unknown_linter() {
+        deny_warnings_args("standard").unwrap_err();
     }
 
     fn ctoken() -> StdCancellationToken {
