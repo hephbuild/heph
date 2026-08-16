@@ -8,9 +8,9 @@ use futures::TryStreamExt;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::engine::error::{MultiError, TargetNotFoundError};
+use crate::engine::error::MultiError;
+use crate::engine::query::skip_unresolvable;
 use crate::engine::{Engine, get_cwp, get_root, gitignore};
-use crate::hmemoizer::downcast_chain_ref;
 use crate::htaddr::Addr;
 use crate::htmatcher::Matcher;
 use crate::htpkg::{self, PkgBuf};
@@ -109,21 +109,15 @@ impl App for ValidateApp {
                     .await?;
                 let futs = addrs.iter().map(|addr| {
                     enclose!((engine, rs, addr) async move {
-                        let def = match Arc::clone(&engine).get_def(rs.clone(), &addr).await {
-                            Ok(def) => def,
-                            // A provider may `list` an addr it cannot `get`
-                            // standalone — e.g. go per-platform variants that only
-                            // resolve as in-context deps. The query resolver skips
-                            // these the same way. A NotFound for a *different* addr
-                            // is a real missing dependency and still propagates
-                            // (get_def surfaces it while expanding inputs).
-                            Err(e)
-                                if downcast_chain_ref::<TargetNotFoundError>(&e)
-                                    .is_some_and(|nf| nf.addr == addr) =>
-                            {
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e),
+                        // A listed candidate that doesn't resolve standalone —
+                        // e.g. go per-platform variants that only resolve as
+                        // in-context deps — has no graph of its own to link. The
+                        // helper rather than a `query_*` stream: the fan-out below
+                        // reports *every* failure, and a stream stops at the
+                        // first.
+                        let res = Arc::clone(&engine).get_def(rs.clone(), &addr).await;
+                        let Some(def) = skip_unresolvable(&addr, res)? else {
+                            return Ok(());
                         };
                         Arc::clone(&engine)
                             .link(rs.clone(), Arc::clone(&def.target_def))

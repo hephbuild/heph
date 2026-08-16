@@ -2,8 +2,9 @@ use crate::engine::Engine;
 use crate::engine::error::{CancelledError, CycleError, TargetNotFoundError};
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
+use crate::engine::spec::EngineTargetSpec;
 use enclose::enclose;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher;
@@ -300,6 +301,75 @@ impl Engine {
             }
         }
     }
+
+    /// [`Engine::query`] one tier up: the **spec** of every target matching `m`,
+    /// with the candidates that don't resolve already dropped (see
+    /// [`skip_unresolvable`]).
+    ///
+    /// This is what a walk that reads specs should use. Resolving `query`'s
+    /// addrs by hand is the same four lines of `TargetNotFoundError` downcast at
+    /// every call site, and getting them wrong turns one unresolvable candidate
+    /// into a failed walk.
+    ///
+    /// Specs are resolved off the addr stream with a bounded in-flight set and
+    /// yielded in completion order, so nothing is materialized in bulk: a
+    /// whole-graph selector can be many thousands of addrs.
+    pub fn query_spec<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+    ) -> impl Stream<Item = anyhow::Result<Arc<EngineTargetSpec>>> + 'a {
+        // Cap in-flight spec resolutions; the engine's own semaphores gate the
+        // real work, this just bounds the orchestration set held off the stream.
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .saturating_mul(2);
+
+        Arc::clone(&self)
+            .query(rs.clone(), m)
+            .map_ok(move |addr| {
+                enclose!((self => engine, rs) async move {
+                    skip_unresolvable(&addr, engine.get_spec(rs, &addr).await)
+                })
+            })
+            .try_buffer_unordered(concurrency)
+            .try_filter_map(|spec| std::future::ready(Ok(spec)))
+    }
+}
+
+/// Drop a [`Engine::query`] candidate that cannot be resolved standalone.
+///
+/// A provider's `list` is a **candidate** set, not a target list: it may
+/// advertise an addr `get` declines — go's per-package target set, for one, is
+/// only known once `go list` has run, so `list` emits the superset and `get`
+/// narrows it. A walk over query results must expect that and skip such a
+/// candidate rather than fail: it is not a broken target, it is a target that
+/// was never there.
+///
+/// Only a `TargetNotFound` naming **this same addr** counts. One naming a
+/// *different* addr came from resolving a dependency of this target — a real
+/// missing dependency, which still propagates.
+///
+/// [`Engine::query_spec`] applies this already; call it directly only where the
+/// resolution isn't stream-shaped (a `join_all_failable` fan-out that must
+/// report every failure, or a def-tier walk):
+///
+/// ```ignore
+/// let Some(def) = skip_unresolvable(&addr, engine.get_def(rs, &addr).await)? else {
+///     return Ok(Vec::new());
+/// };
+/// ```
+pub fn skip_unresolvable<T>(addr: &Addr, res: anyhow::Result<T>) -> anyhow::Result<Option<T>> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(e)
+            if downcast_chain_ref::<TargetNotFoundError>(&e).is_some_and(|nf| nf.addr == *addr) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +406,112 @@ mod tests {
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok(Arc::new(engine))
+    }
+
+    /// A provider that lists one addr per package and can `get` none of them —
+    /// the shape every real provider has some corner of (go's `list` is a
+    /// candidate set narrowed at `get` time by what `go list` reports).
+    struct PhantomLister;
+
+    impl crate::engine::provider::Provider for PhantomLister {
+        fn config(
+            &self,
+            _req: crate::engine::provider::ConfigRequest,
+        ) -> anyhow::Result<crate::engine::provider::ConfigResponse> {
+            Ok(crate::engine::provider::ConfigResponse {
+                name: "phantom".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            req: ListRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<
+                Box<
+                    dyn Iterator<Item = anyhow::Result<crate::engine::provider::ListResponse>>
+                        + Send,
+                >,
+            >,
+        > {
+            let addr = Addr::new(
+                req.package.clone(),
+                "phantom".to_string(),
+                Default::default(),
+            );
+            Box::pin(async move {
+                let items = vec![Ok(crate::engine::provider::ListResponse { addr })];
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: crate::engine::provider::ListPackagesRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<
+                Box<
+                    dyn Iterator<
+                            Item = anyhow::Result<crate::engine::provider::ListPackageResponse>,
+                        > + Send,
+                >,
+            >,
+        > {
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: crate::engine::provider::GetRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<crate::engine::provider::GetResponse, crate::engine::provider::GetError>,
+        > {
+            Box::pin(async { Err(crate::engine::provider::GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: crate::engine::provider::ProbeRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<crate::engine::provider::ProbeResponse>>
+        {
+            Box::pin(async { Ok(crate::engine::provider::ProbeResponse { states: vec![] }) })
+        }
+    }
+
+    /// `list` is a candidate set: a provider may advertise an addr no provider
+    /// can resolve. `query_spec` is where that gets absorbed — one phantom
+    /// sibling must not take a whole-graph walk down with `target not found`,
+    /// and every consumer that resolves query results (`labels`, `validate`,
+    /// `revdeps`, the gitignore walk) leans on it.
+    #[tokio::test]
+    async fn query_spec_skips_candidates_that_cannot_be_resolved() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let provider =
+            pluginstatictarget::Provider::new(vec![target("foo", "a", &["//labels:lint"])])?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        engine.register_provider(|_| Box::new(PhantomLister))?;
+        let engine = Arc::new(engine);
+
+        let rs = engine.new_state();
+        let specs: Vec<Arc<EngineTargetSpec>> = engine
+            .query_spec(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .try_collect()
+            .await?;
+
+        let addrs: Vec<String> = specs.iter().map(|s| s.addr.format()).collect();
+        assert_eq!(addrs, vec!["//foo:a".to_string()]);
+        Ok(())
     }
 
     #[tokio::test]

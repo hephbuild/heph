@@ -7,7 +7,8 @@ use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
 
 use crate::engine::Engine;
-use crate::engine::error::{CycleError, TargetNotFoundError};
+use crate::engine::error::CycleError;
+use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
 
 impl Engine {
@@ -57,24 +58,18 @@ async fn resolve_dependent(
     candidate: Addr,
     target: &Addr,
 ) -> anyhow::Result<Option<Addr>> {
-    let def = match Arc::clone(engine)
+    let res = Arc::clone(engine)
         .get_direct_def(rs.clone(), &candidate)
-        .await
-    {
-        Ok(def) => def,
-        // A provider may `list` an addr it cannot `get` standalone (e.g.
-        // per-platform variants that only resolve as in-context deps), or a
-        // candidate may cycle back to the query target. Neither can be a
-        // resolvable dependent; skip it the way the query resolver does. A
-        // NotFound for a *different* addr is a real breakage and still propagates.
-        Err(e)
-            if downcast_chain_ref::<TargetNotFoundError>(&e)
-                .is_some_and(|nf| nf.addr == candidate) =>
-        {
-            return Ok(None);
-        }
+        .await;
+    // On top of the candidate that is not a target at all (`skip_unresolvable`):
+    // a candidate that cycles back to the query target cannot be a resolvable
+    // dependent either. Skip it the way the query resolver does.
+    let res = match res {
         Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => return Ok(None),
-        Err(e) => return Err(e),
+        res => res,
+    };
+    let Some(def) = skip_unresolvable(&candidate, res)? else {
+        return Ok(None);
     };
     let uses = def
         .target_def

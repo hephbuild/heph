@@ -14,9 +14,8 @@ use futures::TryStreamExt;
 
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::path::{CodegenMode, Content};
-use crate::engine::error::TargetNotFoundError;
+use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
-use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::{Addr, parse_addr};
 use hmodel::htmatcher::{MatchResult, Matcher};
 
@@ -117,20 +116,13 @@ impl Engine {
         let fail_fast = rs.fail_fast();
         let futs = addrs.iter().map(|addr| {
             enclose!((self => engine, rs, addr) async move {
-                // A provider may `list` an addr it cannot `get` standalone (e.g.
-                // go's `//pkg:build` for a non-main package, resolved only as an
-                // in-context dep). Such a target emits no codegen-copy output here,
-                // so skip it on a self-addr NotFound — matching the query resolver
-                // and `validate`. Any other failure propagates.
-                let def = match engine.get_def(rs, &addr).await {
-                    Ok(def) => def,
-                    Err(e)
-                        if downcast_chain_ref::<TargetNotFoundError>(&e)
-                            .is_some_and(|nf| nf.addr == addr) =>
-                    {
-                        return Ok(Vec::new());
-                    }
-                    Err(e) => return Err(e),
+                // A listed candidate that doesn't resolve standalone (e.g. go's
+                // `//pkg:build` for a non-main package, resolved only as an
+                // in-context dep) emits no codegen-copy output. The helper rather
+                // than a `query_*` stream: the fan-out below reports *every*
+                // failure, and a stream stops at the first.
+                let Some(def) = skip_unresolvable(&addr, engine.get_def(rs, &addr).await)? else {
+                    return Ok(Vec::new());
                 };
                 let entries: Vec<GitignoreEntry> = def
                     .target_def
