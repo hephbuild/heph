@@ -144,3 +144,54 @@ async fn js_test_cache_is_invalidated_when_an_imported_file_changes() -> anyhow:
     );
     Ok(())
 }
+
+/// `js_lint` end to end: a real `node_modules/.bin/oxlint` (installed by the
+/// same real `npm install` `simple_vitest`'s tests rely on) linting a real,
+/// clean first-party source file. Reported live bug: `heph r //pkg:js_lint`
+/// failed with oxlint's own `No files found to lint` — the driver invoked a
+/// real oxlint binary but handed it either no source-file args, or args that
+/// didn't resolve to any file actually staged in the sandbox. This proves
+/// the whole pipeline — `Provider::list`/`get` discover the package, declare
+/// its first-party sources as Inputs, the sandbox stages them, and
+/// `JsLintDriver::run` builds oxlint's argv from what was actually staged —
+/// produces a real, successful lint of a real file, not a false "0 files"
+/// pass or an unwarranted failure.
+#[tokio::test]
+async fn js_lint_passes_on_a_real_clean_package() -> anyhow::Result<()> {
+    require_npm!();
+    let dir = common::npm_fixture("simple_oxlint")?;
+    let ws = common::make_workspace(dir)?;
+
+    let result = ws.run("//:js_lint").await?;
+    assert!(
+        result.artifacts.is_empty(),
+        "js_lint produces no output artifacts by design"
+    );
+    Ok(())
+}
+
+/// Mirror of the passing case: a real oxlint violation (`no-debugger`, one of
+/// its default-enabled correctness rules) must fail the target and surface
+/// oxlint's own diagnostic — proving oxlint actually saw and linted the
+/// staged file, not the "silently 0 files, exit 0" failure mode that would
+/// make this reported bug invisible (an older oxlint accepts bogus/missing
+/// path args as "nothing to lint" and exits 0; a newer one hard-fails with
+/// `No files found to lint`; either way a real violation must be caught).
+#[tokio::test]
+async fn js_lint_fails_and_surfaces_the_real_oxlint_violation() -> anyhow::Result<()> {
+    require_npm!();
+    let dir = common::npm_fixture("simple_oxlint_violation")?;
+    let ws = common::make_workspace(dir)?;
+
+    let err = ws
+        .run("//:js_lint")
+        .await
+        .err()
+        .expect("a real oxlint violation must fail the target");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no-debugger") || msg.contains("debugger"),
+        "expected the real oxlint failure naming the violating rule, got: {msg}"
+    );
+    Ok(())
+}
