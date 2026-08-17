@@ -809,8 +809,13 @@ impl Provider {
             Some(linter) => linter,
             None => {
                 let workspace_root = self.workspace_root.clone();
+                let pkg_dir = if pkg.as_str().is_empty() {
+                    workspace_root.clone()
+                } else {
+                    workspace_root.join(pkg.as_str())
+                };
                 hcore::blocking::run(move || {
-                    toolchain::detect_linter(&workspace_root).map(str::to_string)
+                    toolchain::detect_linter(&workspace_root, &pkg_dir).map(str::to_string)
                 })
                 .await
                 .context("auto-detecting js_lint's linter")?

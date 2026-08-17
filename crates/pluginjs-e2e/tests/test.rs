@@ -283,3 +283,33 @@ async fn js_lint_auto_detected_eslint_fails_on_a_real_warning_severity_violation
     );
     Ok(())
 }
+
+/// Live user pushback on the auto-detection design: "why are you checking
+/// the workspace root, this doesn't make any sense its a per package
+/// thing" — confirmed correct. `js_lint` is per-package, so detection must
+/// walk from the requesting *package* up to the workspace root (the same
+/// ancestor chain `find_nearest_lint_config` already resolves the config
+/// content against), not stop at the bare root. This fixture's root
+/// `package.json` carries no linter config at all; only `packages/a` has
+/// its own `eslint.config.js` — proving detection finds a package-owned
+/// config with nothing at the root, through the real engine + real eslint,
+/// not just the `toolchain::detect_linter` unit tests.
+#[tokio::test]
+async fn js_lint_auto_detects_a_nested_packages_own_config_with_no_root_config()
+-> anyhow::Result<()> {
+    require_npm!();
+    let dir = common::npm_fixture("nested_eslint")?;
+    let ws = common::make_workspace(dir)?;
+
+    let err = ws
+        .run("//packages/a:js_lint")
+        .await
+        .err()
+        .expect("the real, warning-severity no-debugger violation must fail the target");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no-debugger") || msg.contains("debugger"),
+        "expected the real eslint failure naming the violating rule, got: {msg}"
+    );
+    Ok(())
+}
