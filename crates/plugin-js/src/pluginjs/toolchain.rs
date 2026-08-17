@@ -47,6 +47,7 @@
 //! and threads the resulting string through the target's config for the
 //! driver to hash — see `driver_typecheck.rs`'s module docs.
 
+use crate::pluginjs::importgraph;
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 
@@ -202,48 +203,68 @@ pub(crate) fn lint_config_candidates(linter: &str) -> anyhow::Result<&'static [&
     }
 }
 
-/// Auto-detect which linter this workspace uses, for when no applicable
+/// Auto-detect which linter `pkg_dir`'s package uses, for when no applicable
 /// `provider_state(provider = "js", linter = ...)` sets one (see
 /// `pluginjs::provider::pick_configured_linter`). Checks for each tool's own
-/// config file (see [`lint_config_candidates`]) at the workspace root —
-/// **not** which binary happens to be installed, and never `PATH`. A config
-/// file is the workspace owner's own declared choice; package presence is
-/// not: a repo mid-migration between the two tools, or one that carries
-/// both as transitive/dev tooling for unrelated reasons, can easily have
-/// both binaries installed with only one actually configured, which made an
-/// earlier binary-presence-based version of this function spuriously call
-/// that "ambiguous" — a confirmed live bug already showed the cost of
-/// guessing wrong here (`linter` silently defaulted to `oxlint`, and a
-/// stray binary then ran against a workspace that only used `eslint`).
-/// Failing loudly on "neither" or "both configured" — rather than
-/// guessing — mirrors this same provider's `pkgmanager` option, which has
-/// no default for the identical reason (an ambiguous, silently-picked
-/// answer is worse than requiring the caller to say which one).
-pub(crate) fn detect_linter(workspace_root: &Path) -> anyhow::Result<&'static str> {
-    let has_config = |linter: &str| -> bool {
-        lint_config_candidates(linter)
-            .into_iter()
-            .flatten()
-            .any(|name| workspace_root.join(name).is_file())
+/// config file (see [`lint_config_candidates`]) along the *same*
+/// ancestor-chain walk `Provider::lint_config` itself resolves the config
+/// against (`importgraph::find_nearest_lint_config`, `pkg_dir` up to
+/// `workspace_root`, inclusive of both) — **not** the workspace root alone:
+/// `js_lint` is per-package, and a package can carry its own config with no
+/// root-level config at all, so checking only the root would wrongly call
+/// that "no linter detected". And **not** which binary happens to be
+/// installed, and never `PATH` — a config file is the workspace owner's own
+/// declared choice; package presence is not: a repo mid-migration between
+/// the two tools, or one that carries both as transitive/dev tooling for
+/// unrelated reasons, can easily have both binaries installed with only one
+/// actually configured, which made an earlier binary-presence-based version
+/// of this function spuriously call that "ambiguous" — a confirmed live bug
+/// already showed the cost of guessing wrong here (`linter` silently
+/// defaulted to `oxlint`, and a stray binary then ran against a workspace
+/// that only used `eslint`). Failing loudly on "neither" or "both
+/// configured" — rather than guessing — mirrors this same provider's
+/// `pkgmanager` option, which has no default for the identical reason (an
+/// ambiguous, silently-picked answer is worse than requiring the caller to
+/// say which one).
+pub(crate) fn detect_linter(workspace_root: &Path, pkg_dir: &Path) -> anyhow::Result<&'static str> {
+    let found = |linter: &str| -> Option<PathBuf> {
+        lint_config_candidates(linter).ok().and_then(|candidates| {
+            importgraph::find_nearest_lint_config(workspace_root, pkg_dir, candidates)
+        })
     };
-    match (has_config(OXLINT), has_config(ESLINT)) {
-        (true, false) => Ok(OXLINT),
-        (false, true) => Ok(ESLINT),
-        (false, false) => anyhow::bail!(
-            "js provider: could not detect a linter — no oxlint config \
-             ({:?}) or eslint config ({:?}) was found at the workspace root {:?}. Add one, or \
-             set `provider_state(provider = \"js\", linter = \"oxlint\" | \"eslint\")` \
-             explicitly.",
+    let oxlint_config = found(OXLINT);
+    let eslint_config = found(ESLINT);
+    match (&oxlint_config, &eslint_config) {
+        (Some(_), None) => Ok(OXLINT),
+        (None, Some(_)) => Ok(ESLINT),
+        (None, None) => anyhow::bail!(
+            "js provider: could not detect a linter for {pkg_dir:?} — no oxlint config \
+             ({:?}) or eslint config ({:?}) was found there or in any ancestor up to the \
+             workspace root {workspace_root:?}. Add one, or set \
+             `provider_state(provider = \"js\", linter = \"oxlint\" | \"eslint\")` explicitly.",
             lint_config_candidates(OXLINT).unwrap_or_default(),
             lint_config_candidates(ESLINT).unwrap_or_default(),
-            workspace_root
         ),
-        (true, true) => anyhow::bail!(
-            "js provider: both an oxlint config and an eslint config were found at the \
-             workspace root {:?} — ambiguous which one `js_lint` should run. Set \
-             `provider_state(provider = \"js\", linter = \"oxlint\" | \"eslint\")` explicitly.",
-            workspace_root
-        ),
+        // Both tools have *a* config somewhere on the ancestor chain — the
+        // closer one wins, mirroring every other closest-declaration-wins
+        // resolution this plugin already has (`provider_state`'s own
+        // ancestor precedence, `find_nearest_lint_config` itself). Depth is
+        // compared by each config's own directory, not the file path
+        // itself, since the candidate filenames differ in length.
+        (Some(ox), Some(es)) => {
+            let depth = |p: &Path| p.parent().map(|d| d.components().count()).unwrap_or(0);
+            match depth(ox).cmp(&depth(es)) {
+                std::cmp::Ordering::Greater => Ok(OXLINT),
+                std::cmp::Ordering::Less => Ok(ESLINT),
+                std::cmp::Ordering::Equal => anyhow::bail!(
+                    "js provider: both an oxlint config ({ox:?}) and an eslint config ({es:?}) \
+                     apply equally closely to {pkg_dir:?} — ambiguous which one `js_lint` \
+                     should run. Set \
+                     `provider_state(provider = \"js\", linter = \"oxlint\" | \"eslint\")` \
+                     explicitly.",
+                ),
+            }
+        }
     }
 }
 
@@ -660,14 +681,20 @@ mod tests {
     fn detect_linter_finds_oxlint_config_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_config(dir.path(), OXLINT);
-        assert_eq!(detect_linter(dir.path()).expect("detect"), OXLINT);
+        assert_eq!(
+            detect_linter(dir.path(), dir.path()).expect("detect"),
+            OXLINT
+        );
     }
 
     #[test]
     fn detect_linter_finds_eslint_config_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_config(dir.path(), ESLINT);
-        assert_eq!(detect_linter(dir.path()).expect("detect"), ESLINT);
+        assert_eq!(
+            detect_linter(dir.path(), dir.path()).expect("detect"),
+            ESLINT
+        );
     }
 
     #[test]
@@ -677,13 +704,16 @@ mod tests {
         // must also satisfy detection.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".eslintrc.json"), b"{}").expect("write legacy config");
-        assert_eq!(detect_linter(dir.path()).expect("detect"), ESLINT);
+        assert_eq!(
+            detect_linter(dir.path(), dir.path()).expect("detect"),
+            ESLINT
+        );
     }
 
     #[test]
     fn detect_linter_errors_when_no_config_present() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = detect_linter(dir.path()).expect_err("no config anywhere must error");
+        let err = detect_linter(dir.path(), dir.path()).expect_err("no config anywhere must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("oxlint") && msg.contains("eslint"), "{msg}");
     }
@@ -693,7 +723,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_config(dir.path(), OXLINT);
         write_config(dir.path(), ESLINT);
-        let err = detect_linter(dir.path()).expect_err("ambiguous — both configured must error");
+        let err = detect_linter(dir.path(), dir.path())
+            .expect_err("ambiguous — both configured must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("ambiguous"), "{msg}");
     }
@@ -707,10 +738,76 @@ mod tests {
         // `detect_linter`'s doc for the exact live bug this guards against.
         let dir = tempfile::tempdir().expect("tempdir");
         write_local_bin(dir.path(), OXLINT);
-        let err = detect_linter(dir.path())
+        let err = detect_linter(dir.path(), dir.path())
             .expect_err("an installed binary with no config must not satisfy detection");
         let msg = format!("{err:#}");
         assert!(msg.contains("oxlint") && msg.contains("eslint"), "{msg}");
+    }
+
+    // ---- per-package: js_lint is per-package, so detection must walk from
+    // the requesting package up to the workspace root, not stop at the root.
+
+    #[test]
+    fn detect_linter_finds_a_package_owned_config_with_no_root_config_at_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir");
+        write_config(&pkg_dir, ESLINT);
+        assert_eq!(
+            detect_linter(dir.path(), &pkg_dir).expect("detect"),
+            ESLINT,
+            "a package's own config must be found even with nothing at the workspace root"
+        );
+    }
+
+    #[test]
+    fn detect_linter_falls_back_to_the_workspace_root_config_for_a_package_with_none_of_its_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_config(dir.path(), OXLINT);
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir");
+        assert_eq!(
+            detect_linter(dir.path(), &pkg_dir).expect("detect"),
+            OXLINT,
+            "the root config must apply to a descendant package that carries no config of its own"
+        );
+    }
+
+    #[test]
+    fn detect_linter_prefers_the_closer_config_when_both_tools_are_configured_at_different_depths()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Root uses eslint; this one package opted into oxlint specifically.
+        write_config(dir.path(), ESLINT);
+        let pkg_dir = dir.path().join("packages/a");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir");
+        write_config(&pkg_dir, OXLINT);
+        assert_eq!(
+            detect_linter(dir.path(), &pkg_dir).expect("detect"),
+            OXLINT,
+            "the package's own, closer config must win over the farther workspace-root one"
+        );
+        // A sibling package with no config of its own still falls back to
+        // the root's eslint — the oxlint override doesn't leak sideways.
+        let sibling_dir = dir.path().join("packages/b");
+        std::fs::create_dir_all(&sibling_dir).expect("mkdir");
+        assert_eq!(
+            detect_linter(dir.path(), &sibling_dir).expect("detect"),
+            ESLINT
+        );
+    }
+
+    #[test]
+    fn detect_linter_errors_when_both_configs_apply_equally_closely() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Both tools configured in the exact same directory — genuinely
+        // ambiguous, unlike the different-depths case above.
+        write_config(dir.path(), OXLINT);
+        write_config(dir.path(), ESLINT);
+        let err = detect_linter(dir.path(), dir.path())
+            .expect_err("equally-close configs for both tools must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ambiguous"), "{msg}");
     }
 
     #[test]
