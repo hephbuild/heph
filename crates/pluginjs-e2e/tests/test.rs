@@ -233,3 +233,53 @@ async fn js_lint_fails_with_an_actionable_message_when_ignore_patterns_exclude_e
     );
     Ok(())
 }
+
+/// Reported live bug, the other half: the workspace owner said "i'm not
+/// using oxlint, i'm using eslint" — but `linter` had no auto-detection, so
+/// it silently defaulted to oxlint and (in their real environment) resolved
+/// a stray PATH `oxlint` binary despite the workspace only having `eslint`
+/// installed. `make_workspace` passes `linter: None` (see `common::mod.rs`),
+/// so every js_lint e2e test — this one included — exercises real
+/// auto-detection, not an assumed default. This fixture has only `eslint`
+/// in `node_modules/.bin` (no oxlint), so detection must resolve to eslint
+/// and actually run it — proving the whole pipeline, not just the detection
+/// function in isolation (already unit-tested in `toolchain::tests`).
+#[tokio::test]
+async fn js_lint_auto_detects_and_passes_on_a_real_eslint_only_package() -> anyhow::Result<()> {
+    require_npm!();
+    let dir = common::npm_fixture("simple_eslint")?;
+    let ws = common::make_workspace(dir)?;
+
+    let result = ws.run("//:js_lint").await?;
+    assert!(
+        result.artifacts.is_empty(),
+        "js_lint produces no output artifacts by design"
+    );
+    Ok(())
+}
+
+/// Mirror of the passing case, and the specific regression check for the
+/// `--max-warnings 0` fix (see `driver_lint.rs`'s `deny_warnings_args`):
+/// this fixture's `no-debugger` rule is configured as `"warn"`, not
+/// `"error"` — eslint already exits nonzero on an "error" finding with no
+/// extra flag, so only a *warning*-severity finding actually exercises
+/// whether heph forces warnings to fail the target too.
+#[tokio::test]
+async fn js_lint_auto_detected_eslint_fails_on_a_real_warning_severity_violation()
+-> anyhow::Result<()> {
+    require_npm!();
+    let dir = common::npm_fixture("simple_eslint_violation")?;
+    let ws = common::make_workspace(dir)?;
+
+    let err = ws
+        .run("//:js_lint")
+        .await
+        .err()
+        .expect("a real eslint warning-severity violation must still fail the target");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no-debugger") || msg.contains("debugger"),
+        "expected the real eslint failure naming the violating rule, got: {msg}"
+    );
+    Ok(())
+}

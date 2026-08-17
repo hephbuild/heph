@@ -1,10 +1,11 @@
 //! `js_lint` — runs a configured linter over one package at a time.
 //!
-//! One driver name, tool selected by config (`linter = "oxlint"` default,
-//! `"eslint"` alt) — matching the established naming rule this crate already
-//! follows for `js_test`'s `testrunner` axis: never a driver-per-tool
-//! (`js_lint_oxlint`/`js_lint_eslint`), see `ai-docs/js-plugin-plan.md`'s
-//! tool-selection table.
+//! One driver name, tool selected by config (`linter = "oxlint"` or
+//! `"eslint"`, auto-detected from what's installed when unset — see
+//! `toolchain::detect_linter`) — matching the established naming rule this
+//! crate already follows for `js_test`'s `testrunner` axis: never a
+//! driver-per-tool (`js_lint_oxlint`/`js_lint_eslint`), see
+//! `ai-docs/js-plugin-plan.md`'s tool-selection table.
 //!
 //! ## Granularity: per-package, for both tools
 //!

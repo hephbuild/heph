@@ -53,9 +53,10 @@ pub const TYPECHECK_TARGET: &str = "js_typecheck";
 pub const TEST_TARGET: &str = "js_test";
 
 /// Target name of the M5 `js_lint` target: runs the configured linter
-/// (`oxlint` default, `eslint` alt) over one package at a time — per-package
-/// granularity, the same as `js_typecheck` (see `driver_lint.rs` module docs
-/// for why per-file caching isn't worth the bookkeeping here either).
+/// (`oxlint` or `eslint`, auto-detected from what's installed when unset)
+/// over one package at a time — per-package granularity, the same as
+/// `js_typecheck` (see `driver_lint.rs` module docs for why per-file caching
+/// isn't worth the bookkeeping here either).
 pub const LINT_TARGET: &str = "js_lint";
 
 /// Target name of the M6 `js_bundle` target: runs the configured bundler
