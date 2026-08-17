@@ -344,6 +344,7 @@ impl ManagedDriver for JsLintDriver {
             env.insert("PATH".to_string(), v);
         }
 
+        let src_count = srcs.len();
         let mut args: Vec<OsString> = deny_warnings_args(&def.linter)?;
         if !def.config_path.is_empty() {
             let config_abs = req.sandbox_ws_dir.join(&def.config_path);
@@ -362,7 +363,17 @@ impl ManagedDriver for JsLintDriver {
         // practice. See `driver_test.rs`'s module docs for the confirmed
         // live bug this mirrors the fix for.
         self.exec_linter(&linter_bin, args, &env, &req.sandbox_pkg_dir, ctoken)
-            .await?;
+            .await
+            .with_context(|| {
+                format!(
+                    "{src_count} source file(s) declared as js_lint Inputs, resolved config: {}",
+                    if def.config_path.is_empty() {
+                        "<none — linter's own defaults>".to_string()
+                    } else {
+                        def.config_path.clone()
+                    }
+                )
+            })?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -422,11 +433,34 @@ impl JsLintDriver {
         if !output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
+            let mut msg = format!(
                 "lint failed ({}):\n{}",
                 output.status,
                 lint_failure_detail(&stdout, &stderr)
             );
+            // oxlint's exact wording for "every explicitly-passed file matched
+            // the resolved config's own `ignorePatterns`" — confirmed live: this
+            // driver always passes an explicit, non-empty file list (the early
+            // no-op return above already handles a genuinely empty one), so
+            // this specific message means the *linter's own ignore config*, not
+            // heph, decided there was nothing to lint. Point at both remedies
+            // rather than leaving the raw oxlint text — which reads as a heph
+            // bug ("there clearly are files") when it is a config/intent
+            // mismatch between what heph declared as sources and what the
+            // resolved lint config says to skip.
+            if zero_files_matches_ignore_patterns(&stdout) {
+                msg.push_str(
+                    "\n\nheph note: every source file this js_lint target declared as an \
+                     Input matched the resolved lint config's own ignore rules (e.g. \
+                     `ignorePatterns` in .oxlintrc.json / .eslintrc), so the linter found \
+                     nothing to actually lint — heph passes files explicitly, and this \
+                     linter still applies its ignore config even to explicit paths. Either \
+                     narrow the ignore rule so it doesn't match this package, or if this \
+                     package is meant to skip linting entirely, say so explicitly with \
+                     `provider_state(provider = \"js\", lint = False)` in its BUILD file.",
+                );
+            }
+            anyhow::bail!(msg);
         }
         Ok(())
     }
@@ -445,6 +479,19 @@ fn deny_warnings_args(linter: &str) -> anyhow::Result<Vec<OsString>> {
         toolchain::ESLINT => vec![OsString::from("--max-warnings"), OsString::from("0")],
         other => anyhow::bail!("js_lint: unsupported linter {other:?} in resolved def"),
     })
+}
+
+/// Whether `stdout` is oxlint's own message for "every path given on the
+/// command line matched the resolved config's `ignorePatterns` (or an
+/// equivalent ignore rule), so nothing was actually linted" — confirmed live
+/// against a real oxlint (1.78.0): `oxlint --deny-warnings -c
+/// <config-with-ignorePatterns-matching-everything> <file>` prints exactly
+/// this and exits nonzero, even though `<file>` genuinely exists and was
+/// explicitly named. A substring match on oxlint's current wording — best
+/// effort, not a stable contract; a future oxlint wording change just stops
+/// the hint from firing, it doesn't break the underlying failure surfacing.
+fn zero_files_matches_ignore_patterns(stdout: &str) -> bool {
+    stdout.contains("No files found to lint")
 }
 
 /// Build the human-readable detail for a failed lint invocation. Both oxlint
