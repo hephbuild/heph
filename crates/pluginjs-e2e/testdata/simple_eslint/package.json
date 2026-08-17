@@ -1,0 +1,8 @@
+{
+  "name": "simple",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "eslint": "10.8.1"
+  }
+}

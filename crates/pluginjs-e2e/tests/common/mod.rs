@@ -127,7 +127,10 @@ pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
                         "**/*.test.{ts,tsx,js,jsx}".to_string(),
                         "**/*.spec.{ts,tsx,js,jsx}".to_string(),
                     ],
-                    linter: "oxlint".to_string(),
+                    // `None` — auto-detect from what's actually installed in
+                    // the fixture (see `toolchain::detect_linter`). Exercises
+                    // the real detection path rather than assuming oxlint.
+                    linter: None,
                     bundler: "esbuild".to_string(),
                 },
             ))

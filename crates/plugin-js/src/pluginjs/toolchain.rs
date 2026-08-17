@@ -155,7 +155,8 @@ pub(crate) fn resolve_host_test_runner(
 /// `resolve_host_linter` doc and `driver_lint.rs` module docs for the same
 /// disclosed non-hermetic-toolchain shape `tstool = "host"`/`testrunner`
 /// already have. Mirrors `ai-docs/js-plugin-plan.md`'s `js_lint` row:
-/// `linter` defaults to `oxlint`, alt `eslint` (for type-aware rules).
+/// `oxlint` (syntactic, fast) or `eslint` (for type-aware rules) — no static
+/// default; see [`detect_linter`] for what happens when unset.
 pub const OXLINT: &str = "oxlint";
 pub const ESLINT: &str = "eslint";
 
@@ -163,6 +164,43 @@ pub const ESLINT: &str = "eslint";
 /// recognizes in this milestone.
 pub fn is_supported_linter(linter: &str) -> bool {
     linter == OXLINT || linter == ESLINT
+}
+
+/// Auto-detect which linter this workspace uses, for when the `js`
+/// provider's `linter` option is left unset. Checks only
+/// `<workspace_root>/node_modules/.bin/{oxlint,eslint}` — deliberately never
+/// `PATH` — because a stray, unrelated global binary is exactly the wrong
+/// signal to decide this on: a confirmed live bug had `linter` silently
+/// default to `oxlint`, and a PATH-resolved `oxlint` binary then ran against
+/// an eslint-only workspace with no oxlint installed at all, producing an
+/// oxlint-specific failure the workspace owner had no way to explain (they
+/// had never chosen oxlint). Failing loudly on "neither" or "both" — rather
+/// than guessing — mirrors this same provider's `pkgmanager` option, which
+/// has no default for the identical reason (an ambiguous, silently-picked
+/// answer is worse than requiring the caller to say which one).
+pub(crate) fn detect_linter(workspace_root: &Path) -> anyhow::Result<&'static str> {
+    let installed = |name: &str| -> bool {
+        std::fs::metadata(workspace_root.join("node_modules").join(".bin").join(name))
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+    };
+    match (installed(OXLINT), installed(ESLINT)) {
+        (true, false) => Ok(OXLINT),
+        (false, true) => Ok(ESLINT),
+        (false, false) => anyhow::bail!(
+            "js provider: could not detect a linter — neither `oxlint` nor `eslint` was found \
+             at {:?}. Install one (`npm install -D oxlint` or `npm install -D eslint` — or the \
+             `pnpm`/`yarn` equivalent), or set the js provider's `linter` option explicitly to \
+             \"oxlint\" or \"eslint\".",
+            workspace_root.join("node_modules").join(".bin")
+        ),
+        (true, true) => anyhow::bail!(
+            "js provider: both `oxlint` and `eslint` are installed at {:?} — ambiguous which \
+             one `js_lint` should run. Set the js provider's `linter` option explicitly to \
+             \"oxlint\" or \"eslint\".",
+            workspace_root.join("node_modules").join(".bin")
+        ),
+    }
 }
 
 /// Resolve the configured `linter`'s binary:
@@ -560,6 +598,67 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("eslint"), "{msg}");
         assert!(msg.contains("PATH"), "{msg}");
+    }
+
+    fn write_local_bin(dir: &Path, name: &str) {
+        let local_bin_dir = dir.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&local_bin_dir).expect("mkdir");
+        std::fs::write(local_bin_dir.join(name), b"#!/bin/sh\necho local\n")
+            .expect("write local bin");
+    }
+
+    #[test]
+    fn detect_linter_finds_oxlint_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_local_bin(dir.path(), OXLINT);
+        assert_eq!(detect_linter(dir.path()).expect("detect"), OXLINT);
+    }
+
+    #[test]
+    fn detect_linter_finds_eslint_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_local_bin(dir.path(), ESLINT);
+        assert_eq!(detect_linter(dir.path()).expect("detect"), ESLINT);
+    }
+
+    #[test]
+    fn detect_linter_errors_when_neither_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = detect_linter(dir.path()).expect_err("neither installed must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("oxlint") && msg.contains("eslint"), "{msg}");
+    }
+
+    #[test]
+    fn detect_linter_errors_when_both_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_local_bin(dir.path(), OXLINT);
+        write_local_bin(dir.path(), ESLINT);
+        let err = detect_linter(dir.path()).expect_err("ambiguous — both installed must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ambiguous"), "{msg}");
+    }
+
+    #[test]
+    fn detect_linter_ignores_path_only_binaries() {
+        // A stray global oxlint on PATH must never decide detection — see
+        // `detect_linter`'s doc for the exact live bug this guards against.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(path_dir.path().join(OXLINT), b"#!/bin/sh\necho stray\n")
+            .expect("write stray path oxlint");
+        let prior = std::env::var_os("PATH");
+        // SAFETY: test-only, single-threaded within this process for the
+        // duration of the mutation; restored immediately below.
+        unsafe { std::env::set_var("PATH", path_dir.path()) };
+        let result = detect_linter(dir.path());
+        match &prior {
+            // SAFETY: test-only, restoring the prior value we saved above.
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            // SAFETY: test-only, restoring the prior (unset) state.
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        result.expect_err("a PATH-only oxlint must not satisfy detection");
     }
 
     #[test]

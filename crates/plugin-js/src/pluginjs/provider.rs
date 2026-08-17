@@ -69,11 +69,18 @@ pub struct Config {
     /// are matched against to discover `js_test` targets. Defaults to
     /// [`DEFAULT_TEST_GLOBS`] when unset — see that constant's doc for why.
     pub test_glob: Vec<String>,
-    /// Which linter `js_lint` invokes — `"oxlint"` (default) or `"eslint"`,
-    /// per `ai-docs/js-plugin-plan.md`'s `js_lint` row. Same provider-level,
+    /// Which linter `js_lint` invokes — `"oxlint"` or `"eslint"`, per
+    /// `ai-docs/js-plugin-plan.md`'s `js_lint` row. Same provider-level,
     /// host-toolchain shape as `tstool`/`testrunner` — see
-    /// `toolchain::resolve_host_linter`.
-    pub linter: String,
+    /// `toolchain::resolve_host_linter`. Unlike those, this has no static
+    /// default: `None` auto-detects from what's actually installed at
+    /// `<workspace_root>/node_modules/.bin/` (see `toolchain::detect_linter`,
+    /// resolved lazily at `Provider::get` time, same point the binary itself
+    /// is resolved) — a confirmed live bug had this silently default to
+    /// `oxlint` and then resolve a stray PATH `oxlint` binary in a workspace
+    /// that only had `eslint` installed, producing an oxlint-specific
+    /// failure the workspace owner had no way to explain.
+    pub linter: Option<String>,
     /// Which bundler `js_bundle` invokes — `"esbuild"` (default, the only
     /// value implemented this milestone), per `ai-docs/js-plugin-plan.md`'s
     /// `js_bundle` row. Same provider-level, host-toolchain shape as
@@ -94,7 +101,7 @@ impl Config {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
-            linter: toolchain::OXLINT.to_string(),
+            linter: None,
             bundler: toolchain::ESBUILD.to_string(),
         }
     }
@@ -144,17 +151,20 @@ pub struct Provider {
     /// scale a real subprocess cost with the number of test files, not just
     /// packages.
     testrunner_cache: OnceCell<Arc<(PathBuf, String)>>,
-    /// Which linter `js_lint` invokes — see [`Config::linter`]'s doc.
-    linter: String,
-    /// Lazily resolved host linter binary path + queried `--version`, cached
-    /// once for the `Provider`'s lifetime — same rationale as
-    /// `tsc_cache`/`testrunner_cache`: `lint_config` runs once per `js_lint`
-    /// target (one per package) per `Provider::get`, so re-resolving and
-    /// re-spawning `<linter> --version` per package would scale a real
-    /// subprocess cost with package count, including a 100%-cache-hit run
-    /// (the same M3/M4-review-flagged mistake this milestone's task
-    /// explicitly calls out not to repeat).
-    linter_cache: OnceCell<Arc<(PathBuf, String)>>,
+    /// Which linter `js_lint` invokes — see [`Config::linter`]'s doc. `None`
+    /// auto-detects, lazily, via [`Provider::resolved_host_linter`].
+    linter: Option<String>,
+    /// Lazily resolved linter tool name (`"oxlint"`/`"eslint"`, auto-detected
+    /// when [`Provider::linter`] is `None`), its binary path, and its queried
+    /// `--version` — cached once for the `Provider`'s lifetime — same
+    /// rationale as `tsc_cache`/`testrunner_cache`: `lint_config` runs once
+    /// per `js_lint` target (one per package) per `Provider::get`, so
+    /// re-resolving and re-spawning `<linter> --version` (or re-detecting)
+    /// per package would scale a real subprocess/filesystem cost with
+    /// package count, including a 100%-cache-hit run (the same M3/M4-review-
+    /// flagged mistake this milestone's task explicitly calls out not to
+    /// repeat).
+    linter_cache: OnceCell<Arc<(String, PathBuf, String)>>,
     /// Which bundler `js_bundle` invokes — see [`Config::bundler`]'s doc.
     bundler: String,
     /// Lazily resolved host bundler binary path + queried `--version`,
@@ -311,15 +321,15 @@ impl Provider {
                     .collect()
             });
 
-        // See `Config::linter`'s doc: defaults to the design doc's
-        // recommended default (`oxlint`, the fast oxc-family syntactic
-        // linter; `eslint` is the alt for type-aware rules).
-        let linter: String = hplugin::config::decode_opt(opts, "js provider", "linter")?
-            .unwrap_or_else(|| toolchain::OXLINT.to_string());
-        anyhow::ensure!(
-            toolchain::is_supported_linter(&linter),
-            "js provider: unsupported `linter` {linter:?} — expected \"oxlint\" or \"eslint\""
-        );
+        // See `Config::linter`'s doc: no default — unset auto-detects from
+        // what's actually installed, lazily, at `Provider::get` time.
+        let linter: Option<String> = hplugin::config::decode_opt(opts, "js provider", "linter")?;
+        if let Some(linter) = &linter {
+            anyhow::ensure!(
+                toolchain::is_supported_linter(linter),
+                "js provider: unsupported `linter` {linter:?} — expected \"oxlint\" or \"eslint\""
+            );
+        }
 
         // See `Config::bundler`'s doc: defaults to the design doc's
         // recommended default (`esbuild`, the fast oxc-family-adjacent
@@ -798,26 +808,38 @@ impl Provider {
         Ok(Arc::clone(result))
     }
 
-    /// The host linter binary path and its queried `--version`, resolved once
-    /// and cached for the `Provider`'s lifetime — see
-    /// [`Provider::linter_cache`]'s doc for why this matters.
-    async fn resolved_host_linter(&self) -> anyhow::Result<Arc<(PathBuf, String)>> {
+    /// The resolved linter tool name, its host binary path, and its queried
+    /// `--version`, resolved once and cached for the `Provider`'s lifetime —
+    /// see [`Provider::linter_cache`]'s doc for why this matters. When
+    /// [`Provider::linter`] is unset, the tool name is auto-detected via
+    /// [`toolchain::detect_linter`] as part of this same resolution — see
+    /// that function's doc for why (and why it never trusts `PATH`).
+    async fn resolved_host_linter(&self) -> anyhow::Result<Arc<(String, PathBuf, String)>> {
         let workspace_root = self.workspace_root.clone();
-        let linter = self.linter.clone();
+        let configured_linter = self.linter.clone();
         let result = self
             .linter_cache
             .get_or_try_init(|| async move {
-                anyhow::ensure!(
-                    toolchain::is_supported_linter(&linter),
-                    "js provider: unsupported linter {linter:?} — only \"oxlint\" or \"eslint\" \
-                     is supported in this milestone; see pluginjs::toolchain module docs"
-                );
-                hcore::blocking::run(move || -> anyhow::Result<Arc<(PathBuf, String)>> {
+                if let Some(linter) = &configured_linter {
+                    anyhow::ensure!(
+                        toolchain::is_supported_linter(linter),
+                        "js provider: unsupported linter {linter:?} — only \"oxlint\" or \
+                         \"eslint\" is supported in this milestone; see pluginjs::toolchain \
+                         module docs"
+                    );
+                }
+                hcore::blocking::run(move || -> anyhow::Result<Arc<(String, PathBuf, String)>> {
+                    let linter = match &configured_linter {
+                        Some(linter) => linter.clone(),
+                        None => toolchain::detect_linter(&workspace_root)
+                            .context("auto-detecting js_lint's linter")?
+                            .to_string(),
+                    };
                     let linter_bin = toolchain::resolve_host_linter(&workspace_root, &linter)
                         .context("resolving the js_lint linter toolchain")?;
                     let linter_version = toolchain::query_linter_version(&linter_bin)
                         .with_context(|| format!("querying {linter_bin:?} --version"))?;
-                    Ok(Arc::new((linter_bin, linter_version)))
+                    Ok(Arc::new((linter, linter_bin, linter_version)))
                 })
                 .await
             })
@@ -892,8 +914,9 @@ impl Provider {
     /// the fix already applied to the other three.
     async fn lint_config(&self, pkg: &PkgBuf) -> anyhow::Result<HashMap<String, Value>> {
         let resolved_linter = self.resolved_host_linter().await?;
-        let linter_bin = resolved_linter.0.to_string_lossy().into_owned();
-        let linter_version = resolved_linter.1.clone();
+        let linter = resolved_linter.0.clone();
+        let linter_bin = resolved_linter.1.to_string_lossy().into_owned();
+        let linter_version = resolved_linter.2.clone();
         let pkg_str = pkg.as_str().to_string();
         let pkg_dir = if pkg_str.is_empty() {
             self.workspace_root.clone()
@@ -910,7 +933,6 @@ impl Provider {
         let member_addrs_by_name = self.member_addrs_by_name().await?;
         let workspace_root = self.workspace_root.clone();
         let walker = Arc::clone(&self.walker);
-        let linter = self.linter.clone();
         let os = platform::current_os();
         let arch = platform::current_arch();
 
@@ -7157,7 +7179,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -7295,7 +7317,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -7376,7 +7398,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -7466,7 +7488,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -7549,7 +7571,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -7632,7 +7654,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -7705,7 +7727,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -7792,7 +7814,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -7899,7 +7921,7 @@ mod tests {
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -7978,7 +8000,7 @@ snapshots:
                 tstool: toolchain::HOST.to_string(),
                 testrunner: toolchain::VITEST.to_string(),
                 test_glob: Vec::new(),
-                linter: toolchain::OXLINT.to_string(),
+                linter: Some(toolchain::OXLINT.to_string()),
                 bundler: toolchain::ESBUILD.to_string(),
             },
         );
@@ -10760,7 +10782,14 @@ snapshots:
             "export const x = 1;\n",
         );
 
-        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        // Explicit `linter`, not the auto-detect default: this test proves
+        // against a real oxlint found via `PATH` (`find_real_oxlint_for_test`
+        // above), which `toolchain::detect_linter` deliberately never
+        // trusts — auto-detection is covered separately in
+        // `toolchain::tests::detect_linter_*` and the `pluginjs-e2e` suite.
+        let mut config = Config::new(PkgManager::Npm);
+        config.linter = Some(toolchain::OXLINT.to_string());
+        let provider = Provider::with_config(dir.path().to_path_buf(), config);
         let ct = ctoken();
         let executor = Arc::new(NoopExecutor);
         let resp = provider
