@@ -127,10 +127,12 @@ pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
                         "**/*.test.{ts,tsx,js,jsx}".to_string(),
                         "**/*.spec.{ts,tsx,js,jsx}".to_string(),
                     ],
-                    // `None` — auto-detect from what's actually installed in
-                    // the fixture (see `toolchain::detect_linter`). Exercises
-                    // the real detection path rather than assuming oxlint.
-                    linter: None,
+                    // `js_lint`'s linter is set (or left to auto-detect) per
+                    // package via `provider_state(provider = "js", linter =
+                    // ...)`, not a provider-construction option — every test
+                    // here that touches `js_lint` exercises real detection
+                    // from the fixture's own config file (see
+                    // `toolchain::detect_linter`), not an assumed default.
                     bundler: "esbuild".to_string(),
                 },
             ))
