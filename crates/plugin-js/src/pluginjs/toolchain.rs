@@ -166,39 +166,83 @@ pub fn is_supported_linter(linter: &str) -> bool {
     linter == OXLINT || linter == ESLINT
 }
 
-/// Auto-detect which linter this workspace uses, for when the `js`
-/// provider's `linter` option is left unset. Checks only
-/// `<workspace_root>/node_modules/.bin/{oxlint,eslint}` — deliberately never
-/// `PATH` — because a stray, unrelated global binary is exactly the wrong
-/// signal to decide this on: a confirmed live bug had `linter` silently
-/// default to `oxlint`, and a PATH-resolved `oxlint` binary then ran against
-/// an eslint-only workspace with no oxlint installed at all, producing an
-/// oxlint-specific failure the workspace owner had no way to explain (they
-/// had never chosen oxlint). Failing loudly on "neither" or "both" — rather
-/// than guessing — mirrors this same provider's `pkgmanager` option, which
-/// has no default for the identical reason (an ambiguous, silently-picked
+/// Candidate config filenames for `linter`, checked at the workspace root
+/// (see [`detect_linter`]) and along a package's ancestor chain (see
+/// `importgraph::find_nearest_lint_config`). oxlint has exactly one
+/// dedicated config filename; eslint's list checks the modern flat-config
+/// filenames first (eslint 9's own default resolution order — a project
+/// with both a flat and a legacy config uses the flat one), falling back to
+/// every legacy `.eslintrc.*` extension eslint itself accepts. Errors on an
+/// unsupported `linter` rather than guessing — callers only ever reach this
+/// after [`is_supported_linter`] has already validated it (see
+/// `Provider::resolved_host_linter`), so this should never actually trigger
+/// in practice, but a fallible return keeps that an enforced invariant
+/// rather than an assumed one.
+pub(crate) fn lint_config_candidates(linter: &str) -> anyhow::Result<&'static [&'static str]> {
+    match linter {
+        OXLINT => Ok(&[".oxlintrc.json"]),
+        ESLINT => Ok(&[
+            "eslint.config.js",
+            "eslint.config.mjs",
+            "eslint.config.cjs",
+            "eslint.config.ts",
+            "eslint.config.mts",
+            "eslint.config.cts",
+            ".eslintrc.js",
+            ".eslintrc.cjs",
+            ".eslintrc.yaml",
+            ".eslintrc.yml",
+            ".eslintrc.json",
+            ".eslintrc",
+        ]),
+        other => anyhow::bail!(
+            "js_lint: unsupported linter {other:?} — expected \"oxlint\" or \"eslint\" (should \
+             have been rejected earlier by is_supported_linter)"
+        ),
+    }
+}
+
+/// Auto-detect which linter this workspace uses, for when no applicable
+/// `provider_state(provider = "js", linter = ...)` sets one (see
+/// `pluginjs::provider::pick_configured_linter`). Checks for each tool's own
+/// config file (see [`lint_config_candidates`]) at the workspace root —
+/// **not** which binary happens to be installed, and never `PATH`. A config
+/// file is the workspace owner's own declared choice; package presence is
+/// not: a repo mid-migration between the two tools, or one that carries
+/// both as transitive/dev tooling for unrelated reasons, can easily have
+/// both binaries installed with only one actually configured, which made an
+/// earlier binary-presence-based version of this function spuriously call
+/// that "ambiguous" — a confirmed live bug already showed the cost of
+/// guessing wrong here (`linter` silently defaulted to `oxlint`, and a
+/// stray binary then ran against a workspace that only used `eslint`).
+/// Failing loudly on "neither" or "both configured" — rather than
+/// guessing — mirrors this same provider's `pkgmanager` option, which has
+/// no default for the identical reason (an ambiguous, silently-picked
 /// answer is worse than requiring the caller to say which one).
 pub(crate) fn detect_linter(workspace_root: &Path) -> anyhow::Result<&'static str> {
-    let installed = |name: &str| -> bool {
-        std::fs::metadata(workspace_root.join("node_modules").join(".bin").join(name))
-            .map(|m| m.is_file())
-            .unwrap_or(false)
+    let has_config = |linter: &str| -> bool {
+        lint_config_candidates(linter)
+            .into_iter()
+            .flatten()
+            .any(|name| workspace_root.join(name).is_file())
     };
-    match (installed(OXLINT), installed(ESLINT)) {
+    match (has_config(OXLINT), has_config(ESLINT)) {
         (true, false) => Ok(OXLINT),
         (false, true) => Ok(ESLINT),
         (false, false) => anyhow::bail!(
-            "js provider: could not detect a linter — neither `oxlint` nor `eslint` was found \
-             at {:?}. Install one (`npm install -D oxlint` or `npm install -D eslint` — or the \
-             `pnpm`/`yarn` equivalent), or set the js provider's `linter` option explicitly to \
-             \"oxlint\" or \"eslint\".",
-            workspace_root.join("node_modules").join(".bin")
+            "js provider: could not detect a linter — no oxlint config \
+             ({:?}) or eslint config ({:?}) was found at the workspace root {:?}. Add one, or \
+             set `provider_state(provider = \"js\", linter = \"oxlint\" | \"eslint\")` \
+             explicitly.",
+            lint_config_candidates(OXLINT).unwrap_or_default(),
+            lint_config_candidates(ESLINT).unwrap_or_default(),
+            workspace_root
         ),
         (true, true) => anyhow::bail!(
-            "js provider: both `oxlint` and `eslint` are installed at {:?} — ambiguous which \
-             one `js_lint` should run. Set the js provider's `linter` option explicitly to \
-             \"oxlint\" or \"eslint\".",
-            workspace_root.join("node_modules").join(".bin")
+            "js provider: both an oxlint config and an eslint config were found at the \
+             workspace root {:?} — ambiguous which one `js_lint` should run. Set \
+             `provider_state(provider = \"js\", linter = \"oxlint\" | \"eslint\")` explicitly.",
+            workspace_root
         ),
     }
 }
@@ -607,58 +651,66 @@ mod tests {
             .expect("write local bin");
     }
 
+    fn write_config(dir: &Path, linter: &str) {
+        let name = lint_config_candidates(linter).expect("supported linter")[0];
+        std::fs::write(dir.join(name), b"{}").expect("write config file");
+    }
+
     #[test]
-    fn detect_linter_finds_oxlint_only() {
+    fn detect_linter_finds_oxlint_config_only() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_local_bin(dir.path(), OXLINT);
+        write_config(dir.path(), OXLINT);
         assert_eq!(detect_linter(dir.path()).expect("detect"), OXLINT);
     }
 
     #[test]
-    fn detect_linter_finds_eslint_only() {
+    fn detect_linter_finds_eslint_config_only() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_local_bin(dir.path(), ESLINT);
+        write_config(dir.path(), ESLINT);
         assert_eq!(detect_linter(dir.path()).expect("detect"), ESLINT);
     }
 
     #[test]
-    fn detect_linter_errors_when_neither_installed() {
+    fn detect_linter_recognizes_a_legacy_eslintrc_config_too() {
+        // Not just the flat-config filename `write_config` reaches for —
+        // every legacy `.eslintrc.*` extension in `lint_config_candidates`
+        // must also satisfy detection.
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = detect_linter(dir.path()).expect_err("neither installed must error");
+        std::fs::write(dir.path().join(".eslintrc.json"), b"{}").expect("write legacy config");
+        assert_eq!(detect_linter(dir.path()).expect("detect"), ESLINT);
+    }
+
+    #[test]
+    fn detect_linter_errors_when_no_config_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = detect_linter(dir.path()).expect_err("no config anywhere must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("oxlint") && msg.contains("eslint"), "{msg}");
     }
 
     #[test]
-    fn detect_linter_errors_when_both_installed() {
+    fn detect_linter_errors_when_both_configs_present() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_local_bin(dir.path(), OXLINT);
-        write_local_bin(dir.path(), ESLINT);
-        let err = detect_linter(dir.path()).expect_err("ambiguous — both installed must error");
+        write_config(dir.path(), OXLINT);
+        write_config(dir.path(), ESLINT);
+        let err = detect_linter(dir.path()).expect_err("ambiguous — both configured must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("ambiguous"), "{msg}");
     }
 
     #[test]
-    fn detect_linter_ignores_path_only_binaries() {
-        // A stray global oxlint on PATH must never decide detection — see
+    fn detect_linter_ignores_an_installed_binary_with_no_config() {
+        // Package presence alone must never decide detection — a config
+        // file is the workspace owner's own declared choice; having the
+        // package installed (transitively, for tooling unrelated to this
+        // provider, or mid-migration to the other tool) is not. See
         // `detect_linter`'s doc for the exact live bug this guards against.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path_dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(path_dir.path().join(OXLINT), b"#!/bin/sh\necho stray\n")
-            .expect("write stray path oxlint");
-        let prior = std::env::var_os("PATH");
-        // SAFETY: test-only, single-threaded within this process for the
-        // duration of the mutation; restored immediately below.
-        unsafe { std::env::set_var("PATH", path_dir.path()) };
-        let result = detect_linter(dir.path());
-        match &prior {
-            // SAFETY: test-only, restoring the prior value we saved above.
-            Some(v) => unsafe { std::env::set_var("PATH", v) },
-            // SAFETY: test-only, restoring the prior (unset) state.
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-        result.expect_err("a PATH-only oxlint must not satisfy detection");
+        write_local_bin(dir.path(), OXLINT);
+        let err = detect_linter(dir.path())
+            .expect_err("an installed binary with no config must not satisfy detection");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("oxlint") && msg.contains("eslint"), "{msg}");
     }
 
     #[test]
