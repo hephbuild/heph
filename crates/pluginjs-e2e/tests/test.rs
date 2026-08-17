@@ -195,3 +195,41 @@ async fn js_lint_fails_and_surfaces_the_real_oxlint_violation() -> anyhow::Resul
     );
     Ok(())
 }
+
+/// Reported live bug, reproduced exactly: `//pkg:js_lint` failing with
+/// oxlint's own `No files found to lint. Please check your paths and ignore
+/// patterns.` even though real, staged source files exist in the sandbox.
+/// Root cause, confirmed against a real oxlint 1.78.0: this driver always
+/// passes every first-party source file as an *explicit* path argument
+/// (never a bare directory scan), and oxlint still applies the resolved
+/// config's own `ignorePatterns` to explicitly-named files — if every
+/// explicit path matches, oxlint reports zero files and (on this version)
+/// exits nonzero, even though heph genuinely staged real files. This is a
+/// linter-config/heph-Input-declaration mismatch, not a staging bug — proves
+/// the driver surfaces it as a clear, actionable failure (see
+/// `zero_files_matches_ignore_patterns`'s hint) instead of a bare, confusing
+/// "no files found" with no explanation.
+#[tokio::test]
+async fn js_lint_fails_with_an_actionable_message_when_ignore_patterns_exclude_every_source()
+-> anyhow::Result<()> {
+    require_npm!();
+    let dir = common::npm_fixture("simple_oxlint_config_ignores_everything")?;
+    let ws = common::make_workspace(dir)?;
+
+    let err = ws
+        .run("//:js_lint")
+        .await
+        .err()
+        .expect("ignorePatterns matching every declared source must still fail the target");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("No files found to lint"),
+        "expected oxlint's own message to be preserved, got: {msg}"
+    );
+    assert!(
+        msg.contains("ignorePatterns") && msg.contains("provider_state"),
+        "expected heph's own actionable hint pointing at the ignore-pattern mismatch and the \
+         lint=False escape hatch, got: {msg}"
+    );
+    Ok(())
+}
