@@ -1,6 +1,1 @@
 gen.go
-
-# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)
-# //:gen
-/gen.go
-# END heph-generated

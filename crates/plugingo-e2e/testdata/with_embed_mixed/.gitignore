@@ -1,4 +1,0 @@
-# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)
-# //:ui_dist
-/ui_dist/index.html
-# END heph-generated

@@ -2691,10 +2691,15 @@ impl Engine {
     ///   file, accumulate per-file diffs, and on any divergence return a
     ///   [`FrozenCheckError`] without writing anything.
     /// - otherwise: unpack the cached artifact into the workspace root (copy
-    ///   semantics). A `Copy` (net-new) group's paths are excluded from later
-    ///   source globs by the workspace's codegen claims; `InPlace` groups are
-    ///   not claimed (they overwrite tracked source files), and never write onto
-    ///   a path some `Copy` target already owns.
+    ///   semantics). `InPlace` groups overwrite tracked source files and never
+    ///   write onto a path some `Copy` target already owns.
+    ///
+    /// Either way, a target with `Copy` output paths first **registers** them as
+    /// codegen claims, so a later `glob()`/`file()` excludes them. Registration
+    /// happens here, next to the write, for the reason the extended attribute
+    /// this replaced got right: the claim must land in the same operation that
+    /// puts the file on disk, or there is a window where the generated file
+    /// exists and looks like source.
     ///
     /// The gates are cheap and stay here; everything past them runs on
     /// `hcore::blocking` (see [`Self::materialize_codegen_tree`]).
@@ -2764,11 +2769,30 @@ impl Engine {
         // hashes exactly as it did before this call — which is what lets the
         // caller skip the fixpoint recompute.
         let mut wrote = false;
-        // Paths this target wrote as `Copy` output that the workspace does not
-        // claim. Collected rather than warned per file so one stale `.gitignore`
-        // produces one actionable line, not one per generated file.
-        let mut unclaimed: Vec<String> = Vec::new();
         let mut frozen_diff = String::new();
+
+        // Register this target's `Copy` outputs BEFORE touching the tree, and on
+        // the frozen path too. Ordering is deliberate: a claim with no file yet is
+        // harmless, while a file with no claim is exactly the hole this mechanism
+        // closes, so if the write below fails we want to have erred on the safe
+        // side. Derived from the *declared* paths rather than from what the walk
+        // happens to write, so the claim also covers a file the generator will
+        // emit later, and re-recording releases a path it no longer emits. A
+        // no-op once the ledger already says this, which is the steady state
+        // after the first run.
+        let copy_patterns: Vec<String> = target
+            .outputs
+            .iter()
+            .flat_map(|o| o.paths.iter())
+            .filter(|p| matches!(p.codegen_tree, CodegenMode::Copy))
+            .map(|p| crate::engine::gitignore::content_to_pattern(&p.content))
+            .collect();
+        if !copy_patterns.is_empty() {
+            claims
+                .record(&target.addr.format(), &copy_patterns)
+                .with_context(|| format!("register codegen claims for {}", target.addr.format()))?;
+        }
+        let claim_set = claims.snapshot();
 
         // Map each codegen output group to its declared mode (first non-None
         // path wins). One group can back MULTIPLE cached Output artifacts (e.g.
@@ -2820,7 +2844,7 @@ impl Engine {
                     // target never touches a copy-owned tree file, so a
                     // divergence there is not drift this target would reconcile —
                     // don't flag it in the frozen check.
-                    if matches!(mode, CodegenMode::InPlace) && claims.claims(&entry.path) {
+                    if matches!(mode, CodegenMode::InPlace) && claim_set.claims(&entry.path) {
                         continue;
                     }
                     let old_bytes = match std::fs::read(&tree_path) {
@@ -2898,7 +2922,7 @@ impl Engine {
                     // would clobber the copy target's output and leave the
                     // provenance pointing at the wrong producer. Leave such files
                     // to their owner.
-                    if matches!(mode, CodegenMode::InPlace) && claims.claims(&entry.path) {
+                    if matches!(mode, CodegenMode::InPlace) && claim_set.claims(&entry.path) {
                         continue;
                     }
                     match entry.kind {
@@ -2945,15 +2969,6 @@ impl Engine {
                                     }
                                 }
                             }
-                            // A net-new (Copy) output is excluded from later
-                            // source globs by the workspace's claim set. Nothing
-                            // is written onto the file to say so — that is the
-                            // point: the claim is declared, so the next tool to
-                            // rewrite this file cannot erase it. Record a path
-                            // the workspace does not claim so the run can say so.
-                            if matches!(mode, CodegenMode::Copy) && !claims.claims(&entry.path) {
-                                unclaimed.push(entry.path.display().to_string());
-                            }
                         }
                         WalkEntryKind::Symlink { target } => {
                             // Codegen outputs are regular files in practice;
@@ -2984,12 +2999,6 @@ impl Engine {
                                     )?;
                                     wrote = true;
                                 }
-                                // A Copy symlink output is claimed like a regular
-                                // Copy file; flag it the same way when it is not.
-                                if matches!(mode, CodegenMode::Copy) && !claims.claims(&entry.path)
-                                {
-                                    unclaimed.push(entry.path.display().to_string());
-                                }
                             }
                         }
                     }
@@ -3002,23 +3011,6 @@ impl Engine {
                 addr: target.addr.clone(),
                 diff: frozen_diff,
             }));
-        }
-
-        // A `codegen = "copy"` output that the workspace does not claim will be
-        // sourced as raw input by the next `glob()` that reaches it — the exact
-        // double-sourcing the claim exists to prevent. It is not an error (the
-        // generated file itself is correct, and failing the build over a stale
-        // ignore file would be a worse trade), but it is never something the user
-        // wants, so name the fix rather than leaving it to be discovered as a
-        // mysterious extra input. `heph validate` reports the same staleness.
-        if !unclaimed.is_empty() {
-            tracing::warn!(
-                addr = %target.addr.format(),
-                paths = %unclaimed.join(", "),
-                "codegen = \"copy\" output is not registered in the heph-managed \
-                 .gitignore section and will be sourced as raw input — \
-                 run `heph tool gen-gitignore`"
-            );
         }
 
         Ok(wrote)
@@ -10264,9 +10256,14 @@ mod tests {
         Ok(())
     }
 
-    /// End-to-end provenance: a `copy` codegen target's declared output is
-    /// EXCLUDED from a later `@heph/fs` glob over the same tree (so it is never
-    /// double-sourced), while an unclaimed `in_place` output stays visible.
+    /// End-to-end provenance: a `copy` codegen target's output is EXCLUDED from a
+    /// later `@heph/fs` glob over the same tree (so it is never double-sourced),
+    /// while an `in_place` output stays visible.
+    ///
+    /// The workspace has **no `.gitignore`** and nothing pre-registered. Running
+    /// the target is what claims its output — the property that makes this usable:
+    /// declare a codegen target, run it, and the file it writes is not source, with
+    /// no command to remember and no ordering to get right.
     ///
     /// Asserted unconditionally. The xattr version of this test could only assert
     /// on a filesystem that persisted extended attributes and silently passed
@@ -10274,13 +10271,12 @@ mod tests {
     /// to be broken.
     #[tokio::test]
     async fn claimed_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
-        let (engine, root) = engine_with_home_fs_claiming(
-            vec![
-                codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
-                codegen_run_target("//pkg:ip", "in_place", &["keep.txt"], "true"),
-            ],
-            &["# //pkg:cp", "/pkg/out.gen"],
-        )?;
+        // No `.gitignore`, and nothing registered up front: the claim has to come
+        // from the act of generating the file.
+        let (engine, root) = engine_with_home_fs(vec![
+            codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
+            codegen_run_target("//pkg:ip", "in_place", &["keep.txt"], "true"),
+        ])?;
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(pkg_dir.join("keep.txt"), b"keep\n")?;
@@ -10316,6 +10312,41 @@ mod tests {
         Ok(())
     }
 
+    /// The committed `.gitignore` section is the second claim source, and it does
+    /// something the ledger cannot: claim a path *before* anything has generated
+    /// it. Here `//pkg:cp` has never run, so the ledger is empty and `pkg/out.gen`
+    /// is a plain file someone dropped in the tree — the section still keeps it
+    /// out of a glob.
+    ///
+    /// This is also what covers a wiped `.heph3` next to surviving generated
+    /// files: the ledger goes, the declaration stays.
+    #[tokio::test]
+    async fn the_committed_section_claims_before_anything_is_generated() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs_claiming(
+            vec![codegen_run_target(
+                "//pkg:cp",
+                "copy",
+                &["*.gen"],
+                "echo generated > out.gen",
+            )],
+            &["# //pkg:cp", "/pkg/out.gen"],
+        )?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        // Never generated by this engine — no ledger entry exists for it.
+        std::fs::write(pkg_dir.join("out.gen"), b"stale generated\n")?;
+
+        let gen_glob = hbuiltins::pluginfs::glob_addr("pkg/*.gen", &[]);
+        let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
+        let gen_res = res.expect("glob over generated files resolves");
+        assert!(
+            gen_res.artifacts.is_empty(),
+            "a declared copy output is claimed before it is ever generated, got {} artifacts",
+            gen_res.artifacts.len(),
+        );
+        Ok(())
+    }
+
     /// A generated file rewritten by an outside tool the way formatters do —
     /// write a temp file, rename over it, replacing the inode — is still excluded
     /// from a later glob.
@@ -10326,15 +10357,12 @@ mod tests {
     /// so nothing done to the file can revoke it.
     #[tokio::test]
     async fn claim_survives_an_outside_rewrite_of_the_generated_file() -> anyhow::Result<()> {
-        let (engine, root) = engine_with_home_fs_claiming(
-            vec![codegen_run_target(
-                "//pkg:cp",
-                "copy",
-                &["*.gen"],
-                "echo generated > out.gen",
-            )],
-            &["# //pkg:cp", "/pkg/out.gen"],
-        )?;
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:cp",
+            "copy",
+            &["*.gen"],
+            "echo generated > out.gen",
+        )])?;
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
 
@@ -10364,20 +10392,17 @@ mod tests {
     /// A net-new `copy` codegen target materializes its file into the workspace
     /// root, and an `in_place` target's re-emitted file exists there too. Neither
     /// carries any heph-written metadata: which of them is generated is answered
-    /// by the claim set, not by anything on the file.
+    /// by the claim set the run registered, not by anything on the file.
     #[tokio::test]
     async fn writeback_materializes_both_modes() -> anyhow::Result<()> {
-        let (engine, root) = engine_with_home_fs_claiming(
-            vec![
-                // Copy: generates a net-new file. The introspect input is a glob
-                // (`pkg/*.gen`) so the not-yet-existing output doesn't error at
-                // input resolution the way a `file()` over a missing path would.
-                codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
-                // In-place: re-emits an existing tracked source file untouched.
-                codegen_run_target("//pkg:ip", "in_place", &["src.txt"], "true"),
-            ],
-            &["# //pkg:cp", "/pkg/out.gen"],
-        )?;
+        let (engine, root) = engine_with_home_fs(vec![
+            // Copy: generates a net-new file. The introspect input is a glob
+            // (`pkg/*.gen`) so the not-yet-existing output doesn't error at
+            // input resolution the way a `file()` over a missing path would.
+            codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
+            // In-place: re-emits an existing tracked source file untouched.
+            codegen_run_target("//pkg:ip", "in_place", &["src.txt"], "true"),
+        ])?;
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(pkg_dir.join("src.txt"), b"src\n")?;
@@ -10398,16 +10423,13 @@ mod tests {
             root.path().join("pkg/src.txt").exists(),
             "in_place codegen file must exist in the tree"
         );
+        let claims = engine.codegen_claims.snapshot();
         assert!(
-            engine
-                .codegen_claims
-                .claims(std::path::Path::new("pkg/out.gen")),
+            claims.claims(std::path::Path::new("pkg/out.gen")),
             "the copy output is claimed"
         );
         assert!(
-            !engine
-                .codegen_claims
-                .claims(std::path::Path::new("pkg/src.txt")),
+            !claims.claims(std::path::Path::new("pkg/src.txt")),
             "the in_place output is a tracked source and must NOT be claimed"
         );
         Ok(())
@@ -10419,19 +10441,16 @@ mod tests {
     /// guard leaves the copy-owned file untouched.
     #[tokio::test]
     async fn in_place_does_not_clobber_copy_controlled_file() -> anyhow::Result<()> {
-        let (engine, root) = engine_with_home_fs_claiming(
-            vec![
-                codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo copyowned > out.gen"),
-                // in_place over the same path, emitting DIFFERENT bytes.
-                codegen_run_target(
-                    "//pkg:ip",
-                    "in_place",
-                    &["*.gen"],
-                    "echo clobbered > out.gen",
-                ),
-            ],
-            &["# //pkg:cp", "/pkg/out.gen"],
-        )?;
+        let (engine, root) = engine_with_home_fs(vec![
+            codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo copyowned > out.gen"),
+            // in_place over the same path, emitting DIFFERENT bytes.
+            codegen_run_target(
+                "//pkg:ip",
+                "in_place",
+                &["*.gen"],
+                "echo clobbered > out.gen",
+            ),
+        ])?;
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
 

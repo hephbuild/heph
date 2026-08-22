@@ -1,4 +1,0 @@
-# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)
-# //app/openapi:openapi-build
-/app/openapi/openapi_gen.yaml
-# END heph-generated

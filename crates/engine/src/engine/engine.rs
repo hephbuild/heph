@@ -36,11 +36,10 @@ pub struct PluginInit {
     pub skip_globs: Vec<String>,
     /// Shared cross-run filesystem-walk cache for tree-walking plugins.
     pub walker: Arc<hwalk::CachedWalker>,
-    /// Workspace paths a `codegen = "copy"` target owns, read once from the
-    /// heph-managed `.gitignore` section. Every plugin that discovers source
-    /// files must skip them: their content already enters the graph through
-    /// their generator, so sourcing them again double-sources it. Handed to the
-    /// plugin rather than discovered, like the skip set beside it.
+    /// Workspace paths a `codegen = "copy"` target owns. Every plugin that
+    /// discovers source files must skip them: their content already enters the
+    /// graph through its generator, so sourcing them again double-sources it.
+    /// Handed to the plugin rather than discovered, like the skip set beside it.
     pub codegen_claims: Arc<hwalk::CodegenClaims>,
     /// The engine's runtime — what an in-process plugin's memoizers spawn
     /// their computations on. Handed to the plugin, never discovered by it
@@ -81,10 +80,10 @@ pub struct Engine {
     /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
     /// tree-walking plugins via [`PluginInit`].
     pub(crate) walker: Arc<hwalk::CachedWalker>,
-    /// Tree paths owned by a `codegen = "copy"` target. Read once at
-    /// construction and handed to every plugin via [`PluginInit`]; the engine
-    /// also consults it in the codegen write-back, so an `in_place` target never
-    /// clobbers a file a `copy` target owns.
+    /// Tree paths owned by a `codegen = "copy"` target. Handed to every plugin
+    /// via [`PluginInit`], and written by the codegen write-back — which both
+    /// registers each `copy` target's outputs and reads the set, so an `in_place`
+    /// target never clobbers a file a `copy` target owns.
     pub(crate) codegen_claims: Arc<hwalk::CodegenClaims>,
 
     pub(crate) providers: Vec<Arc<Provider>>,
@@ -435,11 +434,16 @@ impl Engine {
             &home.join("cache").join("fswalk.db"),
         ));
 
-        // Which tree paths are generated rather than source. Read once, from the
-        // committed `.gitignore` section `heph tool gen-gitignore` writes and
-        // `heph validate` checks — a declaration, so unlike the file-metadata
-        // mark it replaced, no tool that rewrites a file can erase it.
-        let codegen_claims = Arc::new(hwalk::CodegenClaims::load(&cfg.root));
+        // Which tree paths are generated rather than source: the ledger the
+        // codegen write-back maintains (`<home>/codegen-claims`, registered in the
+        // same operation that puts a file on disk, so a generated file is never on
+        // disk unclaimed) unioned with the committed `.gitignore` section. Neither
+        // is attached to the file, so no tool that rewrites one can erase the
+        // claim — the failure that sank the extended attribute this replaced.
+        let codegen_claims = Arc::new(hwalk::CodegenClaims::load(
+            &cfg.root,
+            home.join("codegen-claims"),
+        ));
 
         let max_workers = 2 * parallelism;
 

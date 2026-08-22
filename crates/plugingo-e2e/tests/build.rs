@@ -340,9 +340,9 @@ async fn test_embed_generated_by_in_tree_tool_resolves_deterministically() -> an
 /// This surfaced in the wild as ~1 run in 3 failing with "matched no files" —
 /// because the exclusion was then a `user.heph.codegen` xattr on the file, which
 /// any rewrite that replaced the inode erased. Whether the generated file looked
-/// like source was therefore a coin flip. The claim is declared in the
-/// heph-managed `.gitignore` section instead, so the answer is the same on every
-/// run and the query has to be correct on its own merits.
+/// like source was therefore a coin flip. The claim is now recorded beside the
+/// file rather than on it, so the answer is the same on every run and the query
+/// has to be correct on its own merits.
 #[tokio::test]
 async fn test_embed_generated_in_subpackage_of_the_embedder() -> anyhow::Result<()> {
     require_go!();

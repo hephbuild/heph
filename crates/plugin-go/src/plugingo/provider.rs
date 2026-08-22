@@ -2974,6 +2974,10 @@ impl ProviderInner {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(anyhow::Error::new(e).context(format!("read go pkg dir {dir:?}"))),
         };
+        // One claim snapshot for the whole scan, like the fs glob walk: the
+        // freshness check behind it is a `stat`, cheap once per package and not
+        // once per file.
+        let claims = self.codegen_claims.snapshot();
         let mut files: Vec<String> = Vec::new();
         for entry in entries {
             let entry = entry.with_context(|| format!("read go pkg dir entry in {dir:?}"))?;
@@ -2989,10 +2993,10 @@ impl ProviderInner {
             }
             // A generated `.go` file is not a package source: its content
             // already enters the graph through its generator, so listing it here
-            // would double-source it. The claim is declared rather than marked on
-            // the file, so a `gofmt -w` over the generated file cannot revoke it.
+            // would double-source it. The claim lives beside the file rather than
+            // on it, so a `gofmt -w` over the generated file cannot revoke it.
             let rel = path.strip_prefix(&self.workspace_root).unwrap_or(&path);
-            if self.codegen_claims.claims(rel) || pluginfs::resolves_into_heph_dir(&path) {
+            if claims.claims(rel) || pluginfs::resolves_into_heph_dir(&path) {
                 continue;
             }
             files.push(name.to_string());
@@ -5546,6 +5550,59 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             );
         }
         opts
+    }
+
+    /// A generated `.go` file must not be listed as a package source: its content
+    /// already reaches the graph through its generator, so listing it here would
+    /// double-source it.
+    ///
+    /// The claim comes from `record` — i.e. from a codegen target having actually
+    /// generated the file — with no `.gitignore` and no command run first, which
+    /// is the shape a real workspace is in right after `heph run //pkg:gen`.
+    #[test]
+    fn package_scan_skips_a_generated_go_file() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let pkg = ws.path().join("pkg");
+        std::fs::create_dir_all(&pkg).expect("mkdir");
+        std::fs::write(pkg.join("hand_written.go"), b"package pkg\n").expect("write");
+        std::fs::write(pkg.join("gen.go"), b"package pkg\n").expect("write");
+
+        let claims = Arc::new(hwalk::CodegenClaims::load(
+            ws.path(),
+            ws.path().join(".heph3").join("codegen-claims"),
+        ));
+
+        let provider = Provider::with_config(
+            ws.path().to_path_buf(),
+            Config {
+                codegen_claims: Arc::clone(&claims),
+                ..Default::default()
+            },
+            test_runtime(),
+        )
+        .expect("provider");
+
+        assert_eq!(
+            provider
+                .inner
+                .package_go_files_on_disk("pkg")
+                .expect("scan"),
+            vec!["gen.go".to_string(), "hand_written.go".to_string()],
+            "before anything claims it, a generated file is indistinguishable from source"
+        );
+
+        claims
+            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .expect("record");
+
+        assert_eq!(
+            provider
+                .inner
+                .package_go_files_on_disk("pkg")
+                .expect("scan"),
+            vec!["hand_written.go".to_string()],
+            "generating the file is what takes it out of the package's sources"
+        );
     }
 
     fn cctool_from(opts: &hplugin::config::Options) -> String {

@@ -1,6 +1,1 @@
 genpb/
-
-# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)
-# //:gen
-/genpb/gen.go
-# END heph-generated

@@ -7,33 +7,54 @@
 //! when the generator's own inputs glob the same directory, feeds a target's
 //! output back into its input.
 //!
-//! # Why a declaration and not a mark on the file
+//! # Why not a mark on the file
 //!
 //! This was previously a `user.heph.codegen` extended attribute stamped on each
-//! written-back file. xattrs are **inode-scoped**, and the dominant way tools
+//! written-back file. The stamp was written at the instant the file was created,
+//! so there was never a moment where the file existed unmarked — that part was
+//! right, and it is the bar any replacement has to clear.
+//!
+//! What was wrong is that xattrs are **inode-scoped**, and the dominant way tools
 //! rewrite a file is write-temp-then-`rename(2)` — a new inode. So `gofmt -w`,
 //! `prettier`, `sed -i`, every editor save, `git checkout`, `cp` without `-p`,
 //! `tar`/`rsync` without their xattr flags, and any filesystem without xattr
 //! support all silently erased the mark. A file that lost it looked like source
-//! on the very next walk, and the walk that observed the loss had no dependency
-//! edge forcing the generator to run first — so nothing re-stamped it in time.
+//! on the very next walk, and nothing re-stamped it in time: a target that merely
+//! globs a generated file has no dependency edge on its generator, so there is no
+//! ordering guarantee that the write-back runs first.
 //!
-//! The replacement is a *declaration* rather than a *mark*: the set of claimed
-//! paths is read from the heph-managed section of the workspace-root
-//! `.gitignore` — the same section `heph tool gen-gitignore` writes from the
-//! declared `codegen = "copy"` output paths and `heph validate` checks for
-//! freshness. That section is committed, survives every tool that touches the
-//! tree (nothing about it is tied to an inode), is correct for a file that has
-//! never been generated yet, and is reviewable in a diff.
+//! # The two sources
 //!
-//! Reading it lives here, next to [`Ignore`](crate::Ignore), because the same
-//! set has to reach every tree-walking plugin and this crate is the one they all
-//! already depend on. Rendering that section stays in the engine, which is the
-//! only place that can resolve target defs; the marker constants are defined
-//! here so reader and writer cannot drift.
+//! [`CodegenClaims`] answers from the union of two sets. Neither alone is enough,
+//! and each covers the other's hole:
+//!
+//! - **The ledger** (`<home>/codegen-claims`) — written by the codegen write-back
+//!   itself, in the same operation that puts the file on disk. This keeps the
+//!   xattr's guarantee (registered atomically with the file, so the file never
+//!   exists unclaimed) while living somewhere no tool that rewrites the file can
+//!   reach. It needs no user action, which is the whole point: a target that
+//!   generates into the tree is claimed the moment it does so, not once someone
+//!   remembers to run a command.
+//! - **The heph-managed `.gitignore` section** — rendered by
+//!   `heph tool gen-gitignore` from the *declared* `codegen = "copy"` output
+//!   paths and checked by `heph validate`. Being a declaration rather than a
+//!   record, it is correct for a path that has never been generated yet, and
+//!   being committed, it survives `rm -rf .heph3` and a fresh clone.
+//!
+//! The set is re-read when the ledger changes, so a claim registered by a
+//! write-back is visible to a glob later in the *same* run — again matching what
+//! reading an xattr off the filesystem gave for free.
+//!
+//! This lives next to [`Ignore`](crate::Ignore) because the same set has to reach
+//! every tree-walking plugin and this crate is the one they all already depend
+//! on. Rendering the `.gitignore` section stays in the engine, which is the only
+//! place that can resolve target defs; the marker constants are defined here so
+//! reader and writer cannot drift.
 
 use anyhow::Context as _;
-use std::path::Path;
+use parking_lot::RwLock;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wax::{Any, Glob, Program as _};
 
@@ -50,36 +71,26 @@ pub const END_MARKER: &str = "# END heph-generated";
 struct Claim {
     /// Compiled matcher for workspace-relative paths.
     glob: Glob<'static>,
-    /// The emitting target's addr, from the section's attribution comment.
-    /// `None` for an un-attributed (hand-written or legacy) line.
+    /// The emitting target's addr, from the attribution comment above the
+    /// pattern. `None` for an un-attributed (hand-written or legacy) line.
     owner: Option<String>,
 }
 
-/// The set of workspace-relative paths claimed as `codegen = "copy"` output.
+/// An immutable, compiled set of claimed paths — the answer to "is this path
+/// generated?" at one point in time.
 ///
-/// Cheap to share (`Arc`) and immutable once built: it is loaded once per
-/// process, at engine construction, and handed to every plugin that walks the
-/// tree. A claim added to `.gitignore` mid-run therefore takes effect on the
-/// next run — the same timing the xattr stamp had, since that too was written
-/// after the walk that would have consulted it.
+/// Handed out by [`CodegenClaims::snapshot`] so a walk matches thousands of paths
+/// against a fixed set without touching a lock or the filesystem per file.
 #[derive(Debug)]
-pub struct CodegenClaims {
+pub struct ClaimSet {
     claims: Vec<Claim>,
     /// Union of every claim's glob — the fast path, one match for the common
     /// "is this path generated?" question asked once per walked file.
     any: Arc<Any<'static>>,
 }
 
-impl Default for CodegenClaims {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-impl CodegenClaims {
-    /// Claims nothing. The right value for a workspace with no codegen targets,
-    /// and for the non-engine call sites (LSP, unit tests) that have no root to
-    /// read from.
+impl ClaimSet {
+    /// Claims nothing.
     pub fn empty() -> Self {
         Self {
             claims: Vec::new(),
@@ -87,64 +98,30 @@ impl CodegenClaims {
         }
     }
 
-    /// Read the claim set from the heph-managed section of `<root>/.gitignore`.
-    ///
-    /// Never fails: a missing file, an unreadable one, or a malformed pattern
-    /// yields an empty (or partial) set with a warning, because a workspace that
-    /// cannot be read is not a workspace where refusing to build is the helpful
-    /// answer. The cost of an empty set is that generated files are sourced as
-    /// raw input — which `heph validate` reports as a stale `.gitignore`, and
-    /// which the write-back warns about the moment it writes an unclaimed path.
-    pub fn load(root: &Path) -> Self {
-        let path = root.join(".gitignore");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::empty(),
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "cannot read .gitignore; codegen outputs will not be excluded from source globs"
-                );
-                return Self::empty();
-            }
-        };
-        match Self::from_gitignore(&text) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %format!("{e:#}"),
-                    "cannot parse the heph-managed .gitignore section; \
-                     codegen outputs will not be excluded from source globs"
-                );
-                Self::empty()
-            }
-        }
+    /// True when nothing is claimed — the whole check can be skipped.
+    pub fn is_empty(&self) -> bool {
+        self.claims.is_empty()
     }
 
-    /// Parse the heph-managed section out of a `.gitignore`'s full text.
-    ///
-    /// The section is a sequence of root-anchored pattern lines, each optionally
-    /// preceded by a `# //pkg:target` attribution comment on its own line — the
-    /// shape the engine's renderer emits. Lines outside the markers are ignored:
-    /// a user's own ignore rules say nothing about what is generated.
-    #[expect(
-        clippy::string_slice,
-        reason = "slice indices come from `find` on ASCII markers — always char-aligned"
-    )]
-    pub fn from_gitignore(text: &str) -> anyhow::Result<Self> {
-        let (Some(start), Some(end)) = (text.find(BEGIN_MARKER_PREFIX), text.find(END_MARKER))
-        else {
-            return Ok(Self::empty());
-        };
-        if end < start {
-            return Ok(Self::empty());
-        }
-        Self::from_lines(text[start..end].lines())
+    /// True if the workspace-relative path `rel` is generated by a
+    /// `codegen = "copy"` target, and so must never be sourced as raw input.
+    pub fn claims(&self, rel: &Path) -> bool {
+        !self.claims.is_empty() && self.any.is_match(rel)
     }
 
-    /// Build from the section's lines (markers may be present; they are skipped).
+    /// The addr of the target that emits `rel`, when the claim carries an
+    /// attribution. Diagnostics only — [`Self::claims`] is the decision.
+    pub fn owner(&self, rel: &Path) -> Option<&str> {
+        self.claims
+            .iter()
+            .find(|c| c.glob.is_match(rel))
+            .and_then(|c| c.owner.as_deref())
+    }
+
+    /// Build from attributed pattern lines: a `# //pkg:target` comment applies to
+    /// the pattern line under it. Both the ledger and the heph-managed
+    /// `.gitignore` section are written in exactly this shape, so one parser
+    /// serves both and they cannot drift.
     fn from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> anyhow::Result<Self> {
         let mut claims = Vec::new();
         let mut pending: Option<String> = None;
@@ -154,13 +131,12 @@ impl CodegenClaims {
         {
             if let Some(rest) = line.strip_prefix('#') {
                 // Attribution comments name the emitting target; anything else in
-                // the section is a comment we don't own. Held for the next
-                // pattern line, matching how the renderer lays them out.
+                // the section is a comment we don't own.
                 let rest = rest.trim();
                 pending = rest.starts_with("//").then(|| rest.to_string());
                 continue;
             }
-            // A negation un-ignores a path — the renderer never emits one, and
+            // A negation un-ignores a path — nothing heph writes emits one, and
             // treating it as a claim would invert its meaning.
             if line.starts_with('!') {
                 pending = None;
@@ -184,29 +160,326 @@ impl CodegenClaims {
         Ok(Self { claims, any })
     }
 
-    /// True when nothing is claimed — the whole check can be skipped.
-    pub fn is_empty(&self) -> bool {
-        self.claims.is_empty()
-    }
-
-    /// True if the workspace-relative path `rel` is generated by a
-    /// `codegen = "copy"` target, and so must never be sourced as raw input.
-    pub fn claims(&self, rel: &Path) -> bool {
-        !self.claims.is_empty() && self.any.is_match(rel)
-    }
-
-    /// The addr of the target that emits `rel`, when the claim carries an
-    /// attribution comment. Diagnostics only — [`Self::claims`] is the decision.
-    pub fn owner(&self, rel: &Path) -> Option<&str> {
-        self.claims
-            .iter()
-            .find(|c| c.glob.is_match(rel))
-            .and_then(|c| c.owner.as_deref())
+    /// Parse the heph-managed section out of a `.gitignore`'s full text. Lines
+    /// outside the markers are ignored: a user's own ignore rules say nothing
+    /// about what is generated.
+    #[expect(
+        clippy::string_slice,
+        reason = "slice indices come from `find` on ASCII markers — always char-aligned"
+    )]
+    pub fn from_gitignore(text: &str) -> anyhow::Result<Self> {
+        let (Some(start), Some(end)) = (text.find(BEGIN_MARKER_PREFIX), text.find(END_MARKER))
+        else {
+            return Ok(Self::empty());
+        };
+        if end < start {
+            return Ok(Self::empty());
+        }
+        Self::from_lines(text[start..end].lines())
     }
 }
 
-/// Translate one root-anchored `.gitignore` pattern into the wax globs that
-/// match the same workspace-relative paths.
+/// Identifies a version of the ledger file without reading it. Every target we
+/// support has sub-second mtime resolution (APFS and ext4 both store
+/// nanoseconds), and the length is carried too so an in-place rewrite that
+/// somehow lands in the same tick is still noticed.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct Marker {
+    mtime: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl Marker {
+    /// The marker for a missing file, distinct from any real one.
+    const ABSENT: Self = Self {
+        mtime: None,
+        len: u64::MAX,
+    };
+
+    fn of(path: &Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(m) => Self {
+                mtime: m.modified().ok(),
+                len: m.len(),
+            },
+            Err(_) => Self::ABSENT,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct State {
+    set: Arc<ClaimSet>,
+    /// The ledger version `set` was built from.
+    seen: Marker,
+}
+
+/// The live set of workspace paths owned by `codegen = "copy"` targets.
+///
+/// Built once at engine construction and handed to every plugin that walks the
+/// tree (a cdylib plugin builds its own from the same two paths). Shared by
+/// `Arc`; [`Self::snapshot`] is the read path and [`Self::record`] the write one.
+#[derive(Debug)]
+pub struct CodegenClaims {
+    /// `<root>/.gitignore` — the committed declaration. Empty for a claim set
+    /// with no workspace behind it.
+    gitignore: Option<PathBuf>,
+    /// `<home>/codegen-claims` — the ledger the write-back maintains.
+    ledger: Option<PathBuf>,
+    state: RwLock<State>,
+}
+
+impl Default for CodegenClaims {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl CodegenClaims {
+    /// A claim set with no workspace behind it: claims nothing, reads nothing,
+    /// records nothing. For the non-engine call sites (LSP, unit tests).
+    pub fn disabled() -> Self {
+        Self {
+            gitignore: None,
+            ledger: None,
+            state: RwLock::new(State {
+                set: Arc::new(ClaimSet::empty()),
+                seen: Marker::ABSENT,
+            }),
+        }
+    }
+
+    /// Read the claim set for the workspace at `root`, with its ledger at
+    /// `ledger` (`<home>/codegen-claims`).
+    ///
+    /// Never fails: an unreadable file or a malformed pattern yields an empty set
+    /// with a warning rather than refusing to build. The cost of an empty set is
+    /// that generated files get sourced as raw input — noisy and wrong, but a
+    /// build that will not start is worse, and the ledger repairs itself on the
+    /// next write-back.
+    pub fn load(root: &Path, ledger: PathBuf) -> Self {
+        let this = Self {
+            gitignore: Some(root.join(".gitignore")),
+            ledger: Some(ledger),
+            state: RwLock::new(State {
+                set: Arc::new(ClaimSet::empty()),
+                // Never equal to a real marker, so the first `snapshot` builds.
+                seen: Marker {
+                    mtime: None,
+                    len: u64::MAX - 1,
+                },
+            }),
+        };
+        this.snapshot();
+        this
+    }
+
+    /// The current claim set, re-reading the sources if the ledger changed since
+    /// the last look.
+    ///
+    /// Call once per walk or scan and match every path against the returned set:
+    /// the freshness check is a single `stat`, but it is not free enough to run
+    /// per file, and a walk wants a fixed answer for its duration anyway.
+    pub fn snapshot(&self) -> Arc<ClaimSet> {
+        let Some(ledger) = self.ledger.as_deref() else {
+            return Arc::clone(&self.state.read().set);
+        };
+        let marker = Marker::of(ledger);
+        {
+            let state = self.state.read();
+            if state.seen == marker {
+                return Arc::clone(&state.set);
+            }
+        }
+        let set = Arc::new(self.build());
+        let mut state = self.state.write();
+        // Another thread may have rebuilt from a newer ledger while we were
+        // reading; keep the newer one rather than moving the marker backwards.
+        if state.seen != marker {
+            state.set = Arc::clone(&set);
+            state.seen = marker;
+        }
+        Arc::clone(&state.set)
+    }
+
+    /// Re-read both sources and compile them into one set.
+    fn build(&self) -> ClaimSet {
+        let mut lines = String::new();
+        if let Some(path) = self.gitignore.as_deref() {
+            match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    // Only the managed section; a user's own ignores are not
+                    // statements about what is generated.
+                    if let (Some(start), Some(end)) =
+                        (text.find(BEGIN_MARKER_PREFIX), text.find(END_MARKER))
+                        && start < end
+                    {
+                        lines.push_str(section_body(&text, start, end));
+                        lines.push('\n');
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "read .gitignore"),
+            }
+        }
+        if let Some(path) = self.ledger.as_deref() {
+            // Through the parsed map, not the raw text: a target that re-recorded
+            // has an older block still in the file, and only its latest one is a
+            // live claim.
+            match read_ledger(path) {
+                Ok(entries) => {
+                    for (addr, patterns) in &entries {
+                        for pattern in patterns {
+                            lines.push_str("# ");
+                            lines.push_str(addr);
+                            lines.push('\n');
+                            lines.push_str(pattern);
+                            lines.push('\n');
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %format!("{e:#}"),
+                        "read codegen claim ledger"
+                    );
+                }
+            }
+        }
+        match ClaimSet::from_lines(lines.lines()) {
+            Ok(set) => set,
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "cannot compile the codegen claim set; generated files will be \
+                     sourced as raw input"
+                );
+                ClaimSet::empty()
+            }
+        }
+    }
+
+    /// Register `patterns` as the root-anchored `codegen = "copy"` output of
+    /// `addr`, replacing whatever that target claimed before.
+    ///
+    /// Called by the codegen write-back in the same operation that puts the files
+    /// on disk, so a generated file is never on disk unclaimed. A no-op — no
+    /// write, no rebuild — when the ledger already says exactly this, which is
+    /// the steady state after the first run.
+    ///
+    /// The write is an `O_APPEND` of this target's block, and a read resolves
+    /// duplicates last-wins. That is what makes two `heph` processes generating
+    /// into one workspace safe: a read-modify-write of a whole-file map would let
+    /// each one drop the other's target, losing a claim for a file that is
+    /// already on disk — the very failure this mechanism exists to prevent.
+    /// Appends never interleave, and since an unchanged claim writes nothing, the
+    /// file does not grow in the steady state.
+    pub fn record(&self, addr: &str, patterns: &[String]) -> anyhow::Result<()> {
+        let Some(ledger) = self.ledger.as_deref() else {
+            return Ok(());
+        };
+        if read_ledger(ledger)?.get(addr).map(Vec::as_slice) == Some(patterns) {
+            return Ok(());
+        }
+        append_entry(ledger, addr, patterns)?;
+
+        // Install the new set directly rather than waiting for a `snapshot` to
+        // notice: this process just wrote the file, so there is no reason to
+        // round-trip through the filesystem's mtime resolution to learn it.
+        let set = Arc::new(self.build());
+        let mut state = self.state.write();
+        state.set = set;
+        state.seen = Marker::of(ledger);
+        Ok(())
+    }
+}
+
+/// The body of the managed section, markers excluded.
+#[expect(
+    clippy::string_slice,
+    reason = "indices come from `find` on ASCII markers — always char-aligned"
+)]
+fn section_body(text: &str, start: usize, end: usize) -> &str {
+    &text[start..end]
+}
+
+/// Parse the ledger into `addr -> patterns`.
+///
+/// The file is append-only, so a target that re-recorded appears more than once;
+/// the LAST block for an addr is its current claim, and earlier ones are history.
+/// An empty block (an addr with no patterns under it) is how a target that no
+/// longer emits `copy` output releases its paths.
+fn read_ledger(path: &Path) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("read codegen claim ledger {}", path.display()));
+        }
+    };
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut pending: Option<&str> = None;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(rest) = line.strip_prefix('#') {
+            let rest = rest.trim();
+            pending = rest.starts_with("//").then_some(rest);
+            // A new block for this addr supersedes whatever it claimed earlier.
+            if let Some(addr) = pending {
+                out.insert(addr.to_owned(), Vec::new());
+            }
+            continue;
+        }
+        // A pattern with no attribution above it belongs to no target, so nothing
+        // could ever replace or release it. Drop it rather than let it accumulate
+        // as an unowned claim.
+        if let Some(addr) = pending {
+            out.entry(addr.to_owned())
+                .or_default()
+                .push(line.to_owned());
+        }
+    }
+    out.retain(|_, patterns| !patterns.is_empty());
+    Ok(out)
+}
+
+/// Append one target's block. `O_APPEND` positions the write atomically, so two
+/// processes recording different targets at the same time cannot lose either.
+///
+/// A block with no pattern lines releases that target's claims — the header alone
+/// supersedes its previous block.
+fn append_entry(path: &Path, addr: &str, patterns: &[String]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir for codegen claim ledger {}", parent.display()))?;
+    }
+    let mut block = String::new();
+    if patterns.is_empty() {
+        block.push_str("# ");
+        block.push_str(addr);
+        block.push('\n');
+    }
+    for pattern in patterns {
+        block.push_str("# ");
+        block.push_str(addr);
+        block.push('\n');
+        block.push_str(pattern);
+        block.push('\n');
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open codegen claim ledger {}", path.display()))?;
+    f.write_all(block.as_bytes())
+        .with_context(|| format!("append to codegen claim ledger {}", path.display()))?;
+    Ok(())
+}
+
+/// Translate one root-anchored pattern into the wax globs that match the same
+/// workspace-relative paths.
 ///
 /// Two differences from gitignore syntax matter here:
 ///  - a leading `/` anchors to the repo root, which is already what a
@@ -232,12 +505,30 @@ mod tests {
         Path::new(s)
     }
 
-    fn section(body: &str) -> CodegenClaims {
-        CodegenClaims::from_gitignore(&format!(
+    fn section(body: &str) -> ClaimSet {
+        ClaimSet::from_gitignore(&format!(
             "target/\n\n{BEGIN_MARKER_PREFIX} (managed)\n{body}\n{END_MARKER}\nnode_modules/\n"
         ))
         .expect("valid section")
     }
+
+    /// A workspace with a `.gitignore` holding `body` (may be empty) and an empty
+    /// ledger dir, ready for `record`.
+    fn workspace(body: &str) -> (tempfile::TempDir, CodegenClaims) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        if !body.is_empty() {
+            std::fs::write(
+                dir.path().join(".gitignore"),
+                format!("target/\n{BEGIN_MARKER_PREFIX}\n{body}\n{END_MARKER}\n"),
+            )
+            .expect("write .gitignore");
+        }
+        let ledger = dir.path().join(".heph3").join("codegen-claims");
+        let claims = CodegenClaims::load(dir.path(), ledger);
+        (dir, claims)
+    }
+
+    // ─── Pattern semantics ─────────────────────────────────────────────────
 
     #[test]
     fn file_claim_matches_only_that_path() {
@@ -273,19 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn unattributed_line_still_claims() {
-        // A legacy or hand-written line inside the managed section is honored as
-        // a claim; only its provenance is unknown.
-        let c = section("/legacy/out.txt");
-        assert!(c.claims(p("legacy/out.txt")));
-        assert_eq!(c.owner(p("legacy/out.txt")), None);
-    }
-
-    #[test]
     fn patterns_outside_the_markers_are_not_claims() {
-        // `target/` and `node_modules/` sit outside the managed section in
-        // `section()`'s scaffolding — a user's own ignores say nothing about what
-        // is generated.
         let c = section("/pkg/gen");
         assert!(!c.claims(p("target/debug/heph")));
         assert!(!c.claims(p("node_modules/x/index.js")));
@@ -293,7 +572,7 @@ mod tests {
 
     #[test]
     fn no_section_claims_nothing() {
-        let c = CodegenClaims::from_gitignore("target/\nnode_modules/\n").expect("valid");
+        let c = ClaimSet::from_gitignore("target/\nnode_modules/\n").expect("valid");
         assert!(c.is_empty());
         assert!(!c.claims(p("target/debug/heph")));
     }
@@ -306,18 +585,229 @@ mod tests {
     }
 
     #[test]
-    fn empty_claims_never_match() {
-        let c = CodegenClaims::empty();
-        assert!(c.is_empty());
-        assert!(!c.claims(p("anything")));
-        assert!(!c.claims(p("")));
+    fn malformed_pattern_is_an_error_not_a_silent_drop() {
+        let err =
+            ClaimSet::from_gitignore(&format!("{BEGIN_MARKER_PREFIX}\n/pkg/<bad\n{END_MARKER}\n"));
+        assert!(err.is_err(), "an unparseable claim must not be dropped");
     }
 
     #[test]
-    fn malformed_pattern_is_an_error_not_a_silent_drop() {
-        let err = CodegenClaims::from_gitignore(&format!(
-            "{BEGIN_MARKER_PREFIX}\n/pkg/<bad\n{END_MARKER}\n"
-        ));
-        assert!(err.is_err(), "an unparseable claim must not be dropped");
+    fn disabled_never_claims() {
+        let c = CodegenClaims::disabled();
+        let s = c.snapshot();
+        assert!(s.is_empty());
+        assert!(!s.claims(p("anything")));
+    }
+
+    // ─── The ledger ────────────────────────────────────────────────────────
+
+    /// The property the whole design turns on: a target that generates into the
+    /// tree is claimed by the act of generating, with no command run first. A
+    /// workspace with an EMPTY `.gitignore` must still exclude the output.
+    #[test]
+    fn recording_claims_without_any_gitignore_section() {
+        let (_dir, claims) = workspace("");
+        assert!(claims.snapshot().is_empty(), "nothing claimed up front");
+
+        claims
+            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .expect("record");
+
+        let s = claims.snapshot();
+        assert!(s.claims(p("pkg/gen.go")));
+        assert_eq!(s.owner(p("pkg/gen.go")), Some("//pkg:gen"));
+        assert!(!s.claims(p("pkg/hand_written.go")));
+    }
+
+    /// A claim recorded mid-run is visible to a walk later in the same run,
+    /// through the same shared handle — what re-reading an xattr off the
+    /// filesystem gave for free, and what a load-once set would not.
+    #[test]
+    fn a_recorded_claim_is_visible_to_a_later_snapshot() {
+        let (_dir, claims) = workspace("");
+        let before = claims.snapshot();
+        claims
+            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .expect("record");
+        let after = claims.snapshot();
+
+        assert!(
+            !before.claims(p("pkg/gen.go")),
+            "the earlier walk's set is fixed"
+        );
+        assert!(after.claims(p("pkg/gen.go")), "a later walk sees it");
+    }
+
+    /// A separately-constructed reader — the shape a cdylib plugin has, holding
+    /// its own handle over the same paths — picks the claim up too.
+    #[test]
+    fn a_second_reader_over_the_same_paths_sees_a_recorded_claim() {
+        let (dir, writer) = workspace("");
+        let ledger = dir.path().join(".heph3").join("codegen-claims");
+        let reader = CodegenClaims::load(dir.path(), ledger);
+        assert!(!reader.snapshot().claims(p("pkg/gen.go")));
+
+        writer
+            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .expect("record");
+
+        assert!(
+            reader.snapshot().claims(p("pkg/gen.go")),
+            "an independent handle must notice the ledger change"
+        );
+    }
+
+    /// Re-recording replaces a target's claims rather than accumulating them, so
+    /// an output path that a target no longer emits stops being claimed — a stale
+    /// claim would hide a real source file.
+    #[test]
+    fn re_recording_replaces_that_targets_claims() {
+        let (_dir, claims) = workspace("");
+        claims
+            .record("//pkg:gen", &["/pkg/old.go".to_string()])
+            .expect("record");
+        claims
+            .record("//pkg:gen", &["/pkg/new.go".to_string()])
+            .expect("re-record");
+
+        let s = claims.snapshot();
+        assert!(s.claims(p("pkg/new.go")));
+        assert!(!s.claims(p("pkg/old.go")), "the dropped output is released");
+    }
+
+    /// One target's record must not disturb another's.
+    #[test]
+    fn records_from_different_targets_coexist() {
+        let (_dir, claims) = workspace("");
+        claims
+            .record("//a:gen", &["/a/gen.go".to_string()])
+            .expect("record a");
+        claims
+            .record("//b:gen", &["/b/gen.go".to_string()])
+            .expect("record b");
+
+        let s = claims.snapshot();
+        assert_eq!(s.owner(p("a/gen.go")), Some("//a:gen"));
+        assert_eq!(s.owner(p("b/gen.go")), Some("//b:gen"));
+    }
+
+    /// The ledger and the committed section are a union: the ledger covers what
+    /// has been generated, the section covers what is declared but not yet
+    /// generated (and survives the ledger being deleted).
+    #[test]
+    fn the_ledger_and_the_gitignore_section_union() {
+        let (_dir, claims) = workspace("# //pkg:declared\n/pkg/declared.txt");
+        claims
+            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .expect("record");
+
+        let s = claims.snapshot();
+        assert!(
+            s.claims(p("pkg/declared.txt")),
+            "from the committed section"
+        );
+        assert!(s.claims(p("pkg/gen.go")), "from the ledger");
+    }
+
+    /// Deleting `.heph3` must not resurrect a declared output as source: the
+    /// committed section still answers, which is why both sources exist.
+    #[test]
+    fn a_deleted_ledger_falls_back_to_the_committed_section() {
+        let (dir, claims) = workspace("# //pkg:gen\n/pkg/gen.go");
+        claims
+            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .expect("record");
+        std::fs::remove_dir_all(dir.path().join(".heph3")).expect("wipe .heph3");
+
+        assert!(claims.snapshot().claims(p("pkg/gen.go")));
+    }
+
+    /// Two `heph` processes generating into one workspace record through separate
+    /// handles that never see each other's in-memory state. Both claims must
+    /// survive: losing one leaves a file already on disk unclaimed, which is the
+    /// exact failure this mechanism exists to prevent.
+    ///
+    /// This is why the ledger is appended to rather than rewritten — a
+    /// read-modify-write of a whole-file map lets each writer drop the other's
+    /// target.
+    #[test]
+    fn concurrent_writers_do_not_drop_each_others_claims() {
+        let (dir, a) = workspace("");
+        let ledger = dir.path().join(".heph3").join("codegen-claims");
+        let b = CodegenClaims::load(dir.path(), ledger);
+
+        // Interleaved the damaging way: both read the ledger before either writes.
+        assert!(a.snapshot().is_empty());
+        assert!(b.snapshot().is_empty());
+        a.record("//a:gen", &["/a/gen.go".to_string()])
+            .expect("record a");
+        b.record("//b:gen", &["/b/gen.go".to_string()])
+            .expect("record b");
+
+        for (label, claims) in [("a", &a), ("b", &b)] {
+            let s = claims.snapshot();
+            assert!(s.claims(p("a/gen.go")), "{label} lost //a:gen");
+            assert!(s.claims(p("b/gen.go")), "{label} lost //b:gen");
+        }
+    }
+
+    /// The append-only file accumulates a target's history; only its latest block
+    /// is a live claim. Without last-wins on read, a path a target stopped
+    /// emitting would stay claimed forever and hide a real source file.
+    #[test]
+    fn only_the_latest_block_for_a_target_counts() {
+        let (dir, claims) = workspace("");
+        let ledger = dir.path().join(".heph3").join("codegen-claims");
+        claims
+            .record("//pkg:gen", &["/pkg/old.go".to_string()])
+            .expect("record");
+        claims
+            .record("//pkg:gen", &["/pkg/new.go".to_string()])
+            .expect("re-record");
+
+        // Both blocks are still in the file — nothing rewrites it.
+        let raw = std::fs::read_to_string(&ledger).expect("read ledger");
+        assert!(
+            raw.contains("/pkg/old.go"),
+            "history is kept, not rewritten"
+        );
+
+        // A reader starting cold resolves the same way as the writer's own view.
+        let cold = CodegenClaims::load(dir.path(), ledger);
+        let s = cold.snapshot();
+        assert!(s.claims(p("pkg/new.go")));
+        assert!(!s.claims(p("pkg/old.go")), "superseded claim is released");
+    }
+
+    /// Recording no patterns releases a target's claims outright — the path a
+    /// target used to generate becomes ordinary source again.
+    #[test]
+    fn recording_no_patterns_releases_the_claim() {
+        let (_dir, claims) = workspace("");
+        claims
+            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .expect("record");
+        assert!(claims.snapshot().claims(p("pkg/gen.go")));
+
+        claims.record("//pkg:gen", &[]).expect("release");
+        assert!(!claims.snapshot().claims(p("pkg/gen.go")));
+    }
+
+    /// Recording the same thing twice must not rewrite the file — the steady
+    /// state after the first run is every target re-recording what it already
+    /// claimed, and that should touch nothing.
+    #[test]
+    fn re_recording_identical_claims_does_not_rewrite_the_ledger() {
+        let (dir, claims) = workspace("");
+        let ledger = dir.path().join(".heph3").join("codegen-claims");
+        claims
+            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .expect("record");
+        let first = Marker::of(&ledger);
+
+        claims
+            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .expect("re-record");
+        assert_eq!(Marker::of(&ledger), first, "identical record is a no-op");
     }
 }

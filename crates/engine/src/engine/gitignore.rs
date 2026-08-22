@@ -474,7 +474,7 @@ mod tests {
     /// exactly the paths that shape covers, and nothing beside them.
     #[test]
     fn rendered_section_round_trips_through_the_claim_reader() {
-        use hwalk::CodegenClaims;
+        use hwalk::ClaimSet;
         use std::path::Path;
 
         let rendered = render(
@@ -495,7 +495,7 @@ mod tests {
                 ),
             ],
         );
-        let claims = CodegenClaims::from_gitignore(&rendered).expect("reader parses our render");
+        let claims = ClaimSet::from_gitignore(&rendered).expect("reader parses our render");
 
         assert!(claims.claims(Path::new("pkg/a.pb.go")));
         assert!(claims.claims(Path::new("pkg/gen")), "the dir output itself");
