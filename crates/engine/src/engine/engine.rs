@@ -649,6 +649,12 @@ impl Engine {
 
     /// Register an exec runner under `name`, matching the driver name of the
     /// runner targets it serves.
+    /// The workspace-level `defaultRunner:`, if set. Read by diagnostics to say
+    /// *how* a target's environment was chosen, not only which it was.
+    pub fn default_runner(&self) -> Option<&hmodel::htaddr::Addr> {
+        self.cfg.default_runner.as_ref()
+    }
+
     pub fn register_exec_runner(
         &mut self,
         name: impl Into<String>,

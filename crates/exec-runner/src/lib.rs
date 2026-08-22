@@ -93,6 +93,12 @@ pub struct SessionCaps {
 pub struct SessionDescription {
     /// The runner that opened it (`local`, or a runner target's addr).
     pub runner: String,
+    /// Names the environment defines as **shell functions** rather than
+    /// binaries. Diagnostics only, and the difference between a dead end and a
+    /// recoverable error: a target calling one of these otherwise fails with
+    /// "not found in PATH", which sends the reader hunting for a missing
+    /// package that is not missing.
+    pub shell_functions: Vec<String>,
     /// Content-addressed key this session was opened for. Empty for `local`,
     /// which contributes nothing to any cache key.
     pub key: String,
@@ -133,6 +139,14 @@ pub enum SpawnError {
         key: String,
         reason: String,
     },
+    /// The program is not a binary in this environment, but the environment
+    /// *does* define it as a shell function — which a snapshot runner cannot
+    /// provide. Named separately because the fix is different in kind: not
+    /// "install it" but "this runner mode cannot express it".
+    ShellFunctionNotABinary {
+        program: String,
+        runner: String,
+    },
     Io(std::io::Error),
 }
 
@@ -163,6 +177,13 @@ impl std::fmt::Display for SpawnError {
                      check that the working directory {cwd:?} exists."
                 ),
             },
+            SpawnError::ShellFunctionNotABinary { program, runner } => write!(
+                f,
+                "spawn child process {program:?}: runner `{runner}` defines {program:?} as a shell \
+                 function, not a binary on PATH. The snapshot runner cannot provide shell \
+                 functions — call the underlying command directly, or set `mode = \"session\"` on \
+                 the runner target."
+            ),
             SpawnError::SessionDied { key, reason } => write!(
                 f,
                 "exec session {key} died before the process could be created: {reason}"
@@ -176,7 +197,7 @@ impl std::error::Error for SpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             SpawnError::Io(e) | SpawnError::ProgramNotFound { io: e, .. } => Some(e),
-            SpawnError::SessionDied { .. } => None,
+            SpawnError::SessionDied { .. } | SpawnError::ShellFunctionNotABinary { .. } => None,
         }
     }
 }
@@ -343,6 +364,7 @@ impl LocalSession {
             },
             description: SessionDescription {
                 runner: "local".to_string(),
+                shell_functions: Vec::new(),
                 key: String::new(),
                 summary: "host process, no environment applied".to_string(),
             },
@@ -531,6 +553,7 @@ mod env_session_tests {
             },
             SessionDescription {
                 runner: "test".to_string(),
+                shell_functions: Vec::new(),
                 key: "k".to_string(),
                 summary: "test".to_string(),
             },
@@ -590,5 +613,25 @@ mod env_session_tests {
             .prepare(spec_with(&[("A", "caller")]))
             .expect("prepare");
         assert_eq!(out.env.iter().filter(|(k, _)| k == "A").count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod shell_function_diag_tests {
+    use super::*;
+
+    /// M1's one real limitation, made recoverable. Without this the reader sees
+    /// "not found in PATH" and goes looking for a package that is not missing.
+    #[test]
+    fn a_shell_function_says_so_rather_than_not_found() {
+        let msg = SpawnError::ShellFunctionNotABinary {
+            program: "fmt-all".to_string(),
+            runner: "//:devenv".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("shell function"), "{msg}");
+        assert!(msg.contains("//:devenv"), "{msg}");
+        // Names the way out, not just the problem.
+        assert!(msg.contains(r#"mode = "session""#), "{msg}");
     }
 }

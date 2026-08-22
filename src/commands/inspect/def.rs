@@ -28,6 +28,24 @@ pub struct Args {
 struct DefView<'a> {
     target_def: &'a TargetDef,
     applied_transitive: Option<&'a Sandbox>,
+    /// The exec environment this target's processes are created in
+    /// (`docs/EXEC_RUNNERS.md`). `None` = the host process.
+    ///
+    /// Here rather than in a new top-level command because `inspect def`
+    /// already serializes its whole view as JSON unconditionally, so this is
+    /// answerable by a person and by an agent from day one — and "why did it
+    /// build in that environment?" is a per-target question, which the build
+    /// event stream deliberately does not carry at 20k targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner: Option<RunnerView>,
+}
+
+#[derive(Serialize)]
+struct RunnerView {
+    /// The runner target's address.
+    addr: String,
+    /// How it was chosen — the answer to "I never wrote `runner =` on this".
+    selected_by: &'static str,
 }
 
 struct DefApp {
@@ -69,6 +87,14 @@ impl App for DefApp {
             let view = DefView {
                 target_def: &def.target_def,
                 applied_transitive: def.applied_transitive.as_ref(),
+                runner: def.runner.as_ref().map(|addr| RunnerView {
+                    addr: addr.format(),
+                    selected_by: if self.engine.default_runner() == Some(addr) {
+                        "defaultRunner"
+                    } else {
+                        "target"
+                    },
+                }),
             };
             let json = serde_json::to_string_pretty(&view).context("serialize def")?;
             println!("{json}");

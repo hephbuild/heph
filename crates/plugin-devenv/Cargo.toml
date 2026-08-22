@@ -1,0 +1,25 @@
+[package]
+name = "plugin-devenv"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hmodel = { package = "model", path = "../model" }
+hplugin = { package = "plugin", path = "../plugin" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+hexec-runner = { package = "exec-runner", path = "../exec-runner" }
+hproc = { package = "proc", path = "../proc" }
+htspec-derive = { path = "../htspec-derive" }
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+
+[dev-dependencies]
+tempfile = "3"

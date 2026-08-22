@@ -1090,20 +1090,49 @@ impl Driver {
         if shell && let Ok(term) = std::env::var("TERM") {
             env.insert("TERM".to_string(), term);
         }
-        // Where the child's PATH came from, for the spawn-failure diagnostic.
-        // A session that reports no environment (`local`, and any runner whose
-        // environment cannot be enumerated host-side) leaves the driver's own
-        // `path` option in charge, which is the pre-runner behaviour.
-        let path_source = match req.runner.base_env() {
-            Some(base) if base.iter().any(|(k, _)| k == "PATH") => {
-                hexec_runner::PathSource::Session {
-                    runner: req.runner.describe().runner.clone(),
-                }
+        // The session's PATH REPLACES the driver's, rather than sitting under it
+        // (`docs/EXEC_RUNNERS.md` §4.4). Appending the driver's default after it
+        // would mean a tool missing from the runner silently falls through to
+        // the host — the exact ambient dependency a runner exists to remove —
+        // and it would do so invisibly, under a cache key asserting the runner's
+        // environment.
+        //
+        // It has to happen here, not in the session's `prepare`: the sandbox
+        // `bin/` prepend below builds on whatever PATH is in this map, so a
+        // session PATH merged afterwards would arrive too late and lose to the
+        // bin dir.
+        let session_path = req
+            .runner
+            .base_env()
+            .and_then(|base| base.iter().find(|(k, _)| k == "PATH"))
+            .and_then(|(_, v)| v.to_str())
+            .map(str::to_owned);
+
+        // An explicitly written `path` under a runner is a hard error rather
+        // than a silent discard: the two cases are distinguishable (an empty
+        // `search_path` means the option was never set), and quietly ignoring
+        // something the user wrote is not an option.
+        if session_path.is_some() && !self.search_path.is_empty() {
+            anyhow::bail!(
+                "target runs under runner `{}`, which supplies PATH, but the `{}` driver also has                  an explicit `path` option ({}). Only one of them can be in charge — remove the                  driver's `path`, or set `runner = None` on this target.",
+                req.runner.describe().runner,
+                self.name,
+                self.search_path.join(":"),
+            );
+        }
+
+        let path_source = if session_path.is_some() {
+            hexec_runner::PathSource::Session {
+                runner: req.runner.describe().runner.clone(),
             }
-            _ => hexec_runner::PathSource::Driver,
+        } else {
+            hexec_runner::PathSource::Driver
         };
 
-        env.insert("PATH".to_string(), self.sandbox_path_display());
+        env.insert(
+            "PATH".to_string(),
+            session_path.unwrap_or_else(|| self.sandbox_path_display()),
+        );
         env.insert(
             "WORKSPACE_ROOT".to_string(),
             req.sandbox_ws_dir.to_string_lossy().to_string(),
@@ -1365,6 +1394,10 @@ impl Driver {
             }
         }
 
+        // The PATH the child will actually search, captured for the failure
+        // diagnostic before `env` is consumed.
+        let searched_path = env.get("PATH").cloned().unwrap_or_default();
+
         let output_log_path = req.sandbox_dir.join("log.txt");
         let output_log =
             std::fs::File::create(&output_log_path).with_context(|| "create log file")?;
@@ -1480,13 +1513,24 @@ impl Driver {
                 // from. The session reports whether it supplied one; the naming
                 // of the fix — `.hephconfig` vs the runner — follows from that.
                 hexec_runner::SpawnError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                    anyhow::Error::new(hexec_runner::SpawnError::ProgramNotFound {
-                        program: program.to_string(),
-                        path: self.sandbox_path_display(),
-                        source: path_source,
-                        cwd: req.sandbox_pkg_dir.display().to_string(),
-                        io,
-                    })
+                    let desc = req.runner.describe();
+                    // The environment knows this name — as a shell function,
+                    // which a snapshot runner cannot provide. Saying so turns a
+                    // hunt for a missing package into a one-line fix.
+                    if desc.shell_functions.iter().any(|f| f == program) {
+                        anyhow::Error::new(hexec_runner::SpawnError::ShellFunctionNotABinary {
+                            program: program.to_string(),
+                            runner: desc.runner.clone(),
+                        })
+                    } else {
+                        anyhow::Error::new(hexec_runner::SpawnError::ProgramNotFound {
+                            program: program.to_string(),
+                            path: searched_path.clone(),
+                            source: path_source,
+                            cwd: req.sandbox_pkg_dir.display().to_string(),
+                            io,
+                        })
+                    }
                 }
                 other => {
                     anyhow::Error::new(other).context(format!("spawn child process {program:?}"))

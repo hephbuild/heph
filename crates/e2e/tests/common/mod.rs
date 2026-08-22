@@ -54,6 +54,9 @@ pub struct RecordingExecRunner {
     pub opens: Arc<std::sync::atomic::AtomicUsize>,
     /// Env var name/value the returned session applies to every process.
     pub var: (String, String),
+    /// When set, the session also supplies `PATH`, which must then REPLACE the
+    /// driver's own rather than sit under it.
+    pub path: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -75,17 +78,25 @@ impl heph::engine::exec_runner::ExecRunner for RecordingExecRunner {
             .map(|a| String::from_utf8_lossy(&a.bytes).trim().to_string())
             .unwrap_or_default();
 
+        let mut base = vec![];
+        if let Some(p) = &self.path {
+            base.push((
+                std::ffi::OsString::from("PATH"),
+                std::ffi::OsString::from(p.clone()),
+            ));
+        }
+        base.extend(vec![
+            (
+                std::ffi::OsString::from(self.var.0.clone()),
+                std::ffi::OsString::from(self.var.1.clone()),
+            ),
+            (
+                std::ffi::OsString::from("HEPH_TEST_RUNNER_ARTIFACT"),
+                std::ffi::OsString::from(from_artifact),
+            ),
+        ]);
         Ok(Arc::new(er::EnvSession::new(
-            vec![
-                (
-                    std::ffi::OsString::from(self.var.0.clone()),
-                    std::ffi::OsString::from(self.var.1.clone()),
-                ),
-                (
-                    std::ffi::OsString::from("HEPH_TEST_RUNNER_ARTIFACT"),
-                    std::ffi::OsString::from(from_artifact),
-                ),
-            ],
+            base,
             er::SessionCaps {
                 pty: true,
                 max_concurrent: None,
@@ -95,6 +106,7 @@ impl heph::engine::exec_runner::ExecRunner for RecordingExecRunner {
             },
             er::SessionDescription {
                 runner: req.runner_addr.clone(),
+                shell_functions: Vec::new(),
                 key: req.key,
                 summary: "recording test runner".to_string(),
             },
@@ -109,6 +121,16 @@ impl Workspace {
         opens: Arc<std::sync::atomic::AtomicUsize>,
         var: (&str, &str),
     ) -> Self {
+        Self::with_recording_runner_path(opens, var, None)
+    }
+
+    /// [`Self::with_recording_runner`] whose session also supplies `PATH`.
+    pub fn with_recording_runner_path(
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        var: (&str, &str),
+        path: Option<&str>,
+    ) -> Self {
+        let path = path.map(str::to_owned);
         Self {
             inner: WorkspaceBuilder::new()
                 .expect("workspace tempdir")
@@ -127,6 +149,7 @@ impl Workspace {
                     Arc::new(RecordingExecRunner {
                         opens,
                         var: (var.0.to_string(), var.1.to_string()),
+                        path,
                     }),
                 )
                 .build()
@@ -166,6 +189,7 @@ impl Workspace {
                     Arc::new(RecordingExecRunner {
                         opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         var: ("FROM_DEFAULT_RUNNER".to_string(), "1".to_string()),
+                        path: None,
                     }),
                 )
                 .build()

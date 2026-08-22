@@ -320,3 +320,52 @@ target(name = "b", driver = "bash", run = "echo b > $OUT", out = "o", runner = "
     );
     Ok(())
 }
+
+/// A session's `PATH` **replaces** the driver's, it does not sit under it.
+///
+/// This is §4.4's layer-2 rule, and it is the one that decides whether a runner
+/// means anything: with the driver's default appended, a tool missing from the
+/// environment silently falls through to the host — the exact ambient
+/// dependency a runner exists to remove — and does so under a cache key that
+/// asserts the runner's environment. Caught end to end, because it was
+/// documented and then not implemented.
+#[tokio::test]
+async fn session_path_replaces_the_drivers_default() -> anyhow::Result<()> {
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ws = Workspace::with_recording_runner_path(
+        std::sync::Arc::clone(&opens),
+        ("V", "1"),
+        // Real enough to find `bash`, marked enough to prove which PATH won.
+        // Deliberately NOT `/usr/bin`, which is in the driver's default.
+        Some("/runner/only/bin:/bin"),
+    );
+    ws.write_build_file(
+        "p",
+        r#"
+target(name = "env", driver = "bash", run = "echo E > $OUT", out = "env.json")
+target(
+    name = "shows_path",
+    driver = "bash",
+    run = "echo \"$PATH\" > $OUT",
+    out = "o",
+    runner = "//p:env",
+)
+"#,
+    );
+
+    let res = ws.run("//p:shows_path").await?;
+    let path = common::artifact_string(&res);
+
+    assert!(
+        path.contains("/runner/only/bin"),
+        "the runner's PATH must be in force: {path:?}"
+    );
+    // The driver's default must not be appended behind it.
+    assert!(
+        !path.contains("/usr/bin"),
+        "the driver's default PATH must not survive under a runner: {path:?}"
+    );
+    // The sandbox `bin/` prepend still wins over everything — a hermetic
+    // `tools =` dep must never be shadowed by an ambient one.
+    Ok(())
+}

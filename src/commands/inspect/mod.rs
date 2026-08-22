@@ -9,6 +9,7 @@ mod outputs;
 mod packages;
 mod path;
 mod revdeps;
+mod runners;
 mod spec;
 mod states;
 
@@ -38,6 +39,16 @@ pub enum InspectCommands {
     ///
     /// `heph inspect packages //cmd/...`
     Packages(packages::Args),
+    /// List the exec runners this workspace can use
+    ///
+    /// Shows `defaultRunner:` and the registered runner implementations. A
+    /// runner target's `driver` name selects which one reads its artifact.
+    ///
+    /// Static by design: live sessions belong to the build that opened them,
+    /// so a separate process cannot see them.
+    ///
+    /// Example: `heph inspect runners`
+    Runners(runners::Args),
     /// List the unique labels declared across matching targets
     ///
     /// Enumerates every target in the packages matching the given matcher,
@@ -194,6 +205,7 @@ impl InspectCommands {
     pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match self {
             InspectCommands::Packages(args) => packages::execute(args, sink, global),
+            InspectCommands::Runners(args) => runners::execute(args, sink, global),
             InspectCommands::Labels(args) => labels::execute(args, sink, global),
             InspectCommands::Hashin(args) => hashin::execute(args, sink, global),
             InspectCommands::Hashout(args) => hashout::execute(args, sink, global),

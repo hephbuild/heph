@@ -1268,6 +1268,7 @@ fn guest_session(req: &pb::ManagedRunRequest) -> Arc<dyn hexec_runner::ExecSessi
         },
         hexec_runner::SessionDescription {
             runner: req.runner_addr.clone(),
+            shell_functions: Vec::new(),
             key: req.runner_key.clone(),
             summary: "host-supplied environment".to_string(),
         },
