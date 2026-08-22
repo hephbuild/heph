@@ -646,6 +646,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: std::path::PathBuf::from("/tmp"),
+            scratch: vec![],
         };
         let res = Driver
             .run(req, &ctoken())

@@ -1016,6 +1016,28 @@ pub mod outputartifact {
     }
 }
 
+/// A scratch cache the host has resolved, locked and created for this run.
+///
+/// The driver's job is only to place it and announce it: symlink `path` (relative
+/// to the target's cwd) at `dir`, and set `env` to `dir`. Everything else — which
+/// declaration this came from, how the slot was keyed, which lock is held — is the
+/// host's, and deliberately not visible here.
+///
+/// `dir` is the *canonical* slot path, not the in-sandbox mount, and that is the
+/// point: tools bake absolute paths into their cache entries, so every consumer
+/// must see one stable string for the same cache or it is present and inert.
+#[derive(Clone, Debug)]
+pub struct ScratchMount {
+    /// The declaring target, for diagnostics.
+    pub addr: Addr,
+    /// Mount point relative to the target's cwd.
+    pub path: String,
+    /// Environment variable that carries `dir`.
+    pub env: String,
+    /// Canonical slot directory. Already created; the mount points here.
+    pub dir: PathBuf,
+}
+
 pub struct RunRequest<'a, 'io> {
     pub request_id: &'a String,
     pub target: &'a targetdef::TargetDef,
@@ -1026,6 +1048,9 @@ pub struct RunRequest<'a, 'io> {
     pub stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub sandbox_dir: std::path::PathBuf,
+    /// Scratch caches to mount for this run, already locked and created by the
+    /// host. Empty for the overwhelming majority of targets.
+    pub scratch: Vec<ScratchMount>,
 }
 /// Cleanup closure a driver returns for the engine to run after `cache_locally`.
 /// The FUSE/OS sandbox layers each supply their own teardown; the engine's

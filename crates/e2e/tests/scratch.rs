@@ -243,6 +243,9 @@ async fn bumping_a_scratch_version_does_not_invalidate_consumers() -> anyhow::Re
     let first_def_hash = def_hash(&first_engine, "//app:a").await?;
     let first = ws.run("//app:a").await?;
     let first_hash = first.artifacts[0].hashout()?;
+    // Released before the second engine opens — see the note in
+    // `a_scratch_carries_state_between_runs`.
+    drop(first);
 
     ws.write_build_file("build", &decl("v2"));
     // A second engine over the same on-disk cache — what the next `heph`
@@ -386,5 +389,184 @@ target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt",
 
     assert!(!ws.run("//app:a").await?.artifacts.is_empty());
     assert!(!ws.run("//app:b").await?.artifacts.is_empty());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mounting: the point of the whole thing.
+// ---------------------------------------------------------------------------
+
+/// The feature, end to end: a target writes into its scratch, a later run with
+/// changed inputs (so it genuinely re-executes) reads back what the first wrote.
+///
+/// This is the property everything else exists to support — state carried between
+/// runs — and it is asserted through the real sandbox, symlink and env var.
+#[tokio::test]
+async fn a_scratch_carries_state_between_runs() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "MYCACHE")"#,
+    );
+    let build = |marker: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = [
+         "if [ -f \"$MYCACHE/marker\" ]; then cat \"$MYCACHE/marker\" > $OUT; else echo cold > $OUT; fi",
+         "echo {marker} > \"$MYCACHE/marker\"",
+       ])"#
+        )
+    };
+
+    ws.write_build_file("app", &build("first"));
+    let first = ws.run("//app:a").await?;
+    let first_out = common::artifact_string(&first).trim().to_string();
+    // Drop before reopening. An `EResult`'s artifacts hold a *riding read guard*
+    // on their addr's result lock, and the second engine takes the **write** lock
+    // on the same lock files to re-execute — so holding this across `reopen()`
+    // deadlocks the two engines against each other. (A second run that were a
+    // cache *hit* would only take a read lock and would not notice.) Same idiom
+    // as `engine_core.rs`.
+    drop(first);
+    assert_eq!(first_out, "cold", "the first run must see an empty scratch");
+
+    // Change the target so the second run is a genuine miss, not a cache hit —
+    // a hit would never reach the sandbox and the test would prove nothing.
+    ws.write_build_file("app", &build("second"));
+    let engine = ws.reopen()?;
+    let addr = heph::htaddr::parse_addr("//app:a")?;
+    let second = engine
+        .clone()
+        .result_addr(
+            engine.new_state(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        common::artifact_string(&second).trim(),
+        "first",
+        "the second run must see what the first wrote into the scratch"
+    );
+    Ok(())
+}
+
+/// The declaration's `env` is what makes a reference sufficient: the consumer
+/// wires nothing, and the variable holds the canonical slot path — an absolute
+/// path outside the sandbox, not the in-sandbox mount. Tools bake absolute paths
+/// into their cache entries, so every consumer must see the same string.
+#[tokio::test]
+async fn the_env_var_carries_the_canonical_path() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "MYCACHE")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["echo \"$MYCACHE\" > $OUT"])"#,
+    );
+
+    let out = common::artifact_string(&*ws.run("//app:a").await?);
+    let path = out.trim();
+    assert!(path.starts_with('/'), "must be absolute, got {path:?}");
+    assert!(
+        path.contains("/scratch/"),
+        "must point into the scratch store, got {path:?}"
+    );
+    assert!(
+        !path.contains("/sandbox/"),
+        "must be the canonical slot, not the in-sandbox mount, got {path:?}"
+    );
+    Ok(())
+}
+
+/// Two targets referencing one declaration must resolve to one directory —
+/// otherwise "sharing" is a word rather than a behaviour.
+#[tokio::test]
+async fn two_targets_sharing_a_declaration_get_one_directory() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "MYCACHE",
+       access = "shared")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "a.txt", scratch = ["//build:c"],
+       run = ["echo \"$MYCACHE\" > $OUT"])
+target(name = "b", driver = "bash", out = "b.txt", scratch = ["//build:c"],
+       run = ["echo \"$MYCACHE\" > $OUT"])"#,
+    );
+
+    let a = common::artifact_string(&*ws.run("//app:a").await?);
+    let b = common::artifact_string(&*ws.run("//app:b").await?);
+    assert_eq!(a.trim(), b.trim(), "one declaration is one slot");
+    Ok(())
+}
+
+/// Two declarations differing only in `version` are different caches — that is
+/// what makes `version` a bust handle rather than a label.
+#[tokio::test]
+async fn version_selects_a_different_slot() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "v1", driver = "scratch", path = ".cache/x", env = "C", version = "1")
+target(name = "v2", driver = "scratch", path = ".cache/x", env = "C", version = "2")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:v1"],
+       run = ["echo \"$C\" > $OUT"])
+target(name = "b", driver = "bash", out = "o.txt", scratch = ["//build:v2"],
+       run = ["echo \"$C\" > $OUT"])"#,
+    );
+
+    let a = common::artifact_string(&*ws.run("//app:a").await?);
+    let b = common::artifact_string(&*ws.run("//app:b").await?);
+    assert_ne!(
+        a.trim(),
+        b.trim(),
+        "a `version` bump must give a fresh slot"
+    );
+    Ok(())
+}
+
+/// A scratch mounting where an input already landed would let the target read
+/// cache contents where it believes it reads a declared dependency — bytes no
+/// `hashin` describes. That is the one way a scratch can cause a *wrong build*
+/// rather than a slow one, so it must fail rather than silently win.
+#[tokio::test]
+async fn a_scratch_cannot_mount_over_a_materialized_input() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = "depdir", env = "C")"#,
+    );
+    // The producer's output unpacks into the consumer's sandbox at `depdir/f.txt`,
+    // which is exactly where the scratch wants to mount.
+    ws.write_build_file(
+        "app",
+        r#"target(name = "producer", driver = "bash", out = "depdir/f.txt",
+       run = ["mkdir -p depdir && echo real > depdir/f.txt"])
+target(name = "a", driver = "bash", out = "o.txt",
+       scratch = ["//build:c"],
+       deps = {"src": ["//app:producer"]},
+       run = ["cat depdir/f.txt > $OUT"])"#,
+    );
+
+    let err = expect_err(
+        ws.run("//app:a").await,
+        "a scratch must not mount over a materialized input",
+    );
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("already there"),
+        "must explain the collision: {msg}"
+    );
+    assert!(msg.contains("//build:c"), "must name the scratch: {msg}");
     Ok(())
 }

@@ -1268,6 +1268,11 @@ async fn run_once(
         stdout: Some(&mut stdout_sink),
         stderr: Some(&mut stderr_sink),
         sandbox_dir: sandbox_dir.clone(),
+        scratch: req
+            .scratch
+            .into_iter()
+            .filter_map(convert::scratch_mount_from_pb)
+            .collect(),
     };
     let mrr = ManagedRunRequest {
         request: rr,

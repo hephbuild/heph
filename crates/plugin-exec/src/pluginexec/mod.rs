@@ -1476,6 +1476,39 @@ impl Driver {
 
         env.extend(def.runtime_env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
+        // Scratch caches: each declaration names the variable its tool reads the
+        // directory from, so a consumer needs no wiring of its own — declaring
+        // `env = "GOCACHE"` is what makes `scratch = [...]` sufficient.
+        //
+        // The value is the *canonical* slot path the host resolved, not the
+        // in-sandbox symlink: tools bake absolute paths into their cache entries,
+        // so every consumer must see one stable string or the cache restores and
+        // is inert. Set after `runtime_env` and before PATH, and never hashed —
+        // the path contains the engine home, so hashing it would make every cache
+        // key machine-specific.
+        //
+        // A collision with the target's own env is rejected rather than resolved:
+        // silently winning either way leaves one of the two settings inoperative
+        // with nothing to see.
+        for m in &rreq.scratch {
+            let dir = m.dir.to_str().ok_or_else(|| {
+                anyhow::anyhow!("scratch dir for {} is not valid UTF-8: {:?}", m.addr, m.dir)
+            })?;
+            if let Some(existing) = env.get(&m.env)
+                && existing != dir
+            {
+                anyhow::bail!(
+                    "scratch {} sets `{}`, but this target already sets it to {:?}. One would \
+                     shadow the other — rename the variable on the scratch declaration, or drop \
+                     it from this target's env",
+                    m.addr,
+                    m.env,
+                    existing
+                );
+            }
+            env.insert(m.env.clone(), dir.to_string());
+        }
+
         // The target's own tools lead, wherever it ends up running — composed by
         // `hexecrunner` rather than spliced into the string here, because under
         // a runner the rest of `PATH` is not known until the runner (or its
@@ -2163,6 +2196,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let res = tokio::time::timeout(
@@ -2487,6 +2521,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let _res = driver.run(make_req(req), &ctoken).await?;
@@ -2545,6 +2580,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let res = driver.run(make_req(req), &ctoken).await;
@@ -2616,6 +2652,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         // Use a timeout to detect the hang
@@ -2677,6 +2714,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2745,6 +2783,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2812,6 +2851,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let res = tokio::time::timeout(
@@ -2988,6 +3028,7 @@ mod tests {
             stdout: Some(&mut out_handle),
             stderr: Some(&mut err_handle),
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
@@ -3069,6 +3110,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         driver.run(make_req(req), &ctoken).await?;
@@ -3143,6 +3185,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: Some(&mut stderr),
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         tokio::time::timeout(
@@ -3299,6 +3342,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         tokio::time::timeout(
@@ -3397,6 +3441,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
@@ -4428,6 +4473,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -4474,6 +4520,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -4553,6 +4600,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -4709,6 +4757,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: sandbox.clone(),
+            scratch: vec![],
         };
 
         os.run_inner(req, &ctoken, false).await?;
@@ -4805,6 +4854,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -4879,6 +4929,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver.run(make_req(req), &ctoken).await?;
 
@@ -4965,6 +5016,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -5067,6 +5119,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -5156,6 +5209,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         driver.run(make_req(req), &ctoken).await?;
