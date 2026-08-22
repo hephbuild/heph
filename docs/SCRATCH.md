@@ -1,13 +1,14 @@
 # Design: named scratch caches (GitHub-Actions-style per-target caching)
 
-**Status:** phases 1–2 implemented and in review (PR #403, #407); phases 3–9
-designed, not built. §18 has the ordering; the notes below record what building it
+**Status:** phases 1–3 implemented and in review (PR #403, #407, #412) — a
+scratch now mounts, locks and sets its env var, so the feature works locally.
+Phases 4–9 (lineage, scopes, remote, retrofits) designed, not built. §18 has the ordering; the notes below record what building it
 changed about the design.
 
 Review-board consults (`product-vision`, `feature-quality`, `hermeticity`,
 `compatibility`) are *pending*; §16 and §21 list what each has to rule on. The
-`compatibility` consult now has a concrete trigger: mounting (phase 3) needs an
-additive `RunRequest` field and an `ABI_SEMVER` minor bump — see §5.3.
+`compatibility` consult has a landed trigger to rule on: mounting added an
+additive `RunRequest` field and took `ABI_SEMVER` to 0.6.0 — see §5.3.
 
 ### Implementation notes
 
@@ -1612,11 +1613,12 @@ document should be believed until it is an interleaved A/B on the corpus.**
    not need storage: wrong-kind addr, env collisions, mount overlaps, duplicates.
    Nothing observable happens yet beyond `heph query` — deliberately, so the
    checks land before anything can write.
-3. **Mount + lock + env + events.** The feature, locally. Needs the `RunRequest`
-   field above, the bridge to create the symlink (it owns sandbox creation and may
-   redirect the path into a FUSE mount), and the slot lock — which must ship *with*
-   `access`, since an `exclusive` that does not serialize is a silent lie. Where
-   the `golist_gocache` win becomes general.
+3. **Mount + lock + env.** ✅ *PR #412.* The symlink (created by the bridge,
+   which owns sandbox creation and may redirect into a FUSE mount), the keyed
+   cross-process slot lock — shipped *with* `access`, since an `exclusive` that
+   does not serialize is a silent lie — and the declaration's env var. Events
+   deferred to the observability phase. Where the `golist_gocache` win becomes
+   general.
 4. **The lineage model + scopes, local only** (§10.1–§10.7). Branch-aware local
    caches, `${git:branch}`, the drift guard. Reviewable without any network, and
    the piece the remote phase then reuses wholesale rather than reimplements.
@@ -1834,3 +1836,28 @@ than after.
   is `if: always()`: a cache warmed by a partially failing build is still warm, and
   the head it publishes is no less valid than one from a green run. Worth stating
   as guidance, since the intuitive choice is `if: success()` and it is wrong.
+
+---
+
+## Appendix: notes from implementing phases 1–3
+
+Things that only showed up in code, recorded so the next phase does not re-learn
+them.
+
+- **An `EResult` holds a riding read lock on its addr.** A test that keeps a run's
+  result alive across `reopen()` deadlocks the second engine's *write* lock
+  against it — and only when the second run actually re-executes, since a cache
+  hit takes a read lock and coexists happily. Cost ~30 minutes of hang before it
+  surfaced as an unrelated-looking `ENOENT` on a lock file. `engine_core.rs`
+  already had the idiom (`drop(result)` before reopening); it is worth stating.
+- **`cargo build --workspace` does not build test targets.** Adding a field to
+  `RunRequest` compiled clean and then broke 28 construction sites in `#[cfg(test)]`
+  code. `--all-targets` is the check that matters, exactly as `.claude/rust.md`
+  says for clippy.
+- **Zero outputs is a supported target shape.** A declaration is executed like any
+  other target when someone resolves it directly, so its `run` must succeed and
+  produce nothing. The first version treated being run as an engine bug, which was
+  simply wrong.
+- **Two `ScratchMount` types is one too many.** The engine's resolved form and the
+  driver-facing form are the same thing; keeping the contract type and deleting the
+  engine-local duplicate removed a conversion that could drift.
