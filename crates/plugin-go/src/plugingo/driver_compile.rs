@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hexec_runner::ExecSession;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -489,6 +490,7 @@ impl ManagedDriver for GoCompileDriver {
                 args.push(format!("./{s}"));
             }
             self.exec_go(
+                &*req.runner,
                 &go_bin,
                 run_go(args),
                 &env,
@@ -533,8 +535,16 @@ impl ManagedDriver for GoCompileDriver {
         cargs.push("-o".to_string());
         cargs.push(def.out_file.clone());
         cargs.push(format!("@{}", rsp_path.to_string_lossy()));
-        self.exec_go(&go_bin, run_go(cargs), &env, pkg_dir, ctoken, "compile")
-            .await?;
+        self.exec_go(
+            &*req.runner,
+            &go_bin,
+            run_go(cargs),
+            &env,
+            pkg_dir,
+            ctoken,
+            "compile",
+        )
+        .await?;
 
         // 6. asm step 3+4: assemble each .s, then pack into the archive.
         if has_asm {
@@ -557,8 +567,16 @@ impl ManagedDriver for GoCompileDriver {
                 ];
                 args.extend(shared.map(str::to_string));
                 args.extend(["-o".to_string(), obj, format!("./{s}")]);
-                self.exec_go(&go_bin, run_go(args), &env, pkg_dir, ctoken, "asm")
-                    .await?;
+                self.exec_go(
+                    &*req.runner,
+                    &go_bin,
+                    run_go(args),
+                    &env,
+                    pkg_dir,
+                    ctoken,
+                    "asm",
+                )
+                .await?;
             }
             let mut pargs = vec![
                 "tool".to_string(),
@@ -569,8 +587,16 @@ impl ManagedDriver for GoCompileDriver {
             for s in &def.s_files {
                 pargs.push(format!("{}.o", s.trim_end_matches(".s")));
             }
-            self.exec_go(&go_bin, run_go(pargs), &env, pkg_dir, ctoken, "pack")
-                .await?;
+            self.exec_go(
+                &*req.runner,
+                &go_bin,
+                run_go(pargs),
+                &env,
+                pkg_dir,
+                ctoken,
+                "pack",
+            )
+            .await?;
         }
 
         Ok(ManagedRunResponse { artifacts: vec![] })
@@ -701,8 +727,13 @@ impl GoCompileDriver {
         Ok(rel)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one process invocation: binary, argv, env, cwd, session, cancellation, and the step name for diagnostics"
+    )]
     async fn exec_go(
         &self,
+        runner: &dyn ExecSession,
         go_bin: &std::path::Path,
         args: Vec<OsString>,
         env: &HashMap<String, String>,
@@ -725,7 +756,8 @@ impl GoCompileDriver {
             setsid: false,
             ctty: false,
         };
-        let output = proc_exec::output(spec, ctoken)
+        let output = runner
+            .output(spec, ctoken)
             .await
             .with_context(|| format!("wait for go {step}"))?;
         if !output.status.success() {

@@ -265,10 +265,73 @@ enum Chunk {
 /// request. Forwarding them as they arrive rather than at the end is the whole
 /// point — a `docker buildx build` or a `go build` should print while it runs,
 /// not in one burst after it finishes.
+/// Check a guest's runner **ack**: its echo of the environment key it was told
+/// to run under.
+///
+/// Positive confirmation, not absence of complaint. A guest compiled before
+/// `runner_env` existed cannot object to what it ignored — prost drops unknown
+/// fields before guest code runs — so silence has to read as failure. Otherwise
+/// the guest builds in the host environment while the target's `hashin` already
+/// asserts the runner's, and that artifact goes to the shared remote cache for
+/// every other machine to pick up.
+fn verify_runner_ack(expected: &str, got: &str, driver: &str) -> anyhow::Result<()> {
+    if expected.is_empty() || got == expected {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "driver `{driver}` did not confirm it ran under the requested exec environment \
+         (expected key {expected:?}, got {got:?}). The target's cache key already asserts that \
+         environment, so the run is refused rather than producing an artifact whose key does not \
+         describe how it was built. Rebuild the plugin against a heph that understands exec \
+         runners, or set `runner = None` on this target."
+    )
+}
+
+#[cfg(test)]
+mod runner_ack_tests {
+    use super::verify_runner_ack;
+
+    /// No runner requested: every guest, old or new, echoes nothing and that is
+    /// correct. This is the path every existing plugin takes.
+    #[test]
+    fn no_runner_requested_needs_no_ack() {
+        verify_runner_ack("", "", "go").expect("no runner requested must pass");
+    }
+
+    #[test]
+    fn matching_ack_passes() {
+        verify_runner_ack("k1", "k1", "go").expect("a matching ack must pass");
+    }
+
+    /// The case this exists for: an older cdylib silently ignores the
+    /// environment and returns a result as though nothing happened.
+    #[test]
+    fn silence_from_an_older_guest_is_a_failure_not_a_pass() {
+        let err = verify_runner_ack("k1", "", "go").expect_err("silence must not pass");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("did not confirm"), "{msg}");
+        assert!(msg.contains("go"), "{msg}");
+        assert!(msg.contains("runner = None"), "must name a way out: {msg}");
+    }
+
+    /// A guest that applied a *different* environment than the one the key
+    /// asserts is the same class of wrong, and is caught by the same check.
+    #[test]
+    fn a_mismatched_ack_is_a_failure() {
+        assert!(verify_runner_ack("k1", "k2", "go").is_err());
+    }
+}
+
+/// Drain a run's response stream, returning the result and the guest's
+/// **runner ack** — its echo of the environment key it was asked to use.
+///
+/// The ack rides out of here rather than on `ManagedRunResponse` so the Rust
+/// type every in-tree managed driver constructs stays as it was; only the
+/// seam that can actually be lied to needs to carry it.
 fn drain_run(
     stream: DynItemStream,
     chunks: &tokio::sync::mpsc::UnboundedSender<Chunk>,
-) -> anyhow::Result<ManagedRunResponse> {
+) -> anyhow::Result<(ManagedRunResponse, String)> {
     loop {
         let bytes = stream.next();
         if bytes.is_empty() {
@@ -276,13 +339,17 @@ fn drain_run(
         }
         match pb::RunOutFrame::decode(&bytes[..])?.msg {
             Some(pb::run_out_frame::Msg::Response(r)) => {
-                return Ok(ManagedRunResponse {
-                    artifacts: r
-                        .artifacts
-                        .into_iter()
-                        .map(convert::output_artifact_from_pb)
-                        .collect(),
-                });
+                let ack = r.runner_key.clone();
+                return Ok((
+                    ManagedRunResponse {
+                        artifacts: r
+                            .artifacts
+                            .into_iter()
+                            .map(convert::output_artifact_from_pb)
+                            .collect(),
+                    },
+                    ack,
+                ));
             }
             Some(pb::run_out_frame::Msg::Error(e)) => anyhow::bail!("{e}"),
             // A dropped receiver means the caller stopped reading; keep draining
@@ -723,7 +790,24 @@ impl StableRemoteManagedDriver {
             inputs: req.inputs.iter().map(managed_input_to_pb).collect(),
             shell,
             driver: self.name.clone(),
+            // The environment the guest must create its processes in. Sent as
+            // bytes because env values are bytes; see `pb::EnvVar`.
+            runner_env: req
+                .runner
+                .base_env()
+                .unwrap_or_default()
+                .iter()
+                .map(|(k, v)| pb::EnvVar {
+                    key: k.as_encoded_bytes().to_vec().into(),
+                    value: v.as_encoded_bytes().to_vec().into(),
+                })
+                .collect(),
+            runner_key: req.runner.describe().key.clone(),
+            runner_addr: req.runner.describe().runner.clone(),
         };
+        // Held for the ack check below: a guest that ignored the environment
+        // must not be able to pass by staying quiet.
+        let expect_runner_key = req.runner.describe().key.clone();
         // `run` is bidi: the request stream carries the run request (RunInFrame),
         // the response stream carries the result (RunOutFrame). `shell` rides pmrr.
         let in_frame = pb::RunInFrame {
@@ -783,10 +867,20 @@ impl StableRemoteManagedDriver {
                 futures::future::Either::Right((never, _)) => match never {},
             }
         };
-        match result {
-            Ok(result) => result,
+        let (response, ack) = match result {
+            Ok(result) => result?,
             Err(_canceled) => anyhow::bail!("run drain thread dropped"),
-        }
+        };
+
+        // Positive confirmation, not absence of complaint. A guest compiled
+        // before `runner_env` existed cannot object to what it ignored — prost
+        // drops unknown fields before guest code runs — so silence has to read
+        // as failure. Otherwise the guest builds in the host environment while
+        // the target's `hashin` already asserts the runner's, and that artifact
+        // goes to the shared remote cache for every other machine to pick up.
+        verify_runner_ack(&expect_runner_key, &ack, &self.name)?;
+
+        Ok(response)
     }
 }
 

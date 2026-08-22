@@ -363,17 +363,6 @@ pub struct Provider {
 pub struct Driver {
     pub name: String,
     pub driver: Box<dyn SDKDriver>,
-    /// Whether this driver is served across the plugin ABI (a cdylib) rather
-    /// than linked into the host.
-    ///
-    /// Load-bearing, not informational: an ABI-served driver cannot yet be told
-    /// which environment to build in — the `runner_*` fields on
-    /// `pb::ManagedRunRequest` and their positive ack are Phase 2. Until then a
-    /// non-`local` runner on such a target would key the artifact as
-    /// runner-built while the plugin builds it in the host environment, and that
-    /// artifact goes to the shared remote cache. So the engine refuses the
-    /// combination outright rather than degrading (`docs/EXEC_RUNNERS.md` §8).
-    pub abi_served: bool,
 }
 
 impl Engine {
@@ -633,20 +622,9 @@ impl Engine {
     /// Registers an already-constructed driver. Shared by [`Self::register_driver`]
     /// and [`Self::register_managed_driver`].
     fn insert_driver(&mut self, driver: Box<dyn SDKDriver>) -> anyhow::Result<()> {
-        self.insert_driver_with(driver, false)
-    }
-
-    /// [`Self::insert_driver`], recording whether the driver is served across
-    /// the plugin ABI. See [`Driver::abi_served`].
-    fn insert_driver_with(
-        &mut self,
-        driver: Box<dyn SDKDriver>,
-        abi_served: bool,
-    ) -> anyhow::Result<()> {
         let driver = Arc::new(Driver {
             name: driver.config(driver::ConfigRequest {})?.name,
             driver,
-            abi_served,
         });
 
         if self.drivers_by_name.contains_key(&driver.name) {
@@ -667,20 +645,6 @@ impl Engine {
         let managed = factory(&self.plugin_init_payload());
         let driver = self.new_managed_driver(managed);
         self.insert_driver(Box::new(driver))
-    }
-
-    /// [`Self::register_managed_driver`] for a driver loaded from a cdylib.
-    ///
-    /// The only difference is that the driver is marked [`Driver::abi_served`],
-    /// which the engine uses to refuse a non-`local` runner on its targets until
-    /// Phase 2 can actually carry one across the seam.
-    pub fn register_managed_driver_abi(
-        &mut self,
-        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKManagedDriver>,
-    ) -> anyhow::Result<()> {
-        let managed = factory(&self.plugin_init_payload());
-        let driver = self.new_managed_driver(managed);
-        self.insert_driver_with(Box::new(driver), true)
     }
 
     /// Register an exec runner under `name`, matching the driver name of the

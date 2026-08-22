@@ -107,27 +107,10 @@ impl Engine {
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
         runner: Option<&Addr>,
-        consumer_driver: &crate::engine::engine::Driver,
     ) -> anyhow::Result<Arc<dyn ExecSession>> {
         let Some(runner_addr) = runner else {
             return Ok(Arc::new(hexec_runner::LocalSession::new()));
         };
-
-        // Refuse rather than degrade. The runner's hashout is already folded
-        // into this target's `hashin` — that happened at def time — so building
-        // it in the host environment now would write an artifact whose key
-        // asserts an environment its bytes do not reflect, and push it to the
-        // shared remote cache. An older cdylib could not even warn about it:
-        // prost drops fields it was not compiled with before guest code runs.
-        if consumer_driver.abi_served {
-            anyhow::bail!(
-                "driver `{}` is served across the plugin ABI and cannot yet run targets under a \
-                 runner (`{}`). Set `runner = None` on this target, or drop `defaultRunner` for \
-                 it, until the driver can be told which environment to build in.",
-                consumer_driver.name,
-                runner_addr.format(),
-            );
-        }
 
         // The runner's own result: its artifacts are the environment's
         // description, and their hashouts are its identity.

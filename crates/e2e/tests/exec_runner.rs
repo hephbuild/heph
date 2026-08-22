@@ -320,35 +320,3 @@ target(name = "b", driver = "bash", run = "echo b > $OUT", out = "o", runner = "
     );
     Ok(())
 }
-
-/// A driver served across the plugin ABI cannot yet be told which environment
-/// to build in, so the engine **refuses** the combination rather than degrading.
-///
-/// Degrading is the dangerous option, not the safe one: the runner's hashout is
-/// folded into the target's `hashin` at def time, so a plugin that quietly built
-/// in the host environment would write an artifact whose key asserts an
-/// environment its bytes do not reflect — and push it to the shared remote
-/// cache. An older cdylib could not even warn: prost drops fields it was not
-/// compiled with before guest code runs.
-#[tokio::test]
-async fn abi_served_driver_refuses_a_runner() -> anyhow::Result<()> {
-    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let ws = Workspace::with_recording_runner_abi_driver(std::sync::Arc::clone(&opens));
-    ws.write_build_file(
-        "abi",
-        r#"
-target(name = "env", driver = "bash", run = "echo E > $OUT", out = "env.json")
-target(name = "c", driver = "abidriver", run = "true", runner = "//abi:env")
-"#,
-    );
-
-    let msg = match ws.run("//abi:c").await {
-        Ok(_) => panic!("an ABI-served driver must refuse a runner"),
-        Err(e) => format!("{e:#}"),
-    };
-    assert!(
-        msg.contains("plugin ABI") && msg.contains("abidriver"),
-        "error must name the driver and why, got: {msg}"
-    );
-    Ok(())
-}

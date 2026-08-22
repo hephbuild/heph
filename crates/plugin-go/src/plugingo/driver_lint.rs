@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hexec_runner::ExecSession;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -415,6 +416,7 @@ impl ManagedDriver for GoLintDriver {
         // produced and cached regardless of findings.
         let report = self
             .exec_govet(
+                &*req.runner,
                 std::path::Path::new(&govet_bin),
                 vec![
                     OsString::from("-json"),
@@ -495,6 +497,7 @@ impl GoLintDriver {
     /// findings do NOT fail here, `-json` makes the tool exit 0 for those.
     async fn exec_govet(
         &self,
+        runner: &dyn ExecSession,
         govet_bin: &std::path::Path,
         args: Vec<OsString>,
         env: &HashMap<String, String>,
@@ -516,7 +519,8 @@ impl GoLintDriver {
             setsid: false,
             ctty: false,
         };
-        let output = proc_exec::output(spec, ctoken)
+        let output = runner
+            .output(spec, ctoken)
             .await
             .context("wait for heph-govet")?;
         if !output.status.success() {

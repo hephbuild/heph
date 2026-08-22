@@ -11,6 +11,7 @@ hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hwalk = { package = "walk", path = "../walk" }
 hproc = { package = "proc", path = "../proc" }
+hexec-runner = { package = "exec-runner", path = "../exec-runner" }
 hplugin = { package = "plugin", path = "../plugin" }
 hbuiltins = { package = "builtins", path = "../builtins" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }

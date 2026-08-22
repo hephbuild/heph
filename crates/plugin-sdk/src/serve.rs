@@ -1235,6 +1235,45 @@ impl tokio::io::AsyncWrite for FrameSink {
     }
 }
 
+/// Build the session the host asked for.
+///
+/// An empty `runner_key` means no runner was selected, and `LocalSession` — the
+/// identity transform — is what every driver behind this seam did before exec
+/// runners existed. A non-empty key means the host resolved an environment and
+/// is expecting it back in the ack.
+fn guest_session(req: &pb::ManagedRunRequest) -> Arc<dyn hexec_runner::ExecSession> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    if req.runner_key.is_empty() {
+        return Arc::new(hexec_runner::LocalSession::new());
+    }
+    Arc::new(hexec_runner::EnvSession::new(
+        req.runner_env
+            .iter()
+            .map(|kv| {
+                (
+                    std::ffi::OsString::from_vec(kv.key.to_vec()),
+                    std::ffi::OsString::from_vec(kv.value.to_vec()),
+                )
+            })
+            .collect(),
+        hexec_runner::SessionCaps {
+            pty: true,
+            max_concurrent: None,
+            // The host decided how well-pinned this is; the guest is only
+            // applying it, and must not claim more than it knows.
+            identity: hexec_runner::Identity::Asserted {
+                why: "supplied by the host for this run".to_string(),
+            },
+        },
+        hexec_runner::SessionDescription {
+            runner: req.runner_addr.clone(),
+            key: req.runner_key.clone(),
+            summary: "host-supplied environment".to_string(),
+        },
+    ))
+}
+
 async fn run_once(
     driver: Arc<dyn ManagedDriver>,
     req: pb::ManagedRunRequest,
@@ -1243,6 +1282,9 @@ async fn run_once(
 ) -> pb::RunOutFrame {
     // `shell` selects run_shell over run; it rides the request.
     let shell = req.shell;
+    // Both captured before `req` is consumed field-by-field below.
+    let runner_key = req.runner_key.clone();
+    let session = guest_session(&req);
     let target = match convert::target_def_from_pb(req.target.unwrap_or_default()) {
         Ok(t) => t,
         Err(e) => return run_out_err(err_message(&e)),
@@ -1276,18 +1318,10 @@ async fn run_once(
         sandbox_ws_dir: PathBuf::from(req.sandbox_ws_dir),
         sandbox_pkg_dir: PathBuf::from(req.sandbox_pkg_dir),
         inputs: managed_inputs,
-        // Guest-side `local`: an identity transform, matching what a cdylib
-        // driver did before the seam existed.
-        //
-        // A runner selected host-side does NOT reach a plugin driver yet — the
-        // `runner_*` fields on `pb::ManagedRunRequest` are Phase 2. Until they
-        // exist WITH the positive-ack handshake, the host refuses `runner !=
-        // local` for any ABI-served driver rather than letting it build in the
-        // host environment under a cache key that asserts the runner's. That
-        // refusal is the host's to make: an older cdylib has no field to notice
-        // and could not even log the discrepancy — prost drops unknown bytes
-        // before guest code runs.
-        runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
+        // The environment the host resolved for this target. Empty key ⇒ no
+        // runner was selected and this is `local`, the identity transform —
+        // exactly what a cdylib driver did before the seam existed.
+        runner: session,
     };
     let result = if shell {
         driver.run_shell(mrr, ct).await
@@ -1304,6 +1338,10 @@ async fn run_once(
             Ok(artifacts) => pb::RunOutFrame {
                 msg: Some(pb::run_out_frame::Msg::Response(pb::ManagedRunResponse {
                     artifacts,
+                    // The ack. Echoed only once the run has actually returned,
+                    // so it is evidence the environment was in force for the
+                    // whole run rather than a promise made up front.
+                    runner_key: runner_key.clone(),
                 })),
             },
             Err(e) => run_out_err(err_message(&e)),

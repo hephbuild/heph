@@ -108,10 +108,48 @@ message ManagedRunRequest {
   // true => run_shell
   bool shell = 9;
   string driver = 10;
+
+  // ---- Exec runner (docs/EXEC_RUNNERS.md) ----
+  // The environment this target's processes must be created in. Absent/empty
+  // means the host process itself, which is what every driver did before exec
+  // runners existed — so an older guest that never reads these behaves exactly
+  // as it always has.
+  //
+  // A guest that DOES honour them must echo `runner_key` back in
+  // `ManagedRunResponse.runner_key`. See that field: the ack is not a courtesy,
+  // it is what stops a silently-degraded run from poisoning the shared cache.
+  repeated EnvVar runner_env = 11;
+  // Identity of the environment, echoed back to prove it was applied.
+  string runner_key = 12;
+  // Diagnostics: the runner target's address.
+  string runner_addr = 13;
+}
+
+// An environment variable. `bytes`, not `string`: env values are bytes
+// (`Spec.env` is `Vec<(OsString, OsString)>`) and proto3 `string` must be valid
+// UTF-8, so a non-UTF-8 `LANG` or store path would be dropped — a silently
+// wrong environment — or fail the encode outright.
+message EnvVar {
+  bytes key = 1;
+  bytes value = 2;
 }
 
 message ManagedRunResponse {
   repeated OutputArtifactRef artifacts = 1;
+  // Echo of `ManagedRunRequest.runner_key`, proving the guest created its
+  // processes in the environment the host asked for.
+  //
+  // The host REFUSES the run when a runner was requested and this does not
+  // match. Degrading is the dangerous option: the runner's hashout is folded
+  // into the target's `hashin` before the driver ever runs, so a guest that
+  // quietly built in the host environment produces an artifact whose key
+  // asserts an environment its bytes do not reflect — and that artifact goes to
+  // the shared remote cache, where every other machine gets it.
+  //
+  // An older guest cannot warn about what it ignored: prost drops fields it was
+  // not compiled with before guest code runs. So the check has to be the host's,
+  // and it has to be on evidence of success rather than absence of complaint.
+  string runner_key = 2;
 }
 
 // ---- Bidi run streams (DriverMethod RUN over StableManagedDriver::invoke_bidi) ----

@@ -91,16 +91,6 @@ impl WorkspaceBuilder {
         self
     }
 
-    /// [`Self::with_managed_driver`], registered as though it were loaded from a
-    /// cdylib. Lets a test exercise the engine's refusal to run an ABI-served
-    /// driver under a runner without building an actual plugin.
-    pub fn with_managed_driver_abi(mut self, driver: Box<dyn SDKManagedDriver>) -> Self {
-        self.setups.push(Box::new(move |e: &mut Engine| {
-            e.register_managed_driver_abi(|_| driver)
-        }));
-        self
-    }
-
     pub fn with_driver(mut self, driver: Box<dyn SDKDriver>) -> Self {
         self.setups.push(Box::new(move |e: &mut Engine| {
             e.register_driver(|_| driver)

@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hexec_runner::ExecSession;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -74,6 +75,7 @@ fn arg_file(pkg_dir: &std::path::Path, files: &[String]) -> anyhow::Result<OsStr
 /// Run `heph-govet` with `args`, returning (exit code or None-if-signal, stdout,
 /// stderr). Never fails on a non-zero exit — the caller interprets the code.
 async fn exec_govet(
+    runner: &dyn ExecSession,
     bin: &str,
     args: Vec<OsString>,
     env: &HashMap<String, String>,
@@ -95,7 +97,8 @@ async fn exec_govet(
         setsid: false,
         ctty: false,
     };
-    let output = proc_exec::output(spec, ctoken)
+    let output = runner
+        .output(spec, ctoken)
         .await
         .context("wait for heph-govet -format")?;
     Ok((output.status.code(), output.stdout, output.stderr))
@@ -277,7 +280,8 @@ impl ManagedDriver for GoFormatDriver {
         }
         let args = vec![OsString::from("-format"), arg_file(pkg_dir, &files)?];
 
-        let (code, _stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, ctoken).await?;
+        let (code, _stdout, stderr) =
+            exec_govet(&*req.runner, &bin, args, &env, pkg_dir, ctoken).await?;
         if code != Some(0) {
             anyhow::bail!(
                 "heph-govet -format failed ({code:?}):\n{}",
@@ -379,7 +383,8 @@ impl ManagedDriver for GoFormatCheckDriver {
             arg_file(pkg_dir, &files)?,
         ];
 
-        let (code, stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, ctoken).await?;
+        let (code, stdout, stderr) =
+            exec_govet(&*req.runner, &bin, args, &env, pkg_dir, ctoken).await?;
         match code {
             Some(0) => Ok(ManagedRunResponse { artifacts: vec![] }),
             // Exit 1 = files need formatting; the tool prints them to stdout.

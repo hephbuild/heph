@@ -46,62 +46,6 @@ impl std::ops::Deref for Workspace {
     }
 }
 
-/// A do-nothing managed driver registered as ABI-served, so a test can reach
-/// the engine's refusal without building a cdylib.
-pub struct AbiDriver;
-
-#[async_trait::async_trait]
-impl heph::engine::driver_managed::ManagedDriver for AbiDriver {
-    fn config(
-        &self,
-        _: heph::engine::driver::ConfigRequest,
-    ) -> anyhow::Result<heph::engine::driver::ConfigResponse> {
-        Ok(heph::engine::driver::ConfigResponse {
-            name: "abidriver".to_string(),
-        })
-    }
-    fn schema(&self) -> heph::engine::driver::DriverSchema {
-        Default::default()
-    }
-    async fn parse(
-        &self,
-        req: heph::engine::driver::ParseRequest,
-        _: &(dyn heph::hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<heph::engine::driver::ParseResponse> {
-        use heph::engine::driver::targetdef::{CacheConfig, TargetDef};
-        Ok(heph::engine::driver::ParseResponse {
-            target_def: TargetDef {
-                addr: req.target_spec.addr.clone(),
-                labels: vec![],
-                raw_def: Arc::new(()),
-                inputs: vec![],
-                outputs: vec![],
-                support_files: vec![],
-                cache: CacheConfig::off(),
-                pty: false,
-                hash: vec![1],
-                transparent: false,
-            },
-        })
-    }
-    async fn apply_transitive(
-        &self,
-        req: heph::engine::driver::ApplyTransitiveRequest,
-        _: &(dyn heph::hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<heph::engine::driver::ApplyTransitiveResponse> {
-        Ok(heph::engine::driver::ApplyTransitiveResponse {
-            target_def: req.target_def,
-        })
-    }
-    async fn run<'a, 'io>(
-        &self,
-        _: heph::engine::driver_managed::ManagedRunRequest<'a, 'io>,
-        _: &(dyn heph::hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<heph::engine::driver_managed::ManagedRunResponse> {
-        Ok(heph::engine::driver_managed::ManagedRunResponse { artifacts: vec![] })
-    }
-}
-
 /// A test [`ExecRunner`] that counts its opens and hands back an environment.
 ///
 /// The open counter is the point: the whole premise of a session is "acquire
@@ -193,33 +137,6 @@ impl Workspace {
 
     pub fn new() -> Self {
         Self::with_parallelism(None)
-    }
-
-    /// Like [`Workspace::with_recording_runner`], plus an `abidriver` managed
-    /// driver registered as though it came from a cdylib.
-    pub fn with_recording_runner_abi_driver(opens: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        Self {
-            inner: WorkspaceBuilder::new()
-                .expect("workspace tempdir")
-                .with_provider(|init| {
-                    Box::new(pluginbuildfile::Provider::new(
-                        init.root.to_path_buf(),
-                        init.runtime.clone(),
-                    ))
-                })
-                .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
-                .with_managed_driver_abi(Box::new(AbiDriver))
-                .with_exec_runner(
-                    "bash",
-                    Arc::new(RecordingExecRunner {
-                        opens,
-                        var: ("V".to_string(), "1".to_string()),
-                    }),
-                )
-                .build()
-                .expect("build workspace"),
-            reopen_with: None,
-        }
     }
 
     /// A workspace with `defaultRunner:` set — the exec environment every

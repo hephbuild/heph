@@ -86,6 +86,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hexec_runner::ExecSession;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
 use hplugin::driver::targetdef::{Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -1171,9 +1172,16 @@ impl ManagedDriver for Driver {
 
         let addr = req.request.target.addr.format();
         let mut io = ToolIo::from_request(&mut req.request);
-        run_tool(argv, &context_dir, "docker buildx build", &mut io, ctoken)
-            .await
-            .map_err(|e| build_error_hint(e, &def, &addr))?;
+        run_tool(
+            &*req.runner,
+            argv,
+            &context_dir,
+            "docker buildx build",
+            &mut io,
+            ctoken,
+        )
+        .await
+        .map_err(|e| build_error_hint(e, &def, &addr))?;
 
         let metadata = tokio::fs::read_to_string(&metadata_file)
             .await
@@ -1407,6 +1415,7 @@ async fn tee<'w>(
 ///
 /// Returns captured stdout.
 pub(crate) async fn run_tool(
+    runner: &dyn ExecSession,
     argv: Vec<String>,
     cwd: &Path,
     what: &'static str,
@@ -1432,7 +1441,9 @@ pub(crate) async fn run_tool(
         ctty: false,
     };
 
-    let mut handle = proc_exec::spawn(spec).map_err(|e| missing_tool_error(e, bin, what))?;
+    let mut handle = runner
+        .spawn(spec)
+        .map_err(|e| missing_tool_error(e, bin, what))?;
     let output_reader = handle.take_output();
 
     let out_tail = std::sync::Mutex::new(TailBuf::default());
@@ -1491,8 +1502,12 @@ pub(crate) async fn run_tool(
 /// something the reader can act on. `docker` is a host capability
 /// heph does not install, so "not found" is a routine first-run state, not an
 /// internal error.
-fn missing_tool_error(e: std::io::Error, bin: &str, what: &str) -> anyhow::Error {
-    if e.kind() == std::io::ErrorKind::NotFound {
+fn missing_tool_error(e: hexec_runner::SpawnError, bin: &str, what: &str) -> anyhow::Error {
+    let not_found = matches!(
+        &e,
+        hexec_runner::SpawnError::Io(io) if io.kind() == std::io::ErrorKind::NotFound,
+    ) || matches!(&e, hexec_runner::SpawnError::ProgramNotFound { .. });
+    if not_found {
         let hint = match Path::new(bin).file_name().and_then(|n| n.to_str()) {
             Some("docker") => " — install Docker (the `docker_build` driver needs `docker buildx`)",
             _ => "",

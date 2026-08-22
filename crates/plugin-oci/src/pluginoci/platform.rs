@@ -285,6 +285,7 @@ impl ManagedDriver for Driver {
 
         let mut io = super::docker_build::ToolIo::from_request(&mut req.request);
         let stdout = super::docker_build::run_tool(
+            &*req.runner,
             argv,
             &cwd,
             "docker buildx inspect",

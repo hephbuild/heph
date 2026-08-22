@@ -4140,6 +4140,7 @@ dependencies = [
  "core",
  "driver-support",
  "enclose",
+ "exec-runner",
  "flate2",
  "futures",
  "glob",

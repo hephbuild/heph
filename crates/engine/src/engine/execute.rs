@@ -43,9 +43,7 @@ impl Engine {
         // nothing and keeps the execute path from growing another parameter.
         // The session itself is pooled and opened at most once per environment.
         let runner_addr = self.resolve_runner(addr, spec);
-        let session = self
-            .exec_session_for(&rs, runner_addr.as_ref(), &driver)
-            .await?;
+        let session = self.exec_session_for(&rs, runner_addr.as_ref()).await?;
 
         hcore::hmemoizer::set_phase("execute:inputs_result_exec");
         let deps_result = self
