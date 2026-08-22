@@ -649,6 +649,15 @@ impl Engine {
 
     /// Register an exec runner under `name`, matching the driver name of the
     /// runner targets it serves.
+    /// Tear down every open exec session.
+    ///
+    /// Call this on any path that ends the process. It is idempotent, and it
+    /// cannot be left to `Drop`: heph's hard-abort path exits without running
+    /// destructors, which is exactly when a leaked container or shell matters.
+    pub fn shutdown_exec_sessions(&self) {
+        self.exec_sessions.teardown_all();
+    }
+
     /// The workspace-level `defaultRunner:`, if set. Read by diagnostics to say
     /// *how* a target's environment was chosen, not only which it was.
     pub fn default_runner(&self) -> Option<&hmodel::htaddr::Addr> {

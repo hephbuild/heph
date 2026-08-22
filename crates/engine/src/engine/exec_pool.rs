@@ -25,22 +25,26 @@ pub struct ExecSessionPool {
     entries: Mutex<HashMap<String, SessionCell>>,
 }
 
-impl Drop for ExecSessionPool {
-    /// Tear every open session down on the way out.
+impl ExecSessionPool {
+    /// Tear every open session down, and forget them.
     ///
-    /// Synchronous by necessity and by design: `Drop` cannot await, and a
-    /// teardown that only ran on the orderly path would leak exactly when it
-    /// matters — a `Wrap` session's `docker run -d` container, or a devenv
-    /// shell, surviving every Ctrl-C. See `hexec_runner::TeardownJob`.
+    /// **Idempotent**, and must be called explicitly rather than left to
+    /// `Drop`. Two reasons, both learned the hard way:
     ///
-    /// `try_lock` rather than `lock`: nothing else can hold this at drop time
-    /// (the pool is being destroyed, so no `Arc` to it remains), and blocking a
-    /// destructor on a lock that will never be released would hang exit instead
-    /// of cleaning up.
-    fn drop(&mut self) {
-        let Ok(mut entries) = self.entries.try_lock() else {
-            tracing::warn!("exec session pool busy at shutdown; sessions not torn down");
-            return;
+    /// 1. `Drop` runs only if the last `Arc<Engine>` is actually released. Any
+    ///    retained handle — a spawned task, a diagnostic, a test holding one —
+    ///    silently disables teardown, and silence is the failure mode here.
+    /// 2. heph's second-Ctrl-C path calls `std::process::exit`, which **runs no
+    ///    destructors at all**. That is precisely the moment a leaked `docker
+    ///    run -d` container or devenv shell matters most.
+    ///
+    /// `Drop` still calls this, as a backstop for the ordinary path.
+    pub fn teardown_all(&self) {
+        let mut entries = match self.entries.lock() {
+            Ok(e) => e,
+            // A panic while the map was locked must not stop cleanup: the data
+            // is a plain `HashMap` and is still structurally sound.
+            Err(poisoned) => poisoned.into_inner(),
         };
         for (key, cell) in entries.drain() {
             let Some(session) = cell.get() else { continue };
@@ -54,6 +58,12 @@ impl Drop for ExecSessionPool {
                 tracing::warn!(key = %key, error = %format!("{e:#}"), "exec session teardown failed");
             }
         }
+    }
+}
+
+impl Drop for ExecSessionPool {
+    fn drop(&mut self) {
+        self.teardown_all();
     }
 }
 

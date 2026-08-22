@@ -370,40 +370,55 @@ target(
     Ok(())
 }
 
-/// A session's teardown runs when the pool goes away.
+/// A session's teardown runs on shutdown, and exactly once.
 ///
-/// Without this, a `Wrap` session's `docker run -d` container — or a devenv
-/// shell — survives every build, and survives Ctrl-C in particular, which is
-/// the case it matters in. `Drop` is where it has to happen: an orderly-only
-/// teardown leaks exactly when things are not orderly.
+/// Without it, a `Wrap` session's `docker run -d` container — or a devenv shell
+/// — survives every build, and survives Ctrl-C in particular, which is the case
+/// it matters in.
+///
+/// Exercised through the **explicit** shutdown rather than by dropping the
+/// engine, because that is the path production takes and the only one that is
+/// guaranteed to run: `Drop` fires only if the last `Arc<Engine>` is released,
+/// and heph's hard-abort path calls `std::process::exit`, which runs no
+/// destructors at all. An earlier version of this test relied on drop; it
+/// passed on darwin and failed on linux/arm64, where something still held the
+/// `Arc` — silence being exactly the failure mode teardown must not have.
 #[tokio::test]
-async fn a_sessions_teardown_runs_when_the_pool_is_dropped() -> anyhow::Result<()> {
+async fn a_sessions_teardown_runs_on_shutdown_exactly_once() -> anyhow::Result<()> {
     let torn = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    {
-        let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ws = Workspace::with_teardown_runner(
-            std::sync::Arc::clone(&opens),
-            std::sync::Arc::clone(&torn),
-        );
-        ws.write_build_file(
-            "td",
-            r#"
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ws = Workspace::with_teardown_runner(
+        std::sync::Arc::clone(&opens),
+        std::sync::Arc::clone(&torn),
+    );
+    ws.write_build_file(
+        "td",
+        r#"
 target(name = "env", driver = "bash", run = "echo E > $OUT", out = "env.json")
 target(name = "a", driver = "bash", run = "echo a > $OUT", out = "o", runner = "//td:env")
 "#,
-        );
-        ws.run("//td:a").await?;
-        assert_eq!(
-            torn.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "teardown must not run while the session is still in use",
-        );
-    }
+    );
+    ws.run("//td:a").await?;
+    assert_eq!(
+        torn.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "teardown must not run while the session is still in use",
+    );
 
+    ws.engine.shutdown_exec_sessions();
     assert_eq!(
         torn.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "the session must be torn down exactly once when the pool goes away",
+        "the session must be torn down on shutdown",
+    );
+
+    // Idempotent: a `Drop` backstop after an explicit shutdown must not run a
+    // container's `docker rm` — or a shell's kill — a second time.
+    ws.engine.shutdown_exec_sessions();
+    assert_eq!(
+        torn.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "teardown must not run twice",
     );
     Ok(())
 }

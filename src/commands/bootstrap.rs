@@ -252,7 +252,7 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
             return;
         }
         tracing::error!("second ctrl-c, aborting");
-        hard_abort(|code| std::process::exit(code));
+        hard_abort(engine.upgrade().as_deref(), |code| std::process::exit(code));
     });
 }
 
@@ -267,8 +267,15 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
 /// registered a restore closure, so a non-interactive run's second Ctrl-C
 /// still exits with no extra work and no stray writes to a redirected
 /// stdout/stderr.
-fn hard_abort(exit: impl FnOnce(i32)) {
+fn hard_abort(engine: Option<&engine::Engine>, exit: impl FnOnce(i32)) {
     hcore::shutdown::restore_terminal();
+    // For the same reason the terminal restore is here: `exit` runs no
+    // destructors, so anything that must happen before the process disappears
+    // has to happen on this line rather than in a `Drop`. A live `docker run
+    // -d` container or a `devenv shell` would otherwise outlive heph.
+    if let Some(e) = engine {
+        e.shutdown_exec_sessions();
+    }
     exit(130);
 }
 
@@ -536,7 +543,7 @@ fs:
         });
 
         let mut exit_code = None;
-        hard_abort(|code| exit_code = Some(code));
+        hard_abort(None, |code| exit_code = Some(code));
 
         assert!(
             restored.load(std::sync::atomic::Ordering::SeqCst),
@@ -557,7 +564,7 @@ fs:
         hcore::shutdown::clear_terminal_restore();
 
         let mut exit_code = None;
-        hard_abort(|code| exit_code = Some(code));
+        hard_abort(None, |code| exit_code = Some(code));
 
         assert_eq!(exit_code, Some(130));
     }
