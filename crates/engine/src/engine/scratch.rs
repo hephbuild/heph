@@ -1,0 +1,259 @@
+//! Host-side handling of scratch references.
+//!
+//! A scratch cache is declared as a target (`driver = "scratch"`) and referenced
+//! by addr from the targets that use it. The reference arrives as an [`Input`]
+//! with `hashed: false, runtime: false`, marked by
+//! [`SCRATCH_ANNOTATION`](hdriver_support::scratch::SCRATCH_ANNOTATION) — see that
+//! module for why the settings travel on the declaration's spec rather than on
+//! the edge.
+//!
+//! This module owns the part the engine must decide: **which declaration a
+//! reference resolves to, and whether the set of them a target holds is
+//! coherent**. Everything that gives a resolved reference an effect — the slot
+//! store, mounting, locking, the lineage — builds on top of this.
+//!
+//! # Why validation is here and not in the driver
+//!
+//! A driver sees its own target's config and nothing else. The properties that
+//! matter across a *set* of references — two of them wanting the same environment
+//! variable, two of them mounting over each other — are only visible once each
+//! addr has been resolved to a declaration, which is a host operation. Doing it
+//! here also means every driver gets the checks, not just pluginexec.
+
+use crate::engine::Engine;
+use crate::engine::driver::targetdef::Input;
+use crate::engine::request_state::RequestState;
+use anyhow::Context as _;
+use hbuiltins::pluginscratch::{DRIVER_NAME, ScratchDef, parse_declaration};
+use hmodel::htaddr::Addr;
+use std::sync::Arc;
+
+/// A reference resolved against its declaration: what the consuming target asked
+/// for, plus everything the declaration says about the cache.
+#[derive(Debug, Clone)]
+pub struct ResolvedScratch {
+    /// The declaring target.
+    pub addr: Addr,
+    /// The declaration's settings.
+    pub def: ScratchDef,
+}
+
+/// True when this input is a scratch reference rather than an ordinary dep.
+pub(crate) fn is_scratch_input(input: &Input) -> bool {
+    hdriver_support::scratch::is_scratch(&input.annotations)
+}
+
+impl Engine {
+    /// Resolve every scratch reference on a def, and reject an incoherent set.
+    ///
+    /// Returns them in the order the target declared them, which is the order the
+    /// locks are *not* taken in — lock ordering is by addr, deliberately, so two
+    /// targets referencing the same pair in different orders cannot deadlock.
+    ///
+    /// Cheap on the overwhelmingly common path: a target with no scratch
+    /// references returns immediately without resolving anything, and one with
+    /// references pays a `get_spec` each — memoized per request, and never a
+    /// `get_def`, because a declaration's config is all that is needed.
+    pub(crate) async fn resolve_scratch(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        consumer: &Addr,
+        inputs: &[Input],
+    ) -> anyhow::Result<Vec<ResolvedScratch>> {
+        let refs: Vec<&Input> = inputs.iter().filter(|i| is_scratch_input(i)).collect();
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut resolved = Vec::with_capacity(refs.len());
+        for input in refs {
+            let addr = input.r#ref.r#ref.clone();
+            let spec = Arc::clone(self)
+                .get_spec(rs.clone(), &addr)
+                .await
+                .with_context(|| {
+                    format!("{consumer} references scratch {addr}, which does not resolve")
+                })?;
+
+            // A reference to the wrong kind of target is a BUILD-file mistake
+            // that would otherwise surface much later as a mount that does
+            // nothing. Name both ends: the author is looking at the consumer, and
+            // the problem is the thing it named.
+            if spec.driver != DRIVER_NAME {
+                anyhow::bail!(
+                    "{consumer} lists {addr} under `scratch`, but {addr} is a `{}` target — \
+                     `scratch` takes addresses of `{DRIVER_NAME}` targets, which declare a cache \
+                     directory. Did you mean to put it in `deps`?",
+                    spec.driver
+                );
+            }
+
+            let def = parse_declaration(&spec)
+                .with_context(|| format!("{consumer} references scratch {addr}"))?;
+            resolved.push(ResolvedScratch { addr, def });
+        }
+
+        check_env_collisions(consumer, &resolved)?;
+        check_mount_overlaps(consumer, &resolved)?;
+        Ok(resolved)
+    }
+}
+
+/// Reject two references that would claim the same environment variable.
+///
+/// The default name is derived from the target *name* alone (so packages do not
+/// disambiguate it) through a deliberately lossy sanitizer, which makes
+/// `//a:go-cache` and `//b:go.cache` collide — and an explicit `env` on two
+/// declarations collides outright. Either way one of two real caches becomes
+/// unreachable, silently, which is exactly the failure worth spending an error
+/// on. The fix is on a *declaration*, not here, because the reference configures
+/// nothing.
+fn check_env_collisions(consumer: &Addr, resolved: &[ResolvedScratch]) -> anyhow::Result<()> {
+    for (i, a) in resolved.iter().enumerate() {
+        for b in resolved.iter().skip(i + 1) {
+            if a.def.env == b.def.env {
+                anyhow::bail!(
+                    "{consumer} references two scratches that both set `{}`: {} and {}. One \
+                     would shadow the other, so neither is safe to mount. Set an explicit `env` \
+                     on one of those declarations.",
+                    a.def.env,
+                    a.addr,
+                    b.addr
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject two references whose mount points overlap.
+///
+/// Mounting one scratch inside another means the outer one's directory contains a
+/// symlink to the inner, so whatever writes the outer cache also writes into the
+/// inner — two caches, one set of bytes, with lifetimes and eviction policies that
+/// disagree. Equal paths are the degenerate case of the same thing.
+fn check_mount_overlaps(consumer: &Addr, resolved: &[ResolvedScratch]) -> anyhow::Result<()> {
+    for (i, a) in resolved.iter().enumerate() {
+        for b in resolved.iter().skip(i + 1) {
+            if paths_overlap(&a.def.path, &b.def.path) {
+                anyhow::bail!(
+                    "{consumer} references two scratches whose mount points overlap: {} at {:?} \
+                     and {} at {:?}. One cache would be written through the other; give them \
+                     disjoint paths.",
+                    a.addr,
+                    a.def.path,
+                    b.addr,
+                    b.def.path
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True when two mount paths name the same directory, or one contains the other.
+///
+/// Compared component-wise rather than by string prefix, so `.cache/go` and
+/// `.cache/golang` are correctly *not* an overlap — a raw `starts_with` would
+/// call them one, and the resulting error would be nonsense the author cannot act
+/// on. Trailing slashes and `.` segments are normalized away first so two
+/// spellings of one path still collide.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let comps = |p: &str| -> Vec<String> {
+        std::path::Path::new(p)
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                std::path::Component::ParentDir => Some("..".to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let (a, b) = (comps(a), comps(b));
+    a.iter().zip(b.iter()).all(|(x, y)| x == y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hmodel::htpkg::PkgBuf;
+
+    fn addr(name: &str) -> Addr {
+        Addr::new(PkgBuf::from("build"), name.to_string(), Default::default())
+    }
+
+    fn res(name: &str, env: &str, path: &str) -> ResolvedScratch {
+        ResolvedScratch {
+            addr: addr(name),
+            def: ScratchDef {
+                path: path.to_string(),
+                env: env.to_string(),
+                access: hbuiltins::pluginscratch::Access::Exclusive,
+                platform: hbuiltins::pluginscratch::Platform::OsArch,
+                version: String::new(),
+                remote: false,
+                max_size: None,
+            },
+        }
+    }
+
+    #[test]
+    fn distinct_envs_and_paths_are_fine() {
+        let r = [res("a", "A", "ca"), res("b", "B", "cb")];
+        check_env_collisions(&addr("c"), &r).expect("no env collision");
+        check_mount_overlaps(&addr("c"), &r).expect("no overlap");
+    }
+
+    #[test]
+    fn two_scratches_claiming_one_variable_name_both_declarations() {
+        let r = [res("a", "GOCACHE", "ca"), res("b", "GOCACHE", "cb")];
+        let err = check_env_collisions(&addr("c"), &r).expect_err("collision must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("GOCACHE"), "{msg}");
+        assert!(
+            msg.contains("//build:a") && msg.contains("//build:b"),
+            "{msg}"
+        );
+        // The fix is on a declaration; say so, because the author is looking at
+        // the consumer and there is nothing to change there.
+        assert!(msg.contains("declarations"), "{msg}");
+    }
+
+    #[test]
+    fn a_mount_nested_inside_another_is_rejected() {
+        let r = [res("a", "A", ".cache"), res("b", "B", ".cache/go")];
+        let err = check_mount_overlaps(&addr("c"), &r).expect_err("nesting must fail");
+        assert!(format!("{err:#}").contains("overlap"));
+    }
+
+    #[test]
+    fn identical_mounts_are_rejected_however_they_are_spelled() {
+        for (x, y) in [("c", "c"), ("c", "./c"), ("c/", "c"), ("a/b", "a/./b")] {
+            let r = [res("a", "A", x), res("b", "B", y)];
+            check_mount_overlaps(&addr("c"), &r)
+                .expect_err(&format!("{x:?} vs {y:?} must collide"));
+        }
+    }
+
+    /// A string `starts_with` would call these an overlap and emit an error the
+    /// author cannot act on, because there is nothing wrong.
+    #[test]
+    fn a_shared_name_prefix_is_not_an_overlap() {
+        for (x, y) in [
+            (".cache/go", ".cache/golang"),
+            ("build", "buildkit"),
+            ("a/bc", "a/bcd"),
+        ] {
+            let r = [res("a", "A", x), res("b", "B", y)];
+            check_mount_overlaps(&addr("c"), &r)
+                .unwrap_or_else(|e| panic!("{x:?} vs {y:?} must not collide: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn sibling_paths_do_not_overlap() {
+        assert!(!paths_overlap("a/b", "a/c"));
+        assert!(paths_overlap("a", "a/b"));
+        assert!(paths_overlap("a/b", "a"));
+    }
+}

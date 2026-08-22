@@ -18,6 +18,7 @@
 mod common;
 
 use common::Workspace;
+use heph::engine::{OutputMatcher, ResultOptions};
 
 /// `EResult` has no `Debug`, so `expect_err` will not compile. Unwrap the error
 /// side explicitly instead.
@@ -158,5 +159,201 @@ async fn an_unknown_access_names_the_valid_options() -> anyhow::Result<()> {
     );
     let msg = format!("{err:#}");
     assert!(msg.contains("exclusive") && msg.contains("shared"), "{msg}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Referencing a scratch from a consuming target.
+// ---------------------------------------------------------------------------
+
+/// The central property (`docs/SCRATCH.md` §6.3): **nothing about a scratch
+/// reaches a consumer's `hashin`**. Not the reference, and not the declaration.
+///
+/// The tempting design is the opposite — fold the declaration in, so bumping
+/// `version` rebuilds everything using the cache. But a target's outputs are
+/// required to be identical whether its scratch is warm, cold, or absent, so a
+/// fresh slot changes nothing about them and the rebuild is pure waste. The
+/// `version` bump is the case that is easy to get wrong, so it is asserted
+/// separately below.
+#[tokio::test]
+async fn referencing_a_scratch_does_not_change_the_consumer_hash() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "bare", driver = "bash", run = "echo hi > $OUT", out = "o.txt")
+target(name = "with", driver = "bash", run = "echo hi > $OUT", out = "o.txt",
+       scratch = ["//build:c"])"#,
+    );
+
+    let bare = ws.run("//app:bare").await?;
+    let with = ws.run("//app:with").await?;
+    assert_eq!(
+        bare.artifacts[0].hashout()?,
+        with.artifacts[0].hashout()?,
+        "a scratch reference must not change what a target produces"
+    );
+    Ok(())
+}
+
+/// Bumping a scratch's `version` yields a fresh, empty slot and must leave every
+/// consumer's cached result a hit — which is exactly what you want when the reason
+/// for bumping it is "the old cache had gone bad".
+#[tokio::test]
+async fn bumping_a_scratch_version_does_not_invalidate_consumers() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let consumer = r#"target(name = "a", driver = "bash", run = "echo hi > $OUT", out = "o.txt",
+       scratch = ["//build:c"])"#;
+    ws.write_build_file("app", consumer);
+
+    let decl = |v: &str| {
+        format!(r#"target(name = "c", driver = "scratch", path = ".cache/x", version = "{v}")"#)
+    };
+
+    ws.write_build_file("build", &decl("v1"));
+    let first = ws.run("//app:a").await?;
+    let first_hash = first.artifacts[0].hashout()?;
+
+    ws.write_build_file("build", &decl("v2"));
+    // A second engine over the same on-disk cache — what the next `heph`
+    // invocation sees. Needed because a spec is memoized per engine, so rewriting
+    // the BUILD file and re-running through the same one would replay the old
+    // declaration and prove nothing.
+    let engine = ws.reopen()?;
+    let addr = heph::htaddr::parse_addr("//app:a")?;
+    let second = engine
+        .clone()
+        .result_addr(
+            engine.new_state(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        first_hash,
+        second.artifacts[0].hashout()?,
+        "a `version` bump must not change a consumer's result"
+    );
+    Ok(())
+}
+
+/// Pointing `scratch` at something that is not a scratch target is a BUILD-file
+/// mistake that would otherwise show up much later as a mount doing nothing. Both
+/// ends belong in the message: the author is reading the consumer, and the problem
+/// is the thing it named.
+#[tokio::test]
+async fn referencing_a_non_scratch_target_names_both_ends() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"target(name = "dep", driver = "bash", run = "echo x > $OUT", out = "o.txt")
+target(name = "a", driver = "bash", run = "echo hi > $OUT", out = "o.txt",
+       scratch = ["//app:dep"])"#,
+    );
+
+    let err = expect_err(
+        ws.run("//app:a").await,
+        "a non-scratch ref must not resolve",
+    );
+    let msg = format!("{err:#}");
+    assert!(msg.contains("//app:a"), "must name the consumer: {msg}");
+    assert!(msg.contains("//app:dep"), "must name the referent: {msg}");
+    assert!(msg.contains("deps"), "must suggest the likely fix: {msg}");
+    Ok(())
+}
+
+/// Two caches claiming one variable means one silently shadows the other, so
+/// neither is safe to mount.
+#[tokio::test]
+async fn two_scratches_claiming_one_env_var_is_an_error() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "a", driver = "scratch", path = "ca", env = "GOCACHE")
+target(name = "b", driver = "scratch", path = "cb", env = "GOCACHE")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "x", driver = "bash", run = "echo hi > $OUT", out = "o.txt",
+       scratch = ["//build:a", "//build:b"])"#,
+    );
+
+    let err = expect_err(ws.run("//app:x").await, "an env collision must not resolve");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("GOCACHE"), "{msg}");
+    assert!(
+        msg.contains("//build:a") && msg.contains("//build:b"),
+        "{msg}"
+    );
+    Ok(())
+}
+
+/// One cache mounted inside another means whatever writes the outer also writes
+/// the inner — two caches over one set of bytes, with policies that disagree.
+#[tokio::test]
+async fn overlapping_mounts_are_an_error() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "outer", driver = "scratch", path = ".cache")
+target(name = "inner", driver = "scratch", path = ".cache/go")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "x", driver = "bash", run = "echo hi > $OUT", out = "o.txt",
+       scratch = ["//build:outer", "//build:inner"])"#,
+    );
+
+    let err = expect_err(
+        ws.run("//app:x").await,
+        "overlapping mounts must not resolve",
+    );
+    assert!(format!("{err:#}").contains("overlap"));
+    Ok(())
+}
+
+/// Referencing the same scratch twice mounts one directory twice and sets one
+/// variable twice. Quietly collapsing it would hide a BUILD-file mistake.
+#[tokio::test]
+async fn referencing_one_scratch_twice_is_an_error() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = "cache")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "x", driver = "bash", run = "echo hi > $OUT", out = "o.txt",
+       scratch = ["//build:c", "//build:c"])"#,
+    );
+
+    let err = expect_err(ws.run("//app:x").await, "a duplicate ref must not resolve");
+    assert!(format!("{err:#}").contains("twice"));
+    Ok(())
+}
+
+/// Many targets sharing one declaration is the whole point, and it must resolve
+/// without any of them configuring anything.
+#[tokio::test]
+async fn many_targets_can_share_one_declaration() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", access = "shared")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt",
+       scratch = ["//build:c"])
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt",
+       scratch = ["//build:c"])"#,
+    );
+
+    assert!(!ws.run("//app:a").await?.artifacts.is_empty());
+    assert!(!ws.run("//app:b").await?.artifacts.is_empty());
     Ok(())
 }

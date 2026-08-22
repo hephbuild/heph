@@ -240,6 +240,19 @@ fn validate_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse and validate a scratch declaration straight from a target spec.
+///
+/// The engine calls this when a consumer references a scratch: it needs the
+/// declaration's `path`, `env` and `access` to mount and lock the directory, and
+/// a `raw_def` is opaque to the host by contract. Reading the spec config — which
+/// *is* host-visible — through the same function the driver uses keeps one
+/// implementation of the parsing and validation rules, so the host and the driver
+/// can never disagree about what a declaration means.
+pub fn parse_declaration(spec: &hplugin::provider::TargetSpec) -> anyhow::Result<ScratchDef> {
+    let parsed = ScratchSpec::from(&spec.config).context("parse scratch config")?;
+    ScratchDef::from_spec(parsed, &spec.addr.name)
+}
+
 impl ScratchDef {
     /// Parse and validate a declaration from its spec config.
     fn from_spec(spec: ScratchSpec, target_name: &str) -> anyhow::Result<Self> {
@@ -294,8 +307,7 @@ impl hplugin::driver::Driver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let spec = ScratchSpec::from(&req.target_spec.config).context("parse scratch config")?;
-        let def = ScratchDef::from_spec(spec, &req.target_spec.addr.name)
+        let def = parse_declaration(&req.target_spec)
             .with_context(|| format!("scratch {}", req.target_spec.addr))?;
 
         // The def hash covers the declaration so that `heph inspect` and the
