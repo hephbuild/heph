@@ -3308,6 +3308,142 @@ mod tests {
         Ok(())
     }
 
+    /// Golden freeze of the child process's environment.
+    ///
+    /// The exec-runner design (`docs/EXEC_RUNNERS.md` §4.4) inserts a runner's
+    /// `base_env` beneath the driver's `PATH` and skips the driver's `path`
+    /// default when a runner supplies one. Everything else about this sequence
+    /// must stay byte-identical — and an earlier draft of that design stated a
+    /// precedence order that was the *inverse* of what this code does in two
+    /// places, which would have silently changed what existing targets see
+    /// while `hashin` stayed put (`runtime_*` values are unhashed).
+    ///
+    /// So this freezes the parts a layer table cannot express:
+    ///
+    /// - `pass_env` / `runtime_pass_env` / `runtime_env` are applied AFTER the
+    ///   heph-computed vars, so they override `WORKSPACE_ROOT` / `OUT_*`.
+    /// - `env` is applied BEFORE them, so `OUT_*` APPENDS to an `env`-supplied
+    ///   value rather than replacing it (`entry().or_default()`, not `insert`).
+    /// - `runtime_env` beats `pass_env` for the same key.
+    /// - Nothing ambient leaks in: the spawn is `env_clear`ed.
+    ///
+    /// `env_clear` is what makes this assertable at all — the child's
+    /// environment is exactly what the driver put there, so the only entries to
+    /// filter are the four bash sets for itself.
+    #[tokio::test]
+    async fn env_composition_golden() -> anyhow::Result<()> {
+        unsafe {
+            std::env::set_var("heph_TEST_GOLDEN_RUNTIME_PASS", "from_runtime_pass_env");
+        }
+
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let out_path = |p: &str| Path {
+            content: Content::FilePath(p.to_string()),
+            codegen_tree: CodegenMode::None,
+            collect: true,
+        };
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec!["env".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+                // `OUT` collides with the heph-computed output var on purpose:
+                // it is the append-merge case.
+                env: BTreeMap::from([
+                    ("OUT".to_string(), "from_env".to_string()),
+                    ("PLAIN".to_string(), "from_env".to_string()),
+                    ("OVERRIDDEN".to_string(), "from_env".to_string()),
+                ]),
+                // Collides with a heph-computed var (`WORKSPACE_ROOT`) and with
+                // `env` (`OVERRIDDEN`) on purpose.
+                pass_env: BTreeMap::from([
+                    ("WORKSPACE_ROOT".to_string(), "from_pass_env".to_string()),
+                    ("OVERRIDDEN".to_string(), "from_pass_env".to_string()),
+                ]),
+                runtime_pass_env: vec!["heph_TEST_GOLDEN_RUNTIME_PASS".to_string()],
+                // Beats `pass_env` for the same key.
+                runtime_env: HashMap::from([(
+                    "OVERRIDDEN".to_string(),
+                    "from_runtime_env".to_string(),
+                )]),
+            }),
+            inputs: vec![],
+            outputs: vec![
+                Output {
+                    group: String::new(),
+                    paths: vec![out_path("default.txt")],
+                },
+                Output {
+                    group: "named".to_string(),
+                    paths: vec![out_path("named.txt")],
+                },
+            ],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let mut stdout = Vec::new();
+        let request_id = "env-golden".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: Some(&mut stdout),
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+        driver.run(make_req(req), &ctoken).await?;
+
+        let raw = String::from_utf8(stdout)?;
+        let sandbox = tmp.path().to_string_lossy().into_owned();
+
+        // Bash sets these for itself after `execve`; they are not part of what
+        // the driver composed and are not what this test is freezing.
+        const BASH_OWN: &[&str] = &["PWD=", "SHLVL=", "_=", "OLDPWD="];
+
+        let mut got: Vec<String> = raw
+            .lines()
+            .filter(|l| l.contains('=') && !BASH_OWN.iter().any(|b| l.starts_with(b)))
+            .map(|l| l.replace(&sandbox, "<SANDBOX>"))
+            .collect();
+        got.sort();
+
+        let want = vec![
+            "OUT=from_env default.txt".to_string(),
+            "OUT_NAMED=named.txt".to_string(),
+            "OVERRIDDEN=from_runtime_env".to_string(),
+            "PATH=/usr/local/bin:/usr/bin:/bin".to_string(),
+            "PLAIN=from_env".to_string(),
+            "WORKSPACE_ROOT=from_pass_env".to_string(),
+            "heph_TEST_GOLDEN_RUNTIME_PASS=from_runtime_pass_env".to_string(),
+        ];
+
+        assert_eq!(
+            got, want,
+            "child env drifted.\n got: {got:#?}\nwant: {want:#?}\n\
+             If this is a deliberate change to env composition, it changes what \
+             existing targets see under an unchanged cache key — see \
+             docs/EXEC_RUNNERS.md §4.4 before updating this golden."
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_parse_pass_env_resolves_value() -> anyhow::Result<()> {
         unsafe {
