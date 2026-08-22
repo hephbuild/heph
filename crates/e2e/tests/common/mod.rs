@@ -46,6 +46,40 @@ impl std::ops::Deref for Workspace {
     }
 }
 
+/// Wraps a session so its teardown can be observed.
+struct TeardownSession {
+    inner: heph::engine::exec_runner::EnvSession,
+    /// Taken on the first hand-over, so a second caller gets `None` — teardown
+    /// must not be runnable twice.
+    torn: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
+}
+
+#[async_trait::async_trait]
+impl heph::engine::exec_runner::ExecSession for TeardownSession {
+    fn prepare(
+        &self,
+        spec: heph::proc_exec::Spec,
+    ) -> Result<heph::proc_exec::Spec, heph::engine::exec_runner::SpawnError> {
+        self.inner.prepare(spec)
+    }
+    fn base_env(&self) -> Option<&[(std::ffi::OsString, std::ffi::OsString)]> {
+        self.inner.base_env()
+    }
+    fn caps(&self) -> &heph::engine::exec_runner::SessionCaps {
+        self.inner.caps()
+    }
+    fn describe(&self) -> &heph::engine::exec_runner::SessionDescription {
+        self.inner.describe()
+    }
+    fn teardown(&self) -> Option<heph::engine::exec_runner::TeardownJob> {
+        let torn = self.torn.lock().ok()?.take()?;
+        Some(Box::new(move || {
+            torn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }))
+    }
+}
+
 /// A test [`ExecRunner`] that counts its opens and hands back an environment.
 ///
 /// The open counter is the point: the whole premise of a session is "acquire
@@ -57,6 +91,8 @@ pub struct RecordingExecRunner {
     /// When set, the session also supplies `PATH`, which must then REPLACE the
     /// driver's own rather than sit under it.
     pub path: Option<String>,
+    /// Incremented by the session's teardown job, so a test can prove it ran.
+    pub torn: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 #[async_trait::async_trait]
@@ -95,6 +131,28 @@ impl heph::engine::exec_runner::ExecRunner for RecordingExecRunner {
                 std::ffi::OsString::from(from_artifact),
             ),
         ]);
+        if let Some(torn) = self.torn.clone() {
+            return Ok(Arc::new(TeardownSession {
+                inner: er::EnvSession::new(
+                    base,
+                    er::SessionCaps {
+                        pty: true,
+                        max_concurrent: None,
+                        identity: er::Identity::Pinned {
+                            by: req.key.clone(),
+                        },
+                    },
+                    er::SessionDescription {
+                        runner: req.runner_addr.clone(),
+                        shell_functions: Vec::new(),
+                        key: req.key.clone(),
+                        summary: "teardown test runner".to_string(),
+                    },
+                ),
+                torn: std::sync::Mutex::new(Some(torn)),
+            }));
+        }
+
         Ok(Arc::new(er::EnvSession::new(
             base,
             er::SessionCaps {
@@ -150,6 +208,7 @@ impl Workspace {
                         opens,
                         var: (var.0.to_string(), var.1.to_string()),
                         path,
+                        torn: None,
                     }),
                 )
                 .build()
@@ -160,6 +219,36 @@ impl Workspace {
 
     pub fn new() -> Self {
         Self::with_parallelism(None)
+    }
+
+    /// A workspace whose session records that its teardown ran.
+    pub fn with_teardown_runner(
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        torn: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            inner: WorkspaceBuilder::new()
+                .expect("workspace tempdir")
+                .with_provider(|init| {
+                    Box::new(pluginbuildfile::Provider::new(
+                        init.root.to_path_buf(),
+                        init.runtime.clone(),
+                    ))
+                })
+                .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+                .with_exec_runner(
+                    "bash",
+                    Arc::new(RecordingExecRunner {
+                        opens,
+                        var: ("V".to_string(), "1".to_string()),
+                        path: None,
+                        torn: Some(torn),
+                    }),
+                )
+                .build()
+                .expect("build workspace"),
+            reopen_with: None,
+        }
     }
 
     /// A workspace with `defaultRunner:` set — the exec environment every
@@ -190,6 +279,7 @@ impl Workspace {
                         opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         var: ("FROM_DEFAULT_RUNNER".to_string(), "1".to_string()),
                         path: None,
+                        torn: None,
                     }),
                 )
                 .build()

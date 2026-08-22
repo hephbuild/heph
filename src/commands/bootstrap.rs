@@ -140,13 +140,17 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // Two halves of one plugin: the `devenv` driver captures the environment as
     // an artifact, the `devenv` runner reads it back. Registered under the same
     // name, which is how a runner target's driver selects its runner.
+    let runner_root = root.clone();
     {
         let devenv_root = root.clone();
         e.register_managed_driver(move |_| Box::new(plugindevenv::Driver::new(devenv_root)))?;
     }
     e.register_exec_runner(
         plugindevenv::NAME,
-        std::sync::Arc::new(plugindevenv::Runner),
+        std::sync::Arc::new(plugindevenv::Runner::new(session_support(
+            &home_dir,
+            &runner_root,
+        ))),
     )?;
 
     // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
@@ -268,6 +272,23 @@ fn hard_abort(exit: impl FnOnce(i32)) {
     exit(130);
 }
 
+/// What a `mode = "session"` runner needs: this binary (it is both the agent
+/// and the per-target client) and a directory for its sockets.
+///
+/// `None` when the current executable cannot be located — a session runner then
+/// fails saying so, rather than silently downgrading to a snapshot and running
+/// targets in an environment nobody asked for.
+fn session_support(
+    home_dir: &std::path::Path,
+    tree_root: &std::path::Path,
+) -> Option<plugindevenv::SessionSupport> {
+    Some(plugindevenv::SessionSupport {
+        heph_bin: std::env::current_exe().ok()?,
+        socket_dir: home_dir.join("exec-agents"),
+        tree_root: tree_root.to_path_buf(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +316,7 @@ mod tests {
             .map(|p| root.join(p))
             .unwrap_or_else(|| root.join(".heph3"));
         let devenv_root = root.clone();
+        let runner_root = root.clone();
         let mut e = engine::Engine::new(engine::Config {
             root,
             home_dir: home_dir.clone(),
@@ -317,7 +339,10 @@ mod tests {
         e.register_managed_driver(move |_| Box::new(plugindevenv::Driver::new(devenv_root)))?;
         e.register_exec_runner(
             plugindevenv::NAME,
-            std::sync::Arc::new(plugindevenv::Runner),
+            std::sync::Arc::new(plugindevenv::Runner::new(session_support(
+                &home_dir,
+                &runner_root,
+            ))),
         )?;
 
         e.register_provider_factory("buildfile", |init, opts| {

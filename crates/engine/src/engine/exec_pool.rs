@@ -10,7 +10,7 @@ use hcore::hasync::Cancellable;
 use hexec_runner::{ExecRunner, ExecSession, OpenRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 /// One key's session, or the in-flight open of it. Named because the nesting
 /// is load-bearing and unreadable inline: the outer `Mutex` guards the map, the
@@ -23,6 +23,38 @@ type SessionCell = Arc<tokio::sync::OnceCell<Arc<dyn ExecSession>>>;
 #[derive(Default)]
 pub struct ExecSessionPool {
     entries: Mutex<HashMap<String, SessionCell>>,
+}
+
+impl Drop for ExecSessionPool {
+    /// Tear every open session down on the way out.
+    ///
+    /// Synchronous by necessity and by design: `Drop` cannot await, and a
+    /// teardown that only ran on the orderly path would leak exactly when it
+    /// matters — a `Wrap` session's `docker run -d` container, or a devenv
+    /// shell, surviving every Ctrl-C. See `hexec_runner::TeardownJob`.
+    ///
+    /// `try_lock` rather than `lock`: nothing else can hold this at drop time
+    /// (the pool is being destroyed, so no `Arc` to it remains), and blocking a
+    /// destructor on a lock that will never be released would hang exit instead
+    /// of cleaning up.
+    fn drop(&mut self) {
+        let Ok(mut entries) = self.entries.try_lock() else {
+            tracing::warn!("exec session pool busy at shutdown; sessions not torn down");
+            return;
+        };
+        for (key, cell) in entries.drain() {
+            let Some(session) = cell.get() else { continue };
+            let Some(job) = session.teardown() else {
+                continue;
+            };
+            if let Err(e) = job() {
+                // A failed teardown is a leak the user can act on — a container
+                // still running, a shell still holding a lock — so it is said
+                // out loud rather than swallowed.
+                tracing::warn!(key = %key, error = %format!("{e:#}"), "exec session teardown failed");
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for ExecSessionPool {
@@ -45,8 +77,14 @@ impl ExecSessionPool {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<Arc<dyn ExecSession>> {
         let key = req.key.clone();
+        // The map lock is taken and released around the clone — never held
+        // across the `open` below, which can be tens of seconds for a cold
+        // environment and would serialize every other key behind it.
         let cell = {
-            let mut entries = self.entries.lock().await;
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(entries.entry(key.clone()).or_default())
         };
 
@@ -57,7 +95,10 @@ impl ExecSessionPool {
         match res {
             Ok(s) => Ok(Arc::clone(s)),
             Err(e) => {
-                self.entries.lock().await.remove(&key);
+                self.entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
                 Err(e)
             }
         }

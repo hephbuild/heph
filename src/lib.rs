@@ -28,6 +28,8 @@ pub use hlock::hlock;
 pub use hmodel::{htaddr, htmatcher, htpkg, htquery};
 pub use hplugin::htspec;
 pub use hplugin_buildfile::pluginbuildfile;
+pub mod runner_agent;
+
 pub use hplugin_devenv::plugindevenv;
 pub use hplugin_exec::pluginexec;
 pub use hplugin_http::pluginhttp;

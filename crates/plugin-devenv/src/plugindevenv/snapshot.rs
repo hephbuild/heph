@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 /// a variable from the filter (a correctness fix) would leave every existing
 /// artifact keyed as though the old environment were still in force. The same
 /// reason `NixDef.system` and `EXEC_DEF_FORMAT_VERSION` exist.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+/// v2: session-mode preludes gained `export -f`, without which a function was
+/// defined in a shell the target never runs in.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// The canonicalized environment. **This artifact _is_ the description** — the
 /// runner half does nothing but parse it, so everything the environment depends
@@ -34,6 +36,14 @@ pub struct Snapshot {
     pub dropped_path_entries: Vec<String>,
     /// Variables dropped for naming a machine-local path.
     pub dropped_vars: Vec<String>,
+    /// The shell functions' definitions, as a bash snippet.
+    ///
+    /// Empty unless the target asked for `mode = "session"`. Carried in the
+    /// artifact rather than re-derived at `open` for the same reason as
+    /// everything else here: `open` runs after `hashin` and not at all on a
+    /// cached build, so a definition discovered there would be unhashed input.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shell_prelude: String,
 }
 
 /// Paths that make a snapshot machine-specific. A value mentioning any of them
@@ -101,6 +111,15 @@ pub fn build(
     shell_functions: Vec<String>,
     local: &LocalPaths,
 ) -> Snapshot {
+    build_with_prelude(variables, shell_functions, local, String::new())
+}
+
+pub fn build_with_prelude(
+    variables: &BTreeMap<String, Variable>,
+    shell_functions: Vec<String>,
+    local: &LocalPaths,
+    shell_prelude: String,
+) -> Snapshot {
     let mut env = BTreeMap::new();
     let mut dropped_vars = Vec::new();
     let mut dropped_path_entries = Vec::new();
@@ -149,6 +168,7 @@ pub fn build(
         shell_functions,
         dropped_path_entries,
         dropped_vars,
+        shell_prelude,
     }
 }
 

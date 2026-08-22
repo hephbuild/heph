@@ -40,6 +40,8 @@
 //! darwin and passes on linux. So the batch/streaming drain policy stays inside
 //! `hproc`, and this trait exposes both.
 
+pub mod agent;
+
 use hcore::hasync::Cancellable;
 use hproc::proc_exec::{self, Handle, Spec};
 use std::ffi::OsString;
@@ -633,5 +635,436 @@ mod shell_function_diag_tests {
         assert!(msg.contains("//:devenv"), "{msg}");
         // Names the way out, not just the problem.
         assert!(msg.contains(r#"mode = "session""#), "{msg}");
+    }
+}
+
+/// How a `Wrap` session gets the environment to the *inner* process.
+///
+/// The distinction is not cosmetic: `chroot`, `bwrap` and `nix develop
+/// --command` exec the inner program in their own process, so it inherits the
+/// spec's environment. `docker exec` does not — the environment we set belongs
+/// to the `docker` CLI on this side of the socket, and the container process
+/// sees none of it. A wrapper of the second kind that used `Inherit` would run
+/// every target with an environment it never asked for and no error to show
+/// for it.
+#[derive(Debug, Clone)]
+pub enum WrapEnv {
+    /// The wrapper execs the inner program; the spec's env carries through.
+    Inherit,
+    /// The wrapper creates the process elsewhere. Each variable is rendered
+    /// into the wrapper's own argv using this template, where `{K}` and `{V}`
+    /// are replaced — e.g. `["-e", "{K}={V}"]` for `docker exec`.
+    Args(Vec<String>),
+}
+
+/// A `Wrap` session: the process is created by a wrapper command — a container
+/// exec, a `chroot`, a `nix develop --command`.
+///
+/// Still a pure spec transformation, which is the whole reason `prepare` is the
+/// seam: nothing here owns a process, so `proc_exec` keeps its synchronous
+/// spawn, its `Handle` invariants and its stdio handling untouched.
+#[derive(Debug)]
+pub struct WrapSession {
+    prefix_argv: Vec<OsString>,
+    env_mode: WrapEnv,
+    base_env: Vec<(OsString, OsString)>,
+    caps: SessionCaps,
+    description: SessionDescription,
+}
+
+impl WrapSession {
+    pub fn new(
+        prefix_argv: Vec<OsString>,
+        env_mode: WrapEnv,
+        base_env: Vec<(OsString, OsString)>,
+        caps: SessionCaps,
+        description: SessionDescription,
+    ) -> anyhow::Result<Self> {
+        if prefix_argv.is_empty() {
+            anyhow::bail!("a Wrap session needs a wrapper command; `prefix_argv` is empty");
+        }
+        Ok(Self {
+            prefix_argv,
+            env_mode,
+            base_env,
+            caps,
+            description,
+        })
+    }
+
+    fn merged_env(&self, spec_env: &[(OsString, OsString)]) -> Vec<(OsString, OsString)> {
+        let mut env = Vec::with_capacity(self.base_env.len() + spec_env.len());
+        for (k, v) in &self.base_env {
+            if !spec_env.iter().any(|(sk, _)| sk == k) {
+                env.push((k.clone(), v.clone()));
+            }
+        }
+        env.extend_from_slice(spec_env);
+        env
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecSession for WrapSession {
+    fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
+        let merged = self.merged_env(&spec.env);
+
+        // prefix[0] becomes the program; everything else, then the env args (if
+        // this wrapper needs them), then the original program and its args.
+        // `split_first` rather than an index: the constructor already rejects an
+        // empty prefix, but a slice that "cannot be empty" is worth expressing
+        // in the type rather than in a comment.
+        let (wrapper, rest) = self
+            .prefix_argv
+            .split_first()
+            .ok_or_else(|| SpawnError::Io(std::io::Error::other("empty wrapper command")))?;
+        let mut args: Vec<OsString> = rest.to_vec();
+        if let WrapEnv::Args(template) = &self.env_mode {
+            for (k, v) in &merged {
+                for part in template {
+                    args.push(OsString::from(
+                        part.replace("{K}", &k.to_string_lossy())
+                            .replace("{V}", &v.to_string_lossy()),
+                    ));
+                }
+            }
+        }
+        args.push(spec.program.clone().into_os_string());
+        args.append(&mut spec.args);
+
+        spec.program = std::path::PathBuf::from(wrapper);
+        spec.args = args;
+        // The wrapper itself still needs an environment to run in — a `PATH` to
+        // find `docker` with, at minimum — so the merged env goes on the spec
+        // either way. Under `Args` it reaches the inner process through argv
+        // instead, and this is what the wrapper process sees.
+        spec.env = merged;
+        Ok(spec)
+    }
+
+    fn base_env(&self) -> Option<&[(OsString, OsString)]> {
+        match self.env_mode {
+            // The environment reaches the inner process, so reporting it is
+            // honest.
+            WrapEnv::Inherit => Some(&self.base_env),
+            // It does not describe what the inner process sees — the wrapper
+            // decides that. Saying `None` makes a caller degrade explicitly
+            // rather than print a confident, wrong answer.
+            WrapEnv::Args(_) => None,
+        }
+    }
+
+    fn caps(&self) -> &SessionCaps {
+        &self.caps
+    }
+
+    fn describe(&self) -> &SessionDescription {
+        &self.description
+    }
+}
+
+#[cfg(test)]
+mod wrap_session_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn caps() -> SessionCaps {
+        SessionCaps {
+            pty: false,
+            max_concurrent: None,
+            identity: Identity::Pinned {
+                by: "img@sha256:abc".to_string(),
+            },
+        }
+    }
+
+    fn desc() -> SessionDescription {
+        SessionDescription {
+            runner: "//:ctr".to_string(),
+            shell_functions: vec![],
+            key: "k".to_string(),
+            summary: "container".to_string(),
+        }
+    }
+
+    fn spec() -> Spec {
+        Spec {
+            program: PathBuf::from("cargo"),
+            args: vec![OsString::from("build")],
+            env: vec![(OsString::from("MINE"), OsString::from("1"))],
+            cwd: PathBuf::from("/ws"),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Null,
+            stderr: proc_exec::StdioSpec::Null,
+            setsid: false,
+            ctty: false,
+        }
+    }
+
+    fn argv(s: &Spec) -> Vec<String> {
+        std::iter::once(s.program.to_string_lossy().into_owned())
+            .chain(s.args.iter().map(|a| a.to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn the_wrapper_becomes_the_program_and_the_original_follows() {
+        let s = WrapSession::new(
+            vec![OsString::from("chroot"), OsString::from("/root")],
+            WrapEnv::Inherit,
+            vec![(OsString::from("CC"), OsString::from("clang"))],
+            caps(),
+            desc(),
+        )
+        .expect("wrap");
+        let out = s.prepare(spec()).expect("prepare");
+        assert_eq!(argv(&out), vec!["chroot", "/root", "cargo", "build"]);
+        // Base env still applies underneath the caller's own.
+        assert!(out.env.iter().any(|(k, v)| k == "CC" && v == "clang"));
+        assert!(out.env.iter().any(|(k, v)| k == "MINE" && v == "1"));
+    }
+
+    /// `docker exec` does not inherit our environment, so it has to be rendered
+    /// into the wrapper's argv or the inner process never sees it.
+    #[test]
+    fn args_mode_renders_the_environment_into_the_wrappers_argv() {
+        let s = WrapSession::new(
+            vec![
+                OsString::from("docker"),
+                OsString::from("exec"),
+                OsString::from("-i"),
+            ],
+            WrapEnv::Args(vec!["-e".to_string(), "{K}={V}".to_string()]),
+            vec![(OsString::from("CC"), OsString::from("clang"))],
+            caps(),
+            desc(),
+        )
+        .expect("wrap");
+        let out = s.prepare(spec()).expect("prepare");
+        let a = argv(&out);
+        assert_eq!(a[0], "docker");
+        assert!(
+            a.windows(2).any(|w| w[0] == "-e" && w[1] == "CC=clang"),
+            "{a:?}"
+        );
+        assert!(
+            a.windows(2).any(|w| w[0] == "-e" && w[1] == "MINE=1"),
+            "{a:?}"
+        );
+        // The inner command still comes last, after everything the wrapper needs.
+        assert_eq!(&a[a.len() - 2..], &["cargo", "build"]);
+    }
+
+    /// A `Wrap` runner whose environment lives inside the container cannot
+    /// honestly answer "what will this process see" — so it says so rather than
+    /// reporting the host-side map as if it were the answer.
+    #[test]
+    fn args_mode_reports_no_enumerable_environment() {
+        let s = WrapSession::new(
+            vec![OsString::from("docker")],
+            WrapEnv::Args(vec!["-e".to_string(), "{K}={V}".to_string()]),
+            vec![(OsString::from("CC"), OsString::from("clang"))],
+            caps(),
+            desc(),
+        )
+        .expect("wrap");
+        assert!(s.base_env().is_none());
+    }
+
+    #[test]
+    fn an_empty_wrapper_command_is_rejected() {
+        assert!(
+            WrapSession::new(vec![], WrapEnv::Inherit, vec![], caps(), desc()).is_err(),
+            "a Wrap session with nothing to wrap with is not a session"
+        );
+    }
+}
+
+/// An `Agent` session: processes are forked by a long-lived helper living
+/// inside the environment — a `devenv shell` held open for the build.
+///
+/// Like the other modes, this is a **pure spec transformation**: the spec is
+/// rewritten to run a client that heph spawns as its own ordinary child. See
+/// [`agent`] for why that indirection exists rather than an overridden `spawn`.
+pub struct AgentSession {
+    /// The heph binary, which is also the client (`__runner-exec`).
+    client_bin: std::path::PathBuf,
+    socket: std::path::PathBuf,
+    base_env: Vec<(OsString, OsString)>,
+    caps: SessionCaps,
+    description: SessionDescription,
+    teardown: std::sync::Mutex<Option<TeardownJob>>,
+}
+
+impl std::fmt::Debug for AgentSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentSession")
+            .field("socket", &self.socket)
+            .field("runner", &self.description.runner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentSession {
+    pub fn new(
+        client_bin: std::path::PathBuf,
+        socket: std::path::PathBuf,
+        base_env: Vec<(OsString, OsString)>,
+        caps: SessionCaps,
+        description: SessionDescription,
+        teardown: Option<TeardownJob>,
+    ) -> Self {
+        Self {
+            client_bin,
+            socket,
+            base_env,
+            caps,
+            description,
+            teardown: std::sync::Mutex::new(teardown),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecSession for AgentSession {
+    fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
+        // Base env under the caller's own, exactly as `Direct` does. The client
+        // forwards its own environment to the agent, which applies it with
+        // `env_clear` — so the devenv shell's ambient variables never reach the
+        // target. That is the correction the design's M2 analysis needed: an
+        // agent that let its own environment through would put the developer's
+        // `GOFLAGS` into every build, unhashed, under a lockfile-pinned key.
+        let mut env = Vec::with_capacity(self.base_env.len() + spec.env.len());
+        for (k, v) in &self.base_env {
+            if !spec.env.iter().any(|(sk, _)| sk == k) {
+                env.push((k.clone(), v.clone()));
+            }
+        }
+        env.append(&mut spec.env);
+
+        let mut args: Vec<OsString> = vec![
+            OsString::from("__runner-exec"),
+            OsString::from("--socket"),
+            self.socket.clone().into_os_string(),
+            OsString::from("--"),
+        ];
+        args.push(spec.program.clone().into_os_string());
+        args.append(&mut spec.args);
+
+        spec.program = self.client_bin.clone();
+        spec.args = args;
+        spec.env = env;
+        Ok(spec)
+    }
+
+    fn base_env(&self) -> Option<&[(OsString, OsString)]> {
+        Some(&self.base_env)
+    }
+
+    fn caps(&self) -> &SessionCaps {
+        &self.caps
+    }
+
+    fn describe(&self) -> &SessionDescription {
+        &self.description
+    }
+
+    fn teardown(&self) -> Option<TeardownJob> {
+        self.teardown.lock().ok().and_then(|mut t| t.take())
+    }
+}
+
+#[cfg(test)]
+mod agent_session_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn session() -> AgentSession {
+        AgentSession::new(
+            PathBuf::from("/usr/bin/heph"),
+            PathBuf::from("/run/agent.sock"),
+            vec![(OsString::from("CC"), OsString::from("clang"))],
+            SessionCaps {
+                pty: true,
+                max_concurrent: None,
+                identity: Identity::Asserted {
+                    why: "live shell".to_string(),
+                },
+            },
+            SessionDescription {
+                runner: "//:devenv".to_string(),
+                shell_functions: vec!["fmt-all".to_string()],
+                key: "k".to_string(),
+                summary: "session".to_string(),
+            },
+            None,
+        )
+    }
+
+    fn spec() -> Spec {
+        Spec {
+            program: PathBuf::from("cargo"),
+            args: vec![OsString::from("build")],
+            env: vec![(OsString::from("MINE"), OsString::from("1"))],
+            cwd: PathBuf::from("/ws"),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Null,
+            stderr: proc_exec::StdioSpec::Null,
+            setsid: false,
+            ctty: false,
+        }
+    }
+
+    /// The rewrite heph then spawns as an ordinary child — which is what keeps
+    /// `Handle`, the drain and the PTY untouched.
+    #[test]
+    fn the_spec_becomes_a_client_invocation_wrapping_the_original() {
+        let out = session().prepare(spec()).expect("prepare");
+        assert_eq!(out.program, PathBuf::from("/usr/bin/heph"));
+        let args: Vec<String> = out
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "__runner-exec",
+                "--socket",
+                "/run/agent.sock",
+                "--",
+                "cargo",
+                "build"
+            ]
+        );
+        // `--` matters: a target's own argv must never be read as client flags.
+        assert!(args.iter().any(|a| a == "--"));
+    }
+
+    #[test]
+    fn the_environment_is_merged_with_the_caller_winning() {
+        let mut s = spec();
+        s.env.push((OsString::from("CC"), OsString::from("gcc")));
+        let out = session().prepare(s).expect("prepare");
+        let cc: Vec<_> = out.env.iter().filter(|(k, _)| k == "CC").collect();
+        assert_eq!(cc.len(), 1, "no duplicate keys reach execve");
+        assert_eq!(cc[0].1, OsString::from("gcc"), "the caller wins");
+        assert!(out.env.iter().any(|(k, _)| k == "MINE"));
+    }
+
+    /// Teardown is handed over once — a second caller must not be able to run
+    /// `docker rm` (or kill the shell) a second time.
+    #[test]
+    fn teardown_is_handed_over_at_most_once() {
+        let s = AgentSession::new(
+            PathBuf::from("/usr/bin/heph"),
+            PathBuf::from("/run/a.sock"),
+            vec![],
+            session().caps.clone(),
+            session().description.clone(),
+            Some(Box::new(|| Ok(()))),
+        );
+        assert!(s.teardown().is_some());
+        assert!(s.teardown().is_none());
     }
 }

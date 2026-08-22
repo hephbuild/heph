@@ -33,6 +33,13 @@ fn main() -> ExitCode {
         heph::process_supervisor::run_supervisor_main(fd);
     }
 
+    // The exec-agent pair, for `Agent` sessions. Parsed here for the same reason
+    // as the supervisor: neither should pull clap, logging or a runtime into a
+    // process whose whole job is to fork one child.
+    if let Some(cmd) = heph::runner_agent::parse(std::env::args().skip(1)) {
+        return heph::runner_agent::run(cmd);
+    }
+
     // Dynamic shell completion. A no-op unless the `COMPLETE` env var is set
     // (a tab press or `heph tool completions` registration), in which case it
     // emits candidates / the registration script and exits the process. Runs

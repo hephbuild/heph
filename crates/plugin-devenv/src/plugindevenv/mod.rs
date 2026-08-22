@@ -32,11 +32,21 @@ const OUT_NAME: &str = "devenv-env.json";
 struct DevenvSpec {
     /// The `devenv` binary. Defaults to `devenv` on the driver's PATH.
     bin: Option<String>,
+    /// `"snapshot"` (default) or `"session"`.
+    ///
+    /// `snapshot` captures the environment once and applies it to every target
+    /// — no live process, cacheable, and the environment's own bytes are its
+    /// cache identity. `session` additionally holds a `devenv shell` open and
+    /// forks every target's process from inside it, which is what makes
+    /// `enterShell` side effects and shell functions available. It costs one
+    /// shell per heph process, forever, and cannot amortize across machines.
+    mode: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DevenvDef {
     bin: String,
+    session: bool,
 }
 
 pub struct Driver {
@@ -67,13 +77,24 @@ impl ManagedDriver for Driver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let spec = DevenvSpec::from(&req.target_spec.config).with_context(|| "devenv spec")?;
+        let session = match spec.mode.as_deref() {
+            None | Some("snapshot") => false,
+            Some("session") => true,
+            Some(other) => {
+                anyhow::bail!("devenv `mode` must be \"snapshot\" or \"session\", got {other:?}")
+            }
+        };
         let def = DevenvDef {
             bin: spec.bin.unwrap_or_else(|| "devenv".to_string()),
+            session,
         };
 
         let mut h = xxhash_rust::xxh3::Xxh3::new();
         snapshot::SNAPSHOT_FORMAT_VERSION.hash(&mut h);
         def.bin.hash(&mut h);
+        // The mode changes what the artifact contains (a session snapshot also
+        // carries the shell prelude), so it must change the key.
+        def.session.hash(&mut h);
         req.target_spec.addr.format().hash(&mut h);
 
         Ok(ParseResponse {
@@ -165,7 +186,7 @@ impl ManagedDriver for Driver {
             );
         }
 
-        let snap = snapshot_from_json(&out.stdout, &self.local_paths())?;
+        let snap = snapshot_from_json(&out.stdout, &self.local_paths(), def.session)?;
         if snap.env.is_empty() {
             anyhow::bail!(
                 "the devenv environment came out empty after filtering, which would describe \
@@ -239,7 +260,11 @@ struct PrintDevEnv {
     bash_functions: BTreeMap<String, serde_json::Value>,
 }
 
-fn snapshot_from_json(stdout: &[u8], local: &LocalPaths) -> anyhow::Result<Snapshot> {
+fn snapshot_from_json(
+    stdout: &[u8],
+    local: &LocalPaths,
+    with_prelude: bool,
+) -> anyhow::Result<Snapshot> {
     // `bashFunctions` in the wire format; serde's rename is applied here rather
     // than in the struct so the field name reads as Rust.
     let raw: serde_json::Value = serde_json::from_slice(stdout).with_context(|| {
@@ -259,11 +284,67 @@ fn snapshot_from_json(stdout: &[u8], local: &LocalPaths) -> anyhow::Result<Snaps
     }))
     .context("decode devenv env")?;
 
-    Ok(snapshot::build(
+    // Only in session mode: the definitions are large, and a snapshot runner
+    // cannot use them — carrying them anyway would bloat every consumer's cache
+    // key for something nothing reads.
+    let prelude = if with_prelude {
+        render_prelude(&parsed.bash_functions)
+    } else {
+        String::new()
+    };
+
+    Ok(snapshot::build_with_prelude(
         &parsed.variables,
         parsed.bash_functions.keys().cloned().collect(),
         local,
+        prelude,
     ))
+}
+
+/// Render devenv's function bodies as a bash snippet the agent sources before
+/// each command.
+///
+/// `print-dev-env` gives each body without the `name () {…}` wrapper, so it is
+/// rebuilt here — and every function is then **exported**.
+///
+/// The export is the part that makes this work at all. The agent sources this
+/// into one bash, but the command it runs is itself `bash -c …` (that is how
+/// `pluginexec` invokes a target), and a function defined in a parent shell is
+/// not visible to a child shell unless exported. Without `export -f`, the
+/// prelude is defined in a process the target never runs in — which is exactly
+/// how this failed the first time.
+fn render_prelude(functions: &BTreeMap<String, serde_json::Value>) -> String {
+    let mut out = String::new();
+    for (name, body) in functions {
+        if !is_exportable_function_name(name) {
+            continue;
+        }
+        if let Some(b) = body.as_str() {
+            out.push_str(name);
+            out.push_str(" () {");
+            out.push_str(b);
+            out.push_str("}\n");
+            out.push_str("export -f ");
+            out.push_str(name);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A name bash can both declare and `export -f`.
+///
+/// Stricter than "a name devenv used": bash accepts some punctuation in a
+/// function name but cannot export it, and a failed `export -f` in the prelude
+/// takes down every command in the session — so anything not a plain identifier
+/// is skipped rather than risked.
+fn is_exportable_function_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The runner half: a pure parse of the artifact the driver produced.
@@ -272,7 +353,33 @@ fn snapshot_from_json(stdout: &[u8], local: &LocalPaths) -> anyhow::Result<Snaps
 /// run at all on a fully-cached build, so anything discovered here would be
 /// unhashed input that cannot be validated on the build where a stale artifact
 /// is served (`docs/EXEC_RUNNERS.md` §4.7).
-pub struct Runner;
+///
+/// In `session` mode it additionally *starts* something — a `devenv shell`
+/// holding an agent — but strictly from the artifact's contents. What it starts
+/// is decided by bytes the cache key already covers; only the socket path and
+/// the pid are new, and neither describes the environment.
+pub struct Runner {
+    /// Where agent sockets live, and the heph binary that serves as both agent
+    /// and client. Absent in a host with no session support, which makes
+    /// `mode = "session"` an error rather than a silent downgrade.
+    session: Option<SessionSupport>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionSupport {
+    pub heph_bin: std::path::PathBuf,
+    pub socket_dir: std::path::PathBuf,
+    /// Where `devenv.nix` lives. `devenv shell` must run there — it was the
+    /// socket directory once, which has no `devenv.nix`, and the only symptom
+    /// was a five-minute wait for a socket that was never going to appear.
+    pub tree_root: std::path::PathBuf,
+}
+
+impl Runner {
+    pub fn new(session: Option<SessionSupport>) -> Self {
+        Self { session }
+    }
+}
 
 #[async_trait]
 impl ExecRunner for Runner {
@@ -306,11 +413,15 @@ impl ExecRunner for Runner {
             );
         }
 
-        let base_env = snap
+        let base_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = snap
             .env
             .iter()
             .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
             .collect();
+
+        if !snap.shell_prelude.is_empty() {
+            return self.open_session(&req, &snap, base_env).await;
+        }
 
         Ok(Arc::new(EnvSession::new(
             base_env,
@@ -337,9 +448,197 @@ impl ExecRunner for Runner {
     }
 }
 
+impl Runner {
+    /// `mode = "session"`: hold a `devenv shell` open with an agent inside it,
+    /// and fork every target's process from there.
+    async fn open_session(
+        &self,
+        req: &OpenRequest,
+        snap: &Snapshot,
+        base_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) -> anyhow::Result<Arc<dyn ExecSession>> {
+        let support = self.session.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} asks for `mode = \"session\"`, but this heph was built without session \
+                 support",
+                req.runner_addr,
+            )
+        })?;
+
+        let socket = hexec_runner::agent::socket_path(&support.socket_dir, &req.key);
+        std::fs::create_dir_all(&support.socket_dir)?;
+
+        // The prelude goes to a file rather than the command line: a dev shell's
+        // function bodies run to tens of kilobytes, well past what argv can
+        // carry, and `execve` would fail with E2BIG rather than anything that
+        // explains itself.
+        let prelude_path = socket.with_extension("prelude.sh");
+        std::fs::write(&prelude_path, &snap.shell_prelude)?;
+
+        // The agent runs INSIDE the shell — that is the whole difference from
+        // snapshot mode. `devenv shell -- <cmd>` is the supported way in.
+        let mut cmd = std::process::Command::new("devenv");
+        cmd.arg("shell")
+            .arg("--")
+            .arg(&support.heph_bin)
+            .arg("__runner-agent")
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--prelude")
+            .arg(&prelude_path)
+            .current_dir(&support.tree_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+
+        // Its stderr goes to a file, not to /dev/null. A session that fails to
+        // start is otherwise a five-minute timeout with no reason attached, and
+        // the reason is always in what `devenv` said on the way down.
+        let log_path = socket.with_extension("log");
+        match std::fs::File::create(&log_path) {
+            Ok(f) => {
+                cmd.stderr(std::process::Stdio::from(f));
+            }
+            Err(_) => {
+                cmd.stderr(std::process::Stdio::null());
+            }
+        }
+        let mut child = cmd
+            .spawn()
+            .with_context(|| "starting `devenv shell` for a session runner")?;
+        let pid = child.id();
+
+        // Wait for the socket rather than assume it: a cold `devenv shell` is
+        // tens of seconds, and connecting too early would fail every target of
+        // the build for a reason that reads like the environment is broken.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while !socket.exists() {
+            if std::time::Instant::now() > deadline {
+                let tail = std::fs::read_to_string(&log_path)
+                    .map(|s| s.lines().rev().take(20).collect::<Vec<_>>().join("\n"))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "`devenv shell` did not open its exec agent at {} within 5 minutes.\n\
+                     Its last output:\n{tail}",
+                    socket.display(),
+                );
+            }
+            // A shell that has already exited is never going to open it, and
+            // waiting out the deadline only delays the same failure.
+            if let Ok(Some(status)) = child.try_wait() {
+                let tail = std::fs::read_to_string(&log_path)
+                    .map(|s| s.lines().rev().take(20).collect::<Vec<_>>().join("\n"))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "`devenv shell` exited ({status}) before opening its exec agent.\n\
+                     Its last output:\n{tail}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let teardown_socket = socket.clone();
+        let teardown: hexec_runner::TeardownJob = Box::new(move || {
+            // Killing the shell closes the agent with it. Sync and
+            // fire-and-forget by contract — `Drop` and process exit must both
+            // be able to reach it.
+            //
+            // SAFETY: `kill` with a pid this process spawned; the worst case is
+            // ESRCH if it is already gone, which is not an error here.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            // Best-effort: the agent removes it on a clean exit, so it is
+            // usually already gone.
+            drop(std::fs::remove_file(&teardown_socket));
+            Ok(())
+        });
+
+        Ok(Arc::new(hexec_runner::AgentSession::new(
+            support.heph_bin.clone(),
+            socket,
+            base_env,
+            SessionCaps {
+                pty: true,
+                max_concurrent: None,
+                // Asserted, not Pinned: the environment is now whatever that
+                // live shell has. The lockfiles pin what it was *asked* to be,
+                // which is a claim rather than an observation — and
+                // `enterShell` side effects and running services are outside
+                // any key by construction.
+                identity: Identity::Asserted {
+                    why: "a live `devenv shell`; enterShell effects and services are outside the \
+                          cache key"
+                        .to_string(),
+                },
+            },
+            SessionDescription {
+                runner: req.runner_addr.clone(),
+                shell_functions: snap.shell_functions.clone(),
+                key: req.key.clone(),
+                summary: format!(
+                    "devenv session: {} vars, {} shell functions",
+                    snap.env.len(),
+                    snap.shell_functions.len()
+                ),
+            },
+            Some(teardown),
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Session mode carries function *definitions*, snapshot mode only their
+    /// names — the definitions are large and a snapshot runner cannot use them.
+    #[test]
+    fn only_session_mode_carries_the_prelude() {
+        let json = br#"{"bashFunctions":{"fmt":"  echo hi\n"},"variables":{"CC":{"type":"exported","value":"clang"}}}"#;
+        let local = LocalPaths {
+            tree_root: "/r".to_string(),
+            home: "/h".to_string(),
+            tmpdir: String::new(),
+        };
+        let snap = snapshot_from_json(json, &local, false).expect("snapshot");
+        assert!(snap.shell_prelude.is_empty());
+        assert_eq!(snap.shell_functions, vec!["fmt"]);
+
+        let sess = snapshot_from_json(json, &local, true).expect("session");
+        assert!(
+            sess.shell_prelude.contains("fmt () {"),
+            "{:?}",
+            sess.shell_prelude
+        );
+    }
+
+    /// A name that is not a shell identifier cannot be declared; pasting it
+    /// would produce a snippet that fails to parse and take every command in
+    /// the session down with it.
+    #[test]
+    fn a_non_identifier_function_name_is_skipped() {
+        let mut fns = BTreeMap::new();
+        fns.insert("ok_name".to_string(), serde_json::json!("  :\n"));
+        fns.insert("bad name; rm -rf /".to_string(), serde_json::json!("  :\n"));
+        // bash declares this one but cannot `export -f` it, and a failed export
+        // in the prelude takes down every command in the session.
+        fns.insert("has-dash".to_string(), serde_json::json!("  :\n"));
+        let out = render_prelude(&fns);
+        assert!(out.contains("ok_name () {"));
+        assert!(!out.contains("rm -rf"), "{out}");
+        assert!(!out.contains("has-dash"), "{out}");
+    }
+
+    /// Every function is exported, or it is defined in a shell the target never
+    /// runs in — `pluginexec` invokes the target through its own `bash -c`.
+    #[test]
+    fn functions_are_exported_to_child_shells() {
+        let mut fns = BTreeMap::new();
+        fns.insert("fmt_all".to_string(), serde_json::json!("  echo hi\n"));
+        let out = render_prelude(&fns);
+        assert!(out.contains("fmt_all () {"), "{out}");
+        assert!(out.contains("export -f fmt_all"), "{out}");
+    }
 
     #[test]
     fn parses_devenvs_real_json_shape() {
@@ -359,6 +658,7 @@ mod tests {
                 home: "/home/u".to_string(),
                 tmpdir: String::new(),
             },
+            false,
         )
         .expect("parse");
 

@@ -1716,7 +1716,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "core",
+ "libc",
  "proc",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -4084,12 +4088,14 @@ dependencies = [
  "driver-support",
  "exec-runner",
  "htspec-derive",
+ "libc",
  "model",
  "plugin",
  "proc",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "xxhash-rust",
 ]
