@@ -24,13 +24,15 @@ use hmodel::htmatcher::{MatchResult, Matcher};
 /// preserved verbatim.
 pub const BEGIN_MARKER: &str =
     "# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)";
-pub const END_MARKER: &str = "# END heph-generated";
-
-/// Stable prefix of [`BEGIN_MARKER`]. Detection matches on this rather than the
-/// full marker so that changing the parenthetical (e.g. the command name) never
-/// orphans an already-committed section — the old block is still found and
-/// rewritten with the current [`BEGIN_MARKER`] text.
-pub const BEGIN_MARKER_PREFIX: &str = "# BEGIN heph-generated";
+/// The section's closing marker, and the stable prefix of [`BEGIN_MARKER`] that
+/// detection matches on (so changing the parenthetical never orphans an
+/// already-committed section — the old block is still found and rewritten with
+/// the current [`BEGIN_MARKER`] text).
+///
+/// Both are defined by the *reader* — [`hwalk::CodegenClaims`], which parses this
+/// section to decide which tree paths are generated — and re-exported here so the
+/// writer cannot drift from it.
+pub use hwalk::codegen::{BEGIN_MARKER_PREFIX, END_MARKER};
 
 /// Prefix marking an attribution comment line: `# //pkg:target`, rendered on its
 /// own line *above* the pattern it annotates.
@@ -461,6 +463,60 @@ mod tests {
                 attributed("/foo/a.go", "//foo:gen"),
                 attributed("/bar/b.go", "//bar:gen"),
             ]
+        );
+    }
+
+    /// The section this module renders is the same section
+    /// [`hwalk::CodegenClaims`] reads to decide which tree paths are generated.
+    /// That coupling is the whole mechanism — a renderer change that the reader
+    /// cannot parse silently turns every generated file back into source — so
+    /// pin it: render from each output-path shape, then assert the reader claims
+    /// exactly the paths that shape covers, and nothing beside them.
+    #[test]
+    fn rendered_section_round_trips_through_the_claim_reader() {
+        use hwalk::CodegenClaims;
+        use std::path::Path;
+
+        let rendered = render(
+            "target/\n",
+            &[
+                // The three `content_to_pattern` shapes: a file, a directory, a glob.
+                attributed(
+                    &content_to_pattern(&Content::FilePath("pkg/a.pb.go".into())),
+                    "//pkg:proto",
+                ),
+                attributed(
+                    &content_to_pattern(&Content::DirPath("pkg/gen".into())),
+                    "//pkg:gen",
+                ),
+                attributed(
+                    &content_to_pattern(&Content::Glob("web/**/*.ts".into())),
+                    "//web:tsc",
+                ),
+            ],
+        );
+        let claims = CodegenClaims::from_gitignore(&rendered).expect("reader parses our render");
+
+        assert!(claims.claims(Path::new("pkg/a.pb.go")));
+        assert!(claims.claims(Path::new("pkg/gen")), "the dir output itself");
+        assert!(claims.claims(Path::new("pkg/gen/deep/x.go")), "its subtree");
+        assert!(claims.claims(Path::new("web/app/main.ts")));
+
+        assert!(
+            !claims.claims(Path::new("pkg/a.go")),
+            "a hand-written sibling"
+        );
+        assert!(!claims.claims(Path::new("web/app/main.js")));
+        assert!(
+            !claims.claims(Path::new("target/debug/heph")),
+            "a user ignore outside the managed section is not a codegen claim"
+        );
+
+        // Attribution survives the round trip, so a diagnostic can name the owner.
+        assert_eq!(claims.owner(Path::new("pkg/a.pb.go")), Some("//pkg:proto"));
+        assert_eq!(
+            claims.owner(Path::new("pkg/gen/deep/x.go")),
+            Some("//pkg:gen")
         );
     }
 

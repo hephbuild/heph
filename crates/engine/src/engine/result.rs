@@ -869,22 +869,6 @@ fn build_eresult(
     }
 }
 
-/// Stamp the codegen-provenance xattr on a written-back `copy` output. This is
-/// REQUIRED, not best-effort: the stamp is what makes a later `glob()`/`file()`
-/// exclude the generated file, so a workspace whose filesystem cannot store
-/// extended attributes (some tmpfs/NFS/FAT) must FAIL loudly rather than silently
-/// emit an unstamped output that would then be double-sourced. (`in_place` outputs
-/// are never stamped, so they remain usable on any filesystem.)
-fn stamp_codegen_xattr(path: &std::path::Path, value: &str) -> anyhow::Result<()> {
-    xattr::set(path, hbuiltins::pluginfs::CODEGEN_XATTR, value.as_bytes()).with_context(|| {
-        format!(
-            "stamp codegen xattr on {:?}: `codegen = \"copy\"` requires a filesystem with \
-             extended-attribute support",
-            path
-        )
-    })
-}
-
 pub type InteractiveInner = Box<
     dyn for<'io> FnOnce(
             Option<&'io mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
@@ -2707,9 +2691,10 @@ impl Engine {
     ///   file, accumulate per-file diffs, and on any divergence return a
     ///   [`FrozenCheckError`] without writing anything.
     /// - otherwise: unpack the cached artifact into the workspace root (copy
-    ///   semantics). `Copy` (net-new) groups additionally stamp every written
-    ///   file with the codegen xattr so a later fs glob excludes them; `InPlace`
-    ///   groups are not stamped (they overwrite tracked source files).
+    ///   semantics). A `Copy` (net-new) group's paths are excluded from later
+    ///   source globs by the workspace's codegen claims; `InPlace` groups are
+    ///   not claimed (they overwrite tracked source files), and never write onto
+    ///   a path some `Copy` target already owns.
     ///
     /// The gates are cheap and stay here; everything past them runs on
     /// `hcore::blocking` (see [`Self::materialize_codegen_tree`]).
@@ -2750,13 +2735,14 @@ impl Engine {
         // half way would be worse: the write-back is per-file and the tree is
         // the user's source, so an abandoned job leaves a *partial* codegen tree
         // either way, and letting it finish at least leaves a consistent one.
-        let (target, cached, root) = (
+        let (target, cached, root, claims) = (
             Arc::clone(&def.target),
             cached.to_vec(),
             self.cfg.root.clone(),
+            Arc::clone(&self.codegen_claims),
         );
         hcore::blocking::run(move || {
-            Self::materialize_codegen_tree(&target, &cached, &root, frozen)
+            Self::materialize_codegen_tree(&target, &cached, &root, &claims, frozen)
         })
         .await
     }
@@ -2768,16 +2754,20 @@ impl Engine {
         target: &crate::engine::driver::targetdef::TargetDef,
         cached: &[ResultArtifact],
         root: &std::path::Path,
+        claims: &hwalk::CodegenClaims,
         frozen: bool,
     ) -> anyhow::Result<bool> {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
-        // Whether anything about the tree actually moved. Content writes, exec-bit
-        // reconciles and symlink recreates all count; the codegen xattr does not
-        // (it is metadata, outside the `@heph/fs` content+exec-bit hash). `false`
-        // therefore means the tree still hashes exactly as it did before this
-        // call — which is what lets the caller skip the fixpoint recompute.
+        // Whether anything about the tree actually moved: content writes, exec-bit
+        // reconciles and symlink recreates. `false` therefore means the tree still
+        // hashes exactly as it did before this call — which is what lets the
+        // caller skip the fixpoint recompute.
         let mut wrote = false;
+        // Paths this target wrote as `Copy` output that the workspace does not
+        // claim. Collected rather than warned per file so one stale `.gitignore`
+        // produces one actionable line, not one per generated file.
+        let mut unclaimed: Vec<String> = Vec::new();
         let mut frozen_diff = String::new();
 
         // Map each codegen output group to its declared mode (first non-None
@@ -2830,9 +2820,7 @@ impl Engine {
                     // target never touches a copy-owned tree file, so a
                     // divergence there is not drift this target would reconcile —
                     // don't flag it in the frozen check.
-                    if matches!(mode, CodegenMode::InPlace)
-                        && hbuiltins::pluginfs::has_codegen_xattr(&tree_path)
-                    {
+                    if matches!(mode, CodegenMode::InPlace) && claims.claims(&entry.path) {
                         continue;
                     }
                     let old_bytes = match std::fs::read(&tree_path) {
@@ -2897,7 +2885,6 @@ impl Engine {
                 // target hits the fixpoint cache instead of re-executing.
                 // Skipping identical writes also avoids needless source-control
                 // churn and pointless mtime bumps.
-                let stamp = target.addr.format();
                 let walker = artifact
                     .content
                     .walk()
@@ -2907,13 +2894,11 @@ impl Engine {
                         .with_context(|| format!("read codegen entry for write-back: {group}"))?;
                     let dest = root.join(&entry.path);
                     // An `in_place` target must not write back into a tree file
-                    // that another `codegen = "copy"` target owns (stamped with
-                    // the codegen xattr) — doing so would clobber the copy
-                    // target's output and leave the provenance pointing at the
-                    // wrong producer. Leave such files to their owner.
-                    if matches!(mode, CodegenMode::InPlace)
-                        && hbuiltins::pluginfs::has_codegen_xattr(&dest)
-                    {
+                    // that another `codegen = "copy"` target claims — doing so
+                    // would clobber the copy target's output and leave the
+                    // provenance pointing at the wrong producer. Leave such files
+                    // to their owner.
+                    if matches!(mode, CodegenMode::InPlace) && claims.claims(&entry.path) {
                         continue;
                     }
                     match entry.kind {
@@ -2960,13 +2945,14 @@ impl Engine {
                                     }
                                 }
                             }
-                            // Stamp net-new (Copy) outputs so a later fs glob
-                            // excludes them. InPlace outputs overwrite tracked
-                            // sources and stay unstamped. (xattr is file metadata,
-                            // not content, so it does not perturb the content+x
-                            // fs hash.)
-                            if matches!(mode, CodegenMode::Copy) {
-                                stamp_codegen_xattr(&dest, &stamp)?;
+                            // A net-new (Copy) output is excluded from later
+                            // source globs by the workspace's claim set. Nothing
+                            // is written onto the file to say so — that is the
+                            // point: the claim is declared, so the next tool to
+                            // rewrite this file cannot erase it. Record a path
+                            // the workspace does not claim so the run can say so.
+                            if matches!(mode, CodegenMode::Copy) && !claims.claims(&entry.path) {
+                                unclaimed.push(entry.path.display().to_string());
                             }
                         }
                         WalkEntryKind::Symlink { target } => {
@@ -2998,10 +2984,11 @@ impl Engine {
                                     )?;
                                     wrote = true;
                                 }
-                                // Stamp Copy symlink outputs too, so a later fs
-                                // glob excludes them like regular Copy files.
-                                if matches!(mode, CodegenMode::Copy) {
-                                    stamp_codegen_xattr(&dest, &stamp)?;
+                                // A Copy symlink output is claimed like a regular
+                                // Copy file; flag it the same way when it is not.
+                                if matches!(mode, CodegenMode::Copy) && !claims.claims(&entry.path)
+                                {
+                                    unclaimed.push(entry.path.display().to_string());
                                 }
                             }
                         }
@@ -3015,6 +3002,23 @@ impl Engine {
                 addr: target.addr.clone(),
                 diff: frozen_diff,
             }));
+        }
+
+        // A `codegen = "copy"` output that the workspace does not claim will be
+        // sourced as raw input by the next `glob()` that reaches it — the exact
+        // double-sourcing the claim exists to prevent. It is not an error (the
+        // generated file itself is correct, and failing the build over a stale
+        // ignore file would be a worse trade), but it is never something the user
+        // wants, so name the fix rather than leaving it to be discovered as a
+        // mysterious extra input. `heph validate` reports the same staleness.
+        if !unclaimed.is_empty() {
+            tracing::warn!(
+                addr = %target.addr.format(),
+                paths = %unclaimed.join(", "),
+                "codegen = \"copy\" output is not registered in the heph-managed \
+                 .gitignore section and will be sourced as raw input — \
+                 run `heph tool gen-gitignore`"
+            );
         }
 
         Ok(wrote)
@@ -9510,7 +9514,32 @@ mod tests {
     fn engine_with_home_fs(
         targets: Vec<pluginstatictarget::Target>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        engine_with_home_fs_claiming(targets, &[])
+    }
+
+    /// [`engine_with_home_fs`] with a heph-managed `.gitignore` section already
+    /// in place, claiming `claims` as `codegen = "copy"` output.
+    ///
+    /// Written *before* `Engine::new` because the claim set is read once at
+    /// construction — the same point the engine hands it to every plugin. That is
+    /// also the real workflow: `heph tool gen-gitignore` commits the section, and
+    /// every later run reads it.
+    fn engine_with_home_fs_claiming(
+        targets: Vec<pluginstatictarget::Target>,
+        claims: &[&str],
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempdir()?;
+        if !claims.is_empty() {
+            let body = claims.join("\n");
+            std::fs::write(
+                root.path().join(".gitignore"),
+                format!(
+                    "{}\n{body}\n{}\n",
+                    crate::engine::gitignore::BEGIN_MARKER,
+                    crate::engine::gitignore::END_MARKER
+                ),
+            )?;
+        }
         let mut engine = Engine::new(Config {
             root: root.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
@@ -10235,26 +10264,28 @@ mod tests {
         Ok(())
     }
 
-    /// End-to-end provenance: after a `copy` codegen target writes+stamps a
-    /// net-new file, a subsequent `@heph/fs` glob over the same tree EXCLUDES it
-    /// (so it is never double-sourced), while an unstamped in_place output stays
-    /// visible to a glob.
+    /// End-to-end provenance: a `copy` codegen target's declared output is
+    /// EXCLUDED from a later `@heph/fs` glob over the same tree (so it is never
+    /// double-sourced), while an unclaimed `in_place` output stays visible.
+    ///
+    /// Asserted unconditionally. The xattr version of this test could only assert
+    /// on a filesystem that persisted extended attributes and silently passed
+    /// everywhere else — including on the tmpfs where the feature was most likely
+    /// to be broken.
     #[tokio::test]
-    async fn stamped_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
-        let (engine, root) = engine_with_home_fs(vec![
-            codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
-            codegen_run_target("//pkg:ip", "in_place", &["keep.txt"], "true"),
-        ])?;
+    async fn claimed_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs_claiming(
+            vec![
+                codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
+                codegen_run_target("//pkg:ip", "in_place", &["keep.txt"], "true"),
+            ],
+            &["# //pkg:cp", "/pkg/out.gen"],
+        )?;
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(pkg_dir.join("keep.txt"), b"keep\n")?;
 
-        // Skip the exclusion assertions on a filesystem that can't persist xattrs.
-        let probe = root.path().join(".xattr_probe");
-        std::fs::write(&probe, b"x")?;
-        let xattr_supported = xattr::set(&probe, hbuiltins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
-
-        // Materialize + stamp the copy output, and write back the in_place file.
+        // Materialize the copy output, and write back the in_place file.
         resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:cp")?)
             .await
             .0
@@ -10264,52 +10295,92 @@ mod tests {
             .0
             .expect("in_place target resolves");
 
-        // A glob over the stamped copy output must yield nothing.
+        // A glob over the claimed copy output must yield nothing.
         let gen_glob = hbuiltins::pluginfs::glob_addr("pkg/*.gen", &[]);
         let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
         let gen_res = res.expect("glob over generated files resolves");
-        // A glob over the unstamped in_place output must still see it.
+        // A glob over the unclaimed in_place output must still see it.
         let keep_glob = hbuiltins::pluginfs::glob_addr("pkg/keep.txt", &[]);
         let (res, _) = resolve_collecting_events(&engine, &keep_glob).await;
         let keep_res = res.expect("glob over in_place output resolves");
 
-        if xattr_supported {
-            assert!(
-                gen_res.artifacts.is_empty(),
-                "stamped copy output must be excluded from a later glob, got {} artifacts",
-                gen_res.artifacts.len(),
-            );
-        }
+        assert!(
+            gen_res.artifacts.is_empty(),
+            "claimed copy output must be excluded from a later glob, got {} artifacts",
+            gen_res.artifacts.len(),
+        );
         assert!(
             !keep_res.artifacts.is_empty(),
-            "unstamped in_place output must remain visible to a glob",
+            "unclaimed in_place output must remain visible to a glob",
         );
         Ok(())
     }
 
-    /// A net-new `copy` codegen target: after resolve the generated file is
-    /// materialized into the workspace root AND carries the codegen xattr (so a
-    /// later fs glob excludes it). An in_place target's re-emitted file exists
-    /// but is NOT stamped.
+    /// A generated file rewritten by an outside tool the way formatters do —
+    /// write a temp file, rename over it, replacing the inode — is still excluded
+    /// from a later glob.
+    ///
+    /// This is the regression the whole mechanism exists for. The xattr lived on
+    /// the inode, so `gofmt -w`, an editor save, or a `git checkout` erased it and
+    /// the generated file re-entered the graph as source. The claim is declared,
+    /// so nothing done to the file can revoke it.
     #[tokio::test]
-    async fn writeback_xattr() -> anyhow::Result<()> {
-        let (engine, root) = engine_with_home_fs(vec![
-            // Copy: generates a net-new file. The introspect input is a glob
-            // (`pkg/*.gen`) so the not-yet-existing output doesn't error at
-            // input resolution the way a `file()` over a missing path would.
-            codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
-            // In-place: re-emits an existing tracked source file untouched.
-            codegen_run_target("//pkg:ip", "in_place", &["src.txt"], "true"),
-        ])?;
+    async fn claim_survives_an_outside_rewrite_of_the_generated_file() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs_claiming(
+            vec![codegen_run_target(
+                "//pkg:cp",
+                "copy",
+                &["*.gen"],
+                "echo generated > out.gen",
+            )],
+            &["# //pkg:cp", "/pkg/out.gen"],
+        )?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+
+        resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:cp")?)
+            .await
+            .0
+            .expect("copy target resolves");
+        let gen_file = pkg_dir.join("out.gen");
+        assert!(gen_file.exists(), "copy output must be written to the tree");
+
+        // Rewrite it from outside heph, replacing the inode.
+        let tmp = pkg_dir.join("out.gen.tmp");
+        std::fs::write(&tmp, b"rewritten by some other tool\n")?;
+        std::fs::rename(&tmp, &gen_file)?;
+
+        let gen_glob = hbuiltins::pluginfs::glob_addr("pkg/*.gen", &[]);
+        let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
+        let gen_res = res.expect("glob over generated files resolves");
+        assert!(
+            gen_res.artifacts.is_empty(),
+            "a rewritten generated file is still generated, got {} artifacts",
+            gen_res.artifacts.len(),
+        );
+        Ok(())
+    }
+
+    /// A net-new `copy` codegen target materializes its file into the workspace
+    /// root, and an `in_place` target's re-emitted file exists there too. Neither
+    /// carries any heph-written metadata: which of them is generated is answered
+    /// by the claim set, not by anything on the file.
+    #[tokio::test]
+    async fn writeback_materializes_both_modes() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs_claiming(
+            vec![
+                // Copy: generates a net-new file. The introspect input is a glob
+                // (`pkg/*.gen`) so the not-yet-existing output doesn't error at
+                // input resolution the way a `file()` over a missing path would.
+                codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
+                // In-place: re-emits an existing tracked source file untouched.
+                codegen_run_target("//pkg:ip", "in_place", &["src.txt"], "true"),
+            ],
+            &["# //pkg:cp", "/pkg/out.gen"],
+        )?;
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(pkg_dir.join("src.txt"), b"src\n")?;
-
-        // Probe whether this filesystem actually persists xattrs; skip the
-        // assertions (not the run) if not, so a tmpfs can't make us flake.
-        let probe = root.path().join(".xattr_probe");
-        std::fs::write(&probe, b"x")?;
-        let xattr_supported = xattr::set(&probe, hbuiltins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
 
         let cp_addr = hmodel::htaddr::parse_addr("//pkg:cp")?;
         let ip_addr = hmodel::htaddr::parse_addr("//pkg:ip")?;
@@ -10319,56 +10390,52 @@ mod tests {
         let (res, _e) = resolve_collecting_events(&engine, &ip_addr).await;
         res.expect("in_place codegen target must resolve");
 
-        let gen_file = root.path().join("pkg/out.gen");
         assert!(
-            gen_file.exists(),
+            root.path().join("pkg/out.gen").exists(),
             "copy codegen file must be written to the tree"
         );
-        let src_file = root.path().join("pkg/src.txt");
         assert!(
-            src_file.exists(),
+            root.path().join("pkg/src.txt").exists(),
             "in_place codegen file must exist in the tree"
         );
-
-        if xattr_supported {
-            assert!(
-                xattr::get(&gen_file, hbuiltins::pluginfs::CODEGEN_XATTR)?.is_some(),
-                "net-new copy output must carry the codegen xattr"
-            );
-            assert!(
-                xattr::get(&src_file, hbuiltins::pluginfs::CODEGEN_XATTR)?.is_none(),
-                "in_place output must NOT carry the codegen xattr"
-            );
-        }
+        assert!(
+            engine
+                .codegen_claims
+                .claims(std::path::Path::new("pkg/out.gen")),
+            "the copy output is claimed"
+        );
+        assert!(
+            !engine
+                .codegen_claims
+                .claims(std::path::Path::new("pkg/src.txt")),
+            "the in_place output is a tracked source and must NOT be claimed"
+        );
         Ok(())
     }
 
     /// An `in_place` target must NOT write back into a tree file that another
-    /// `copy` codegen target owns (stamped with the codegen xattr). Here `//pkg:cp`
-    /// generates+stamps `out.gen`; `//pkg:ip` (in_place) then regenerates `out.gen`
-    /// with different bytes. The guard leaves the copy-owned file untouched.
+    /// `copy` codegen target claims. Here `//pkg:cp` generates `out.gen`;
+    /// `//pkg:ip` (in_place) then regenerates `out.gen` with different bytes. The
+    /// guard leaves the copy-owned file untouched.
     #[tokio::test]
     async fn in_place_does_not_clobber_copy_controlled_file() -> anyhow::Result<()> {
-        let (engine, root) = engine_with_home_fs(vec![
-            codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo copyowned > out.gen"),
-            // in_place over the same path, emitting DIFFERENT bytes.
-            codegen_run_target(
-                "//pkg:ip",
-                "in_place",
-                &["*.gen"],
-                "echo clobbered > out.gen",
-            ),
-        ])?;
+        let (engine, root) = engine_with_home_fs_claiming(
+            vec![
+                codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo copyowned > out.gen"),
+                // in_place over the same path, emitting DIFFERENT bytes.
+                codegen_run_target(
+                    "//pkg:ip",
+                    "in_place",
+                    &["*.gen"],
+                    "echo clobbered > out.gen",
+                ),
+            ],
+            &["# //pkg:cp", "/pkg/out.gen"],
+        )?;
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
 
-        // Skip the guard assertion (not the run) on a filesystem without xattrs —
-        // without a stamp there is nothing to protect and no way to detect one.
-        let probe = root.path().join(".xattr_probe");
-        std::fs::write(&probe, b"x")?;
-        let xattr_supported = xattr::set(&probe, hbuiltins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
-
-        // Copy first: writes+stamps out.gen. Then in_place tries to overwrite it.
+        // Copy first: writes out.gen. Then in_place tries to overwrite it.
         resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:cp")?)
             .await
             .0
@@ -10378,18 +10445,11 @@ mod tests {
             .0
             .expect("in_place target resolves");
 
-        let gen_file = pkg_dir.join("out.gen");
-        if xattr_supported {
-            assert_eq!(
-                std::fs::read(&gen_file)?,
-                b"copyowned\n",
-                "in_place must not clobber a copy-controlled tree file",
-            );
-            assert!(
-                xattr::get(&gen_file, hbuiltins::pluginfs::CODEGEN_XATTR)?.is_some(),
-                "the copy target's provenance stamp must survive",
-            );
-        }
+        assert_eq!(
+            std::fs::read(pkg_dir.join("out.gen"))?,
+            b"copyowned\n",
+            "in_place must not clobber a copy-controlled tree file",
+        );
         Ok(())
     }
 

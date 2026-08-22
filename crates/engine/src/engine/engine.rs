@@ -36,6 +36,12 @@ pub struct PluginInit {
     pub skip_globs: Vec<String>,
     /// Shared cross-run filesystem-walk cache for tree-walking plugins.
     pub walker: Arc<hwalk::CachedWalker>,
+    /// Workspace paths a `codegen = "copy"` target owns, read once from the
+    /// heph-managed `.gitignore` section. Every plugin that discovers source
+    /// files must skip them: their content already enters the graph through
+    /// their generator, so sourcing them again double-sources it. Handed to the
+    /// plugin rather than discovered, like the skip set beside it.
+    pub codegen_claims: Arc<hwalk::CodegenClaims>,
     /// The engine's runtime — what an in-process plugin's memoizers spawn
     /// their computations on. Handed to the plugin, never discovered by it
     /// (a cdylib plugin uses its own runtime instead; this field serves the
@@ -75,6 +81,11 @@ pub struct Engine {
     /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
     /// tree-walking plugins via [`PluginInit`].
     pub(crate) walker: Arc<hwalk::CachedWalker>,
+    /// Tree paths owned by a `codegen = "copy"` target. Read once at
+    /// construction and handed to every plugin via [`PluginInit`]; the engine
+    /// also consults it in the codegen write-back, so an `in_place` target never
+    /// clobbers a file a `copy` target owns.
+    pub(crate) codegen_claims: Arc<hwalk::CodegenClaims>,
 
     pub(crate) providers: Vec<Arc<Provider>>,
     pub providers_by_name: HashMap<String, Arc<Provider>>,
@@ -424,6 +435,12 @@ impl Engine {
             &home.join("cache").join("fswalk.db"),
         ));
 
+        // Which tree paths are generated rather than source. Read once, from the
+        // committed `.gitignore` section `heph tool gen-gitignore` writes and
+        // `heph validate` checks — a declaration, so unlike the file-metadata
+        // mark it replaced, no tool that rewrites a file can erase it.
+        let codegen_claims = Arc::new(hwalk::CodegenClaims::load(&cfg.root));
+
         let max_workers = 2 * parallelism;
 
         // Fails loudly here rather than at first request: every request's
@@ -440,6 +457,7 @@ impl Engine {
             local_cache,
             local_cache_tmp,
             walker,
+            codegen_claims,
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],
@@ -477,12 +495,15 @@ impl Engine {
 
         // The `fs` provider + driver are always-on built-ins. Each builds its
         // `Ignore` from the same `PluginInit` (home + `fs.skip` dirs/globs) the
-        // engine hands every plugin, so every fs glob walk prunes the same paths.
+        // engine hands every plugin, so every fs glob walk prunes the same paths,
+        // and takes the same codegen claim set so a generated file is never
+        // sourced as raw input.
         // The fallible variant lets a bad `fs.skip` glob surface as an error here.
         engine.try_register_provider(|init| {
             let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             Ok(Box::new(hbuiltins::pluginfs::Provider::new(
                 ignore,
+                init.codegen_claims.clone(),
                 init.walker.clone(),
             )))
         })?;
@@ -490,6 +511,7 @@ impl Engine {
             let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             Ok(Box::new(hbuiltins::pluginfs::Driver::new(
                 ignore,
+                init.codegen_claims.clone(),
                 init.walker.clone(),
             )))
         })?;
@@ -601,6 +623,7 @@ impl Engine {
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
             walker: self.walker.clone(),
+            codegen_claims: self.codegen_claims.clone(),
             runtime: self.runtime.clone(),
         }
     }

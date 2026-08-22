@@ -36,7 +36,7 @@ use hplugin::provider::{
     ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
     ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
 };
-use hwalk::{CachedWalker, EntryKind, Ignore};
+use hwalk::{CachedWalker, CodegenClaims, EntryKind, Ignore};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -80,6 +80,10 @@ pub struct Config {
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
     pub skip: Arc<Ignore>,
+    /// Tree paths a `codegen = "copy"` target owns. A generated `.go` file is not
+    /// a package source — its content already reaches the graph through its
+    /// generator — so package discovery skips it. See [`hwalk::CodegenClaims`].
+    pub codegen_claims: Arc<CodegenClaims>,
     /// Reject target names this provider doesn't own *before* the `_golist`
     /// resolve (see [`is_known_go_target_name`]). On by default: it avoids a
     /// wasted `go list` for foreign names (e.g. a buildfile codegen target
@@ -105,6 +109,7 @@ impl Default for Config {
             govet: govet::default_addr(),
             cctool: cc_toolchain::default_addr(),
             skip: Arc::new(Ignore::default()),
+            codegen_claims: Arc::default(),
             foreign_name_guard: true,
             walker: Arc::new(CachedWalker::disabled()),
         }
@@ -133,6 +138,9 @@ pub(crate) struct ProviderInner {
     cctool: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
+    /// Tree paths owned by a `codegen = "copy"` target — skipped by package
+    /// discovery, which must never source a generated `.go` file.
+    codegen_claims: Arc<CodegenClaims>,
     /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
     walker: Arc<CachedWalker>,
     /// See [`Config::foreign_name_guard`].
@@ -244,6 +252,7 @@ impl Provider {
         workspace_root: PathBuf,
         skip_dirs: &[PathBuf],
         skip_globs: &[String],
+        codegen_claims: Arc<CodegenClaims>,
         opts: &hplugin::config::Options,
         walker: Arc<CachedWalker>,
         runtime: tokio::runtime::Handle,
@@ -305,6 +314,7 @@ impl Provider {
                 govet,
                 cctool,
                 skip,
+                codegen_claims,
                 walker,
                 ..Default::default()
             },
@@ -325,6 +335,7 @@ impl Provider {
                 govet: config.govet,
                 cctool: config.cctool,
                 skip: config.skip,
+                codegen_claims: config.codegen_claims,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
                 pkg_cache: Memoizer::with_tag_task("pkg_cache", runtime.clone()),
@@ -1533,8 +1544,8 @@ fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Ve
 /// pattern (decoupled out of `_golist`) poisons go list's atomic per-package embed
 /// resolution, zeroing `EmbedFiles` for the co-located plain `//go:embed` statics
 /// too. Staging the static tree lets the in-driver Go-faithful selector resolve
-/// those statics from the bytes. Generated `go_embed_src` outputs carry the
-/// codegen xattr and are skipped by the glob, so the decoupling (and any
+/// those statics from the bytes. Generated `go_embed_src` outputs are claimed as
+/// codegen output and skipped by the glob, so the decoupling (and any
 /// `go_embed_src` lane staging) is preserved with no double-staging.
 fn pkg_static_embed_glob_addr(pkg_str: &str) -> String {
     let glob = if pkg_str.is_empty() {
@@ -2976,7 +2987,12 @@ impl ProviderInner {
             if !path.is_file() {
                 continue;
             }
-            if pluginfs::has_codegen_xattr(&path) || pluginfs::resolves_into_heph_dir(&path) {
+            // A generated `.go` file is not a package source: its content
+            // already enters the graph through its generator, so listing it here
+            // would double-source it. The claim is declared rather than marked on
+            // the file, so a `gofmt -w` over the generated file cannot revoke it.
+            let rel = path.strip_prefix(&self.workspace_root).unwrap_or(&path);
+            if self.codegen_claims.claims(rel) || pluginfs::resolves_into_heph_dir(&path) {
                 continue;
             }
             files.push(name.to_string());
@@ -5537,6 +5553,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             PathBuf::from("/nonexistent"),
             &[],
             &[],
+            Arc::default(),
             opts,
             Arc::new(CachedWalker::disabled()),
             test_runtime(),
@@ -5570,6 +5587,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             PathBuf::from("/nonexistent"),
             &[],
             &[],
+            Arc::default(),
             &opts,
             Arc::new(CachedWalker::disabled()),
             test_runtime(),

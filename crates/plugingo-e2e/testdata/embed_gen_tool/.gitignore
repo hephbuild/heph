@@ -1,8 +1,4 @@
-.heph*
-profile.json.gz
-profile.json.syms.json
-
 # BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)
-# //fmt:generated
-/fmt/generated.txt
+# //app:openapi_gen
+/app/openapi/openapi_gen.yaml
 # END heph-generated

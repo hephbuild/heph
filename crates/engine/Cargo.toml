@@ -90,7 +90,6 @@ which = "8.0.3"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 thiserror = "2.0.18"
 libc = "0.2"
-xattr = "1"
 tempfile = "3.27"
 derivative = "2.2.0"
 humantime = "2.3.0"
