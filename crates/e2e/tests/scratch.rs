@@ -19,6 +19,7 @@ mod common;
 
 use common::Workspace;
 use heph::engine::{OutputMatcher, ResultOptions};
+use std::sync::Arc;
 
 /// `EResult` has no `Debug`, so `expect_err` will not compile. Unwrap the error
 /// side explicitly instead.
@@ -166,6 +167,18 @@ async fn an_unknown_access_names_the_valid_options() -> anyhow::Result<()> {
 // Referencing a scratch from a consuming target.
 // ---------------------------------------------------------------------------
 
+/// Read a target's def hash — the thing that must not move. Asserting on
+/// `hashout` instead would be a trap: a target whose key moved still produces
+/// identical bytes, so a hashout comparison passes while the cache misses on
+/// every run.
+async fn def_hash(engine: &Arc<heph::engine::Engine>, addr: &str) -> anyhow::Result<Vec<u8>> {
+    let addr = heph::htaddr::parse_addr(addr)?;
+    let def = Arc::clone(engine)
+        .get_def(engine.new_state(), &addr)
+        .await?;
+    Ok(def.target_def.hash.clone())
+}
+
 /// The central property (`docs/SCRATCH.md` §6.3): **nothing about a scratch
 /// reaches a consumer's `hashin`**. Not the reference, and not the declaration.
 ///
@@ -186,16 +199,28 @@ async fn referencing_a_scratch_does_not_change_the_consumer_hash() -> anyhow::Re
         "app",
         r#"target(name = "bare", driver = "bash", run = "echo hi > $OUT", out = "o.txt")
 target(name = "with", driver = "bash", run = "echo hi > $OUT", out = "o.txt",
-       scratch = ["//build:c"])"#,
+       scratch = ["//build:c"])
+target(name = "other", driver = "bash", run = "echo bye > $OUT", out = "o.txt")"#,
     );
 
+    let engine = ws.reopen()?;
+    // Precondition: `def_hash` discriminates. Without this the assertion below
+    // would pass just as happily if it returned a constant, and a test that
+    // cannot fail proves nothing.
+    assert_ne!(
+        def_hash(&engine, "//app:bare").await?,
+        def_hash(&engine, "//app:other").await?,
+        "def_hash must distinguish targets that genuinely differ"
+    );
+    assert_eq!(
+        def_hash(&engine, "//app:bare").await?,
+        def_hash(&engine, "//app:with").await?,
+        "a scratch reference must not change the consumer's def hash"
+    );
+    // And end to end: it does not change what the target produces either.
     let bare = ws.run("//app:bare").await?;
     let with = ws.run("//app:with").await?;
-    assert_eq!(
-        bare.artifacts[0].hashout()?,
-        with.artifacts[0].hashout()?,
-        "a scratch reference must not change what a target produces"
-    );
+    assert_eq!(bare.artifacts[0].hashout()?, with.artifacts[0].hashout()?);
     Ok(())
 }
 
@@ -214,6 +239,8 @@ async fn bumping_a_scratch_version_does_not_invalidate_consumers() -> anyhow::Re
     };
 
     ws.write_build_file("build", &decl("v1"));
+    let first_engine = ws.reopen()?;
+    let first_def_hash = def_hash(&first_engine, "//app:a").await?;
     let first = ws.run("//app:a").await?;
     let first_hash = first.artifacts[0].hashout()?;
 
@@ -233,11 +260,15 @@ async fn bumping_a_scratch_version_does_not_invalidate_consumers() -> anyhow::Re
             &ResultOptions::default(),
         )
         .await?;
+    // The load-bearing assertion: the consumer's *key* is untouched, so its
+    // cached result is still a hit. A `version` bump gives a fresh empty slot and
+    // rebuilds nothing.
     assert_eq!(
-        first_hash,
-        second.artifacts[0].hashout()?,
-        "a `version` bump must not change a consumer's result"
+        first_def_hash,
+        def_hash(&engine, "//app:a").await?,
+        "a scratch `version` bump must not change a consumer's def hash"
     );
+    assert_eq!(first_hash, second.artifacts[0].hashout()?);
     Ok(())
 }
 
