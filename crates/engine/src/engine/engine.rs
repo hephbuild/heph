@@ -440,7 +440,10 @@ impl Engine {
         // state, and not attached to the file — so no tool that rewrites the file
         // can erase the claim, which is the failure that sank the extended
         // attribute this replaced.
-        let codegen_claims = Arc::new(hwalk::CodegenClaims::load(home.join("codegen-claims")));
+        let codegen_claims = Arc::new(
+            hwalk::CodegenClaims::open(home.join("cache").join("codegen-claims.db"))
+                .context("opening the codegen claim store")?,
+        );
 
         let max_workers = 2 * parallelism;
 

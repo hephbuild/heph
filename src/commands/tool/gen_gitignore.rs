@@ -56,9 +56,15 @@ impl App for GenGitignoreApp {
 
         let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
-            let fresh = Arc::clone(&self.engine)
-                .codegen_copy_gitignore_patterns(rs.clone(), &self.matcher)
+            // One whole-or-scoped resolution feeds both derived artifacts: the
+            // claim store (which decides what is generated) and the `.gitignore`
+            // section (which only tells git to ignore build outputs). They ride
+            // the same command because the resolution is the expensive part, not
+            // because they are the same thing.
+            let scan = Arc::clone(&self.engine)
+                .codegen_copy_scan_for(rs.clone(), &self.matcher)
                 .await?;
+            let fresh = gitignore::normalize_entries(scan.gitignore_entries());
 
             let path = self.root.join(".gitignore");
             let existing = match std::fs::read_to_string(&path) {
@@ -83,7 +89,7 @@ impl App for GenGitignoreApp {
             // a stale claim silently hides a real source file at that path.
             let dropped = gitignore::reconcile_claims(
                 self.engine.codegen_claims(),
-                &fresh,
+                &scan,
                 &self.matcher,
                 self.scoped,
             )

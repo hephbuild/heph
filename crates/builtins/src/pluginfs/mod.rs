@@ -1807,12 +1807,23 @@ mod tests {
         );
     }
 
-    /// A claim set holding `patterns`, as if a codegen target had generated them.
-    fn claims_for(patterns: &[&str]) -> (tempfile::TempDir, Arc<CodegenClaims>) {
+    /// A claim set holding `paths`, as if a codegen target had generated them.
+    fn claims_for(paths: &[&str]) -> (tempfile::TempDir, Arc<CodegenClaims>) {
         let dir = tempdir().expect("tempdir");
-        let claims = Arc::new(CodegenClaims::load(dir.path().join("codegen-claims")));
-        let owned: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
-        claims.record("//pkg:gen", &owned).expect("record");
+        let claims = Arc::new(
+            CodegenClaims::open(dir.path().join("codegen-claims.db")).expect("claim store"),
+        );
+        let declared: Vec<hwalk::Claim> = paths
+            .iter()
+            .map(|p| {
+                if p.ends_with("/**") || !p.contains('.') {
+                    hwalk::Claim::dir(p.trim_end_matches("/**"))
+                } else {
+                    hwalk::Claim::file(*p)
+                }
+            })
+            .collect();
+        claims.record("//pkg:gen", &declared).expect("record");
         (dir, claims)
     }
 

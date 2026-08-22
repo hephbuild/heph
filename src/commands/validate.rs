@@ -146,25 +146,28 @@ impl App for ValidateApp {
                 if scoped {
                     return Ok((false, Vec::new()));
                 }
-                let entries = Arc::clone(&engine)
-                    .codegen_copy_gitignore_patterns(
-                        rs.clone(),
-                        &Matcher::TreeOutputTo(PkgBuf::from("")),
-                    )
+                let scan = Arc::clone(&engine)
+                    .codegen_copy_scan_for(rs.clone(), &Matcher::TreeOutputTo(PkgBuf::from("")))
                     .await?;
+                let entries = gitignore::normalize_entries(scan.gitignore_entries());
 
                 // Claims whose target no longer emits them. Reported, not
                 // repaired: `validate` is a check, and the repair belongs to the
                 // command that rewrites these declarations. A stale claim is the
                 // quiet failure — it hides a real source file at that path — so
                 // silence here would be the wrong kind of clean run.
-                let want = gitignore::entries_by_addr(&entries);
+                // Only a target that RESOLVED and declares no copy output is
+                // positive evidence of an orphan. One that failed to resolve tells
+                // us nothing, and reporting it would send the user to a command
+                // that would then release a live claim.
                 let orphans: Vec<String> = engine
                     .codegen_claims()
                     .entries()
-                    .context("reading the codegen claim ledger")?
+                    .context("reading the codegen claim store")?
                     .into_keys()
-                    .filter(|addr| !want.contains_key(addr))
+                    .filter(|addr| {
+                        !scan.claims.contains_key(addr) && !scan.unresolved.contains(addr)
+                    })
                     .collect();
 
                 let path = root.join(".gitignore");

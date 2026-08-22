@@ -2780,16 +2780,16 @@ impl Engine {
         // emit later, and re-recording releases a path it no longer emits. A
         // no-op once the ledger already says this, which is the steady state
         // after the first run.
-        let copy_patterns: Vec<String> = target
+        let copy_claims: Vec<hwalk::Claim> = target
             .outputs
             .iter()
             .flat_map(|o| o.paths.iter())
             .filter(|p| matches!(p.codegen_tree, CodegenMode::Copy))
-            .map(|p| crate::engine::gitignore::content_to_pattern(&p.content))
+            .map(|p| crate::engine::gitignore::content_to_claim(&p.content))
             .collect();
-        if !copy_patterns.is_empty() {
+        if !copy_claims.is_empty() {
             claims
-                .record(&target.addr.format(), &copy_patterns)
+                .record(&target.addr.format(), &copy_claims)
                 .with_context(|| format!("register codegen claims for {}", target.addr.format()))?;
         }
         let claim_set = claims.snapshot();

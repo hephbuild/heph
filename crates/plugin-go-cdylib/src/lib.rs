@@ -81,7 +81,9 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // Its own handle rather than one passed across the ABI: the set is re-read
     // when the ledger changes, so a claim the host registers mid-run reaches this
     // copy too, with no ABI surface to keep in sync.
-    let codegen_claims = Arc::new(hwalk::CodegenClaims::load(home.join("codegen-claims")));
+    let codegen_claims = Arc::new(hwalk::CodegenClaims::open(
+        home.join("cache").join("codegen-claims.db"),
+    )?);
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(Provider::from_options(
         root,
         &[],

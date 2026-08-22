@@ -5567,9 +5567,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         std::fs::write(pkg.join("hand_written.go"), b"package pkg\n").expect("write");
         std::fs::write(pkg.join("gen.go"), b"package pkg\n").expect("write");
 
-        let claims = Arc::new(hwalk::CodegenClaims::load(
-            ws.path().join(".heph3").join("codegen-claims"),
-        ));
+        let claims = Arc::new(
+            hwalk::CodegenClaims::open(ws.path().join(".heph3").join("codegen-claims.db"))
+                .expect("claim store"),
+        );
 
         let provider = Provider::with_config(
             ws.path().to_path_buf(),
@@ -5591,7 +5592,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         );
 
         claims
-            .record("//pkg:gen", &["/pkg/gen.go".to_string()])
+            .record("//pkg:gen", &[hwalk::Claim::file("/pkg/gen.go")])
             .expect("record");
 
         assert_eq!(
