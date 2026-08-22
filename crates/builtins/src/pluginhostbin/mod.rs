@@ -325,6 +325,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: sandbox_dir.to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         }
     }
 

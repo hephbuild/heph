@@ -75,7 +75,8 @@ target(name = "b", driver = "bash", run = "echo x > $OUT", out = "o", runner = N
 /// starts matching a file that appeared for reasons the BUILD file cannot see.
 #[tokio::test]
 async fn runner_artifact_is_not_materialized_into_the_sandbox() -> anyhow::Result<()> {
-    let ws = Workspace::new();
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ws = Workspace::with_recording_runner(std::sync::Arc::clone(&opens), ("X", "y"));
     ws.write_build_file(
         "mat",
         r#"
@@ -215,5 +216,139 @@ target(name = "user", driver = "bash", run = "echo x > $OUT", out = "o")
     // Resolves rather than cycling.
     let res = ws.run("//self:user").await?;
     assert!(!common::artifact_string(&res).is_empty());
+    Ok(())
+}
+
+/// The session actually reaches the process: a variable the runner supplies is
+/// visible to the target, and one the target sets itself is *not* overwritten
+/// by the runner's value for the same name.
+#[tokio::test]
+async fn the_session_environment_reaches_the_target() -> anyhow::Result<()> {
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ws = Workspace::with_recording_runner(
+        std::sync::Arc::clone(&opens),
+        ("FROM_RUNNER", "runner_value"),
+    );
+    ws.write_build_file(
+        "sess",
+        r#"
+target(name = "env", driver = "bash", run = "echo ARTIFACT_BODY > $OUT", out = "env.json")
+target(
+    name = "consumer",
+    driver = "bash",
+    run = "echo \"$FROM_RUNNER|$HEPH_TEST_RUNNER_ARTIFACT|$MINE\" > $OUT",
+    out = "o",
+    env = {"MINE": "target_value"},
+    runner = "//sess:env",
+)
+"#,
+    );
+
+    let res = ws.run("//sess:consumer").await?;
+    let out = common::artifact_string(&res);
+    assert!(
+        out.contains("runner_value"),
+        "runner env did not reach the target: {out:?}"
+    );
+    // The runner derived this from the runner target's artifact, not from thin
+    // air — which is what keeps `open` a pure parse of hashed content.
+    assert!(
+        out.contains("ARTIFACT_BODY"),
+        "runner did not see the runner target's artifact: {out:?}"
+    );
+    assert!(
+        out.contains("target_value"),
+        "the target's own env must survive: {out:?}"
+    );
+    Ok(())
+}
+
+/// "Spawn the shell once and have multiple targets run within that context" —
+/// the requirement the whole session abstraction exists for. Asserted with a
+/// counter, because nothing else can show it.
+#[tokio::test]
+async fn one_open_serves_many_targets() -> anyhow::Result<()> {
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ws = Workspace::with_recording_runner(std::sync::Arc::clone(&opens), ("V", "1"));
+    ws.write_build_file(
+        "many",
+        r#"
+target(name = "env", driver = "bash", run = "echo E > $OUT", out = "env.json")
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "o", runner = "//many:env")
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "o", runner = "//many:env")
+target(name = "c", driver = "bash", run = "echo c > $OUT", out = "o", runner = "//many:env")
+"#,
+    );
+
+    for t in ["//many:a", "//many:b", "//many:c"] {
+        ws.run(t).await?;
+    }
+
+    assert_eq!(
+        opens.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "three targets sharing one environment must open it once",
+    );
+    Ok(())
+}
+
+/// Two runner targets whose artifacts are byte-identical are the *same*
+/// environment, so they share a session. Keying by content rather than by addr
+/// is what makes that true — and it is the same property that lets a renamed
+/// runner target keep its cache.
+#[tokio::test]
+async fn identical_artifacts_share_one_session() -> anyhow::Result<()> {
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ws = Workspace::with_recording_runner(std::sync::Arc::clone(&opens), ("V", "1"));
+    ws.write_build_file(
+        "same",
+        r#"
+target(name = "env1", driver = "bash", run = "echo SAME > $OUT", out = "env.json")
+target(name = "env2", driver = "bash", run = "echo SAME > $OUT", out = "env.json")
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "o", runner = "//same:env1")
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "o", runner = "//same:env2")
+"#,
+    );
+
+    ws.run("//same:a").await?;
+    ws.run("//same:b").await?;
+
+    assert_eq!(
+        opens.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "byte-identical runner artifacts describe one environment and must share a session",
+    );
+    Ok(())
+}
+
+/// A driver served across the plugin ABI cannot yet be told which environment
+/// to build in, so the engine **refuses** the combination rather than degrading.
+///
+/// Degrading is the dangerous option, not the safe one: the runner's hashout is
+/// folded into the target's `hashin` at def time, so a plugin that quietly built
+/// in the host environment would write an artifact whose key asserts an
+/// environment its bytes do not reflect — and push it to the shared remote
+/// cache. An older cdylib could not even warn: prost drops fields it was not
+/// compiled with before guest code runs.
+#[tokio::test]
+async fn abi_served_driver_refuses_a_runner() -> anyhow::Result<()> {
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ws = Workspace::with_recording_runner_abi_driver(std::sync::Arc::clone(&opens));
+    ws.write_build_file(
+        "abi",
+        r#"
+target(name = "env", driver = "bash", run = "echo E > $OUT", out = "env.json")
+target(name = "c", driver = "abidriver", run = "true", runner = "//abi:env")
+"#,
+    );
+
+    let msg = match ws.run("//abi:c").await {
+        Ok(_) => panic!("an ABI-served driver must refuse a runner"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        msg.contains("plugin ABI") && msg.contains("abidriver"),
+        "error must name the driver and why, got: {msg}"
+    );
     Ok(())
 }

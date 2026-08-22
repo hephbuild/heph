@@ -563,6 +563,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "core",
+ "exec-runner",
  "futures",
  "glob",
  "itertools 0.15.0",
@@ -1503,6 +1504,7 @@ name = "e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "core",
  "heph",
  "plugin-oci",
@@ -1562,6 +1564,7 @@ dependencies = [
  "driver-bridge",
  "driver-support",
  "enclose",
+ "exec-runner",
  "flate2",
  "futures",
  "glob",
@@ -4008,6 +4011,7 @@ dependencies = [
  "config",
  "core",
  "erased-serde 0.4.10",
+ "exec-runner",
  "futures",
  "htspec-derive",
  "itertools 0.15.0",

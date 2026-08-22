@@ -103,7 +103,9 @@ fn load_dylib_plugins(
             e.register_provider(|_| Box::new(p))?;
         }
         for (_name, drv) in drivers {
-            e.register_managed_driver(|_| Box::new(drv))?;
+            // `_abi`: these came from a cdylib, and a driver behind the seam
+            // cannot yet be told which environment to build in.
+            e.register_managed_driver_abi(|_| Box::new(drv))?;
         }
         for (_name, hook) in hooks {
             e.register_hook(std::sync::Arc::new(hook))?;

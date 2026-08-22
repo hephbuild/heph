@@ -3617,7 +3617,7 @@ impl Engine {
     /// its own dependency — which the cycle checker does catch, but reports as a
     /// graph problem when it is really a config one. Excluding it up front means
     /// the common case never reaches the checker at all.
-    fn resolve_runner(&self, addr: &Addr, spec: &TargetSpec) -> Option<Addr> {
+    pub(crate) fn resolve_runner(&self, addr: &Addr, spec: &TargetSpec) -> Option<Addr> {
         match &spec.runner {
             // `runner = None`: explicit opt-out, no default applies.
             Some(RunnerRef::Local) => None,

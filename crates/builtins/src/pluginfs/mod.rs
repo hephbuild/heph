@@ -1533,6 +1533,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: root,
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         }
     }
 

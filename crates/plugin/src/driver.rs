@@ -1026,6 +1026,13 @@ pub struct RunRequest<'a, 'io> {
     pub stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub sandbox_dir: std::path::PathBuf,
+    /// The environment this target's processes are created in. Always present;
+    /// `LocalSession` (an identity transform) unless a runner was selected.
+    ///
+    /// Resolved by the engine per target — a driver never chooses it. Drivers
+    /// create processes through this rather than calling `proc_exec` directly
+    /// (`docs/EXEC_RUNNERS.md` §4.2).
+    pub runner: std::sync::Arc<dyn hexec_runner::ExecSession>,
 }
 /// Cleanup closure a driver returns for the engine to run after `cache_locally`.
 /// The FUSE/OS sandbox layers each supply their own teardown; the engine's

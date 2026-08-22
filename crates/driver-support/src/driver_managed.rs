@@ -201,6 +201,7 @@ async fn run_shell_fallback<'a, 'io>(
         stdout,
         stderr,
         sandbox_dir: req_sandbox_dir,
+        runner: req_runner,
     } = request;
 
     let mut synthetic = (*shell_fallback.spec_template).clone();
@@ -235,6 +236,7 @@ async fn run_shell_fallback<'a, 'io>(
         stdout,
         stderr,
         sandbox_dir: req_sandbox_dir,
+        runner: req_runner,
     };
     let new_mreq = ManagedRunRequest {
         request: new_req,

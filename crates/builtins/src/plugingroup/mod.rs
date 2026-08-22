@@ -727,6 +727,7 @@ mod tests {
                     stdout: None,
                     stderr: None,
                     sandbox_dir: Default::default(),
+                    runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
                 },
                 &ctoken(),
             )

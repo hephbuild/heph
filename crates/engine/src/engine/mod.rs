@@ -29,6 +29,7 @@ pub use cwd::get_cwp;
 // The plugin contract (driver/provider/error + targetdef/eresult/htspec) now
 // lives in the `heph-plugin` crate; re-export at the original engine paths so
 // `crate::engine::driver::…` etc. resolve unchanged across engine + plugins.
+pub use hexec_runner as exec_runner;
 pub use hplugin::driver;
 pub use hplugin::error;
 pub use hplugin::hook;
@@ -69,6 +70,7 @@ pub use spec::EngineTargetSpec;
 pub use hdriver_bridge::driver_managed_fuse;
 pub use hdriver_support::driver_managed;
 pub use hdriver_support::driver_managed_os;
+pub(crate) mod exec_pool;
 mod execute;
 mod managed_register;
 mod result_lock;

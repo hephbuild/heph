@@ -46,9 +46,180 @@ impl std::ops::Deref for Workspace {
     }
 }
 
+/// A do-nothing managed driver registered as ABI-served, so a test can reach
+/// the engine's refusal without building a cdylib.
+pub struct AbiDriver;
+
+#[async_trait::async_trait]
+impl heph::engine::driver_managed::ManagedDriver for AbiDriver {
+    fn config(
+        &self,
+        _: heph::engine::driver::ConfigRequest,
+    ) -> anyhow::Result<heph::engine::driver::ConfigResponse> {
+        Ok(heph::engine::driver::ConfigResponse {
+            name: "abidriver".to_string(),
+        })
+    }
+    fn schema(&self) -> heph::engine::driver::DriverSchema {
+        Default::default()
+    }
+    async fn parse(
+        &self,
+        req: heph::engine::driver::ParseRequest,
+        _: &(dyn heph::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<heph::engine::driver::ParseResponse> {
+        use heph::engine::driver::targetdef::{CacheConfig, TargetDef};
+        Ok(heph::engine::driver::ParseResponse {
+            target_def: TargetDef {
+                addr: req.target_spec.addr.clone(),
+                labels: vec![],
+                raw_def: Arc::new(()),
+                inputs: vec![],
+                outputs: vec![],
+                support_files: vec![],
+                cache: CacheConfig::off(),
+                pty: false,
+                hash: vec![1],
+                transparent: false,
+            },
+        })
+    }
+    async fn apply_transitive(
+        &self,
+        req: heph::engine::driver::ApplyTransitiveRequest,
+        _: &(dyn heph::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<heph::engine::driver::ApplyTransitiveResponse> {
+        Ok(heph::engine::driver::ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+    async fn run<'a, 'io>(
+        &self,
+        _: heph::engine::driver_managed::ManagedRunRequest<'a, 'io>,
+        _: &(dyn heph::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<heph::engine::driver_managed::ManagedRunResponse> {
+        Ok(heph::engine::driver_managed::ManagedRunResponse { artifacts: vec![] })
+    }
+}
+
+/// A test [`ExecRunner`] that counts its opens and hands back an environment.
+///
+/// The open counter is the point: the whole premise of a session is "acquire
+/// once, serve many", and nothing else can prove it.
+pub struct RecordingExecRunner {
+    pub opens: Arc<std::sync::atomic::AtomicUsize>,
+    /// Env var name/value the returned session applies to every process.
+    pub var: (String, String),
+}
+
+#[async_trait::async_trait]
+impl heph::engine::exec_runner::ExecRunner for RecordingExecRunner {
+    async fn open(
+        &self,
+        req: heph::engine::exec_runner::OpenRequest,
+        _ctoken: &(dyn heph::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<Arc<dyn heph::engine::exec_runner::ExecSession>> {
+        use heph::engine::exec_runner as er;
+        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // The environment is derived from the artifact, not invented: that is
+        // the rule that keeps `open` a pure parse of content the cache key
+        // already covers (docs/EXEC_RUNNERS.md §4.7).
+        let from_artifact = req
+            .artifacts
+            .first()
+            .map(|a| String::from_utf8_lossy(&a.bytes).trim().to_string())
+            .unwrap_or_default();
+
+        Ok(Arc::new(er::EnvSession::new(
+            vec![
+                (
+                    std::ffi::OsString::from(self.var.0.clone()),
+                    std::ffi::OsString::from(self.var.1.clone()),
+                ),
+                (
+                    std::ffi::OsString::from("HEPH_TEST_RUNNER_ARTIFACT"),
+                    std::ffi::OsString::from(from_artifact),
+                ),
+            ],
+            er::SessionCaps {
+                pty: true,
+                max_concurrent: None,
+                identity: er::Identity::Pinned {
+                    by: req.key.clone(),
+                },
+            },
+            er::SessionDescription {
+                runner: req.runner_addr.clone(),
+                key: req.key,
+                summary: "recording test runner".to_string(),
+            },
+        )))
+    }
+}
+
 impl Workspace {
+    /// A workspace whose `bash`-driven runner targets are served by
+    /// [`RecordingExecRunner`], with `defaultRunner` unset.
+    pub fn with_recording_runner(
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        var: (&str, &str),
+    ) -> Self {
+        Self {
+            inner: WorkspaceBuilder::new()
+                .expect("workspace tempdir")
+                .with_provider(|init| {
+                    Box::new(pluginbuildfile::Provider::new(
+                        init.root.to_path_buf(),
+                        init.runtime.clone(),
+                    ))
+                })
+                .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
+                .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+                // Keyed by the runner target's DRIVER name — a runner target
+                // built by `bash` is read back by the runner registered here.
+                .with_exec_runner(
+                    "bash",
+                    Arc::new(RecordingExecRunner {
+                        opens,
+                        var: (var.0.to_string(), var.1.to_string()),
+                    }),
+                )
+                .build()
+                .expect("build workspace"),
+            reopen_with: None,
+        }
+    }
+
     pub fn new() -> Self {
         Self::with_parallelism(None)
+    }
+
+    /// Like [`Workspace::with_recording_runner`], plus an `abidriver` managed
+    /// driver registered as though it came from a cdylib.
+    pub fn with_recording_runner_abi_driver(opens: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            inner: WorkspaceBuilder::new()
+                .expect("workspace tempdir")
+                .with_provider(|init| {
+                    Box::new(pluginbuildfile::Provider::new(
+                        init.root.to_path_buf(),
+                        init.runtime.clone(),
+                    ))
+                })
+                .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+                .with_managed_driver_abi(Box::new(AbiDriver))
+                .with_exec_runner(
+                    "bash",
+                    Arc::new(RecordingExecRunner {
+                        opens,
+                        var: ("V".to_string(), "1".to_string()),
+                    }),
+                )
+                .build()
+                .expect("build workspace"),
+            reopen_with: None,
+        }
     }
 
     /// A workspace with `defaultRunner:` set — the exec environment every
@@ -72,6 +243,14 @@ impl Workspace {
                 .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
                 .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
                 .with_default_runner(addr)
+                // A default runner is only useful if something can serve it.
+                .with_exec_runner(
+                    "bash",
+                    Arc::new(RecordingExecRunner {
+                        opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        var: ("FROM_DEFAULT_RUNNER".to_string(), "1".to_string()),
+                    }),
+                )
                 .build()
                 .expect("build workspace"),
             reopen_with: None,

@@ -17,6 +17,7 @@ pub struct WorkspaceBuilder {
     parallelism: Option<usize>,
     fs_skip: Vec<String>,
     default_runner: Option<Addr>,
+    exec_runners: Vec<(String, Arc<dyn heph::engine::exec_runner::ExecRunner>)>,
     setups: Vec<SetupFn>,
 }
 
@@ -27,6 +28,7 @@ impl WorkspaceBuilder {
             parallelism: None,
             fs_skip: vec![],
             default_runner: None,
+            exec_runners: vec![],
             setups: vec![],
         })
     }
@@ -37,6 +39,7 @@ impl WorkspaceBuilder {
             parallelism: None,
             fs_skip: vec![],
             default_runner: None,
+            exec_runners: vec![],
             setups: vec![],
         }
     }
@@ -61,6 +64,17 @@ impl WorkspaceBuilder {
         self
     }
 
+    /// Register an exec runner under `name`, which must match the *driver name*
+    /// of the runner targets it serves.
+    pub fn with_exec_runner(
+        mut self,
+        name: impl Into<String>,
+        runner: Arc<dyn heph::engine::exec_runner::ExecRunner>,
+    ) -> Self {
+        self.exec_runners.push((name.into(), runner));
+        self
+    }
+
     pub fn with_provider(
         mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKProvider> + 'static,
@@ -73,6 +87,16 @@ impl WorkspaceBuilder {
     pub fn with_managed_driver(mut self, driver: Box<dyn SDKManagedDriver>) -> Self {
         self.setups.push(Box::new(move |e: &mut Engine| {
             e.register_managed_driver(|_| driver)
+        }));
+        self
+    }
+
+    /// [`Self::with_managed_driver`], registered as though it were loaded from a
+    /// cdylib. Lets a test exercise the engine's refusal to run an ABI-served
+    /// driver under a runner without building an actual plugin.
+    pub fn with_managed_driver_abi(mut self, driver: Box<dyn SDKManagedDriver>) -> Self {
+        self.setups.push(Box::new(move |e: &mut Engine| {
+            e.register_managed_driver_abi(|_| driver)
         }));
         self
     }
@@ -93,6 +117,9 @@ impl WorkspaceBuilder {
             default_runner: self.default_runner,
             ..Default::default()
         })?;
+        for (name, runner) in self.exec_runners {
+            e.register_exec_runner(name, runner)?;
+        }
         for setup in self.setups {
             setup(&mut e)?;
         }

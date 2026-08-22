@@ -44,6 +44,7 @@ use hcore::hasync::Cancellable;
 use hproc::proc_exec::{self, Handle, Spec};
 use std::ffi::OsString;
 use std::process::Output;
+use std::sync::Arc;
 
 /// How well-pinned a session's environment is. Diagnostics only — it never
 /// changes whether heph caches a target. Choosing a weakly-pinned environment
@@ -248,6 +249,60 @@ pub trait ExecSession: Send + Sync {
     }
 }
 
+/// One file from the runner target's artifacts, handed to [`ExecRunner::open`].
+///
+/// Bytes rather than a path: the artifact **is** the description of the
+/// environment (§4.7 — "the canonicalized `ExecSessionSpec` *is* the runner
+/// target's output artifact"), it is small by construction, and passing bytes
+/// keeps `open` a pure parse of content the cache key already covers rather
+/// than a filesystem read the key knows nothing about.
+#[derive(Debug, Clone)]
+pub struct RunnerArtifact {
+    /// Path within the artifact tree.
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+/// What a runner needs to open a session.
+#[derive(Debug, Clone)]
+pub struct OpenRequest {
+    /// Content-addressed identity of this environment — the runner target's
+    /// hashouts. Two runner targets with byte-identical artifacts are the same
+    /// environment and share a session, which is the intended behaviour.
+    pub key: String,
+    /// The runner target's address, for diagnostics only.
+    pub runner_addr: String,
+    /// The runner target's output artifacts.
+    pub artifacts: Vec<RunnerArtifact>,
+}
+
+/// An environment in which target processes are created.
+///
+/// Registered on the engine under a name, and selected by the *driver name of
+/// the runner target*: a plugin that exports a `devenv` driver (which builds
+/// the environment artifact) exports a `devenv` runner alongside it (which
+/// parses that artifact). One name, two halves — the half that produces the
+/// description, and the half that reads it.
+#[async_trait::async_trait]
+pub trait ExecRunner: Send + Sync {
+    /// Acquire the session for `req.key`.
+    ///
+    /// Called at most once per distinct key per engine — the pool single-flights
+    /// it — and never on the per-target path. It may be slow: a cold devenv
+    /// evaluation is tens of seconds.
+    ///
+    /// **Must be a pure function of `req`.** Anything it reads that is not in
+    /// `req` is unhashed input: `open` runs after `hashin` is computed, and not
+    /// at all on a fully-cached build, so a value it discovers cannot reach the
+    /// key and cannot be validated on the build where a stale artifact is
+    /// served.
+    async fn open(
+        &self,
+        req: OpenRequest,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<Arc<dyn ExecSession>>;
+}
+
 /// The zero-configuration session: the process is created exactly as it would
 /// have been before exec runners existed.
 ///
@@ -388,5 +443,152 @@ mod tests {
         .to_string();
         assert!(session.contains("runner `//:devenv`"), "{session}");
         assert!(session.contains("tools ="), "{session}");
+    }
+}
+
+/// A `Direct` session: processes are forked from this process, with a base
+/// environment applied beneath the caller's own.
+///
+/// This is the shape a devenv env-snapshot runner produces — the environment is
+/// a set of variables, and nothing else about process creation changes. It is
+/// also the reason `prepare` is the seam: there is no process to own here, only
+/// a spec to transform.
+#[derive(Debug)]
+pub struct EnvSession {
+    base_env: Vec<(OsString, OsString)>,
+    caps: SessionCaps,
+    description: SessionDescription,
+}
+
+impl EnvSession {
+    pub fn new(
+        base_env: Vec<(OsString, OsString)>,
+        caps: SessionCaps,
+        description: SessionDescription,
+    ) -> Self {
+        Self {
+            base_env,
+            caps,
+            description,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecSession for EnvSession {
+    /// Merge `base_env` **underneath** the spec's own entries.
+    ///
+    /// The caller wins on a collision: by the time a driver hands over a spec it
+    /// has already resolved the target's `env` / `pass_env` / `runtime_env` and
+    /// the sandbox's `$OUT`/`$SRC` routing, and none of that may be silently
+    /// replaced by an environment the target did not write.
+    ///
+    /// Pre-sized and built as a `Vec` rather than routed through a
+    /// `HashMap<String, String>`: the latter would clone every key and value and
+    /// then convert each again into `OsString`, which for a 60–150-variable dev
+    /// shell is hundreds of allocations per executed target.
+    fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
+        let mut env = Vec::with_capacity(self.base_env.len() + spec.env.len());
+        for (k, v) in &self.base_env {
+            if !spec.env.iter().any(|(sk, _)| sk == k) {
+                env.push((k.clone(), v.clone()));
+            }
+        }
+        env.append(&mut spec.env);
+        spec.env = env;
+        Ok(spec)
+    }
+
+    fn base_env(&self) -> Option<&[(OsString, OsString)]> {
+        Some(&self.base_env)
+    }
+
+    fn caps(&self) -> &SessionCaps {
+        &self.caps
+    }
+
+    fn describe(&self) -> &SessionDescription {
+        &self.description
+    }
+}
+
+#[cfg(test)]
+mod env_session_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn session(base: &[(&str, &str)]) -> EnvSession {
+        EnvSession::new(
+            base.iter()
+                .map(|(k, v)| (OsString::from(*k), OsString::from(*v)))
+                .collect(),
+            SessionCaps {
+                pty: true,
+                max_concurrent: None,
+                identity: Identity::Pinned {
+                    by: "test".to_string(),
+                },
+            },
+            SessionDescription {
+                runner: "test".to_string(),
+                key: "k".to_string(),
+                summary: "test".to_string(),
+            },
+        )
+    }
+
+    fn spec_with(env: &[(&str, &str)]) -> Spec {
+        Spec {
+            program: PathBuf::from("/bin/true"),
+            args: vec![],
+            env: env
+                .iter()
+                .map(|(k, v)| (OsString::from(*k), OsString::from(*v)))
+                .collect(),
+            cwd: PathBuf::from("/"),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Null,
+            stderr: proc_exec::StdioSpec::Null,
+            setsid: false,
+            ctty: false,
+        }
+    }
+
+    fn get<'a>(spec: &'a Spec, key: &str) -> Option<&'a OsString> {
+        spec.env.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn base_env_is_applied_where_the_caller_said_nothing() {
+        let out = session(&[("PATH", "/nix/bin")])
+            .prepare(spec_with(&[]))
+            .expect("prepare");
+        assert_eq!(get(&out, "PATH"), Some(&OsString::from("/nix/bin")));
+    }
+
+    /// The caller wins. A driver has already resolved the target's own `env` and
+    /// the sandbox's `$OUT`/`$SRC` routing by this point; an environment the
+    /// target never wrote must not silently replace any of it.
+    #[test]
+    fn the_callers_entries_win_over_the_base() {
+        let out = session(&[("PATH", "/nix/bin"), ("CC", "clang")])
+            .prepare(spec_with(&[("PATH", "/sandbox/bin:/nix/bin")]))
+            .expect("prepare");
+        assert_eq!(
+            get(&out, "PATH"),
+            Some(&OsString::from("/sandbox/bin:/nix/bin"))
+        );
+        // …and a base entry the caller did not mention still arrives.
+        assert_eq!(get(&out, "CC"), Some(&OsString::from("clang")));
+    }
+
+    /// One entry per key: a duplicate would leave which value the child sees up
+    /// to `execve`, which is not a decision to leave to chance.
+    #[test]
+    fn no_duplicate_keys_survive_the_merge() {
+        let out = session(&[("A", "base")])
+            .prepare(spec_with(&[("A", "caller")]))
+            .expect("prepare");
+        assert_eq!(out.env.iter().filter(|(k, _)| k == "A").count(), 1);
     }
 }

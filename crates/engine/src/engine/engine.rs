@@ -80,6 +80,18 @@ pub struct Engine {
     pub providers_by_name: HashMap<String, Arc<Provider>>,
     pub(crate) drivers: Vec<Arc<Driver>>,
     pub drivers_by_name: HashMap<String, Arc<Driver>>,
+    /// Exec runners by name. A runner is selected by the **driver name of the
+    /// runner target**: a plugin exporting a `devenv` driver (which builds the
+    /// environment artifact) exports a `devenv` runner alongside it (which reads
+    /// that artifact back).
+    pub exec_runners: HashMap<String, Arc<dyn hexec_runner::ExecRunner>>,
+    /// Open sessions, keyed by content — the runner target's hashouts.
+    ///
+    /// Engine-scoped rather than request-scoped so a long-lived process opens a
+    /// cold environment once, not once per invocation. Keyed by content and not
+    /// by addr so two runner targets with byte-identical artifacts correctly
+    /// share one session.
+    pub(crate) exec_sessions: Arc<crate::engine::exec_pool::ExecSessionPool>,
 
     /// Registered build-event hooks. Fed every emitted `BuildEvent` (see
     /// `RequestState::emit`); unlike providers/drivers they are never queried,
@@ -351,6 +363,17 @@ pub struct Provider {
 pub struct Driver {
     pub name: String,
     pub driver: Box<dyn SDKDriver>,
+    /// Whether this driver is served across the plugin ABI (a cdylib) rather
+    /// than linked into the host.
+    ///
+    /// Load-bearing, not informational: an ABI-served driver cannot yet be told
+    /// which environment to build in — the `runner_*` fields on
+    /// `pb::ManagedRunRequest` and their positive ack are Phase 2. Until then a
+    /// non-`local` runner on such a target would key the artifact as
+    /// runner-built while the plugin builds it in the host environment, and that
+    /// artifact goes to the shared remote cache. So the engine refuses the
+    /// combination outright rather than degrading (`docs/EXEC_RUNNERS.md` §8).
+    pub abi_served: bool,
 }
 
 impl Engine {
@@ -444,6 +467,8 @@ impl Engine {
             providers_by_name: HashMap::new(),
             drivers: vec![],
             drivers_by_name: HashMap::new(),
+            exec_runners: HashMap::new(),
+            exec_sessions: Arc::new(crate::engine::exec_pool::ExecSessionPool::default()),
             hooks: vec![],
             requests: Mutex::new(HashMap::new()),
             result_permits: {
@@ -608,9 +633,20 @@ impl Engine {
     /// Registers an already-constructed driver. Shared by [`Self::register_driver`]
     /// and [`Self::register_managed_driver`].
     fn insert_driver(&mut self, driver: Box<dyn SDKDriver>) -> anyhow::Result<()> {
+        self.insert_driver_with(driver, false)
+    }
+
+    /// [`Self::insert_driver`], recording whether the driver is served across
+    /// the plugin ABI. See [`Driver::abi_served`].
+    fn insert_driver_with(
+        &mut self,
+        driver: Box<dyn SDKDriver>,
+        abi_served: bool,
+    ) -> anyhow::Result<()> {
         let driver = Arc::new(Driver {
             name: driver.config(driver::ConfigRequest {})?.name,
             driver,
+            abi_served,
         });
 
         if self.drivers_by_name.contains_key(&driver.name) {
@@ -631,6 +667,34 @@ impl Engine {
         let managed = factory(&self.plugin_init_payload());
         let driver = self.new_managed_driver(managed);
         self.insert_driver(Box::new(driver))
+    }
+
+    /// [`Self::register_managed_driver`] for a driver loaded from a cdylib.
+    ///
+    /// The only difference is that the driver is marked [`Driver::abi_served`],
+    /// which the engine uses to refuse a non-`local` runner on its targets until
+    /// Phase 2 can actually carry one across the seam.
+    pub fn register_managed_driver_abi(
+        &mut self,
+        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKManagedDriver>,
+    ) -> anyhow::Result<()> {
+        let managed = factory(&self.plugin_init_payload());
+        let driver = self.new_managed_driver(managed);
+        self.insert_driver_with(Box::new(driver), true)
+    }
+
+    /// Register an exec runner under `name`, matching the driver name of the
+    /// runner targets it serves.
+    pub fn register_exec_runner(
+        &mut self,
+        name: impl Into<String>,
+        runner: Arc<dyn hexec_runner::ExecRunner>,
+    ) -> anyhow::Result<()> {
+        let name = name.into();
+        if self.exec_runners.insert(name.clone(), runner).is_some() {
+            anyhow::bail!("exec runner already registered: {name}");
+        }
+        Ok(())
     }
 
     pub fn register_driver(

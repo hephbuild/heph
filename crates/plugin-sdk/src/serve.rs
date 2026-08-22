@@ -1268,6 +1268,7 @@ async fn run_once(
         stdout: Some(&mut stdout_sink),
         stderr: Some(&mut stderr_sink),
         sandbox_dir: sandbox_dir.clone(),
+        runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
     };
     let mrr = ManagedRunRequest {
         request: rr,

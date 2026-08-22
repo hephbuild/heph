@@ -38,6 +38,15 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
             .cloned()?;
 
+        // Resolved here rather than threaded from `get_def`: `resolve_runner` is
+        // a pure function of (addr, spec, config), so recomputing it costs
+        // nothing and keeps the execute path from growing another parameter.
+        // The session itself is pooled and opened at most once per environment.
+        let runner_addr = self.resolve_runner(addr, spec);
+        let session = self
+            .exec_session_for(&rs, runner_addr.as_ref(), &driver)
+            .await?;
+
         hcore::hmemoizer::set_phase("execute:inputs_result_exec");
         let deps_result = self
             .clone()
@@ -158,7 +167,7 @@ impl Engine {
                     let hashin = hashin.to_owned();
 
                     let inner: InteractiveInner = Box::new(enclose!(
-                        (driver, def, rs, self => engine, sandbox_dir)
+                        (driver, def, rs, self => engine, sandbox_dir, session)
                         move |stdin, stdout, stderr| {
                             Box::pin(async move {
                                 let req = RunRequest {
@@ -171,6 +180,7 @@ impl Engine {
                                     stdout,
                                     stderr,
                                     sandbox_dir,
+                                    runner: Arc::clone(&session),
                                 };
                                 let res = if shell {
                                     driver.driver.run_shell(req, rs.ctoken()).await?

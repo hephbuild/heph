@@ -6,7 +6,6 @@ use hdriver_support::driver_managed::{
     detect_output_collisions_blocking, invoke_inner, list_path_for, resolve_unpack_root,
     unpack_blocking, write_source_map_blocking,
 };
-use hexec_runner::ExecSession;
 use hplugin::driver::{RunInput, RunRequest, RunResponse, SandboxGuard};
 use hsandboxfuse as sandboxfuse;
 use std::collections::BTreeMap;
@@ -24,8 +23,6 @@ pub struct ManagedDriverFuse {
     pub(crate) fs: Arc<sandboxfuse::LayeredFs>,
     pub(crate) fuse_lower: PathBuf,
     pub(crate) fuse_upper: PathBuf,
-    /// See [`hdriver_support::driver_managed_os::ManagedDriverOs::runner`].
-    pub(crate) runner: Arc<dyn ExecSession>,
 }
 
 impl ManagedDriverFuse {
@@ -148,6 +145,8 @@ impl ManagedDriverFuse {
 
         let target = req.target;
         let hashin = req.hashin;
+        // Cloned before `req` moves into `invoke_inner`.
+        let session = Arc::clone(&req.runner);
 
         let mut res = invoke_inner(
             &**self.driver,
@@ -159,7 +158,9 @@ impl ManagedDriverFuse {
             sandbox_pkg_dir.clone(),
             inputs,
             &self.shell_fallback,
-            Arc::clone(&self.runner),
+            // The engine resolved this target's environment; the struct field
+            // is only the fallback for callers that build a request by hand.
+            session,
         )
         .await?;
 

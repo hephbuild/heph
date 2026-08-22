@@ -2028,6 +2028,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         let res = tokio::time::timeout(
@@ -2352,6 +2353,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         let _res = driver.run(make_req(req), &ctoken).await?;
@@ -2409,6 +2411,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         let res = driver.run(make_req(req), &ctoken).await;
@@ -2479,6 +2482,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         // Use a timeout to detect the hang
@@ -2539,6 +2543,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2606,6 +2611,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2672,6 +2678,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         let res = tokio::time::timeout(
@@ -2847,6 +2854,7 @@ mod tests {
             stdout: Some(&mut out_handle),
             stderr: Some(&mut err_handle),
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
@@ -2927,6 +2935,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         driver.run(make_req(req), &ctoken).await?;
@@ -3000,6 +3009,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: Some(&mut stderr),
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         tokio::time::timeout(
@@ -3155,6 +3165,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         tokio::time::timeout(
@@ -3252,6 +3263,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
@@ -3433,6 +3445,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
         driver.run(make_req(req), &ctoken).await?;
 
@@ -4129,6 +4142,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
         driver
             .run(
@@ -4176,6 +4190,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
         driver
             .run(
@@ -4255,6 +4270,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
         driver
             .run(
@@ -4411,6 +4427,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: sandbox.clone(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         os.run_inner(req, &ctoken, false).await?;
@@ -4507,6 +4524,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
         driver
             .run(
@@ -4581,6 +4599,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
         driver.run(make_req(req), &ctoken).await?;
 
@@ -4666,6 +4685,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
         driver
             .run(
@@ -4768,6 +4788,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
         driver
             .run(
@@ -4857,6 +4878,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         };
 
         driver.run(make_req(req), &ctoken).await?;

@@ -463,6 +463,7 @@ pub(crate) mod testfake {
                 stdout: None,
                 stderr: None,
                 sandbox_dir: sandbox.dir.path().to_path_buf(),
+                runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
             },
             sandbox_dir: sandbox.dir.path().to_path_buf(),
             sandbox_ws_dir: sandbox.ws.clone(),
