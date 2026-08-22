@@ -268,20 +268,32 @@ to `hashin`" stops being a rule someone has to remember and becomes a structural
 property of where the data enters.
 
 **3. `Input.annotations` is host-visible and is already the producer→host
-channel.** It is a `map<string, string>` on the `Input` proto message, it is
-already copied into `RunInput` on the execute path (`engine/execute.rs:245`), and
+channel.** It is a `map<string, string>` on the `Input` proto message and
 `driver-support` already acts on producer-set annotations this exact way —
 `READ_ONLY_ANNOTATION` and `STAGE_PER_FILE_ANNOTATION` in `stage.rs` are the
-precedent. The scratch mount path, access mode and resolved slot path travel as
-annotations on the scratch input; the engine reads them where it already reads
-`read_only`.
+precedent. A scratch reference is marked with one, and the engine recognizes it
+where it already recognizes `read_only`.
 
-The cost of this is that the settings are stringly-typed on the wire rather than a
-typed message, with no schema enforcement at the ABI layer. That is the same trade
-`read_only` and `stage_per_file` already made, and it buys three things worth more
-than the typing: no version negotiation, no `plugin-abi` conversion code, and
-**third-party plugin drivers get scratch without being recompiled or even knowing
-it exists** — they pass through annotations and transitive sandboxes already.
+So **declaring and referencing a scratch costs no ABI surface at all**, and that
+half is implemented and shipped: the reference is an annotated `Input`, the
+settings are read from the declaration's spec config, and no proto message,
+`TargetDef` field or `ABI_SEMVER` bump was needed.
+
+> **Correction, from implementing it.** An earlier revision of this section
+> claimed the same for the *resolved* mount and env — that they would ride to the
+> driver on `RunInput.annotations`. They cannot. `link.rs:36` filters
+> `runtime: false` inputs out of `LinkedTargetDef`, which is what makes a scratch
+> a pure graph edge in the first place — so a scratch reference never becomes a
+> `RunInput` and has no annotation map to travel on. The two facts are the same
+> fact seen from both sides, and the design only noticed the flattering one.
+>
+> Mounting therefore does need a driver-visible channel, because the *bridge*
+> owns sandbox creation (it may redirect the path into a FUSE mount, which is why
+> the engine cannot pre-create anything there). The resolved list goes on
+> `RunRequest` — free for in-process managed drivers like pluginexec, and an
+> additive proto field for the cdylib transport, which does mean a `ABI_SEMVER`
+> bump and does mean a third-party cdylib driver must be rebuilt to mount a
+> scratch. Declaration and reference remain ABI-free; only mounting is not.
 
 ### 5.4 The reference as a graph edge
 
@@ -1417,14 +1429,18 @@ cost here that scales with the graph rather than with the slots.
 `plugin-abi`/`ABI_SEMVER`, the CLI surface, the on-disk format and the remote wire
 format. Claims to be checked:
 
-- **Plugin ABI: unchanged. No new message, no new field, no `ABI_SEMVER` bump**
-  (§5.3). Scratch travels on `TargetSpec.transitive` and `Input.annotations`,
-  which every ABI version already carries and every driver already passes through.
-  A new host with an old plugin, and an old host with a new plugin, both simply
-  see annotations they do not act on — the target runs cold, which is a
-  *slowdown, not a wrong build*. This is the strongest compatibility position
-  available and it is worth protecting: the moment a typed `ScratchRef` field is
-  added for tidiness, every one of those properties is spent.
+- **Plugin ABI, declaration + reference: unchanged.** No new message, no new
+  field, no bump. A reference travels on `Input.annotations` and the settings are
+  read from the declaration's spec config, both of which every ABI version already
+  carries. An old plugin and a new host, and the reverse, simply see an annotation
+  they do not act on.
+- **Plugin ABI, mounting: one additive field on `RunRequest`** and an
+  `ABI_SEMVER` minor bump (§5.3's correction). Free for in-process managed
+  drivers; a cdylib driver must be rebuilt before it can mount a scratch, and
+  until it is, its targets run without one — a *slowdown, not a wrong build*,
+  because the engine's lock is keyed on a declaration the old plugin never sees,
+  so there is no shared directory to race either. Worth keeping that degradation
+  intact when the field lands.
 - **On-disk:** `<home>/scratch/` is a new tree; nothing existing changes shape.
   `<slot>.meta` is versioned borsh. An unreadable or unknown-`SCRATCH_FORMAT` slot
   is *deleted*, not migrated — it is a cache.
@@ -1507,10 +1523,16 @@ generations spanning the zero-padding width; scope precedence.
   to the same slot; `heph query revdeps` on the declaration lists both; a reference
   to a missing addr is `TargetNotFoundError`; a reference to a non-scratch target
   is a wrong-kind error naming both
-- **nothing about scratch reaches `hashin`** (§6.3), asserted four ways: content
-  changes, mount-path override, `access` flip, and — the one that is easy to get
-  wrong — a `version` bump. A `version` bump gives a fresh empty slot **and leaves
-  every consumer's cached result a hit**
+- **nothing about scratch reaches `hashin`** (§6.3), asserted against the def hash
+  *directly* — a consumer's def hash must be byte-identical with and without a
+  reference, and unchanged by a `version` bump on the referenced scratch.
+  Asserting on `hashout` instead is **not** sufficient and is a trap worth naming:
+  a target whose key moved still produces identical bytes, so a hashout comparison
+  passes while the cache silently misses on every run. The `version` bump is the
+  case most likely to be "fixed" into a rebuild later, so it gets its own test.
+  Watch this when the mounting path lands: pluginexec's `apply_transitive`
+  re-seeds the def hash, so routing anything scratch-shaped through the transitive
+  sandbox would move the key of every consumer that has one
 - **`platform`:** `os_arch` gives different slots on different os/arch; `any`
   gives one slot across all of them; `os` splits on os only — asserted on the key,
   not on behaviour
