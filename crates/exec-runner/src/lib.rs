@@ -42,8 +42,8 @@
 
 use hcore::hasync::Cancellable;
 use hproc::proc_exec::{self, Handle, Spec};
-use std::process::Output;
 use std::ffi::OsString;
+use std::process::Output;
 
 /// How well-pinned a session's environment is. Diagnostics only — it never
 /// changes whether heph caches a target. Choosing a weakly-pinned environment
