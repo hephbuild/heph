@@ -1,8 +1,28 @@
 # Design: named scratch caches (GitHub-Actions-style per-target caching)
 
-**Status:** proposal — not implemented. Review-board consults (`product-vision`,
-`feature-quality`, `hermeticity`, `compatibility`) are *pending*; §15 and §20 list
-what each of them has to rule on.
+**Status:** phases 1–2 implemented and in review (PR #403, #407); phases 3–9
+designed, not built. §18 has the ordering; the notes below record what building it
+changed about the design.
+
+Review-board consults (`product-vision`, `feature-quality`, `hermeticity`,
+`compatibility`) are *pending*; §16 and §21 list what each has to rule on. The
+`compatibility` consult now has a concrete trigger: mounting (phase 3) needs an
+additive `RunRequest` field and an `ABI_SEMVER` minor bump — see §5.3.
+
+### Implementation notes
+
+Two things building phases 1–2 changed:
+
+1. **§5.3's ABI claim was half wrong.** Declaration and reference are ABI-free, as
+   designed and as shipped. The *resolved mount* cannot be — `link.rs:36` filters
+   `runtime: false` inputs out of `LinkedTargetDef`, which is exactly what makes a
+   scratch a pure graph edge, and therefore also why it never becomes a `RunInput`
+   with annotations to travel on. The design saw only the flattering half of that
+   fact. Corrected in place.
+2. **§17's `hashout` assertions did not test what they claimed.** A target whose
+   `hashin` moved still produces identical bytes, so those tests would have passed
+   while the cache missed on every run. They compare def hashes now, with a
+   precondition that the comparison discriminates at all.
 
 **The ask, restated:** a target can declare a directory that persists across runs.
 Before the target executes, heph restores the directory as of the most recent
@@ -1584,29 +1604,35 @@ document should be believed until it is an interleaved A/B on the corpus.**
 
 ## 18. Phasing
 
-1. **Model + plumbing.** The `scratch()` builtin and its provider, the reference
-   on `TargetDef`, proto + ABI, the exec attribute, and all of §13's validation.
-   No storage yet — declaring and referencing a scratch does nothing observable
-   beyond appearing in `heph query`. The overlap checks land here, *before*
-   anything can write.
-2. **`live` mode + locking + the `SCRATCH_*` env + events.** The feature,
-   locally, in its cheapest form. Where the `golist_gocache` win becomes general.
-3. **The lineage model + scopes, local only** (§10.1–§10.7). Branch-aware local
+1. **The declaration.** ✅ *PR #403.* The `scratch` builtin driver, its config
+   schema, and mount-path validation at the declaration — `target(driver =
+   "scratch", …)`, no new Starlark global.
+2. **The reference.** ✅ *PR #407.* The `scratch` attribute on exec, resolved to an
+   `Input` with `hashed: false, runtime: false`, plus every check in §13 that does
+   not need storage: wrong-kind addr, env collisions, mount overlaps, duplicates.
+   Nothing observable happens yet beyond `heph query` — deliberately, so the
+   checks land before anything can write.
+3. **Mount + lock + env + events.** The feature, locally. Needs the `RunRequest`
+   field above, the bridge to create the symlink (it owns sandbox creation and may
+   redirect the path into a FUSE mount), and the slot lock — which must ship *with*
+   `access`, since an `exclusive` that does not serialize is a silent lie. Where
+   the `golist_gocache` win becomes general.
+4. **The lineage model + scopes, local only** (§10.1–§10.7). Branch-aware local
    caches, `${git:branch}`, the drift guard. Reviewable without any network, and
    the piece the remote phase then reuses wholesale rather than reimplements.
-4. **Eviction + the read-only half of `heph tool scratch` + `--scratch` modes.**
+5. **Eviction + the read-only half of `heph tool scratch` + `--scratch` modes.**
    Makes it operable and inspectable.
-5. **Remote pull** (§10.4, §10.8) — resolve, fetch, seed. A CI runner gets warm
+6. **Remote pull** (§10.4, §10.8) — resolve, fetch, seed. A CI runner gets warm
    from whatever is already published, with no workflow change. Useful on its own
    the moment anything is in the bucket.
-6. **`heph tool scratch push`** (§10.10) — the publish half, and the only part CI
+7. **`heph tool scratch push`** (§10.10) — the publish half, and the only part CI
    has to be told about.
-7. **Retrofit `plugin-go`** (§11.1), in its own order: the golist `GOCACHE` first
+8. **Retrofit `plugin-go`** (§11.1), in its own order: the golist `GOCACHE` first
    (delete `golist_gocache.rs`), then compile's per-sandbox one, then the
    `GOMODCACHE`/`GOPROXY` passthrough — each measured separately, because §2.1 is
    the standing reminder that an obvious cache win can move wall time by zero.
    This is the proof that the general mechanism subsumes the special case.
-8. **Retrofit `plugin-oci`** (§11.2) — the shared blob store, then the local
+9. **Retrofit `plugin-oci`** (§11.2) — the shared blob store, then the local
    BuildKit layer cache. Not a prerequisite for anything; it is the evidence that
    a second ecosystem adopts the mechanism without it growing new knobs.
 
