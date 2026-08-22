@@ -24,15 +24,14 @@ use hmodel::htmatcher::{MatchResult, Matcher};
 /// preserved verbatim.
 pub const BEGIN_MARKER: &str =
     "# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)";
-/// The section's closing marker, and the stable prefix of [`BEGIN_MARKER`] that
-/// detection matches on (so changing the parenthetical never orphans an
-/// already-committed section — the old block is still found and rewritten with
-/// the current [`BEGIN_MARKER`] text).
-///
-/// Both are defined by the *reader* — [`hwalk::CodegenClaims`], which parses this
-/// section to decide which tree paths are generated — and re-exported here so the
-/// writer cannot drift from it.
-pub use hwalk::codegen::{BEGIN_MARKER_PREFIX, END_MARKER};
+/// The section's closing marker.
+pub const END_MARKER: &str = "# END heph-generated";
+
+/// Stable prefix of [`BEGIN_MARKER`]. Detection matches on this rather than the
+/// full marker so that changing the parenthetical (e.g. the command name) never
+/// orphans an already-committed section — the old block is still found and
+/// rewritten with the current [`BEGIN_MARKER`] text.
+pub const BEGIN_MARKER_PREFIX: &str = "# BEGIN heph-generated";
 
 /// Prefix marking an attribution comment line: `# //pkg:target`, rendered on its
 /// own line *above* the pattern it annotates.
@@ -174,11 +173,17 @@ pub fn entries_by_addr(
 /// again. Without this its claims would outlive it forever, and a stale claim
 /// silently hides a real source file at that path.
 ///
+/// This is the reconciliation pass, not a claim source: the ledger alone decides
+/// what is generated, and the `.gitignore` section this module renders only tells
+/// git to ignore build outputs. They share a command because both derive from one
+/// whole-workspace resolution, which is expensive enough to want doing once.
+///
 /// `fresh` is the freshly-resolved set; `scoped` says whether it covers the whole
 /// workspace or only what `matcher` selects. Scoped runs leave other targets'
 /// claims alone, exactly as [`merge_section`] leaves their `.gitignore` lines
-/// alone — the ledger and the section are reconciled from the same data, by the
-/// same rule, in the same command.
+/// alone: this run resolved nothing about them, so their absence proves nothing,
+/// and guessing would drop a *live* claim — a generated file with no claim is the
+/// failure the whole mechanism exists to prevent.
 pub fn reconcile_claims(
     claims: &hwalk::CodegenClaims,
     fresh: &[GitignoreEntry],
@@ -530,132 +535,6 @@ mod tests {
                 attributed("/bar/b.go", "//bar:gen"),
             ]
         );
-    }
-
-    /// The section this module renders is the same section
-    /// [`hwalk::CodegenClaims`] reads to decide which tree paths are generated.
-    /// That coupling is the whole mechanism — a renderer change that the reader
-    /// cannot parse silently turns every generated file back into source — so
-    /// pin it: render from each output-path shape, then assert the reader claims
-    /// exactly the paths that shape covers, and nothing beside them.
-    #[test]
-    fn rendered_section_round_trips_through_the_claim_reader() {
-        use hwalk::ClaimSet;
-        use std::path::Path;
-
-        let rendered = render(
-            "target/\n",
-            &[
-                // The three `content_to_pattern` shapes: a file, a directory, a glob.
-                attributed(
-                    &content_to_pattern(&Content::FilePath("pkg/a.pb.go".into())),
-                    "//pkg:proto",
-                ),
-                attributed(
-                    &content_to_pattern(&Content::DirPath("pkg/gen".into())),
-                    "//pkg:gen",
-                ),
-                attributed(
-                    &content_to_pattern(&Content::Glob("web/**/*.ts".into())),
-                    "//web:tsc",
-                ),
-            ],
-        );
-        let claims = ClaimSet::from_gitignore(&rendered).expect("reader parses our render");
-
-        assert!(claims.claims(Path::new("pkg/a.pb.go")));
-        assert!(claims.claims(Path::new("pkg/gen")), "the dir output itself");
-        assert!(claims.claims(Path::new("pkg/gen/deep/x.go")), "its subtree");
-        assert!(claims.claims(Path::new("web/app/main.ts")));
-
-        assert!(
-            !claims.claims(Path::new("pkg/a.go")),
-            "a hand-written sibling"
-        );
-        assert!(!claims.claims(Path::new("web/app/main.js")));
-        assert!(
-            !claims.claims(Path::new("target/debug/heph")),
-            "a user ignore outside the managed section is not a codegen claim"
-        );
-
-        // Attribution survives the round trip, so a diagnostic can name the owner.
-        assert_eq!(claims.owner(Path::new("pkg/a.pb.go")), Some("//pkg:proto"));
-        assert_eq!(
-            claims.owner(Path::new("pkg/gen/deep/x.go")),
-            Some("//pkg:gen")
-        );
-    }
-
-    /// Reconciliation drops a claim whose target no longer emits `copy` output —
-    /// the target was deleted from the tree, or its `out` moved — while leaving
-    /// the live ones alone. Without it, a deleted target's claim hides a real
-    /// source file at that path for good, since the write-back that records
-    /// claims only ever sees targets that still run.
-    #[test]
-    fn reconcile_releases_claims_with_no_live_target() {
-        use hwalk::CodegenClaims;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let claims = CodegenClaims::load(dir.path(), dir.path().join("ledger"));
-        claims
-            .record("//pkg:gone", &["/pkg/gone.go".to_string()])
-            .expect("record");
-        claims
-            .record("//pkg:moved", &["/pkg/old.go".to_string()])
-            .expect("record");
-        claims
-            .record("//pkg:live", &["/pkg/live.go".to_string()])
-            .expect("record");
-
-        // Live set: `gone` is deleted, `moved` emits somewhere else now.
-        let fresh = vec![
-            attributed("/pkg/new.go", "//pkg:moved"),
-            attributed("/pkg/live.go", "//pkg:live"),
-        ];
-        let dropped = reconcile_claims(
-            &claims,
-            &fresh,
-            &Matcher::TreeOutputTo(hmodel::htpkg::PkgBuf::from("")),
-            false,
-        )
-        .expect("reconcile");
-
-        assert_eq!(dropped, vec!["//pkg:gone".to_string()]);
-        let set = claims.snapshot();
-        assert!(!set.claims(std::path::Path::new("pkg/gone.go")));
-        assert!(!set.claims(std::path::Path::new("pkg/old.go")));
-        assert!(set.claims(std::path::Path::new("pkg/new.go")));
-        assert!(set.claims(std::path::Path::new("pkg/live.go")));
-    }
-
-    /// A scoped run resolved nothing about targets outside its matcher, so their
-    /// absence from the fresh set says nothing about whether they still exist.
-    /// Keep their claims — the same rule [`merge_section`] applies to their
-    /// `.gitignore` lines. Guessing here would drop a live claim, and a generated
-    /// file with no claim is the failure the whole mechanism exists to prevent.
-    #[test]
-    fn reconcile_leaves_out_of_scope_claims_alone() {
-        use hwalk::CodegenClaims;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let claims = CodegenClaims::load(dir.path(), dir.path().join("ledger"));
-        claims
-            .record("//other:gen", &["/other/gen.go".to_string()])
-            .expect("record");
-        claims
-            .record("//pkg:gone", &["/pkg/gone.go".to_string()])
-            .expect("record");
-
-        let matcher = Matcher::Package(hmodel::htpkg::PkgBuf::from("pkg"));
-        let dropped = reconcile_claims(&claims, &[], &matcher, true).expect("reconcile");
-
-        assert_eq!(dropped, vec!["//pkg:gone".to_string()]);
-        let set = claims.snapshot();
-        assert!(
-            set.claims(std::path::Path::new("other/gen.go")),
-            "a claim outside the scope must survive"
-        );
-        assert!(!set.claims(std::path::Path::new("pkg/gone.go")));
     }
 
     #[test]

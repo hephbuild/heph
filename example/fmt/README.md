@@ -59,27 +59,23 @@ $ heph run //fmt:fmt --frozen          # dirty tree → fails
 `file()` excludes it — it is a build output, not source. Consumers depend on the
 target (`//fmt:generated`), not on the file.
 
-**Nothing is written onto the file to mark it.** heph keeps the claim beside the
-file instead, in two places:
+**Nothing is written onto the file to mark it, and nothing you edit decides it.**
+heph records the claim in its own state, at `.heph3/codegen-claims`, written by
+the write-back in the same operation that puts the file on disk. So a generated
+file is never on disk unclaimed, and no command has to be run first.
 
-- **`.heph3/codegen-claims`** — a heph-owned ledger, written by the write-back in
-  the same operation that puts the file on disk. So a generated file is never on
-  disk unclaimed, and no command has to be run first. This is the one that makes
-  it work by default.
-- **The heph-managed `.gitignore` section** — written by
-  `heph tool gen-gitignore` from the *declared* output paths and checked by
-  `heph validate`:
+Note what is *not* consulted: the heph-managed `.gitignore` section lists the
+same paths, but it exists to tell **git** to ignore build outputs. It is a file
+you own and edit, and a hand-edit must not change what heph treats as source —
+least of all in the direction it would fail, where a stale line hides a real
+source file from every `glob()` with no diagnostic.
 
-  ```
-  # BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)
-  # //fmt:generated
-  /fmt/generated.txt
-  # END heph-generated
-  ```
-
-  Being committed and declarative, it covers what the ledger cannot: a path
-  that has not been generated yet, and a workspace whose `.heph3` was deleted
-  while the generated files survived.
+```
+# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)
+# //fmt:generated
+/fmt/generated.txt
+# END heph-generated
+```
 
 ### Changing or removing a codegen target
 
@@ -89,10 +85,12 @@ target generates — a target's claims are replaced wholesale, not accumulated.
 **Delete** the target, though, and it never generates again, so nothing releases
 its claims on its own. That matters: a claim with no target behind it keeps
 hiding whatever is at that path, so a real source file you later add there is
-invisible to every `glob()`. `heph tool gen-gitignore` reconciles both the ledger
-and the `.gitignore` section against the targets that actually exist, reporting
-what it released; `heph validate` fails when they disagree. (The generated file
-itself is left in the tree — heph does not delete from your working tree.)
+invisible to every `glob()`. `heph tool gen-gitignore` reconciles the ledger
+against the targets that actually exist — and refreshes the `.gitignore` section
+while it is there, since both come from one whole-workspace resolution —
+reporting what it released; `heph validate` fails when they disagree. (The
+generated file itself is left in the tree; heph does not delete from your
+working tree.)
 
 An earlier design stamped a `user.heph.codegen` extended attribute on the file.
 The stamp landed at the right moment — when the file was created — but xattrs

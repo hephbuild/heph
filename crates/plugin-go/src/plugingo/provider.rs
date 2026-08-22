@@ -5568,7 +5568,6 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         std::fs::write(pkg.join("gen.go"), b"package pkg\n").expect("write");
 
         let claims = Arc::new(hwalk::CodegenClaims::load(
-            ws.path(),
             ws.path().join(".heph3").join("codegen-claims"),
         ));
 

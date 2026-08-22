@@ -434,16 +434,13 @@ impl Engine {
             &home.join("cache").join("fswalk.db"),
         ));
 
-        // Which tree paths are generated rather than source: the ledger the
-        // codegen write-back maintains (`<home>/codegen-claims`, registered in the
-        // same operation that puts a file on disk, so a generated file is never on
-        // disk unclaimed) unioned with the committed `.gitignore` section. Neither
-        // is attached to the file, so no tool that rewrites one can erase the
-        // claim — the failure that sank the extended attribute this replaced.
-        let codegen_claims = Arc::new(hwalk::CodegenClaims::load(
-            &cfg.root,
-            home.join("codegen-claims"),
-        ));
+        // Which tree paths are generated rather than source: the ledger the codegen
+        // write-back maintains, registered in the same operation that puts a file
+        // on disk, so a generated file is never on disk unclaimed. Heph's own
+        // state, and not attached to the file — so no tool that rewrites the file
+        // can erase the claim, which is the failure that sank the extended
+        // attribute this replaced.
+        let codegen_claims = Arc::new(hwalk::CodegenClaims::load(home.join("codegen-claims")));
 
         let max_workers = 2 * parallelism;
 

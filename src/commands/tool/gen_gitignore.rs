@@ -72,12 +72,15 @@ impl App for GenGitignoreApp {
             // keeping every line emitted by a target outside the matcher.
             // Whole-workspace: replace the section wholesale.
             // Reconcile the codegen claim ledger from the same freshly-resolved
-            // data, before touching `.gitignore`. The write-back that maintains
-            // the ledger only ever sees targets that still exist and still run,
-            // so a target deleted from the tree — or one whose `out` moved — keeps
-            // its old claim indefinitely, and a stale claim silently hides a real
-            // source file at that path. This is the pass that has just resolved
-            // every target, so it is the one that can tell.
+            // data, before touching `.gitignore`. The ledger is what decides which
+            // tree paths are generated; the `.gitignore` section below only tells
+            // git to ignore build outputs. They ride the same command because both
+            // need one whole-workspace resolution.
+            //
+            // Reconciliation is needed because the write-back that maintains the
+            // ledger only ever sees targets that still exist and still run, so a
+            // target deleted from the tree keeps its old claim indefinitely — and
+            // a stale claim silently hides a real source file at that path.
             let dropped = gitignore::reconcile_claims(
                 self.engine.codegen_claims(),
                 &fresh,

@@ -1807,22 +1807,12 @@ mod tests {
         );
     }
 
-    /// Claims parsed from a heph-managed `.gitignore` section, for tests that
-    /// need the fs plugin to treat a path as generated.
+    /// A claim set holding `patterns`, as if a codegen target had generated them.
     fn claims_for(patterns: &[&str]) -> (tempfile::TempDir, Arc<CodegenClaims>) {
         let dir = tempdir().expect("tempdir");
-        let body = patterns.join("\n");
-        fs::write(
-            dir.path().join(".gitignore"),
-            format!(
-                "{}\n{body}\n{}\n",
-                hwalk::codegen::BEGIN_MARKER_PREFIX,
-                hwalk::codegen::END_MARKER
-            ),
-        )
-        .expect("write .gitignore");
-        let ledger = dir.path().join(".heph3").join("codegen-claims");
-        let claims = Arc::new(CodegenClaims::load(dir.path(), ledger));
+        let claims = Arc::new(CodegenClaims::load(dir.path().join("codegen-claims")));
+        let owned: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
+        claims.record("//pkg:gen", &owned).expect("record");
         (dir, claims)
     }
 
@@ -1853,7 +1843,7 @@ mod tests {
         assert!(arts.iter().all(|a| !a.hashout.is_empty()));
 
         // A claimed file drops out of the walk; its unclaimed sibling stays.
-        let (_cd, claims) = claims_for(&["# //gen:it", "/a.rs"]);
+        let (_cd, claims) = claims_for(&["/a.rs"]);
         let compiled = compile_glob(&skip, &claims, "t", "**/*.rs", &[]).unwrap();
         let arts = walk_glob(&walker, root, &compiled).unwrap();
         let names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
@@ -1877,7 +1867,7 @@ mod tests {
 
         let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
         let walker = CachedWalker::disabled();
-        let (_cd, claims) = claims_for(&["# //pkg:gen", "/gen"]);
+        let (_cd, claims) = claims_for(&["/gen"]);
         let compiled = compile_glob(&skip, &claims, "t", "**/*.rs", &[]).unwrap();
 
         let arts = walk_glob(&walker, root, &compiled).unwrap();
@@ -1897,7 +1887,7 @@ mod tests {
 
         let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
         let walker = CachedWalker::disabled();
-        let (_cd, claims) = claims_for(&["# //pkg:gen", "/gen.rs"]);
+        let (_cd, claims) = claims_for(&["/gen.rs"]);
         let compiled = compile_glob(&skip, &claims, "t", "**/*.rs", &[]).unwrap();
         assert!(walk_glob(&walker, root, &compiled).unwrap().is_empty());
 
@@ -2939,7 +2929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_glob_excludes_claimed_codegen() {
-        let (_cd, driver) = driver_claiming(&["# //pkg:gen", "/generated.rs"]);
+        let (_cd, driver) = driver_claiming(&["/generated.rs"]);
         let tmp = tempdir().unwrap();
         let plain = tmp.path().join("plain.rs");
         let generated = tmp.path().join("generated.rs");
@@ -2969,7 +2959,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_file_claimed_codegen_yields_nothing() {
-        let (_cd, driver) = driver_claiming(&["# //pkg:gen", "/generated.rs"]);
+        let (_cd, driver) = driver_claiming(&["/generated.rs"]);
         let tmp = tempdir().unwrap();
         let generated = tmp.path().join("generated.rs");
         fs::write(&generated, b"generated").unwrap();
@@ -3005,7 +2995,7 @@ mod tests {
     /// carries no stamp, so it read as plain missing source.
     #[tokio::test]
     async fn test_driver_run_file_claimed_but_not_yet_generated_yields_nothing() {
-        let (_cd, driver) = driver_claiming(&["# //pkg:gen", "/generated.rs"]);
+        let (_cd, driver) = driver_claiming(&["/generated.rs"]);
         let tmp = tempdir().unwrap();
 
         let config = std::collections::HashMap::from([(
