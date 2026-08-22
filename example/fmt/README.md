@@ -81,6 +81,19 @@ file instead, in two places:
   that has not been generated yet, and a workspace whose `.heph3` was deleted
   while the generated files survived.
 
+### Changing or removing a codegen target
+
+Move a `copy` target's `out` and the old path is released the next time that
+target generates — a target's claims are replaced wholesale, not accumulated.
+
+**Delete** the target, though, and it never generates again, so nothing releases
+its claims on its own. That matters: a claim with no target behind it keeps
+hiding whatever is at that path, so a real source file you later add there is
+invisible to every `glob()`. `heph tool gen-gitignore` reconciles both the ledger
+and the `.gitignore` section against the targets that actually exist, reporting
+what it released; `heph validate` fails when they disagree. (The generated file
+itself is left in the tree — heph does not delete from your working tree.)
+
 An earlier design stamped a `user.heph.codegen` extended attribute on the file.
 The stamp landed at the right moment — when the file was created — but xattrs
 live on the inode, and almost every tool rewrites a file by writing a temp and

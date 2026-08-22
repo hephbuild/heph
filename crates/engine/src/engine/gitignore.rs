@@ -146,7 +146,73 @@ impl Engine {
     }
 }
 
-/// Extract the entries currently inside the heph-managed marker section of
+/// Group entries by emitting target, the shape the codegen claim ledger stores.
+///
+/// Un-attributed lines are dropped: the ledger is keyed by target so a claim can
+/// be replaced or released when that target changes, and a line belonging to no
+/// target could never be either.
+pub fn entries_by_addr(
+    entries: &[GitignoreEntry],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for e in entries {
+        if let Some(addr) = &e.addr {
+            out.entry(addr.format())
+                .or_default()
+                .push(e.pattern.clone());
+        }
+    }
+    out
+}
+
+/// Reconcile the codegen claim ledger against the live set of `codegen = "copy"`
+/// targets, and report which targets' claims were dropped.
+///
+/// The write-back can only add a target's claims or update them in place — it
+/// runs when a target generates, and a target deleted from the tree never runs
+/// again. Without this its claims would outlive it forever, and a stale claim
+/// silently hides a real source file at that path.
+///
+/// `fresh` is the freshly-resolved set; `scoped` says whether it covers the whole
+/// workspace or only what `matcher` selects. Scoped runs leave other targets'
+/// claims alone, exactly as [`merge_section`] leaves their `.gitignore` lines
+/// alone — the ledger and the section are reconciled from the same data, by the
+/// same rule, in the same command.
+pub fn reconcile_claims(
+    claims: &hwalk::CodegenClaims,
+    fresh: &[GitignoreEntry],
+    matcher: &Matcher,
+    scoped: bool,
+) -> anyhow::Result<Vec<String>> {
+    let want = entries_by_addr(fresh);
+    let current = claims.entries()?;
+
+    let mut next = want.clone();
+    let mut dropped = Vec::new();
+    for addr in current.keys() {
+        if want.contains_key(addr) {
+            continue;
+        }
+        // Out of a scoped run's reach: this run resolved nothing about that
+        // target, so its absence from `fresh` says nothing about whether it
+        // still exists. Keep the claim rather than guess.
+        let in_scope = !scoped
+            || parse_addr(addr).is_ok_and(|a| matcher.matches_addr(&a) == MatchResult::MatchYes);
+        if in_scope {
+            dropped.push(addr.clone());
+        } else if let Some(patterns) = current.get(addr) {
+            next.insert(addr.clone(), patterns.clone());
+        }
+    }
+    if next != current {
+        claims.rewrite(&next)?;
+    }
+    dropped.sort();
+    Ok(dropped)
+}
+
+/// Extract the entries currently inside the heph-managed marker section of/// Extract the entries currently inside the heph-managed marker section of
 /// `existing`. Returns an empty vec when no section is present.
 ///
 /// The section is a sequence of pattern lines, each optionally preceded by a
@@ -518,6 +584,78 @@ mod tests {
             claims.owner(Path::new("pkg/gen/deep/x.go")),
             Some("//pkg:gen")
         );
+    }
+
+    /// Reconciliation drops a claim whose target no longer emits `copy` output —
+    /// the target was deleted from the tree, or its `out` moved — while leaving
+    /// the live ones alone. Without it, a deleted target's claim hides a real
+    /// source file at that path for good, since the write-back that records
+    /// claims only ever sees targets that still run.
+    #[test]
+    fn reconcile_releases_claims_with_no_live_target() {
+        use hwalk::CodegenClaims;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let claims = CodegenClaims::load(dir.path(), dir.path().join("ledger"));
+        claims
+            .record("//pkg:gone", &["/pkg/gone.go".to_string()])
+            .expect("record");
+        claims
+            .record("//pkg:moved", &["/pkg/old.go".to_string()])
+            .expect("record");
+        claims
+            .record("//pkg:live", &["/pkg/live.go".to_string()])
+            .expect("record");
+
+        // Live set: `gone` is deleted, `moved` emits somewhere else now.
+        let fresh = vec![
+            attributed("/pkg/new.go", "//pkg:moved"),
+            attributed("/pkg/live.go", "//pkg:live"),
+        ];
+        let dropped = reconcile_claims(
+            &claims,
+            &fresh,
+            &Matcher::TreeOutputTo(hmodel::htpkg::PkgBuf::from("")),
+            false,
+        )
+        .expect("reconcile");
+
+        assert_eq!(dropped, vec!["//pkg:gone".to_string()]);
+        let set = claims.snapshot();
+        assert!(!set.claims(std::path::Path::new("pkg/gone.go")));
+        assert!(!set.claims(std::path::Path::new("pkg/old.go")));
+        assert!(set.claims(std::path::Path::new("pkg/new.go")));
+        assert!(set.claims(std::path::Path::new("pkg/live.go")));
+    }
+
+    /// A scoped run resolved nothing about targets outside its matcher, so their
+    /// absence from the fresh set says nothing about whether they still exist.
+    /// Keep their claims — the same rule [`merge_section`] applies to their
+    /// `.gitignore` lines. Guessing here would drop a live claim, and a generated
+    /// file with no claim is the failure the whole mechanism exists to prevent.
+    #[test]
+    fn reconcile_leaves_out_of_scope_claims_alone() {
+        use hwalk::CodegenClaims;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let claims = CodegenClaims::load(dir.path(), dir.path().join("ledger"));
+        claims
+            .record("//other:gen", &["/other/gen.go".to_string()])
+            .expect("record");
+        claims
+            .record("//pkg:gone", &["/pkg/gone.go".to_string()])
+            .expect("record");
+
+        let matcher = Matcher::Package(hmodel::htpkg::PkgBuf::from("pkg"));
+        let dropped = reconcile_claims(&claims, &[], &matcher, true).expect("reconcile");
+
+        assert_eq!(dropped, vec!["//pkg:gone".to_string()]);
+        let set = claims.snapshot();
+        assert!(
+            set.claims(std::path::Path::new("other/gen.go")),
+            "a claim outside the scope must survive"
+        );
+        assert!(!set.claims(std::path::Path::new("pkg/gone.go")));
     }
 
     #[test]

@@ -619,6 +619,14 @@ impl Engine {
         });
     }
 
+    /// The workspace's codegen claim set — which tree paths a `codegen = "copy"`
+    /// target owns. Exposed so the commands that resolve every target can
+    /// reconcile the ledger against them (see
+    /// [`gitignore::reconcile_claims`](crate::engine::gitignore::reconcile_claims)).
+    pub fn codegen_claims(&self) -> &Arc<hwalk::CodegenClaims> {
+        &self.codegen_claims
+    }
+
     /// The [`PluginInit`] context handed to every plugin constructor (direct
     /// registration or factory): workspace root + the engine's skip dirs/globs.
     fn plugin_init_payload(&self) -> PluginInit {

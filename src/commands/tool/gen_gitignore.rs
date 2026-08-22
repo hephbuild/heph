@@ -71,6 +71,26 @@ impl App for GenGitignoreApp {
             // Scoped: graft the freshly-scanned slice over the existing section,
             // keeping every line emitted by a target outside the matcher.
             // Whole-workspace: replace the section wholesale.
+            // Reconcile the codegen claim ledger from the same freshly-resolved
+            // data, before touching `.gitignore`. The write-back that maintains
+            // the ledger only ever sees targets that still exist and still run,
+            // so a target deleted from the tree — or one whose `out` moved — keeps
+            // its old claim indefinitely, and a stale claim silently hides a real
+            // source file at that path. This is the pass that has just resolved
+            // every target, so it is the one that can tell.
+            let dropped = gitignore::reconcile_claims(
+                self.engine.codegen_claims(),
+                &fresh,
+                &self.matcher,
+                self.scoped,
+            )
+            .context("reconciling the codegen claim ledger")?;
+            for addr in &dropped {
+                out.println(format!(
+                    "Released codegen claims for {addr} (no longer emits codegen = \"copy\" output)"
+                ));
+            }
+
             let entries = if self.scoped {
                 gitignore::merge_section(&existing, fresh, &self.matcher)
             } else {

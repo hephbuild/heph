@@ -45,6 +45,17 @@
 //! write-back is visible to a glob later in the *same* run — again matching what
 //! reading an xattr off the filesystem gave for free.
 //!
+//! # Releasing a claim
+//!
+//! A target whose `out` moved releases the old path the next time it generates:
+//! [`CodegenClaims::record`] replaces that target's whole block. A target
+//! *deleted* from the tree never generates again, so nothing would ever release
+//! its claims — and a claim that outlives its target silently hides a real source
+//! file at that path. [`CodegenClaims::rewrite`] reconciles the ledger against the
+//! live set, driven by `heph tool gen-gitignore`, which is already the command
+//! that rewrites the equivalent `.gitignore` declarations from the same data;
+//! `heph validate` reports the discrepancy without repairing it.
+//!
 //! This lives next to [`Ignore`](crate::Ignore) because the same set has to reach
 //! every tree-walking plugin and this crate is the one they all already depend
 //! on. Rendering the `.gitignore` section stays in the engine, which is the only
@@ -65,6 +76,11 @@ pub const BEGIN_MARKER_PREFIX: &str = "# BEGIN heph-generated";
 
 /// The managed section's closing marker.
 pub const END_MARKER: &str = "# END heph-generated";
+
+/// Preamble on the ledger, so someone who finds the file knows what it is.
+const LEDGER_HEADER: &str = "\
+# heph-owned: which tree paths are `codegen = \"copy\"` output.\n\
+# Written by the codegen write-back; safe to delete (it is rebuilt).\n";
 
 /// One claimed path pattern and the target that emits it.
 #[derive(Debug)]
@@ -360,6 +376,41 @@ impl CodegenClaims {
         }
     }
 
+    /// The ledger's current contents: `addr -> patterns`, with the append-only
+    /// history already resolved. For a caller reconciling it against the live set
+    /// of targets.
+    pub fn entries(&self) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+        match self.ledger.as_deref() {
+            Some(path) => read_ledger(path),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// Replace the ledger with exactly `entries`.
+    ///
+    /// [`Self::record`] can only ever *add* a target's claims or update them in
+    /// place — it runs when a target generates, and a target that was deleted from
+    /// the tree never runs again. Its claims would otherwise outlive it forever,
+    /// and a stale claim silently hides a real source file at that path. So the
+    /// full set has to be reconciled against the live one somewhere, and that
+    /// somewhere is a caller that has just resolved every target: `heph tool
+    /// gen-gitignore`, which is already the command that rewrites the equivalent
+    /// declarations in `.gitignore` from the same data.
+    ///
+    /// Also compacts: `record` appends, so a long-lived workspace accumulates
+    /// superseded blocks, and this collapses them.
+    pub fn rewrite(&self, entries: &BTreeMap<String, Vec<String>>) -> anyhow::Result<()> {
+        let Some(ledger) = self.ledger.as_deref() else {
+            return Ok(());
+        };
+        write_ledger(ledger, entries)?;
+        let set = Arc::new(self.build());
+        let mut state = self.state.write();
+        state.set = set;
+        state.seen = Marker::of(ledger);
+        Ok(())
+    }
+
     /// Register `patterns` as the root-anchored `codegen = "copy"` output of
     /// `addr`, replacing whatever that target claimed before.
     ///
@@ -441,6 +492,33 @@ fn read_ledger(path: &Path) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
     }
     out.retain(|_, patterns| !patterns.is_empty());
     Ok(out)
+}
+
+/// Write the ledger as exactly `entries`, atomically: a reader sees either the
+/// whole previous version or the whole new one, never a torn file.
+fn write_ledger(path: &Path, entries: &BTreeMap<String, Vec<String>>) -> anyhow::Result<()> {
+    let mut body = String::from(LEDGER_HEADER);
+    for (addr, patterns) in entries {
+        for pattern in patterns {
+            body.push_str("# ");
+            body.push_str(addr);
+            body.push('\n');
+            body.push_str(pattern);
+            body.push('\n');
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir for codegen claim ledger {}", parent.display()))?;
+    }
+    // Same directory as the target so the rename stays within one filesystem, and
+    // pid-tagged so two processes rewriting at once cannot share a temp name.
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, body)
+        .with_context(|| format!("write codegen claim ledger {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("install codegen claim ledger {}", path.display()))?;
+    Ok(())
 }
 
 /// Append one target's block. `O_APPEND` positions the write atomically, so two
@@ -791,6 +869,72 @@ mod tests {
 
         claims.record("//pkg:gen", &[]).expect("release");
         assert!(!claims.snapshot().claims(p("pkg/gen.go")));
+    }
+
+    /// A target deleted from the tree never runs again, so `record` can never
+    /// release its claims — they would hide a real source file at that path
+    /// forever. `rewrite` against the live set is what releases them.
+    #[test]
+    fn rewrite_releases_a_deleted_targets_claims() {
+        let (_dir, claims) = workspace("");
+        claims
+            .record("//pkg:gone", &["/pkg/gone.go".to_string()])
+            .expect("record");
+        claims
+            .record("//pkg:live", &["/pkg/live.go".to_string()])
+            .expect("record");
+        assert!(claims.snapshot().claims(p("pkg/gone.go")));
+
+        // The live set no longer contains //pkg:gone.
+        let live = BTreeMap::from([("//pkg:live".to_string(), vec!["/pkg/live.go".to_string()])]);
+        claims.rewrite(&live).expect("rewrite");
+
+        let s = claims.snapshot();
+        assert!(
+            !s.claims(p("pkg/gone.go")),
+            "a deleted target's claim must be released"
+        );
+        assert!(s.claims(p("pkg/live.go")), "a live target's claim stays");
+    }
+
+    /// `rewrite` also compacts: `record` appends, so a workspace that has been
+    /// building for a while accumulates superseded blocks.
+    #[test]
+    fn rewrite_compacts_the_append_history() {
+        let (dir, claims) = workspace("");
+        let ledger = dir.path().join(".heph3").join("codegen-claims");
+        for out in ["/pkg/a.go", "/pkg/b.go", "/pkg/c.go"] {
+            claims
+                .record("//pkg:gen", &[out.to_string()])
+                .expect("record");
+        }
+        let before = std::fs::read_to_string(&ledger).expect("read");
+        assert!(before.contains("/pkg/a.go"), "history accumulated");
+
+        let live = BTreeMap::from([("//pkg:gen".to_string(), vec!["/pkg/c.go".to_string()])]);
+        claims.rewrite(&live).expect("rewrite");
+
+        let after = std::fs::read_to_string(&ledger).expect("read");
+        assert!(!after.contains("/pkg/a.go"), "superseded blocks collapsed");
+        assert!(claims.snapshot().claims(p("pkg/c.go")));
+    }
+
+    /// `entries` resolves the append history the same way a read does, so a
+    /// caller reconciling against the live set compares like with like.
+    #[test]
+    fn entries_reports_the_resolved_history() {
+        let (_dir, claims) = workspace("");
+        claims
+            .record("//pkg:gen", &["/pkg/old.go".to_string()])
+            .expect("record");
+        claims
+            .record("//pkg:gen", &["/pkg/new.go".to_string()])
+            .expect("re-record");
+
+        assert_eq!(
+            claims.entries().expect("entries"),
+            BTreeMap::from([("//pkg:gen".to_string(), vec!["/pkg/new.go".to_string()])])
+        );
     }
 
     /// Recording the same thing twice must not rewrite the file — the steady
