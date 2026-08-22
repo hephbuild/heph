@@ -5,6 +5,7 @@ use crate::driver_managed::{
 };
 use anyhow::Context;
 use hcore::hasync::Cancellable;
+use hexec_runner::{ExecSession, LocalSession};
 use hplugin::driver::{RunInput, RunRequest, RunResponse};
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,6 +25,10 @@ pub struct ManagedDriverOs {
     /// staging (read-only inputs fall back to the plain copy path) — used by
     /// the standalone [`ManagedDriverOs::new`] constructor.
     pub stage_dir: Option<PathBuf>,
+    /// The environment target processes are created in. Phase 0 always holds a
+    /// `LocalSession` (an identity transform); Phase 1 resolves it per target
+    /// from the target's `runner =`.
+    pub runner: Arc<dyn ExecSession>,
 }
 
 impl ManagedDriverOs {
@@ -36,6 +41,7 @@ impl ManagedDriverOs {
             driver: Arc::new(driver),
             shell_fallback,
             stage_dir: None,
+            runner: Arc::new(LocalSession::new()),
         }
     }
 
@@ -147,6 +153,7 @@ impl ManagedDriverOs {
             sandbox_pkg_dir.clone(),
             inputs,
             &self.shell_fallback,
+            Arc::clone(&self.runner),
         )
         .await?;
 

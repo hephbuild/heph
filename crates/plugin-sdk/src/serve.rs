@@ -1275,6 +1275,18 @@ async fn run_once(
         sandbox_ws_dir: PathBuf::from(req.sandbox_ws_dir),
         sandbox_pkg_dir: PathBuf::from(req.sandbox_pkg_dir),
         inputs: managed_inputs,
+        // Guest-side `local`: an identity transform, matching what a cdylib
+        // driver did before the seam existed.
+        //
+        // A runner selected host-side does NOT reach a plugin driver yet — the
+        // `runner_*` fields on `pb::ManagedRunRequest` are Phase 2. Until they
+        // exist WITH the positive-ack handshake, the host refuses `runner !=
+        // local` for any ABI-served driver rather than letting it build in the
+        // host environment under a cache key that asserts the runner's. That
+        // refusal is the host's to make: an older cdylib has no field to notice
+        // and could not even log the discrepancy — prost drops unknown bytes
+        // before guest code runs.
+        runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
     };
     let result = if shell {
         driver.run_shell(mrr, ct).await

@@ -1434,6 +1434,7 @@ dependencies = [
  "config",
  "core",
  "driver-support",
+ "exec-runner",
  "model",
  "plugin",
  "rayon",
@@ -1450,6 +1451,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "core",
+ "exec-runner",
  "glob",
  "lock",
  "model",
@@ -1702,6 +1704,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "exec-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "proc",
+ "tokio",
 ]
 
 [[package]]
@@ -2231,6 +2244,7 @@ dependencies = [
  "enclose",
  "engine",
  "erased-serde 0.4.10",
+ "exec-runner",
  "flate2",
  "futures",
  "glob",
@@ -4065,6 +4079,7 @@ dependencies = [
  "crossterm",
  "driver-support",
  "enclose",
+ "exec-runner",
  "glob",
  "libc",
  "minijinja",
@@ -4186,6 +4201,7 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
+ "exec-runner",
  "model",
  "plugin",
  "proc",
@@ -4208,6 +4224,7 @@ dependencies = [
  "core",
  "docker_credential",
  "driver-support",
+ "exec-runner",
  "futures",
  "model",
  "oci-client",
@@ -4257,6 +4274,7 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
+ "exec-runner",
  "futures",
  "model",
  "plugin",

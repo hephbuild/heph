@@ -1090,6 +1090,19 @@ impl Driver {
         if shell && let Ok(term) = std::env::var("TERM") {
             env.insert("TERM".to_string(), term);
         }
+        // Where the child's PATH came from, for the spawn-failure diagnostic.
+        // A session that reports no environment (`local`, and any runner whose
+        // environment cannot be enumerated host-side) leaves the driver's own
+        // `path` option in charge, which is the pre-runner behaviour.
+        let path_source = match req.runner.base_env() {
+            Some(base) if base.iter().any(|(k, _)| k == "PATH") => {
+                hexec_runner::PathSource::Session {
+                    runner: req.runner.describe().runner.clone(),
+                }
+            }
+            _ => hexec_runner::PathSource::Driver,
+        };
+
         env.insert("PATH".to_string(), self.sandbox_path_display());
         env.insert(
             "WORKSPACE_ROOT".to_string(),
@@ -1455,16 +1468,29 @@ impl Driver {
         // and `req` are still fully owned locals at this point (only cloned
         // versions of their fields were moved into `spec` above), so no work
         // happens on the far more common spawn-succeeds path.
-        let mut handle = proc_exec::spawn(spec).map_err(|e| {
+        // Through the session, not `proc_exec::spawn` directly: that is the
+        // whole exec-runner seam (`docs/EXEC_RUNNERS.md` §4.2). Under `local`
+        // the session's `prepare` is the identity function, so this is the same
+        // fork it always was.
+        let mut handle = req.runner.spawn(spec).map_err(|e| {
             let program = run.first().map_or("", String::as_str);
-            if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "spawn child process {program:?}: {e} — not found in the driver's sandbox PATH ({path}). This PATH is set by the driver's `path` option in .hephconfig and is independent of the invoking shell's PATH — a program on your interactive PATH can still be missing here. Also check that the working directory {cwd:?} exists.",
-                    path = self.sandbox_path_display(),
-                    cwd = req.sandbox_pkg_dir,
-                )
-            } else {
-                anyhow::Error::new(e).context(format!("spawn child process {program:?}"))
+            match e {
+                // Classified here rather than in the session because only the
+                // driver knows *which* PATH it composed and where that PATH came
+                // from. The session reports whether it supplied one; the naming
+                // of the fix — `.hephconfig` vs the runner — follows from that.
+                hexec_runner::SpawnError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    anyhow::Error::new(hexec_runner::SpawnError::ProgramNotFound {
+                        program: program.to_string(),
+                        path: self.sandbox_path_display(),
+                        source: path_source,
+                        cwd: req.sandbox_pkg_dir.display().to_string(),
+                        io,
+                    })
+                }
+                other => {
+                    anyhow::Error::new(other).context(format!("spawn child process {program:?}"))
+                }
             }
         })?;
 
@@ -2084,6 +2110,7 @@ mod tests {
             sandbox_ws_dir: path.clone(),
             sandbox_pkg_dir: path,
             inputs: vec![],
+            runner: Arc::new(hexec_runner::LocalSession::new()),
         }
     }
 
@@ -4111,6 +4138,7 @@ mod tests {
                     sandbox_pkg_dir: tmp.path().to_path_buf(),
                     request: req,
                     inputs: vec![managed_input],
+                    runner: Arc::new(hexec_runner::LocalSession::new()),
                 },
                 &ctoken,
             )
@@ -4157,6 +4185,7 @@ mod tests {
                     sandbox_pkg_dir: tmp.path().to_path_buf(),
                     request: req,
                     inputs: vec![managed_input],
+                    runner: Arc::new(hexec_runner::LocalSession::new()),
                 },
                 &ctoken,
             )
@@ -4235,6 +4264,7 @@ mod tests {
                     sandbox_pkg_dir: tmp.path().to_path_buf(),
                     request: req,
                     inputs: vec![managed_input],
+                    runner: Arc::new(hexec_runner::LocalSession::new()),
                 },
                 &ctoken,
             )
@@ -4486,6 +4516,7 @@ mod tests {
                     sandbox_pkg_dir: tmp.path().to_path_buf(),
                     request: req,
                     inputs: managed_inputs,
+                    runner: Arc::new(hexec_runner::LocalSession::new()),
                 },
                 &ctoken,
             )
@@ -4644,6 +4675,7 @@ mod tests {
                     sandbox_pkg_dir: tmp.path().to_path_buf(),
                     request: req,
                     inputs: vec![mi_a, mi_b],
+                    runner: Arc::new(hexec_runner::LocalSession::new()),
                 },
                 &ctoken,
             )
@@ -4745,6 +4777,7 @@ mod tests {
                     sandbox_pkg_dir: tmp.path().to_path_buf(),
                     request: req,
                     inputs: vec![mi_a, mi_b],
+                    runner: Arc::new(hexec_runner::LocalSession::new()),
                 },
                 &ctoken,
             )

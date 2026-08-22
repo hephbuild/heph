@@ -468,6 +468,7 @@ pub(crate) mod testfake {
             sandbox_ws_dir: sandbox.ws.clone(),
             sandbox_pkg_dir: sandbox.pkg.clone(),
             inputs,
+            runner: std::sync::Arc::new(hexec_runner::LocalSession::new()),
         }
     }
 }

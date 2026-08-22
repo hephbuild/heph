@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hexec_runner::ExecSession;
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
@@ -141,6 +142,7 @@ fn passthrough_nix_env() -> Vec<(OsString, OsString)> {
 async fn lock_flake_url(
     nix_bin: &str,
     url: &str,
+    runner: &dyn ExecSession,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<String> {
     let args: Vec<OsString> = [
@@ -171,7 +173,8 @@ async fn lock_flake_url(
         ctty: false,
     };
 
-    let output = proc_exec::output(spec, ctoken)
+    let output = runner
+        .output(spec, ctoken)
         .await
         .context("wait for nix flake metadata")?;
     if !output.status.success() {
@@ -384,7 +387,7 @@ impl ManagedDriver for Driver {
         // eval cache (the single biggest avoidable eval cost — jvns).
         // `nix flake metadata --json <url>` resolves to an immutable URL
         // (containing rev / narHash) which `getFlake` accepts in pure mode.
-        let locked_flake_url = lock_flake_url(&nix_bin, &def.nixpkgs, ctoken)
+        let locked_flake_url = lock_flake_url(&nix_bin, &def.nixpkgs, &*req.runner, ctoken)
             .await
             .with_context(|| format!("lock flake url {}", def.nixpkgs))?;
 
@@ -420,7 +423,12 @@ impl ManagedDriver for Driver {
             ctty: false,
         };
 
-        let output = proc_exec::output(spec, ctoken)
+        // Through the session — see `docs/EXEC_RUNNERS.md` §4.2. `output`, not
+        // `spawn`: nix build output is collected in full after the wait, which
+        // needs the unbounded drain.
+        let output = req
+            .runner
+            .output(spec, ctoken)
             .await
             .with_context(|| format!("wait for nix build for {addr_str}"))?;
 

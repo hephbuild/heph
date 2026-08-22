@@ -11,6 +11,7 @@ hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }
 hlock = { package = "lock", path = "../lock" }
+hexec-runner = { package = "exec-runner", path = "../exec-runner" }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 serde = { version = "1", features = ["derive"] }

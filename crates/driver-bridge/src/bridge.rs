@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ShellFallback};
 use hdriver_support::driver_managed_os::ManagedDriverOs;
+use hexec_runner::{ExecSession, LocalSession};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver,
     ParseRequest, ParseResponse, RunInput, RunRequest, RunResponse,
@@ -47,10 +48,17 @@ impl ManagedDriverBridge {
         fuse: Option<FuseSlot>,
     ) -> Self {
         let driver = Arc::new(driver);
+        // Phase 0: one `local` session shared by both sandbox runners. It is an
+        // identity transform, so behaviour is byte-for-byte what it was before
+        // the seam existed. Phase 1 replaces this with per-target resolution —
+        // the bridge is already where the per-target `Os` vs `Fuse` choice is
+        // made, so it is the natural place for the per-target runner choice too.
+        let runner: Arc<dyn ExecSession> = Arc::new(LocalSession::new());
         let os = ManagedDriverOs {
             driver: driver.clone(),
             shell_fallback: shell_fallback.clone(),
             stage_dir: Some(home.join("stage")),
+            runner: Arc::clone(&runner),
         };
         let fuse = fuse.map(|f| ManagedDriverFuse {
             driver: driver.clone(),
@@ -59,6 +67,7 @@ impl ManagedDriverBridge {
             fs: f.fs,
             fuse_lower: f.fuse_lower,
             fuse_upper: f.fuse_upper,
+            runner: Arc::clone(&runner),
         });
         Self { cfg, os, fuse }
     }
@@ -76,6 +85,7 @@ impl ManagedDriverBridge {
                 driver: Arc::new(driver),
                 shell_fallback,
                 stage_dir: None,
+                runner: Arc::new(LocalSession::new()),
             },
             fuse: None,
         }

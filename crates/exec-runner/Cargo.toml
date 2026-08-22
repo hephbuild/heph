@@ -1,0 +1,16 @@
+[package]
+name = "exec-runner"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hproc = { package = "proc", path = "../proc" }
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt", "macros"] }

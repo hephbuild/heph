@@ -2,6 +2,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hartifactcontent;
 use hcore::hasync::{self, Cancellable};
+use hexec_runner::ExecSession;
 use hmodel::htaddr::Addr;
 use hplugin::driver::inputartifact;
 use hplugin::driver::outputartifact::Content::TarPath;
@@ -52,6 +53,14 @@ pub struct ManagedRunRequest<'a, 'io> {
     pub sandbox_ws_dir: PathBuf,
     pub sandbox_pkg_dir: PathBuf,
     pub inputs: Vec<ManagedRunInput>,
+    /// The environment this target's processes are created in. Always present;
+    /// `LocalSession` (an identity transform) unless a runner was selected.
+    ///
+    /// A driver creates processes through this rather than calling
+    /// `proc_exec::{spawn,output}` directly — that is the whole of the
+    /// exec-runner seam (`docs/EXEC_RUNNERS.md` §4.2). A driver that creates no
+    /// process ignores it.
+    pub runner: Arc<dyn ExecSession>,
 }
 pub struct ManagedRunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
@@ -130,6 +139,7 @@ pub async fn invoke_inner<'a, 'io>(
     sandbox_pkg_dir: PathBuf,
     inputs: Vec<ManagedRunInput>,
     shell_fallback: &ShellFallback,
+    runner: Arc<dyn ExecSession>,
 ) -> anyhow::Result<ManagedRunResponse> {
     // Some inner drivers (e.g. pluginexec writing `init.sh`) read
     // `req.request.sandbox_dir` for filesystem ops. Keep both consistent
@@ -141,6 +151,7 @@ pub async fn invoke_inner<'a, 'io>(
         sandbox_pkg_dir,
         request: req,
         inputs,
+        runner,
     };
     let res = if shell {
         if driver.supports_shell() {
@@ -178,6 +189,7 @@ async fn run_shell_fallback<'a, 'io>(
         sandbox_ws_dir,
         sandbox_pkg_dir,
         inputs,
+        runner,
     } = mreq;
     let RunRequest {
         request_id,
@@ -230,6 +242,12 @@ async fn run_shell_fallback<'a, 'io>(
         sandbox_ws_dir,
         sandbox_pkg_dir,
         inputs,
+        // The synthetic shell target inherits the ORIGINAL target's session.
+        // Without this, `heph run --shell` on a driver that doesn't implement
+        // `run_shell` would drop the user into a *host* shell while claiming to
+        // show what the target sees — a lie about the environment, and exactly
+        // the question `--shell` exists to answer.
+        runner,
     };
     shell_fallback.driver.run_shell(new_mreq, ctoken).await
 }
