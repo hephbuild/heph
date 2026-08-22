@@ -1,4 +1,6 @@
 use crate::engine::Engine;
+use crate::engine::driver::TargetAddr;
+use crate::engine::driver::targetdef::InputMode;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{
@@ -18,6 +20,7 @@ use hcore::hmemoizer::{downcast_chain_ref, unwrap_arc_err};
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::MatchResult;
 use hmodel::htpkg::PkgBuf;
+use hplugin::provider::RunnerRef;
 
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
@@ -491,10 +494,48 @@ impl ProviderExecutor for EngineProviderExecutor {
 pub struct ExtendedTargetDef {
     pub target_def: Arc<TargetDef>,
     pub applied_transitive: Option<Sandbox>,
+    /// Resolved exec environment: `None` for `local`, else the runner target's
+    /// addr. Resolution order is per-target `runner =` → workspace
+    /// `defaultRunner` → local (`docs/EXEC_RUNNERS.md` §6).
+    ///
+    /// The addr is recorded for diagnostics and for execution to look the
+    /// session up. It does **not** feed the cache key directly — the runner
+    /// reaches `hashin` as an ordinary hashed input (see
+    /// [`Engine::resolve_runner`]), so two runner targets with byte-identical
+    /// artifacts are correctly the same environment.
+    pub runner: Option<Addr>,
     /// Registry name of the driver that produced `target_def`. Folded into
     /// `hashin` so swapping drivers under the same addr invalidates cache —
     /// even if the produced `TargetDef` bytes happen to match.
     pub driver: String,
+}
+
+/// The `origin_id` the runner input carries. Distinct and reserved so a driver
+/// cannot collide with it, and so diagnostics can name the edge.
+pub const RUNNER_ORIGIN_ID: &str = "@runner";
+
+/// The runner target, as an input of every target that uses it.
+///
+/// `hashed: true, runtime: false` — the existing `hash_deps` shape. That pair is
+/// the whole trick: the runner's `hashout` reaches the consumer's `hashin`, so
+/// changing the environment changes the key, while its bytes are **never**
+/// materialized into the consumer's sandbox. Materializing would cost a symlink,
+/// a list file and an `SRC_*`/`LIST_*` entry per target — 20k redundant file
+/// operations on a 20k-target build — and would change what an in-sandbox glob
+/// matches, which is a behaviour change nobody asked for.
+fn runner_input(addr: &Addr) -> Input {
+    Input {
+        r#ref: TargetAddr {
+            r#ref: addr.clone(),
+            output: None,
+            filters: vec![],
+        },
+        mode: InputMode::Standard,
+        origin_id: RUNNER_ORIGIN_ID.to_string(),
+        annotations: Default::default(),
+        hashed: true,
+        runtime: false,
+    }
 }
 
 /// Aggregate of a multi-target fanout. `errors` is non-empty only when the
@@ -3567,6 +3608,27 @@ impl Engine {
             .with_context(|| format!("get_def: {}", addr))
     }
 
+    /// Resolve which exec environment a target's processes are created in.
+    ///
+    /// Order: per-target `runner =` → workspace `defaultRunner` → local.
+    ///
+    /// The runner target itself is **excluded from the workspace default**. It
+    /// has to build under something, and letting it inherit the default makes it
+    /// its own dependency — which the cycle checker does catch, but reports as a
+    /// graph problem when it is really a config one. Excluding it up front means
+    /// the common case never reaches the checker at all.
+    fn resolve_runner(&self, addr: &Addr, spec: &TargetSpec) -> Option<Addr> {
+        match &spec.runner {
+            // `runner = None`: explicit opt-out, no default applies.
+            Some(RunnerRef::Local) => None,
+            Some(RunnerRef::Target(a)) => Some(a.clone()),
+            None => match &self.cfg.default_runner {
+                Some(d) if d == addr => None,
+                other => other.clone(),
+            },
+        }
+    }
+
     async fn get_def_inner(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -3658,6 +3720,25 @@ impl Engine {
             anyhow::bail!("missing hash");
         }
 
+        // Resolve the exec environment and wire it in as a hashed, non-runtime
+        // input.
+        //
+        // AFTER `apply_transitive`, deliberately. The runner is an engine-level
+        // concern that no driver is told about, and a driver's
+        // `apply_transitive` is free to rebuild `def.inputs` rather than push to
+        // it. Injecting earlier would leave the runner's presence in the cache
+        // key at the mercy of a driver that has no idea it exists — and its
+        // *absence* is silent, since a target that hashes as though it built in
+        // the host environment is exactly what it would then be.
+        //
+        // Nothing is lost by being late: `collect_transitive_deps` filters on
+        // `runtime`, which this input is not, so it would have been skipped
+        // there regardless.
+        let runner = self.resolve_runner(addr, &spec.spec);
+        if let Some(runner_addr) = &runner {
+            def.inputs.push(runner_input(runner_addr));
+        }
+
         // Validate approval notices against the finalized input set at definition
         // time — before any result resolution or execution — so a notice naming a
         // non-existent input group fails fast and identically on every path.
@@ -3667,6 +3748,7 @@ impl Engine {
         Ok(Arc::new(ExtendedTargetDef {
             target_def: Arc::new(def),
             applied_transitive: all_transitive,
+            runner,
             driver: spec.driver.clone(),
         }))
     }

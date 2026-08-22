@@ -84,6 +84,37 @@ pub struct TargetSpec {
     pub labels: Vec<String>,
     pub transitive: Sandbox,
     pub approval: Approval,
+    /// Authored `runner =`: the exec environment this target's processes are
+    /// created in (`docs/EXEC_RUNNERS.md`).
+    ///
+    /// `None` means *not authored*, which is not the same as `local`: an
+    /// unauthored target inherits the workspace `defaultRunner`, while
+    /// [`RunnerRef::Local`] is an explicit opt-out that no default overrides.
+    /// Collapsing the two would make it impossible to opt a bootstrap target
+    /// out of a workspace default.
+    pub runner: Option<RunnerRef>,
+}
+
+/// The reserved, non-addr value of `runner =`: the explicit opt-out.
+///
+/// Spelled once here so the BUILD-file parser, the wire conversion and the
+/// engine's resolution cannot drift on it.
+pub const RUNNER_LOCAL: &str = "local";
+
+/// Where a target's processes are created.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum RunnerRef {
+    /// `runner = None` — the host process, exactly as before exec runners
+    /// existed. Never subject to `defaultRunner`; the runner target itself must
+    /// build under something, and letting it inherit the default would turn a
+    /// config mistake into a cycle error.
+    #[default]
+    Local,
+    /// `runner = //pkg:name` — a target whose artifact describes the
+    /// environment. A target reference rather than a config name so its
+    /// identity reaches the cache key through the ordinary dependency
+    /// mechanism (see `docs/EXEC_RUNNERS.md` §4.3).
+    Target(Addr),
 }
 
 pub trait ProviderExecutor: Send + Sync {

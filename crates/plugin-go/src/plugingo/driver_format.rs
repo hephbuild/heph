@@ -470,6 +470,7 @@ pub fn build_format_spec(p: FormatParams) -> TargetSpec {
         ],
         transitive: Default::default(),
         approval: Default::default(),
+        runner: None,
     }
 }
 
@@ -487,6 +488,7 @@ pub fn build_format_check_spec(p: FormatParams) -> TargetSpec {
         labels: vec!["go-format-check".to_string(), "format-check".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
+        runner: None,
     }
 }
 

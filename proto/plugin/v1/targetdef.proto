@@ -21,6 +21,12 @@ message TargetSpec {
   repeated string labels = 4;
   Sandbox transitive = 5;
   Approval approval = 6;
+  // The exec environment this target's processes are created in
+  // (`docs/EXEC_RUNNERS.md`). Empty = not authored, so the workspace default
+  // applies; the reserved value "local" is the explicit opt-out. Additive: an
+  // older host ignores it and builds locally, which is the pre-runner
+  // behaviour.
+  string runner = 7;
 }
 
 // Opaque driver-specific config blob. The host never inspects this; it is

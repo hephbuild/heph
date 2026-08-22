@@ -619,6 +619,7 @@ impl EProvider for Provider {
                             labels: p.labels.clone(),
                             transitive: p.transitive.clone(),
                             approval: p.approval.clone(),
+                            runner: p.runner.clone(),
                         },
                     });
                 }

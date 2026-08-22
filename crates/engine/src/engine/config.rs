@@ -6,6 +6,8 @@
 //! [`ConfigYaml::resolve`]. Everything downstream of [`resolve`](ConfigYaml::resolve)
 //! sees a fully-populated [`Config`] and never has to reason about defaults.
 
+use anyhow::Context as _;
+use hmodel::htaddr::Addr;
 use std::path::{Path, PathBuf};
 
 use crate::engine::RemoteCacheDef;
@@ -22,6 +24,10 @@ pub struct Config {
     ///
     /// [`Engine::skip_dirs`]: crate::engine::Engine::skip_dirs
     pub fs_skip: Vec<String>,
+    /// Workspace-level `defaultRunner:` — the exec environment applied to every
+    /// target that neither authored `runner =` nor opted out with
+    /// `runner = None`. See `docs/EXEC_RUNNERS.md` §6.
+    pub default_runner: Option<Addr>,
     pub parallelism: Option<usize>,
     /// In-memory tier fronting the durable (SQLite) local cache.
     pub mem_cache: MemCacheOptions,
@@ -60,6 +66,7 @@ impl Default for Config {
             root: PathBuf::new(),
             home_dir: PathBuf::new(),
             fs_skip: Vec::new(),
+            default_runner: None,
             parallelism: None,
             mem_cache: MemCacheOptions::default(),
             tmp_cache: MemCacheOptions::default_tmp(),
@@ -139,6 +146,17 @@ impl ConfigYamlExt for ConfigYaml {
                 .map(|p| root.join(p))
                 .unwrap_or_else(|| root.join(".heph3")),
             fs_skip: self.fs.as_ref().map(|f| f.skip.clone()).unwrap_or_default(),
+            // Parsed here rather than carried as a string so a typo fails at
+            // config load, naming the file — not at the first target that tried
+            // to use it, where it reads as a target problem.
+            default_runner: self
+                .default_runner
+                .as_deref()
+                .map(|s| {
+                    hmodel::htaddr::parse_addr_with_base(s, &hmodel::htpkg::PkgBuf::from(""))
+                        .with_context(|| format!("defaultRunner: {s:?} is not a target address"))
+                })
+                .transpose()?,
             parallelism: None,
             mem_cache: self
                 .mem_cache

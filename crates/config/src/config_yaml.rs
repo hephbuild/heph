@@ -44,6 +44,17 @@ pub struct ConfigYaml {
     pub version_flavour: Option<String>,
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
+    /// Exec environment every target's processes are created in unless the
+    /// target says otherwise (`docs/EXEC_RUNNERS.md` §6). A runner target's
+    /// address, e.g. `//:devenv`.
+    ///
+    /// This is the expected way to use exec runners — "the whole repo builds
+    /// under devenv" — and it is a one-line change with a whole-workspace
+    /// rebuild behind it, because the environment is part of every affected
+    /// target's cache key. Targets opt out with `runner = None`, and the runner
+    /// target itself is never subject to it.
+    #[serde(default)]
+    pub default_runner: Option<String>,
     /// Every provider/driver — built-in or external — is declared as a single
     /// `plugin`. A `builtin:` entry selects a compiled-in plugin by name; a
     /// `path:`/`url:` entry points at a `*-plugin.json` manifest for a loadable

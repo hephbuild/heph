@@ -10,6 +10,7 @@ use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::{DriverSchema, TargetAddr};
 use hplugin::provider::{
     Approval, FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
+    RunnerRef,
 };
 use hwalk::{CachedWalker, EntryKind};
 use starlark::any::ProvidesStaticType;
@@ -464,10 +465,40 @@ pub(crate) struct OnTargetPayload {
     pub labels: Vec<String>,
     pub transitive: Sandbox,
     pub approval: Approval,
+    pub runner: Option<RunnerRef>,
     pub config: HashMap<String, htvalue::Value>,
     /// Source call sites that produced this target (innermost `target()` call
     /// first). See [`hplugin::provider::ProvenanceFrame`].
     pub provenance: Vec<ProvenanceFrame>,
+}
+
+/// Parse a BUILD-file `runner` value into a [`RunnerRef`].
+///
+/// Two spellings, and the asymmetry is deliberate: `runner = None` is the
+/// explicit opt-out, and everything else is an **addr**, not a name. That is
+/// the one place this differs from `driver =` sitting next to it, which is
+/// always a name — so a bare word here would be ambiguous with a target called
+/// `//:local`, and is rejected rather than guessed at.
+fn runner_from(v: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Option<RunnerRef>> {
+    match v {
+        htvalue::Value::Null() => Ok(Some(RunnerRef::Local)),
+        htvalue::Value::String(s) if s == hplugin::provider::RUNNER_LOCAL => {
+            Ok(Some(RunnerRef::Local))
+        }
+        htvalue::Value::String(s) => {
+            if !s.contains("//") && !s.contains(':') {
+                anyhow::bail!(
+                    "runner must be a target address (e.g. `//:devenv`) or `None` to opt out; \
+                     got the bare name {s:?}. Unlike `driver`, `runner` names a target, because \
+                     the environment it describes has to reach the cache key."
+                );
+            }
+            Ok(Some(RunnerRef::Target(htaddr::parse_addr_with_base(
+                &s, pkg,
+            )?)))
+        }
+        other => anyhow::bail!("runner must be a target address string or `None`, got {other:?}"),
+    }
 }
 
 /// Parse a BUILD-file `approval` value into an [`Approval`]. Two spellings:
@@ -834,6 +865,12 @@ pub(crate) fn target_base_fields() -> Vec<hplugin::driver::DriverField> {
             false,
         ),
         f(
+            "runner",
+            ParamType::union(vec![ParamType::String, ParamType::Null]),
+            "Exec environment this target's processes run in: a runner target's addr, or `None` to opt out of the workspace `defaultRunner`.",
+            false,
+        ),
+        f(
             "approval",
             ParamType::union(vec![
                 ParamType::Bool,
@@ -874,6 +911,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         let mut labels: Vec<String> = vec![];
         let mut transitive: Sandbox = Default::default();
         let mut approval: Approval = Default::default();
+        let mut runner: Option<RunnerRef> = None;
         let config = m
             .iter()
             .map(|e| -> anyhow::Result<Option<(String, htvalue::Value)>> {
@@ -910,6 +948,11 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                             approval_from(starlark_to_rust(e.1)?).with_context(|| "approval")?;
                         Ok(None)
                     }
+                    "runner" => {
+                        runner = runner_from(starlark_to_rust(e.1)?, &PkgBuf::from(extra.pkg))
+                            .with_context(|| "runner")?;
+                        Ok(None)
+                    }
                     _ => Ok(Some((e.0.as_str().to_string(), starlark_to_rust(e.1)?))),
                 }
             })
@@ -938,6 +981,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             labels,
             transitive,
             approval,
+            runner,
             config,
             provenance,
         };

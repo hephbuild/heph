@@ -104,7 +104,7 @@ impl Engine {
         // the link/execute path, but must not alter the cache key.
         let futures = inputs.iter().filter(|input| input.hashed).map(|input| {
             enclose!((self => engine, rc, input) async move {
-                engine
+                let res = engine
                     .clone()
                     .result_addr(
                         rc,
@@ -112,7 +112,32 @@ impl Engine {
                         OutputMatcher::None,
                         &ResultOptions::default(),
                     )
-                    .await
+                    .await?;
+
+                // A runner target that produces nothing is INVISIBLE to the
+                // cache key, and silently so: `hashin` folds input *hashouts*,
+                // and a zero-output target yields an empty `artifacts_meta`. Two
+                // runner targets describing completely different environments
+                // would then produce byte-identical `hashin` for every consumer,
+                // and an artifact built under one would be served for the other.
+                //
+                // Rejecting here rather than folding the runner's own `hashin`
+                // instead: that would be a second, runner-shaped hash component,
+                // and the design deliberately has exactly one way for anything to
+                // reach the key — through a dependency's hashout.
+                if input.origin_id == crate::engine::result::RUNNER_ORIGIN_ID
+                    && res.artifacts_meta.is_empty()
+                {
+                    anyhow::bail!(
+                        "runner {} produces no output artifacts, so it cannot describe an \
+                         environment: nothing of it would reach the cache key, and every target \
+                         using it would share a key with targets using a different runner. Give \
+                         the runner target an `out`.",
+                        input.r#ref.r#ref.format(),
+                    );
+                }
+
+                Ok(res)
             })
         });
 
@@ -157,6 +182,7 @@ mod tests {
         ExtendedTargetDef {
             target_def,
             applied_transitive: None,
+            runner: None,
             driver: driver.to_string(),
         }
     }

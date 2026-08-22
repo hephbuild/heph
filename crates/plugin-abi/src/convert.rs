@@ -15,7 +15,7 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::targetdef::{RawDef, RawDefBytes};
-use hplugin::provider::{Approval, State, TargetSpec};
+use hplugin::provider::{Approval, RUNNER_LOCAL, RunnerRef, State, TargetSpec};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -500,7 +500,33 @@ pub fn target_spec_to_pb(t: &TargetSpec) -> pb::TargetSpec {
         labels: t.labels.clone(),
         transitive: Some(sandbox_to_pb(&t.transitive)),
         approval: Some(approval_to_pb(&t.approval)),
+        runner: runner_to_pb(t.runner.as_ref()),
     }
+}
+
+/// `runner =` crosses as a string: empty for "not authored" (inherit the
+/// workspace default), the reserved `"local"` for the explicit opt-out, and a
+/// formatted addr otherwise. A string rather than a message so the field is
+/// additive in the plainest possible way — an older peer sees an absent field
+/// and behaves exactly as it did before runners existed.
+fn runner_to_pb(r: Option<&RunnerRef>) -> String {
+    match r {
+        None => String::new(),
+        Some(RunnerRef::Local) => RUNNER_LOCAL.to_string(),
+        Some(RunnerRef::Target(addr)) => addr.format(),
+    }
+}
+
+fn runner_from_pb(s: &str, pkg: &PkgBuf) -> anyhow::Result<Option<RunnerRef>> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if s == RUNNER_LOCAL {
+        return Ok(Some(RunnerRef::Local));
+    }
+    Ok(Some(RunnerRef::Target(
+        hmodel::htaddr::parse_addr_with_base(s, pkg)?,
+    )))
 }
 
 pub fn target_spec_from_pb(t: pb::TargetSpec) -> TargetSpec {
@@ -515,6 +541,11 @@ pub fn target_spec_from_pb(t: pb::TargetSpec) -> TargetSpec {
         labels: t.labels,
         transitive: sandbox_from_pb(t.transitive.unwrap_or_default()),
         approval: approval_from_pb(t.approval.unwrap_or_default()),
+        // A malformed runner addr from a peer is not worth failing the whole
+        // spec decode over; it degrades to "not authored" and the workspace
+        // default applies. The authoring side (`target()`) rejects it loudly,
+        // which is where a human can act on it.
+        runner: runner_from_pb(&t.runner, &PkgBuf::from("")).ok().flatten(),
     }
 }
 
@@ -896,6 +927,9 @@ mod tests {
                 required: true,
                 notice: vec!["plan".to_string()],
             },
+            runner: Some(RunnerRef::Target(
+                hmodel::htaddr::parse_addr_with_base("//pkg:devenv", &PkgBuf::from("")).unwrap(),
+            )),
         };
         spec.transitive.push_dep(Dep {
             r#ref: TargetAddr {

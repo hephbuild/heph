@@ -16,6 +16,7 @@ pub struct WorkspaceBuilder {
     dir: TempDir,
     parallelism: Option<usize>,
     fs_skip: Vec<String>,
+    default_runner: Option<Addr>,
     setups: Vec<SetupFn>,
 }
 
@@ -25,6 +26,7 @@ impl WorkspaceBuilder {
             dir: tempfile::tempdir().context("create workspace tempdir")?,
             parallelism: None,
             fs_skip: vec![],
+            default_runner: None,
             setups: vec![],
         })
     }
@@ -34,6 +36,7 @@ impl WorkspaceBuilder {
             dir,
             parallelism: None,
             fs_skip: vec![],
+            default_runner: None,
             setups: vec![],
         }
     }
@@ -47,6 +50,14 @@ impl WorkspaceBuilder {
     /// plugin prunes. The engine splits these into literal dirs and globs.
     pub fn with_fs_skip(mut self, skip: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.fs_skip = skip.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Mirrors the config file's `defaultRunner:` — the exec environment every
+    /// target inherits unless it authored `runner =` or opted out with
+    /// `runner = None`.
+    pub fn with_default_runner(mut self, addr: Addr) -> Self {
+        self.default_runner = Some(addr);
         self
     }
 
@@ -79,6 +90,7 @@ impl WorkspaceBuilder {
             home_dir: std::path::PathBuf::new(),
             parallelism: self.parallelism,
             fs_skip: self.fs_skip,
+            default_runner: self.default_runner,
             ..Default::default()
         })?;
         for setup in self.setups {

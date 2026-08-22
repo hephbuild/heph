@@ -51,6 +51,33 @@ impl Workspace {
         Self::with_parallelism(None)
     }
 
+    /// A workspace with `defaultRunner:` set — the exec environment every
+    /// target inherits unless it authored `runner =` or opted out.
+    ///
+    /// Not reopenable: `ReopenConfig` would have to carry the default too, and
+    /// a reopen that silently dropped it would resolve the same targets under
+    /// different keys into the same on-disk cache — the exact confusion that
+    /// struct's doc comment exists to prevent.
+    pub fn with_default_runner(addr: &str) -> Self {
+        let addr = heph::htaddr::parse_addr(addr).expect("parse defaultRunner addr");
+        Self {
+            inner: WorkspaceBuilder::new()
+                .expect("workspace tempdir")
+                .with_provider(|init| {
+                    Box::new(pluginbuildfile::Provider::new(
+                        init.root.to_path_buf(),
+                        init.runtime.clone(),
+                    ))
+                })
+                .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
+                .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+                .with_default_runner(addr)
+                .build()
+                .expect("build workspace"),
+            reopen_with: None,
+        }
+    }
+
     pub fn with_parallelism(parallelism: impl Into<Option<usize>>) -> Self {
         let p = parallelism.into();
         let builder = WorkspaceBuilder::new()

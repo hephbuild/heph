@@ -1324,6 +1324,7 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         labels: vec![],
         transitive: Default::default(),
         approval: Default::default(),
+        runner: None,
     }
 }
 
@@ -1366,6 +1367,7 @@ pub fn build_lint_gate_spec(
         labels: vec!["go-lint-check".to_string(), "lint-check".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
+        runner: None,
     }
 }
 
@@ -1429,6 +1431,7 @@ pub fn build_lint_fix_spec(
         labels: vec!["go-lint".to_string(), "lint".to_string(), "fix".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
+        runner: None,
     }
 }
 
