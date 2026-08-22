@@ -512,6 +512,7 @@ impl Engine {
             remote_tmp_ready: tokio::sync::OnceCell::new(),
         };
         engine.register_driver(|_| Box::new(hbuiltins::plugingroup::Driver))?;
+        engine.register_driver(|_| Box::new(hbuiltins::pluginscratch::Driver))?;
         engine.register_provider(|_| Box::new(hplugin_query::pluginquery::Provider))?;
 
         // The `fs` provider + driver are always-on built-ins. Each builds its

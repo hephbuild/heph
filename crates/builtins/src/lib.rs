@@ -4,6 +4,7 @@
 //!
 //! - `pluginfs` — the `fs` provider + driver (filesystem targets).
 //! - `plugingroup` — the `group` driver (aggregate targets).
+//! - `pluginscratch` — the `scratch` driver (persistent cache-directory declarations).
 //! - `pluginstatictarget` — in-memory static target provider (tests/wiring).
 //! - `plugintextfile` — the `textfile` driver.
 //! - `pluginhostbin` — the host-binary provider + driver.
@@ -11,6 +12,7 @@
 pub mod pluginfs;
 pub mod plugingroup;
 pub mod pluginhostbin;
+pub mod pluginscratch;
 pub mod pluginstatictarget;
 pub mod plugintextfile;
 
