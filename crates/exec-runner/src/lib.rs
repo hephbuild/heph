@@ -517,45 +517,49 @@ pub struct SessionEnv {
 }
 
 impl SessionEnv {
-    /// The environment layer this runner contributes, lowest precedence first.
+    /// Host variables this runner passes through, resolved **now**.
     ///
-    /// Ordered to mirror what a *target's* own keys do in `pluginexec`
-    /// (`env` → `pass_env` → `runtime_pass_env` → `runtime_env`), so a reader
-    /// who knows one knows the other. Everything here still sits **underneath**
-    /// the caller's own entries — see [`ExecSession::prepare`].
+    /// The **weakest** layer — weaker than the environment the runner captured.
+    /// That ordering is deliberate and differs from a target's own keys, where
+    /// `runtime_pass_env` sits on top of `env`.
     ///
-    /// `runtime_*` are resolved here, at spawn, and not when the environment was
-    /// captured. That is the whole point of them.
-    pub fn layer(&self) -> Vec<(OsString, OsString)> {
+    /// The reason: a runner exists to *provide* an environment. If a passed-
+    /// through host variable outranked the captured one, `runtime_pass_env =
+    /// ["*"]` would silently replace that environment with the developer's own
+    /// — a devenv `CC` quietly becoming whatever `CC` the login shell had. The
+    /// build would still be keyed as though it ran in devenv. CI caught exactly
+    /// this: a runner declaring `CC=clang` and `"*"` produced `CC=gcc`, because
+    /// the runner ran on a machine whose environment set `CC`.
+    ///
+    /// A runner that genuinely wants to override its captured environment says
+    /// so with `runtime_env`, which is explicit and outranks it.
+    pub fn host_layer(&self) -> Vec<(OsString, OsString)> {
+        let mut out: Vec<(OsString, OsString)> = Vec::new();
+        if self.runtime_pass_env.iter().any(|n| n == "*") {
+            out.extend(std::env::vars_os());
+        } else {
+            for name in &self.runtime_pass_env {
+                if let Some(v) = std::env::var_os(name) {
+                    out.push((OsString::from(name), v));
+                }
+            }
+        }
+        out
+    }
+
+    /// What the runner declared literally: `env` (captured) then `runtime_env`
+    /// (applied at spawn), the latter winning. Both outrank the host layer and
+    /// the captured environment, and both lose to the target's own entries.
+    pub fn declared_layer(&self) -> Vec<(OsString, OsString)> {
         let mut out: Vec<(OsString, OsString)> =
             Vec::with_capacity(self.env.len() + self.runtime_env.len());
-
-        let put = |k: OsString, v: OsString, out: &mut Vec<(OsString, OsString)>| {
-            // Last writer wins *within* the layer, and no key appears twice —
-            // a duplicate would leave which value the child sees up to `execve`.
+        for (k, v) in self.env.iter().chain(self.runtime_env.iter()) {
+            let (k, v) = (OsString::from(k), OsString::from(v));
             if let Some(slot) = out.iter_mut().find(|(ek, _)| *ek == k) {
                 slot.1 = v;
             } else {
                 out.push((k, v));
             }
-        };
-
-        for (k, v) in &self.env {
-            put(OsString::from(k), OsString::from(v), &mut out);
-        }
-        if self.runtime_pass_env.iter().any(|n| n == "*") {
-            for (k, v) in std::env::vars_os() {
-                put(k, v, &mut out);
-            }
-        } else {
-            for name in &self.runtime_pass_env {
-                if let Some(v) = std::env::var_os(name) {
-                    put(OsString::from(name), v, &mut out);
-                }
-            }
-        }
-        for (k, v) in &self.runtime_env {
-            put(OsString::from(k), OsString::from(v), &mut out);
         }
         out
     }
@@ -619,12 +623,23 @@ impl ExecSession for EnvSession {
     /// then convert each again into `OsString`, which for a 60–150-variable dev
     /// shell is hundreds of allocations per executed target.
     fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
-        let runtime = self.declared.layer();
-        let mut env = Vec::with_capacity(self.base_env.len() + runtime.len() + spec.env.len());
-        for (k, v) in self.base_env.iter().chain(runtime.iter()) {
-            // The caller wins, and the later of base/runtime wins between
-            // themselves — which is what puts `runtime_env` above the captured
-            // environment, mirroring a target's own ordering.
+        // Weakest to strongest:
+        //   host passthrough  <  captured environment  <  declared literals  <  the target
+        //
+        // The first two are the order CI corrected: a `"*"` passthrough must not
+        // be able to replace the environment the runner was chosen to provide.
+        let host = self.declared.host_layer();
+        let declared = self.declared.declared_layer();
+        let mut env =
+            Vec::with_capacity(host.len() + self.base_env.len() + declared.len() + spec.env.len());
+        for (k, v) in host
+            .iter()
+            .chain(self.base_env.iter())
+            .chain(declared.iter())
+        {
+            // The target always wins, and within the runner's own layers the
+            // later one does. No key appears twice — a duplicate would leave
+            // which value the child sees up to `execve`.
             if spec.env.iter().any(|(sk, _)| sk == k) {
                 continue;
             }
@@ -1209,7 +1224,10 @@ mod session_env_tests {
             env: pairs(&[("CC", "clang")]),
             ..Default::default()
         };
-        assert_eq!(get(&se.layer(), "CC"), Some(&OsString::from("clang")));
+        assert_eq!(
+            get(&se.declared_layer(), "CC"),
+            Some(&OsString::from("clang"))
+        );
     }
 
     /// `runtime_env` sits above the captured `env`, mirroring the order a
@@ -1221,7 +1239,7 @@ mod session_env_tests {
             runtime_env: pairs(&[("MODE", "runtime")]),
             ..Default::default()
         };
-        let l = se.layer();
+        let l = se.declared_layer();
         assert_eq!(get(&l, "MODE"), Some(&OsString::from("runtime")));
         assert_eq!(
             l.iter().filter(|(k, _)| k == "MODE").count(),
@@ -1244,7 +1262,7 @@ mod session_env_tests {
             ..Default::default()
         };
         assert_eq!(
-            get(&se.layer(), "heph_TEST_RUNNER_RT_PASS"),
+            get(&se.host_layer(), "heph_TEST_RUNNER_RT_PASS"),
             Some(&OsString::from("from_host"))
         );
     }
@@ -1255,7 +1273,7 @@ mod session_env_tests {
             runtime_pass_env: vec!["heph_TEST_RUNNER_DEFINITELY_UNSET".to_string()],
             ..Default::default()
         };
-        assert!(get(&se.layer(), "heph_TEST_RUNNER_DEFINITELY_UNSET").is_none());
+        assert!(get(&se.host_layer(), "heph_TEST_RUNNER_DEFINITELY_UNSET").is_none());
     }
 
     /// `"*"` is the same escape hatch a target has: the whole host environment,
@@ -1271,62 +1289,93 @@ mod session_env_tests {
             ..Default::default()
         };
         assert_eq!(
-            get(&se.layer(), "heph_TEST_RUNNER_WILDCARD"),
+            get(&se.host_layer(), "heph_TEST_RUNNER_WILDCARD"),
             Some(&OsString::from("yes"))
         );
     }
 
-    /// …but even the wildcard stays underneath the target's own entries. A
-    /// runner that could overwrite `$OUT` or a target's `env` would silently
-    /// change what the target builds.
+    /// The ordering CI corrected, and the reason it is not a target's.
+    ///
+    /// A runner exists to *provide* an environment. If a passed-through host
+    /// variable outranked the captured one, `runtime_pass_env = ["*"]` would
+    /// silently replace that environment with the developer's own — and the
+    /// build would still be keyed as though it ran in the runner's. This failed
+    /// on both Linux legs, where the CI image sets `CC`: a runner declaring
+    /// `CC=clang` produced `CC=gcc`.
+    #[test]
+    fn the_captured_environment_outranks_a_host_passthrough() {
+        // SAFETY: process-global, and the name is this test's alone.
+        unsafe {
+            std::env::set_var("heph_TEST_RUNNER_CAPTURED", "from_host");
+        }
+        let session = EnvSession::with_declared(
+            vec![(
+                OsString::from("heph_TEST_RUNNER_CAPTURED"),
+                OsString::from("from_capture"),
+            )],
+            SessionEnv {
+                runtime_pass_env: vec!["*".to_string()],
+                ..Default::default()
+            },
+            caps(),
+            desc(),
+        );
+        let out = session.prepare(bare_spec()).expect("prepare");
+        assert_eq!(
+            get(&out.env, "heph_TEST_RUNNER_CAPTURED"),
+            Some(&OsString::from("from_capture")),
+            "a `*` passthrough must not replace what the runner captured",
+        );
+    }
+
+    /// …and `runtime_env` is how a runner overrides its own capture, because it
+    /// is explicit rather than whatever the host happened to have.
+    #[test]
+    fn runtime_env_can_override_the_capture_when_the_host_cannot() {
+        let session = EnvSession::with_declared(
+            vec![(OsString::from("MODE"), OsString::from("captured"))],
+            SessionEnv {
+                runtime_env: pairs(&[("MODE", "explicit")]),
+                ..Default::default()
+            },
+            caps(),
+            desc(),
+        );
+        let out = session.prepare(bare_spec()).expect("prepare");
+        assert_eq!(get(&out.env, "MODE"), Some(&OsString::from("explicit")));
+    }
+
+    /// Above all of it, the target. A runner that could overwrite `$OUT`, `$SRC`
+    /// or a target's own `env` would silently change what the target builds.
     #[test]
     fn the_target_still_wins_over_everything_the_runner_declares() {
-        // SAFETY: as above — a name used by this test alone.
+        // SAFETY: as above.
         unsafe {
             std::env::set_var("heph_TEST_RUNNER_COLLIDE", "from_host");
         }
         let session = EnvSession::with_declared(
-            vec![(OsString::from("CC"), OsString::from("clang"))],
+            vec![(
+                OsString::from("heph_TEST_RUNNER_COLLIDE"),
+                OsString::from("from_capture"),
+            )],
             SessionEnv {
                 runtime_env: pairs(&[("heph_TEST_RUNNER_COLLIDE", "from_runner")]),
                 runtime_pass_env: vec!["*".to_string()],
                 ..Default::default()
             },
-            SessionCaps {
-                pty: false,
-                max_concurrent: None,
-                identity: Identity::Pinned {
-                    by: "t".to_string(),
-                },
-            },
-            SessionDescription {
-                runner: "//:r".to_string(),
-                shell_functions: vec![],
-                key: "k".to_string(),
-                summary: String::new(),
-            },
+            caps(),
+            desc(),
         );
-
-        let spec = Spec {
-            program: PathBuf::from("/bin/true"),
-            args: vec![],
-            env: vec![(
-                OsString::from("heph_TEST_RUNNER_COLLIDE"),
-                OsString::from("from_target"),
-            )],
-            cwd: PathBuf::from("/"),
-            stdin: proc_exec::StdioSpec::Null,
-            stdout: proc_exec::StdioSpec::Null,
-            stderr: proc_exec::StdioSpec::Null,
-            setsid: false,
-            ctty: false,
-        };
+        let mut spec = bare_spec();
+        spec.env = vec![(
+            OsString::from("heph_TEST_RUNNER_COLLIDE"),
+            OsString::from("from_target"),
+        )];
         let out = session.prepare(spec).expect("prepare");
         assert_eq!(
             get(&out.env, "heph_TEST_RUNNER_COLLIDE"),
             Some(&OsString::from("from_target"))
         );
-        assert_eq!(get(&out.env, "CC"), Some(&OsString::from("clang")));
         assert_eq!(
             out.env
                 .iter()
@@ -1334,5 +1383,38 @@ mod session_env_tests {
                 .count(),
             1
         );
+    }
+
+    fn caps() -> SessionCaps {
+        SessionCaps {
+            pty: false,
+            max_concurrent: None,
+            identity: Identity::Pinned {
+                by: "t".to_string(),
+            },
+        }
+    }
+
+    fn desc() -> SessionDescription {
+        SessionDescription {
+            runner: "//:r".to_string(),
+            shell_functions: vec![],
+            key: "k".to_string(),
+            summary: String::new(),
+        }
+    }
+
+    fn bare_spec() -> Spec {
+        Spec {
+            program: PathBuf::from("/bin/true"),
+            args: vec![],
+            env: vec![],
+            cwd: PathBuf::from("/"),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Null,
+            stderr: proc_exec::StdioSpec::Null,
+            setsid: false,
+            ctty: false,
+        }
     }
 }
