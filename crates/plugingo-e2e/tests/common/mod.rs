@@ -363,6 +363,7 @@ impl heph::engine::exec_runner::ExecRunner for RecordingRunner {
             },
             description: heph::engine::exec_runner::SessionDescription {
                 runner: req.runner_addr.clone(),
+                shell_functions: vec![],
                 key: req.key.clone(),
                 summary: "recording (identity)".to_string(),
             },
