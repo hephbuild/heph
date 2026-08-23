@@ -496,7 +496,7 @@ pub struct ExtendedTargetDef {
     pub applied_transitive: Option<Sandbox>,
     /// Resolved exec environment: `None` for `local`, else the runner target's
     /// addr. Resolution order is per-target `runner =` → workspace
-    /// `defaultRunner` → local (`docs/EXEC_RUNNERS.md` §6).
+    /// `defaultRunner` → local (`docs/EXEC_RUNNERS.md`).
     ///
     /// The addr is recorded for diagnostics and for execution to look the
     /// session up. It does **not** feed the cache key directly — the runner

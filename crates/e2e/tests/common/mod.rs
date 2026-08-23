@@ -107,7 +107,7 @@ impl heph::engine::exec_runner::ExecRunner for RecordingExecRunner {
 
         // The environment is derived from the artifact, not invented: that is
         // the rule that keeps `open` a pure parse of content the cache key
-        // already covers (docs/EXEC_RUNNERS.md §4.7).
+        // already covers. See `docs/EXEC_RUNNERS.md`.
         let from_artifact = req
             .artifacts
             .first()
@@ -282,6 +282,31 @@ impl Workspace {
                         torn: None,
                     }),
                 )
+                .build()
+                .expect("build workspace"),
+            reopen_with: None,
+        }
+    }
+
+    /// A workspace whose runner targets built by `driver_name` are served by
+    /// `runner` — the shape a loaded cdylib gets, where a driver that answers
+    /// the exec-runner lane is registered as the runner for its own name.
+    pub fn with_exec_runner_named(
+        driver_name: &str,
+        runner: Arc<dyn heph::engine::exec_runner::ExecRunner>,
+    ) -> Self {
+        Self {
+            inner: WorkspaceBuilder::new()
+                .expect("workspace tempdir")
+                .with_provider(|init| {
+                    Box::new(pluginbuildfile::Provider::new(
+                        init.root.to_path_buf(),
+                        init.runtime.clone(),
+                    ))
+                })
+                .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
+                .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+                .with_exec_runner(driver_name, runner)
                 .build()
                 .expect("build workspace"),
             reopen_with: None,

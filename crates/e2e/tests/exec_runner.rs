@@ -5,7 +5,7 @@
 
 //! `runner =` selection and its effect on the cache key.
 //!
-//! Design: `docs/EXEC_RUNNERS.md`. The property under test throughout is §4.3's:
+//! Design: `docs/EXEC_RUNNERS.md`. The property under test throughout is:
 //! a runner reference is a *target* reference, so the environment reaches
 //! `hashin` through the ordinary dependency mechanism and not through a new
 //! hash component.
@@ -156,7 +156,7 @@ target(name = "c", driver = "bash", run = "echo x > $OUT", out = "o", runner = "
     Ok(())
 }
 
-/// The workspace default applies to targets that did not author one — which §6
+/// The workspace default applies to targets that did not author one — which the workspace default
 /// calls the expected way to use this ("the whole repo builds under devenv").
 #[tokio::test]
 async fn workspace_default_applies_and_can_be_opted_out_of() -> anyhow::Result<()> {
@@ -323,7 +323,7 @@ target(name = "b", driver = "bash", run = "echo b > $OUT", out = "o", runner = "
 
 /// A session's `PATH` **replaces** the driver's, it does not sit under it.
 ///
-/// This is §4.4's layer-2 rule, and it is the one that decides whether a runner
+/// This is the PATH-replacement rule, and it is the one that decides whether a runner
 /// means anything: with the driver's default appended, a tool missing from the
 /// environment silently falls through to the host — the exact ambient
 /// dependency a runner exists to remove — and does so under a cache key that

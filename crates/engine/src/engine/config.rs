@@ -26,7 +26,7 @@ pub struct Config {
     pub fs_skip: Vec<String>,
     /// Workspace-level `defaultRunner:` — the exec environment applied to every
     /// target that neither authored `runner =` nor opted out with
-    /// `runner = None`. See `docs/EXEC_RUNNERS.md` §6.
+    /// `runner = None`. See `docs/EXEC_RUNNERS.md`.
     pub default_runner: Option<Addr>,
     pub parallelism: Option<usize>,
     /// In-memory tier fronting the durable (SQLite) local cache.
