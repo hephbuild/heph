@@ -31,6 +31,7 @@ pub mod platform;
 pub mod pull;
 pub mod push;
 pub mod registry;
+pub mod runner;
 
 /// Archive format an image is built/consumed as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

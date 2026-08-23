@@ -18,19 +18,22 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_oci::pluginoci;
-use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedDriver, PluginComponents};
+use plugin_sdk::stabby::abi::{
+    DynLogSink, DynSupervisor, NamedDriver, NamedExecRunner, PluginComponents,
+};
 use plugin_sdk::stabby::{
-    install_log_sink, install_supervisor, make_dyn_managed_driver, make_dyn_provider,
+    create_config_from_bytes, install_log_sink, install_supervisor, make_dyn_exec_runner,
+    make_dyn_managed_driver, make_dyn_provider,
 };
 use std::sync::Arc;
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
-/// `pb::CreateConfig` bytes; this plugin reads nothing out of it, but the
-/// parameter stays so config fields can be added without an ABI change.
+/// `pb::CreateConfig` bytes — the workspace root, which `oci_runner` needs to
+/// know which directory to mount into its containers.
 #[stabby::export]
-pub extern "C" fn heph_plugin_create(_cfg: stabby::vec::Vec<u8>) -> PluginComponents {
-    build()
+pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginComponents {
+    build(&cfg)
 }
 
 /// Stable ABI log-sink entry: the host calls this right after `create` to hand
@@ -54,7 +57,16 @@ pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
     install_supervisor(sup);
 }
 
-fn build() -> PluginComponents {
+fn build(cfg: &[u8]) -> PluginComponents {
+    // A root we could not decode leaves the runner with nothing to mount, which
+    // would fail every target under it with a dangling `$OUT`. The drivers are
+    // unaffected, so this degrades to "no runner exported" — the host then
+    // refuses an `oci_runner` target by name rather than running one wrongly.
+    let root = create_config_from_bytes(cfg)
+        .ok()
+        .map(|c| std::path::PathBuf::from(c.root))
+        .filter(|r| !r.as_os_str().is_empty());
+
     let mut drivers = stabby::vec::Vec::new();
 
     // Assembles target outputs into an image. No daemon, no execution.
@@ -105,6 +117,26 @@ fn build() -> PluginComponents {
         driver: make_dyn_managed_driver(platform),
     });
 
+    // Writes the image reference a container session is opened from.
+    let oci_runner: Arc<dyn ManagedDriver> = Arc::new(pluginoci::runner::Driver);
+    drivers.push(NamedDriver {
+        name: pluginoci::runner::DRIVER_NAME.into(),
+        driver: make_dyn_managed_driver(oci_runner),
+    });
+
+    // The runner half, under the same name — a target built by the `oci_runner`
+    // driver selects the `oci_runner` runner.
+    let mut runners = stabby::vec::Vec::new();
+    if let Some(root) = root {
+        let runner: Arc<dyn plugin_sdk::runner::ExecRunner> = Arc::new(
+            pluginoci::runner::Runner::new(root.join(".heph3").join("sandbox")),
+        );
+        runners.push(NamedExecRunner {
+            name: pluginoci::runner::DRIVER_NAME.into(),
+            runner: make_dyn_exec_runner(runner),
+        });
+    }
+
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(pluginoci::platform::Provider);
 
     PluginComponents {
@@ -112,8 +144,7 @@ fn build() -> PluginComponents {
         provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
         hooks: stabby::vec::Vec::new(),
-        // No exec runner: this plugin serves no environments.
-        runners: stabby::vec::Vec::new(),
+        runners,
         meta: stabby::vec::Vec::new(),
     }
 }
