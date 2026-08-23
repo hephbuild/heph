@@ -29,8 +29,22 @@
 //! the design exists to prevent. The client then exits with the child's status,
 //! so the exit code a driver sees is the real one.
 //!
-//! Cancellation falls out: heph kills the client's process group, the agent sees
-//! the socket close, and kills the child it forked.
+//! ## Cancellation
+//!
+//! heph kills the client. That alone cannot reach the target: the target was
+//! forked by the *agent*, in a different process tree, and then `setsid` into a
+//! session of its own — so no group kill heph can issue touches it, and the
+//! session teardown's `SIGTERM` to the `devenv shell` misses it for the same
+//! reason.
+//!
+//! So the agent watches the socket. [`serve_one`] hands `run` a descriptor to
+//! poll; when the client goes away the peer hangs up, and the agent kills the
+//! process group it created. The target *is* that group's leader, because
+//! `setsid` made it one — which is what makes a single `kill(-pid)` enough.
+//!
+//! This used to be documented as working and was not implemented: `serve_one`
+//! blocked in `child.wait()` with nothing watching, so a cancelled build left
+//! its targets running to completion.
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd, RawFd};
@@ -269,9 +283,12 @@ pub fn bind(socket: &Path) -> std::io::Result<UnixListener> {
 /// process, reply with its status.
 ///
 /// `run` is the fork/exec, injected so the protocol can be tested without one.
+/// Its third argument is a descriptor that becomes readable when the client
+/// disconnects — the implementation must stop watching it before returning,
+/// since it is borrowed from this connection.
 pub fn serve_one(
     mut sock: UnixStream,
-    run: &dyn Fn(ExecRequest, [RawFd; 3]) -> anyhow::Result<Option<i32>>,
+    run: &dyn Fn(ExecRequest, [RawFd; 3], RawFd) -> anyhow::Result<Option<i32>>,
 ) -> anyhow::Result<()> {
     let body = read_frame(&mut sock)?;
     let req: ExecRequest = serde_json::from_slice(&body)?;
@@ -285,7 +302,10 @@ pub fn serve_one(
         ))
     })?;
 
-    let reply = match run(req, stdio) {
+    // The socket itself is the liveness signal: the client sends nothing after
+    // the request, so anything readable on it means the peer is gone.
+    let hangup = sock.as_raw_fd();
+    let reply = match run(req, stdio, hangup) {
         Ok(code) => ExecReply::Exited { code },
         Err(e) => ExecReply::Error {
             message: format!("{e:#}"),
@@ -305,6 +325,69 @@ pub fn serve_one(
     Ok(())
 }
 
+/// Kills the target's process group if the client disconnects first.
+pub struct HangupWatch {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HangupWatch {
+    pub fn arm(hangup: RawFd, pid: u32) -> Self {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let done = std::sync::Arc::clone(&done);
+            move || {
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let mut pfd = libc::pollfd {
+                        fd: hangup,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // A 200 ms tick rather than an infinite wait, so the normal
+                    // path (child exits first) reaps this thread promptly
+                    // instead of leaving it on a descriptor about to close.
+                    // SAFETY: `pfd` is a live local, and `hangup` is owned by
+                    // the connection `serve_one` holds open across this call.
+                    let rc = unsafe { libc::poll(&raw mut pfd, 1, 200) };
+                    if rc <= 0 {
+                        continue;
+                    }
+                    // The client writes nothing after its request, so readable,
+                    // hung up and errored all mean the same thing: it is gone.
+                    if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+                        continue;
+                    }
+                    if done.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    // SIGKILL, not SIGTERM: the client is already gone, so its
+                    // stdio is closed and there is nothing left to flush or
+                    // report. The negative pid is the process *group* — the
+                    // target leads one because it called `setsid`, so this also
+                    // takes down anything it spawned.
+                    // SAFETY: a kill of a group this agent created; ESRCH when
+                    // it has already exited is not an error here.
+                    unsafe {
+                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    }
+                    return;
+                }
+            }
+        });
+        Self {
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn disarm(mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            drop(t.join());
+        }
+    }
+}
+
 #[cfg(test)]
 #[expect(
     clippy::panic_in_result_fn,
@@ -315,6 +398,69 @@ pub fn serve_one(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// A cancelled build must not leave its targets running.
+    ///
+    /// Nothing else can reap them: heph forked the *client*, and the target is
+    /// `setsid` into its own session, so neither a group kill from heph nor the
+    /// session teardown's `SIGTERM` to the `devenv shell` reaches it. The agent
+    /// noticing its client leave is the only signal there is — and it was
+    /// documented as working long before it existed.
+    #[test]
+    fn a_client_that_disappears_takes_its_target_with_it() {
+        use std::os::unix::process::CommandExt as _;
+
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+
+        // Stands in for a target: long enough that finishing on its own would
+        // be indistinguishable from nothing, and its own session leader exactly
+        // as `redirect_and_detach` makes the real one.
+        let mut child = {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            // Hoisted out of the `unsafe` block below so its own `unsafe` is
+            // not swallowed by the enclosing one, and each states its condition.
+            let detach = || {
+                // SAFETY: async-signal-safe, and the child is not yet a
+                // process-group leader, having just been forked.
+                let rc = unsafe { libc::setsid() };
+                if rc < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            };
+            // SAFETY: `detach` runs in the forked child before `exec` and
+            // touches only that child.
+            unsafe {
+                c.pre_exec(detach);
+            }
+            c.spawn().expect("spawn sleep")
+        };
+
+        let watch = HangupWatch::arm(theirs.as_raw_fd(), child.id());
+
+        // The client goes away — a Ctrl-C on the build, from the agent's side.
+        drop(ours);
+
+        let start = std::time::Instant::now();
+        let status = child.wait().expect("wait");
+        let elapsed = start.elapsed();
+        watch.disarm();
+        drop(theirs);
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the target outlived its client by {elapsed:?} — it ran to completion, \
+             which is the bug this watch exists to prevent"
+        );
+        assert!(
+            status.code().is_none(),
+            "expected death by signal, got {status:?}"
+        );
+    }
 
     fn req() -> ExecRequest {
         ExecRequest {
@@ -337,7 +483,7 @@ mod tests {
         let seen_c = Arc::clone(&seen);
         let server = std::thread::spawn(move || -> anyhow::Result<()> {
             let (conn, _) = listener.accept()?;
-            serve_one(conn, &move |r, fds| {
+            serve_one(conn, &move |r, fds, _hangup| {
                 // Prove the descriptors are usable on this side, not just that
                 // three integers arrived: a number that happens to be a valid
                 // fd in this process would pass a weaker check.
@@ -368,7 +514,7 @@ mod tests {
         let listener = bind(&sock_path)?;
         let server = std::thread::spawn(move || -> anyhow::Result<()> {
             let (conn, _) = listener.accept()?;
-            serve_one(conn, &|_, _| anyhow::bail!("no such program"))
+            serve_one(conn, &|_, _, _| anyhow::bail!("no such program"))
         });
 
         let f = std::fs::File::open("/dev/null")?;

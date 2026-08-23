@@ -15,7 +15,30 @@ use std::collections::BTreeMap;
 /// reason `NixDef.system` and `EXEC_DEF_FORMAT_VERSION` exist.
 /// v2: session-mode preludes gained `export -f`, without which a function was
 /// defined in a shell the target never runs in.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// v3: the artifact carries its own `mode` and `bin`. `open` used to infer the
+/// mode from whether `shell_prelude` was empty, which cannot tell `snapshot`
+/// from `wrap` — both have no prelude.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+
+/// How a consumer of this environment should create its processes.
+///
+/// It lives in the artifact because [`ExecRunner::open`] receives only the
+/// runner target's artifacts — no def — so this is the only way the decision
+/// can reach it. Folded into the driver's def hash, so changing it re-keys.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Capture the environment once; every target is forked by heph with it
+    /// applied. The default, and the only mode whose identity is `Pinned`.
+    #[default]
+    Snapshot,
+    /// Additionally hold a `devenv shell` open and fork every target from
+    /// inside it, which is what makes shell functions callable.
+    Session,
+    /// Prefix every spawn with `devenv shell --`. See the runner's `open_wrap`
+    /// for why this is a demonstration rather than a recommendation.
+    Wrap,
+}
 
 /// The canonicalized environment. **This artifact _is_ the description** — the
 /// runner half does nothing but parse it, so everything the environment depends
@@ -23,6 +46,15 @@ pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Snapshot {
     pub format_version: u32,
+    /// How the runner half should consume this. Settled by the driver at
+    /// `parse`, carried here because `open` sees no def.
+    #[serde(default)]
+    pub mode: Mode,
+    /// The `devenv` binary this snapshot was captured with, so `wrap` and
+    /// `session` invoke the same one the driver did rather than whatever
+    /// `devenv` a PATH happens to resolve.
+    #[serde(default)]
+    pub bin: String,
     /// Sorted for a byte-stable artifact: an unsorted map would re-key every
     /// consumer on a whim of iteration order.
     pub env: BTreeMap<String, String>,
@@ -38,7 +70,7 @@ pub struct Snapshot {
     pub dropped_vars: Vec<String>,
     /// The shell functions' definitions, as a bash snippet.
     ///
-    /// Empty unless the target asked for `mode = "session"`. Carried in the
+    /// Empty unless [`Self::mode`] is [`Mode::Session`]. Carried in the
     /// artifact rather than re-derived at `open` for the same reason as
     /// everything else here: `open` runs after `hashin` and not at all on a
     /// cached build, so a definition discovered there would be unhashed input.
@@ -111,13 +143,22 @@ pub fn build(
     shell_functions: Vec<String>,
     local: &LocalPaths,
 ) -> Snapshot {
-    build_with_prelude(variables, shell_functions, local, String::new())
+    build_with_prelude(
+        variables,
+        shell_functions,
+        local,
+        Mode::Snapshot,
+        String::new(),
+        String::new(),
+    )
 }
 
 pub fn build_with_prelude(
     variables: &BTreeMap<String, Variable>,
     shell_functions: Vec<String>,
     local: &LocalPaths,
+    mode: Mode,
+    bin: String,
     shell_prelude: String,
 ) -> Snapshot {
     let mut env = BTreeMap::new();
@@ -164,6 +205,8 @@ pub fn build_with_prelude(
 
     Snapshot {
         format_version: SNAPSHOT_FORMAT_VERSION,
+        mode,
+        bin,
         env,
         shell_functions,
         dropped_path_entries,

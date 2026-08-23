@@ -32,7 +32,7 @@ const OUT_NAME: &str = "devenv-env.json";
 struct DevenvSpec {
     /// The `devenv` binary. Defaults to `devenv` on the driver's PATH.
     bin: Option<String>,
-    /// `"snapshot"` (default) or `"session"`.
+    /// `"snapshot"` (default), `"session"` or `"wrap"`.
     ///
     /// `snapshot` captures the environment once and applies it to every target
     /// — no live process, cacheable, and the environment's own bytes are its
@@ -40,13 +40,21 @@ struct DevenvSpec {
     /// forks every target's process from inside it, which is what makes
     /// `enterShell` side effects and shell functions available. It costs one
     /// shell per heph process, forever, and cannot amortize across machines.
+    ///
+    /// `wrap` prefixes every spawn with `devenv shell --`. It is a
+    /// **demonstration** of the generic `Wrap` lane, not a recommendation:
+    /// measured at 4.5 s per spawn on this repo's own shell, it re-runs
+    /// `enterShell` once per target rather than once per build, and it does
+    /// **not** make shell functions callable — `devenv shell -- prog` execs
+    /// `prog` directly, with no functions defined. Use it only for a runner a
+    /// handful of targets name.
     mode: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DevenvDef {
     bin: String,
-    session: bool,
+    mode: snapshot::Mode,
 }
 
 pub struct Driver {
@@ -77,24 +85,26 @@ impl ManagedDriver for Driver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let spec = DevenvSpec::from(&req.target_spec.config).with_context(|| "devenv spec")?;
-        let session = match spec.mode.as_deref() {
-            None | Some("snapshot") => false,
-            Some("session") => true,
-            Some(other) => {
-                anyhow::bail!("devenv `mode` must be \"snapshot\" or \"session\", got {other:?}")
-            }
+        let mode = match spec.mode.as_deref() {
+            None | Some("snapshot") => snapshot::Mode::Snapshot,
+            Some("session") => snapshot::Mode::Session,
+            Some("wrap") => snapshot::Mode::Wrap,
+            Some(other) => anyhow::bail!(
+                "devenv `mode` must be \"snapshot\", \"session\" or \"wrap\", got {other:?}"
+            ),
         };
         let def = DevenvDef {
             bin: spec.bin.unwrap_or_else(|| "devenv".to_string()),
-            session,
+            mode,
         };
 
         let mut h = xxhash_rust::xxh3::Xxh3::new();
         snapshot::SNAPSHOT_FORMAT_VERSION.hash(&mut h);
         def.bin.hash(&mut h);
         // The mode changes what the artifact contains (a session snapshot also
-        // carries the shell prelude), so it must change the key.
-        def.session.hash(&mut h);
+        // carries the shell prelude) and how it is consumed, so it must change
+        // the key.
+        def.mode.hash(&mut h);
         req.target_spec.addr.format().hash(&mut h);
 
         Ok(ParseResponse {
@@ -186,7 +196,7 @@ impl ManagedDriver for Driver {
             );
         }
 
-        let snap = snapshot_from_json(&out.stdout, &self.local_paths(), def.session)?;
+        let snap = snapshot_from_json(&out.stdout, &self.local_paths(), def.mode, def.bin.clone())?;
         if snap.env.is_empty() {
             anyhow::bail!(
                 "the devenv environment came out empty after filtering, which would describe \
@@ -263,7 +273,8 @@ struct PrintDevEnv {
 fn snapshot_from_json(
     stdout: &[u8],
     local: &LocalPaths,
-    with_prelude: bool,
+    mode: snapshot::Mode,
+    bin: String,
 ) -> anyhow::Result<Snapshot> {
     // `bashFunctions` in the wire format; serde's rename is applied here rather
     // than in the struct so the field name reads as Rust.
@@ -287,7 +298,7 @@ fn snapshot_from_json(
     // Only in session mode: the definitions are large, and a snapshot runner
     // cannot use them — carrying them anyway would bloat every consumer's cache
     // key for something nothing reads.
-    let prelude = if with_prelude {
+    let prelude = if mode == snapshot::Mode::Session {
         render_prelude(&parsed.bash_functions)
     } else {
         String::new()
@@ -297,6 +308,8 @@ fn snapshot_from_json(
         &parsed.variables,
         parsed.bash_functions.keys().cloned().collect(),
         local,
+        mode,
+        bin,
         prelude,
     ))
 }
@@ -419,8 +432,10 @@ impl ExecRunner for Runner {
             .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
             .collect();
 
-        if !snap.shell_prelude.is_empty() {
-            return self.open_session(&req, &snap, base_env).await;
+        match snap.mode {
+            snapshot::Mode::Session => return self.open_session(&req, &snap, base_env).await,
+            snapshot::Mode::Wrap => return Self::open_wrap(&req, &snap, base_env),
+            snapshot::Mode::Snapshot => {}
         }
 
         Ok(Arc::new(EnvSession::new(
@@ -449,6 +464,78 @@ impl ExecRunner for Runner {
 }
 
 impl Runner {
+    /// `mode = "wrap"`: prefix every spawn with `devenv shell --`.
+    ///
+    /// This is the tree's demonstration that the generic [`WrapSession`] lane
+    /// works — it is the shape a `docker exec` or `chroot` runner has — and it
+    /// is deliberately *not* the recommended way to use devenv. Three measured
+    /// reasons, in the order they will bite:
+    ///
+    /// 1. **Cost.** `devenv shell -- true` is ~4.5 s warm on this repo. Snapshot
+    ///    mode pays `devenv print-dev-env --json` **once, as a cached target**;
+    ///    this pays a full shell entry per spawn. A Go build is thousands of
+    ///    processes.
+    /// 2. **`enterShell` runs per target**, not per build. A shell that starts a
+    ///    service or writes to the tree does it once per spawn, which is exactly
+    ///    the side-effect-freedom the target model asks for.
+    /// 3. **It does not buy shell functions.** `devenv shell -- prog` execs
+    ///    `prog` directly with no functions defined (`declare -F` reports none),
+    ///    so the one thing `session` mode exists for is still missing here.
+    ///
+    /// Identity is therefore `Asserted`, not `Pinned`: the snapshot's bytes no
+    /// longer describe what the target runs in — the live shell does, per spawn,
+    /// outside any key.
+    ///
+    /// [`WrapEnv::Inherit`], because `devenv shell` execs the inner program and
+    /// the spec's environment carries through — unlike `docker exec`, which is
+    /// what the `Args` half of that enum is for.
+    fn open_wrap(
+        req: &OpenRequest,
+        snap: &Snapshot,
+        base_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) -> anyhow::Result<Arc<dyn ExecSession>> {
+        // `snap.bin` rather than a bare "devenv": the driver captured this
+        // snapshot with a specific binary and the wrapper must be the same one.
+        // It is in the def hash, so the key covers it.
+        let bin = if snap.bin.is_empty() {
+            "devenv"
+        } else {
+            snap.bin.as_str()
+        };
+        let prefix = vec![
+            std::ffi::OsString::from(bin),
+            std::ffi::OsString::from("shell"),
+            std::ffi::OsString::from("--"),
+        ];
+
+        Ok(Arc::new(hexec_runner::WrapSession::new(
+            prefix,
+            hexec_runner::WrapEnv::Inherit,
+            base_env,
+            SessionCaps {
+                pty: true,
+                max_concurrent: None,
+                identity: Identity::Asserted {
+                    why: "a `devenv shell` entered per spawn; what it produces is outside the \
+                          cache key, and `enterShell` runs once per target"
+                        .to_string(),
+                },
+            },
+            SessionDescription {
+                runner: req.runner_addr.clone(),
+                // Named, but still not callable: `devenv shell -- prog` execs
+                // `prog` rather than sourcing anything, so the diagnostic that
+                // says "that is a shell function" stays useful here.
+                shell_functions: snap.shell_functions.clone(),
+                key: req.key.clone(),
+                summary: format!(
+                    "devenv wrap: `{bin} shell --` per spawn, {} vars",
+                    snap.env.len()
+                ),
+            },
+        )?))
+    }
+
     /// `mode = "session"`: hold a `devenv shell` open with an agent inside it,
     /// and fork every target's process from there.
     async fn open_session(
@@ -477,7 +564,13 @@ impl Runner {
 
         // The agent runs INSIDE the shell — that is the whole difference from
         // snapshot mode. `devenv shell -- <cmd>` is the supported way in.
-        let mut cmd = std::process::Command::new("devenv");
+        // The binary the driver captured with, not whatever `devenv` a PATH
+        // resolves to — a configured `bin` was previously ignored here.
+        let mut cmd = std::process::Command::new(if snap.bin.is_empty() {
+            "devenv"
+        } else {
+            snap.bin.as_str()
+        });
         cmd.arg("shell")
             .arg("--")
             .arg(&support.heph_bin)
@@ -590,6 +683,133 @@ impl Runner {
 mod tests {
     use super::*;
 
+    fn snap_for(mode: snapshot::Mode) -> Snapshot {
+        let json = br#"{"bashFunctions":{"fmt":"  echo hi\n"},"variables":{"CC":{"type":"exported","value":"clang"},"PATH":{"type":"exported","value":"/nix/store/a/bin"}}}"#;
+        snapshot_from_json(
+            json,
+            &LocalPaths {
+                tree_root: "/r".to_string(),
+                home: "/h".to_string(),
+                tmpdir: String::new(),
+            },
+            mode,
+            "/nix/store/d/bin/devenv".into(),
+        )
+        .expect("snapshot")
+    }
+
+    fn open_req() -> OpenRequest {
+        OpenRequest {
+            key: "k".to_string(),
+            runner_addr: "//:devenv".to_string(),
+            artifacts: vec![],
+        }
+    }
+
+    fn a_spec() -> hproc::proc_exec::Spec {
+        hproc::proc_exec::Spec {
+            program: std::path::PathBuf::from("go"),
+            args: vec![std::ffi::OsString::from("build")],
+            env: vec![(
+                std::ffi::OsString::from("CC"),
+                std::ffi::OsString::from("mine"),
+            )],
+            cwd: std::path::PathBuf::from("/ws"),
+            stdin: hproc::proc_exec::StdioSpec::Null,
+            stdout: hproc::proc_exec::StdioSpec::Piped,
+            stderr: hproc::proc_exec::StdioSpec::Piped,
+            setsid: false,
+            ctty: false,
+        }
+    }
+
+    /// `wrap` defers each spawn to `devenv shell --`, using the binary the
+    /// driver captured with rather than whatever a PATH resolves to.
+    #[test]
+    fn wrap_mode_prefixes_every_spawn_with_devenv_shell() {
+        let snap = snap_for(snapshot::Mode::Wrap);
+        let session = Runner::open_wrap(&open_req(), &snap, vec![]).expect("wrap session");
+
+        let out = session.prepare(a_spec()).expect("prepare");
+        assert_eq!(
+            out.program,
+            std::path::PathBuf::from("/nix/store/d/bin/devenv")
+        );
+        let args: Vec<String> = out
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["shell", "--", "go", "build"]);
+    }
+
+    /// The target still wins on a collision, exactly as under `snapshot`.
+    ///
+    /// Only up to the point where `devenv shell` runs: it re-derives the
+    /// variables it owns and those win over what is handed in, which is one of
+    /// the reasons this mode is a demonstration rather than a recommendation.
+    #[test]
+    fn wrap_mode_puts_the_environment_under_the_target() {
+        let snap = snap_for(snapshot::Mode::Wrap);
+        let base = vec![
+            (
+                std::ffi::OsString::from("CC"),
+                std::ffi::OsString::from("clang"),
+            ),
+            (
+                std::ffi::OsString::from("EXTRA"),
+                std::ffi::OsString::from("1"),
+            ),
+        ];
+        let session = Runner::open_wrap(&open_req(), &snap, base).expect("wrap session");
+
+        let out = session.prepare(a_spec()).expect("prepare");
+        let cc = out
+            .env
+            .iter()
+            .find(|(k, _)| k == "CC")
+            .map(|(_, v)| v.to_string_lossy().into_owned());
+        assert_eq!(cc.as_deref(), Some("mine"), "the target's own value wins");
+        assert!(out.env.iter().any(|(k, _)| k == "EXTRA"));
+    }
+
+    /// A live shell entered per spawn cannot claim what a captured snapshot can.
+    #[test]
+    fn wrap_mode_is_asserted_not_pinned() {
+        let snap = snap_for(snapshot::Mode::Wrap);
+        let session = Runner::open_wrap(&open_req(), &snap, vec![]).expect("wrap session");
+        assert!(
+            !session.caps().identity.is_pinned(),
+            "wrap re-enters the shell per spawn, outside any cache key"
+        );
+    }
+
+    /// `wrap` has no prelude — and that is not a bug, it is the reason the mode
+    /// buys nothing over `snapshot` for shell functions: `devenv shell -- prog`
+    /// execs `prog` with no functions defined.
+    #[test]
+    fn wrap_mode_carries_no_prelude_and_still_names_the_functions() {
+        let snap = snap_for(snapshot::Mode::Wrap);
+        assert!(snap.shell_prelude.is_empty());
+        assert_eq!(snap.shell_functions, vec!["fmt"]);
+    }
+
+    /// The mode travels in the artifact, because `open` never sees a def.
+    #[test]
+    fn the_mode_round_trips_through_the_artifact() {
+        for mode in [
+            snapshot::Mode::Snapshot,
+            snapshot::Mode::Session,
+            snapshot::Mode::Wrap,
+        ] {
+            let snap = snap_for(mode);
+            let bytes = serde_json::to_vec(&snap).expect("encode");
+            let back: Snapshot = serde_json::from_slice(&bytes).expect("decode");
+            assert_eq!(back.mode, mode);
+            assert_eq!(back.bin, "/nix/store/d/bin/devenv");
+        }
+    }
+
     /// Session mode carries function *definitions*, snapshot mode only their
     /// names — the definitions are large and a snapshot runner cannot use them.
     #[test]
@@ -600,11 +820,13 @@ mod tests {
             home: "/h".to_string(),
             tmpdir: String::new(),
         };
-        let snap = snapshot_from_json(json, &local, false).expect("snapshot");
+        let snap = snapshot_from_json(json, &local, snapshot::Mode::Snapshot, "devenv".into())
+            .expect("snapshot");
         assert!(snap.shell_prelude.is_empty());
         assert_eq!(snap.shell_functions, vec!["fmt"]);
 
-        let sess = snapshot_from_json(json, &local, true).expect("session");
+        let sess = snapshot_from_json(json, &local, snapshot::Mode::Session, "devenv".into())
+            .expect("session");
         assert!(
             sess.shell_prelude.contains("fmt () {"),
             "{:?}",
@@ -658,7 +880,8 @@ mod tests {
                 home: "/home/u".to_string(),
                 tmpdir: String::new(),
             },
-            false,
+            snapshot::Mode::Snapshot,
+            "devenv".into(),
         )
         .expect("parse");
 

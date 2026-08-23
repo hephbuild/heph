@@ -145,8 +145,8 @@ fn run_agent(socket: &std::path::Path, prelude: Option<&std::path::Path>) -> Exi
             // A failed request is reported to its own client over the socket;
             // there is nothing useful for the agent to do with it here, and a
             // panic would take the whole session down for one target.
-            drop(agent::serve_one(conn, &move |req, stdio| {
-                exec_and_wait(req, stdio, prelude.as_deref())
+            drop(agent::serve_one(conn, &move |req, stdio, hangup| {
+                exec_and_wait(req, stdio, prelude.as_deref(), hangup)
             }));
         });
     }
@@ -165,6 +165,7 @@ fn exec_and_wait(
     req: ExecRequest,
     stdio: [RawFd; 3],
     prelude: Option<&str>,
+    hangup: RawFd,
 ) -> anyhow::Result<Option<i32>> {
     use std::os::unix::process::CommandExt as _;
 
@@ -212,8 +213,17 @@ fn exec_and_wait(
             req.argv.first().map_or("", String::as_str)
         )
     })?;
-    let status = child.wait()?;
-    Ok(status.code())
+
+    // Nothing else can kill this child. heph forked the client, not the target,
+    // and `setsid` above put the target in a session of its own — so a group
+    // kill from heph cannot reach it and neither can the session teardown. The
+    // client disappearing is the only cancellation signal that arrives here.
+    let watch = agent::HangupWatch::arm(hangup, child.id());
+    let status = child.wait();
+    // Before returning either way: the watcher borrows this connection's
+    // descriptor, which `serve_one` still has to write the reply on.
+    watch.disarm();
+    Ok(status?.code())
 }
 
 /// The child's pre-exec setup: point 0/1/2 at the descriptors the client sent,
