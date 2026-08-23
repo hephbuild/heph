@@ -373,7 +373,7 @@ impl heph::engine::exec_runner::ExecRunner for RecordingRunner {
 
 #[async_trait::async_trait]
 impl heph::engine::exec_runner::ExecSession for RecordingSession {
-    fn prepare(
+    async fn prepare(
         &self,
         spec: heph::proc_exec::Spec,
     ) -> Result<heph::proc_exec::Spec, heph::engine::exec_runner::SpawnError> {
