@@ -91,30 +91,77 @@ discard.
 
 ## Modes
 
-A runner plugin returns a *description*; the host creates every process. The
-plugin never spawns, holds a process, or touches a descriptor.
+A runner returns a **session**, and every mode is a pure transformation of the
+process spec — `prepare(spec) -> spec`. That is what keeps `proc_exec::spawn`
+synchronous, its `Handle` invariants intact and its PTY handling in one place:
+no mode owns a process type of its own.
 
-| mode | what it is | notes |
-|---|---|---|
-| `Direct` | a base environment applied to a local fork | the devenv snapshot; no live process |
-| `Wrap` | a wrapper command prepended | container, `chroot`, `nix develop --command` |
-| `Agent` | processes forked by a helper inside a live environment | `devenv shell` held open |
-
-All three are pure transformations of the process spec. `Agent` reaches its
-helper through a client heph spawns as an ordinary child, which passes its own
-stdio descriptors over `SCM_RIGHTS` — passed, not proxied, so the bounded drain,
-the PTY handling and the supervisor are untouched.
+| mode | who forks the target | what `prepare` does | used by |
+|---|---|---|---|
+| `Local` | heph | nothing — the identity | the default |
+| `Env` | heph | layers env under the target's own | devenv `mode = "snapshot"` |
+| `Wrap` | the wrapper | prepends wrapper argv | devenv `mode = "wrap"` |
+| `Agent` | a helper inside a live environment | rewrites argv to the client | devenv `mode = "session"` |
 
 Sessions are pooled per environment (keyed by content, so byte-identical
 artifacts share one) and opened at most once. Teardown is explicit and
 idempotent: heph's hard-abort path exits without running destructors, so a
 `Drop`-only teardown would leak a container or shell exactly when it matters.
 
+### `__runner-agent` and `__runner-exec`
+
+Two hidden `heph` subcommands, used only by `Agent` mode. They exist for one
+reason, so it is worth stating plainly.
+
+The goal is *one* `devenv shell` for the whole build, with every target's
+process created inside it. But a process can only be created inside that shell
+by something already living there — so heph starts one helper there and asks it.
+That helper is **`heph __runner-agent`**: `devenv shell -- heph __runner-agent
+--socket S` runs it inside the environment, where it listens on a unix socket
+and forks a target on request.
+
+Which raises the real problem: heph now has a target process it did not fork.
+It cannot wait on it, cannot put it in a process group, and cannot give it a
+pipe or a PTY — a `Handle` can only be built for a child of *this* process, and
+all of heph's output streaming and cancellation is built on that.
+
+**`heph __runner-exec`** is the answer. Per target, heph forks it as an
+ordinary child, exactly as it would have forked the target itself:
+
+```
+heph ──fork──> __runner-exec ──socket──> __runner-agent ──fork──> the target
+                    │          SCM_RIGHTS      │
+                    └──── its own 0,1,2 ───────┘
+```
+
+It sends the command and hands over its own **stdio descriptors** — the ones
+heph already wired to the target's pipes or PTY. Passed, not proxied: the agent
+`dup2`s them onto the target's 0/1/2, so the bytes never travel through this
+path and none of the bounded-drain or line-discipline handling is re-derived on
+a new transport. Then it waits and exits with the target's real status.
+
+So from heph's side an `Agent`-mode target looks like any other child: one
+process it forked, whose output it reads and whose exit code it trusts. The
+client is that illusion, and it costs one small process per target.
+
+Two details that are not obvious:
+
+- The client forwards **its own environment** in the request, and the agent
+  applies it with `env_clear`. The agent lives inside the dev shell, so letting
+  a target inherit *its* environment would put the developer's ambient
+  `GOFLAGS` into every build — unhashed, under a lockfile-pinned key.
+- The target is `setsid` into its own session, so no kill heph issues reaches
+  it. The agent therefore watches the socket: when the client goes away — a
+  cancelled build — the peer hangs up and the agent kills the target's process
+  group. Without that, cancelling a build left its targets running to
+  completion.
+
 ## devenv
 
 ```python
 target(name = "env", driver = "devenv")                  # snapshot (default)
 target(name = "live", driver = "devenv", mode = "session")
+target(name = "wrapped", driver = "devenv", mode = "wrap")
 ```
 
 **Snapshot** captures `devenv print-dev-env --json` once as an artifact:
@@ -129,6 +176,22 @@ gets an error saying so by name rather than a misleading "not found in PATH".
 **Session** additionally holds a `devenv shell` open and forks every target's
 process from inside it, which is what makes those available. It costs one shell
 per heph process and cannot amortize across machines.
+
+**Wrap** (`mode = "wrap"`) prefixes every spawn with `devenv shell --`. It is a
+**demonstration of the `Wrap` lane, not a recommendation** — measured before it
+was written:
+
+- `devenv shell -- true` is **~4.5 s warm**. Snapshot pays `devenv
+  print-dev-env --json` once, as a *cached target*; wrap pays a full shell entry
+  per spawn, and a Go build is thousands of processes.
+- `enterShell` runs once per target rather than once per build, so any side
+  effect it has happens N times.
+- It does **not** buy shell functions: `devenv shell -- bash -c 'declare -F'`
+  reports none, because `devenv shell -- prog` execs `prog` directly.
+
+So its identity is `Asserted`, not `Pinned`. Reach for it only for a runner a
+handful of targets name — and note that the snapshot's `PATH` is store-only, so
+`bin` usually has to be an absolute path for `devenv` itself to be found.
 
 ## Go
 
