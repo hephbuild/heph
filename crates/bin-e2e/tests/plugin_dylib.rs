@@ -285,3 +285,95 @@ fn shipped_oci_cdylib_parses_across_the_abi_without_aborting() {
         describe(&out)
     );
 }
+
+/// The `devenv` driver, served from a REAL cdylib.
+///
+/// This is the seam an in-process test structurally cannot reach: the plugin is
+/// `dlopen`ed, its `heph_plugin_create` runs behind the stable ABI, and the
+/// `devenv` driver it exports has to be registered by name and reachable from
+/// the engine — none of which happens when a test constructs the driver
+/// directly through generics.
+///
+/// It also pins the shape of the conversion: `plugin-devenv` is **driver-only**.
+/// The runner half is generic and lives in the host, which is what let this ship
+/// over the existing `drivers` lane with no runner lane and no `ABI_SEMVER`
+/// bump. If someone later tries to hand a runner across the seam, this is the
+/// test that keeps the driver lane honest.
+///
+/// The assertion is not that the target *builds* — that would run `devenv
+/// print-dev-env` against a workspace that has no `devenv.nix`, which is slow
+/// and not what is under test. It is that the driver resolves across the seam
+/// and comes back diagnosable rather than as a SIGABRT.
+#[test]
+fn shipped_devenv_cdylib_serves_its_driver_across_the_abi() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("devenv");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-devenv-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash devenv cdylib");
+    write_manifest(&manifest, "devenv", &dylib, Some(&sum)).expect("write manifest");
+    ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
+        .expect("write config");
+
+    ws.write("pkg/BUILD", "target(name = \"env\", driver = \"devenv\")\n")
+        .expect("write BUILD");
+
+    let out = ws
+        .run(&dist, &["inspect", "def", "//pkg:env"])
+        .expect("run");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.code().is_some(),
+        "heph was killed by a signal — the plugin panicked across the ABI seam: {}",
+        describe(&out)
+    );
+    assert!(
+        !combined.contains("panic in a function that cannot unwind")
+            && !combined.contains("there is no reactor running"),
+        "plugin aborted across the seam: {}",
+        describe(&out)
+    );
+    // The driver has to be *known*. Before this crate existed, `devenv` was
+    // compiled into the binary; if the cdylib failed to register it, this is the
+    // error that would come back instead.
+    assert!(
+        !combined.contains("no driver named"),
+        "the cdylib did not register its `devenv` driver: {}",
+        describe(&out)
+    );
+    assert!(
+        out.status.success(),
+        "parsing a devenv target across the seam failed: {}",
+        describe(&out)
+    );
+}
+
+/// The host binary must NOT carry a compiled-in `devenv` driver any more.
+///
+/// Without this, the conversion silently half-lands: the builtin keeps
+/// answering, every fixture passes, and nobody notices the cdylib is dead
+/// weight that is never actually loaded.
+#[test]
+fn devenv_is_not_compiled_into_the_binary() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    // BASE_CONFIG only: no devenv plugin entry at all.
+    ws.write("pkg/BUILD", "target(name = \"env\", driver = \"devenv\")\n")
+        .expect("write BUILD");
+
+    let out = ws
+        .run(&dist, &["inspect", "def", "//pkg:env"])
+        .expect("run");
+    assert!(
+        !out.status.success(),
+        "`devenv` resolved with no plugin configured — it is still a builtin: {}",
+        describe(&out)
+    );
+}
