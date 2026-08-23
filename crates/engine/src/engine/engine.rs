@@ -658,6 +658,15 @@ impl Engine {
         self.exec_sessions.teardown_all();
     }
 
+    /// [`Self::shutdown_exec_sessions`] for a caller that can await.
+    ///
+    /// Prefer it: a session served by a plugin is closed by talking to the
+    /// plugin, and the synchronous path cannot do that. Both are idempotent, so
+    /// an orderly close followed by an abort-path teardown is safe.
+    pub async fn close_exec_sessions(&self) {
+        self.exec_sessions.close_all().await;
+    }
+
     /// The workspace-level `defaultRunner:`, if set. Read by diagnostics to say
     /// *how* a target's environment was chosen, not only which it was.
     pub fn default_runner(&self) -> Option<&hmodel::htaddr::Addr> {

@@ -1505,7 +1505,7 @@ impl Driver {
         // whole exec-runner seam (`docs/EXEC_RUNNERS.md` §4.2). Under `local`
         // the session's `prepare` is the identity function, so this is the same
         // fork it always was.
-        let mut handle = req.runner.spawn(spec).map_err(|e| {
+        let mut handle = req.runner.spawn(spec).await.map_err(|e| {
             let program = run.first().map_or("", String::as_str);
             match e {
                 // Classified here rather than in the session because only the

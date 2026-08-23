@@ -56,11 +56,11 @@ struct TeardownSession {
 
 #[async_trait::async_trait]
 impl heph::engine::exec_runner::ExecSession for TeardownSession {
-    fn prepare(
+    async fn prepare(
         &self,
         spec: heph::proc_exec::Spec,
     ) -> Result<heph::proc_exec::Spec, heph::engine::exec_runner::SpawnError> {
-        self.inner.prepare(spec)
+        self.inner.prepare(spec).await
     }
     fn base_env(&self) -> Option<&[(std::ffi::OsString, std::ffi::OsString)]> {
         self.inner.base_env()

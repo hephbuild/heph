@@ -39,6 +39,37 @@ impl ExecSessionPool {
     ///    run -d` container or devenv shell matters most.
     ///
     /// `Drop` still calls this, as a backstop for the ordinary path.
+    /// Orderly teardown: ask each session to close, then run its synchronous
+    /// job. Use this wherever there is a runtime to await on.
+    ///
+    /// A session living inside a plugin can only be closed by *talking* to the
+    /// plugin, which is async — so [`Self::teardown_all`] alone cannot reach
+    /// it. That path stays for hard abort, where nothing async runs and a
+    /// plugin-spawned process is reaped by the host supervisor that tracked it.
+    pub async fn close_all(&self) {
+        let sessions: Vec<(String, Arc<dyn ExecSession>)> = {
+            let mut entries = match self.entries.lock() {
+                Ok(e) => e,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            entries
+                .drain()
+                .filter_map(|(k, cell)| cell.get().map(|s| (k, Arc::clone(s))))
+                .collect()
+        };
+        for (key, session) in sessions {
+            if let Err(e) = session.close().await {
+                tracing::warn!(key = %key, error = %format!("{e:#}"), "exec session close failed");
+            }
+            let Some(job) = session.teardown() else {
+                continue;
+            };
+            if let Err(e) = job() {
+                tracing::warn!(key = %key, error = %format!("{e:#}"), "exec session teardown failed");
+            }
+        }
+    }
+
     pub fn teardown_all(&self) {
         let mut entries = match self.entries.lock() {
             Ok(e) => e,

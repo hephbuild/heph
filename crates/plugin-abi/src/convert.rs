@@ -867,6 +867,188 @@ pub fn raw_def_from_blob(blob: &pb::RawDefBlob) -> anyhow::Result<Arc<dyn RawDef
     Ok(Arc::new(RawDefBytes::from_json_slice(&blob.data)?))
 }
 
+// ---- exec-runner lane ------------------------------------------------------
+//
+// The spec conversions carry only the *mutable* half of a `proc_exec::Spec`.
+// stdio is absent by design: `StdioSpec::Fd` owns a file descriptor, which
+// cannot cross a stable boundary, and a runner has no business reassigning the
+// host's PTY slave. The host keeps the real stdio and re-applies it to whatever
+// comes back — see `exec_spec_apply`.
+//
+// Bytes, not strings, throughout: a program path, an argument and an env value
+// are all `OsString`-shaped, and proto3 `string` must be valid UTF-8. The same
+// reason `runner_env` is `bytes`.
+
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+pub fn exec_spec_to_pb(spec: &hproc::proc_exec::Spec) -> pb::ExecSpecPatch {
+    pb::ExecSpecPatch {
+        program: spec.program.as_os_str().as_bytes().to_vec().into(),
+        args: spec
+            .args
+            .iter()
+            .map(|a| a.as_bytes().to_vec().into())
+            .collect(),
+        env: spec
+            .env
+            .iter()
+            .map(|(k, v)| pb::EnvVar {
+                key: k.as_bytes().to_vec().into(),
+                value: v.as_bytes().to_vec().into(),
+            })
+            .collect(),
+        cwd: spec.cwd.as_os_str().as_bytes().to_vec().into(),
+        setsid: spec.setsid,
+        ctty: spec.ctty,
+    }
+}
+
+/// Build a spec from the wire. stdio defaults to `Null` — callers that own real
+/// stdio use [`exec_spec_apply`] instead, which never lets the wire touch it.
+pub fn exec_spec_from_pb(p: pb::ExecSpecPatch) -> hproc::proc_exec::Spec {
+    hproc::proc_exec::Spec {
+        program: std::path::PathBuf::from(OsString::from_vec(p.program.to_vec())),
+        args: p
+            .args
+            .into_iter()
+            .map(|a| OsString::from_vec(a.to_vec()))
+            .collect(),
+        env: p
+            .env
+            .into_iter()
+            .map(|kv| {
+                (
+                    OsString::from_vec(kv.key.to_vec()),
+                    OsString::from_vec(kv.value.to_vec()),
+                )
+            })
+            .collect(),
+        cwd: std::path::PathBuf::from(OsString::from_vec(p.cwd.to_vec())),
+        stdin: hproc::proc_exec::StdioSpec::Null,
+        stdout: hproc::proc_exec::StdioSpec::Null,
+        stderr: hproc::proc_exec::StdioSpec::Null,
+        setsid: p.setsid,
+        ctty: p.ctty,
+    }
+}
+
+/// Apply a plugin's transformation onto a spec the host still owns.
+///
+/// This is the host's side of the round trip, and the reason it exists is
+/// ownership: `spec` holds the real stdio (possibly a PTY slave `OwnedFd`), and
+/// nothing from the wire may replace it. Only the fields a runner is entitled
+/// to change are moved across.
+pub fn exec_spec_apply(spec: &mut hproc::proc_exec::Spec, p: pb::ExecSpecPatch) {
+    spec.program = std::path::PathBuf::from(OsString::from_vec(p.program.to_vec()));
+    spec.args = p
+        .args
+        .into_iter()
+        .map(|a| OsString::from_vec(a.to_vec()))
+        .collect();
+    spec.env = p
+        .env
+        .into_iter()
+        .map(|kv| {
+            (
+                OsString::from_vec(kv.key.to_vec()),
+                OsString::from_vec(kv.value.to_vec()),
+            )
+        })
+        .collect();
+    spec.cwd = std::path::PathBuf::from(OsString::from_vec(p.cwd.to_vec()));
+    spec.setsid = p.setsid;
+    spec.ctty = p.ctty;
+}
+
+pub fn stdio_kind_to_pb(s: &hproc::proc_exec::StdioSpec) -> i32 {
+    let k = match s {
+        hproc::proc_exec::StdioSpec::Null => pb::StdioKind::Null,
+        hproc::proc_exec::StdioSpec::Inherit => pb::StdioKind::Inherit,
+        hproc::proc_exec::StdioSpec::Piped => pb::StdioKind::Piped,
+        hproc::proc_exec::StdioSpec::Fd(_) => pb::StdioKind::Fd,
+    };
+    k as i32
+}
+
+pub fn opened_session_to_pb(s: &hexec_runner::OpenedSession) -> pb::OpenSessionResponse {
+    let (pinned, detail) = match &s.caps.identity {
+        hexec_runner::Identity::Pinned { by } => (true, by.clone()),
+        hexec_runner::Identity::Asserted { why } => (false, why.clone()),
+    };
+    pb::OpenSessionResponse {
+        session_id: s.session_id.clone(),
+        caps: Some(pb::SessionCaps {
+            pty: s.caps.pty,
+            max_concurrent: s.caps.max_concurrent.map(|n| n as u32),
+            pinned,
+            identity_detail: detail,
+        }),
+        shell_functions: s.description.shell_functions.clone(),
+        summary: s.description.summary.clone(),
+        base_env: s
+            .base_env
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|(k, v)| pb::EnvVar {
+                key: k.as_bytes().to_vec().into(),
+                value: v.as_bytes().to_vec().into(),
+            })
+            .collect(),
+        // `None` is not "empty": a caller asking where a PATH entry came from
+        // must degrade explicitly rather than print a confident, wrong answer.
+        base_env_known: s.base_env.is_some(),
+    }
+}
+
+pub fn opened_session_from_pb(
+    p: pb::OpenSessionResponse,
+    runner_addr: &str,
+    key: &str,
+) -> hexec_runner::OpenedSession {
+    let caps = p.caps.unwrap_or_default();
+    hexec_runner::OpenedSession {
+        session_id: p.session_id,
+        caps: hexec_runner::SessionCaps {
+            pty: caps.pty,
+            max_concurrent: caps.max_concurrent.map(|n| n as usize),
+            identity: if caps.pinned {
+                hexec_runner::Identity::Pinned {
+                    by: caps.identity_detail,
+                }
+            } else {
+                hexec_runner::Identity::Asserted {
+                    // A plugin that claimed nothing still gets an honest label:
+                    // silence must not read as a guarantee.
+                    why: if caps.identity_detail.is_empty() {
+                        "the runner did not say how this environment was determined".to_string()
+                    } else {
+                        caps.identity_detail
+                    },
+                }
+            },
+        },
+        description: hexec_runner::SessionDescription {
+            runner: runner_addr.to_string(),
+            shell_functions: p.shell_functions,
+            key: key.to_string(),
+            summary: p.summary,
+        },
+        base_env: p.base_env_known.then(|| {
+            p.base_env
+                .into_iter()
+                .map(|kv| {
+                    (
+                        OsString::from_vec(kv.key.to_vec()),
+                        OsString::from_vec(kv.value.to_vec()),
+                    )
+                })
+                .collect()
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -102,7 +102,20 @@ fn load_dylib_plugins(
         if let Some(p) = provider {
             e.register_provider(|_| Box::new(p))?;
         }
-        for (_name, drv) in drivers {
+        for (name, drv) in drivers {
+            // A driver that serves exec sessions is also the runner for runner
+            // targets it built. Registered under the same name, which is how a
+            // runner target's driver selects its runner — and probed over the
+            // sync `meta` lane, so this is settled at load rather than on the
+            // first target that needs an environment.
+            if hdriver_support::driver_managed::ManagedDriver::serves_exec_sessions(&drv) {
+                let runner = std::sync::Arc::new(
+                    hdriver_support::exec_runner_driver::DriverExecRunner::new(
+                        std::sync::Arc::new(drv.clone()),
+                    ),
+                );
+                e.register_exec_runner(name, runner)?;
+            }
             e.register_managed_driver(|_| Box::new(drv))?;
         }
         for (_name, hook) in hooks {

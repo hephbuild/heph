@@ -1443,6 +1443,7 @@ pub(crate) async fn run_tool(
 
     let mut handle = runner
         .spawn(spec)
+        .await
         .map_err(|e| missing_tool_error(e, bin, what))?;
     let output_reader = handle.take_output();
 

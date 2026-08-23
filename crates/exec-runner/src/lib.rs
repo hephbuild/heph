@@ -19,8 +19,14 @@
 //! - `proc_exec::spawn` stays **synchronous**. There is no suspension point
 //!   between the fork and the caller receiving the `Handle`, so a cancellation
 //!   cannot land there and orphan a child that was never registered with the
-//!   supervisor. An `async fn spawn` would open exactly that window, and under
-//!   fail-fast it is the common cancellation shape, not an exotic one.
+//!   supervisor — and under fail-fast that is the common cancellation shape,
+//!   not an exotic one.
+//!
+//!   [`ExecSession::spawn`] *is* `async`, because `prepare` may cross the plugin
+//!   seam. That does not reopen the window: the only suspension point is before
+//!   the fork, and the fork through to returning the `Handle` stays a single
+//!   synchronous run of `proc_exec::spawn`. The invariant is "nothing awaits
+//!   between fork and `Handle`", not "the function is not async".
 //! - `Handle`'s "the spawn is the API" invariant (waiting and draining must not
 //!   share a task) and its OS-divergent reader-termination discipline stay
 //!   concrete rather than erased behind a trait object.
@@ -212,17 +218,22 @@ impl From<std::io::Error> for SpawnError {
 
 /// Cleanup a session hands back for the host to run.
 ///
-/// **Synchronous on purpose**, and not an `async fn close`. The weak argument is
-/// "`Drop` cannot await" — which does not hold on its own, since the pool owns
-/// the session and an aborted build never drops it. The real reasons:
+/// **Synchronous on purpose.** [`ExecSession::close`] exists alongside it for
+/// cleanup that must *talk* to something, but it cannot replace this one:
 ///
-/// 1. An async teardown detached at exit (`tokio::spawn(close())`) is silently
-///    dropped when the runtime is already shutting down — which is the common
-///    case for "heph is exiting". It works in tests and leaks in production.
-/// 2. The mechanism that actually guarantees completion before process exit is
+/// 1. The hard-abort path calls teardown and then `std::process::exit`. Nothing
+///    async runs there, by construction.
+/// 2. An async teardown detached at exit (`tokio::spawn(close())`) is silently
+///    dropped when the runtime is already shutting down — the common case for
+///    "heph is exiting". It works in tests and leaks in production.
+/// 3. The mechanism that actually guarantees completion before process exit is
 ///    `sandbox_cleaner`'s `bg_pending` accounting, and it is `FnOnce`-shaped.
-/// 3. That lane may not move onto tokio at all, per the macOS cross-thread waker
+/// 4. That lane may not move onto tokio at all, per the macOS cross-thread waker
 ///    hazard (`docs/RCA_MACOS_WAKER.md`).
+///
+/// So: `close` on any path that can await, this on every path. For a session
+/// whose processes live inside a plugin, abort-path reaping is the host
+/// supervisor's job — it tracked them when the plugin spawned them.
 ///
 /// Teardown is `docker rm` / `kill` — blocking calls that belong on a dedicated
 /// thread. It returns `Result` so a failure is a `warn!` rather than silence.
@@ -238,12 +249,19 @@ pub trait ExecSession: Send + Sync {
     /// The caller's entries win. A driver has already resolved the target's
     /// `env` / `pass_env` / `runtime_env` and the sandbox's `$OUT`/`$SRC`
     /// routing by this point; the session supplies the floor beneath them.
-    fn prepare(&self, spec: Spec) -> Result<Spec, SpawnError>;
+    async fn prepare(&self, spec: Spec) -> Result<Spec, SpawnError>;
 
     /// Streaming creation. Bounded drain, for a caller that consumes output
     /// concurrently with the child.
-    fn spawn(&self, spec: Spec) -> Result<Handle, SpawnError> {
-        Ok(proc_exec::spawn(self.prepare(spec)?)?)
+    ///
+    /// `async` only because `prepare` may cross the plugin seam. The suspension
+    /// point is **before** the fork and there is none after it, so the invariant
+    /// that made `proc_exec::spawn` synchronous still holds: a cancellation
+    /// cannot land between the fork and the caller receiving the `Handle`, and
+    /// so cannot orphan a child the supervisor never saw.
+    async fn spawn(&self, spec: Spec) -> Result<Handle, SpawnError> {
+        let spec = self.prepare(spec).await?;
+        Ok(proc_exec::spawn(spec)?)
     }
 
     /// Batch creation. Unbounded drain — see the module docs for why this is
@@ -253,7 +271,8 @@ pub trait ExecSession: Send + Sync {
         spec: Spec,
         cancel: &(dyn Cancellable + Send + Sync),
     ) -> Result<Output, SpawnError> {
-        Ok(proc_exec::output(self.prepare(spec)?, cancel).await?)
+        let spec = self.prepare(spec).await?;
+        Ok(proc_exec::output(spec, cancel).await?)
     }
 
     /// The environment every process here starts from, or `None` when it cannot
@@ -267,8 +286,22 @@ pub trait ExecSession: Send + Sync {
     fn describe(&self) -> &SessionDescription;
 
     /// See [`TeardownJob`]. `None` when there is nothing to tear down.
+    ///
+    /// Synchronous by contract: the hard-abort path calls it and then
+    /// `std::process::exit`, which runs no destructors and cannot await.
     fn teardown(&self) -> Option<TeardownJob> {
         None
+    }
+
+    /// Orderly teardown, for a session whose cleanup has to *talk* to something
+    /// — a plugin across the ABI, a daemon over a socket.
+    ///
+    /// Called on paths that can await, before [`Self::teardown`]. It is not a
+    /// replacement for it: on hard abort nothing async runs, and a
+    /// plugin-spawned process is reaped there by the host supervisor that
+    /// tracked it, not by this.
+    async fn close(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -284,6 +317,26 @@ pub struct RunnerArtifact {
     /// Path within the artifact tree.
     pub path: String,
     pub bytes: Vec<u8>,
+}
+
+/// What a driver reports when it opens a session on the host's behalf.
+///
+/// The host turns this into an [`ExecSession`] whose `prepare` calls back into
+/// the plugin. Everything here is settled once, at open; the per-spawn
+/// transformation stays behind [`ExecSession::prepare`] where the plugin can
+/// make a decision per target.
+#[derive(Debug, Clone)]
+pub struct OpenedSession {
+    /// Opaque to the host — the plugin's own handle on this session, echoed on
+    /// every later `prepare` and on `close`.
+    pub session_id: String,
+    pub caps: SessionCaps,
+    pub description: SessionDescription,
+    /// The environment every process here starts from, or `None` when the
+    /// plugin cannot enumerate it host-side. `None` is not "empty": a caller
+    /// asking "where did this PATH entry come from" must degrade explicitly
+    /// rather than print a confident, wrong answer.
+    pub base_env: Option<Vec<(OsString, OsString)>>,
 }
 
 /// What a runner needs to open a session.
@@ -376,7 +429,7 @@ impl LocalSession {
 
 #[async_trait::async_trait]
 impl ExecSession for LocalSession {
-    fn prepare(&self, spec: Spec) -> Result<Spec, SpawnError> {
+    async fn prepare(&self, spec: Spec) -> Result<Spec, SpawnError> {
         Ok(spec)
     }
 
@@ -415,11 +468,11 @@ mod tests {
     /// `local` must not perturb the spec at all. If this ever fails, every
     /// cached artifact built before exec runners shipped is suspect: `local`
     /// contributes nothing to `hashin` precisely because it changes nothing.
-    #[test]
-    fn local_prepare_is_the_identity() {
+    #[tokio::test]
+    async fn local_prepare_is_the_identity() {
         let s = LocalSession::new();
         let before = spec("/bin/echo");
-        let after = s.prepare(spec("/bin/echo")).expect("prepare");
+        let after = s.prepare(spec("/bin/echo")).await.expect("prepare");
 
         assert_eq!(after.program, before.program);
         assert_eq!(after.args, before.args);
@@ -622,7 +675,7 @@ impl ExecSession for EnvSession {
     /// `HashMap<String, String>`: the latter would clone every key and value and
     /// then convert each again into `OsString`, which for a 60–150-variable dev
     /// shell is hundreds of allocations per executed target.
-    fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
+    async fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
         // Weakest to strongest:
         //   host passthrough  <  captured environment  <  declared literals  <  the target
         //
@@ -717,10 +770,11 @@ mod env_session_tests {
         spec.env.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
-    #[test]
-    fn base_env_is_applied_where_the_caller_said_nothing() {
+    #[tokio::test]
+    async fn base_env_is_applied_where_the_caller_said_nothing() {
         let out = session(&[("PATH", "/nix/bin")])
             .prepare(spec_with(&[]))
+            .await
             .expect("prepare");
         assert_eq!(get(&out, "PATH"), Some(&OsString::from("/nix/bin")));
     }
@@ -728,10 +782,11 @@ mod env_session_tests {
     /// The caller wins. A driver has already resolved the target's own `env` and
     /// the sandbox's `$OUT`/`$SRC` routing by this point; an environment the
     /// target never wrote must not silently replace any of it.
-    #[test]
-    fn the_callers_entries_win_over_the_base() {
+    #[tokio::test]
+    async fn the_callers_entries_win_over_the_base() {
         let out = session(&[("PATH", "/nix/bin"), ("CC", "clang")])
             .prepare(spec_with(&[("PATH", "/sandbox/bin:/nix/bin")]))
+            .await
             .expect("prepare");
         assert_eq!(
             get(&out, "PATH"),
@@ -743,10 +798,11 @@ mod env_session_tests {
 
     /// One entry per key: a duplicate would leave which value the child sees up
     /// to `execve`, which is not a decision to leave to chance.
-    #[test]
-    fn no_duplicate_keys_survive_the_merge() {
+    #[tokio::test]
+    async fn no_duplicate_keys_survive_the_merge() {
         let out = session(&[("A", "base")])
             .prepare(spec_with(&[("A", "caller")]))
+            .await
             .expect("prepare");
         assert_eq!(out.env.iter().filter(|(k, _)| k == "A").count(), 1);
     }
@@ -840,7 +896,7 @@ impl WrapSession {
 
 #[async_trait::async_trait]
 impl ExecSession for WrapSession {
-    fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
+    async fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
         let merged = self.merged_env(&spec.env);
 
         // prefix[0] becomes the program; everything else, then the env args (if
@@ -941,8 +997,8 @@ mod wrap_session_tests {
             .collect()
     }
 
-    #[test]
-    fn the_wrapper_becomes_the_program_and_the_original_follows() {
+    #[tokio::test]
+    async fn the_wrapper_becomes_the_program_and_the_original_follows() {
         let s = WrapSession::new(
             vec![OsString::from("chroot"), OsString::from("/root")],
             WrapEnv::Inherit,
@@ -951,7 +1007,7 @@ mod wrap_session_tests {
             desc(),
         )
         .expect("wrap");
-        let out = s.prepare(spec()).expect("prepare");
+        let out = s.prepare(spec()).await.expect("prepare");
         assert_eq!(argv(&out), vec!["chroot", "/root", "cargo", "build"]);
         // Base env still applies underneath the caller's own.
         assert!(out.env.iter().any(|(k, v)| k == "CC" && v == "clang"));
@@ -960,8 +1016,8 @@ mod wrap_session_tests {
 
     /// `docker exec` does not inherit our environment, so it has to be rendered
     /// into the wrapper's argv or the inner process never sees it.
-    #[test]
-    fn args_mode_renders_the_environment_into_the_wrappers_argv() {
+    #[tokio::test]
+    async fn args_mode_renders_the_environment_into_the_wrappers_argv() {
         let s = WrapSession::new(
             vec![
                 OsString::from("docker"),
@@ -974,7 +1030,7 @@ mod wrap_session_tests {
             desc(),
         )
         .expect("wrap");
-        let out = s.prepare(spec()).expect("prepare");
+        let out = s.prepare(spec()).await.expect("prepare");
         let a = argv(&out);
         assert_eq!(a[0], "docker");
         assert!(
@@ -1061,7 +1117,7 @@ impl AgentSession {
 
 #[async_trait::async_trait]
 impl ExecSession for AgentSession {
-    fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
+    async fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
         // Base env under the caller's own, exactly as `Direct` does. The client
         // forwards its own environment to the agent, which applies it with
         // `env_clear` — so the devenv shell's ambient variables never reach the
@@ -1151,9 +1207,9 @@ mod agent_session_tests {
 
     /// The rewrite heph then spawns as an ordinary child — which is what keeps
     /// `Handle`, the drain and the PTY untouched.
-    #[test]
-    fn the_spec_becomes_a_client_invocation_wrapping_the_original() {
-        let out = session().prepare(spec()).expect("prepare");
+    #[tokio::test]
+    async fn the_spec_becomes_a_client_invocation_wrapping_the_original() {
+        let out = session().prepare(spec()).await.expect("prepare");
         assert_eq!(out.program, PathBuf::from("/usr/bin/heph"));
         let args: Vec<String> = out
             .args
@@ -1175,11 +1231,11 @@ mod agent_session_tests {
         assert!(args.iter().any(|a| a == "--"));
     }
 
-    #[test]
-    fn the_environment_is_merged_with_the_caller_winning() {
+    #[tokio::test]
+    async fn the_environment_is_merged_with_the_caller_winning() {
         let mut s = spec();
         s.env.push((OsString::from("CC"), OsString::from("gcc")));
-        let out = session().prepare(s).expect("prepare");
+        let out = session().prepare(s).await.expect("prepare");
         let cc: Vec<_> = out.env.iter().filter(|(k, _)| k == "CC").collect();
         assert_eq!(cc.len(), 1, "no duplicate keys reach execve");
         assert_eq!(cc[0].1, OsString::from("gcc"), "the caller wins");
@@ -1302,8 +1358,8 @@ mod session_env_tests {
     /// build would still be keyed as though it ran in the runner's. This failed
     /// on both Linux legs, where the CI image sets `CC`: a runner declaring
     /// `CC=clang` produced `CC=gcc`.
-    #[test]
-    fn the_captured_environment_outranks_a_host_passthrough() {
+    #[tokio::test]
+    async fn the_captured_environment_outranks_a_host_passthrough() {
         // SAFETY: process-global, and the name is this test's alone.
         unsafe {
             std::env::set_var("heph_TEST_RUNNER_CAPTURED", "from_host");
@@ -1320,7 +1376,7 @@ mod session_env_tests {
             caps(),
             desc(),
         );
-        let out = session.prepare(bare_spec()).expect("prepare");
+        let out = session.prepare(bare_spec()).await.expect("prepare");
         assert_eq!(
             get(&out.env, "heph_TEST_RUNNER_CAPTURED"),
             Some(&OsString::from("from_capture")),
@@ -1330,8 +1386,8 @@ mod session_env_tests {
 
     /// …and `runtime_env` is how a runner overrides its own capture, because it
     /// is explicit rather than whatever the host happened to have.
-    #[test]
-    fn runtime_env_can_override_the_capture_when_the_host_cannot() {
+    #[tokio::test]
+    async fn runtime_env_can_override_the_capture_when_the_host_cannot() {
         let session = EnvSession::with_declared(
             vec![(OsString::from("MODE"), OsString::from("captured"))],
             SessionEnv {
@@ -1341,14 +1397,14 @@ mod session_env_tests {
             caps(),
             desc(),
         );
-        let out = session.prepare(bare_spec()).expect("prepare");
+        let out = session.prepare(bare_spec()).await.expect("prepare");
         assert_eq!(get(&out.env, "MODE"), Some(&OsString::from("explicit")));
     }
 
     /// Above all of it, the target. A runner that could overwrite `$OUT`, `$SRC`
     /// or a target's own `env` would silently change what the target builds.
-    #[test]
-    fn the_target_still_wins_over_everything_the_runner_declares() {
+    #[tokio::test]
+    async fn the_target_still_wins_over_everything_the_runner_declares() {
         // SAFETY: as above.
         unsafe {
             std::env::set_var("heph_TEST_RUNNER_COLLIDE", "from_host");
@@ -1371,7 +1427,7 @@ mod session_env_tests {
             OsString::from("heph_TEST_RUNNER_COLLIDE"),
             OsString::from("from_target"),
         )];
-        let out = session.prepare(spec).expect("prepare");
+        let out = session.prepare(spec).await.expect("prepare");
         assert_eq!(
             get(&out.env, "heph_TEST_RUNNER_COLLIDE"),
             Some(&OsString::from("from_target"))

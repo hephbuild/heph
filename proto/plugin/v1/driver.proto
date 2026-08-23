@@ -18,6 +18,16 @@ enum DriverMethod {
   DRIVER_METHOD_RUN = 3; // carries the native stdio (invoke_io)
   DRIVER_METHOD_SCHEMA = 4; // sync metadata (StableMeta::meta)
   DRIVER_METHOD_CONFIG = 5; // sync metadata (StableMeta::meta)
+  // The exec-runner lane. A driver that answers these also serves the runner
+  // for runner targets it built: the host asks it to open a session, to
+  // transform each spawn's spec, and to close the session.
+  //
+  // Additive. A plugin built before these existed simply never answers them,
+  // and the host falls back to refusing a runner it cannot open rather than
+  // running the target in the wrong environment.
+  DRIVER_METHOD_OPEN_SESSION = 6;
+  DRIVER_METHOD_PREPARE_SPEC = 7;
+  DRIVER_METHOD_CLOSE_SESSION = 8;
 }
 
 message ParseRequest {
@@ -175,3 +185,103 @@ message RunOutFrame {
     string error = 4;                // terminal: failure message
   }
 }
+
+// ---- Exec-runner lane (DriverMethod OPEN_SESSION / PREPARE_SPEC / CLOSE_SESSION) ----
+
+// One file from the runner target's artifacts. Bytes rather than a path: the
+// artifact is content the cache key already covers, and passing bytes keeps the
+// guest from reading a filesystem the key knows nothing about.
+message RunnerArtifact {
+  string path = 1;
+  bytes content = 2;
+}
+
+message OpenSessionRequest {
+  string request_id = 1;
+  // Selects which driver on the plugin handles this.
+  string driver = 2;
+  // Content-addressed identity of this environment — the runner target's
+  // hashouts. Two runner targets with byte-identical artifacts are the same
+  // environment and share a session.
+  string key = 3;
+  // The runner target's address, for diagnostics.
+  string runner_addr = 4;
+  repeated RunnerArtifact artifacts = 5;
+}
+
+// How honestly the session describes the environment. `pinned` means the
+// environment is described by content the cache key already covers; otherwise a
+// stale hit is possible where a pinned environment would have missed, and
+// `identity_detail` says why.
+message SessionCaps {
+  bool pty = 1;
+  // Absent = the engine's worker pool is the only cap. Enforced by the host at
+  // admission, which is why it has to cross rather than stay in the plugin.
+  optional uint32 max_concurrent = 2;
+  bool pinned = 3;
+  string identity_detail = 4;
+}
+
+message OpenSessionResponse {
+  // Opaque to the host. Identifies this session on later PREPARE_SPEC /
+  // CLOSE_SESSION calls.
+  string session_id = 1;
+  SessionCaps caps = 2;
+  // Names the environment defines as shell functions rather than binaries.
+  // Diagnostics only, and the difference between "not found in PATH" and an
+  // error naming the actual problem.
+  repeated string shell_functions = 3;
+  string summary = 4;
+  // The environment every process here starts from, or absent when it cannot be
+  // enumerated host-side (a container's environment lives inside the
+  // container). Callers that report "where did this PATH entry come from" must
+  // degrade explicitly rather than print a confident, wrong answer.
+  repeated EnvVar base_env = 5;
+  bool base_env_known = 6;
+}
+
+// The mutable half of a `proc_exec::Spec`.
+//
+// stdio is deliberately absent: `StdioSpec::Fd` owns a file descriptor, which
+// cannot cross a stable boundary, and a runner has no business reassigning the
+// host's PTY slave. The kinds below are informational so a runner can tell an
+// interactive spawn from a batch one; the host keeps the real stdio and
+// re-applies it to whatever comes back.
+message ExecSpecPatch {
+  bytes program = 1;
+  repeated bytes args = 2;
+  repeated EnvVar env = 3;
+  bytes cwd = 4;
+  bool setsid = 5;
+  bool ctty = 6;
+}
+
+enum StdioKind {
+  STDIO_KIND_UNSPECIFIED = 0;
+  STDIO_KIND_NULL = 1;
+  STDIO_KIND_INHERIT = 2;
+  STDIO_KIND_PIPED = 3;
+  STDIO_KIND_FD = 4;
+}
+
+message PrepareSpecRequest {
+  string request_id = 1;
+  string driver = 2;
+  string session_id = 3;
+  ExecSpecPatch spec = 4;
+  StdioKind stdin = 5;
+  StdioKind stdout = 6;
+  StdioKind stderr = 7;
+}
+
+message PrepareSpecResponse {
+  ExecSpecPatch spec = 1;
+}
+
+message CloseSessionRequest {
+  string request_id = 1;
+  string driver = 2;
+  string session_id = 3;
+}
+
+message CloseSessionResponse {}

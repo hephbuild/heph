@@ -660,7 +660,10 @@ impl ProviderFn for StableRemoteFn {
 }
 
 /// Host handle to a loaded plugin's managed driver. `Clone` (shares the loaded
-/// component) for the engine's driver factory.
+/// component) for the engine's driver factory — and for the exec-runner lane,
+/// where a session-serving driver is registered twice: once as the engine's
+/// driver, once behind a `DriverExecRunner`. Both handles address the same
+/// plugin object.
 #[derive(Clone)]
 pub struct StableRemoteManagedDriver {
     inner: Arc<DynManagedDriver>,
@@ -689,6 +692,108 @@ impl ManagedDriver for StableRemoteManagedDriver {
         pb::Schema::decode(&bytes[..])
             .map(convert::driver_schema_from_pb)
             .unwrap_or_default()
+    }
+
+    // ---- exec-runner lane ----------------------------------------------
+
+    /// Probed over the SYNC `meta` lane, not an async round trip: the host has
+    /// to know at registration time — before any target runs — whether a runner
+    /// naming this driver can be opened at all.
+    ///
+    /// A plugin built before this lane existed returns an empty reply from
+    /// `meta` for an unknown method id, which reads as "no". That is the safe
+    /// direction: the host refuses to open a runner it cannot serve, rather
+    /// than running the target in the host environment under a key that
+    /// asserts the runner's.
+    fn serves_exec_sessions(&self) -> bool {
+        !self
+            .inner
+            .meta(pb::DriverMethod::OpenSession as u32)
+            .is_empty()
+    }
+
+    async fn open_session(
+        &self,
+        req: hexec_runner::OpenRequest,
+        ct: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<hexec_runner::OpenedSession> {
+        let request_id = format!("open-session:{}", req.key);
+        let pb_req = pb::OpenSessionRequest {
+            request_id: request_id.clone(),
+            driver: self.name.clone(),
+            key: req.key.clone(),
+            runner_addr: req.runner_addr.clone(),
+            artifacts: req
+                .artifacts
+                .iter()
+                .map(|a| pb::RunnerArtifact {
+                    path: a.path.clone(),
+                    content: a.bytes.clone().into(),
+                })
+                .collect(),
+        }
+        .encode_to_vec();
+        let fut = self
+            .inner
+            .invoke(pb::DriverMethod::OpenSession as u32, sv(&pb_req));
+        let bytes = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), fut).await;
+        match decode_unary(&bytes)? {
+            Body::OpenSessionResp(r) => Ok(convert::opened_session_from_pb(
+                r,
+                &req.runner_addr,
+                &req.key,
+            )),
+            other => anyhow::bail!("open_session: unexpected reply {other:?}"),
+        }
+    }
+
+    async fn prepare_spec(
+        &self,
+        session_id: &str,
+        spec: hproc::proc_exec::Spec,
+    ) -> anyhow::Result<hproc::proc_exec::Spec> {
+        let pb_req = pb::PrepareSpecRequest {
+            request_id: String::new(),
+            driver: self.name.clone(),
+            session_id: session_id.to_string(),
+            spec: Some(convert::exec_spec_to_pb(&spec)),
+            stdin: convert::stdio_kind_to_pb(&spec.stdin),
+            stdout: convert::stdio_kind_to_pb(&spec.stdout),
+            stderr: convert::stdio_kind_to_pb(&spec.stderr),
+        }
+        .encode_to_vec();
+        let bytes = self
+            .inner
+            .invoke(pb::DriverMethod::PrepareSpec as u32, sv(&pb_req))
+            .await;
+        match decode_unary(&bytes)? {
+            Body::PrepareSpecResp(r) => {
+                // `spec` still owns the real stdio — possibly a PTY slave
+                // `OwnedFd`. Only the fields a runner may change come back
+                // across; nothing from the wire replaces a descriptor.
+                let mut spec = spec;
+                convert::exec_spec_apply(&mut spec, r.spec.unwrap_or_default());
+                Ok(spec)
+            }
+            other => anyhow::bail!("prepare_spec: unexpected reply {other:?}"),
+        }
+    }
+
+    async fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let pb_req = pb::CloseSessionRequest {
+            request_id: String::new(),
+            driver: self.name.clone(),
+            session_id: session_id.to_string(),
+        }
+        .encode_to_vec();
+        let bytes = self
+            .inner
+            .invoke(pb::DriverMethod::CloseSession as u32, sv(&pb_req))
+            .await;
+        match decode_unary(&bytes)? {
+            Body::CloseSessionResp(_) => Ok(()),
+            other => anyhow::bail!("close_session: unexpected reply {other:?}"),
+        }
     }
 
     async fn parse(
