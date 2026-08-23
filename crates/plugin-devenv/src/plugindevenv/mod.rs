@@ -431,14 +431,6 @@ pub struct Runner {
     /// and client. Absent in a host with no session support, which makes
     /// `mode = "session"` an error rather than a silent downgrade.
     session: Option<SessionSupport>,
-    /// Sessions this runner holds open, by the id it handed the host.
-    ///
-    /// Only the id crosses the seam. What a session owns — a live `devenv
-    /// shell`, its socket, its pid — cannot, which is exactly why the component
-    /// trait is id-shaped and the runner keeps the objects here.
-    sessions: std::sync::Mutex<std::collections::HashMap<String, Arc<dyn ExecSession>>>,
-    /// Monotonic, so two environments opened in one build never collide.
-    next_session: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -453,78 +445,7 @@ pub struct SessionSupport {
 
 impl Runner {
     pub fn new(session: Option<SessionSupport>) -> Self {
-        Self {
-            session,
-            sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-            next_session: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    /// A panic while the map was locked must not wedge every later spawn: the
-    /// data is a plain `HashMap` and is still structurally sound, which is the
-    /// same call `ExecSessionPool::teardown_all` makes.
-    fn sessions(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Arc<dyn ExecSession>>> {
-        self.sessions.lock().unwrap_or_else(|p| p.into_inner())
-    }
-}
-
-/// The plugin-facing half: the same runner, addressed by session id so it can be
-/// served across the ABI as a component.
-#[async_trait]
-impl hexec_runner::ExecRunnerPlugin for Runner {
-    async fn open_session(
-        &self,
-        req: OpenRequest,
-        ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<hexec_runner::OpenedSession> {
-        let session = ExecRunner::open(self, req, ctoken).await?;
-        let id = format!(
-            "devenv-{}",
-            self.next_session
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        );
-        let opened = hexec_runner::OpenedSession {
-            session_id: id.clone(),
-            caps: session.caps().clone(),
-            description: session.describe().clone(),
-            base_env: session.base_env().map(<[_]>::to_vec),
-        };
-        self.sessions().insert(id, session);
-        Ok(opened)
-    }
-
-    async fn prepare_spec(
-        &self,
-        session_id: &str,
-        spec: hproc::proc_exec::Spec,
-    ) -> anyhow::Result<hproc::proc_exec::Spec> {
-        let session = self
-            .sessions()
-            .get(session_id)
-            .map(Arc::clone)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no devenv session {session_id}; it was closed, or never opened here"
-                )
-            })?;
-        session
-            .prepare(spec)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
-    }
-
-    async fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
-        // Removed first: close is reachable from more than one path and the
-        // shell must not be killed twice.
-        let Some(session) = self.sessions().remove(session_id) else {
-            return Ok(());
-        };
-        if let Some(job) = session.teardown() {
-            job()?;
-        }
-        Ok(())
+        Self { session }
     }
 }
 

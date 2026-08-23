@@ -74,7 +74,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
                 tree_root: root.clone(),
             });
     let driver: Arc<dyn ManagedDriver> = Arc::new(hplugin_devenv::plugindevenv::Driver::new(root));
-    let runner: Arc<dyn plugin_sdk::runner::ExecRunnerPlugin> =
+    let runner: Arc<dyn plugin_sdk::runner::ExecRunner> =
         Arc::new(hplugin_devenv::plugindevenv::Runner::new(session));
     let mut drivers = stabby::vec::Vec::new();
     drivers.push(NamedDriver {
