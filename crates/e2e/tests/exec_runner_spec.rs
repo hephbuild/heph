@@ -29,8 +29,10 @@ use heph::htaddr::parse_addr;
 /// A runner that holds "one shell" open and routes every spawn through it —
 /// the shape of a devenv session runner, without needing devenv.
 ///
-/// Note what is absent: no `parse`, no `run`, no schema. A runner is its own
-/// component kind, so it implements three methods and nothing else.
+/// Note what is absent: no `parse`, no `run`, no schema, and no session id. A
+/// runner is its own component kind, and it implements the *same* `ExecRunner`
+/// a host-side runner does — the session it returns is an object, so what that
+/// session holds stays on the runner's side.
 ///
 /// It rewrites each spawn to `env FROM_RUNNER=… SEQ=<n> <program> <args>`, so a
 /// target's own `run` can observe both that the session reached it and that the
@@ -39,22 +41,31 @@ struct MuxRunner {
     opens: Arc<AtomicUsize>,
     prepares: Arc<AtomicUsize>,
     closes: Arc<AtomicUsize>,
-    /// Per-session environment, held **inside the runner**.
-    ///
-    /// Under this lane the host does not merge `base_env` for anyone: the
-    /// runner owns the whole transformation, because the runner is what starts
-    /// the process. `ExecSession::base_env` is what the host *reports*, not
-    /// what it applies.
-    envs: std::sync::Mutex<std::collections::HashMap<String, Vec<(OsString, OsString)>>>,
+}
+
+/// The mux's session. Its state lives here, on the plugin's side — there is no
+/// id, no lookup table, and nothing for the host to address it by.
+///
+/// Under this lane the host does not merge `base_env` for anyone: the runner
+/// owns the whole transformation, because the runner is what decides how the
+/// process starts. `ExecSession::base_env` is what the host *reports*, not what
+/// it applies.
+struct MuxSession {
+    base_env: Vec<(OsString, OsString)>,
+    seq: AtomicUsize,
+    caps: heph::engine::exec_runner::SessionCaps,
+    description: heph::engine::exec_runner::SessionDescription,
+    prepares: Arc<AtomicUsize>,
+    closes: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
-impl heph::engine::exec_runner::ExecRunnerPlugin for MuxRunner {
-    async fn open_session(
+impl heph::engine::exec_runner::ExecRunner for MuxRunner {
+    async fn open(
         &self,
         req: heph::engine::exec_runner::OpenRequest,
         _ct: &(dyn heph::hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<heph::engine::exec_runner::OpenedSession> {
+    ) -> anyhow::Result<Arc<dyn heph::engine::exec_runner::ExecSession>> {
         self.opens.fetch_add(1, Ordering::SeqCst);
         // Derived from the artifact, not invented — the runner target's bytes
         // are what the consumer's key already covers.
@@ -63,17 +74,12 @@ impl heph::engine::exec_runner::ExecRunnerPlugin for MuxRunner {
             .first()
             .map(|a| String::from_utf8_lossy(&a.bytes).trim().to_string())
             .unwrap_or_default();
-        let base_env = vec![(
-            OsString::from("FROM_RUNNER"),
-            OsString::from(from_artifact.clone()),
-        )];
-        let session_id = format!("mux-{}", req.key);
-        self.envs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(session_id.clone(), base_env.clone());
-        Ok(heph::engine::exec_runner::OpenedSession {
-            session_id,
+        Ok(Arc::new(MuxSession {
+            base_env: vec![(
+                OsString::from("FROM_RUNNER"),
+                OsString::from(from_artifact.clone()),
+            )],
+            seq: AtomicUsize::new(0),
             caps: heph::engine::exec_runner::SessionCaps {
                 pty: true,
                 max_concurrent: Some(4),
@@ -87,38 +93,47 @@ impl heph::engine::exec_runner::ExecRunnerPlugin for MuxRunner {
                 key: req.key.clone(),
                 summary: format!("mux over {from_artifact}"),
             },
-            base_env: Some(base_env),
-        })
+            prepares: Arc::clone(&self.prepares),
+            closes: Arc::clone(&self.closes),
+        }))
     }
+}
 
-    async fn prepare_spec(
+#[async_trait::async_trait]
+impl heph::engine::exec_runner::ExecSession for MuxSession {
+    async fn prepare(
         &self,
-        session_id: &str,
         mut spec: heph::proc_exec::Spec,
-    ) -> anyhow::Result<heph::proc_exec::Spec> {
-        let n = self.prepares.fetch_add(1, Ordering::SeqCst);
+    ) -> Result<heph::proc_exec::Spec, heph::engine::exec_runner::SpawnError> {
+        self.prepares.fetch_add(1, Ordering::SeqCst);
+        let n = self.seq.fetch_add(1, Ordering::SeqCst);
         // The session's environment goes UNDER the caller's own — a runner
         // supplies the floor, or it could silently change what a target builds.
-        let base = self
-            .envs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default();
-        for (k, v) in base {
-            if !spec.env.iter().any(|(sk, _)| *sk == k) {
-                spec.env.push((k, v));
+        for (k, v) in &self.base_env {
+            if !spec.env.iter().any(|(sk, _)| sk == k) {
+                spec.env.push((k.clone(), v.clone()));
             }
         }
         // Per-SPAWN state. An environment described once at open could not
-        // produce this — it is the capability the ABI lane exists for.
+        // produce this — it is the capability a live session buys.
         spec.env
             .push((OsString::from("SEQ"), OsString::from(n.to_string())));
         Ok(spec)
     }
 
-    async fn close_session(&self, _session_id: &str) -> anyhow::Result<()> {
+    fn base_env(&self) -> Option<&[(OsString, OsString)]> {
+        Some(&self.base_env)
+    }
+
+    fn caps(&self) -> &heph::engine::exec_runner::SessionCaps {
+        &self.caps
+    }
+
+    fn describe(&self) -> &heph::engine::exec_runner::SessionDescription {
+        &self.description
+    }
+
+    async fn close(&self) -> anyhow::Result<()> {
         self.closes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -130,26 +145,23 @@ struct Counts {
     closes: Arc<AtomicUsize>,
 }
 
-/// A workspace whose `bash` runner targets are served by a driver over the
-/// exec-runner lane — the same adapter a loaded cdylib gets on the host side.
+/// A workspace whose `bash` runner targets are served over the exec-runner
+/// lane. Registered exactly as a loaded cdylib's runner is: no adapter, because
+/// there is no separate plugin-side trait to adapt from.
 fn mux_workspace() -> (Workspace, Counts) {
     let c = Counts {
         opens: Arc::new(AtomicUsize::new(0)),
         prepares: Arc::new(AtomicUsize::new(0)),
         closes: Arc::new(AtomicUsize::new(0)),
     };
-    let plugin: Arc<dyn heph::engine::exec_runner::ExecRunnerPlugin> = Arc::new(MuxRunner {
+    let runner: Arc<dyn heph::engine::exec_runner::ExecRunner> = Arc::new(MuxRunner {
         opens: Arc::clone(&c.opens),
         prepares: Arc::clone(&c.prepares),
         closes: Arc::clone(&c.closes),
-        envs: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     // Registered under `bash`: a runner target's driver name selects the runner
     // that serves it, and the runner targets below are bash targets.
-    let ws = Workspace::with_exec_runner_named(
-        "bash",
-        Arc::new(heph::engine::exec_runner::PluginExecRunner::new(plugin)),
-    );
+    let ws = Workspace::with_exec_runner_named("bash", runner);
     (ws, c)
 }
 
