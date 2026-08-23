@@ -226,10 +226,10 @@ jobs:
 #            runs-on: macos-latest-large
 #            target: x86_64-apple-darwin
 
-          # macOS ARM64 (Apple Silicon natively runs on macos-latest)
+          # macOS ARM64 (Apple Silicon natively runs on the blacksmith macOS runner)
           - os: darwin
             arch: arm64
-            runs-on: macos-latest
+            runs-on: blacksmith-6vcpu-macos-latest
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
@@ -439,41 +439,51 @@ jobs:
           DEBUG_BIN_NAME: "heph_debug_${{ matrix.os }}_${{ matrix.arch }}"
           EXPECTED_VERSION: "${{needs.gen.outputs.version}}"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{steps.build.outputs.bin_name}}
-          path: ${{steps.build.outputs.bin_name}}
+      # Six independent uploads of files already sitting on disk: none reads
+      # another's result, so they go up concurrently rather than one after the
+      # other. `parallel:` rather than `background: true` on each, because it
+      # waits at the end of the block — which is what keeps the drain step below
+      # genuinely last (see its comment). Backgrounded uploads would be free to
+      # still be running underneath it.
+      #
+      # Six is under the ten-concurrent-background-step cap, so none of them
+      # queues behind another.
+      - parallel:
+          - name: Upload artifact
+            uses: actions/upload-artifact@v6
+            with:
+              name: ${{steps.build.outputs.bin_name}}
+              path: ${{steps.build.outputs.bin_name}}
 
-      - name: Upload debug flavour artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{steps.build.outputs.debug_bin_name}}
-          path: ${{steps.build.outputs.debug_bin_name}}
+          - name: Upload debug flavour artifact
+            uses: actions/upload-artifact@v6
+            with:
+              name: ${{steps.build.outputs.debug_bin_name}}
+              path: ${{steps.build.outputs.debug_bin_name}}
 
-      - name: Upload heph-bench artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{steps.build.outputs.bench_bin_name}}
-          path: ${{steps.build.outputs.bench_bin_name}}
+          - name: Upload heph-bench artifact
+            uses: actions/upload-artifact@v6
+            with:
+              name: ${{steps.build.outputs.bench_bin_name}}
+              path: ${{steps.build.outputs.bench_bin_name}}
 
-      - name: Upload go plugin artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{steps.build.outputs.plugin_go_name}}
-          path: ${{steps.build.outputs.plugin_go_name}}
+          - name: Upload go plugin artifact
+            uses: actions/upload-artifact@v6
+            with:
+              name: ${{steps.build.outputs.plugin_go_name}}
+              path: ${{steps.build.outputs.plugin_go_name}}
 
-      - name: Upload gha plugin artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{steps.build.outputs.plugin_gha_name}}
-          path: ${{steps.build.outputs.plugin_gha_name}}
+          - name: Upload gha plugin artifact
+            uses: actions/upload-artifact@v6
+            with:
+              name: ${{steps.build.outputs.plugin_gha_name}}
+              path: ${{steps.build.outputs.plugin_gha_name}}
 
-      - name: Upload oci plugin artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{steps.build.outputs.plugin_oci_name}}
-          path: ${{steps.build.outputs.plugin_oci_name}}
+          - name: Upload oci plugin artifact
+            uses: actions/upload-artifact@v6
+            with:
+              name: ${{steps.build.outputs.plugin_oci_name}}
+              path: ${{steps.build.outputs.plugin_oci_name}}
 
       # Last, deliberately. This is the only job with steps after its compile,
       # and the drain must not sit in front of them: it would still be correct
@@ -781,10 +791,10 @@ jobs:
             runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
 
-          # macOS ARM64 (Apple Silicon natively runs on macos-latest)
+          # macOS ARM64 (Apple Silicon natively runs on the blacksmith macOS runner)
           - os: darwin
             arch: arm64
-            runs-on: macos-latest
+            runs-on: blacksmith-6vcpu-macos-latest
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
