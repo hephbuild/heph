@@ -985,6 +985,10 @@ impl StableRemoteManagedDriver {
                 .collect(),
             runner_key: req.runner.describe().key.clone(),
             runner_addr: req.runner.describe().runner.clone(),
+            // A session that also rewrites argv cannot be sent as an
+            // environment. Saying so is what turns a silently-local run into a
+            // refusal the user can act on.
+            runner_opaque: !req.runner.flattens_to_env(),
         };
         // Held for the ack check below: a guest that ignored the environment
         // must not be able to pass by staying quiet.

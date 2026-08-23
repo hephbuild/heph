@@ -1415,13 +1415,33 @@ impl tokio::io::AsyncWrite for FrameSink {
 /// identity transform — is what every driver behind this seam did before exec
 /// runners existed. A non-empty key means the host resolved an environment and
 /// is expecting it back in the ack.
-fn guest_session(req: &pb::ManagedRunRequest) -> Arc<dyn hexec_runner::ExecSession> {
+///
+/// `runner_opaque` means the host's session is more than an environment: its
+/// `prepare` also rewrites argv. Nothing here can reconstruct that, so the run
+/// is refused. Before this check the guest built an `EnvSession` regardless,
+/// which under `mode = "session"` ran the target on the host with the variables
+/// applied — never entering the shell — while the ack still passed.
+fn guest_session(
+    req: &pb::ManagedRunRequest,
+) -> anyhow::Result<Arc<dyn hexec_runner::ExecSession>> {
     use std::os::unix::ffi::OsStringExt as _;
 
     if req.runner_key.is_empty() {
-        return Arc::new(hexec_runner::LocalSession::new());
+        return Ok(Arc::new(hexec_runner::LocalSession::new()));
     }
-    Arc::new(hexec_runner::EnvSession::new(
+    if req.runner_opaque {
+        anyhow::bail!(
+            "driver `{}` runs in a plugin, and runner `{}` serves an environment that a plugin \
+             cannot enter: it rewrites the command as well as the environment (a container \
+             wrapper, or a `mode = \"session\"` devenv shell). Only the environment crosses the \
+             plugin seam today. Either build this target with a driver compiled into heph, or \
+             give the runner a mode that is purely an environment — for devenv, \
+             `mode = \"snapshot\"`.",
+            req.driver,
+            req.runner_addr,
+        );
+    }
+    Ok(Arc::new(hexec_runner::EnvSession::new(
         req.runner_env
             .iter()
             .map(|kv| {
@@ -1446,7 +1466,7 @@ fn guest_session(req: &pb::ManagedRunRequest) -> Arc<dyn hexec_runner::ExecSessi
             key: req.runner_key.clone(),
             summary: "host-supplied environment".to_string(),
         },
-    ))
+    )))
 }
 
 async fn run_once(
@@ -1459,7 +1479,10 @@ async fn run_once(
     let shell = req.shell;
     // Both captured before `req` is consumed field-by-field below.
     let runner_key = req.runner_key.clone();
-    let session = guest_session(&req);
+    let session = match guest_session(&req) {
+        Ok(s) => s,
+        Err(e) => return run_out_err(err_message(&e)),
+    };
     let target = match convert::target_def_from_pb(req.target.unwrap_or_default()) {
         Ok(t) => t,
         Err(e) => return run_out_err(err_message(&e)),
@@ -3607,6 +3630,86 @@ mod tests {
         session.close().await.expect("close");
         session.close().await.expect("close again");
         assert_eq!(closed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A plugin cannot enter an environment that is more than an environment,
+    /// and must say so rather than run the target somewhere else.
+    ///
+    /// Only `runner_env` crosses this seam. Under `mode = "session"` the guest
+    /// used to rebuild an `EnvSession` from it and spawn locally with the
+    /// variables applied — never entering the shell — while echoing
+    /// `runner_key` back, so the host's ack could not tell the difference. A
+    /// silently-wrong build is the one outcome the ack exists to prevent.
+    #[test]
+    fn a_plugin_refuses_a_session_it_cannot_enter() {
+        let flat = pb::ManagedRunRequest {
+            runner_key: "k1".to_string(),
+            runner_addr: "//:devenv".to_string(),
+            driver: "go_compile".to_string(),
+            runner_opaque: false,
+            ..Default::default()
+        };
+        assert!(
+            guest_session(&flat).is_ok(),
+            "a pure environment is exactly what this seam can carry"
+        );
+
+        let opaque = pb::ManagedRunRequest {
+            runner_opaque: true,
+            ..flat
+        };
+        let err = match guest_session(&opaque) {
+            Ok(_) => panic!("an argv-rewriting session must not be reconstructed as an env"),
+            Err(e) => format!("{e:#}"),
+        };
+        // Names both ends and both ways out — the message is the whole fix for
+        // someone who hits it.
+        assert!(err.contains("go_compile"), "{err}");
+        assert!(err.contains("//:devenv"), "{err}");
+        assert!(err.contains("mode = \"snapshot\""), "{err}");
+    }
+
+    /// The host's half of the same contract: which sessions declare themselves
+    /// unsendable.
+    #[test]
+    fn only_environment_shaped_sessions_flatten() {
+        use hexec_runner::ExecSession as _;
+        assert!(hexec_runner::LocalSession::new().flattens_to_env());
+        assert!(
+            hexec_runner::EnvSession::new(vec![], caps_for_test(), desc_for_test())
+                .flattens_to_env()
+        );
+        assert!(
+            !hexec_runner::WrapSession::new(
+                vec![OsString::from("docker")],
+                hexec_runner::WrapEnv::Inherit,
+                vec![],
+                caps_for_test(),
+                desc_for_test(),
+            )
+            .expect("wrap")
+            .flattens_to_env(),
+            "the wrapper lives in argv, which does not cross"
+        );
+    }
+
+    fn caps_for_test() -> hexec_runner::SessionCaps {
+        hexec_runner::SessionCaps {
+            pty: true,
+            max_concurrent: None,
+            identity: hexec_runner::Identity::Asserted {
+                why: "test".to_string(),
+            },
+        }
+    }
+
+    fn desc_for_test() -> hexec_runner::SessionDescription {
+        hexec_runner::SessionDescription {
+            runner: "//:r".to_string(),
+            shell_functions: vec![],
+            key: "k".to_string(),
+            summary: "test".to_string(),
+        }
     }
 
     /// The capability that justified making this its own component: a runner

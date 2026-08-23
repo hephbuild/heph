@@ -281,6 +281,20 @@ pub trait ExecSession: Send + Sync {
     /// must degrade explicitly rather than pretend an empty environment.
     fn base_env(&self) -> Option<&[(OsString, OsString)]>;
 
+    /// Whether this session is fully described by [`base_env`](Self::base_env).
+    ///
+    /// A driver behind the plugin seam cannot be handed this object — a cdylib
+    /// links its own copy of these types — so the host sends it the environment
+    /// instead and the guest rebuilds an [`EnvSession`] from it. That is exact
+    /// for `Local` and `Env`, and **wrong** for anything whose `prepare` also
+    /// rewrites argv: a `Wrap` session would lose its wrapper and an `Agent`
+    /// session would spawn on the host, both while the `runner_key` ack still
+    /// passed. Such a session says `false` here so the seam refuses the run
+    /// rather than silently degrading it.
+    fn flattens_to_env(&self) -> bool {
+        true
+    }
+
     fn caps(&self) -> &SessionCaps;
 
     fn describe(&self) -> &SessionDescription;
@@ -876,6 +890,11 @@ impl WrapSession {
 
 #[async_trait::async_trait]
 impl ExecSession for WrapSession {
+    /// The wrapper is in the argv, not the environment.
+    fn flattens_to_env(&self) -> bool {
+        false
+    }
+
     async fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
         let merged = self.merged_env(&spec.env);
 
@@ -1097,6 +1116,11 @@ impl AgentSession {
 
 #[async_trait::async_trait]
 impl ExecSession for AgentSession {
+    /// The client is in the argv, and the process is created by the agent.
+    fn flattens_to_env(&self) -> bool {
+        false
+    }
+
     async fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
         // Base env under the caller's own, exactly as `Direct` does. The client
         // forwards its own environment to the agent, which applies it with

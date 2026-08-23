@@ -123,6 +123,11 @@ message ManagedRunRequest {
   string runner_key = 12;
   // Diagnostics: the runner target's address.
   string runner_addr = 13;
+  // True when the environment above does NOT fully describe the session — it
+  // also rewrites argv (a `Wrap` wrapper, an `Agent` client). A guest cannot
+  // reconstruct that from `runner_env`, so it must refuse the run instead of
+  // creating the process itself and acking as though it had complied.
+  bool runner_opaque = 14;
 }
 
 // An environment variable. `bytes`, not `string`: env values are bytes
