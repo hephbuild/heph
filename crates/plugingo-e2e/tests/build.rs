@@ -348,3 +348,43 @@ async fn test_embed_generated_in_subpackage_of_the_embedder() -> anyhow::Result<
     );
     Ok(())
 }
+
+/// Every `go` invocation a build makes must be created **in the runner's
+/// session**, `go list` included.
+///
+/// `go_golist` used to call `proc_exec::output` directly while `go_compile`
+/// went through `req.runner`. With no runner configured the two are
+/// indistinguishable — `LocalSession::prepare` is the identity — so the whole
+/// existing suite passed while, under a real runner, `go build` ran in the
+/// environment and `go list` ran on the host. The target's `hashin` says
+/// otherwise, which makes it a wrong build rather than a slow one.
+///
+/// The recording runner is deliberately passive: it changes nothing and only
+/// notes what it was asked to start. A runner that *did* something would fail
+/// this for the wrong reason (a broken build), and a driver that bypasses the
+/// session is invisible to anything less passive.
+#[tokio::test]
+async fn every_go_invocation_is_created_in_the_runner_session() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("simple_lib")?;
+    let (ws, seen) = common::make_workspace_recording_runner(dir)?;
+    ws.run("//:build_lib@v=host").await?;
+
+    let seen = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert!(
+        !seen.is_empty(),
+        "the runner saw no process at all — the default runner is not wired up, \
+         so this test would pass vacuously"
+    );
+
+    let go_list = seen
+        .iter()
+        .filter(|(program, _)| std::path::Path::new(program).file_name() == Some("go".as_ref()))
+        .any(|(_, args)| args.first().map(String::as_str) == Some("list"));
+    assert!(
+        go_list,
+        "no `go list` reached the runner; the go_golist driver spawned it beside \
+         the session. Saw: {seen:#?}"
+    );
+    Ok(())
+}

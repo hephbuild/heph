@@ -17,6 +17,7 @@ hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"
+async-trait = "0.1.89"
 tempfile = "3"
 futures = "0.3"
 # Reads the program headers of a linked Go binary, to assert its buildmode.

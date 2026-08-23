@@ -439,7 +439,13 @@ impl ManagedDriver for GoGolistDriver {
             ctty: false,
         };
 
-        let output = proc_exec::output(spec, ctoken)
+        // Through the session, like every other `go` invocation: a target whose
+        // `hashin` says it ran in a runner's environment must actually have run
+        // there. `LocalSession::prepare` is the identity, so this is free when
+        // no runner is configured.
+        let output = req
+            .runner
+            .output(spec, ctoken)
             .await
             .with_context(|| format!("wait for go list for {}", def.import_path))?;
 

@@ -268,7 +268,7 @@ impl hplugin::provider::Provider for VariantInjector {
 /// the few tests that specifically exercise the hermetic toolchain use
 /// [`make_workspace_hermetic`]. Requires `go` on PATH (guard with `require_go!`).
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, &[], HOST_GO)
+    make_workspace_ordered(dir, false, true, &[], HOST_GO, None)
 }
 
 /// Alias for [`make_workspace`] kept for call sites that spell the host toolchain
@@ -282,7 +282,7 @@ pub fn make_workspace_host(dir: TempDir) -> anyhow::Result<Workspace> {
 /// so reserve it for the *select few* tests that must prove the hermetic
 /// toolchain path itself; everything else uses [`make_workspace`] (host `go`).
 pub fn make_workspace_hermetic(dir: TempDir) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
+    make_workspace_ordered(dir, false, true, &[], HERMETIC_GO, None)
 }
 
 /// A published heph release whose `heph-govet_<goos>_<goarch>` assets the lint
@@ -299,7 +299,7 @@ pub fn govet_addr() -> String {
 /// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
 /// package lives under a skipped subtree (e.g. a generated `gen/**` tree).
 pub fn make_workspace_fs_skip(dir: TempDir, skip: &[&str]) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, skip, HOST_GO)
+    make_workspace_ordered(dir, false, true, skip, HOST_GO, None)
 }
 
 /// Same as [`make_workspace`] but registers the **go provider before** the
@@ -314,7 +314,108 @@ pub fn make_workspace_go_first(
     dir: TempDir,
     foreign_name_guard: bool,
 ) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, true, foreign_name_guard, &[], HOST_GO)
+    make_workspace_ordered(dir, true, foreign_name_guard, &[], HOST_GO, None)
+}
+
+/// Addr of the stand-in runner target [`make_workspace_recording_runner`] adds.
+///
+/// A `bash` target, so the runner registered under `"bash"` serves it — the same
+/// wiring a real workspace uses for a `devenv` runner target built by the devenv
+/// driver.
+pub const RECORDING_RUNNER_ADDR: &str = "//@heph/runner:env";
+
+/// Every spec that reached the runner, as `(program, args)`.
+pub type SeenSpecs = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
+
+/// A runner that records what it was asked to start and otherwise changes
+/// nothing.
+///
+/// `prepare` is the identity, so a target behaves exactly as it does with no
+/// runner — which is the point. The question this answers is not *what* the
+/// environment does but *whether the driver asked it at all*, and a driver that
+/// calls `proc_exec` directly is invisible to a runner that does anything less
+/// passive.
+struct RecordingRunner {
+    seen: SeenSpecs,
+}
+
+struct RecordingSession {
+    seen: SeenSpecs,
+    caps: heph::engine::exec_runner::SessionCaps,
+    description: heph::engine::exec_runner::SessionDescription,
+}
+
+#[async_trait::async_trait]
+impl heph::engine::exec_runner::ExecRunner for RecordingRunner {
+    async fn open(
+        &self,
+        req: heph::engine::exec_runner::OpenRequest,
+        _ct: &(dyn heph::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<std::sync::Arc<dyn heph::engine::exec_runner::ExecSession>> {
+        Ok(std::sync::Arc::new(RecordingSession {
+            seen: std::sync::Arc::clone(&self.seen),
+            caps: heph::engine::exec_runner::SessionCaps {
+                pty: true,
+                max_concurrent: None,
+                identity: heph::engine::exec_runner::Identity::Pinned {
+                    by: req.key.clone(),
+                },
+            },
+            description: heph::engine::exec_runner::SessionDescription {
+                runner: req.runner_addr.clone(),
+                key: req.key.clone(),
+                summary: "recording (identity)".to_string(),
+            },
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl heph::engine::exec_runner::ExecSession for RecordingSession {
+    fn prepare(
+        &self,
+        spec: heph::proc_exec::Spec,
+    ) -> Result<heph::proc_exec::Spec, heph::engine::exec_runner::SpawnError> {
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).push((
+            spec.program.to_string_lossy().into_owned(),
+            spec.args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+        ));
+        Ok(spec)
+    }
+
+    fn base_env(&self) -> Option<&[(std::ffi::OsString, std::ffi::OsString)]> {
+        None
+    }
+
+    fn caps(&self) -> &heph::engine::exec_runner::SessionCaps {
+        &self.caps
+    }
+
+    fn describe(&self) -> &heph::engine::exec_runner::SessionDescription {
+        &self.description
+    }
+}
+
+/// [`make_workspace`] with every target routed through a recording runner.
+///
+/// Returns the specs the runner saw, so a test can assert that a given `go`
+/// invocation was actually created *in the session* rather than beside it.
+pub fn make_workspace_recording_runner(dir: TempDir) -> anyhow::Result<(Workspace, SeenSpecs)> {
+    let seen: SeenSpecs = Default::default();
+    let ws = make_workspace_ordered(
+        dir,
+        false,
+        true,
+        &[],
+        HOST_GO,
+        Some(std::sync::Arc::new(RecordingRunner {
+            seen: std::sync::Arc::clone(&seen),
+        })),
+    )?;
+    Ok((ws, seen))
 }
 
 fn make_workspace_ordered(
@@ -323,7 +424,9 @@ fn make_workspace_ordered(
     foreign_name_guard: bool,
     fs_skip: &[&str],
     gotool: &str,
+    exec_runner: Option<std::sync::Arc<dyn heph::engine::exec_runner::ExecRunner>>,
 ) -> anyhow::Result<Workspace> {
+    let wants_runner = exec_runner.is_some();
     let gotool = gotool.to_string();
     let go_bin = go_bin_path();
     let cc_bin = cc_bin_path();
@@ -390,6 +493,26 @@ fn make_workspace_ordered(
                     ..Default::default()
                 });
             }
+            // The runner target `defaultRunner` resolves to. It goes in this
+            // list rather than a second provider — only one
+            // `pluginstatictarget` may register per engine. The engine excludes
+            // a runner target from the default runner, so it does not chase its
+            // own tail.
+            if wants_runner {
+                targets.push(pluginstatictarget::Target {
+                    addr: RECORDING_RUNNER_ADDR.to_string(),
+                    driver: "bash".to_string(),
+                    run: Some("echo recording > env.json".to_string()),
+                    out: std::collections::HashMap::from([(
+                        String::new(),
+                        vec!["env.json".to_string()],
+                    )]),
+                    codegen: None,
+                    deps: Default::default(),
+                    labels: vec![],
+                    ..Default::default()
+                });
+            }
             Box::new(pluginstatictarget::Provider::new(targets).expect("static provider"))
         });
 
@@ -411,6 +534,12 @@ fn make_workspace_ordered(
                 .expect("plugingo provider"),
             )
         });
+    }
+
+    if let Some(runner) = exec_runner {
+        let addr = heph::htaddr::parse_addr(RECORDING_RUNNER_ADDR)
+            .context("parse the recording runner's addr")?;
+        b = b.with_default_runner(addr).with_exec_runner("bash", runner);
     }
 
     b.with_managed_driver(Box::new(pluginexec::Driver::new_bash()))

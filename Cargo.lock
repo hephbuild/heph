@@ -4322,6 +4322,7 @@ name = "plugingo-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "core",
  "futures",
  "heph",
