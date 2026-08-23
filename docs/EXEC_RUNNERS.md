@@ -156,6 +156,18 @@ Two details that are not obvious:
   group. Without that, cancelling a build left its targets running to
   completion.
 
+### What a plugin-hosted driver can and cannot use
+
+Only the *environment* crosses the plugin seam, so a driver in a cdylib (`go`,
+`oci`, devenv's own) can use `Local` and `Env` sessions but not `Wrap` or
+`Agent` — those put a wrapper or a client in the argv, which does not cross.
+The host marks such a session opaque and the guest **refuses the run**, naming
+the driver, the runner and the ways out. It does not quietly fall back to
+running the target on the host, which is what it used to do while still passing
+the `runner_key` ack.
+
+Built-in drivers (`exec`, `bash`) hold the real session and are unaffected.
+
 ## devenv
 
 ```python
