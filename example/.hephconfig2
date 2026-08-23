@@ -12,6 +12,11 @@ plugins:
   # The go plugin: one manifest names the cdylib for this host. The provider + its
   # go_* drivers all come from that one library. Installed to the user-global
   # ~/.heph by the `gen-example` script (which runs `install-go-plugin`).
+  # The devenv plugin: the `devenv` driver, which captures the dev shell as a
+  # runner target's artifact. Driver-only — the runner half is generic and lives
+  # in heph itself, so nothing here selects a runner implementation. Installed by
+  # the `gen-example` script (which runs `install-devenv-plugin`).
+  - path: ~/.heph/plugins/devenv/heph-devenv-plugin.json
   - path: ~/.heph/plugins/go/heph-go-plugin.json
     options:
       # Required. A pinned version → hermetic SDK download (reads nothing from

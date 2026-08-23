@@ -167,14 +167,18 @@ in
     cd $DEVENV_ROOT/example/go/large && go mod tidy
   '';
   # Set up the example workspace end to end: regenerate the large go repo and
-  # install the go plugin (cdylib + manifest) into ~/.heph/plugins/go via
-  # `install-go-plugin`. example/.hephconfig2 loads it in-process behind the
+  # install the go and devenv plugins (cdylib + manifest) into ~/.heph/plugins
+  # via `install-go-plugin` / `install-devenv-plugin`. example/.hephconfig2
+  # loads them in-process behind the
   # stable ABI via `path: ~/.heph/plugins/go/heph-go-plugin.json` (native speed —
   # see ai-docs/PERFORMANCE.md).
   scripts.gen-example.exec = ''
     gen
     gen-go-large
     install-go-plugin
+    # The example workspace's `exec_runner` package uses `driver = "devenv"`,
+    # which is no longer compiled into the binary.
+    install-devenv-plugin
   '';
   # Three clippy passes — default features, `--all-features`, and
   # `--no-default-features` — then fmt-check all hand-written crates
