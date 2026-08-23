@@ -147,6 +147,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         drivers,
         // The go plugin exports no hooks.
         hooks: stabby::vec::Vec::new(),
+        // No exec runner: this plugin serves no environments.
+        runners: stabby::vec::Vec::new(),
         // No return-side metadata to report yet.
         meta: stabby::vec::Vec::new(),
     })

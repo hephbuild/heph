@@ -14,6 +14,17 @@
 /// Re-export of the author-facing contract so a plugin depends only on the SDK.
 pub use hplugin::{driver, eresult, hook, provider};
 
+/// The exec-runner author surface: implement [`runner::ExecRunnerPlugin`] to
+/// serve the environment a runner target describes. A runner is its own
+/// component kind — it needs no driver, no schema and no config.
+#[cfg(feature = "stabby")]
+pub mod runner {
+    pub use hexec_runner::{
+        ExecRunnerPlugin, Identity, OpenRequest, OpenedSession, RunnerArtifact, SessionCaps,
+        SessionDescription,
+    };
+}
+
 #[cfg(feature = "stabby")]
 mod guest;
 #[cfg(feature = "stabby")]
@@ -25,9 +36,10 @@ mod supervisor;
 
 /// In-process stable-ABI cdylib transport (opt-in via the `stabby` feature).
 ///
-/// A plugin crate builds as a `cdylib`, constructs its provider + drivers with
-/// [`stabby::make_dyn_provider`] / [`stabby::make_dyn_managed_driver`], and
-/// returns them from a `#[stabby::export]` entry as [`stabby::abi::PluginComponents`].
+/// A plugin crate builds as a `cdylib`, constructs its components with
+/// [`stabby::make_dyn_provider`] / [`stabby::make_dyn_managed_driver`] /
+/// [`stabby::make_dyn_exec_runner`], and returns them from a
+/// `#[stabby::export]` entry as [`stabby::abi::PluginComponents`].
 /// The host loads it via `hplugin_stabby::load_stable`.
 #[cfg(feature = "stabby")]
 pub mod stabby {
@@ -37,7 +49,8 @@ pub mod stabby {
     pub use crate::guest::GuestExecutor;
     pub use crate::logsink::install_log_sink;
     pub use crate::serve::{
-        cdylib_runtime_handle, make_dyn_hook, make_dyn_managed_driver, make_dyn_provider,
+        cdylib_runtime_handle, make_dyn_exec_runner, make_dyn_hook, make_dyn_managed_driver,
+        make_dyn_provider,
     };
     pub use crate::supervisor::{install_supervisor, supervisor_sink};
 

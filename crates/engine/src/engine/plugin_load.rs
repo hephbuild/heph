@@ -98,25 +98,22 @@ fn load_dylib_plugins(
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     // Engine mutation is single-threaded; register the loaded components in order.
-    for (provider, drivers, hooks) in loaded {
+    for (provider, drivers, hooks, runners) in loaded {
         if let Some(p) = provider {
             e.register_provider(|_| Box::new(p))?;
         }
-        for (name, drv) in drivers {
-            // A driver that serves exec sessions is also the runner for runner
-            // targets it built. Registered under the same name, which is how a
-            // runner target's driver selects its runner — and probed over the
-            // sync `meta` lane, so this is settled at load rather than on the
-            // first target that needs an environment.
-            if hdriver_support::driver_managed::ManagedDriver::serves_exec_sessions(&drv) {
-                let runner = std::sync::Arc::new(
-                    hdriver_support::exec_runner_driver::DriverExecRunner::new(
-                        std::sync::Arc::new(drv.clone()),
-                    ),
-                );
-                e.register_exec_runner(name, runner)?;
-            }
+        for (_name, drv) in drivers {
             e.register_managed_driver(|_| Box::new(drv))?;
+        }
+        // Exec runners are their own component kind, registered under their own
+        // names — a plugin can export a runner with no driver at all.
+        for (name, runner) in runners {
+            e.register_exec_runner(
+                name,
+                std::sync::Arc::new(hexec_runner::PluginExecRunner::new(std::sync::Arc::new(
+                    runner,
+                ))),
+            )?;
         }
         for (_name, hook) in hooks {
             e.register_hook(std::sync::Arc::new(hook))?;

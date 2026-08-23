@@ -1015,10 +1015,83 @@ async fn driver_apply_transitive(
     .await
 }
 
-// ---- exec-runner lane ------------------------------------------------------
+// ---- the exec-runner component ---------------------------------------------
 
-async fn driver_open_session(
-    driver: Arc<dyn ManagedDriver>,
+/// Wrap an author `ExecRunnerPlugin` as a [`StableExecRunner`].
+pub fn make_dyn_exec_runner(
+    runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
+) -> hplugin_stabby::abi::DynExecRunner {
+    dynify(stabby::boxed::Box::new(StableExecRunnerImpl {
+        runner,
+        name: Arc::from("exec-runner"),
+        cancels: Arc::new(CancelRegistry::default()),
+    }))
+}
+
+pub struct StableExecRunnerImpl {
+    pub runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
+    /// For the seam's panic/abort labelling, like a driver's own name.
+    name: Arc<str>,
+    cancels: Arc<CancelRegistry>,
+}
+
+impl StableMeta for StableExecRunnerImpl {
+    extern "C" fn meta(&self, _kind: u32) -> SVec<u8> {
+        // A runner has no schema and no config: it is addressed by its own name
+        // from the component bundle, so there is nothing to probe.
+        SVec::new()
+    }
+}
+
+impl StableCancel for StableExecRunnerImpl {
+    extern "C" fn cancel(&self, request_id: stabby::string::String) {
+        self.cancels.cancel(&request_id);
+    }
+}
+
+impl hplugin_stabby::abi::StableExecRunner for StableExecRunnerImpl {
+    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+        let runner = Arc::clone(&self.runner);
+        match pb::ExecRunnerMethod::try_from(method as i32) {
+            Ok(pb::ExecRunnerMethod::OpenSession) => {
+                let req = pb::OpenSessionRequest::decode(&req[..]).unwrap_or_default();
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "open_session",
+                    req.runner_addr.clone(),
+                    runner_open_session(runner, req, Arc::clone(&self.cancels)),
+                    |m| unary(err_body(m)),
+                )))
+            }
+            Ok(pb::ExecRunnerMethod::PrepareSpec) => {
+                let req = pb::PrepareSpecRequest::decode(&req[..]).unwrap_or_default();
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "prepare_spec",
+                    req.session_id.clone(),
+                    runner_prepare_spec(runner, req),
+                    |m| unary(err_body(m)),
+                )))
+            }
+            Ok(pb::ExecRunnerMethod::CloseSession) => {
+                let req = pb::CloseSessionRequest::decode(&req[..]).unwrap_or_default();
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "close_session",
+                    req.session_id.clone(),
+                    runner_close_session(runner, req),
+                    |m| unary(err_body(m)),
+                )))
+            }
+            _ => dynify(stabby::boxed::Box::new(
+                async move { unimplemented(method) },
+            )),
+        }
+    }
+}
+
+async fn runner_open_session(
+    runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
     req: pb::OpenSessionRequest,
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
@@ -1036,7 +1109,7 @@ async fn driver_open_session(
             .collect(),
     };
     on_plugin_runtime(guard, move |guard| async move {
-        match driver.open_session(oreq, guard.token()).await {
+        match runner.open_session(oreq, guard.token()).await {
             Ok(s) => Body::OpenSessionResp(plugin_abi::convert::opened_session_to_pb(&s)),
             Err(e) => err_body(err_message(&e)),
         }
@@ -1044,14 +1117,14 @@ async fn driver_open_session(
     .await
 }
 
-async fn driver_prepare_spec(
-    driver: Arc<dyn ManagedDriver>,
+async fn runner_prepare_spec(
+    runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
     req: pb::PrepareSpecRequest,
 ) -> SVec<u8> {
     // No cancel guard: `prepare` is a pure, fast transformation on the spawn
     // path, and the host abandons the future if the target is cancelled.
     let spec = plugin_abi::convert::exec_spec_from_pb(req.spec.unwrap_or_default());
-    match driver.prepare_spec(&req.session_id, spec).await {
+    match runner.prepare_spec(&req.session_id, spec).await {
         Ok(out) => unary(Body::PrepareSpecResp(pb::PrepareSpecResponse {
             spec: Some(plugin_abi::convert::exec_spec_to_pb(&out)),
         })),
@@ -1059,11 +1132,11 @@ async fn driver_prepare_spec(
     }
 }
 
-async fn driver_close_session(
-    driver: Arc<dyn ManagedDriver>,
+async fn runner_close_session(
+    runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
     req: pb::CloseSessionRequest,
 ) -> SVec<u8> {
-    match driver.close_session(&req.session_id).await {
+    match runner.close_session(&req.session_id).await {
         Ok(()) => unary(Body::CloseSessionResp(pb::CloseSessionResponse {})),
         Err(e) => unary(err_body(err_message(&e))),
     }
@@ -1074,16 +1147,6 @@ impl StableMeta for StableManagedDriverImpl {
         match pb::DriverMethod::try_from(kind as i32) {
             Ok(pb::DriverMethod::Config) => driver_config(&self.driver),
             Ok(pb::DriverMethod::Schema) => driver_schema(&self.driver),
-            // Capability probe, answered synchronously at load: a non-empty
-            // reply means this driver serves exec sessions. The host needs it
-            // before any target runs, so it cannot be an async round trip.
-            Ok(pb::DriverMethod::OpenSession) => {
-                if self.driver.serves_exec_sessions() {
-                    SVec::from_iter([1u8])
-                } else {
-                    SVec::new()
-                }
-            }
             _ => SVec::new(),
         }
     }
@@ -1115,36 +1178,6 @@ impl StableManagedDriver for StableManagedDriverImpl {
                     "apply_transitive",
                     key,
                     driver_apply_transitive(driver, req, Arc::clone(&self.cancels)),
-                    |m| unary(err_body(m)),
-                )))
-            }
-            Ok(pb::DriverMethod::OpenSession) => {
-                let req = pb::OpenSessionRequest::decode(&req[..]).unwrap_or_default();
-                dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
-                    "open_session",
-                    req.runner_addr.clone(),
-                    driver_open_session(driver, req, Arc::clone(&self.cancels)),
-                    |m| unary(err_body(m)),
-                )))
-            }
-            Ok(pb::DriverMethod::PrepareSpec) => {
-                let req = pb::PrepareSpecRequest::decode(&req[..]).unwrap_or_default();
-                dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
-                    "prepare_spec",
-                    req.session_id.clone(),
-                    driver_prepare_spec(driver, req),
-                    |m| unary(err_body(m)),
-                )))
-            }
-            Ok(pb::DriverMethod::CloseSession) => {
-                let req = pb::CloseSessionRequest::decode(&req[..]).unwrap_or_default();
-                dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
-                    "close_session",
-                    req.session_id.clone(),
-                    driver_close_session(driver, req),
                     |m| unary(err_body(m)),
                 )))
             }
@@ -3265,9 +3298,14 @@ mod tests {
     // directly would prove nothing about the seam — and the seam is the point,
     // because it is what lets a runner plugin own process creation.
 
-    /// A driver that holds "one shell" open and routes every spawn through it,
+    /// A runner that holds "one shell" open and routes every spawn through it,
     /// which is the shape a devenv session runner has.
-    struct MuxDriver {
+    ///
+    /// Note what is NOT here: no `parse`, no `apply_transitive`, no `run`, no
+    /// config schema. A runner is its own component kind, so it implements three
+    /// methods and nothing else — the earlier draft of this lane rode
+    /// `ManagedDriver` and needed three `bail!("unused")` stubs per runner.
+    struct MuxRunner {
         opened: Arc<std::sync::atomic::AtomicUsize>,
         closed: Arc<std::sync::atomic::AtomicUsize>,
         prepared: Arc<std::sync::atomic::AtomicUsize>,
@@ -3275,44 +3313,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ManagedDriver for MuxDriver {
-        fn config(
-            &self,
-            _req: hplugin::driver::ConfigRequest,
-        ) -> Result<hplugin::driver::ConfigResponse> {
-            Ok(hplugin::driver::ConfigResponse {
-                name: "mux".to_string(),
-            })
-        }
-        fn schema(&self) -> hplugin::driver::DriverSchema {
-            Default::default()
-        }
-        async fn parse(
-            &self,
-            _req: hplugin::driver::ParseRequest,
-            _ct: &(dyn Cancellable + Send + Sync),
-        ) -> Result<hplugin::driver::ParseResponse> {
-            anyhow::bail!("unused")
-        }
-        async fn apply_transitive(
-            &self,
-            _req: hplugin::driver::ApplyTransitiveRequest,
-            _ct: &(dyn Cancellable + Send + Sync),
-        ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
-            anyhow::bail!("unused")
-        }
-        async fn run<'a, 'io>(
-            &self,
-            _req: hdriver_support::driver_managed::ManagedRunRequest<'a, 'io>,
-            _ct: &(dyn Cancellable + Send + Sync),
-        ) -> Result<hdriver_support::driver_managed::ManagedRunResponse> {
-            anyhow::bail!("unused")
-        }
-
-        fn serves_exec_sessions(&self) -> bool {
-            true
-        }
-
+    impl hexec_runner::ExecRunnerPlugin for MuxRunner {
         async fn open_session(
             &self,
             req: hexec_runner::OpenRequest,
@@ -3356,7 +3357,7 @@ mod tests {
                 OsString::from("--socket"),
                 OsString::from(session_id),
                 // Per-SPAWN state. A description settled once at open could not
-                // produce this, which is the capability this lane buys.
+                // produce this, which is the capability this component buys.
                 OsString::from(format!("--seq={n}")),
                 OsString::from("--"),
             ];
@@ -3379,7 +3380,7 @@ mod tests {
     fn mux_host(
         enumerable_env: bool,
     ) -> (
-        hplugin_stabby::load_stable::StableRemoteManagedDriver,
+        hplugin_stabby::load_stable::StableRemoteExecRunner,
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<std::sync::atomic::AtomicUsize>,
@@ -3387,14 +3388,14 @@ mod tests {
         let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let d = Arc::new(MuxDriver {
+        let r = Arc::new(MuxRunner {
             opened: Arc::clone(&opened),
             closed: Arc::clone(&closed),
             prepared: Arc::clone(&prepared),
             enumerable_env,
-        }) as Arc<dyn ManagedDriver>;
-        let host = hplugin_stabby::load_stable::StableRemoteManagedDriver::new(
-            make_dyn_managed_driver(d),
+        }) as Arc<dyn hexec_runner::ExecRunnerPlugin>;
+        let host = hplugin_stabby::load_stable::StableRemoteExecRunner::new(
+            make_dyn_exec_runner(r),
             "mux",
         );
         (host, opened, closed, prepared)
@@ -3415,10 +3416,9 @@ mod tests {
     }
 
     async fn open_mux(
-        host: &hplugin_stabby::load_stable::StableRemoteManagedDriver,
+        host: &hplugin_stabby::load_stable::StableRemoteExecRunner,
     ) -> Arc<dyn hexec_runner::ExecSession> {
-        let runner =
-            hdriver_support::exec_runner_driver::DriverExecRunner::new(Arc::new(host.clone()));
+        let runner = hexec_runner::PluginExecRunner::new(Arc::new(host.clone()));
         hexec_runner::ExecRunner::open(
             &runner,
             hexec_runner::OpenRequest {
@@ -3436,7 +3436,7 @@ mod tests {
     /// runner's client, with the real program demoted to an argument. One shell
     /// is opened once and every target is routed through it.
     #[tokio::test]
-    async fn a_session_served_by_a_driver_rewrites_the_spawn() {
+    async fn a_plugin_served_session_rewrites_the_spawn() {
         let (host, opened, _closed, prepared) = mux_host(true);
         let session = open_mux(&host).await;
 
@@ -3521,9 +3521,9 @@ mod tests {
     }
 
     /// Closing is idempotent: teardown is reachable from the orderly path and
-    /// the abort path by design, and the driver must not be told twice.
+    /// the abort path by design, and the plugin must not be told twice.
     #[tokio::test]
-    async fn closing_twice_tells_the_driver_once() {
+    async fn closing_twice_tells_the_plugin_once() {
         let (host, _o, closed, _p) = mux_host(true);
         let session = open_mux(&host).await;
         session.close().await.expect("close");
@@ -3531,75 +3531,28 @@ mod tests {
         assert_eq!(closed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// A plugin built before this lane existed answers the sync capability probe
-    /// with nothing. That must read as "cannot serve" and REFUSE — never as
-    /// "run it locally", which would build the target in the host environment
-    /// under a key asserting the runner's, and push that to the shared cache.
+    /// The capability that justified making this its own component: a runner
+    /// with **no driver at all**.
+    ///
+    /// Every test above already proves it — `MuxRunner` implements three methods
+    /// and there is no `ManagedDriver` anywhere in the picture. This one says so
+    /// on purpose, because the earlier draft could not do it: the lane rode
+    /// `ManagedDriver`, so shipping a runner meant inventing a dummy driver that
+    /// built nothing and stubbed `parse` / `apply_transitive` / `run`.
+    ///
+    /// It also changes how "this plugin serves no environments" is expressed. It
+    /// used to be a probe that could answer wrong; now it is structural — a
+    /// plugin's `PluginComponents.runners` is simply empty, so the host
+    /// registers nothing and a runner target naming it fails at resolution with
+    /// an engine-level error (covered in `crates/e2e`).
     #[tokio::test]
-    async fn a_driver_that_does_not_serve_sessions_is_refused_not_degraded() {
-        struct OldDriver;
-        #[async_trait::async_trait]
-        impl ManagedDriver for OldDriver {
-            fn config(
-                &self,
-                _req: hplugin::driver::ConfigRequest,
-            ) -> Result<hplugin::driver::ConfigResponse> {
-                Ok(hplugin::driver::ConfigResponse {
-                    name: "old".to_string(),
-                })
-            }
-            fn schema(&self) -> hplugin::driver::DriverSchema {
-                Default::default()
-            }
-            async fn parse(
-                &self,
-                _req: hplugin::driver::ParseRequest,
-                _ct: &(dyn Cancellable + Send + Sync),
-            ) -> Result<hplugin::driver::ParseResponse> {
-                anyhow::bail!("unused")
-            }
-            async fn apply_transitive(
-                &self,
-                _req: hplugin::driver::ApplyTransitiveRequest,
-                _ct: &(dyn Cancellable + Send + Sync),
-            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
-                anyhow::bail!("unused")
-            }
-            async fn run<'a, 'io>(
-                &self,
-                _req: hdriver_support::driver_managed::ManagedRunRequest<'a, 'io>,
-                _ct: &(dyn Cancellable + Send + Sync),
-            ) -> Result<hdriver_support::driver_managed::ManagedRunResponse> {
-                anyhow::bail!("unused")
-            }
-        }
-
-        let host = hplugin_stabby::load_stable::StableRemoteManagedDriver::new(
-            make_dyn_managed_driver(Arc::new(OldDriver) as Arc<dyn ManagedDriver>),
-            "old",
-        );
-        assert!(
-            !hdriver_support::driver_managed::ManagedDriver::serves_exec_sessions(&host),
-            "an unknown method id must probe as unsupported"
-        );
-
-        let runner =
-            hdriver_support::exec_runner_driver::DriverExecRunner::new(Arc::new(host.clone()));
-        let err = match hexec_runner::ExecRunner::open(
-            &runner,
-            hexec_runner::OpenRequest {
-                key: "k".to_string(),
-                runner_addr: "//:old".to_string(),
-                artifacts: vec![],
-            },
-            &hcore::hasync::StdCancellationToken::new(),
-        )
-        .await
-        {
-            Ok(_) => panic!("an older plugin must not silently serve a local environment"),
-            Err(e) => format!("{e:#}"),
-        };
-        assert!(err.contains("//:old"), "{err}");
-        assert!(err.contains("does not serve exec sessions"), "{err}");
+    async fn a_runner_is_a_component_in_its_own_right() {
+        let (host, opened, closed, _prepared) = mux_host(true);
+        // Serves a session with no driver, no schema, no config.
+        let session = open_mux(&host).await;
+        assert_eq!(session.describe().summary, "one shell, many targets");
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+        session.close().await.expect("close");
+        assert_eq!(closed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

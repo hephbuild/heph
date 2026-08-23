@@ -263,6 +263,23 @@ pub trait StableManagedDriver {
     ) -> DynFuture<'a, DynItemStream>;
 }
 
+/// The cold exec-runner surface. `method` is a `pb::ExecRunnerMethod`.
+///
+/// A **first-class component**, not a driver that happens to answer extra
+/// methods. A runner is not a driver: it does not parse, build, or have a
+/// config schema, and forcing it through `StableManagedDriver` would make every
+/// runner-only plugin stub `parse`/`apply_transitive`/`run` and would tie a
+/// runner's registered name to a driver it does not have.
+///
+/// One unary slot is the whole surface: `open_session` and `close_session` are
+/// per environment, `prepare_spec` is per spawn, and all three are small
+/// request/response pairs. Streaming has no use here — a live session's process
+/// IO never crosses this seam, because the host forks the child.
+#[stabby::stabby]
+pub trait StableExecRunner {
+    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+}
+
 /// The cold hook surface: a single client-streaming RPC. A hook is a build-event
 /// CONSUMER — the host streams the engine's `BuildEvent`s into the plugin
 /// (`HOOK_METHOD_ON_EVENTS`: the request stream carries one event per
@@ -303,11 +320,26 @@ pub type DynManagedDriver = stabby::dynptr!(
 /// only — hooks have no per-request cancellation, so no [`StableCancel`].
 pub type DynHook = stabby::dynptr!(stabby::boxed::Box<dyn StableHook + StableMeta + Send + Sync>);
 
+pub type DynExecRunner = stabby::dynptr!(
+    stabby::boxed::Box<dyn StableExecRunner + StableMeta + StableCancel + Send + Sync>
+);
+
 /// A named managed driver in a plugin's component bundle.
 #[stabby::stabby]
 pub struct NamedDriver {
     pub name: SString,
     pub driver: DynManagedDriver,
+}
+
+/// A named exec runner in a plugin's component bundle.
+///
+/// The name is the runner's own — deliberately NOT a driver's. A plugin can
+/// export a `docker` runner with no driver at all, and a runner target built by
+/// any driver can name it.
+#[stabby::stabby]
+pub struct NamedExecRunner {
+    pub name: SString,
+    pub runner: DynExecRunner,
 }
 
 /// A named hook in a plugin's component bundle.
@@ -334,6 +366,9 @@ pub struct PluginComponents {
     /// The exported provider, or `None` for a hook-only / driver-only plugin.
     pub provider: stabby::option::Option<DynProvider>,
     pub drivers: SVec<NamedDriver>,
+    /// Exec runners this plugin exports. Empty for a plugin that serves no
+    /// environments — which is every plugin that existed before this field.
+    pub runners: SVec<NamedExecRunner>,
     /// Named build-event hooks the plugin exports. Empty for provider/driver-only
     /// plugins. A hook-only plugin leaves `provider_name` empty (its `provider` is
     /// a no-op the host drops) and carries its hooks here.

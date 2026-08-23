@@ -47,6 +47,9 @@
 //! `hproc`, and this trait exposes both.
 
 pub mod agent;
+pub mod plugin;
+
+pub use plugin::{ExecRunnerPlugin, PluginExecRunner};
 
 use hcore::hasync::Cancellable;
 use hproc::proc_exec::{self, Handle, Spec};

@@ -112,6 +112,8 @@ fn build() -> PluginComponents {
         provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
         hooks: stabby::vec::Vec::new(),
+        // No exec runner: this plugin serves no environments.
+        runners: stabby::vec::Vec::new(),
         meta: stabby::vec::Vec::new(),
     }
 }

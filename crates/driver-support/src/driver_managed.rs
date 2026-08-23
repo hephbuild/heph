@@ -104,60 +104,7 @@ pub trait ManagedDriver: Send + Sync {
             "run_shell called on a ManagedDriver with supports_shell()=false; the bridge must dispatch to the shell fallback"
         )
     }
-
-    // ---- the exec-runner lane -------------------------------------------
-    //
-    // A driver that builds runner targets also *serves* the environments they
-    // describe: the host asks it to open a session, to transform each spawn's
-    // spec, and to close the session. Opting in is what makes the runner the
-    // party that starts the process — `prepare_spec` is per-target, so a runner
-    // can hold one shell open and mux every target's exec through it.
-    //
-    // Default off, like `supports_shell`. A driver that says no is never asked.
-
-    /// Whether this driver serves exec sessions for runner targets it built.
-    ///
-    /// Reported over the sync `meta` lane at load, so the host knows at
-    /// registration time — before any target runs — whether a runner naming
-    /// this driver can be opened at all.
-    fn serves_exec_sessions(&self) -> bool {
-        false
-    }
-
-    /// Acquire the session for `req.key`.
-    ///
-    /// Called at most once per distinct environment — the host's pool
-    /// single-flights it — and never on the per-target path. It may be slow: a
-    /// cold devenv evaluation is tens of seconds.
-    async fn open_session(
-        &self,
-        _req: hexec_runner::OpenRequest,
-        _ctoken: &(dyn hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<hexec_runner::OpenedSession> {
-        anyhow::bail!("open_session called on a ManagedDriver with serves_exec_sessions()=false")
-    }
-
-    /// Transform one spawn's spec so the process is created in this environment.
-    ///
-    /// Per target, so this is where a runner earns the ABI lane: it can decide
-    /// per spawn rather than only per environment. Note that stdio never
-    /// crosses — `StdioSpec::Fd` owns a descriptor — so the host re-applies the
-    /// real stdio to whatever comes back.
-    async fn prepare_spec(
-        &self,
-        _session_id: &str,
-        _spec: hproc::proc_exec::Spec,
-    ) -> anyhow::Result<hproc::proc_exec::Spec> {
-        anyhow::bail!("prepare_spec called on a ManagedDriver with serves_exec_sessions()=false")
-    }
-
-    /// Release the session. Best-effort and idempotent: the host also calls it
-    /// on paths where a failure can only be logged.
-    async fn close_session(&self, _session_id: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
-
 // ---------------------------------------------------------------------
 // Shell fallback wiring (consumed by the bridge in `heph-driver-bridge`
 // and by the OS/FUSE sandbox runners)

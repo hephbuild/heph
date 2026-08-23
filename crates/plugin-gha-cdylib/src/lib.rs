@@ -61,6 +61,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         provider: stabby::option::Option::None(),
         drivers: stabby::vec::Vec::new(),
         hooks,
+        // No exec runner: this plugin serves no environments.
+        runners: stabby::vec::Vec::new(),
         meta: stabby::vec::Vec::new(),
     })
 }

@@ -21,6 +21,19 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.6.0: `PluginComponents` gained a `runners` field, and `StableExecRunner` /
+/// `DynExecRunner` / `NamedExecRunner` join the frozen surface — the exec-runner
+/// component kind, so a plugin can serve the environment a runner target
+/// describes and thereby own process creation for every target under it.
+///
+/// A layout change to the create-entry struct, so a hard break: every plugin
+/// must be rebuilt against this ABI, exactly as 0.3.0's `hooks` was. Taken
+/// rather than bolting the methods onto `StableManagedDriver` because a runner
+/// is not a driver — that shape forced every runner-only plugin to stub
+/// `parse`/`apply_transitive`/`run`, made a runner-only plugin impossible
+/// without a dummy driver, and tied a runner's registered name to a driver it
+/// does not have.
+///
 /// 0.5.0: `StableExecutor` gained a `states` method (fetch a package's provider
 /// states for cross-subtree config resolution — the go variant `vp` lookup). A
 /// new method on a `#[stabby::stabby]` vtable trait changes its type-report, so
@@ -35,7 +48,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.5.0";
+pub const ABI_SEMVER: &str = "0.6.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

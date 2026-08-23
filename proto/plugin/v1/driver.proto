@@ -18,16 +18,6 @@ enum DriverMethod {
   DRIVER_METHOD_RUN = 3; // carries the native stdio (invoke_io)
   DRIVER_METHOD_SCHEMA = 4; // sync metadata (StableMeta::meta)
   DRIVER_METHOD_CONFIG = 5; // sync metadata (StableMeta::meta)
-  // The exec-runner lane. A driver that answers these also serves the runner
-  // for runner targets it built: the host asks it to open a session, to
-  // transform each spawn's spec, and to close the session.
-  //
-  // Additive. A plugin built before these existed simply never answers them,
-  // and the host falls back to refusing a runner it cannot open rather than
-  // running the target in the wrong environment.
-  DRIVER_METHOD_OPEN_SESSION = 6;
-  DRIVER_METHOD_PREPARE_SPEC = 7;
-  DRIVER_METHOD_CLOSE_SESSION = 8;
 }
 
 message ParseRequest {
@@ -186,7 +176,22 @@ message RunOutFrame {
   }
 }
 
-// ---- Exec-runner lane (DriverMethod OPEN_SESSION / PREPARE_SPEC / CLOSE_SESSION) ----
+// ---- Exec runners (StableExecRunner, its own component kind) ----
+//
+// A runner is not a driver: it does not parse, build, or carry a config schema,
+// and its name is its own rather than a driver's. So it gets its own vtable and
+// its own method enum, not extra ids on DriverMethod.
+
+enum ExecRunnerMethod {
+  EXEC_RUNNER_METHOD_UNSPECIFIED = 0;
+  // Per environment. The host's pool single-flights it.
+  EXEC_RUNNER_METHOD_OPEN_SESSION = 1;
+  // Per target process. This is what makes the runner the party that starts the
+  // process: it can transform every spawn, not just describe the environment
+  // once.
+  EXEC_RUNNER_METHOD_PREPARE_SPEC = 2;
+  EXEC_RUNNER_METHOD_CLOSE_SESSION = 3;
+}
 
 // One file from the runner target's artifacts. Bytes rather than a path: the
 // artifact is content the cache key already covers, and passing bytes keeps the
@@ -198,8 +203,9 @@ message RunnerArtifact {
 
 message OpenSessionRequest {
   string request_id = 1;
-  // Selects which driver on the plugin handles this.
-  string driver = 2;
+  // Selects which runner on the plugin handles this (a plugin may export
+  // several named runners over one connection). Empty => the sole runner.
+  string runner = 2;
   // Content-addressed identity of this environment — the runner target's
   // hashouts. Two runner targets with byte-identical artifacts are the same
   // environment and share a session.
@@ -266,7 +272,7 @@ enum StdioKind {
 
 message PrepareSpecRequest {
   string request_id = 1;
-  string driver = 2;
+  string runner = 2;
   string session_id = 3;
   ExecSpecPatch spec = 4;
   StdioKind stdin = 5;
@@ -280,7 +286,7 @@ message PrepareSpecResponse {
 
 message CloseSessionRequest {
   string request_id = 1;
-  string driver = 2;
+  string runner = 2;
   string session_id = 3;
 }
 
