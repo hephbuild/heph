@@ -8,8 +8,7 @@ use tokio::sync::mpsc;
 use crate::engine::config::ConfigYamlExt;
 use crate::engine::config_yaml;
 use crate::{
-    engine, pluginbuildfile, plugindevenv, pluginexec, pluginhostbin, pluginhttp, pluginnix,
-    plugintextfile,
+    engine, pluginbuildfile, pluginexec, pluginhostbin, pluginhttp, pluginnix, plugintextfile,
 };
 
 /// Builds the multi-thread runtime used by every command entry point.
@@ -137,21 +136,13 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // (`heph-oci-plugin.json`), under their own `docker_build` / `oci_pull` /
     // `oci_push` / `oci_load` names.
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
-    // Two halves of one plugin: the `devenv` driver captures the environment as
-    // an artifact, the `devenv` runner reads it back. Registered under the same
-    // name, which is how a runner target's driver selects its runner.
-    let runner_root = root.clone();
-    {
-        let devenv_root = root.clone();
-        e.register_managed_driver(move |_| Box::new(plugindevenv::Driver::new(devenv_root)))?;
-    }
-    e.register_exec_runner(
-        plugindevenv::NAME,
-        std::sync::Arc::new(plugindevenv::Runner::new(session_support(
-            &home_dir,
-            &runner_root,
-        ))),
-    )?;
+    // The `devenv` driver is not compiled in: like the go, gha and oci plugins,
+    // it ships as a separate cdylib loaded from a `path:`/`url:` manifest entry
+    // (`heph-devenv-plugin.json`), under its own `devenv` name.
+    //
+    // It serves its own runner too, over the exec-runner ABI lane: a driver that
+    // answers `serves_exec_sessions` is registered as the runner for its own
+    // name at load. Nothing about devenv is compiled into heph.
 
     // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
     // <name> }` entry selects them. The go plugin is no longer compiled in: it
@@ -279,23 +270,6 @@ fn hard_abort(engine: Option<&engine::Engine>, exit: impl FnOnce(i32)) {
     exit(130);
 }
 
-/// What a `mode = "session"` runner needs: this binary (it is both the agent
-/// and the per-target client) and a directory for its sockets.
-///
-/// `None` when the current executable cannot be located — a session runner then
-/// fails saying so, rather than silently downgrading to a snapshot and running
-/// targets in an environment nobody asked for.
-fn session_support(
-    home_dir: &std::path::Path,
-    tree_root: &std::path::Path,
-) -> Option<plugindevenv::SessionSupport> {
-    Some(plugindevenv::SessionSupport {
-        heph_bin: std::env::current_exe().ok()?,
-        socket_dir: home_dir.join("exec-agents"),
-        tree_root: tree_root.to_path_buf(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,8 +296,6 @@ mod tests {
             .as_ref()
             .map(|p| root.join(p))
             .unwrap_or_else(|| root.join(".heph3"));
-        let devenv_root = root.clone();
-        let runner_root = root.clone();
         let mut e = engine::Engine::new(engine::Config {
             root,
             home_dir: home_dir.clone(),
@@ -340,17 +312,7 @@ mod tests {
         e.register_managed_driver(|_| {
             Box::new(pluginnix::Driver::new(home_dir.join("nix-driver")))
         })?;
-        // Two halves of one plugin: the driver captures the environment as an
-        // artifact, the runner reads it back. Registered under the same name,
-        // which is how a runner target's driver selects its runner.
-        e.register_managed_driver(move |_| Box::new(plugindevenv::Driver::new(devenv_root)))?;
-        e.register_exec_runner(
-            plugindevenv::NAME,
-            std::sync::Arc::new(plugindevenv::Runner::new(session_support(
-                &home_dir,
-                &runner_root,
-            ))),
-        )?;
+        // The devenv plugin, and its runner, come from the cdylib.
 
         e.register_provider_factory("buildfile", |init, opts| {
             Ok(Box::new(

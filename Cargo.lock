@@ -2272,7 +2272,6 @@ dependencies = [
  "parking_lot",
  "plugin",
  "plugin-buildfile",
- "plugin-devenv",
  "plugin-exec",
  "plugin-http",
  "plugin-nix",
@@ -4101,6 +4100,18 @@ dependencies = [
  "tokio",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "plugin-devenv-cdylib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "driver-support",
+ "plugin-devenv",
+ "plugin-sdk",
+ "stabby",
+ "tracing",
 ]
 
 [[package]]
