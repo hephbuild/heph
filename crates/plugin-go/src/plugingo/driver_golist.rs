@@ -78,6 +78,9 @@ struct GoGolistSpec {
     deps: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths.
     out: HashMap<String, Vec<String>>,
+    /// Environment for the `go list` invocation, injected by the provider from
+    /// its `goenv` option. Hashed: it changes what `go list` reports.
+    goenv: HashMap<String, String>,
 }
 
 impl GoGolistDriver {
@@ -126,6 +129,8 @@ struct GoGolistDef {
     thirdparty_download_addr: Option<String>,
     /// See [`GoGolistSpec::firstparty`].
     firstparty: bool,
+    /// Sorted `goenv` pairs. See [`GoGolistSpec::goenv`].
+    goenv: Vec<(String, String)>,
 }
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
@@ -136,11 +141,15 @@ struct GoGolistDef {
 /// work could carry empty `EmbedFiles` for a now-resolvable embed, surfacing as
 /// `compute embedcfg: //go:embed pattern(s) matched no files` until evicted.
 /// v17: `firstparty` joined the def, changing every golist target's def hash.
-const GO_GOLIST_FORMAT_VERSION: u32 = 17;
+/// v18: `goenv` — the provider's environment for Go tool invocations.
+const GO_GOLIST_FORMAT_VERSION: u32 = 18;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         GO_GOLIST_FORMAT_VERSION.hash(state);
+        // `GOFLAGS`, `GOPRIVATE` and friends change what `go list` reports, so
+        // they must key the result exactly as the toolchain version does.
+        self.goenv.hash(state);
         self.import_path.hash(state);
         self.goos.hash(state);
         self.goarch.hash(state);
@@ -225,7 +234,11 @@ impl ManagedDriver for GoGolistDriver {
             }
         }
 
+        let mut goenv: Vec<(String, String)> = spec.goenv.into_iter().collect();
+        // Sorted so the def hash does not depend on map order.
+        goenv.sort();
         let def = GoGolistDef {
+            goenv,
             import_path: spec.import_path,
             goos: spec.goos,
             goarch: spec.goarch,
@@ -332,6 +345,8 @@ impl ManagedDriver for GoGolistDriver {
         )?;
 
         let mut env: HashMap<String, String> = HashMap::new();
+        // First, so the driver's own hermetic settings below win a collision.
+        env.extend(def.goenv.iter().cloned());
         env.insert("GOOS".to_string(), def.goos.clone());
         env.insert("GOARCH".to_string(), def.goarch.clone());
         env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
@@ -998,6 +1013,7 @@ mod tests {
             dep_inputs: vec![],
             thirdparty_download_addr: None,
             firstparty: true,
+            goenv: Vec::new(),
         }
     }
 
@@ -1047,7 +1063,7 @@ mod tests {
     /// Pinned pre-`race` value of `def_hash(def_with(false, vec![]))`. Update it
     /// only alongside a deliberate `GO_GOLIST_FORMAT_VERSION` bump — a change
     /// here means every cached listing is being thrown away.
-    const NON_RACE_GOLIST_HASH: u64 = 642058481220411298;
+    const NON_RACE_GOLIST_HASH: u64 = 15939173556682426525;
 
     fn def_hash(def: &GoGolistDef) -> u64 {
         use std::hash::{Hash, Hasher};

@@ -123,6 +123,9 @@ struct GoCompileSpec {
     deps: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths.
     out: HashMap<String, Vec<String>>,
+    /// Environment for the `go` invocation, injected by the provider from its
+    /// `goenv` option. Hashed, because it changes what the compiler is handed.
+    goenv: HashMap<String, String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -144,15 +147,22 @@ struct GoCompileDef {
     golist_origin_id: Option<String>,
     /// origin_ids of the `go_embed_src` inputs (assets `go list` never saw).
     embed_src_origin_ids: Vec<String>,
+    /// Sorted `goenv` pairs. See [`GoCompileSpec::goenv`].
+    goenv: Vec<(String, String)>,
 }
 
 /// Bump to invalidate every cached `go_compile` archive whenever the compile
 /// command shape or embed resolution semantics change.
-const GO_COMPILE_FORMAT_VERSION: u32 = 4;
+/// v5: `goenv` — the provider's environment for Go tool invocations.
+const GO_COMPILE_FORMAT_VERSION: u32 = 5;
 
 impl Hash for GoCompileDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         GO_COMPILE_FORMAT_VERSION.hash(state);
+        // Changes what the compiler is handed, so it must key the cache — a
+        // `GOFLAGS` or `GOEXPERIMENT` arriving through `goenv` alters the
+        // archive exactly as a `gcflags` entry would.
+        self.goenv.hash(state);
         self.p_flag.hash(state);
         self.out_file.hash(state);
         self.goos.hash(state);
@@ -286,7 +296,11 @@ impl ManagedDriver for GoCompileDriver {
             })?
         };
 
+        let mut goenv: Vec<(String, String)> = spec.goenv.into_iter().collect();
+        // Sorted so the def hash does not depend on map order.
+        goenv.sort();
         let def = GoCompileDef {
+            goenv,
             p_flag: spec.p_flag,
             out_file: spec.out_file,
             goos: spec.goos,
@@ -388,6 +402,12 @@ impl ManagedDriver for GoCompileDriver {
             .with_context(|| format!("create gocache dir {gocache:?}"))?;
 
         let mut env: HashMap<String, String> = HashMap::new();
+        // The provider's `goenv` goes in FIRST, so the driver's own settings
+        // below win on a collision. `GOROOT`, `GOOS`/`GOARCH` and `GOWORK=off`
+        // are what make the build hermetic and match the target's variant —
+        // letting a config knob override them would silently build something
+        // other than the address asked for, under that address's cache key.
+        env.extend(def.goenv.iter().cloned());
         env.insert("GOOS".to_string(), def.goos.clone());
         env.insert("GOARCH".to_string(), def.goarch.clone());
         env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
@@ -1323,8 +1343,12 @@ mod driver_tests {
         assert_eq!(def_hash(&compile_def(false)), NON_RACE_COMPILE_HASH);
     }
 
-    /// Pinned at `GO_COMPILE_FORMAT_VERSION` 4 (the `buildmode` field's version).
-    const NON_RACE_COMPILE_HASH: u64 = 11506013216469835997;
+    /// Pinned at `GO_COMPILE_FORMAT_VERSION` 5 (`goenv`).
+    ///
+    /// Moving this constant means every cached `go_compile` archive is
+    /// invalidated, so it changes only alongside a deliberate format bump —
+    /// which is what this test is for.
+    const NON_RACE_COMPILE_HASH: u64 = 7225497344155101483;
 
     fn compile_def(race: bool) -> GoCompileDef {
         GoCompileDef {
@@ -1342,6 +1366,7 @@ mod driver_tests {
             embed_variant: None,
             golist_origin_id: None,
             embed_src_origin_ids: vec![],
+            goenv: Vec::new(),
         }
     }
 
@@ -1362,6 +1387,7 @@ mod driver_tests {
             embed_variant: None,
             golist_origin_id: None,
             embed_src_origin_ids: vec![],
+            goenv: Vec::new(),
         };
         let a = mk(&["net", "os", "errors", "io", "crypto/rand"]);
         let b = mk(&["crypto/rand", "io", "net", "errors", "os"]);

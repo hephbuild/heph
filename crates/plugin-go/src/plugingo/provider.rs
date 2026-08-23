@@ -43,6 +43,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct Config {
+    /// Environment added to every Go *tool* invocation — `go list`, the
+    /// compiler and assembler, `heph-govet`. From the optional `goenv` provider
+    /// option.
+    ///
+    /// Applied by injecting it into each Go target's spec, where it is hashed,
+    /// rather than by the drivers reading it from config at run time: an
+    /// invisible knob that changes compiler input without moving the cache key
+    /// would serve every machine artifacts built under settings the key does
+    /// not record.
+    ///
+    /// Deliberately not applied to the `test`/`xtest` targets, which run the
+    /// built binary rather than a Go tool — their environment is
+    /// `provider_state(test={...})`, and conflating "how it was built" with
+    /// "how it runs" is what that separation exists to avoid.
+    pub goenv: HashMap<String, String>,
     /// Toolchain spec every build/test/list target resolves against. Either a
     /// pinned version (hermetic SDK at `//@heph/go/toolchain/<go_version>:go`)
     /// or [`toolchain::HOST`] (use the host `go`). Set via the required `gotool`
@@ -100,6 +115,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            goenv: HashMap::new(),
             go_version: toolchain::DEFAULT_GO_VERSION.to_string(),
             sdk_checksums: HashMap::new(),
             govet: govet::default_addr(),
@@ -119,6 +135,8 @@ pub struct Provider {
 }
 
 pub(crate) struct ProviderInner {
+    /// See [`Config::goenv`].
+    goenv: HashMap<String, String>,
     workspace_root: PathBuf,
     /// Go release the hermetic toolchain is pinned to (see [`Config::go_version`]).
     go_version: String,
@@ -260,7 +278,7 @@ impl Provider {
         hplugin::config::deny_unknown(
             "go provider",
             opts,
-            &["gotool", "govet", "cctool", "skip", "checksums"],
+            &["gotool", "govet", "cctool", "skip", "checksums", "goenv"],
         )?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
             .ok_or_else(|| {
@@ -295,6 +313,17 @@ impl Provider {
         let mut globs = skip_globs.to_vec();
         let user_skip: Vec<String> =
             hplugin::config::decode_opt(opts, "go provider", "skip")?.unwrap_or_default();
+        // Optional: extra environment for every Go *tool* invocation — `go
+        // list`, the compiler, the assembler, `heph-govet`. `GOPRIVATE`,
+        // `GOFLAGS`, a corporate `GOPROXY` and its `GONOSUMDB` all belong here.
+        //
+        // It goes into each target's hashed `goenv` config rather than being
+        // applied behind the drivers' backs, so changing it invalidates
+        // everything it could have changed. A knob that altered compiler input
+        // without moving the cache key would hand every machine artifacts built
+        // under settings the key does not record.
+        let goenv: HashMap<String, String> =
+            hplugin::config::decode_opt(opts, "go provider", "goenv")?.unwrap_or_default();
         globs.extend(user_skip);
         let skip = Arc::new(Ignore::new(skip_dirs, &globs)?);
         Self::with_config(
@@ -306,6 +335,7 @@ impl Provider {
                 cctool,
                 skip,
                 walker,
+                goenv,
                 ..Default::default()
             },
             runtime,
@@ -319,6 +349,7 @@ impl Provider {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: Arc::new(ProviderInner {
+                goenv: config.goenv,
                 workspace_root,
                 go_version: config.go_version,
                 sdk_checksums: config.sdk_checksums,
@@ -451,7 +482,11 @@ impl ProviderTrait for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         let inner = Arc::clone(&self.inner);
-        Box::pin(async move { inner.handle_get(req).await })
+        Box::pin(async move {
+            let mut resp = Arc::clone(&inner).handle_get(req).await?;
+            inner.apply_goenv(&mut resp.target_spec);
+            Ok(resp)
+        })
     }
 
     fn probe<'a>(
@@ -1210,6 +1245,7 @@ fn parse_str_map(v: &Value) -> anyhow::Result<BTreeMap<String, String>> {
 /// typos / unsupported knobs (the `test` map only configures env, never
 /// enable/disable — that's the bool `test = False`).
 const TEST_STATE_KEYS: &[&str] = &[
+    "runner",
     "env",
     "runtime_env",
     "pass_env",
@@ -1241,6 +1277,69 @@ fn applicable_states<'a>(states: &'a [State], addr_pkg: &str, key: &str) -> Vec<
         .collect();
     out.sort_by_key(|s| s.package.as_str().len());
     out
+}
+
+/// Parse `test = {"runner": …}` the same way a BUILD file's `runner =` is
+/// parsed: a target address, or the reserved `"local"` to opt out of the
+/// workspace default.
+///
+/// A bare name is rejected rather than guessed at, for the reason that rule
+/// exists at all — only a target has a hashout, and a hashout is what carries
+/// the environment into the cache key. Relative addresses resolve against the
+/// package that declared the state, so a state written in `//svc` can say
+/// `:devenv`.
+fn parse_test_runner(
+    v: &Value,
+    state_pkg: &hmodel::htpkg::PkgBuf,
+) -> anyhow::Result<hplugin::provider::RunnerRef> {
+    let Value::String(s) = v else {
+        anyhow::bail!("test.runner must be a string, got {v:?}");
+    };
+    if s == hplugin::provider::RUNNER_LOCAL {
+        return Ok(hplugin::provider::RunnerRef::Local);
+    }
+    if !s.contains("//") && !s.contains(':') {
+        anyhow::bail!(
+            "test.runner must be a target address (e.g. `//:devenv`) or \"local\"; got the bare \
+             name {s:?}"
+        );
+    }
+    Ok(hplugin::provider::RunnerRef::Target(
+        hmodel::htaddr::parse_addr_with_base(s, state_pkg)?,
+    ))
+}
+
+/// Drivers that invoke the **Go toolchain**, and therefore take `goenv`.
+///
+/// An allowlist, for two reasons. `go_toolchain` downloads an SDK and
+/// `go_testmain` writes a file, so handing them an environment they never use
+/// would put it in their cache key for nothing — and re-key every target that
+/// depends on them whenever the knob changed. And the lint/format drivers exec
+/// `heph-govet`, not `go`: `goenv` is the environment for the *Go toolchain*,
+/// and stretching it to cover a different binary would make the name a lie.
+const GO_TOOL_DRIVERS: &[&str] = &["go_compile", "go_golist"];
+
+impl ProviderInner {
+    /// Put the provider's `goenv` on a spec bound for a Go-tool driver.
+    ///
+    /// One choke point rather than a line in each of the two dozen places a
+    /// spec is built: a knob that reached most of them would be worse than one
+    /// that reached none, because the gap would show up as a cache hit on an
+    /// archive built under different settings.
+    fn apply_goenv(&self, spec: &mut hplugin::provider::TargetSpec) {
+        if self.goenv.is_empty() || !GO_TOOL_DRIVERS.contains(&spec.driver.as_str()) {
+            return;
+        }
+        // Sorted, so the def hash does not depend on `HashMap` order.
+        let mut pairs: Vec<(String, Value)> = self
+            .goenv
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        spec.config
+            .insert("goenv".to_string(), Value::Map(pairs.into_iter().collect()));
+    }
 }
 
 fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test::TestEnv> {
@@ -1277,6 +1376,12 @@ fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test
         if let Some(v) = test_map.get("runtime_pass_env") {
             out.runtime_pass_env.extend(
                 parse_strings(v).context("parsing test runtime_pass_env from go provider_state")?,
+            );
+        }
+        if let Some(v) = test_map.get("runner") {
+            out.runner = Some(
+                parse_test_runner(v, &state.package)
+                    .context("parsing test runner from go provider_state")?,
             );
         }
         if let Some(v) = test_map.get("pre_run") {

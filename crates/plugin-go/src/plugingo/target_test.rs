@@ -15,6 +15,23 @@ use std::collections::{BTreeMap, HashMap};
 /// `runtime_env`/`runtime_pass_env` are runtime-only (not hashed).
 #[derive(Debug, Default, Clone)]
 pub struct TestEnv {
+    /// Exec environment the *test binary* runs in, from
+    /// `provider_state(provider="go", test={"runner": "//:devenv"})`.
+    ///
+    /// Only the `test`/`xtest` targets — the ones that execute — take it.
+    /// Compiles deliberately do not: a test binary often needs a database
+    /// client, a browser or a service on PATH, while the build wants the
+    /// hermetic toolchain and nothing else. Applying one environment to both
+    /// would either leak the runtime's tools into every compile's cache key or
+    /// force the build environment onto the test.
+    ///
+    /// `None` leaves the target on whatever the workspace default is;
+    /// `RunnerRef::Local` opts out of that default.
+    ///
+    /// Already parsed and validated by the provider, where the rest of the
+    /// `test = {...}` map is checked, so a bad value fails there with the other
+    /// state errors rather than here.
+    pub runner: Option<hplugin::provider::RunnerRef>,
     pub env: BTreeMap<String, String>,
     pub runtime_env: BTreeMap<String, String>,
     pub pass_env: Vec<String>,
@@ -336,6 +353,7 @@ pub fn test_spec(
         driver: driver.to_string(),
         config,
         labels,
+        runner: test_env.runner.clone(),
         ..Default::default()
     }
 }
@@ -827,6 +845,7 @@ mod tests {
             pass_env: vec!["HOME".to_string()],
             runtime_pass_env: vec!["PATH".to_string()],
             pre_run: Vec::new(),
+            runner: None,
         };
         let spec = test_spec(
             mk_addr("mypkg", "test"),
