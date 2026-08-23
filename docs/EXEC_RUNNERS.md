@@ -205,6 +205,43 @@ So its identity is `Asserted`, not `Pinned`. Reach for it only for a runner a
 handful of targets name — and note that the snapshot's `PATH` is store-only, so
 `bin` usually has to be an absolute path for `devenv` itself to be found.
 
+## OCI — targets in containers
+
+```python
+oci_runner(name = "ctr", image = "ubuntu@sha256:...")     # a literal reference
+oci_runner(name = "ctr", image = "//app:load")            # or an oci_load target
+target(name = "build", driver = "bash", run = "...", runner = ":ctr")
+```
+
+One container per environment, started at `open` and `docker exec`'d per target
+— the shape `WrapEnv::Args` was written for. `docker exec` creates the process
+on the far side of the daemon socket, so the environment heph sets belongs to
+the `docker` CLI on this side and the container sees none of it; each variable
+is rendered into argv as `-e K=V` instead. The spawn becomes:
+
+```
+docker exec -w <target cwd> -e K=V … <container> <program> <args…>
+```
+
+`-w` matters: without it every target runs in the image's `WORKDIR`, usually
+`/`. The sandbox root is bind-mounted **at the same path inside the container**,
+because targets address `$OUT` and `$SRC` absolutely and a different path inside
+would dangle every one of them.
+
+An image referenced by **digest** is content the cache key already covers, so
+the session reports `Pinned`. A tag reports `Asserted` and says why — heph does
+not refuse a tag, it reports the tradeoff. The artifact is local-cache only: the
+reference may name an image that exists solely in this machine's daemon.
+
+The container is removed at teardown (`docker rm -f`), with `--rm` as the
+backstop for an abort that never reaches it, and `--init` so a target's own
+children are reaped inside.
+
+**Today this serves targets built by heph's built-in drivers (`exec`, `bash`).**
+A target built by a *plugin* driver — `go_*`, `oci_*` — under this runner is
+refused, because only the environment crosses the plugin seam and a container is
+not an environment. See the note above.
+
 ## Go
 
 | knob | applies to |

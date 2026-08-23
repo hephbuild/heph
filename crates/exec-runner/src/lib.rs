@@ -847,13 +847,44 @@ pub enum WrapEnv {
 /// Still a pure spec transformation, which is the whole reason `prepare` is the
 /// seam: nothing here owns a process, so `proc_exec` keeps its synchronous
 /// spawn, its `Handle` invariants and its stdio handling untouched.
-#[derive(Debug)]
 pub struct WrapSession {
     prefix_argv: Vec<OsString>,
     env_mode: WrapEnv,
+    /// Rendered into the wrapper's argv with `{CWD}` replaced, when the wrapper
+    /// does not take the spec's own working directory.
+    ///
+    /// `docker exec` is the case that forced this: the wrapper runs on the host
+    /// and `spec.cwd` is where *it* starts, which says nothing about where the
+    /// process inside the container starts. Without `-w` every target would run
+    /// in the image's `WORKDIR` — usually `/` — and a build that reads a
+    /// relative path would fail somewhere far from the cause. A wrapper that
+    /// execs the inner program (`chroot`, `nix develop`) leaves this empty and
+    /// inherits `spec.cwd` as before.
+    cwd_args: Vec<String>,
+    /// Operands between the options and the program — see
+    /// [`with_trailing_args`](Self::with_trailing_args).
+    trailing_args: Vec<OsString>,
     base_env: Vec<(OsString, OsString)>,
     caps: SessionCaps,
     description: SessionDescription,
+    /// See [`TeardownJob`]. A container outlives the build unless something
+    /// removes it, and the hard-abort path cannot await — which is exactly the
+    /// shape this type was written for, and was missing until a runner needed it.
+    teardown: std::sync::Mutex<Option<TeardownJob>>,
+}
+
+impl std::fmt::Debug for WrapSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-rolled because `TeardownJob` is a boxed closure: same reason
+        // `AgentSession` writes its own.
+        f.debug_struct("WrapSession")
+            .field("prefix_argv", &self.prefix_argv)
+            .field("env_mode", &self.env_mode)
+            .field("cwd_args", &self.cwd_args)
+            .field("trailing_args", &self.trailing_args)
+            .field("runner", &self.description.runner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WrapSession {
@@ -870,10 +901,44 @@ impl WrapSession {
         Ok(Self {
             prefix_argv,
             env_mode,
+            cwd_args: Vec::new(),
+            trailing_args: Vec::new(),
             base_env,
             caps,
             description,
+            teardown: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Argv that tells the wrapper where to start the inner process, with
+    /// `{CWD}` replaced per spawn — `["-w", "{CWD}"]` for `docker exec`.
+    ///
+    /// Builders rather than more constructor arguments: only a container-shaped
+    /// wrapper needs either of these, and a seven-argument `new` would make
+    /// every caller name the two it does not use.
+    #[must_use]
+    pub fn with_cwd_args(mut self, cwd_args: Vec<String>) -> Self {
+        self.cwd_args = cwd_args;
+        self
+    }
+
+    /// Argv rendered **after** the options and immediately before the program.
+    ///
+    /// `docker exec` is `[OPTIONS] CONTAINER COMMAND [ARG…]`, so the container
+    /// id is an operand, not an option: it cannot go in `prefix_argv` (which
+    /// precedes the options) and it must not be mistaken for the command. The
+    /// three builders here map onto exactly that grammar — `cwd_args` and the
+    /// [`WrapEnv::Args`] template are options, this is the operand.
+    #[must_use]
+    pub fn with_trailing_args(mut self, trailing_args: Vec<OsString>) -> Self {
+        self.trailing_args = trailing_args;
+        self
+    }
+
+    #[must_use]
+    pub fn with_teardown(self, teardown: TeardownJob) -> Self {
+        *self.teardown.lock().unwrap_or_else(|p| p.into_inner()) = Some(teardown);
+        self
     }
 
     fn merged_env(&self, spec_env: &[(OsString, OsString)]) -> Vec<(OsString, OsString)> {
@@ -895,6 +960,13 @@ impl ExecSession for WrapSession {
         false
     }
 
+    fn teardown(&self) -> Option<TeardownJob> {
+        self.teardown
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
     async fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
         let merged = self.merged_env(&spec.env);
 
@@ -908,6 +980,11 @@ impl ExecSession for WrapSession {
             .split_first()
             .ok_or_else(|| SpawnError::Io(std::io::Error::other("empty wrapper command")))?;
         let mut args: Vec<OsString> = rest.to_vec();
+        for part in &self.cwd_args {
+            args.push(OsString::from(
+                part.replace("{CWD}", &spec.cwd.to_string_lossy()),
+            ));
+        }
         if let WrapEnv::Args(template) = &self.env_mode {
             for (k, v) in &merged {
                 for part in template {
@@ -918,6 +995,7 @@ impl ExecSession for WrapSession {
                 }
             }
         }
+        args.extend(self.trailing_args.iter().cloned());
         args.push(spec.program.clone().into_os_string());
         args.append(&mut spec.args);
 
@@ -1058,6 +1136,39 @@ mod wrap_session_tests {
         )
         .expect("wrap");
         assert!(s.base_env().is_none());
+    }
+
+    /// A container outlives the build unless something removes it, and the
+    /// hard-abort path exits without running destructors — so the teardown must
+    /// be reachable synchronously, and exactly once.
+    #[test]
+    fn a_wrap_session_hands_its_teardown_over_once() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = WrapSession::new(
+            vec![OsString::from("docker")],
+            WrapEnv::Inherit,
+            vec![],
+            caps(),
+            desc(),
+        )
+        .expect("wrap")
+        .with_teardown(Box::new({
+            let ran = std::sync::Arc::clone(&ran);
+            move || {
+                ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }));
+
+        let job = s.teardown().expect("a teardown was handed over");
+        job().expect("run");
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Taken, not cloned: the orderly path and the abort path can both reach
+        // `teardown()`, and a container must not be removed twice.
+        assert!(
+            s.teardown().is_none(),
+            "a second caller must not get the same job"
+        );
     }
 
     #[test]
