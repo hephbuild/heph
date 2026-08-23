@@ -14,14 +14,20 @@
 /// Re-export of the author-facing contract so a plugin depends only on the SDK.
 pub use hplugin::{driver, eresult, hook, provider};
 
-/// The exec-runner author surface: implement [`runner::ExecRunnerPlugin`] to
-/// serve the environment a runner target describes. A runner is its own
-/// component kind — it needs no driver, no schema and no config.
+/// The exec-runner author surface: implement [`runner::ExecRunner`] to serve the
+/// environment a runner target describes, returning an [`runner::ExecSession`].
+/// A runner is its own component kind — it needs no driver, no schema and no
+/// config.
+///
+/// This is the *same* trait a runner compiled into the host implements. There is
+/// no plugin-specific variant, because the session crosses the seam as a live
+/// object: what it holds open — a shell, a socket, a pid, a mux over them — is
+/// the runner's business and the host never names it.
 #[cfg(feature = "stabby")]
 pub mod runner {
     pub use hexec_runner::{
-        ExecRunnerPlugin, Identity, OpenRequest, OpenedSession, RunnerArtifact, SessionCaps,
-        SessionDescription,
+        ExecRunner, ExecSession, Identity, OpenRequest, RunnerArtifact, SessionCaps,
+        SessionDescription, SpawnError, TeardownJob,
     };
 }
 

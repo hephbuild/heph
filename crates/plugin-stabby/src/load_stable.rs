@@ -5,10 +5,11 @@
 //! executor across natively (`HostExecutor`) so callbacks are direct.
 
 use crate::abi::{
-    CREATE_SYMBOL, CreateFn, DynExecRunner, DynExecutor, DynHook, DynItemStream, DynManagedDriver,
-    DynProvider, SET_LOG_SINK_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogSinkFn, SetSupervisorFn,
-    StableCancelDyn, StableExecRunnerDyn, StableHookDyn, StableItemStream, StableItemStreamDyn,
-    StableManagedDriverDyn, StableMetaDyn, StableProviderDyn,
+    CREATE_SYMBOL, CreateFn, DynExecRunner, DynExecSession, DynExecutor, DynHook, DynItemStream,
+    DynManagedDriver, DynProvider, SET_LOG_SINK_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogSinkFn,
+    SetSupervisorFn, StableCancelDyn, StableExecRunnerDyn, StableExecSessionDyn, StableHookDyn,
+    StableItemStream, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
+    StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use crate::vtable::dynify;
@@ -189,16 +190,15 @@ impl StableRemoteExecRunner {
 }
 
 #[async_trait]
-impl hexec_runner::ExecRunnerPlugin for StableRemoteExecRunner {
-    async fn open_session(
+impl hexec_runner::ExecRunner for StableRemoteExecRunner {
+    async fn open(
         &self,
         req: hexec_runner::OpenRequest,
         ct: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<hexec_runner::OpenedSession> {
+    ) -> anyhow::Result<Arc<dyn hexec_runner::ExecSession>> {
         let request_id = format!("open-session:{}", req.key);
         let pb_req = pb::OpenSessionRequest {
             request_id: request_id.clone(),
-            runner: self.name.clone(),
             key: req.key.clone(),
             runner_addr: req.runner_addr.clone(),
             artifacts: req
@@ -211,29 +211,54 @@ impl hexec_runner::ExecRunnerPlugin for StableRemoteExecRunner {
                 .collect(),
         }
         .encode_to_vec();
-        let fut = self
-            .inner
-            .invoke(pb::ExecRunnerMethod::OpenSession as u32, sv(&pb_req));
-        let bytes = await_with_cancel(ct, runner_cancel(&self.inner, &request_id), fut).await;
-        match decode_unary(&bytes)? {
-            Body::OpenSessionResp(r) => Ok(convert::opened_session_from_pb(
-                r,
-                &req.runner_addr,
-                &req.key,
-            )),
-            other => anyhow::bail!("open_session: unexpected reply {other:?}"),
+        let fut = self.inner.open(sv(&pb_req));
+        let outcome = await_with_cancel(ct, runner_cancel(&self.inner, &request_id), fut).await;
+        if !outcome.ok {
+            anyhow::bail!("{}", outcome.message);
         }
+        let session: std::option::Option<DynExecSession> = outcome.session.into();
+        let session = session.ok_or_else(|| {
+            anyhow::anyhow!("open: runner reported success but returned no session")
+        })?;
+        let info = match decode_unary(&outcome.info)? {
+            Body::OpenedSessionInfo(i) => i,
+            other => anyhow::bail!("open: unexpected reply {other:?}"),
+        };
+        let (caps, description, base_env) =
+            convert::session_info_from_pb(info, &req.runner_addr, &req.key);
+        Ok(Arc::new(StableRemoteExecSession {
+            inner: session,
+            caps,
+            description,
+            base_env,
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
+}
 
-    async fn prepare_spec(
+/// A live session living inside the plugin.
+///
+/// Everything this struct holds beyond `inner` is what the *host* needs — the
+/// session's own state (a shell, a socket, a pid, a mux over them) never
+/// crosses and the host has no name for it.
+struct StableRemoteExecSession {
+    inner: DynExecSession,
+    caps: hexec_runner::SessionCaps,
+    description: hexec_runner::SessionDescription,
+    base_env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    /// So `close` cannot tell the plugin twice: the orderly path and the pool's
+    /// drop path can both reach it.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl hexec_runner::ExecSession for StableRemoteExecSession {
+    async fn prepare(
         &self,
-        session_id: &str,
         spec: hproc::proc_exec::Spec,
-    ) -> anyhow::Result<hproc::proc_exec::Spec> {
-        let pb_req = pb::PrepareSpecRequest {
+    ) -> Result<hproc::proc_exec::Spec, hexec_runner::SpawnError> {
+        let pb_req = pb::PrepareRequest {
             request_id: String::new(),
-            runner: self.name.clone(),
-            session_id: session_id.to_string(),
             spec: Some(convert::exec_spec_to_pb(&spec)),
             stdin: convert::stdio_kind_to_pb(&spec.stdin),
             stdout: convert::stdio_kind_to_pb(&spec.stdout),
@@ -242,10 +267,14 @@ impl hexec_runner::ExecRunnerPlugin for StableRemoteExecRunner {
         .encode_to_vec();
         let bytes = self
             .inner
-            .invoke(pb::ExecRunnerMethod::PrepareSpec as u32, sv(&pb_req))
+            .invoke(pb::ExecSessionMethod::Prepare as u32, sv(&pb_req))
             .await;
-        match decode_unary(&bytes)? {
-            Body::PrepareSpecResp(r) => {
+        let died = |reason: String| hexec_runner::SpawnError::SessionDied {
+            key: self.description.key.clone(),
+            reason,
+        };
+        match decode_unary(&bytes).map_err(|e| died(format!("{e:#}")))? {
+            Body::PrepareResp(r) => {
                 // `spec` still owns the real stdio — possibly a PTY slave
                 // `OwnedFd`. Only the fields a runner may change come back
                 // across; nothing from the wire replaces a descriptor.
@@ -253,25 +282,50 @@ impl hexec_runner::ExecRunnerPlugin for StableRemoteExecRunner {
                 convert::exec_spec_apply(&mut spec, r.spec.unwrap_or_default());
                 Ok(spec)
             }
-            other => anyhow::bail!("prepare_spec: unexpected reply {other:?}"),
+            other => Err(died(format!("unexpected reply {other:?}"))),
         }
     }
 
-    async fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
-        let pb_req = pb::CloseSessionRequest {
+    fn base_env(&self) -> Option<&[(std::ffi::OsString, std::ffi::OsString)]> {
+        self.base_env.as_deref()
+    }
+
+    fn caps(&self) -> &hexec_runner::SessionCaps {
+        &self.caps
+    }
+
+    fn describe(&self) -> &hexec_runner::SessionDescription {
+        &self.description
+    }
+
+    async fn close(&self) -> anyhow::Result<()> {
+        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let pb_req = pb::CloseRequest {
             request_id: String::new(),
-            runner: self.name.clone(),
-            session_id: session_id.to_string(),
         }
         .encode_to_vec();
         let bytes = self
             .inner
-            .invoke(pb::ExecRunnerMethod::CloseSession as u32, sv(&pb_req))
+            .invoke(pb::ExecSessionMethod::Close as u32, sv(&pb_req))
             .await;
         match decode_unary(&bytes)? {
-            Body::CloseSessionResp(_) => Ok(()),
-            other => anyhow::bail!("close_session: unexpected reply {other:?}"),
+            Body::CloseResp(_) => Ok(()),
+            other => anyhow::bail!("close: unexpected reply {other:?}"),
         }
+    }
+
+    fn teardown(&self) -> Option<hexec_runner::TeardownJob> {
+        // Nothing synchronous to hand back: closing this session means calling
+        // into the plugin, which is async. The orderly path calls `close`.
+        //
+        // On hard abort nothing async runs, and that is covered elsewhere: a
+        // process the plugin spawned was registered with the HOST's supervisor
+        // (`heph_plugin_set_supervisor`), which kills the group on exit. So the
+        // shell or container does not outlive heph even when `close` never runs
+        // — it is reaped rather than asked to leave.
+        None
     }
 }
 

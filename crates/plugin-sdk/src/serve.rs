@@ -1017,9 +1017,14 @@ async fn driver_apply_transitive(
 
 // ---- the exec-runner component ---------------------------------------------
 
-/// Wrap an author `ExecRunnerPlugin` as a [`StableExecRunner`].
+/// Wrap an author [`ExecRunner`](hexec_runner::ExecRunner) as a
+/// [`StableExecRunner`].
+///
+/// There is no plugin-side variant of the trait: a runner in a cdylib
+/// implements exactly the same `ExecRunner` a host-side one does, because the
+/// session it returns crosses the seam as an object rather than as an id.
 pub fn make_dyn_exec_runner(
-    runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
+    runner: Arc<dyn hexec_runner::ExecRunner>,
 ) -> hplugin_stabby::abi::DynExecRunner {
     dynify(stabby::boxed::Box::new(StableExecRunnerImpl {
         runner,
@@ -1029,7 +1034,7 @@ pub fn make_dyn_exec_runner(
 }
 
 pub struct StableExecRunnerImpl {
-    pub runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
+    pub runner: Arc<dyn hexec_runner::ExecRunner>,
     /// For the seam's panic/abort labelling, like a driver's own name.
     name: Arc<str>,
     cancels: Arc<CancelRegistry>,
@@ -1049,52 +1054,37 @@ impl StableCancel for StableExecRunnerImpl {
     }
 }
 
-impl hplugin_stabby::abi::StableExecRunner for StableExecRunnerImpl {
-    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
-        let runner = Arc::clone(&self.runner);
-        match pb::ExecRunnerMethod::try_from(method as i32) {
-            Ok(pb::ExecRunnerMethod::OpenSession) => {
-                let req = pb::OpenSessionRequest::decode(&req[..]).unwrap_or_default();
-                dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
-                    "open_session",
-                    req.runner_addr.clone(),
-                    runner_open_session(runner, req, Arc::clone(&self.cancels)),
-                    |m| unary(err_body(m)),
-                )))
-            }
-            Ok(pb::ExecRunnerMethod::PrepareSpec) => {
-                let req = pb::PrepareSpecRequest::decode(&req[..]).unwrap_or_default();
-                dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
-                    "prepare_spec",
-                    req.session_id.clone(),
-                    runner_prepare_spec(runner, req),
-                    |m| unary(err_body(m)),
-                )))
-            }
-            Ok(pb::ExecRunnerMethod::CloseSession) => {
-                let req = pb::CloseSessionRequest::decode(&req[..]).unwrap_or_default();
-                dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
-                    "close_session",
-                    req.session_id.clone(),
-                    runner_close_session(runner, req),
-                    |m| unary(err_body(m)),
-                )))
-            }
-            _ => dynify(stabby::boxed::Box::new(
-                async move { unimplemented(method) },
-            )),
-        }
+fn open_failed(message: String) -> hplugin_stabby::abi::OpenOutcome {
+    hplugin_stabby::abi::OpenOutcome {
+        ok: false,
+        message: message.into(),
+        session: stabby::option::Option::None(),
+        info: SVec::new(),
     }
 }
 
-async fn runner_open_session(
-    runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
+impl hplugin_stabby::abi::StableExecRunner for StableExecRunnerImpl {
+    extern "C" fn open<'a>(
+        &'a self,
+        req: SVec<u8>,
+    ) -> DynFuture<'a, hplugin_stabby::abi::OpenOutcome> {
+        let runner = Arc::clone(&self.runner);
+        let req = pb::OpenSessionRequest::decode(&req[..]).unwrap_or_default();
+        dynify(stabby::boxed::Box::new(spawn_seam(
+            &self.name,
+            "open",
+            req.runner_addr.clone(),
+            runner_open(runner, req, Arc::clone(&self.cancels)),
+            open_failed,
+        )))
+    }
+}
+
+async fn runner_open(
+    runner: Arc<dyn hexec_runner::ExecRunner>,
     req: pb::OpenSessionRequest,
     cancels: Arc<CancelRegistry>,
-) -> SVec<u8> {
+) -> hplugin_stabby::abi::OpenOutcome {
     let guard = cancels.enter(&req.request_id);
     let oreq = hexec_runner::OpenRequest {
         key: req.key,
@@ -1108,37 +1098,94 @@ async fn runner_open_session(
             })
             .collect(),
     };
-    on_plugin_runtime(guard, move |guard| async move {
-        match runner.open_session(oreq, guard.token()).await {
-            Ok(s) => Body::OpenSessionResp(plugin_abi::convert::opened_session_to_pb(&s)),
-            Err(e) => err_body(err_message(&e)),
-        }
-    })
-    .await
+    // Same reactor hop as every other author callback: an author `open` shells
+    // out (a cold devenv evaluation), and a plugin cdylib's runtime is polled by
+    // host workers, so touching a timer or IO on the caller's thread aborts.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cdylib_runtime().spawn(async move {
+        let outcome = match runner.open(oreq, guard.token()).await {
+            Ok(session) => {
+                let info = plugin_abi::convert::session_info_to_pb(&*session);
+                hplugin_stabby::abi::OpenOutcome {
+                    ok: true,
+                    message: Default::default(),
+                    session: stabby::option::Option::Some(make_dyn_exec_session(session)),
+                    info: unary(Body::OpenedSessionInfo(info)),
+                }
+            }
+            Err(e) => open_failed(err_message(&e)),
+        };
+        drop(tx.send(outcome));
+    });
+    match rx.await {
+        Ok(outcome) => outcome,
+        Err(_) => open_failed("plugin task dropped before completing".into()),
+    }
 }
 
-async fn runner_prepare_spec(
-    runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
-    req: pb::PrepareSpecRequest,
+/// Wrap a live [`ExecSession`](hexec_runner::ExecSession) for the seam.
+///
+/// What the session owns — a held-open shell, a socket, a pid, a table routing
+/// many targets through one of them — stays on this side. The host gets the
+/// object and two methods.
+fn make_dyn_exec_session(
+    session: Arc<dyn hexec_runner::ExecSession>,
+) -> hplugin_stabby::abi::DynExecSession {
+    dynify(stabby::boxed::Box::new(StableExecSessionImpl { session }))
+}
+
+pub struct StableExecSessionImpl {
+    session: Arc<dyn hexec_runner::ExecSession>,
+}
+
+impl hplugin_stabby::abi::StableExecSession for StableExecSessionImpl {
+    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+        let session = Arc::clone(&self.session);
+        match pb::ExecSessionMethod::try_from(method as i32) {
+            Ok(pb::ExecSessionMethod::Prepare) => {
+                let req = pb::PrepareRequest::decode(&req[..]).unwrap_or_default();
+                dynify(stabby::boxed::Box::new(session_prepare(session, req)))
+            }
+            Ok(pb::ExecSessionMethod::Close) => {
+                dynify(stabby::boxed::Box::new(session_close(session)))
+            }
+            _ => dynify(stabby::boxed::Box::new(
+                async move { unimplemented(method) },
+            )),
+        }
+    }
+}
+
+async fn session_prepare(
+    session: Arc<dyn hexec_runner::ExecSession>,
+    req: pb::PrepareRequest,
 ) -> SVec<u8> {
     // No cancel guard: `prepare` is a pure, fast transformation on the spawn
     // path, and the host abandons the future if the target is cancelled.
     let spec = plugin_abi::convert::exec_spec_from_pb(req.spec.unwrap_or_default());
-    match runner.prepare_spec(&req.session_id, spec).await {
-        Ok(out) => unary(Body::PrepareSpecResp(pb::PrepareSpecResponse {
+    match session.prepare(spec).await {
+        Ok(out) => unary(Body::PrepareResp(pb::PrepareResponse {
             spec: Some(plugin_abi::convert::exec_spec_to_pb(&out)),
         })),
-        Err(e) => unary(err_body(err_message(&e))),
+        Err(e) => unary(err_body(format!("{e}"))),
     }
 }
 
-async fn runner_close_session(
-    runner: Arc<dyn hexec_runner::ExecRunnerPlugin>,
-    req: pb::CloseSessionRequest,
-) -> SVec<u8> {
-    match runner.close_session(&req.session_id).await {
-        Ok(()) => unary(Body::CloseSessionResp(pb::CloseSessionResponse {})),
-        Err(e) => unary(err_body(err_message(&e))),
+async fn session_close(session: Arc<dyn hexec_runner::ExecSession>) -> SVec<u8> {
+    // `close` then `teardown`, the same order and for the same reason as
+    // `ExecSessionPool::close_all` — one orderly attempt that may talk to
+    // something, then the blocking kill. The host's own `teardown` for a remote
+    // session is `None` (it cannot call across the seam synchronously), so if
+    // this did only half of it a plugin session would leak until abort-reap.
+    if let Err(e) = session.close().await {
+        return unary(err_body(err_message(&e)));
+    }
+    match session.teardown() {
+        Some(job) => match job() {
+            Ok(()) => unary(Body::CloseResp(pb::CloseResponse {})),
+            Err(e) => unary(err_body(err_message(&e))),
+        },
+        None => unary(Body::CloseResp(pb::CloseResponse {})),
     }
 }
 
@@ -3302,9 +3349,10 @@ mod tests {
     /// which is the shape a devenv session runner has.
     ///
     /// Note what is NOT here: no `parse`, no `apply_transitive`, no `run`, no
-    /// config schema. A runner is its own component kind, so it implements three
-    /// methods and nothing else — the earlier draft of this lane rode
-    /// `ManagedDriver` and needed three `bail!("unused")` stubs per runner.
+    /// config schema, and no session id. A runner is its own component kind and
+    /// implements exactly the trait a host-side runner does; the session it
+    /// returns is an object, so what it holds open — here a socket path and a
+    /// per-spawn sequence number — never crosses and the host cannot name it.
     struct MuxRunner {
         opened: Arc<std::sync::atomic::AtomicUsize>,
         closed: Arc<std::sync::atomic::AtomicUsize>,
@@ -3312,17 +3360,29 @@ mod tests {
         enumerable_env: bool,
     }
 
+    /// The mux's own session. Everything on it is private to the plugin.
+    struct MuxSession {
+        socket: String,
+        seq: std::sync::atomic::AtomicUsize,
+        caps: hexec_runner::SessionCaps,
+        description: hexec_runner::SessionDescription,
+        base_env: Option<Vec<(OsString, OsString)>>,
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+        prepared: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
     #[async_trait::async_trait]
-    impl hexec_runner::ExecRunnerPlugin for MuxRunner {
-        async fn open_session(
+    impl hexec_runner::ExecRunner for MuxRunner {
+        async fn open(
             &self,
             req: hexec_runner::OpenRequest,
             _ct: &(dyn Cancellable + Send + Sync),
-        ) -> Result<hexec_runner::OpenedSession> {
+        ) -> Result<Arc<dyn hexec_runner::ExecSession>> {
             self.opened
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(hexec_runner::OpenedSession {
-                session_id: format!("sess-for-{}", req.key),
+            Ok(Arc::new(MuxSession {
+                socket: format!("/run/mux/{}", req.key),
+                seq: std::sync::atomic::AtomicUsize::new(0),
                 caps: hexec_runner::SessionCaps {
                     pty: true,
                     // The cap a purely data-shaped lane could not carry.
@@ -3340,22 +3400,29 @@ mod tests {
                 base_env: self
                     .enumerable_env
                     .then(|| vec![(OsString::from("FROM_MUX"), OsString::from("1"))]),
-            })
+                closed: Arc::clone(&self.closed),
+                prepared: Arc::clone(&self.prepared),
+            }))
         }
+    }
 
-        async fn prepare_spec(
+    #[async_trait::async_trait]
+    impl hexec_runner::ExecSession for MuxSession {
+        async fn prepare(
             &self,
-            session_id: &str,
             mut spec: hproc::proc_exec::Spec,
-        ) -> Result<hproc::proc_exec::Spec> {
-            let n = self
-                .prepared
+        ) -> std::result::Result<hproc::proc_exec::Spec, hexec_runner::SpawnError> {
+            self.prepared
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Route through the mux, exactly as an agent-backed session does:
-            // the runner starts the process, the host only forks the client.
+            // the runner decides how the process starts, the host only forks the
+            // client. `self.socket` and `self.seq` are the session's own state —
+            // reachable here precisely because the host holds the object rather
+            // than an id it would have to hand back.
             let mut args: Vec<OsString> = vec![
                 OsString::from("--socket"),
-                OsString::from(session_id),
+                OsString::from(self.socket.clone()),
                 // Per-SPAWN state. A description settled once at open could not
                 // produce this, which is the capability this component buys.
                 OsString::from(format!("--seq={n}")),
@@ -3370,7 +3437,19 @@ mod tests {
             Ok(spec)
         }
 
-        async fn close_session(&self, _session_id: &str) -> Result<()> {
+        fn base_env(&self) -> Option<&[(OsString, OsString)]> {
+            self.base_env.as_deref()
+        }
+
+        fn caps(&self) -> &hexec_runner::SessionCaps {
+            &self.caps
+        }
+
+        fn describe(&self) -> &hexec_runner::SessionDescription {
+            &self.description
+        }
+
+        async fn close(&self) -> Result<()> {
             self.closed
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -3393,7 +3472,7 @@ mod tests {
             closed: Arc::clone(&closed),
             prepared: Arc::clone(&prepared),
             enumerable_env,
-        }) as Arc<dyn hexec_runner::ExecRunnerPlugin>;
+        }) as Arc<dyn hexec_runner::ExecRunner>;
         let host = hplugin_stabby::load_stable::StableRemoteExecRunner::new(
             make_dyn_exec_runner(r),
             "mux",
@@ -3418,9 +3497,8 @@ mod tests {
     async fn open_mux(
         host: &hplugin_stabby::load_stable::StableRemoteExecRunner,
     ) -> Arc<dyn hexec_runner::ExecSession> {
-        let runner = hexec_runner::PluginExecRunner::new(Arc::new(host.clone()));
         hexec_runner::ExecRunner::open(
-            &runner,
+            host,
             hexec_runner::OpenRequest {
                 key: "k1".to_string(),
                 runner_addr: "//:mux".to_string(),
@@ -3534,8 +3612,9 @@ mod tests {
     /// The capability that justified making this its own component: a runner
     /// with **no driver at all**.
     ///
-    /// Every test above already proves it — `MuxRunner` implements three methods
-    /// and there is no `ManagedDriver` anywhere in the picture. This one says so
+    /// Every test above already proves it — `MuxRunner` implements `ExecRunner`
+    /// and nothing else, and there is no `ManagedDriver` anywhere in the
+    /// picture. This one says so
     /// on purpose, because the earlier draft could not do it: the lane rode
     /// `ManagedDriver`, so shipping a runner meant inventing a dummy driver that
     /// built nothing and stubbed `parse` / `apply_transitive` / `run`.

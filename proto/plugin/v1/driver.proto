@@ -182,15 +182,16 @@ message RunOutFrame {
 // and its name is its own rather than a driver's. So it gets its own vtable and
 // its own method enum, not extra ids on DriverMethod.
 
-enum ExecRunnerMethod {
-  EXEC_RUNNER_METHOD_UNSPECIFIED = 0;
-  // Per environment. The host's pool single-flights it.
-  EXEC_RUNNER_METHOD_OPEN_SESSION = 1;
-  // Per target process. This is what makes the runner the party that starts the
-  // process: it can transform every spawn, not just describe the environment
-  // once.
-  EXEC_RUNNER_METHOD_PREPARE_SPEC = 2;
-  EXEC_RUNNER_METHOD_CLOSE_SESSION = 3;
+// Methods on a live session object. `open` is not here: it is the runner's own
+// vtable method, because it is what produces the session.
+enum ExecSessionMethod {
+  EXEC_SESSION_METHOD_UNSPECIFIED = 0;
+  // Per target process. This is what makes the runner the party that decides
+  // how the process starts: it transforms every spawn, not just the environment
+  // once. A muxing runner rewrites argv here to route the target through the
+  // one shell it holds open.
+  EXEC_SESSION_METHOD_PREPARE = 1;
+  EXEC_SESSION_METHOD_CLOSE = 2;
 }
 
 // One file from the runner target's artifacts. Bytes rather than a path: the
@@ -203,16 +204,13 @@ message RunnerArtifact {
 
 message OpenSessionRequest {
   string request_id = 1;
-  // Selects which runner on the plugin handles this (a plugin may export
-  // several named runners over one connection). Empty => the sole runner.
-  string runner = 2;
   // Content-addressed identity of this environment — the runner target's
   // hashouts. Two runner targets with byte-identical artifacts are the same
   // environment and share a session.
-  string key = 3;
+  string key = 2;
   // The runner target's address, for diagnostics.
-  string runner_addr = 4;
-  repeated RunnerArtifact artifacts = 5;
+  string runner_addr = 3;
+  repeated RunnerArtifact artifacts = 4;
 }
 
 // How honestly the session describes the environment. `pinned` means the
@@ -228,31 +226,33 @@ message SessionCaps {
   string identity_detail = 4;
 }
 
-message OpenSessionResponse {
-  // Opaque to the host. Identifies this session on later PREPARE_SPEC /
-  // CLOSE_SESSION calls.
-  string session_id = 1;
-  SessionCaps caps = 2;
+// What the HOST needs to know about a session. Everything else about it — how
+// it is kept alive, how many targets share it, what it is addressed by
+// internally — stays inside the plugin.
+//
+// There is deliberately no session id: the host holds the session object
+// itself, so it has nothing to look one up by and needs nothing to.
+message OpenedSessionInfo {
+  SessionCaps caps = 1;
   // Names the environment defines as shell functions rather than binaries.
   // Diagnostics only, and the difference between "not found in PATH" and an
   // error naming the actual problem.
-  repeated string shell_functions = 3;
-  string summary = 4;
+  repeated string shell_functions = 2;
+  string summary = 3;
   // The environment every process here starts from, or absent when it cannot be
   // enumerated host-side (a container's environment lives inside the
   // container). Callers that report "where did this PATH entry come from" must
   // degrade explicitly rather than print a confident, wrong answer.
-  repeated EnvVar base_env = 5;
-  bool base_env_known = 6;
+  repeated EnvVar base_env = 4;
+  bool base_env_known = 5;
 }
 
 // The mutable half of a `proc_exec::Spec`.
 //
-// stdio is deliberately absent: `StdioSpec::Fd` owns a file descriptor, which
-// cannot cross a stable boundary, and a runner has no business reassigning the
-// host's PTY slave. The kinds below are informational so a runner can tell an
-// interactive spawn from a batch one; the host keeps the real stdio and
-// re-applies it to whatever comes back.
+// stdio is deliberately absent: `StdioSpec::Fd` owns a file descriptor wired to
+// the host's TUI, and a runner has no business reassigning it. The kinds below
+// are informational so a runner can tell an interactive spawn from a batch one;
+// the host keeps the real stdio and re-applies it to whatever comes back.
 message ExecSpecPatch {
   bytes program = 1;
   repeated bytes args = 2;
@@ -270,24 +270,20 @@ enum StdioKind {
   STDIO_KIND_FD = 4;
 }
 
-message PrepareSpecRequest {
+message PrepareRequest {
   string request_id = 1;
-  string runner = 2;
-  string session_id = 3;
-  ExecSpecPatch spec = 4;
-  StdioKind stdin = 5;
-  StdioKind stdout = 6;
-  StdioKind stderr = 7;
+  ExecSpecPatch spec = 2;
+  StdioKind stdin = 3;
+  StdioKind stdout = 4;
+  StdioKind stderr = 5;
 }
 
-message PrepareSpecResponse {
+message PrepareResponse {
   ExecSpecPatch spec = 1;
 }
 
-message CloseSessionRequest {
+message CloseRequest {
   string request_id = 1;
-  string runner = 2;
-  string session_id = 3;
 }
 
-message CloseSessionResponse {}
+message CloseResponse {}

@@ -108,12 +108,9 @@ fn load_dylib_plugins(
         // Exec runners are their own component kind, registered under their own
         // names — a plugin can export a runner with no driver at all.
         for (name, runner) in runners {
-            e.register_exec_runner(
-                name,
-                std::sync::Arc::new(hexec_runner::PluginExecRunner::new(std::sync::Arc::new(
-                    runner,
-                ))),
-            )?;
+            // No adapter: a cdylib runner implements the same `ExecRunner` a
+            // host-side one does, because its sessions cross as objects.
+            e.register_exec_runner(name, std::sync::Arc::new(runner))?;
         }
         for (_name, hook) in hooks {
             e.register_hook(std::sync::Arc::new(hook))?;

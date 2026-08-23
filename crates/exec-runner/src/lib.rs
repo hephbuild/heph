@@ -47,9 +47,6 @@
 //! `hproc`, and this trait exposes both.
 
 pub mod agent;
-pub mod plugin;
-
-pub use plugin::{ExecRunnerPlugin, PluginExecRunner};
 
 use hcore::hasync::Cancellable;
 use hproc::proc_exec::{self, Handle, Spec};
@@ -320,26 +317,6 @@ pub struct RunnerArtifact {
     /// Path within the artifact tree.
     pub path: String,
     pub bytes: Vec<u8>,
-}
-
-/// What a driver reports when it opens a session on the host's behalf.
-///
-/// The host turns this into an [`ExecSession`] whose `prepare` calls back into
-/// the plugin. Everything here is settled once, at open; the per-spawn
-/// transformation stays behind [`ExecSession::prepare`] where the plugin can
-/// make a decision per target.
-#[derive(Debug, Clone)]
-pub struct OpenedSession {
-    /// Opaque to the host — the plugin's own handle on this session, echoed on
-    /// every later `prepare` and on `close`.
-    pub session_id: String,
-    pub caps: SessionCaps,
-    pub description: SessionDescription,
-    /// The environment every process here starts from, or `None` when the
-    /// plugin cannot enumerate it host-side. `None` is not "empty": a caller
-    /// asking "where did this PATH entry come from" must degrade explicitly
-    /// rather than print a confident, wrong answer.
-    pub base_env: Option<Vec<(OsString, OsString)>>,
 }
 
 /// What a runner needs to open a session.

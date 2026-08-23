@@ -263,7 +263,8 @@ pub trait StableManagedDriver {
     ) -> DynFuture<'a, DynItemStream>;
 }
 
-/// The cold exec-runner surface. `method` is a `pb::ExecRunnerMethod`.
+/// The cold exec-runner surface: **one method**, which hands back a live
+/// session.
 ///
 /// A **first-class component**, not a driver that happens to answer extra
 /// methods. A runner is not a driver: it does not parse, build, or have a
@@ -271,12 +272,31 @@ pub trait StableManagedDriver {
 /// runner-only plugin stub `parse`/`apply_transitive`/`run` and would tie a
 /// runner's registered name to a driver it does not have.
 ///
-/// One unary slot is the whole surface: `open_session` and `close_session` are
-/// per environment, `prepare_spec` is per spawn, and all three are small
-/// request/response pairs. Streaming has no use here — a live session's process
-/// IO never crosses this seam, because the host forks the child.
+/// `open` returns a [`DynExecSession`] — an object, not a handle to look up
+/// later. That is the same move [`ResultOutcome`] already makes with
+/// [`DynArtifact`]: a cdylib is `dlopen`ed into this process, so a trait object
+/// crosses the seam as a fat pointer and stays live on the plugin's side. An
+/// earlier draft of this trait assumed the opposite and grew an id-keyed
+/// protocol — `open_session`/`prepare_spec`/`close_session` plus a host-side
+/// session table — to route around a boundary that is not there. There is no
+/// session id on this seam, and no host-side session registry.
 #[stabby::stabby]
 pub trait StableExecRunner {
+    /// `req` is a prost `pb::OpenSessionRequest`.
+    extern "C" fn open<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, OpenOutcome>;
+}
+
+/// One live exec environment, owned by the plugin.
+///
+/// What a session *is* never crosses: a `devenv shell` held open, a socket, a
+/// pid, a mux routing many targets through one of them, whatever bookkeeping
+/// that needs. The host holds this object, calls `prepare` per spawn and `close`
+/// once, and knows nothing else about it.
+///
+/// `method` is a `pb::ExecSessionMethod`; new ones are additive method ids, and
+/// the vtable is untouched.
+#[stabby::stabby]
+pub trait StableExecSession {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
 }
 
@@ -323,6 +343,30 @@ pub type DynHook = stabby::dynptr!(stabby::boxed::Box<dyn StableHook + StableMet
 pub type DynExecRunner = stabby::dynptr!(
     stabby::boxed::Box<dyn StableExecRunner + StableMeta + StableCancel + Send + Sync>
 );
+
+/// A live session handle. Composes neither [`StableMeta`] nor [`StableCancel`]:
+/// a session is not a named component, and neither of its methods is worth
+/// cancelling — `prepare` is a fast pure transform on the spawn path and `close`
+/// is best-effort. The slow, cancellable call is `open`, which is on the runner.
+pub type DynExecSession = stabby::dynptr!(stabby::boxed::Box<dyn StableExecSession + Send + Sync>);
+
+/// Outcome of [`StableExecRunner::open`].
+///
+/// `info` is a prost `pb::OpenedSessionInfo` — the *only* four things the host
+/// consumes about a session, each because a specific host caller needs it:
+/// `base_env` so a "not found in PATH" can name which PATH it searched,
+/// `max_concurrent` because admission control has to happen before the engine's
+/// worker permit is taken, `pty` to gate `--shell`, and the description for
+/// `heph inspect` and the in-flight report.
+#[stabby::stabby]
+pub struct OpenOutcome {
+    pub ok: bool,
+    /// Failure detail. Empty when `ok`.
+    pub message: SString,
+    /// Present iff `ok`.
+    pub session: stabby::option::Option<DynExecSession>,
+    pub info: SVec<u8>,
+}
 
 /// A named managed driver in a plugin's component bundle.
 #[stabby::stabby]

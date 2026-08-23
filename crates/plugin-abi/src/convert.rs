@@ -971,24 +971,29 @@ pub fn stdio_kind_to_pb(s: &hproc::proc_exec::StdioSpec) -> i32 {
     k as i32
 }
 
-pub fn opened_session_to_pb(s: &hexec_runner::OpenedSession) -> pb::OpenSessionResponse {
-    let (pinned, detail) = match &s.caps.identity {
+/// The four things the host consumes about a session, read off the live session
+/// object the runner just returned.
+///
+/// There is no session id: the host holds the object, so it has nothing to look
+/// one up by.
+pub fn session_info_to_pb(s: &dyn hexec_runner::ExecSession) -> pb::OpenedSessionInfo {
+    let caps = s.caps();
+    let desc = s.describe();
+    let (pinned, detail) = match &caps.identity {
         hexec_runner::Identity::Pinned { by } => (true, by.clone()),
         hexec_runner::Identity::Asserted { why } => (false, why.clone()),
     };
-    pb::OpenSessionResponse {
-        session_id: s.session_id.clone(),
+    let base_env = s.base_env();
+    pb::OpenedSessionInfo {
         caps: Some(pb::SessionCaps {
-            pty: s.caps.pty,
-            max_concurrent: s.caps.max_concurrent.map(|n| n as u32),
+            pty: caps.pty,
+            max_concurrent: caps.max_concurrent.map(|n| n as u32),
             pinned,
             identity_detail: detail,
         }),
-        shell_functions: s.description.shell_functions.clone(),
-        summary: s.description.summary.clone(),
-        base_env: s
-            .base_env
-            .as_deref()
+        shell_functions: desc.shell_functions.clone(),
+        summary: desc.summary.clone(),
+        base_env: base_env
             .unwrap_or_default()
             .iter()
             .map(|(k, v)| pb::EnvVar {
@@ -998,19 +1003,22 @@ pub fn opened_session_to_pb(s: &hexec_runner::OpenedSession) -> pb::OpenSessionR
             .collect(),
         // `None` is not "empty": a caller asking where a PATH entry came from
         // must degrade explicitly rather than print a confident, wrong answer.
-        base_env_known: s.base_env.is_some(),
+        base_env_known: base_env.is_some(),
     }
 }
 
-pub fn opened_session_from_pb(
-    p: pb::OpenSessionResponse,
-    runner_addr: &str,
-    key: &str,
-) -> hexec_runner::OpenedSession {
+type SessionInfo = (
+    hexec_runner::SessionCaps,
+    hexec_runner::SessionDescription,
+    Option<Vec<(OsString, OsString)>>,
+);
+
+/// `runner_addr` and `key` are the host's own — it asked for this environment,
+/// so it does not take the plugin's word for which one it got.
+pub fn session_info_from_pb(p: pb::OpenedSessionInfo, runner_addr: &str, key: &str) -> SessionInfo {
     let caps = p.caps.unwrap_or_default();
-    hexec_runner::OpenedSession {
-        session_id: p.session_id,
-        caps: hexec_runner::SessionCaps {
+    (
+        hexec_runner::SessionCaps {
             pty: caps.pty,
             max_concurrent: caps.max_concurrent.map(|n| n as usize),
             identity: if caps.pinned {
@@ -1029,13 +1037,13 @@ pub fn opened_session_from_pb(
                 }
             },
         },
-        description: hexec_runner::SessionDescription {
+        hexec_runner::SessionDescription {
             runner: runner_addr.to_string(),
             shell_functions: p.shell_functions,
             key: key.to_string(),
             summary: p.summary,
         },
-        base_env: p.base_env_known.then(|| {
+        p.base_env_known.then(|| {
             p.base_env
                 .into_iter()
                 .map(|kv| {
@@ -1046,7 +1054,7 @@ pub fn opened_session_from_pb(
                 })
                 .collect()
         }),
-    }
+    )
 }
 
 #[cfg(test)]

@@ -110,10 +110,12 @@ message Frame {
     // call_function request crosses as raw CallFunctionRequest bytes (like
     // list/get); only the response rides a frame body.
     CallFunctionResponse call_function_resp = 55;
-    // exec-runner lane responses (requests cross as raw bytes, like list/get)
-    OpenSessionResponse open_session_resp = 56;
-    PrepareSpecResponse prepare_spec_resp = 57;
-    CloseSessionResponse close_session_resp = 58;
+    // exec-runner lane responses (requests cross as raw bytes, like list/get).
+    // `open`'s reply is the session OBJECT plus this info struct, so what rides
+    // a frame body here is the info, not a response wrapper.
+    OpenedSessionInfo opened_session_info = 56;
+    PrepareResponse prepare_resp = 57;
+    CloseResponse close_resp = 58;
 
     // host-exported callbacks (plugin->host request / host->plugin response)
     ResultRequest result_req = 40;
