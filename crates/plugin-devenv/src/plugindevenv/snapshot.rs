@@ -15,9 +15,10 @@ use std::collections::BTreeMap;
 /// reason `NixDef.system` and `EXEC_DEF_FORMAT_VERSION` exist.
 /// v2: session-mode preludes gained `export -f`, without which a function was
 /// defined in a shell the target never runs in.
-/// v3: the artifact carries its own `mode` and `bin`. `open` used to infer the
-/// mode from whether `shell_prelude` was empty, which cannot tell `snapshot`
-/// from `wrap` — both have no prelude.
+/// v3: the runner's own `env`/`pass_env`/`runtime_env`/`runtime_pass_env`, and
+/// the artifact carrying its own `mode` and `bin`. `open` used to infer the mode
+/// from whether `shell_prelude` was empty, which cannot tell `snapshot` from
+/// `wrap` — both have no prelude.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// How a consumer of this environment should create its processes.
@@ -68,6 +69,11 @@ pub struct Snapshot {
     pub dropped_path_entries: Vec<String>,
     /// Variables dropped for naming a machine-local path.
     pub dropped_vars: Vec<String>,
+    /// What the runner target declared for itself, on top of what `devenv`
+    /// reported. `env`/`pass_env` are already folded into [`Snapshot::env`];
+    /// the `runtime_*` halves are resolved at each spawn instead.
+    #[serde(default, skip_serializing_if = "is_default_session_env")]
+    pub declared: hexec_runner::SessionEnv,
     /// The shell functions' definitions, as a bash snippet.
     ///
     /// Empty unless [`Self::mode`] is [`Mode::Session`]. Carried in the
@@ -138,6 +144,10 @@ fn is_store_path(p: &str) -> bool {
 ///    Dropping them also restores the layer-2 rule (`docs/EXEC_RUNNERS.md`
 ///    §4.4): a tool missing from the environment now fails loudly instead of
 ///    silently falling through to the host.
+fn is_default_session_env(e: &hexec_runner::SessionEnv) -> bool {
+    e == &hexec_runner::SessionEnv::default()
+}
+
 pub fn build(
     variables: &BTreeMap<String, Variable>,
     shell_functions: Vec<String>,
@@ -150,6 +160,7 @@ pub fn build(
         Mode::Snapshot,
         String::new(),
         String::new(),
+        hexec_runner::SessionEnv::default(),
     )
 }
 
@@ -160,6 +171,7 @@ pub fn build_with_prelude(
     mode: Mode,
     bin: String,
     shell_prelude: String,
+    declared: hexec_runner::SessionEnv,
 ) -> Snapshot {
     let mut env = BTreeMap::new();
     let mut dropped_vars = Vec::new();
@@ -197,6 +209,18 @@ pub fn build_with_prelude(
         env.insert(name.clone(), var.value.clone());
     }
 
+    // The runner's own `env` and `pass_env` go on top of what devenv reported:
+    // a target's runner is entitled to override the environment it captured,
+    // and both are hashed by being here, which is what makes overriding safe.
+    for (k, v) in &declared.env {
+        env.insert(k.clone(), v.clone());
+    }
+    for name in &declared.pass_env {
+        if let Ok(v) = std::env::var(name) {
+            env.insert(name.clone(), v);
+        }
+    }
+
     dropped_vars.sort();
     dropped_path_entries.sort();
     dropped_path_entries.dedup();
@@ -212,6 +236,7 @@ pub fn build_with_prelude(
         dropped_path_entries,
         dropped_vars,
         shell_prelude,
+        declared,
     }
 }
 

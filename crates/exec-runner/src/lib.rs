@@ -470,6 +470,97 @@ mod tests {
     }
 }
 
+/// The environment a runner declares, in the same four shapes a target has.
+///
+/// The split is not cosmetic — it is where the cache key is drawn:
+///
+/// | | resolved | in the key |
+/// |---|---|---|
+/// | `env` | at snapshot time, literal | **yes** |
+/// | `pass_env` | at snapshot time, from the host | **yes** — the *value* is baked in |
+/// | `runtime_env` | at spawn, literal | the declaration only |
+/// | `runtime_pass_env` | at spawn, from the host | the *name* only |
+///
+/// The property that matters is the last row. `pass_env` bakes a host value
+/// into the environment's description, so changing that value correctly re-keys
+/// every target built in it. `runtime_pass_env` bakes only the *name*, and reads
+/// the value at spawn — so an `SSH_AUTH_SOCK` or a `DOCKER_HOST` that differs
+/// per machine and per login reaches the process without ever reaching a cache
+/// key. Using the wrong one of those two is the difference between a shared
+/// cache that works and one that serves a machine its neighbour's build.
+///
+/// The declarations themselves are hashed either way, because they live in the
+/// runner target's artifact and that artifact *is* the environment's identity.
+/// That is the honest line: heph will not pretend a different environment is the
+/// same one, but it will not put ambient host state in the key either.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+pub struct SessionEnv {
+    /// Literal variables, resolved when the environment was captured.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Host variables whose **values** were captured with the environment.
+    ///
+    /// Already folded into `env` by the time a session is built; kept separately
+    /// so diagnostics can say where a value came from.
+    #[serde(default)]
+    pub pass_env: Vec<String>,
+    /// Literal variables applied at spawn rather than captured.
+    #[serde(default)]
+    pub runtime_env: Vec<(String, String)>,
+    /// Host variables read at spawn. Only the name is ever hashed.
+    ///
+    /// `"*"` passes the whole host environment, exactly as a target's
+    /// `runtime_pass_env` does — an escape hatch that puts the developer's
+    /// entire ambient environment underneath the target's own.
+    #[serde(default)]
+    pub runtime_pass_env: Vec<String>,
+}
+
+impl SessionEnv {
+    /// The environment layer this runner contributes, lowest precedence first.
+    ///
+    /// Ordered to mirror what a *target's* own keys do in `pluginexec`
+    /// (`env` → `pass_env` → `runtime_pass_env` → `runtime_env`), so a reader
+    /// who knows one knows the other. Everything here still sits **underneath**
+    /// the caller's own entries — see [`ExecSession::prepare`].
+    ///
+    /// `runtime_*` are resolved here, at spawn, and not when the environment was
+    /// captured. That is the whole point of them.
+    pub fn layer(&self) -> Vec<(OsString, OsString)> {
+        let mut out: Vec<(OsString, OsString)> =
+            Vec::with_capacity(self.env.len() + self.runtime_env.len());
+
+        let put = |k: OsString, v: OsString, out: &mut Vec<(OsString, OsString)>| {
+            // Last writer wins *within* the layer, and no key appears twice —
+            // a duplicate would leave which value the child sees up to `execve`.
+            if let Some(slot) = out.iter_mut().find(|(ek, _)| *ek == k) {
+                slot.1 = v;
+            } else {
+                out.push((k, v));
+            }
+        };
+
+        for (k, v) in &self.env {
+            put(OsString::from(k), OsString::from(v), &mut out);
+        }
+        if self.runtime_pass_env.iter().any(|n| n == "*") {
+            for (k, v) in std::env::vars_os() {
+                put(k, v, &mut out);
+            }
+        } else {
+            for name in &self.runtime_pass_env {
+                if let Some(v) = std::env::var_os(name) {
+                    put(OsString::from(name), v, &mut out);
+                }
+            }
+        }
+        for (k, v) in &self.runtime_env {
+            put(OsString::from(k), OsString::from(v), &mut out);
+        }
+        out
+    }
+}
+
 /// A `Direct` session: processes are forked from this process, with a base
 /// environment applied beneath the caller's own.
 ///
@@ -480,6 +571,10 @@ mod tests {
 #[derive(Debug)]
 pub struct EnvSession {
     base_env: Vec<(OsString, OsString)>,
+    /// The runner's declared `runtime_env` / `runtime_pass_env`, resolved on
+    /// every `prepare` rather than once at open — a host variable that changes
+    /// mid-build is meant to be seen.
+    declared: SessionEnv,
     caps: SessionCaps,
     description: SessionDescription,
 }
@@ -490,7 +585,19 @@ impl EnvSession {
         caps: SessionCaps,
         description: SessionDescription,
     ) -> Self {
+        Self::with_declared(base_env, SessionEnv::default(), caps, description)
+    }
+
+    /// [`Self::new`] with the runner's declared environment, whose `runtime_*`
+    /// parts are resolved at each spawn.
+    pub fn with_declared(
+        base_env: Vec<(OsString, OsString)>,
+        declared: SessionEnv,
+        caps: SessionCaps,
+        description: SessionDescription,
+    ) -> Self {
         Self {
+            declared,
             base_env,
             caps,
             description,
@@ -512,9 +619,21 @@ impl ExecSession for EnvSession {
     /// then convert each again into `OsString`, which for a 60–150-variable dev
     /// shell is hundreds of allocations per executed target.
     fn prepare(&self, mut spec: Spec) -> Result<Spec, SpawnError> {
-        let mut env = Vec::with_capacity(self.base_env.len() + spec.env.len());
-        for (k, v) in &self.base_env {
-            if !spec.env.iter().any(|(sk, _)| sk == k) {
+        let runtime = self.declared.layer();
+        let mut env = Vec::with_capacity(self.base_env.len() + runtime.len() + spec.env.len());
+        for (k, v) in self.base_env.iter().chain(runtime.iter()) {
+            // The caller wins, and the later of base/runtime wins between
+            // themselves — which is what puts `runtime_env` above the captured
+            // environment, mirroring a target's own ordering.
+            if spec.env.iter().any(|(sk, _)| sk == k) {
+                continue;
+            }
+            if let Some(slot) = env
+                .iter_mut()
+                .find(|(ek, _): &&mut (OsString, OsString)| ek == k)
+            {
+                slot.1 = v.clone();
+            } else {
                 env.push((k.clone(), v.clone()));
             }
         }
@@ -1066,5 +1185,154 @@ mod agent_session_tests {
         );
         assert!(s.teardown().is_some());
         assert!(s.teardown().is_none());
+    }
+}
+
+#[cfg(test)]
+mod session_env_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(k, x)| ((*k).to_string(), (*x).to_string()))
+            .collect()
+    }
+
+    fn get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsString> {
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn literal_env_is_applied() {
+        let se = SessionEnv {
+            env: pairs(&[("CC", "clang")]),
+            ..Default::default()
+        };
+        assert_eq!(get(&se.layer(), "CC"), Some(&OsString::from("clang")));
+    }
+
+    /// `runtime_env` sits above the captured `env`, mirroring the order a
+    /// target's own keys are applied in.
+    #[test]
+    fn runtime_env_wins_over_captured_env() {
+        let se = SessionEnv {
+            env: pairs(&[("MODE", "captured")]),
+            runtime_env: pairs(&[("MODE", "runtime")]),
+            ..Default::default()
+        };
+        let l = se.layer();
+        assert_eq!(get(&l, "MODE"), Some(&OsString::from("runtime")));
+        assert_eq!(
+            l.iter().filter(|(k, _)| k == "MODE").count(),
+            1,
+            "a duplicate key would leave the child's value up to execve"
+        );
+    }
+
+    /// The property the split exists for: the *value* is read at spawn, so it
+    /// never reaches a cache key. Only the name was ever hashed.
+    #[test]
+    fn runtime_pass_env_reads_the_host_at_spawn() {
+        // SAFETY: process-global mutation, and the name is unique to this test,
+        // so no other test observes or races it.
+        unsafe {
+            std::env::set_var("heph_TEST_RUNNER_RT_PASS", "from_host");
+        }
+        let se = SessionEnv {
+            runtime_pass_env: vec!["heph_TEST_RUNNER_RT_PASS".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            get(&se.layer(), "heph_TEST_RUNNER_RT_PASS"),
+            Some(&OsString::from("from_host"))
+        );
+    }
+
+    #[test]
+    fn a_runtime_pass_env_name_absent_from_the_host_is_simply_not_set() {
+        let se = SessionEnv {
+            runtime_pass_env: vec!["heph_TEST_RUNNER_DEFINITELY_UNSET".to_string()],
+            ..Default::default()
+        };
+        assert!(get(&se.layer(), "heph_TEST_RUNNER_DEFINITELY_UNSET").is_none());
+    }
+
+    /// `"*"` is the same escape hatch a target has: the whole host environment,
+    /// underneath everything the target set itself.
+    #[test]
+    fn a_wildcard_passes_the_whole_host_environment() {
+        // SAFETY: as above — a name used by this test alone.
+        unsafe {
+            std::env::set_var("heph_TEST_RUNNER_WILDCARD", "yes");
+        }
+        let se = SessionEnv {
+            runtime_pass_env: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            get(&se.layer(), "heph_TEST_RUNNER_WILDCARD"),
+            Some(&OsString::from("yes"))
+        );
+    }
+
+    /// …but even the wildcard stays underneath the target's own entries. A
+    /// runner that could overwrite `$OUT` or a target's `env` would silently
+    /// change what the target builds.
+    #[test]
+    fn the_target_still_wins_over_everything_the_runner_declares() {
+        // SAFETY: as above — a name used by this test alone.
+        unsafe {
+            std::env::set_var("heph_TEST_RUNNER_COLLIDE", "from_host");
+        }
+        let session = EnvSession::with_declared(
+            vec![(OsString::from("CC"), OsString::from("clang"))],
+            SessionEnv {
+                runtime_env: pairs(&[("heph_TEST_RUNNER_COLLIDE", "from_runner")]),
+                runtime_pass_env: vec!["*".to_string()],
+                ..Default::default()
+            },
+            SessionCaps {
+                pty: false,
+                max_concurrent: None,
+                identity: Identity::Pinned {
+                    by: "t".to_string(),
+                },
+            },
+            SessionDescription {
+                runner: "//:r".to_string(),
+                shell_functions: vec![],
+                key: "k".to_string(),
+                summary: String::new(),
+            },
+        );
+
+        let spec = Spec {
+            program: PathBuf::from("/bin/true"),
+            args: vec![],
+            env: vec![(
+                OsString::from("heph_TEST_RUNNER_COLLIDE"),
+                OsString::from("from_target"),
+            )],
+            cwd: PathBuf::from("/"),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Null,
+            stderr: proc_exec::StdioSpec::Null,
+            setsid: false,
+            ctty: false,
+        };
+        let out = session.prepare(spec).expect("prepare");
+        assert_eq!(
+            get(&out.env, "heph_TEST_RUNNER_COLLIDE"),
+            Some(&OsString::from("from_target"))
+        );
+        assert_eq!(get(&out.env, "CC"), Some(&OsString::from("clang")));
+        assert_eq!(
+            out.env
+                .iter()
+                .filter(|(k, _)| k == "heph_TEST_RUNNER_COLLIDE")
+                .count(),
+            1
+        );
     }
 }

@@ -9,7 +9,6 @@ plugins:
         - BUILD
   - builtin: exec
   - builtin: bash
-  - builtin: sh
   # The go plugin: one manifest names the cdylib for this host. The provider + its
   # go_* drivers all come from that one library. Installed to the user-global
   # ~/.heph by the `gen-example` script (which runs `install-go-plugin`).

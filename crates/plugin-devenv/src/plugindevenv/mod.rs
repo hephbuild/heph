@@ -24,6 +24,19 @@ use std::sync::Arc;
 
 pub const NAME: &str = "devenv";
 
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// A `HashMap` iterates in an arbitrary order; the def hash must not.
+fn sorted_pairs(m: std::collections::HashMap<String, String>) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = m.into_iter().collect();
+    v.sort();
+    v
+}
+
 /// The snapshot file a `devenv` target produces.
 const OUT_NAME: &str = "devenv-env.json";
 
@@ -32,6 +45,20 @@ const OUT_NAME: &str = "devenv-env.json";
 struct DevenvSpec {
     /// The `devenv` binary. Defaults to `devenv` on the driver's PATH.
     bin: Option<String>,
+    /// Variables this runner adds on top of what devenv reported, as literals.
+    /// Captured with the environment, so changing one re-keys every target
+    /// built in it.
+    env: std::collections::HashMap<String, String>,
+    /// Host variables whose **values** are captured with the environment. Use
+    /// this for something that should re-key when it changes.
+    pass_env: Vec<String>,
+    /// Literal variables applied at spawn instead of being captured.
+    runtime_env: std::collections::HashMap<String, String>,
+    /// Host variables read at spawn. Only the *name* is ever hashed, so use
+    /// this for anything that legitimately differs per machine or per login —
+    /// `SSH_AUTH_SOCK`, `DOCKER_HOST`, a personal token. `"*"` passes the whole
+    /// host environment.
+    runtime_pass_env: Vec<String>,
     /// `"snapshot"` (default), `"session"` or `"wrap"`.
     ///
     /// `snapshot` captures the environment once and applies it to every target
@@ -55,6 +82,7 @@ struct DevenvSpec {
 struct DevenvDef {
     bin: String,
     mode: snapshot::Mode,
+    declared: hexec_runner::SessionEnv,
 }
 
 pub struct Driver {
@@ -93,9 +121,18 @@ impl ManagedDriver for Driver {
                 "devenv `mode` must be \"snapshot\", \"session\" or \"wrap\", got {other:?}"
             ),
         };
+        // Sorted on the way in so the def hash does not depend on map order —
+        // the same reason `NixDef` sorts its package list.
+        let declared = hexec_runner::SessionEnv {
+            env: sorted_pairs(spec.env),
+            pass_env: sorted(spec.pass_env),
+            runtime_env: sorted_pairs(spec.runtime_env),
+            runtime_pass_env: sorted(spec.runtime_pass_env),
+        };
         let def = DevenvDef {
             bin: spec.bin.unwrap_or_else(|| "devenv".to_string()),
             mode,
+            declared,
         };
 
         let mut h = xxhash_rust::xxh3::Xxh3::new();
@@ -105,6 +142,16 @@ impl ManagedDriver for Driver {
         // carries the shell prelude) and how it is consumed, so it must change
         // the key.
         def.mode.hash(&mut h);
+        // `env` and `pass_env` are folded into the captured environment, so they
+        // must move the key. `runtime_*` are hashed as *declarations* too — the
+        // artifact is the environment's identity, and heph will not claim two
+        // differently-declared environments are the same one. What stays out of
+        // the key is the ambient *value* a `runtime_pass_env` name pulls in,
+        // which is read at spawn and never written down.
+        def.declared.env.hash(&mut h);
+        def.declared.pass_env.hash(&mut h);
+        def.declared.runtime_env.hash(&mut h);
+        def.declared.runtime_pass_env.hash(&mut h);
         req.target_spec.addr.format().hash(&mut h);
 
         Ok(ParseResponse {
@@ -196,7 +243,13 @@ impl ManagedDriver for Driver {
             );
         }
 
-        let snap = snapshot_from_json(&out.stdout, &self.local_paths(), def.mode, def.bin.clone())?;
+        let snap = snapshot_from_json(
+            &out.stdout,
+            &self.local_paths(),
+            def.mode,
+            def.bin.clone(),
+            def.declared.clone(),
+        )?;
         if snap.env.is_empty() {
             anyhow::bail!(
                 "the devenv environment came out empty after filtering, which would describe \
@@ -275,6 +328,7 @@ fn snapshot_from_json(
     local: &LocalPaths,
     mode: snapshot::Mode,
     bin: String,
+    declared: hexec_runner::SessionEnv,
 ) -> anyhow::Result<Snapshot> {
     // `bashFunctions` in the wire format; serde's rename is applied here rather
     // than in the struct so the field name reads as Rust.
@@ -311,6 +365,7 @@ fn snapshot_from_json(
         mode,
         bin,
         prelude,
+        declared,
     ))
 }
 
@@ -438,8 +493,9 @@ impl ExecRunner for Runner {
             snapshot::Mode::Snapshot => {}
         }
 
-        Ok(Arc::new(EnvSession::new(
+        Ok(Arc::new(EnvSession::with_declared(
             base_env,
+            snap.declared.clone(),
             SessionCaps {
                 pty: true,
                 max_concurrent: None,
@@ -694,6 +750,7 @@ mod tests {
             },
             mode,
             "/nix/store/d/bin/devenv".into(),
+            Default::default(),
         )
         .expect("snapshot")
     }
@@ -820,13 +877,25 @@ mod tests {
             home: "/h".to_string(),
             tmpdir: String::new(),
         };
-        let snap = snapshot_from_json(json, &local, snapshot::Mode::Snapshot, "devenv".into())
-            .expect("snapshot");
+        let snap = snapshot_from_json(
+            json,
+            &local,
+            snapshot::Mode::Snapshot,
+            "devenv".into(),
+            Default::default(),
+        )
+        .expect("snapshot");
         assert!(snap.shell_prelude.is_empty());
         assert_eq!(snap.shell_functions, vec!["fmt"]);
 
-        let sess = snapshot_from_json(json, &local, snapshot::Mode::Session, "devenv".into())
-            .expect("session");
+        let sess = snapshot_from_json(
+            json,
+            &local,
+            snapshot::Mode::Session,
+            "devenv".into(),
+            Default::default(),
+        )
+        .expect("session");
         assert!(
             sess.shell_prelude.contains("fmt () {"),
             "{:?}",
@@ -882,6 +951,7 @@ mod tests {
             },
             snapshot::Mode::Snapshot,
             "devenv".into(),
+            Default::default(),
         )
         .expect("parse");
 
