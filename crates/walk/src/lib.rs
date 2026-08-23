@@ -28,7 +28,11 @@ use std::sync::Arc;
 use wax::{Any, Glob, Program as _};
 
 pub mod cached_walker;
-pub use cached_walker::{CachedWalker, DirEntry, DirListing, EntryKind, FileHash, file_hashout};
+pub mod codegen;
+pub use cached_walker::{
+    CachedWalker, DirEntry, DirListing, EntryKind, FileHash, file_hashout, hashout_bytes,
+};
+pub use codegen::{REGISTRY_NAME as CODEGEN_REGISTRY_NAME, Registry as CodegenRegistry};
 
 /// Directory + glob ignore rules for a filesystem walk. See the module docs.
 #[derive(Debug, Clone)]

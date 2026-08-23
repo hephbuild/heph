@@ -2,8 +2,8 @@
 #
 # `codegen = "in_place"` tells heph to write the target's collected outputs back
 # onto the source tree. These files are tracked/committed (unlike `codegen =
-# "copy"` outputs, which are generated & meant to be gitignored — heph stamps
-# them so a later `glob()` excludes them).
+# "copy"` outputs, which are generated & meant to be gitignored — heph registers
+# them in a `.hephgen` beside them so a later `glob()` excludes them).
 #
 # The magic `//@heph/introspect:outputs` dep is expanded by the engine, per
 # declared output path, into an input that reads that path. So the target's
@@ -30,8 +30,9 @@ target(
 )
 
 # Copy codegen — emits a NEW, generated file into the source tree. Unlike
-# `in_place`, this file is NOT a tracked source: `codegen = "copy"` stamps it so
-# globs exclude it, and `heph tool gen-gitignore` adds it to the root .gitignore.
+# `in_place`, this file is NOT a tracked source: `codegen = "copy"` records it in
+# a `.hephgen` beside it so globs exclude it, and `heph tool gen-gitignore` adds
+# it to the root .gitignore.
 # Consumers depend on the target (`//fmt:generated`), never on the raw file.
 target(
     name = "generated",

@@ -869,20 +869,46 @@ fn build_eresult(
     }
 }
 
-/// Stamp the codegen-provenance xattr on a written-back `copy` output. This is
-/// REQUIRED, not best-effort: the stamp is what makes a later `glob()`/`file()`
-/// exclude the generated file, so a workspace whose filesystem cannot store
-/// extended attributes (some tmpfs/NFS/FAT) must FAIL loudly rather than silently
-/// emit an unstamped output that would then be double-sourced. (`in_place` outputs
-/// are never stamped, so they remain usable on any filesystem.)
-fn stamp_codegen_xattr(path: &std::path::Path, value: &str) -> anyhow::Result<()> {
-    xattr::set(path, hbuiltins::pluginfs::CODEGEN_XATTR, value.as_bytes()).with_context(|| {
-        format!(
-            "stamp codegen xattr on {:?}: `codegen = \"copy\"` requires a filesystem with \
-             extended-attribute support",
-            path
-        )
-    })
+/// The exec bit of an existing tree file (false when it cannot be stat'd),
+/// which [`hwalk::file_hashout`] folds into the content hash — so the hash of
+/// the bytes about to be replaced is computed the same way the walker will
+/// compute the hash of what replaces them.
+fn exec_bit_on_disk(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Stamp the legacy codegen-provenance xattr on a written-back `copy` output.
+///
+/// **Best-effort, and no longer the authority.** The per-directory `.hephgen`
+/// registry decides what is generated; this stamp is kept only so a tree written
+/// by this binary stays readable by one that predates the registry. It used to
+/// be required — a filesystem that could not store extended attributes failed
+/// the build, because an unstamped output would be silently double-sourced — and
+/// that is exactly the requirement the registry removes: `codegen = "copy"` now
+/// works on any filesystem, and a failure here costs nothing but backwards
+/// compatibility with an older heph.
+fn stamp_codegen_xattr(path: &std::path::Path, value: &str) {
+    if let Err(e) = xattr::set(path, hbuiltins::pluginfs::CODEGEN_XATTR, value.as_bytes()) {
+        // Once per run, not once per file: an xattr-less filesystem fails for
+        // every output, and the fact is about the filesystem, not the file.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::debug!(
+                error = %e,
+                path = %path.display(),
+                "could not write the legacy codegen xattr; provenance is carried by .hephgen",
+            );
+        });
+    }
 }
 
 pub type InteractiveInner = Box<
@@ -2750,13 +2776,15 @@ impl Engine {
         // half way would be worse: the write-back is per-file and the tree is
         // the user's source, so an abandoned job leaves a *partial* codegen tree
         // either way, and letting it finish at least leaves a consistent one.
-        let (target, cached, root) = (
+        let (target, cached, root, home, git_exclude) = (
             Arc::clone(&def.target),
             cached.to_vec(),
             self.cfg.root.clone(),
+            self.cfg.home_dir.clone(),
+            self.cfg.codegen_git_exclude,
         );
         hcore::blocking::run(move || {
-            Self::materialize_codegen_tree(&target, &cached, &root, frozen)
+            Self::materialize_codegen_tree(&target, &cached, &root, &home, git_exclude, frozen)
         })
         .await
     }
@@ -2768,17 +2796,30 @@ impl Engine {
         target: &crate::engine::driver::targetdef::TargetDef,
         cached: &[ResultArtifact],
         root: &std::path::Path,
+        home: &std::path::Path,
+        git_exclude: bool,
         frozen: bool,
     ) -> anyhow::Result<bool> {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
         // Whether anything about the tree actually moved. Content writes, exec-bit
-        // reconciles and symlink recreates all count; the codegen xattr does not
-        // (it is metadata, outside the `@heph/fs` content+exec-bit hash). `false`
-        // therefore means the tree still hashes exactly as it did before this
-        // call — which is what lets the caller skip the fixpoint recompute.
+        // reconciles, symlink recreates and **registry updates** all count. The
+        // registry is in that list because registering a path changes what a later
+        // `glob()` sources, exactly as writing one does — a run that repairs a lost
+        // record without touching a byte has still changed the tree's inputs, and
+        // `false` must keep meaning "the tree still hashes as it did", which is
+        // what lets the caller skip the fixpoint recompute. (The legacy xattr is
+        // *not* in the list: it is no longer consulted for a registered file.)
         let mut wrote = false;
         let mut frozen_diff = String::new();
+        // The registry is only maintained on the write path — `--frozen` writes
+        // nothing, including provenance.
+        let mut registry = crate::engine::codegen_tree::TreeRegistry::new(
+            root,
+            home,
+            target.addr.format(),
+            git_exclude,
+        );
 
         // Map each codegen output group to its declared mode (first non-None
         // path wins). One group can back MULTIPLE cached Output artifacts (e.g.
@@ -2831,7 +2872,7 @@ impl Engine {
                     // divergence there is not drift this target would reconcile —
                     // don't flag it in the frozen check.
                     if matches!(mode, CodegenMode::InPlace)
-                        && hbuiltins::pluginfs::has_codegen_xattr(&tree_path)
+                        && registry.foreign_owner(&tree_path).is_some()
                     {
                         continue;
                     }
@@ -2907,12 +2948,12 @@ impl Engine {
                         .with_context(|| format!("read codegen entry for write-back: {group}"))?;
                     let dest = root.join(&entry.path);
                     // An `in_place` target must not write back into a tree file
-                    // that another `codegen = "copy"` target owns (stamped with
-                    // the codegen xattr) — doing so would clobber the copy
-                    // target's output and leave the provenance pointing at the
-                    // wrong producer. Leave such files to their owner.
+                    // that another `codegen = "copy"` target owns — doing so
+                    // would clobber the copy target's output and leave the
+                    // provenance pointing at the wrong producer. Leave such files
+                    // to their owner.
                     if matches!(mode, CodegenMode::InPlace)
-                        && hbuiltins::pluginfs::has_codegen_xattr(&dest)
+                        && registry.foreign_owner(&dest).is_some()
                     {
                         continue;
                     }
@@ -2921,15 +2962,34 @@ impl Engine {
                             let mut new_bytes = Vec::new();
                             std::io::Read::read_to_end(&mut data, &mut new_bytes)
                                 .with_context(|| format!("read generated file {:?}", entry.path))?;
-                            let unchanged =
-                                matches!(std::fs::read(&dest), Ok(old) if old == new_bytes);
+                            let on_disk = std::fs::read(&dest).ok();
+                            let unchanged = on_disk.as_deref() == Some(new_bytes.as_slice());
+                            // Provenance goes in BEFORE the bytes do. A net-new
+                            // file is registered before it exists, which matches
+                            // nothing; a rewrite keeps the outgoing hash as
+                            // `prev` so that during the swap the file on disk
+                            // matches the record whichever side of the rename a
+                            // concurrent walk observes it from. `prev` is keyed
+                            // off the hash rather than off `unchanged` so that it
+                            // also covers the exec-bit-only rewrite below: the
+                            // bit is folded into the hash, so flipping it moves
+                            // the file's identity without touching a byte.
+                            if matches!(mode, CodegenMode::Copy) {
+                                let new_hash = hwalk::hashout_bytes(&new_bytes, x);
+                                let prev = on_disk
+                                    .as_ref()
+                                    .map(|b| hwalk::hashout_bytes(b, exec_bit_on_disk(&dest)))
+                                    .filter(|cur| *cur != new_hash);
+                                registry.register_file(&dest, new_hash, prev).with_context(
+                                    || format!("register codegen output {:?}", dest),
+                                )?;
+                            }
                             if !unchanged {
-                                if let Some(parent) = dest.parent() {
-                                    std::fs::create_dir_all(parent).with_context(|| {
-                                        format!("create parent dir for {:?}", dest)
-                                    })?;
-                                }
-                                std::fs::write(&dest, &new_bytes)
+                                // Published by rename: a consumer (another heph,
+                                // a compiler, an editor) never sees a partially
+                                // written generated file, and the exec bit is
+                                // already right when the name appears.
+                                crate::engine::codegen_tree::write_atomically(&dest, &new_bytes, x)
                                     .with_context(|| format!("write codegen file {:?}", dest))?;
                                 wrote = true;
                             }
@@ -2960,13 +3020,11 @@ impl Engine {
                                     }
                                 }
                             }
-                            // Stamp net-new (Copy) outputs so a later fs glob
-                            // excludes them. InPlace outputs overwrite tracked
-                            // sources and stay unstamped. (xattr is file metadata,
-                            // not content, so it does not perturb the content+x
-                            // fs hash.)
+                            // Legacy stamp for a binary that predates the
+                            // registry. Best-effort: an xattr-less filesystem
+                            // costs backwards compatibility, not the build.
                             if matches!(mode, CodegenMode::Copy) {
-                                stamp_codegen_xattr(&dest, &stamp)?;
+                                stamp_codegen_xattr(&dest, &stamp);
                             }
                         }
                         WalkEntryKind::Symlink { target } => {
@@ -2974,6 +3032,14 @@ impl Engine {
                             // recreate symlinks only when missing or divergent.
                             #[cfg(unix)]
                             {
+                                if matches!(mode, CodegenMode::Copy) {
+                                    let link = target.to_string_lossy();
+                                    registry
+                                        .register_symlink(&dest, link.as_ref())
+                                        .with_context(|| {
+                                            format!("register codegen symlink {:?}", dest)
+                                        })?;
+                                }
                                 let recreate = match std::fs::read_link(&dest) {
                                     Ok(cur) => cur != target,
                                     Err(_) => true,
@@ -2998,10 +3064,8 @@ impl Engine {
                                     )?;
                                     wrote = true;
                                 }
-                                // Stamp Copy symlink outputs too, so a later fs
-                                // glob excludes them like regular Copy files.
                                 if matches!(mode, CodegenMode::Copy) {
-                                    stamp_codegen_xattr(&dest, &stamp)?;
+                                    stamp_codegen_xattr(&dest, &stamp);
                                 }
                             }
                         }
@@ -3015,6 +3079,12 @@ impl Engine {
                 addr: target.addr.clone(),
                 diff: frozen_diff,
             }));
+        }
+
+        // Close every rewrite window and drop the records of files this target
+        // no longer emits.
+        if registry.finish().context("update codegen registries")? {
+            wrote = true;
         }
 
         Ok(wrote)
@@ -10235,12 +10305,16 @@ mod tests {
         Ok(())
     }
 
-    /// End-to-end provenance: after a `copy` codegen target writes+stamps a
-    /// net-new file, a subsequent `@heph/fs` glob over the same tree EXCLUDES it
-    /// (so it is never double-sourced), while an unstamped in_place output stays
-    /// visible to a glob.
+    /// End-to-end provenance: after a `copy` codegen target writes a net-new
+    /// file, a subsequent `@heph/fs` glob over the same tree EXCLUDES it (so it
+    /// is never double-sourced), while an in_place output stays visible.
+    ///
+    /// The xattr is **stripped before the glob**, which is the whole point: that
+    /// is what `tar`, `git checkout`, `cp` and an editor's atomic save do to a
+    /// generated file, and it used to silently turn the output back into an
+    /// input. The `.hephgen` beside the file is what answers now.
     #[tokio::test]
-    async fn stamped_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
+    async fn registered_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
         let (engine, root) = engine_with_home_fs(vec![
             codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
             codegen_run_target("//pkg:ip", "in_place", &["keep.txt"], "true"),
@@ -10249,12 +10323,7 @@ mod tests {
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(pkg_dir.join("keep.txt"), b"keep\n")?;
 
-        // Skip the exclusion assertions on a filesystem that can't persist xattrs.
-        let probe = root.path().join(".xattr_probe");
-        std::fs::write(&probe, b"x")?;
-        let xattr_supported = xattr::set(&probe, hbuiltins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
-
-        // Materialize + stamp the copy output, and write back the in_place file.
+        // Materialize the copy output, and write back the in_place file.
         resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:cp")?)
             .await
             .0
@@ -10264,35 +10333,155 @@ mod tests {
             .0
             .expect("in_place target resolves");
 
-        // A glob over the stamped copy output must yield nothing.
+        // Every trace of the legacy mechanism, gone.
+        let gen_file = pkg_dir.join("out.gen");
+        let _ = xattr::remove(&gen_file, hbuiltins::pluginfs::CODEGEN_XATTR);
+        assert!(
+            !hbuiltins::pluginfs::has_codegen_xattr(&gen_file),
+            "the test must actually strip the stamp it is proving is unnecessary",
+        );
+
+        // A glob over the registered copy output must yield nothing.
         let gen_glob = hbuiltins::pluginfs::glob_addr("pkg/*.gen", &[]);
         let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
         let gen_res = res.expect("glob over generated files resolves");
-        // A glob over the unstamped in_place output must still see it.
+        // A glob over the in_place output must still see it: in_place rewrites
+        // tracked source, and source is exactly what it stays.
         let keep_glob = hbuiltins::pluginfs::glob_addr("pkg/keep.txt", &[]);
         let (res, _) = resolve_collecting_events(&engine, &keep_glob).await;
         let keep_res = res.expect("glob over in_place output resolves");
 
-        if xattr_supported {
-            assert!(
-                gen_res.artifacts.is_empty(),
-                "stamped copy output must be excluded from a later glob, got {} artifacts",
-                gen_res.artifacts.len(),
-            );
-        }
+        assert!(
+            gen_res.artifacts.is_empty(),
+            "registered copy output must be excluded from a later glob, got {} artifacts",
+            gen_res.artifacts.len(),
+        );
         assert!(
             !keep_res.artifacts.is_empty(),
-            "unstamped in_place output must remain visible to a glob",
+            "in_place output must remain visible to a glob",
+        );
+
+        // And the record says who owns it, without consulting the graph.
+        let reg = hwalk::codegen::Registry::load(&pkg_dir);
+        let entry = reg.get("out.gen").expect("the output is registered");
+        assert_eq!(entry.owner, "//pkg:cp");
+        assert!(
+            reg.get("keep.txt").is_none(),
+            "an in_place output is source, and is never registered",
+        );
+        Ok(())
+    }
+
+    /// A registry entry states which bytes heph wrote. When the file no longer
+    /// holds them — a branch switch that checks a real source file in over a
+    /// generated path, a hand-edit, another tool writing there — it is not
+    /// heph's file, and hiding it would silently drop a real input from the
+    /// build.
+    #[tokio::test]
+    async fn a_registered_path_with_foreign_content_is_source_again() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:cp",
+            "copy",
+            &["*.gen"],
+            "echo generated > out.gen",
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+
+        resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:cp")?)
+            .await
+            .0
+            .expect("copy target resolves");
+
+        let gen_glob = hbuiltins::pluginfs::glob_addr("pkg/*.gen", &[]);
+        let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
+        assert!(
+            res.expect("glob resolves").artifacts.is_empty(),
+            "the generated file starts out hidden",
+        );
+
+        // Somebody else's bytes at the same path. The record still names it.
+        let gen_file = pkg_dir.join("out.gen");
+        std::fs::write(&gen_file, b"hand written by a person, not heph\n")?;
+        let _ = xattr::remove(&gen_file, hbuiltins::pluginfs::CODEGEN_XATTR);
+        assert!(
+            hwalk::codegen::Registry::load(&pkg_dir)
+                .get("out.gen")
+                .is_some(),
+            "the stale record is still there — that is the case under test",
+        );
+
+        let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
+        assert_eq!(
+            res.expect("glob resolves").artifacts.len(),
+            1,
+            "content heph did not write is source, whatever the registry says",
+        );
+        Ok(())
+    }
+
+    /// Losing the registry costs a file its provenance until the owning target
+    /// runs again — and running it again is all it takes. No command, no flag,
+    /// no graph walk.
+    #[tokio::test]
+    async fn a_lost_registry_is_restored_by_the_next_run() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:cp",
+            "copy",
+            &["*.gen"],
+            "echo generated > out.gen",
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:cp")?;
+
+        resolve_collecting_events(&engine, &addr)
+            .await
+            .0
+            .expect("copy target resolves");
+
+        // Wipe both records: the registry and the legacy stamp.
+        std::fs::remove_file(pkg_dir.join(hwalk::codegen::REGISTRY_NAME))?;
+        let _ = xattr::remove(pkg_dir.join("out.gen"), hbuiltins::pluginfs::CODEGEN_XATTR);
+
+        let gen_glob = hbuiltins::pluginfs::glob_addr("pkg/*.gen", &[]);
+        let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
+        assert_eq!(
+            res.expect("glob resolves").artifacts.len(),
+            1,
+            "with no record left, the file reads as source",
+        );
+
+        // The bytes are already correct, so nothing is written — only the record
+        // comes back.
+        resolve_collecting_events(&engine, &addr)
+            .await
+            .0
+            .expect("copy target resolves again");
+        assert!(
+            hwalk::codegen::Registry::load(&pkg_dir)
+                .get("out.gen")
+                .is_some(),
+            "the owning target re-registers what it emits",
+        );
+        let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
+        assert!(
+            res.expect("glob resolves").artifacts.is_empty(),
+            "and the file is hidden again",
         );
         Ok(())
     }
 
     /// A net-new `copy` codegen target: after resolve the generated file is
-    /// materialized into the workspace root AND carries the codegen xattr (so a
-    /// later fs glob excludes it). An in_place target's re-emitted file exists
-    /// but is NOT stamped.
+    /// materialized into the workspace root and registered in its directory's
+    /// `.hephgen`. An in_place target's re-emitted file exists but is registered
+    /// nowhere — it is tracked source, not a generated artifact.
+    ///
+    /// The legacy xattr is still stamped alongside, so a tree written by this
+    /// binary stays readable by one that predates the registry. That half is
+    /// best-effort and asserted only where the filesystem can carry it.
     #[tokio::test]
-    async fn writeback_xattr() -> anyhow::Result<()> {
+    async fn writeback_registers_and_still_stamps() -> anyhow::Result<()> {
         let (engine, root) = engine_with_home_fs(vec![
             // Copy: generates a net-new file. The introspect input is a glob
             // (`pkg/*.gen`) so the not-yet-existing output doesn't error at
@@ -10330,10 +10519,24 @@ mod tests {
             "in_place codegen file must exist in the tree"
         );
 
+        let reg = hwalk::codegen::Registry::load(&pkg_dir);
+        let entry = reg
+            .get("out.gen")
+            .expect("net-new copy output is registered");
+        assert_eq!(entry.owner, "//pkg:cp");
+        assert!(
+            entry.accepts(&hwalk::file_hashout(&gen_file, false)?),
+            "the record must name the bytes that were actually written",
+        );
+        assert!(
+            reg.get("src.txt").is_none(),
+            "an in_place output is tracked source and must NOT be registered",
+        );
+
         if xattr_supported {
             assert!(
                 xattr::get(&gen_file, hbuiltins::pluginfs::CODEGEN_XATTR)?.is_some(),
-                "net-new copy output must carry the codegen xattr"
+                "net-new copy output must still carry the legacy codegen xattr"
             );
             assert!(
                 xattr::get(&src_file, hbuiltins::pluginfs::CODEGEN_XATTR)?.is_none(),
@@ -10362,34 +10565,32 @@ mod tests {
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
 
-        // Skip the guard assertion (not the run) on a filesystem without xattrs —
-        // without a stamp there is nothing to protect and no way to detect one.
-        let probe = root.path().join(".xattr_probe");
-        std::fs::write(&probe, b"x")?;
-        let xattr_supported = xattr::set(&probe, hbuiltins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
-
-        // Copy first: writes+stamps out.gen. Then in_place tries to overwrite it.
+        // Copy first: writes+registers out.gen. Then in_place tries to overwrite
+        // it.
         resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:cp")?)
             .await
             .0
             .expect("copy target resolves");
+        // Strip the legacy stamp: the guard must hold on the registry alone, on
+        // any filesystem, and after any tool that drops extended attributes.
+        let gen_file = pkg_dir.join("out.gen");
+        let _ = xattr::remove(&gen_file, hbuiltins::pluginfs::CODEGEN_XATTR);
         resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:ip")?)
             .await
             .0
             .expect("in_place target resolves");
 
-        let gen_file = pkg_dir.join("out.gen");
-        if xattr_supported {
-            assert_eq!(
-                std::fs::read(&gen_file)?,
-                b"copyowned\n",
-                "in_place must not clobber a copy-controlled tree file",
-            );
-            assert!(
-                xattr::get(&gen_file, hbuiltins::pluginfs::CODEGEN_XATTR)?.is_some(),
-                "the copy target's provenance stamp must survive",
-            );
-        }
+        assert_eq!(
+            std::fs::read(&gen_file)?,
+            b"copyowned\n",
+            "in_place must not clobber a copy-controlled tree file",
+        );
+        let reg = hwalk::codegen::Registry::load(&pkg_dir);
+        assert_eq!(
+            reg.get("out.gen").expect("still registered").owner,
+            "//pkg:cp",
+            "the copy target's provenance must survive the in_place run",
+        );
         Ok(())
     }
 
