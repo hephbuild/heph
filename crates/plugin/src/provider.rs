@@ -113,7 +113,7 @@ pub enum RunnerRef {
     /// `runner = //pkg:name` — a target whose artifact describes the
     /// environment. A target reference rather than a config name so its
     /// identity reaches the cache key through the ordinary dependency
-    /// mechanism (see `docs/EXEC_RUNNERS.md` §4.3).
+    /// mechanism (see `docs/EXEC_RUNNERS.md`, "How it reaches the cache key").
     Target(Addr),
 }
 

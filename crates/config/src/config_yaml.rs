@@ -45,7 +45,7 @@ pub struct ConfigYaml {
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
     /// Exec environment every target's processes are created in unless the
-    /// target says otherwise (`docs/EXEC_RUNNERS.md` §6). A runner target's
+    /// target says otherwise (`docs/EXEC_RUNNERS.md`). A runner target's
     /// address, e.g. `//:devenv`.
     ///
     /// This is the expected way to use exec runners — "the whole repo builds

@@ -12,6 +12,7 @@ heph = { path = "../.." }
 htestkit = { package = "testkit", path = "../testkit" }
 hplugin-oci = { package = "plugin-oci", path = "../plugin-oci" }
 hcore = { package = "core", path = "../core" }
+hplugin = { package = "plugin", path = "../plugin" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"
 async-trait = "0.1.89"

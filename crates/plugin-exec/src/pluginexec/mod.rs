@@ -1091,7 +1091,7 @@ impl Driver {
             env.insert("TERM".to_string(), term);
         }
         // The session's PATH REPLACES the driver's, rather than sitting under it
-        // (`docs/EXEC_RUNNERS.md` §4.4). Appending the driver's default after it
+        // (`docs/EXEC_RUNNERS.md`, "Environment layering"). Appending the driver's default after it
         // would mean a tool missing from the runner silently falls through to
         // the host — the exact ambient dependency a runner exists to remove —
         // and it would do so invisibly, under a cache key asserting the runner's
@@ -1502,7 +1502,7 @@ impl Driver {
         // versions of their fields were moved into `spec` above), so no work
         // happens on the far more common spawn-succeeds path.
         // Through the session, not `proc_exec::spawn` directly: that is the
-        // whole exec-runner seam (`docs/EXEC_RUNNERS.md` §4.2). Under `local`
+        // whole exec-runner seam (`docs/EXEC_RUNNERS.md`). Under `local`
         // the session's `prepare` is the identity function, so this is the same
         // fork it always was.
         let mut handle = req.runner.spawn(spec).await.map_err(|e| {
@@ -3393,7 +3393,7 @@ mod tests {
 
     /// Golden freeze of the child process's environment.
     ///
-    /// The exec-runner design (`docs/EXEC_RUNNERS.md` §4.4) inserts a runner's
+    /// The exec-runner layering rules (`docs/EXEC_RUNNERS.md`) insert a runner's
     /// `base_env` beneath the driver's `PATH` and skips the driver's `path`
     /// default when a runner supplies one. Everything else about this sequence
     /// must stay byte-identical — and an earlier draft of that design stated a
@@ -3522,7 +3522,7 @@ mod tests {
             "child env drifted.\n got: {got:#?}\nwant: {want:#?}\n\
              If this is a deliberate change to env composition, it changes what \
              existing targets see under an unchanged cache key — see \
-             docs/EXEC_RUNNERS.md §4.4 before updating this golden."
+             docs/EXEC_RUNNERS.md (\"Environment layering\") before updating this golden."
         );
 
         Ok(())

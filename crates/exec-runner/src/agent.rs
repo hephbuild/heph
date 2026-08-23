@@ -25,7 +25,7 @@
 //! The client is a real child, so `Handle`, the drain, the PTY and the
 //! supervisor all work unchanged. The child's stdio are the *same* file
 //! descriptors — passed, not proxied — so none of `pluginexec`'s bounded-drain
-//! and line-discipline handling is re-derived on a new transport, which §4.6 of
+//! and line-discipline handling is re-derived on a new transport, which the fd-passing protocol in
 //! the design exists to prevent. The client then exits with the child's status,
 //! so the exit code a driver sees is the real one.
 //!
@@ -241,7 +241,7 @@ pub fn request(socket: &Path, req: &ExecRequest, stdio: [RawFd; 3]) -> anyhow::R
 /// Where an agent for `key` listens.
 ///
 /// Under the runner's own directory rather than a shared `/tmp` name: two heph
-/// processes on one machine each open their own session (§10), and a fixed path
+/// processes on one machine each open their own session, and a fixed path
 /// would have them fight over one socket.
 pub fn socket_path(dir: &Path, key: &str) -> PathBuf {
     // The key is a hex hash, but it is not this function's business to assume

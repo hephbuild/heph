@@ -1031,7 +1031,7 @@ pub struct RunRequest<'a, 'io> {
     ///
     /// Resolved by the engine per target — a driver never chooses it. Drivers
     /// create processes through this rather than calling `proc_exec` directly
-    /// (`docs/EXEC_RUNNERS.md` §4.2).
+    /// (`docs/EXEC_RUNNERS.md`).
     pub runner: std::sync::Arc<dyn hexec_runner::ExecSession>,
 }
 /// Cleanup closure a driver returns for the engine to run after `cache_locally`.

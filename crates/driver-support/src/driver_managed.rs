@@ -58,7 +58,7 @@ pub struct ManagedRunRequest<'a, 'io> {
     ///
     /// A driver creates processes through this rather than calling
     /// `proc_exec::{spawn,output}` directly — that is the whole of the
-    /// exec-runner seam (`docs/EXEC_RUNNERS.md` §4.2). A driver that creates no
+    /// exec-runner seam (`docs/EXEC_RUNNERS.md`). A driver that creates no
     /// process ignores it.
     pub runner: Arc<dyn ExecSession>,
 }

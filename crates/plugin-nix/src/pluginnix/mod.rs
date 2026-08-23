@@ -423,7 +423,7 @@ impl ManagedDriver for Driver {
             ctty: false,
         };
 
-        // Through the session — see `docs/EXEC_RUNNERS.md` §4.2. `output`, not
+        // Through the session — see `docs/EXEC_RUNNERS.md`. `output`, not
         // `spawn`: nix build output is collected in full after the wait, which
         // needs the unbounded drain.
         let output = req
