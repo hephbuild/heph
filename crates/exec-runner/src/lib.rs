@@ -275,6 +275,57 @@ pub trait ExecSession: Send + Sync {
         Ok(proc_exec::output(spec, cancel).await?)
     }
 
+    /// Streaming creation for a caller that wants the bytes **as they are
+    /// produced** but does not need a [`Handle`].
+    ///
+    /// The third shape, and the one a session behind the plugin seam can
+    /// actually serve. [`spawn`](Self::spawn) hands back a `Handle`, which owns
+    /// a real child of *this* process — a guest cannot manufacture one from
+    /// bytes arriving over an ABI, so a driver written against `spawn` can only
+    /// ever run in-process. Written against this, the same driver works on
+    /// either side of the seam.
+    ///
+    /// The channel is deliberately the same shape as
+    /// [`Handle::take_output`]'s reader: both streams arrive tagged on one
+    /// channel, which is what removes head-of-line blocking between them on
+    /// macOS. A consumer that already tees an `OutputReader` changes almost
+    /// nothing to consume this.
+    ///
+    /// It also retires a hazard rather than restating it. With `spawn` the wait
+    /// must not share a task with the reader, or a child that fills a pipe
+    /// wedges forever; here the status is this future's own return value, so
+    /// there is no second task to get wrong.
+    async fn stream(
+        &self,
+        spec: Spec,
+        cancel: &(dyn Cancellable + Send + Sync),
+        chunks: tokio::sync::mpsc::Sender<(proc_exec::StreamId, Vec<u8>)>,
+    ) -> Result<std::process::ExitStatus, SpawnError> {
+        let mut handle = self.spawn(spec).await?;
+        // Taken before `spawn_wait`, which consumes the handle.
+        let reader = handle.take_output();
+        let wait = handle.spawn_wait(cancel.clone_arc());
+        if let Some(mut reader) = reader {
+            // `recv` is fallible: a read error on the pipe ends the stream and
+            // must not be mistaken for the child having finished quietly.
+            while let Some((id, chunk)) = reader.recv().await.map_err(SpawnError::Io)? {
+                // A receiver that went away means the consumer stopped caring;
+                // the child still has to be waited on, so this is not an error.
+                if chunks.send((id, chunk)).await.is_err() {
+                    break;
+                }
+            }
+        }
+        drop(chunks);
+        match wait.await {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(e)) => Err(SpawnError::Io(e)),
+            Err(e) => Err(SpawnError::Io(std::io::Error::other(format!(
+                "wait task for the child: {e}"
+            )))),
+        }
+    }
+
     /// The environment every process here starts from, or `None` when it cannot
     /// be enumerated host-side (a container's environment lives inside the
     /// container). Callers that report "where did this PATH entry come from"
@@ -1141,6 +1192,49 @@ mod wrap_session_tests {
     /// A container outlives the build unless something removes it, and the
     /// hard-abort path exits without running destructors — so the teardown must
     /// be reachable synchronously, and exactly once.
+    /// `stream` must deliver both streams, tagged, and report the real status.
+    ///
+    /// The tag is the point: both arrive on one channel precisely so neither can
+    /// block the other, which is a macOS failure mode rather than a tidiness
+    /// preference.
+    #[tokio::test]
+    async fn stream_delivers_both_streams_tagged_and_the_status() {
+        let s = LocalSession::new();
+        let spec = Spec {
+            program: std::path::PathBuf::from("/bin/sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("echo out; echo err >&2; exit 3"),
+            ],
+            env: vec![],
+            cwd: std::env::temp_dir(),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Piped,
+            stderr: proc_exec::StdioSpec::Piped,
+            setsid: false,
+            ctty: false,
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(proc_exec::StreamId, Vec<u8>)>(16);
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let collect = async move {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            while let Some((id, chunk)) = rx.recv().await {
+                match id {
+                    proc_exec::StreamId::Stdout => out.extend_from_slice(&chunk),
+                    proc_exec::StreamId::Stderr => err.extend_from_slice(&chunk),
+                }
+            }
+            (out, err)
+        };
+        let (status, (out, err)) = tokio::join!(s.stream(spec, &ct, tx), collect);
+
+        let status = status.expect("stream");
+        assert_eq!(status.code(), Some(3), "the real exit status is the return");
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "out");
+        assert_eq!(String::from_utf8_lossy(&err).trim(), "err");
+    }
+
     #[test]
     fn a_wrap_session_hands_its_teardown_over_once() {
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
