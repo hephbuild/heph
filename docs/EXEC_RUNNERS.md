@@ -156,6 +156,27 @@ Two details that are not obvious:
   group. Without that, cancelling a build left its targets running to
   completion.
 
+### How a plugin-hosted driver creates its processes
+
+A driver compiled into heph holds the session object and creates its own
+processes. A driver in a cdylib cannot: a session is a live object and the
+plugin links its own copy of every type, so nothing about it can cross.
+
+So a plugin driver does not create the process at all — it hands the spec to the
+host, which holds the session and applies it in full. Every runner mode works
+for every driver, and the environment never has to stand in for the session.
+
+An earlier draft of this seam sent the session's *environment* instead, which is
+exact for `Local` and `Env` and silently wrong for anything that also rewrites
+the command: under `mode = "session"` a plugin driver would run its target on
+the host with the shell's variables applied, never entering the shell, while
+still echoing `runner_key` back so the ack could not tell.
+
+One consequence worth knowing: a plugin driver's exec is **batch** across the
+seam. Output arrives when the child exits rather than as it is produced. Only
+`docker_build` shows progress while a child runs, and only when it is itself
+under a runner — everything else already waits for the whole output.
+
 ## devenv
 
 ```python

@@ -782,12 +782,12 @@ mod tests {
 
     /// `wrap` defers each spawn to `devenv shell --`, using the binary the
     /// driver captured with rather than whatever a PATH resolves to.
-    #[test]
-    fn wrap_mode_prefixes_every_spawn_with_devenv_shell() {
+    #[tokio::test]
+    async fn wrap_mode_prefixes_every_spawn_with_devenv_shell() {
         let snap = snap_for(snapshot::Mode::Wrap);
         let session = Runner::open_wrap(&open_req(), &snap, vec![]).expect("wrap session");
 
-        let out = session.prepare(a_spec()).expect("prepare");
+        let out = session.prepare(a_spec()).await.expect("prepare");
         assert_eq!(
             out.program,
             std::path::PathBuf::from("/nix/store/d/bin/devenv")
@@ -805,8 +805,8 @@ mod tests {
     /// Only up to the point where `devenv shell` runs: it re-derives the
     /// variables it owns and those win over what is handed in, which is one of
     /// the reasons this mode is a demonstration rather than a recommendation.
-    #[test]
-    fn wrap_mode_puts_the_environment_under_the_target() {
+    #[tokio::test]
+    async fn wrap_mode_puts_the_environment_under_the_target() {
         let snap = snap_for(snapshot::Mode::Wrap);
         let base = vec![
             (
@@ -820,7 +820,7 @@ mod tests {
         ];
         let session = Runner::open_wrap(&open_req(), &snap, base).expect("wrap session");
 
-        let out = session.prepare(a_spec()).expect("prepare");
+        let out = session.prepare(a_spec()).await.expect("prepare");
         let cc = out
             .env
             .iter()

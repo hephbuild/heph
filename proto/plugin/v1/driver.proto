@@ -282,6 +282,31 @@ message PrepareResponse {
   ExecSpecPatch spec = 1;
 }
 
+// ---- host-fulfilled exec ----
+//
+// A driver in a plugin does not create its target's processes. It asks the
+// host, which holds the live `ExecSession` and applies it in full.
+//
+// The alternative — sending the driver an approximation of the session — is
+// exact only for an environment-shaped one and silently wrong for anything that
+// also rewrites the command, which is every container and every held-open
+// shell. Nothing about the session crosses here; only a spec goes out and bytes
+// come back.
+message ExecOutputRequest {
+  string request_id = 1;
+  ExecSpecPatch spec = 2;
+  StdioKind stdin = 3;
+  StdioKind stdout = 4;
+  StdioKind stderr = 5;
+}
+
+message ExecOutputResponse {
+  // Absent = the child was killed by a signal.
+  optional int32 code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+}
+
 message CloseRequest {
   string request_id = 1;
 }

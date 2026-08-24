@@ -59,6 +59,18 @@ fn wrap_executor(exec: &Arc<dyn hplugin::provider::ProviderExecutor>) -> DynExec
     }
 }
 
+/// The exec service a plugin driver's `run` calls back into. Same host/inline
+/// fork, and for the same reason, as [`wrap_executor`].
+fn wrap_exec_service(
+    session: &Arc<dyn hexec_runner::ExecSession>,
+    ct: Arc<dyn Cancellable + Send + Sync>,
+) -> crate::abi::DynExecService {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => crate::host::HostExecService::wrap(Arc::clone(session), ct, handle),
+        Err(_) => crate::host::HostExecService::wrap_inline(Arc::clone(session), ct),
+    }
+}
+
 /// A loaded plugin's host-side handles: an optional provider + named drivers +
 /// named hooks.
 pub type LoadedComponents = (
@@ -995,11 +1007,16 @@ impl StableRemoteManagedDriver {
             msg: Some(pb::run_in_frame::Msg::Start(pmrr)),
         }
         .encode_to_vec();
+        // The session stays here. The guest gets a handle it can ask to create
+        // processes, so a container or a held-open shell is applied by the side
+        // that actually holds it.
+        let exec_service = wrap_exec_service(&req.runner, ct.clone_arc());
         let resp_stream = self
             .inner
             .invoke_bidi(
                 pb::DriverMethod::Run as u32,
                 host_item_stream(vec![in_frame]),
+                exec_service,
             )
             .await;
         // The response stream's `next` blocks (on subprocess output), so drain it on
