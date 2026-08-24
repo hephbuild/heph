@@ -605,15 +605,6 @@ mod tests {
         Ok(())
     }
 
-    /// A container is not an environment: it cannot be sent across the plugin
-    /// seam as one, and saying so is what stops a cdylib driver silently
-    /// running the target on the host instead.
-    #[test]
-    fn a_container_session_does_not_flatten_to_an_environment() -> anyhow::Result<()> {
-        assert!(!session("ubuntu@sha256:abc")?.flattens_to_env());
-        Ok(())
-    }
-
     #[test]
     fn an_addr_is_told_apart_from_a_literal_reference() {
         assert!(looks_like_addr("//app:load"));

@@ -35,6 +35,16 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// without a dummy driver, and tied a runner's registered name to a driver it
 /// does not have.
 ///
+/// `StableManagedDriver::invoke_bidi` gained a `DynExecService`, and
+/// `StableExecService` / `DynExecService` join the frozen surface: a plugin
+/// driver no longer creates its target's processes, it asks the host, which
+/// holds the live session. A draft carried the session's *environment* to the
+/// guest instead and had it rebuild an approximation — exact for an
+/// environment-shaped session, silently wrong for anything that also rewrites
+/// the command. `ManagedRunRequest.runner_opaque`, the flag that told a guest to
+/// refuse what it could not rebuild, is reserved: nothing rebuilds a session any
+/// more.
+///
 /// `StableExecRunner::open` returns a live `DynExecSession` rather than a
 /// session id, which is why there is no `close_session(id)` here and no
 /// host-side session registry. A cdylib is `dlopen`ed into this process, so a

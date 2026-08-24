@@ -156,17 +156,27 @@ Two details that are not obvious:
   group. Without that, cancelling a build left its targets running to
   completion.
 
-### What a plugin-hosted driver can and cannot use
+### How a plugin-hosted driver creates its processes
 
-Only the *environment* crosses the plugin seam, so a driver in a cdylib (`go`,
-`oci`, devenv's own) can use `Local` and `Env` sessions but not `Wrap` or
-`Agent` — those put a wrapper or a client in the argv, which does not cross.
-The host marks such a session opaque and the guest **refuses the run**, naming
-the driver, the runner and the ways out. It does not quietly fall back to
-running the target on the host, which is what it used to do while still passing
-the `runner_key` ack.
+A driver compiled into heph holds the session object and creates its own
+processes. A driver in a cdylib cannot: a session is a live object and the
+plugin links its own copy of every type, so nothing about it can cross.
 
-Built-in drivers (`exec`, `bash`) hold the real session and are unaffected.
+So a plugin driver does not create the process at all — it hands the spec to the
+host, which holds the session and applies it in full. Every runner mode works
+for every driver, and the environment never has to stand in for the session.
+
+Earlier this seam sent the session's *environment* instead, which is exact for
+`Local` and `Env` and silently wrong for anything that also rewrites the
+command: under `mode = "session"` a plugin driver ran its target on the host
+with the shell's variables applied, never entering the shell, while still
+echoing `runner_key` back so the ack could not tell. Asking the host removes the
+class of bug rather than detecting it.
+
+One consequence worth knowing: a plugin driver's exec is **batch** across the
+seam. Output arrives when the child exits rather than as it is produced. Only
+`docker_build` shows progress while a child runs, and only when it is itself
+under a runner — everything else already waits for the whole output.
 
 ## devenv
 
@@ -237,10 +247,9 @@ The container is removed at teardown (`docker rm -f`), with `--rm` as the
 backstop for an abort that never reaches it, and `--init` so a target's own
 children are reaped inside.
 
-**Today this serves targets built by heph's built-in drivers (`exec`, `bash`).**
-A target built by a *plugin* driver — `go_*`, `oci_*` — under this runner is
-refused, because only the environment crosses the plugin seam and a container is
-not an environment. See the note above.
+It serves **any** driver, built-in or plugin: a plugin driver asks the host to
+create its processes, so `go_*` targets build inside the container like any
+other. See the note above.
 
 ## Go
 

@@ -115,6 +115,7 @@ message Frame {
     // a frame body here is the info, not a response wrapper.
     OpenedSessionInfo opened_session_info = 56;
     PrepareResponse prepare_resp = 57;
+    ExecOutputResponse exec_output_resp = 59;
     CloseResponse close_resp = 58;
 
     // host-exported callbacks (plugin->host request / host->plugin response)

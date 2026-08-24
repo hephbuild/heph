@@ -961,6 +961,25 @@ pub fn exec_spec_apply(spec: &mut hproc::proc_exec::Spec, p: pb::ExecSpecPatch) 
     spec.ctty = p.ctty;
 }
 
+/// The inverse of [`stdio_kind_to_pb`], for a caller that *creates* the process
+/// from a spec that crossed the seam.
+///
+/// `ExecSpecPatch` carries no stdio — a `StdioSpec::Fd` owns a descriptor — so a
+/// spec rebuilt from it has defaults, and a host that then spawns it would
+/// capture nothing. The runner lane sidesteps this by re-applying the host's own
+/// stdio; the host-exec lane has none to re-apply and must be told the kind.
+///
+/// `Fd` maps to `Piped`: a guest never has a descriptor to send in the first
+/// place, and pretending otherwise would silently detach the child's output.
+pub fn stdio_kind_from_pb(k: i32) -> hproc::proc_exec::StdioSpec {
+    match pb::StdioKind::try_from(k) {
+        Ok(pb::StdioKind::Null) => hproc::proc_exec::StdioSpec::Null,
+        Ok(pb::StdioKind::Inherit) => hproc::proc_exec::StdioSpec::Inherit,
+        Ok(pb::StdioKind::Piped | pb::StdioKind::Fd) => hproc::proc_exec::StdioSpec::Piped,
+        Ok(pb::StdioKind::Unspecified) | Err(_) => hproc::proc_exec::StdioSpec::Piped,
+    }
+}
+
 pub fn stdio_kind_to_pb(s: &hproc::proc_exec::StdioSpec) -> i32 {
     let k = match s {
         hproc::proc_exec::StdioSpec::Null => pb::StdioKind::Null,

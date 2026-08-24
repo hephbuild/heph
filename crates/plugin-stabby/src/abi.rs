@@ -256,12 +256,44 @@ pub trait StableManagedDriver {
         method: u32,
         req: DynItemStream,
     ) -> DynFuture<'a, SVec<u8>>;
+    /// `run`. Takes a [`DynExecService`] for the same reason a provider's `list`
+    /// takes a [`DynExecutor`]: the call needs something only the host can do —
+    /// here, creating the target's processes in the session the host resolved.
     extern "C" fn invoke_bidi<'a>(
         &'a self,
         method: u32,
         req: DynItemStream,
+        exec: DynExecService,
     ) -> DynFuture<'a, DynItemStream>;
 }
+
+/// Process creation, fulfilled by the **host** on a plugin driver's behalf.
+///
+/// The inversion that removes a whole class of bug. A driver in a cdylib cannot
+/// be handed the session its target must run in — a session is a live object and
+/// the plugin links its own copy of every type — so it used to be sent an
+/// approximation instead: the session's environment variables. That is exact for
+/// an environment-shaped session and silently wrong for one that also rewrites
+/// the command, which is every container and every held-open shell.
+///
+/// So the driver does not create the process. It asks the host, which holds the
+/// real session and applies it in full. Nothing about the session has to cross,
+/// and every runner mode works for every driver.
+///
+/// Handed to `run` the same way a [`DynExecutor`] is handed to a provider's
+/// `list` — that precedent is why this is a parameter rather than a global.
+#[stabby::stabby]
+pub trait StableExecService {
+    /// `req` is a prost `pb::ExecOutputRequest`; the reply is a `pb::Frame`
+    /// carrying `ExecOutputResponse` or an error.
+    ///
+    /// Batch only. Nine of the tree's ten plugin-side call sites want exactly
+    /// this, and the tenth (streaming buildx progress) degrades to it rather
+    /// than justifying a second lane before something needs one.
+    extern "C" fn exec_output<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+}
+
+pub type DynExecService = stabby::dynptr!(stabby::boxed::Box<dyn StableExecService + Send + Sync>);
 
 /// The cold exec-runner surface: **one method**, which hands back a live
 /// session.

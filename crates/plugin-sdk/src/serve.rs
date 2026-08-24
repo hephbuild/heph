@@ -25,9 +25,9 @@ use hplugin::provider::{
     ProviderFunctionRegistry,
 };
 use hplugin_stabby::abi::{
-    DynExecutor, DynFunctionRegistry, DynItemStream, StableCancel, StableFunctionRegistryDyn,
-    StableHook, StableItemStream, StableItemStreamDyn, StableManagedDriver, StableMeta,
-    StableProvider,
+    DynExecService, DynExecutor, DynFunctionRegistry, DynItemStream, StableCancel,
+    StableExecServiceDyn, StableFunctionRegistryDyn, StableHook, StableItemStream,
+    StableItemStreamDyn, StableManagedDriver, StableMeta, StableProvider,
 };
 use hplugin_stabby::seam::panic_text;
 use hplugin_stabby::vtable::dynify;
@@ -1261,12 +1261,13 @@ impl StableManagedDriver for StableManagedDriverImpl {
         &'a self,
         method: u32,
         req: DynItemStream,
+        exec: DynExecService,
     ) -> DynFuture<'a, DynItemStream> {
         let driver = Arc::clone(&self.driver);
         let cancels = Arc::clone(&self.cancels);
         dynify(stabby::boxed::Box::new(async move {
             match pb::DriverMethod::try_from(method as i32) {
-                Ok(pb::DriverMethod::Run) => run_bidi(driver, req, cancels).await,
+                Ok(pb::DriverMethod::Run) => run_bidi(driver, req, cancels, exec).await,
                 _ => unimplemented_item_stream(method),
             }
         }))
@@ -1323,6 +1324,7 @@ async fn run_bidi(
     driver: Arc<dyn ManagedDriver>,
     req: DynItemStream,
     cancels: Arc<CancelRegistry>,
+    exec: DynExecService,
 ) -> DynItemStream {
     let Some(start) = pull_run_start(&req) else {
         return run_error_stream("run: missing start frame".into());
@@ -1337,7 +1339,7 @@ async fn run_bidi(
         let guard = cancels.enter(&start.request_id);
         // `tx` carries both the live output frames and the terminal one, in that
         // order, so the host sees the log before the result that ends the stream.
-        let out = run_once(driver, start, &tx, guard.token()).await;
+        let out = run_once(driver, start, &tx, guard.token(), exec).await;
         // Host gone => receiver dropped; ignore send failure.
         drop(tx.send(out.encode_to_vec()).await);
     });
@@ -1409,64 +1411,161 @@ impl tokio::io::AsyncWrite for FrameSink {
     }
 }
 
-/// Build the session the host asked for.
+/// The session a plugin driver creates its processes in.
 ///
-/// An empty `runner_key` means no runner was selected, and `LocalSession` — the
-/// identity transform — is what every driver behind this seam did before exec
-/// runners existed. A non-empty key means the host resolved an environment and
-/// is expecting it back in the ack.
+/// Two cases, and the split is the whole design:
 ///
-/// `runner_opaque` means the host's session is more than an environment: its
-/// `prepare` also rewrites argv. Nothing here can reconstruct that, so the run
-/// is refused. Before this check the guest built an `EnvSession` regardless,
-/// which under `mode = "session"` ran the target on the host with the variables
-/// applied — never entering the shell — while the ack still passed.
+/// - **No runner** (`runner_key` empty): `LocalSession`, created here. This is
+///   the overwhelmingly common path and every driver behind this seam did
+///   exactly it before exec runners existed — in-process, no round trip, and
+///   `stream` still delivers output live.
+/// - **A runner was resolved**: [`GuestExecSession`], which does not create
+///   anything itself. It hands the spec to the host, which holds the live
+///   session and applies it in full.
+///
+/// The second case used to rebuild an `EnvSession` from a list of environment
+/// variables the host sent. That is exact for an environment-shaped session and
+/// wrong for anything that also rewrites the command — under `mode = "session"`
+/// a cdylib driver ran its target on the host with the shell's variables
+/// applied, never entering the shell, while still echoing `runner_key` back so
+/// the ack could not tell. Asking the host removes the class of bug rather than
+/// detecting it.
 fn guest_session(
     req: &pb::ManagedRunRequest,
-) -> anyhow::Result<Arc<dyn hexec_runner::ExecSession>> {
-    use std::os::unix::ffi::OsStringExt as _;
-
+    exec: DynExecService,
+) -> Arc<dyn hexec_runner::ExecSession> {
     if req.runner_key.is_empty() {
-        return Ok(Arc::new(hexec_runner::LocalSession::new()));
+        return Arc::new(hexec_runner::LocalSession::new());
     }
-    if req.runner_opaque {
-        anyhow::bail!(
-            "driver `{}` runs in a plugin, and runner `{}` serves an environment that a plugin \
-             cannot enter: it rewrites the command as well as the environment (a container \
-             wrapper, or a `mode = \"session\"` devenv shell). Only the environment crosses the \
-             plugin seam today. Either build this target with a driver compiled into heph, or \
-             give the runner a mode that is purely an environment — for devenv, \
-             `mode = \"snapshot\"`.",
-            req.driver,
-            req.runner_addr,
-        );
-    }
-    Ok(Arc::new(hexec_runner::EnvSession::new(
-        req.runner_env
-            .iter()
-            .map(|kv| {
-                (
-                    std::ffi::OsString::from_vec(kv.key.to_vec()),
-                    std::ffi::OsString::from_vec(kv.value.to_vec()),
-                )
-            })
-            .collect(),
-        hexec_runner::SessionCaps {
+    Arc::new(GuestExecSession {
+        exec,
+        caps: hexec_runner::SessionCaps {
             pty: true,
             max_concurrent: None,
-            // The host decided how well-pinned this is; the guest is only
-            // applying it, and must not claim more than it knows.
+            // The host decided how well-pinned this is; the guest only asks it
+            // to run things, and must not claim more than it knows.
             identity: hexec_runner::Identity::Asserted {
-                why: "supplied by the host for this run".to_string(),
+                why: "created by the host for this run".to_string(),
             },
         },
-        hexec_runner::SessionDescription {
+        description: hexec_runner::SessionDescription {
             runner: req.runner_addr.clone(),
             shell_functions: Vec::new(),
             key: req.runner_key.clone(),
-            summary: "host-supplied environment".to_string(),
+            summary: "host-created processes".to_string(),
         },
-    )))
+    })
+}
+
+/// A session whose every process is created by the host.
+struct GuestExecSession {
+    exec: DynExecService,
+    caps: hexec_runner::SessionCaps,
+    description: hexec_runner::SessionDescription,
+}
+
+#[async_trait::async_trait]
+impl hexec_runner::ExecSession for GuestExecSession {
+    /// Unreachable by construction: `output` is overridden below and does not
+    /// call this, and `spawn` is refused above it. A transformation is exactly
+    /// what cannot cross this seam — that is why the host does the work.
+    async fn prepare(
+        &self,
+        _spec: hproc::proc_exec::Spec,
+    ) -> Result<hproc::proc_exec::Spec, hexec_runner::SpawnError> {
+        Err(hexec_runner::SpawnError::SessionDied {
+            key: self.description.key.clone(),
+            reason: "a plugin cannot apply the host's session; it asks the host to create the \
+                     process instead"
+                .to_string(),
+        })
+    }
+
+    async fn output(
+        &self,
+        spec: hproc::proc_exec::Spec,
+        _cancel: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> Result<std::process::Output, hexec_runner::SpawnError> {
+        let req = pb::ExecOutputRequest {
+            request_id: String::new(),
+            spec: Some(plugin_abi::convert::exec_spec_to_pb(&spec)),
+            stdin: plugin_abi::convert::stdio_kind_to_pb(&spec.stdin),
+            stdout: plugin_abi::convert::stdio_kind_to_pb(&spec.stdout),
+            stderr: plugin_abi::convert::stdio_kind_to_pb(&spec.stderr),
+        }
+        .encode_to_vec();
+
+        let died = |reason: String| hexec_runner::SpawnError::SessionDied {
+            key: self.description.key.clone(),
+            reason,
+        };
+        let bytes = self.exec.exec_output(SVec::from(req.as_slice())).await;
+        let frame = pb::Frame::decode(&bytes[..]).map_err(|e| died(format!("{e}")))?;
+        match frame.body {
+            Some(Body::ExecOutputResp(r)) => Ok(std::process::Output {
+                status: exit_status_from_code(r.code),
+                stdout: r.stdout.to_vec(),
+                stderr: r.stderr.to_vec(),
+            }),
+            Some(Body::Error(e)) => Err(died(e.message)),
+            other => Err(died(format!("unexpected reply {other:?}"))),
+        }
+    }
+
+    /// Batch, deliberately. The host's streaming lane is not built yet, and the
+    /// one caller that shows progress while a child runs — `docker_build` —
+    /// only loses liveness when it is *also* under a runner, which is a
+    /// narrower loss than shipping a second lane nothing else needs.
+    async fn stream(
+        &self,
+        spec: hproc::proc_exec::Spec,
+        cancel: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        chunks: tokio::sync::mpsc::Sender<(hproc::proc_exec::StreamId, Vec<u8>)>,
+    ) -> Result<std::process::ExitStatus, hexec_runner::SpawnError> {
+        let out = self.output(spec, cancel).await?;
+        if !out.stdout.is_empty() {
+            drop(
+                chunks
+                    .send((hproc::proc_exec::StreamId::Stdout, out.stdout))
+                    .await,
+            );
+        }
+        if !out.stderr.is_empty() {
+            drop(
+                chunks
+                    .send((hproc::proc_exec::StreamId::Stderr, out.stderr))
+                    .await,
+            );
+        }
+        Ok(out.status)
+    }
+
+    fn base_env(&self) -> Option<&[(std::ffi::OsString, std::ffi::OsString)]> {
+        // The environment lives with the session, in the host. Claiming an empty
+        // one here would make "which PATH was searched" answer confidently and
+        // wrongly; `None` is the honest degrade.
+        None
+    }
+
+    fn caps(&self) -> &hexec_runner::SessionCaps {
+        &self.caps
+    }
+
+    fn describe(&self) -> &hexec_runner::SessionDescription {
+        &self.description
+    }
+}
+
+/// `ExitStatus` has no public constructor from a code, so go through the one
+/// platform-specific conversion that does.
+fn exit_status_from_code(code: Option<i32>) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+    match code {
+        Some(c) => std::process::ExitStatus::from_raw(c << 8),
+        // No code means a signal killed it. SIGKILL is the honest stand-in: the
+        // exact signal did not cross, and reporting success would be a lie.
+        None => std::process::ExitStatus::from_raw(9),
+    }
 }
 
 async fn run_once(
@@ -1474,15 +1573,13 @@ async fn run_once(
     req: pb::ManagedRunRequest,
     out: &tokio::sync::mpsc::Sender<Vec<u8>>,
     ct: &StdCancellationToken,
+    exec: DynExecService,
 ) -> pb::RunOutFrame {
     // `shell` selects run_shell over run; it rides the request.
     let shell = req.shell;
     // Both captured before `req` is consumed field-by-field below.
     let runner_key = req.runner_key.clone();
-    let session = match guest_session(&req) {
-        Ok(s) => s,
-        Err(e) => return run_out_err(err_message(&e)),
-    };
+    let session = guest_session(&req, exec);
     let target = match convert::target_def_from_pb(req.target.unwrap_or_default()) {
         Ok(t) => t,
         Err(e) => return run_out_err(err_message(&e)),
@@ -2219,6 +2316,7 @@ mod tests {
             },
             &out_tx,
             &StdCancellationToken::new(),
+            test_exec_service(),
         ));
         match frame.msg {
             Some(pb::run_out_frame::Msg::Error(msg)) => {
@@ -2291,8 +2389,11 @@ mod tests {
         .encode_to_vec();
         let req_stream = make_item_stream(Box::new(std::iter::once(start)));
 
-        let resp =
-            futures::executor::block_on(dynd.invoke_bidi(pb::DriverMethod::Run as u32, req_stream));
+        let resp = futures::executor::block_on(dynd.invoke_bidi(
+            pb::DriverMethod::Run as u32,
+            req_stream,
+            test_exec_service(),
+        ));
         // `next` blocks on the run task; drain on a thread.
         let frames = std::thread::spawn(move || {
             let mut out: Vec<Vec<u8>> = Vec::new();
@@ -2401,8 +2502,11 @@ mod tests {
         .encode_to_vec();
         let req_stream = make_item_stream(Box::new(std::iter::once(start)));
 
-        let resp =
-            futures::executor::block_on(dynd.invoke_bidi(pb::DriverMethod::Run as u32, req_stream));
+        let resp = futures::executor::block_on(dynd.invoke_bidi(
+            pb::DriverMethod::Run as u32,
+            req_stream,
+            test_exec_service(),
+        ));
         let frames = std::thread::spawn(move || {
             let mut out: Vec<Vec<u8>> = Vec::new();
             loop {
@@ -3362,11 +3466,194 @@ mod tests {
     }
     // ---- exec-runner lane ------------------------------------------------
     use std::ffi::OsString;
+
+    /// A service that refuses. Tests below either take the no-runner path
+    /// (`LocalSession`, which never calls it) or assert on what a driver did
+    /// with a spec, not on a real process.
+    struct NoExecService;
+
+    impl hplugin_stabby::abi::StableExecService for NoExecService {
+        extern "C" fn exec_output<'a>(&'a self, _req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+            dynify(stabby::boxed::Box::new(async move {
+                unary(err_body("no exec service in this test".to_string()))
+            }))
+        }
+    }
+
+    fn test_exec_service() -> DynExecService {
+        dynify(stabby::boxed::Box::new(NoExecService))
+    }
+
     //
     // These cross the REAL stabby vtable: `make_dyn_managed_driver` on one side,
     // `StableRemoteManagedDriver` on the other. A test that called the driver
     // directly would prove nothing about the seam — and the seam is the point,
     // because it is what lets a runner plugin own process creation.
+
+    /// **The whole point, end to end**: a driver behind the seam runs under a
+    /// session that rewrites the command, and the rewrite actually happens.
+    ///
+    /// The wrapper is `/bin/echo wrapped:`, so if the host applied the session
+    /// the child's stdout is `wrapped: /bin/true` — the real program demoted to
+    /// an argument. If it did not, `/bin/true` ran and stdout is empty.
+    ///
+    /// That distinction is exactly the bug this lane was built to remove. A
+    /// plugin cannot be handed a session, so it used to be sent the session's
+    /// *environment* instead — which carries nothing about a wrapper, so a
+    /// container or a held-open shell silently degraded to running on the host
+    /// while the `runner_key` ack still passed. Now the driver does not create
+    /// the process at all; it asks the host, which holds the real session.
+    #[test]
+    fn a_driver_behind_the_seam_runs_inside_a_command_rewriting_session() {
+        use hcore::hasync::Cancellable;
+        use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+        use hplugin_stabby::abi::{StableItemStreamDyn, StableManagedDriverDyn};
+
+        /// Execs `/bin/true` through whatever session it was given and reports
+        /// what came back, so the assertion is on a real child's output.
+        struct ExecDriver;
+
+        #[async_trait::async_trait]
+        impl ManagedDriver for ExecDriver {
+            fn config(
+                &self,
+                _r: hplugin::driver::ConfigRequest,
+            ) -> Result<hplugin::driver::ConfigResponse> {
+                Ok(hplugin::driver::ConfigResponse {
+                    name: "execd".into(),
+                })
+            }
+            fn schema(&self) -> hplugin::driver::DriverSchema {
+                Default::default()
+            }
+            async fn parse(
+                &self,
+                _r: hplugin::driver::ParseRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ParseResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn apply_transitive(
+                &self,
+                _r: hplugin::driver::ApplyTransitiveRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn run<'a, 'io>(
+                &self,
+                r: ManagedRunRequest<'a, 'io>,
+                c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<ManagedRunResponse> {
+                let spec = hproc::proc_exec::Spec {
+                    program: std::path::PathBuf::from("/bin/true"),
+                    args: vec![],
+                    env: vec![],
+                    cwd: std::env::temp_dir(),
+                    stdin: hproc::proc_exec::StdioSpec::Null,
+                    stdout: hproc::proc_exec::StdioSpec::Piped,
+                    stderr: hproc::proc_exec::StdioSpec::Piped,
+                    setsid: false,
+                    ctty: false,
+                };
+                let out = r
+                    .runner
+                    .output(spec, c)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                // Carried out as the error message purely so the test can read
+                // it off the terminal frame.
+                anyhow::bail!(
+                    "SESSION[{}] STDOUT[{}]",
+                    r.runner.describe().key,
+                    String::from_utf8_lossy(&out.stdout).trim()
+                )
+            }
+        }
+
+        // The host's session: a wrapper, which is precisely what cannot be
+        // expressed as an environment.
+        let session: Arc<dyn hexec_runner::ExecSession> = Arc::new(
+            hexec_runner::WrapSession::new(
+                vec![OsString::from("/bin/echo"), OsString::from("wrapped:")],
+                hexec_runner::WrapEnv::Inherit,
+                vec![],
+                hexec_runner::SessionCaps {
+                    pty: false,
+                    max_concurrent: None,
+                    identity: hexec_runner::Identity::Asserted {
+                        why: "test".to_string(),
+                    },
+                },
+                hexec_runner::SessionDescription {
+                    runner: "//:wrap".to_string(),
+                    shell_functions: vec![],
+                    key: "k1".to_string(),
+                    summary: "test wrapper".to_string(),
+                },
+            )
+            .expect("wrap session"),
+        );
+        let ct: Arc<dyn Cancellable + Send + Sync> =
+            Arc::new(hcore::hasync::StdCancellationToken::new());
+        let service = hplugin_stabby::host::HostExecService::wrap_inline(session, ct);
+
+        let dynd = make_dyn_managed_driver(Arc::new(ExecDriver) as Arc<dyn ManagedDriver>);
+        let start = pb::RunInFrame {
+            msg: Some(pb::run_in_frame::Msg::Start(pb::ManagedRunRequest {
+                request_id: "r".into(),
+                // Non-empty: this is what says "a runner was resolved", and so
+                // routes the driver's exec back to the host.
+                runner_key: "k1".into(),
+                runner_addr: "//:wrap".into(),
+                target: Some(pb::TargetDef {
+                    raw_def: Some(pb::RawDefBlob {
+                        driver: String::new(),
+                        format: pb::raw_def_blob::Format::Json as i32,
+                        data: b"null".to_vec().into(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        }
+        .encode_to_vec();
+        let req_stream = make_item_stream(Box::new(std::iter::once(start)));
+
+        let resp = futures::executor::block_on(dynd.invoke_bidi(
+            pb::DriverMethod::Run as u32,
+            req_stream,
+            service,
+        ));
+        let frames = std::thread::spawn(move || {
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let b = resp.next();
+                if b.is_empty() {
+                    break;
+                }
+                out.push(b.to_vec());
+            }
+            out
+        })
+        .join()
+        .expect("drain");
+
+        let msg = frames
+            .iter()
+            .filter_map(|b| pb::RunOutFrame::decode(&b[..]).ok())
+            .find_map(|f| match f.msg {
+                Some(pb::run_out_frame::Msg::Error(m)) => Some(m),
+                _ => None,
+            })
+            .expect("the driver reports what it saw");
+
+        assert!(
+            msg.contains("wrapped: /bin/true"),
+            "the host did not apply the session — the driver ran /bin/true \
+             unwrapped, which is the silent degrade this lane removes. Got: {msg}"
+        );
+    }
 
     /// A runner that holds "one shell" open and routes every spawn through it,
     /// which is the shape a devenv session runner has.
@@ -3630,86 +3917,6 @@ mod tests {
         session.close().await.expect("close");
         session.close().await.expect("close again");
         assert_eq!(closed.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    /// A plugin cannot enter an environment that is more than an environment,
-    /// and must say so rather than run the target somewhere else.
-    ///
-    /// Only `runner_env` crosses this seam. Under `mode = "session"` the guest
-    /// used to rebuild an `EnvSession` from it and spawn locally with the
-    /// variables applied — never entering the shell — while echoing
-    /// `runner_key` back, so the host's ack could not tell the difference. A
-    /// silently-wrong build is the one outcome the ack exists to prevent.
-    #[test]
-    fn a_plugin_refuses_a_session_it_cannot_enter() {
-        let flat = pb::ManagedRunRequest {
-            runner_key: "k1".to_string(),
-            runner_addr: "//:devenv".to_string(),
-            driver: "go_compile".to_string(),
-            runner_opaque: false,
-            ..Default::default()
-        };
-        assert!(
-            guest_session(&flat).is_ok(),
-            "a pure environment is exactly what this seam can carry"
-        );
-
-        let opaque = pb::ManagedRunRequest {
-            runner_opaque: true,
-            ..flat
-        };
-        let err = match guest_session(&opaque) {
-            Ok(_) => panic!("an argv-rewriting session must not be reconstructed as an env"),
-            Err(e) => format!("{e:#}"),
-        };
-        // Names both ends and both ways out — the message is the whole fix for
-        // someone who hits it.
-        assert!(err.contains("go_compile"), "{err}");
-        assert!(err.contains("//:devenv"), "{err}");
-        assert!(err.contains("mode = \"snapshot\""), "{err}");
-    }
-
-    /// The host's half of the same contract: which sessions declare themselves
-    /// unsendable.
-    #[test]
-    fn only_environment_shaped_sessions_flatten() {
-        use hexec_runner::ExecSession as _;
-        assert!(hexec_runner::LocalSession::new().flattens_to_env());
-        assert!(
-            hexec_runner::EnvSession::new(vec![], caps_for_test(), desc_for_test())
-                .flattens_to_env()
-        );
-        assert!(
-            !hexec_runner::WrapSession::new(
-                vec![OsString::from("docker")],
-                hexec_runner::WrapEnv::Inherit,
-                vec![],
-                caps_for_test(),
-                desc_for_test(),
-            )
-            .expect("wrap")
-            .flattens_to_env(),
-            "the wrapper lives in argv, which does not cross"
-        );
-    }
-
-    fn caps_for_test() -> hexec_runner::SessionCaps {
-        hexec_runner::SessionCaps {
-            pty: true,
-            max_concurrent: None,
-            identity: hexec_runner::Identity::Asserted {
-                why: "test".to_string(),
-            },
-        }
-    }
-
-    fn desc_for_test() -> hexec_runner::SessionDescription {
-        hexec_runner::SessionDescription {
-            runner: "//:r".to_string(),
-            shell_functions: vec![],
-            key: "k".to_string(),
-            summary: "test".to_string(),
-        }
     }
 
     /// The capability that justified making this its own component: a runner

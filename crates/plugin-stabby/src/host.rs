@@ -2,9 +2,10 @@
 //! a loaded plugin can call back via direct stabby vtable dispatch.
 
 use crate::abi::{
-    DynArtifact, DynExecutor, DynFunctionRegistry, DynLogSink, DynRead, DynSupervisor,
-    NoteDepOutcome, QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent, StableExecutor,
-    StableFunctionRegistry, StableLogSink, StableRead, StableSupervisor, StatesOutcome,
+    DynArtifact, DynExecService, DynExecutor, DynFunctionRegistry, DynLogSink, DynRead,
+    DynSupervisor, NoteDepOutcome, QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent,
+    StableExecService, StableExecutor, StableFunctionRegistry, StableLogSink, StableRead,
+    StableSupervisor, StatesOutcome,
 };
 use crate::seam::panic_text;
 use crate::vtable::dynify;
@@ -578,6 +579,103 @@ impl StableExecutor for HostExecutor {
                 states: SVec::new(),
             },
         )))
+    }
+}
+
+/// Host side of [`StableExecService`]: creates a plugin driver's processes in the
+/// session the engine resolved for that target.
+///
+/// This is where a container's `docker exec` prefix and an agent session's
+/// client indirection are actually applied — in the host, which holds the real
+/// `ExecSession`. The guest sends a spec and reads back bytes; nothing about the
+/// session crosses, which is what lets a cdylib driver use every runner mode
+/// rather than only the environment-shaped ones.
+pub struct HostExecService {
+    session: Arc<dyn hexec_runner::ExecSession>,
+    ctoken: Arc<dyn hcore::hasync::Cancellable + Send + Sync>,
+    seam: SeamSpawn,
+}
+
+impl HostExecService {
+    /// `handle` is the host runtime. Spawning the body there is not optional:
+    /// this future is polled by a *guest* worker, and creating a process touches
+    /// the host reactor — doing that on a thread with no host runtime context
+    /// panics, and a panic at the extern seam aborts the process.
+    pub fn wrap(
+        session: Arc<dyn hexec_runner::ExecSession>,
+        ctoken: Arc<dyn hcore::hasync::Cancellable + Send + Sync>,
+        handle: tokio::runtime::Handle,
+    ) -> DynExecService {
+        dynify(stabby::boxed::Box::new(HostExecService {
+            session,
+            ctoken,
+            seam: SeamSpawn::on(handle, tracing::debug_span!("host_exec")),
+        }))
+    }
+
+    /// In-process variant for tests that drive the future themselves.
+    pub fn wrap_inline(
+        session: Arc<dyn hexec_runner::ExecSession>,
+        ctoken: Arc<dyn hcore::hasync::Cancellable + Send + Sync>,
+    ) -> DynExecService {
+        dynify(stabby::boxed::Box::new(HostExecService {
+            session,
+            ctoken,
+            seam: SeamSpawn::inline(tracing::debug_span!("host_exec")),
+        }))
+    }
+}
+
+fn exec_err_frame(message: String) -> SVec<u8> {
+    let f = pb::Frame {
+        id: 0,
+        body: Some(Body::Error(pb::Error {
+            kind: pb::error::Kind::Other as i32,
+            message,
+        })),
+    };
+    SVec::from(f.encode_to_vec().as_slice())
+}
+
+impl StableExecService for HostExecService {
+    extern "C" fn exec_output<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+        let session = Arc::clone(&self.session);
+        let ctoken = Arc::clone(&self.ctoken);
+        let decoded = pb::ExecOutputRequest::decode(&req[..]);
+        let key = decoded
+            .as_ref()
+            .map(|r| r.request_id.clone())
+            .unwrap_or_default();
+        let fut = async move {
+            let r = match decoded {
+                Ok(r) => r,
+                Err(e) => return exec_err_frame(format!("decode the exec request: {e}")),
+            };
+            let mut spec = convert::exec_spec_from_pb(r.spec.unwrap_or_default());
+            // The patch carries no stdio, so a spec rebuilt from it defaults —
+            // and this side is the one that actually spawns, so it has to be
+            // told what the caller wanted or it captures nothing.
+            spec.stdin = convert::stdio_kind_from_pb(r.stdin);
+            spec.stdout = convert::stdio_kind_from_pb(r.stdout);
+            spec.stderr = convert::stdio_kind_from_pb(r.stderr);
+            match session.output(spec, ctoken.as_ref()).await {
+                Ok(out) => {
+                    let f = pb::Frame {
+                        id: 0,
+                        body: Some(Body::ExecOutputResp(pb::ExecOutputResponse {
+                            code: out.status.code(),
+                            stdout: out.stdout.into(),
+                            stderr: out.stderr.into(),
+                        })),
+                    };
+                    SVec::from(f.encode_to_vec().as_slice())
+                }
+                Err(e) => exec_err_frame(format!("{e}")),
+            }
+        };
+        dynify(stabby::boxed::Box::new(async move {
+            self.seam.run("exec_output", key, fut, exec_err_frame).await
+        }))
     }
 }
 
