@@ -2271,6 +2271,7 @@ dependencies = [
  "parking_lot",
  "plugin",
  "plugin-buildfile",
+ "plugin-devenv",
  "plugin-exec",
  "plugin-http",
  "plugin-nix",
@@ -4074,6 +4075,39 @@ dependencies = [
  "tracing",
  "walk",
  "xstarlark-fmt",
+]
+
+[[package]]
+name = "plugin-devenv"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "driver-support",
+ "execrunner",
+ "model",
+ "plugin",
+ "proc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "plugin-devenv-cdylib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "driver-support",
+ "plugin",
+ "plugin-devenv",
+ "plugin-sdk",
+ "stabby",
+ "tracing",
 ]
 
 [[package]]

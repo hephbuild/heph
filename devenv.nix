@@ -53,7 +53,7 @@ let
   };
 
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p execrunner -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
+  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p execrunner -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-devenv -p plugin-devenv-cdylib -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
 in
 {
   # https://devenv.sh/basics/
@@ -371,10 +371,11 @@ in
       cp "$src/heph-go-plugin_''${os}_''${arch}.$ext"  "$dist/heph-go-plugin.$ext"
       cp "$src/heph-gha-plugin_''${os}_''${arch}.$ext" "$dist/heph-gha-plugin.$ext"
       cp "$src/heph-oci-plugin_''${os}_''${arch}.$ext" "$dist/heph-oci-plugin.$ext"
+      cp "$src/heph-devenv-plugin_''${os}_''${arch}.$ext" "$dist/heph-devenv-plugin.$ext"
     else
       # Local: build the same artifacts the build job builds, the same way (one
       # invocation so cargo overlaps their LTO tails — see heph.yml).
-      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib
+      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib
       out="$target/release"
 
       # cargo's build lock covers the build but not the gap between it and the
@@ -391,14 +392,15 @@ in
       fingerprint() {
         stat -c '%i %s %Y' "$@" 2>/dev/null || stat -f '%i %z %m' "$@"
       }
-      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext")"
+      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext")"
 
       cp "$out/heph"                       "$dist/heph"
       cp "$out/libplugin_go_cdylib.$ext"   "$dist/heph-go-plugin.$ext"
       cp "$out/libplugin_gha_cdylib.$ext"  "$dist/heph-gha-plugin.$ext"
       cp "$out/libplugin_oci_cdylib.$ext"  "$dist/heph-oci-plugin.$ext"
+      cp "$out/libplugin_devenv_cdylib.$ext" "$dist/heph-devenv-plugin.$ext"
 
-      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext")"
+      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext")"
       if [ "$before" != "$after" ]; then
         echo "e2e: $out changed while staging — another build in this" >&2
         echo "e2e: worktree raced this one. Re-run." >&2
@@ -408,7 +410,7 @@ in
       if [ "$os" = "darwin" ]; then
         # Same post-processing the shipped macOS artifacts get, so a local run
         # tests the same bytes CI would publish.
-        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext"; do
+        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext"; do
           bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$f"
         done
       fi
@@ -424,7 +426,7 @@ in
       # After macos-portable.sh, not before: both re-sign, and this one must
       # have the last word or the signature covers pre-patch bytes.
       version="$(bash "$DEVENV_ROOT/.github/workflows/version.sh")"
-      for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext"; do
+      for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext"; do
         bash "$DEVENV_ROOT/scripts/patch-slot.sh" "$f" "version=$version"
       done
     fi
@@ -533,6 +535,29 @@ in
     ( cd "$DEVENV_ROOT/tools/pluginmanifest" \
         && go run . -name gha -host-path "$name" -checksum-from "$dest/$name" -out "$dest/heph-gha-plugin.json" )
     echo "installed gha plugin -> $dest"
+  '';
+
+  # Build + install the devenv exec-runner plugin (a cdylib + manifest), the same
+  # publish flow as `install-gha-plugin`. Reference it from config with a
+  # `path: ~/.heph/plugins/devenv/heph-devenv-plugin.json` entry.
+  scripts.install-devenv-plugin.exec = ''
+    cargo build --release -p plugin-devenv-cdylib
+    target="$(target-dir)"
+    if [ "$(uname -s)" = "Darwin" ]; then
+      lib="$target/release/libplugin_devenv_cdylib.dylib"
+      name="heph-devenv-plugin.dylib"
+      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
+    else
+      lib="$target/release/libplugin_devenv_cdylib.so"
+      name="heph-devenv-plugin.so"
+    fi
+    dest="$HOME/.heph/plugins/devenv"
+    mkdir -p "$dest"
+    cp "$lib" "$dest/$name.new"
+    mv -f "$dest/$name.new" "$dest/$name"
+    ( cd "$DEVENV_ROOT/tools/pluginmanifest" \
+        && go run . -name devenv -host-path "$name" -checksum-from "$dest/$name" -out "$dest/heph-devenv-plugin.json" )
+    echo "installed devenv plugin -> $dest"
   '';
 
   scripts.install-dev-build.exec = ''

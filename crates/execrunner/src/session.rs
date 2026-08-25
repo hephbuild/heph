@@ -43,6 +43,12 @@ pub struct SessionConfig {
     /// argv that runs a command inside the environment. The agent invocation is
     /// appended to it.
     pub launch: Vec<String>,
+    /// Working directory for the *launch* command — not for targets, which get
+    /// their own sandbox cwd from the request. `devenv shell` resolves its
+    /// environment relative to where it runs, so a runner target that is not in
+    /// the devenv root has to say where the root is.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// A live agent.
@@ -167,27 +173,30 @@ impl SessionRunner {
 
         // `setsid` so the supervisor sidecar's killpg reaps the agent *and* the
         // environment wrapper around it on a hard shutdown.
-        let spec = proc_exec::Spec {
-            program,
-            args,
-            // The agent inherits heph's environment plus the socket path. Its
-            // own environment is never what a target gets — the agent
-            // `env_clear`s and applies exactly what the client forwards.
-            env: std::env::vars_os()
-                .chain(std::iter::once((
-                    OsString::from(SOCK_ENV),
-                    socket.clone().into_os_string(),
-                )))
-                .collect(),
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            stdin: proc_exec::StdioSpec::Null,
-            // Inherited so a failing `devenv shell` says why on heph's stderr
-            // rather than into a pipe nobody drains.
-            stdout: proc_exec::StdioSpec::Inherit,
-            stderr: proc_exec::StdioSpec::Inherit,
-            setsid: true,
-            ctty: false,
-        };
+        let spec =
+            proc_exec::Spec {
+                program,
+                args,
+                // The agent inherits heph's environment plus the socket path. Its
+                // own environment is never what a target gets — the agent
+                // `env_clear`s and applies exactly what the client forwards.
+                env: std::env::vars_os()
+                    .chain(std::iter::once((
+                        OsString::from(SOCK_ENV),
+                        socket.clone().into_os_string(),
+                    )))
+                    .collect(),
+                cwd: cfg.cwd.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+                }),
+                stdin: proc_exec::StdioSpec::Null,
+                // Inherited so a failing `devenv shell` says why on heph's stderr
+                // rather than into a pipe nobody drains.
+                stdout: proc_exec::StdioSpec::Inherit,
+                stderr: proc_exec::StdioSpec::Inherit,
+                setsid: true,
+                ctty: false,
+            };
 
         let agent = proc_exec::spawn(spec).map_err(|e| {
             anyhow::anyhow!(
@@ -336,6 +345,7 @@ mod tests {
     fn launch_argv_appends_the_agent_invocation() {
         let cfg = SessionConfig {
             launch: vec!["devenv".to_string(), "shell".to_string(), "--".to_string()],
+            cwd: None,
         };
         let (program, args) = build_launch_argv(
             &cfg,
@@ -374,7 +384,10 @@ mod tests {
 
     #[test]
     fn an_empty_launch_argv_is_rejected() {
-        let cfg = SessionConfig { launch: vec![] };
+        let cfg = SessionConfig {
+            launch: vec![],
+            cwd: None,
+        };
         build_launch_argv(&cfg, Path::new("/heph"), Path::new("/s.sock"))
             .expect_err("an empty launch argv has no command to run");
     }

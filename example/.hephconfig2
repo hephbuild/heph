@@ -36,6 +36,15 @@ plugins:
       # no release publishes: point it at a build target in *this* workspace, or
       # at a released tag's download target.
       #govet: "//@heph/go/govet/v0.1.234:heph-govet"
+  # The devenv exec runner: a `devenv_runner` target describes a devenv
+  # environment, and targets run inside it by naming that target with
+  # `runner = "//tools/devenv:runner"` — or the whole workspace does it once
+  # with `runner:` in the exec/bash driver options above. Installed to
+  # ~/.heph by `install-devenv-plugin`.
+  #- path: ~/.heph/plugins/devenv/heph-devenv-plugin.json
+  #  options:
+  #    # Which `devenv` to resolve against. Defaults to `devenv` on PATH.
+  #    bin: "devenv"
 #fuse:
 #  enabled: true
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus

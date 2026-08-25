@@ -1,0 +1,556 @@
+//! `devenv_runner` — a target that describes a [devenv](https://devenv.sh)
+//! environment, so other targets can run inside it.
+//!
+//! The output is a `runner.json`; that is the entire contract. Targets name
+//! this target with `runner = "//tools/devenv:runner"`, or a whole workspace
+//! does it once with the `exec`/`bash` driver's `runner:` option.
+//!
+//! # The plugin has no runner code, and that is deliberate
+//!
+//! Both modes reuse a builtin runner:
+//!
+//! - `wrap` captures the environment once, at *runner build time*, and emits it
+//!   as a literal env map. Targets then spawn locally with that environment —
+//!   no `devenv` process per target, no shell evaluation on the hot path.
+//! - `session` emits a `launch` argv and lets the builtin `session` runner hold
+//!   one `devenv shell` open for the whole build, running targets inside it via
+//!   the agent protocol.
+//!
+//! What this driver contributes is the *fingerprint*, and getting that right is
+//! the whole job (see [`fingerprint`](self#fingerprinting)).
+//!
+//! # Which mode
+//!
+//! `wrap` is the one most workspaces want: it is faster, it needs no agent, and
+//! its fingerprint is the strongest available because it *is* the environment.
+//! `session` earns its cost when the environment is not a set of variables —
+//! shell activation with side effects, services devenv starts, state under
+//! `.devenv/` — i.e. when what matters is process ancestry rather than
+//! `environ`.
+//!
+//! # Fingerprinting
+//!
+//! A consumer's cache key comes from this target's *hashout* — the bytes of the
+//! `runner.json`. If those bytes did not move when the environment did, every
+//! consumer would keep serving artifacts built in the old one. So both modes
+//! resolve the environment and fold a digest of it into the file, rather than
+//! hashing `devenv.nix` and hoping: `devenv.nix` is Nix source and can `import
+//! ./nix/rust.nix` or read `devenv.local.nix`, none of which the declared inputs
+//! see.
+//!
+//! The capture must also be a *pure function of declared inputs*, or the runner
+//! target's own hashout drifts per machine and every consumer full-misses
+//! forever. So `devenv` runs under a cleared environment populated only from
+//! [`TargetSpec::pass_env`], whose values are snapshotted and hashed at parse.
+//! Given a pinned input environment the output is deterministic, which is what
+//! makes taking the captured environment wholesale (minus per-process noise)
+//! sound rather than a denylist gamble.
+
+use anyhow::Context as _;
+use async_trait::async_trait;
+use hcore::hasync::Cancellable;
+use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hexecrunner::RunnerRef;
+use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
+use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::{
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
+    ParseResponse, TargetAddr,
+};
+use hplugin::htspec::Spec;
+use hproc::proc_exec;
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
+use xxhash_rust::xxh3::Xxh3;
+
+pub const DRIVER_NAME: &str = "devenv_runner";
+
+/// Bump to re-derive every runner this driver produced, when the shape of what
+/// it writes changes.
+const FORMAT_VERSION: u32 = 1;
+
+/// The file a runner target must produce.
+const OUT_FILE: &str = "runner.json";
+
+/// Host variables `devenv` itself needs to resolve an environment: to find the
+/// nix store and channels, to validate TLS for flake fetches, and to route
+/// through a corporate proxy. Mirrors the list `plugin-nix` passes to `nix`.
+///
+/// These are the *default* `pass_env`. They are snapshotted and hashed at parse
+/// like any other `pass_env`, so the capture stays a pure function of declared
+/// inputs — and so switching nixpkgs channels re-derives rather than serving a
+/// runner built against the old one.
+const DEFAULT_PASS_ENV: &[&str] = &[
+    "HOME",
+    "USER",
+    "PATH",
+    "NIX_PATH",
+    "NIX_SSL_CERT_FILE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+];
+
+/// Variables dropped from the *captured* environment.
+///
+/// Per-process bookkeeping the shell sets for itself, which would otherwise
+/// make the runner's hashout differ per invocation and full-miss every consumer
+/// on every build. This is a denylist, and it is only sound because the *input*
+/// environment is a strict hashed allowlist: with the input pinned, whatever
+/// devenv adds is a function of the declared inputs.
+const CAPTURE_DENY: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_", "TMPDIR", "TMP", "TEMP"];
+
+#[derive(Spec)]
+pub(crate) struct TargetSpec {
+    /// `wrap` (default) captures the environment and runs targets locally in it.
+    /// `session` holds one `devenv shell` open and runs targets inside it.
+    pub mode: String,
+    /// Directory containing `devenv.nix`, relative to this package. Defaults to
+    /// the package directory.
+    pub root: String,
+    /// devenv profile to enter, if any.
+    pub profile: String,
+    /// The environment's own files (`devenv.nix`, `devenv.lock`, `devenv.yaml`,
+    /// anything they import), as target addresses — typically a `glob`.
+    ///
+    /// These make the runner rebuild when the environment's definition changes.
+    /// They are not what the fingerprint is derived from: a `devenv.nix` can
+    /// import files nobody declared, so the fingerprint comes from the
+    /// *resolved* environment instead.
+    pub deps: Vec<String>,
+    /// Host environment variables `devenv` may see, hashed at parse.
+    /// Defaults to the set devenv needs to reach the nix store and the network.
+    pub pass_env: Vec<String>,
+}
+
+/// What `run` needs, and what the def hash is taken over.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct DevenvDef {
+    pub mode: Mode,
+    pub root: String,
+    pub profile: String,
+    /// Snapshotted at parse and hashed — this is what keeps the capture a pure
+    /// function of declared inputs.
+    pub pass_env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Mode {
+    Wrap,
+    Session,
+}
+
+impl Mode {
+    fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw {
+            "" | "wrap" => Ok(Self::Wrap),
+            "session" => Ok(Self::Session),
+            other => anyhow::bail!(
+                "devenv_runner: unknown mode {other:?}; expected \"wrap\" (capture the \
+                 environment, run targets locally in it) or \"session\" (hold one `devenv shell` \
+                 open and run targets inside it)"
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Driver {
+    /// The `devenv` binary. From the driver's `bin:` option so a workspace can
+    /// pin it; `devenv` off `PATH` otherwise.
+    devenv_bin: String,
+}
+
+impl Default for Driver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Driver {
+    pub fn new() -> Self {
+        Self {
+            devenv_bin: "devenv".to_string(),
+        }
+    }
+
+    pub fn from_options(opts: &hplugin::config::Options) -> anyhow::Result<Self> {
+        hplugin::config::deny_unknown("devenv_runner driver", opts, &["bin"])?;
+        let bin: Option<String> = hplugin::config::decode_opt(opts, "devenv_runner driver", "bin")?;
+        Ok(Self {
+            devenv_bin: bin
+                .filter(|b| !b.is_empty())
+                .unwrap_or_else(|| "devenv".to_string()),
+        })
+    }
+}
+
+#[async_trait]
+impl ManagedDriver for Driver {
+    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+        Ok(ConfigResponse {
+            name: DRIVER_NAME.to_string(),
+        })
+    }
+
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        TargetSpec::schema()
+    }
+
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse> {
+        let spec = TargetSpec::from(&req.target_spec.config)?;
+        let pkg = req.target_spec.addr.package.clone();
+        let mode = Mode::parse(&spec.mode)?;
+
+        let names: Vec<String> = if spec.pass_env.is_empty() {
+            DEFAULT_PASS_ENV.iter().map(|s| (*s).to_string()).collect()
+        } else {
+            spec.pass_env.clone()
+        };
+        // Snapshotted here, not read in `run`: these are *inputs*, and hashing
+        // them is what makes a changed `NIX_PATH` re-derive the environment
+        // instead of serving one captured against the old channel.
+        let pass_env: BTreeMap<String, String> = names
+            .into_iter()
+            .filter_map(|n| std::env::var(&n).ok().map(|v| (n, v)))
+            .collect();
+
+        let def = DevenvDef {
+            mode,
+            root: spec.root.clone(),
+            profile: spec.profile.clone(),
+            pass_env,
+        };
+
+        let mut h = Xxh3::new();
+        h.update(b"devenv_runner");
+        h.update(&FORMAT_VERSION.to_le_bytes());
+        h.update(format!("{:?}", def.mode).as_bytes());
+        h.update(def.root.as_bytes());
+        h.update(def.profile.as_bytes());
+        h.update(self.devenv_bin.as_bytes());
+        for (k, v) in &def.pass_env {
+            h.update(k.as_bytes());
+            h.update(b"=");
+            h.update(v.as_bytes());
+            h.update(b"\x1f");
+        }
+        let hash = format!("{:x}", h.digest()).into_bytes();
+
+        let inputs = spec
+            .deps
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                Ok(Input {
+                    r#ref: TargetAddr::parse(d, &pkg)?,
+                    mode: InputMode::Standard,
+                    origin_id: format!("devenv|{i}"),
+                    annotations: BTreeMap::new(),
+                    hashed: true,
+                    runtime: true,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let out_path = hmodel::htpkg::join_rel_checked(pkg.as_str(), OUT_FILE)
+            .with_context(|| format!("resolving {OUT_FILE} in package {pkg}"))?;
+
+        Ok(ParseResponse {
+            target_def: TargetDef {
+                addr: req.target_spec.addr.clone(),
+                labels: req.target_spec.labels.clone(),
+                raw_def: Arc::new(def),
+                inputs,
+                outputs: vec![Output {
+                    group: String::new(),
+                    paths: vec![OutPath {
+                        content: Content::FilePath(out_path),
+                        codegen_tree: CodegenMode::None,
+                        collect: true,
+                    }],
+                }],
+                support_files: vec![],
+                // Local yes, remote never. The captured environment names this
+                // machine's nix store paths; publishing it would let one host's
+                // answer key another's builds, which is the cross-machine
+                // mix-up the fingerprint exists to prevent.
+                cache: CacheConfig::on(false),
+                pty: false,
+                hash,
+                transparent: false,
+            },
+        })
+    }
+
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse> {
+        Ok(ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+
+    async fn run<'a, 'io>(
+        &self,
+        req: ManagedRunRequest<'a, 'io>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        let def = req.request.target.def_de::<DevenvDef>().clone();
+
+        // The devenv root, inside the sandbox: the declared deps were
+        // materialized here, so this is the copy whose content the build
+        // depends on.
+        let root = if def.root.is_empty() {
+            req.sandbox_pkg_dir.clone()
+        } else {
+            req.sandbox_pkg_dir.join(&def.root)
+        };
+
+        let captured = self
+            .capture_env(&root, &def, ctoken)
+            .await
+            .with_context(|| {
+                format!(
+                    "resolving the devenv environment in {root:?}. Both runner modes need it: \
+                     `wrap` uses it directly, and `session` needs its digest as the fingerprint \
+                     every consumer's cache key rests on."
+                )
+            })?;
+
+        let fingerprint = fingerprint_of(&captured);
+        let config = match def.mode {
+            Mode::Wrap => serde_json::json!({
+                "env": captured,
+            }),
+            Mode::Session => {
+                let mut launch = vec![self.devenv_bin.clone()];
+                if !def.profile.is_empty() {
+                    launch.push("--profile".to_string());
+                    launch.push(def.profile.clone());
+                }
+                launch.push("shell".to_string());
+                launch.push("--".to_string());
+                serde_json::json!({
+                    "launch": launch,
+                    // The launch resolves its environment relative to where it
+                    // runs, and the runner target's sandbox is gone by then —
+                    // so point it at the real tree, not the sandbox copy.
+                    "cwd": self.real_root(&req, &def),
+                })
+            }
+        };
+
+        let doc = serde_json::json!({
+            "version": 1,
+            "fingerprint": fingerprint,
+            "runner": match def.mode { Mode::Wrap => "wrap", Mode::Session => "session" },
+            "config": config,
+        });
+
+        let out = req.sandbox_pkg_dir.join(OUT_FILE);
+        tokio::fs::write(&out, serde_json::to_vec_pretty(&doc)?)
+            .await
+            .with_context(|| format!("write {out:?}"))?;
+
+        Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+}
+
+impl Driver {
+    /// The devenv root in the *real* tree.
+    ///
+    /// A session outlives the runner target's sandbox, which is deleted as soon
+    /// as the target is cached — so the launch command has to point at the
+    /// workspace, not at a directory that will be gone.
+    fn real_root(&self, req: &ManagedRunRequest<'_, '_>, def: &DevenvDef) -> String {
+        let pkg = req.request.target.addr.package.as_str();
+        let mut p = req.request.tree_root_path.clone();
+        if !pkg.is_empty() {
+            p = p.join(pkg);
+        }
+        if !def.root.is_empty() {
+            p = p.join(&def.root);
+        }
+        p.to_string_lossy().into_owned()
+    }
+
+    /// Ask devenv what environment it provides.
+    ///
+    /// `env -0`, not `env`: a value may legitimately contain a newline, and a
+    /// line-split capture would tear it in half and hand targets a truncated
+    /// variable.
+    async fn capture_env(
+        &self,
+        root: &std::path::Path,
+        def: &DevenvDef,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        let mut args: Vec<OsString> = Vec::new();
+        if !def.profile.is_empty() {
+            args.push(OsString::from("--profile"));
+            args.push(OsString::from(&def.profile));
+        }
+        args.push(OsString::from("shell"));
+        args.push(OsString::from("--"));
+        args.push(OsString::from("env"));
+        args.push(OsString::from("-0"));
+
+        let spec = proc_exec::Spec {
+            program: PathBuf::from(&self.devenv_bin),
+            args,
+            // Cleared, populated only from the hashed snapshot. This is what
+            // makes the capture reproducible rather than a photograph of
+            // whoever's shell happened to run the build.
+            env: def
+                .pass_env
+                .iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .collect(),
+            cwd: root.to_path_buf(),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Piped,
+            stderr: proc_exec::StdioSpec::Piped,
+            setsid: true,
+            ctty: false,
+        };
+
+        let out = hexecrunner::output(RunnerRef::local(), spec, ctoken)
+            .await
+            .with_context(|| format!("run `{} shell -- env -0`", self.devenv_bin))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("`{} shell` failed in {root:?}: {stderr}", self.devenv_bin);
+        }
+        Ok(parse_env0(&out.stdout))
+    }
+}
+
+/// Parse NUL-separated `KEY=VALUE` records, dropping per-process noise.
+fn parse_env0(bytes: &[u8]) -> BTreeMap<String, String> {
+    bytes
+        .split(|b| *b == 0)
+        .filter(|rec| !rec.is_empty())
+        .filter_map(|rec| {
+            let s = std::str::from_utf8(rec).ok()?;
+            let (k, v) = s.split_once('=')?;
+            if CAPTURE_DENY.contains(&k) {
+                return None;
+            }
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// A digest of the resolved environment.
+///
+/// Derived, never authored, and derived from the environment devenv actually
+/// produced rather than from the files it was asked to read — `devenv.nix` can
+/// import files nobody declared, so a source-file hash would miss exactly the
+/// change that matters.
+fn fingerprint_of(env: &BTreeMap<String, String>) -> String {
+    let mut h = Xxh3::new();
+    h.update(b"devenv/v1");
+    for (k, v) in env {
+        h.update(k.as_bytes());
+        h.update(b"=");
+        h.update(v.as_bytes());
+        h.update(b"\x1f");
+    }
+    format!("devenv:{:016x}", h.digest())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modes_parse_with_wrap_as_the_default() {
+        assert_eq!(Mode::parse("").expect("default"), Mode::Wrap);
+        assert_eq!(Mode::parse("wrap").expect("wrap"), Mode::Wrap);
+        assert_eq!(Mode::parse("session").expect("session"), Mode::Session);
+    }
+
+    #[test]
+    fn an_unknown_mode_explains_both_options() {
+        let err = Mode::parse("agent").expect_err("must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wrap"), "{msg}");
+        assert!(msg.contains("session"), "{msg}");
+    }
+
+    /// `env -0`, because a value may contain a newline and a line-split capture
+    /// would hand the target half of it.
+    #[test]
+    fn env0_survives_a_newline_in_a_value() {
+        let raw = b"A=1\nstill-a\0B=2\0";
+        let env = parse_env0(raw);
+        assert_eq!(env.get("A").map(String::as_str), Some("1\nstill-a"));
+        assert_eq!(env.get("B").map(String::as_str), Some("2"));
+    }
+
+    /// Per-process noise must not reach the capture: it would move the runner's
+    /// hashout on every invocation, and every consumer would full-miss forever
+    /// with nothing pointing at why.
+    #[test]
+    fn per_process_noise_is_dropped() {
+        let raw = b"PWD=/a\0SHLVL=3\0_=/usr/bin/env\0OLDPWD=/b\0KEEP=yes\0";
+        let env = parse_env0(raw);
+        assert_eq!(env.keys().collect::<Vec<_>>(), vec!["KEEP"]);
+    }
+
+    #[test]
+    fn an_empty_capture_still_fingerprints() {
+        assert!(fingerprint_of(&BTreeMap::new()).starts_with("devenv:"));
+    }
+
+    /// The fingerprint must move when the environment does — that is the whole
+    /// reason it exists, and the property a consumer's cache key rests on.
+    #[test]
+    fn the_fingerprint_tracks_the_environment() {
+        let a = BTreeMap::from([("PATH".to_string(), "/nix/store/aaa/bin".to_string())]);
+        let b = BTreeMap::from([("PATH".to_string(), "/nix/store/bbb/bin".to_string())]);
+        assert_ne!(fingerprint_of(&a), fingerprint_of(&b));
+        assert_eq!(fingerprint_of(&a), fingerprint_of(&a.clone()));
+    }
+
+    /// A variable appearing or vanishing is an environment change too.
+    #[test]
+    fn the_fingerprint_notices_an_added_variable() {
+        let a = BTreeMap::from([("A".to_string(), "1".to_string())]);
+        let mut b = a.clone();
+        b.insert("B".to_string(), "2".to_string());
+        assert_ne!(fingerprint_of(&a), fingerprint_of(&b));
+    }
+
+    #[test]
+    fn from_options_reads_the_binary_and_rejects_unknown_keys() {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "bin".to_string(),
+            serde_yaml::from_str("\"/nix/store/x/bin/devenv\"").expect("yaml"),
+        );
+        let d = Driver::from_options(&opts).expect("options");
+        assert_eq!(d.devenv_bin, "/nix/store/x/bin/devenv");
+
+        let mut bad = hplugin::config::Options::new();
+        bad.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
+        Driver::from_options(&bad).expect_err("unknown key must be rejected");
+    }
+}
