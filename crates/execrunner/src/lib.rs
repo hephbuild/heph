@@ -30,8 +30,10 @@
 //! uninstalled host with a non-local runner is a hard error, never a silent
 //! fall back to a local spawn — see [`prepare`].
 
+pub mod agent;
 pub mod config;
 pub mod registry;
+pub mod session;
 
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;

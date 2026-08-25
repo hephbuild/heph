@@ -33,6 +33,18 @@ fn main() -> ExitCode {
         heph::process_supervisor::run_supervisor_main(fd);
     }
 
+    // The two exec-runner subcommands, dispatched here for the same reason:
+    // they must not pull in logging, a runtime, clap or the TUI. Unlike
+    // `__supervisor` these are a pure prefix strip — `__runner-exec`'s argv IS
+    // the target's argv, so parsing it as flags would misread the target's own
+    // options — and they read `args_os`, because a non-UTF-8 filename would
+    // panic `args()`.
+    match parse_runner_args() {
+        Some(RunnerInvocation::Client { argv }) => hexecrunner::agent::client_main(argv),
+        Some(RunnerInvocation::Agent { socket }) => hexecrunner::agent::agent_main(socket),
+        None => {}
+    }
+
     // Dynamic shell completion. A no-op unless the `COMPLETE` env var is set
     // (a tab press or `heph tool completions` registration), in which case it
     // emits candidates / the registration script and exits the process. Runs
@@ -171,6 +183,46 @@ fn main() -> ExitCode {
     }
 
     result
+}
+
+/// The hidden exec-runner invocations.
+enum RunnerInvocation {
+    /// `heph __runner-exec -- <program> <args…>` — the per-target client heph
+    /// forks in the target's place.
+    Client { argv: Vec<std::ffi::OsString> },
+    /// `heph __runner-agent --socket <path>` — the long-lived helper that lives
+    /// inside a held-open environment.
+    Agent { socket: std::path::PathBuf },
+}
+
+/// Detect either exec-runner subcommand.
+///
+/// `args_os`, not `args`: the client's argv is the target's own, and a target
+/// argument that is not valid UTF-8 is legal on every supported target — a
+/// `String`-based scan would panic the client before it ever reached the agent.
+fn parse_runner_args() -> Option<RunnerInvocation> {
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next()?;
+    if first == hexecrunner::agent::CLIENT_SUBCOMMAND {
+        // Everything after the `--` separator is the target's, verbatim.
+        let sep = args.next()?;
+        if sep != "--" {
+            return None;
+        }
+        return Some(RunnerInvocation::Client {
+            argv: args.collect(),
+        });
+    }
+    if first == hexecrunner::agent::AGENT_SUBCOMMAND {
+        let flag = args.next()?;
+        if flag != "--socket" {
+            return None;
+        }
+        return Some(RunnerInvocation::Agent {
+            socket: std::path::PathBuf::from(args.next()?),
+        });
+    }
+    None
 }
 
 /// Detect the hidden `__supervisor --ipc-fd <N>` invocation without dragging

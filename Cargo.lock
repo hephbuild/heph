@@ -1712,12 +1712,16 @@ dependencies = [
  "anyhow",
  "async-trait",
  "core",
+ "libc",
  "model",
  "proc",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

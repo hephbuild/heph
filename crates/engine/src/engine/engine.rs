@@ -458,7 +458,19 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             hooks: vec![],
             requests: Mutex::new(HashMap::new()),
-            exec_runners: Arc::new(hexecrunner::registry::RunnerRegistry::with_builtins()),
+            exec_runners: Arc::new({
+                let mut registry = hexecrunner::registry::RunnerRegistry::with_builtins();
+                // The agent-mode runner needs a directory for its sockets, and
+                // is handed one rather than discovering `$TMPDIR`: a macOS
+                // `sun_path` is 104 bytes and a macOS `$TMPDIR` is most of that
+                // on its own. heph controls the depth of its own home.
+                registry
+                    .register(Arc::new(hexecrunner::session::SessionRunner::new(
+                        home.join("run"),
+                    )))
+                    .context("register the builtin session exec runner")?;
+                registry
+            }),
             result_permits: {
                 let pool = crate::engine::worker_pool::WorkerPool::new(max_workers);
                 // Two readers of the same pool, for two different lines: the

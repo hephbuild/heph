@@ -15,6 +15,11 @@ async-trait = "0.1"
 tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+rustix = { version = "1.1", features = ["net", "fs", "process"] }
+libc = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
