@@ -1,0 +1,18 @@
+[package]
+name = "execrunner"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hmodel = { package = "model", path = "../model" }
+hproc = { package = "proc", path = "../proc" }
+anyhow = "1.0.102"
+async-trait = "0.1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }

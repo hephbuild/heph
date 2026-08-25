@@ -7,6 +7,7 @@ use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -439,7 +440,7 @@ impl ManagedDriver for GoGolistDriver {
             ctty: false,
         };
 
-        let output = proc_exec::output(spec, ctoken)
+        let output = hexecrunner::output(RunnerRef::local(), spec, ctoken)
             .await
             .with_context(|| format!("wait for go list for {}", def.import_path))?;
 

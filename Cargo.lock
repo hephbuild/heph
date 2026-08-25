@@ -1705,6 +1705,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "execrunner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "model",
+ "proc",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2231,6 +2244,7 @@ dependencies = [
  "enclose",
  "engine",
  "erased-serde 0.4.10",
+ "execrunner",
  "flate2",
  "futures",
  "glob",
@@ -4065,6 +4079,7 @@ dependencies = [
  "crossterm",
  "driver-support",
  "enclose",
+ "execrunner",
  "glob",
  "libc",
  "minijinja",
@@ -4121,6 +4136,7 @@ dependencies = [
  "core",
  "driver-support",
  "enclose",
+ "execrunner",
  "flate2",
  "futures",
  "glob",
@@ -4186,6 +4202,7 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
+ "execrunner",
  "model",
  "plugin",
  "proc",
@@ -4208,6 +4225,7 @@ dependencies = [
  "core",
  "docker_credential",
  "driver-support",
+ "execrunner",
  "futures",
  "model",
  "oci-client",

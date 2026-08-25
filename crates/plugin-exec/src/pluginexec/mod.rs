@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+use hexecrunner::RunnerRef;
 use hplugin::driver::sandbox::EnvValue;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{Input, InputMode, Output, TargetDef as EngineTargetDef};
@@ -1455,7 +1456,12 @@ impl Driver {
         // and `req` are still fully owned locals at this point (only cloned
         // versions of their fields were moved into `spec` above), so no work
         // happens on the far more common spawn-succeeds path.
-        let mut handle = proc_exec::spawn(spec).map_err(|e| {
+        // PR 01 wires the seam with the local runner at every site; the
+        // `runner` field that makes this non-local lands next. The spawn error
+        // stays a typed `io::Error` so the NotFound arm below can still render
+        // the sandbox-PATH diagnostic.
+        let (spawned, _) = hexecrunner::spawn_io(RunnerRef::local(), spec, ctoken).await?;
+        let mut handle = spawned.map_err(|e| {
             let program = run.first().map_or("", String::as_str);
             if e.kind() == std::io::ErrorKind::NotFound {
                 anyhow::anyhow!(

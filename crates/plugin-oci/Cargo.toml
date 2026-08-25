@@ -11,6 +11,7 @@ hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }
 hproc = { package = "proc", path = "../proc" }
+hexecrunner = { package = "execrunner", path = "../execrunner" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
 futures = "0.3.32"
 anyhow = "1.0.102"
