@@ -547,6 +547,7 @@ impl ProviderTrait for Provider {
                             ("runtime_env", ParamType::map(ParamType::String)),
                             ("runtime_pass_env", ParamType::list(ParamType::String)),
                             ("pre_run", ParamType::list(ParamType::String)),
+                            ("runner", ParamType::String),
                         ]),
                     ]),
                     "Test settings for this package. `test = False` skips its tests, \
@@ -557,7 +558,11 @@ impl ProviderTrait for Provider {
                      `env`/`runtime_env` (map[string]) and \
                      `pass_env`/`runtime_pass_env` (list[string]) set env, and \
                      `pre_run` (list[string]) runs shell lines before the test binary \
-                     (switching the target to the bash driver). By default applies \
+                     (switching the target to the bash driver), and `runner` (string) \
+                     names an exec-runner target so the tests run inside a described \
+                     environment — a devenv shell or a container — instead of on the \
+                     bare host. The runner is a hashed dependency, so changing the \
+                     environment re-keys every test under it. By default applies \
                      only to this package; set `recursive = True` to apply to \
                      descendant packages too.",
                 ),
@@ -1215,6 +1220,7 @@ const TEST_STATE_KEYS: &[&str] = &[
     "pass_env",
     "runtime_pass_env",
     "pre_run",
+    "runner",
 ];
 
 /// Whether a state opts its per-package config into descendant packages via
@@ -1282,6 +1288,11 @@ fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test
         if let Some(v) = test_map.get("pre_run") {
             out.pre_run
                 .extend(parse_strings(v).context("parsing test pre_run from go provider_state")?);
+        }
+        if let Some(Value::String(runner)) = test_map.get("runner")
+            && !runner.is_empty()
+        {
+            out.runner = Some(runner.clone());
         }
     }
     Ok(out)
@@ -6861,6 +6872,46 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         )];
         let env = pick_test_env(&states, "foo").unwrap();
         assert_eq!(env.pre_run, vec!["a", "b", "c"]);
+    }
+
+    /// The `test = {"runner": ...}` state is how a package says its tests run
+    /// somewhere other than the bare host — a devenv shell, a container.
+    #[test]
+    fn pick_test_env_reads_the_runner() {
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![("runner", Value::String("//tools/devenv:runner".to_string()))],
+        )];
+        let env = pick_test_env(&states, "foo").unwrap();
+        assert_eq!(env.runner.as_deref(), Some("//tools/devenv:runner"));
+    }
+
+    /// Absent is the overwhelmingly common case and must stay distinguishable
+    /// from empty: an empty string is not an address, and emitting one would
+    /// fail the target rather than mean "no runner".
+    #[test]
+    fn pick_test_env_runner_is_absent_by_default_and_when_empty() {
+        let none = pick_test_env(&[], "foo").unwrap();
+        assert_eq!(none.runner, None);
+
+        let empty = vec![state_with_test_map(
+            "foo",
+            vec![("runner", Value::String(String::new()))],
+        )];
+        assert_eq!(pick_test_env(&empty, "foo").unwrap().runner, None);
+    }
+
+    /// A typo in the `test = {...}` map must be rejected by name rather than
+    /// silently dropped — otherwise a misspelled `runner` reads as "my tests
+    /// run in devenv" while they run on the host.
+    #[test]
+    fn pick_test_env_rejects_an_unknown_key() {
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![("runnr", Value::String("//x:y".to_string()))],
+        )];
+        let err = pick_test_env(&states, "foo").expect_err("typo must be rejected");
+        assert!(format!("{err:#}").contains("runnr"), "{err:#}");
     }
 
     #[test]

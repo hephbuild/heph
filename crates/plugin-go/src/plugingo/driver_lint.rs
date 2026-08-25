@@ -31,7 +31,6 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -129,6 +128,12 @@ struct GoLintSpec {
     deps: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths.
     out: HashMap<String, Vec<String>>,
+    /// Exec runner this tool runs under: a target address producing a
+    /// `runner.json`, so the tool runs inside a described environment (a devenv
+    /// shell, a container) instead of on the bare host. Absent, or the literal
+    /// `"local"`, spawns here as before. A hashed dependency, so changing the
+    /// environment re-keys this target.
+    runner: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -140,6 +145,10 @@ struct GoLintDef {
     build_tags: Vec<String>,
     goexperiment: Vec<String>,
     import_paths: Vec<String>,
+    /// Exec runner for this target's tool. Deliberately absent from `Hash` —
+    /// see `plugingo::runner`: it reaches the cache key through the hashout of
+    /// the input `parse` emits, exactly as a `hash_dep` does.
+    runner: Option<TargetAddr>,
 }
 
 /// Bump to invalidate every cached `go_lint` result whenever the cfg shape or
@@ -253,7 +262,11 @@ impl ManagedDriver for GoLintDriver {
             }
         }
 
+        let (runner, runner_input) = super::runner::parse_runner(&spec.runner, &pkg)?;
+        inputs.extend(runner_input);
+
         let def = GoLintDef {
+            runner,
             import_path: spec.import_path,
             goos: spec.goos,
             goarch: spec.goarch,
@@ -423,6 +436,7 @@ impl ManagedDriver for GoLintDriver {
                 ],
                 &env,
                 pkg_dir,
+                super::runner::runner_ref(req.request.request_id, def.runner.as_ref()),
                 ctoken,
             )
             .await?;
@@ -500,6 +514,7 @@ impl GoLintDriver {
         args: Vec<OsString>,
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
+        runner: hexecrunner::RunnerRef<'_>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<Vec<u8>> {
         let env_pairs: Vec<(OsString, OsString)> = env
@@ -517,7 +532,7 @@ impl GoLintDriver {
             setsid: false,
             ctty: false,
         };
-        let output = hexecrunner::output(RunnerRef::local(), spec, ctoken)
+        let output = hexecrunner::output(runner, spec, ctoken)
             .await
             .context("wait for heph-govet")?;
         if !output.status.success() {

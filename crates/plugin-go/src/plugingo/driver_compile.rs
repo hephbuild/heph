@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -123,6 +122,12 @@ struct GoCompileSpec {
     deps: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths.
     out: HashMap<String, Vec<String>>,
+    /// Exec runner this tool runs under: a target address producing a
+    /// `runner.json`, so the tool runs inside a described environment (a devenv
+    /// shell, a container) instead of on the bare host. Absent, or the literal
+    /// `"local"`, spawns here as before. A hashed dependency, so changing the
+    /// environment re-keys this target.
+    runner: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -144,6 +149,10 @@ struct GoCompileDef {
     golist_origin_id: Option<String>,
     /// origin_ids of the `go_embed_src` inputs (assets `go list` never saw).
     embed_src_origin_ids: Vec<String>,
+    /// Exec runner for this target's tool. Deliberately absent from `Hash` —
+    /// see `plugingo::runner`: it reaches the cache key through the hashout of
+    /// the input `parse` emits, exactly as a `hash_dep` does.
+    runner: Option<TargetAddr>,
 }
 
 /// Bump to invalidate every cached `go_compile` archive whenever the compile
@@ -286,7 +295,11 @@ impl ManagedDriver for GoCompileDriver {
             })?
         };
 
+        let (runner, runner_input) = super::runner::parse_runner(&spec.runner, &pkg)?;
+        inputs.extend(runner_input);
+
         let def = GoCompileDef {
+            runner,
             p_flag: spec.p_flag,
             out_file: spec.out_file,
             goos: spec.goos,
@@ -462,6 +475,11 @@ impl ManagedDriver for GoCompileDriver {
         let run_go =
             |args: Vec<String>| -> Vec<OsString> { args.into_iter().map(OsString::from).collect() };
 
+        // Every `go tool` step below runs under the target's exec runner, so a
+        // compile configured to happen inside an environment happens there for
+        // asm and pack too, not only for the compile itself.
+        let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
+
         // 4. asm step 0+1: seed go_asm.h, then -gensymabis → symabis.
         if has_asm {
             std::fs::write(pkg_dir.join("go_asm.h"), b"").context("seed go_asm.h")?;
@@ -494,6 +512,7 @@ impl ManagedDriver for GoCompileDriver {
                 run_go(args),
                 &env,
                 pkg_dir,
+                runner,
                 ctoken,
                 "asm -gensymabis",
             )
@@ -534,8 +553,16 @@ impl ManagedDriver for GoCompileDriver {
         cargs.push("-o".to_string());
         cargs.push(def.out_file.clone());
         cargs.push(format!("@{}", rsp_path.to_string_lossy()));
-        self.exec_go(&go_bin, run_go(cargs), &env, pkg_dir, ctoken, "compile")
-            .await?;
+        self.exec_go(
+            &go_bin,
+            run_go(cargs),
+            &env,
+            pkg_dir,
+            runner,
+            ctoken,
+            "compile",
+        )
+        .await?;
 
         // 6. asm step 3+4: assemble each .s, then pack into the archive.
         if has_asm {
@@ -558,7 +585,7 @@ impl ManagedDriver for GoCompileDriver {
                 ];
                 args.extend(shared.map(str::to_string));
                 args.extend(["-o".to_string(), obj, format!("./{s}")]);
-                self.exec_go(&go_bin, run_go(args), &env, pkg_dir, ctoken, "asm")
+                self.exec_go(&go_bin, run_go(args), &env, pkg_dir, runner, ctoken, "asm")
                     .await?;
             }
             let mut pargs = vec![
@@ -570,8 +597,16 @@ impl ManagedDriver for GoCompileDriver {
             for s in &def.s_files {
                 pargs.push(format!("{}.o", s.trim_end_matches(".s")));
             }
-            self.exec_go(&go_bin, run_go(pargs), &env, pkg_dir, ctoken, "pack")
-                .await?;
+            self.exec_go(
+                &go_bin,
+                run_go(pargs),
+                &env,
+                pkg_dir,
+                runner,
+                ctoken,
+                "pack",
+            )
+            .await?;
         }
 
         Ok(ManagedRunResponse { artifacts: vec![] })
@@ -708,6 +743,7 @@ impl GoCompileDriver {
         args: Vec<OsString>,
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
+        runner: hexecrunner::RunnerRef<'_>,
         ctoken: &(dyn Cancellable + Send + Sync),
         step: &str,
     ) -> anyhow::Result<()> {
@@ -726,7 +762,7 @@ impl GoCompileDriver {
             setsid: false,
             ctty: false,
         };
-        let output = hexecrunner::output(RunnerRef::local(), spec, ctoken)
+        let output = hexecrunner::output(runner, spec, ctoken)
             .await
             .with_context(|| format!("wait for go {step}"))?;
         if !output.status.success() {
@@ -1297,6 +1333,7 @@ mod driver_tests {
 
     fn compile_def(race: bool) -> GoCompileDef {
         GoCompileDef {
+            runner: None,
             p_flag: "example.com/mylib".to_string(),
             out_file: "x.a".to_string(),
             goos: "linux".to_string(),
@@ -1317,6 +1354,7 @@ mod driver_tests {
     #[test]
     fn compile_def_hash_invariant_under_import_path_permutation() {
         let mk = |ips: &[&str]| GoCompileDef {
+            runner: None,
             p_flag: "example.com/mylib".to_string(),
             out_file: "x.a".to_string(),
             goos: "linux".to_string(),

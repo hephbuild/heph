@@ -18,7 +18,6 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -79,6 +78,7 @@ async fn exec_govet(
     args: Vec<OsString>,
     env: &HashMap<String, String>,
     cwd: &std::path::Path,
+    runner: hexecrunner::RunnerRef<'_>,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
     let env_pairs: Vec<(OsString, OsString)> = env
@@ -96,7 +96,7 @@ async fn exec_govet(
         setsid: false,
         ctty: false,
     };
-    let output = hexecrunner::output(RunnerRef::local(), spec, ctoken)
+    let output = hexecrunner::output(runner, spec, ctoken)
         .await
         .context("wait for heph-govet -format")?;
     Ok((output.status.code(), output.stdout, output.stderr))
@@ -112,11 +112,21 @@ struct GoFormatSpec {
     /// Declared outputs (fix driver only): the `.go` files, written back in
     /// place. Absent for the check driver.
     out: HashMap<String, Vec<String>>,
+    /// Exec runner this tool runs under: a target address producing a
+    /// `runner.json`, so the tool runs inside a described environment (a devenv
+    /// shell, a container) instead of on the bare host. Absent, or the literal
+    /// `"local"`, spawns here as before. A hashed dependency, so changing the
+    /// environment re-keys this target.
+    runner: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct GoFormatDef {
     check: bool,
+    /// Exec runner for `gofmt`. Deliberately absent from `Hash` — see
+    /// `plugingo::runner`: it reaches the cache key through the hashout of the
+    /// input `parse` emits, exactly as a `hash_dep` does.
+    runner: Option<hplugin::driver::TargetAddr>,
 }
 
 impl Hash for GoFormatDef {
@@ -206,7 +216,9 @@ impl ManagedDriver for GoFormatDriver {
         let pkg = req.target_spec.addr.package.clone();
         let pkg_str = pkg.as_str();
         let spec = GoFormatSpec::from(&req.target_spec.config).context("parse go_format")?;
-        let inputs = parse_inputs(&spec, &pkg)?;
+        let mut inputs = parse_inputs(&spec, &pkg)?;
+        let (runner, runner_input) = super::runner::parse_runner(&spec.runner, &pkg)?;
+        inputs.extend(runner_input);
 
         let outputs: Vec<Output> = spec
             .out
@@ -235,7 +247,11 @@ impl ManagedDriver for GoFormatDriver {
             let mut h = DebugHasher::new(Xxh3Default::new(), || {
                 format!("go_format_{}", req.target_spec.addr.format())
             });
-            GoFormatDef { check: false }.hash(&mut h);
+            GoFormatDef {
+                check: false,
+                runner: None,
+            }
+            .hash(&mut h);
             format!("{:x}", h.finish()).into_bytes()
         };
 
@@ -243,7 +259,10 @@ impl ManagedDriver for GoFormatDriver {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
-                raw_def: Arc::new(GoFormatDef { check: false }),
+                raw_def: Arc::new(GoFormatDef {
+                    check: false,
+                    runner: runner.clone(),
+                }),
                 inputs,
                 outputs,
                 support_files: vec![],
@@ -271,6 +290,8 @@ impl ManagedDriver for GoFormatDriver {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let pkg_dir = &req.sandbox_pkg_dir;
+        let def = req.request.target.def_de::<GoFormatDef>();
+        let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
         let (bin, env) = govet_bin_and_config(&req)?;
         let files = staged_paths_in_group(&req, "");
         if files.is_empty() {
@@ -278,7 +299,7 @@ impl ManagedDriver for GoFormatDriver {
         }
         let args = vec![OsString::from("-format"), arg_file(pkg_dir, &files)?];
 
-        let (code, _stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, ctoken).await?;
+        let (code, _stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
         if code != Some(0) {
             anyhow::bail!(
                 "heph-govet -format failed ({code:?}):\n{}",
@@ -327,13 +348,19 @@ impl ManagedDriver for GoFormatCheckDriver {
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
         let spec = GoFormatSpec::from(&req.target_spec.config).context("parse go_format_check")?;
-        let inputs = parse_inputs(&spec, &pkg)?;
+        let mut inputs = parse_inputs(&spec, &pkg)?;
+        let (runner, runner_input) = super::runner::parse_runner(&spec.runner, &pkg)?;
+        inputs.extend(runner_input);
 
         let hash = {
             let mut h = DebugHasher::new(Xxh3Default::new(), || {
                 format!("go_format_check_{}", req.target_spec.addr.format())
             });
-            GoFormatDef { check: true }.hash(&mut h);
+            GoFormatDef {
+                check: true,
+                runner: None,
+            }
+            .hash(&mut h);
             format!("{:x}", h.finish()).into_bytes()
         };
 
@@ -341,7 +368,10 @@ impl ManagedDriver for GoFormatCheckDriver {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
-                raw_def: Arc::new(GoFormatDef { check: true }),
+                raw_def: Arc::new(GoFormatDef {
+                    check: true,
+                    runner: runner.clone(),
+                }),
                 inputs,
                 outputs: vec![],
                 support_files: vec![],
@@ -369,6 +399,8 @@ impl ManagedDriver for GoFormatCheckDriver {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let pkg_dir = &req.sandbox_pkg_dir;
+        let def = req.request.target.def_de::<GoFormatDef>();
+        let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
         let (bin, env) = govet_bin_and_config(&req)?;
         let files = staged_paths_in_group(&req, "");
         if files.is_empty() {
@@ -380,7 +412,7 @@ impl ManagedDriver for GoFormatCheckDriver {
             arg_file(pkg_dir, &files)?,
         ];
 
-        let (code, stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, ctoken).await?;
+        let (code, stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
         match code {
             Some(0) => Ok(ManagedRunResponse { artifacts: vec![] }),
             // Exit 1 = files need formatting; the tool prints them to stdout.

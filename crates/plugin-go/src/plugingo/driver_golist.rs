@@ -7,7 +7,6 @@ use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -79,6 +78,12 @@ struct GoGolistSpec {
     deps: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths.
     out: HashMap<String, Vec<String>>,
+    /// Exec runner this tool runs under: a target address producing a
+    /// `runner.json`, so the tool runs inside a described environment (a devenv
+    /// shell, a container) instead of on the bare host. Absent, or the literal
+    /// `"local"`, spawns here as before. A hashed dependency, so changing the
+    /// environment re-keys this target.
+    runner: String,
 }
 
 impl GoGolistDriver {
@@ -127,6 +132,10 @@ struct GoGolistDef {
     thirdparty_download_addr: Option<String>,
     /// See [`GoGolistSpec::firstparty`].
     firstparty: bool,
+    /// Exec runner for this target's tool. Deliberately absent from `Hash` —
+    /// see `plugingo::runner`: it reaches the cache key through the hashout of
+    /// the input `parse` emits, exactly as a `hash_dep` does.
+    runner: Option<TargetAddr>,
 }
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
@@ -226,7 +235,11 @@ impl ManagedDriver for GoGolistDriver {
             }
         }
 
+        let (runner, runner_input) = super::runner::parse_runner(&spec.runner, &pkg)?;
+        dep_inputs.extend(runner_input);
+
         let def = GoGolistDef {
+            runner,
             import_path: spec.import_path,
             goos: spec.goos,
             goarch: spec.goarch,
@@ -440,9 +453,13 @@ impl ManagedDriver for GoGolistDriver {
             ctty: false,
         };
 
-        let output = hexecrunner::output(RunnerRef::local(), spec, ctoken)
-            .await
-            .with_context(|| format!("wait for go list for {}", def.import_path))?;
+        let output = hexecrunner::output(
+            super::runner::runner_ref(req.request.request_id, def.runner.as_ref()),
+            spec,
+            ctoken,
+        )
+        .await
+        .with_context(|| format!("wait for go list for {}", def.import_path))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -982,6 +999,7 @@ mod tests {
 
     fn def_with(with_test: bool, build_tags: Vec<String>) -> GoGolistDef {
         GoGolistDef {
+            runner: None,
             import_path: "example.com/mylib".to_string(),
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),

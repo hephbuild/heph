@@ -22,6 +22,15 @@ pub struct TestEnv {
     /// Shell lines run before the test binary. When non-empty the `test`/`xtest`
     /// target switches from the `exec` driver to the `bash` driver.
     pub pre_run: Vec<String>,
+    /// Exec runner the test runs under: a target address producing a
+    /// `runner.json`, so a package's tests execute inside a described
+    /// environment (a devenv shell, a container) rather than on the bare host.
+    ///
+    /// Reaches the generated target as the exec driver's own `runner` field —
+    /// which is why `runner` lives on that driver rather than in a Go-specific
+    /// mechanism. It is a hashed dependency there, so changing the environment
+    /// re-keys the test.
+    pub runner: Option<String>,
 }
 
 /// Shared `go_compile` builder for the test/xtest/testmain lib compiles.
@@ -318,6 +327,12 @@ pub fn test_spec(
             "runtime_pass_env".to_string(),
             str_list_value(&test_env.runtime_pass_env),
         );
+    }
+    // Omitted when unset, like every other key here: an always-present field
+    // would change the spec — and so the cache fingerprint — of every existing
+    // test target in every workspace, for a feature nobody enabled.
+    if let Some(runner) = &test_env.runner {
+        config.insert("runner".to_string(), Value::String(runner.clone()));
     }
 
     // A race target deliberately does NOT carry the generic `test`/`go-test`
@@ -822,6 +837,7 @@ mod tests {
     #[test]
     fn test_test_spec_plumbs_all_env_knobs() {
         let test_env = TestEnv {
+            runner: None,
             env: BTreeMap::from([("FOO".to_string(), "1".to_string())]),
             runtime_env: BTreeMap::from([("BAR".to_string(), "2".to_string())]),
             pass_env: vec!["HOME".to_string()],
@@ -970,6 +986,43 @@ mod tests {
         );
         assert!(s.contains("//mypkg"), "must filter by package: {s}");
         assert_eq!(s, qa.format());
+    }
+
+    /// The runner reaches the generated target as the exec driver's own
+    /// `runner` field. That is the whole reason `runner` lives on that driver:
+    /// the Go side is a pass-through, and gets the hashing for free.
+    #[test]
+    fn test_test_spec_passes_the_runner_through() {
+        let test_env = TestEnv {
+            runner: Some("//tools/devenv:runner".to_string()),
+            ..TestEnv::default()
+        };
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            mk_addr("mypkg", "build_test"),
+            &query_addr("mypkg"),
+            &test_env,
+            false,
+        );
+        assert_eq!(
+            spec.config.get("runner"),
+            Some(&Value::String("//tools/devenv:runner".to_string()))
+        );
+    }
+
+    /// Omitted when unset. An always-present key would change the spec — and so
+    /// the cache fingerprint — of every existing test target in every
+    /// workspace, for a feature nobody enabled.
+    #[test]
+    fn test_test_spec_omits_the_runner_when_unset() {
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            mk_addr("mypkg", "build_test"),
+            &query_addr("mypkg"),
+            &TestEnv::default(),
+            false,
+        );
+        assert!(!spec.config.contains_key("runner"));
     }
 
     #[test]
