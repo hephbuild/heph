@@ -226,10 +226,13 @@ jobs:
 #            runs-on: macos-latest-large
 #            target: x86_64-apple-darwin
 
-          # macOS ARM64 (Apple Silicon natively runs on the blacksmith macOS runner)
+          # macOS ARM64 (Apple Silicon). The runner label is the `MACOS_RUNNER`
+          # repository variable, so switching between the blacksmith runner and a
+          # GitHub-hosted one is a repo-settings change rather than a code change.
+          # There is no fallback: unset the variable and the job fails to start.
           - os: darwin
             arch: arm64
-            runs-on: blacksmith-6vcpu-macos-latest
+            runs-on: ${{ vars.MACOS_RUNNER }}
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
@@ -791,10 +794,13 @@ jobs:
             runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
 
-          # macOS ARM64 (Apple Silicon natively runs on the blacksmith macOS runner)
+          # macOS ARM64 (Apple Silicon). The runner label is the `MACOS_RUNNER`
+          # repository variable, so switching between the blacksmith runner and a
+          # GitHub-hosted one is a repo-settings change rather than a code change.
+          # There is no fallback: unset the variable and the job fails to start.
           - os: darwin
             arch: arm64
-            runs-on: blacksmith-6vcpu-macos-latest
+            runs-on: ${{ vars.MACOS_RUNNER }}
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
