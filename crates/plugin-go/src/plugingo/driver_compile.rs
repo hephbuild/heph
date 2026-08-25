@@ -737,6 +737,11 @@ impl GoCompileDriver {
         Ok(rel)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one private helper threading a single `go tool` invocation; \
+                  grouping these into a struct would only move the argument list"
+    )]
     async fn exec_go(
         &self,
         go_bin: &std::path::Path,

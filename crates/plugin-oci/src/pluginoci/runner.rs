@@ -295,7 +295,6 @@ fn heph_home_of(req: &ManagedRunRequest<'_, '_>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
 
     #[test]

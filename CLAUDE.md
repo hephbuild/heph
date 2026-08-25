@@ -74,6 +74,19 @@ It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run i
 
 `tst` excludes `bin-e2e` deliberately: those tests need staged artifacts and hard-fail without `HEPH_E2E_DIST`, so a suite that never ran can't read as a suite that passed. See `.claude/testing.md` for what belongs there versus `crates/e2e`.
 
+### Exec runners
+
+Every subprocess heph spawns goes through `crates/execrunner`, never
+`hproc::proc_exec` directly — `tests/execrunner_gate.rs` fails the build if a
+driver starts to. A target can name a runner (`runner = "//tools/devenv:runner"`
+on `exec`/`bash`, or the driver's `runner:` option workspace-wide) and its
+command runs inside the environment that runner describes.
+
+Read `docs/EXEC_RUNNERS.md` before touching any of it. The one thing to know
+going in: a runner target's `fingerprint` is what makes a consumer's cache key
+move when the environment does, and getting it wrong is a silently wrong build
+in one direction and a permanent full-miss in the other.
+
 ### `heph-bench` — perf-regression harness
 
 `crates/bench-corpus` (deterministic synthetic corpus generator) + `crates/bench` (`heph-bench` binary: `corpus`/`run inprocess`/`run dist`/`compare`). Times `heph` scenarios in-process (Tier A, no process spawn, no plugin cdylib) or against the real prebuilt binary + plugin cdylib (Tier B, the seam only a real `dlopen` can exercise), then decides regression from a baseline-vs-candidate comparison.

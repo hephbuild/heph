@@ -37,12 +37,13 @@ anything `get_stabbied` would reject:
 - Add, remove, reorder, or re-sign a method on a `#[stabby::stabby]` trait — the
   vtable slots: `StableProvider`, `StableManagedDriver` (the `invoke*` slots),
   `StableExecutor`, `StableItemStream`, `StableRead`, `StableArtifactContent`,
-  `StableFunctionRegistry`, `StableMeta`, `StableCancel`.
+  `StableFunctionRegistry`, `StableMeta`, `StableCancel`, `StableHook`.
 - Add, remove, or reorder a field on a `#[stabby::stabby]` struct: `StableAddr`,
   `StableArg`, `NoteDepOutcome`, `ResultOutcome`, `QueryOutcome`, `NamedDriver`,
-  `PluginComponents`.
+  `NamedHook`, `PluginComponents`.
 - Change a `dynptr!` / type-alias: `DynRead`, `DynArtifact`, `DynItemStream`,
-  `DynExecutor`, `DynProvider`, `DynManagedDriver`, `DynFunctionRegistry`.
+  `DynExecutor`, `DynProvider`, `DynManagedDriver`, `DynFunctionRegistry`,
+  `DynHook`.
 - Rename or retype `CREATE_SYMBOL` or `CreateFn` — the entry point.
 - Change the `stabby` dependency version in any crate that links the boundary
   (`plugin-stabby`, `plugin-sdk`, `plugin-go-cdylib`). stabby keys its type reports
