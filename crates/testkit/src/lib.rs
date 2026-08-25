@@ -84,9 +84,13 @@ impl WorkspaceBuilder {
         for setup in self.setups {
             setup(&mut e)?;
         }
+        let engine = Arc::new(e);
+        // Same call the CLI makes right after `Arc::new`: without it a target
+        // naming a runner fails with "no runner host is installed".
+        engine.install_exec_runner_host();
         Ok(Workspace {
             dir: self.dir,
-            engine: Arc::new(e),
+            engine,
         })
     }
 }

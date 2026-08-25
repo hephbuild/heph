@@ -177,6 +177,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     }
 
     let engine = Arc::new(e);
+    engine.install_exec_runner_host();
 
     // Telemetry: record the enabled provider + driver type names (built-ins plus
     // whatever the config turned on) and the remote-cache count for the exit

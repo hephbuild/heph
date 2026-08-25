@@ -87,6 +87,18 @@ pub struct Engine {
     pub(crate) hooks: Vec<Arc<dyn SDKHook>>,
 
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
+    /// Every exec runner this host knows, by name: `local`, `wrap`, `session`.
+    ///
+    /// Builtins only. A plugin that wants agent mode does not implement a
+    /// runner — it emits a `runner.json` naming `session` with the argv that
+    /// enters its environment, and the descriptor passing, cancellation and
+    /// pooling are shared. Both in-tree plugins that run targets somewhere else
+    /// (devenv, oci) work that way, which is why there is no ABI surface for a
+    /// plugin-exported runner.
+    ///
+    /// Held behind an `Arc` so `install_exec_runner_host` can hand the resolver
+    /// a clone.
+    pub(crate) exec_runners: Arc<hexecrunner::registry::RunnerRegistry>,
     pub home: PathBuf,
     /// The runtime every request's memoizers spawn their computations on.
     /// Captured once at construction — the engine is handed its runtime, the
@@ -446,6 +458,7 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             hooks: vec![],
             requests: Mutex::new(HashMap::new()),
+            exec_runners: Arc::new(hexecrunner::registry::RunnerRegistry::with_builtins()),
             result_permits: {
                 let pool = crate::engine::worker_pool::WorkerPool::new(max_workers);
                 // Two readers of the same pool, for two different lines: the
@@ -680,6 +693,22 @@ impl Engine {
         self.providers_by_name
             .insert(provider.name.clone(), provider);
         Ok(())
+    }
+
+    /// Hand `hexecrunner` the resolver for this engine.
+    ///
+    /// Must be called once the engine is behind an `Arc`, because the resolver
+    /// holds a `Weak` back to it. Both the CLI and the test harness do this
+    /// immediately after `Arc::new`; without it, a target naming a runner fails
+    /// with "no runner host is installed" rather than silently spawning
+    /// locally.
+    pub fn install_exec_runner_host(self: &Arc<Self>) {
+        hexecrunner::install_host(Arc::new(
+            crate::engine::execrunner_host::EngineRunnerHost::new(
+                Arc::downgrade(self),
+                Arc::clone(&self.exec_runners),
+            ),
+        ));
     }
 
     /// Register a build-event hook. Hooks are observers — fed every emitted

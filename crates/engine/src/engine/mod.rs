@@ -22,6 +22,7 @@ mod plugin_load;
 pub use plugin_load::clear_plugin_cache;
 pub mod approval;
 pub mod diag;
+pub mod execrunner_host;
 pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest};
 mod cwd;
 mod result;

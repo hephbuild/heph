@@ -1560,6 +1560,7 @@ dependencies = [
  "driver-bridge",
  "driver-support",
  "enclose",
+ "execrunner",
  "flate2",
  "futures",
  "glob",
@@ -1713,6 +1714,8 @@ dependencies = [
  "core",
  "model",
  "proc",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

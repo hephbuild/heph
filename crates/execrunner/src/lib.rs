@@ -30,6 +30,9 @@
 //! uninstalled host with a non-local runner is a hard error, never a silent
 //! fall back to a local spawn — see [`prepare`].
 
+pub mod config;
+pub mod registry;
+
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;
 use hproc::proc_exec;
@@ -135,6 +138,20 @@ pub trait RunnerHost: Send + Sync {
     ///
     /// May start a session (an agent runner holds a live environment), so it is
     /// async and may be slow on first use for a given runner.
+    /// Whether this host can resolve `request_id`.
+    ///
+    /// A process can hold more than one engine — the test harness builds many,
+    /// and reopening a workspace builds a second over the same root — so the
+    /// installed hosts are a list, not a slot, and a request is routed to the
+    /// engine that owns it. Request ids are process-unique, so at most one host
+    /// answers.
+    fn owns(&self, request_id: &str) -> bool;
+
+    /// Whether the engine behind this host is still alive. Dead hosts are
+    /// pruned on the next install so a long-lived process (the test binary)
+    /// does not accumulate them.
+    fn alive(&self) -> bool;
+
     async fn prepare(
         &self,
         request_id: &str,
@@ -144,23 +161,45 @@ pub trait RunnerHost: Send + Sync {
     ) -> anyhow::Result<SpecRewrite>;
 }
 
-static HOST: OnceLock<Arc<dyn RunnerHost>> = OnceLock::new();
-
-/// Install the process-wide runner host. Idempotent-ish: a second call is
-/// ignored and reported, matching the "first writer wins" shape of the other
-/// process-global installs in the tree.
+/// The installed hosts, newest last.
 ///
-/// Called once by the engine at construction, and once per loaded cdylib by the
-/// plugin SDK (each cdylib has its own copy of this static).
-pub fn install_host(host: Arc<dyn RunnerHost>) {
-    if HOST.set(host).is_err() {
-        tracing::debug!("exec-runner host already installed; ignoring second install");
-    }
+/// A list rather than a `OnceLock` slot because a process can hold several
+/// engines: every `WorkspaceBuilder::build` in the test suite makes one, and
+/// `reopen` makes a second over the same root deliberately. With a single slot
+/// the first engine to install would silently answer for all of them, and a
+/// target in the second engine would resolve its runner against the first
+/// engine's request registry — which fails, confusingly, as "request is no
+/// longer live". Routing by request id is what makes many engines behave the
+/// way one does.
+static HOSTS: OnceLock<std::sync::Mutex<Vec<Arc<dyn RunnerHost>>>> = OnceLock::new();
+
+fn hosts() -> &'static std::sync::Mutex<Vec<Arc<dyn RunnerHost>>> {
+    HOSTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// Whether a runner host has been installed in *this* copy of the crate.
+/// Install a runner host. Called once per engine, and once per loaded cdylib by
+/// the plugin SDK (each cdylib has its own copy of this static).
+pub fn install_host(host: Arc<dyn RunnerHost>) {
+    let Ok(mut list) = hosts().lock() else {
+        tracing::error!("exec-runner host registry poisoned; runner resolution will fail");
+        return;
+    };
+    list.retain(|h| h.alive());
+    list.push(host);
+}
+
+/// Whether any runner host has been installed in *this* copy of the crate.
 pub fn host_installed() -> bool {
-    HOST.get().is_some()
+    hosts().lock().map(|l| !l.is_empty()).unwrap_or(false)
+}
+
+/// The host that owns `request_id`, if one is installed here.
+fn host_for(request_id: &str) -> Option<Arc<dyn RunnerHost>> {
+    let list = hosts().lock().ok()?;
+    list.iter()
+        .rev()
+        .find(|h| h.owns(request_id))
+        .map(Arc::clone)
 }
 
 /// Resolve the runner and rewrite the spec in place.
@@ -183,13 +222,24 @@ async fn prepare(
         return Ok(());
     };
 
-    let host = HOST.get().ok_or_else(|| {
-        anyhow::anyhow!(
-            "target requests exec runner {} but no runner host is installed in this component. \
-             A plugin cdylib links its own copy of the exec-runner crate and must be handed the \
-             host's runner registry at load time; a plugin built against an older SDK will not be.",
-            addr.format(),
-        )
+    let host = host_for(runner.request_id).ok_or_else(|| {
+        if host_installed() {
+            anyhow::anyhow!(
+                "target requests exec runner {} but no installed runner host owns request '{}'. \
+                 The runner is resolved while the target that named it is executing, so this \
+                 means the request was dropped mid-execution.",
+                addr.format(),
+                runner.request_id,
+            )
+        } else {
+            anyhow::anyhow!(
+                "target requests exec runner {} but no runner host is installed in this \
+                 component. A plugin cdylib links its own copy of the exec-runner crate and must \
+                 be handed the host's runner registry at load time; a plugin built against an \
+                 older SDK will not be.",
+                addr.format(),
+            )
+        }
     })?;
 
     let rewritten = host

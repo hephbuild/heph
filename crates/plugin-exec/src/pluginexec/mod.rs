@@ -33,6 +33,15 @@ pub struct Driver {
     name: String,
     /// PATH the driver injects into target processes. Empty falls back to a hardcoded default.
     search_path: Vec<String>,
+    /// Workspace-wide default exec runner, from the driver's `runner:` option.
+    ///
+    /// A per-target field alone would mean editing every BUILD file to move a
+    /// workspace into an environment, which is the wrong shape for the main use
+    /// case. Resolved in `parse`, where it becomes the same hashed `Input` an
+    /// explicit `runner =` would — a default that reached the child without
+    /// reaching the cache key would serve every previously-cached artifact
+    /// unchanged when it was switched on.
+    default_runner: Option<String>,
     wrap_run: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
     wrap_run_shell: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
 }
@@ -63,6 +72,18 @@ struct TargetDef {
     pub pass_env: BTreeMap<String, String>,
     pub runtime_pass_env: Vec<String>,
     pub runtime_env: HashMap<String, String>,
+    /// Exec runner for this target, already resolved (per-target field, then
+    /// the driver default, then none).
+    ///
+    /// Deliberately **absent from `Hash`**, like `hash_deps`. It reaches the
+    /// cache key the same way they do — through the hashout of the `Input`
+    /// `parse` emits for it, folded into `hashin` by the engine. Hashing the
+    /// address here as well would be redundant, and worse: two runner targets
+    /// at different addresses that emit byte-identical `runner.json` describe
+    /// the same environment and should share cache entries, which hashing the
+    /// address would prevent. Keeping it out also means every target that names
+    /// no runner hashes byte-identically to before this field existed.
+    pub runner: Option<TargetAddr>,
 }
 
 impl Hash for TargetDef {
@@ -234,6 +255,7 @@ pub fn bash_args_public(
 impl Driver {
     pub fn new_exec() -> Self {
         Self {
+            default_runner: None,
             name: "exec".to_string(),
             search_path: vec![],
             wrap_run: |_, run| Ok(run.to_vec()),
@@ -270,6 +292,7 @@ impl Driver {
 
     pub fn new_bash() -> Self {
         Self {
+            default_runner: None,
             name: "bash".to_string(),
             search_path: vec![],
             wrap_run: |sandbox_dir, run| {
@@ -282,6 +305,7 @@ impl Driver {
     pub fn from_options_exec(opts: &hplugin::config::Options) -> anyhow::Result<Self> {
         Ok(Self {
             search_path: decode_path(opts)?,
+            default_runner: decode_runner(opts)?,
             ..Self::new_exec()
         })
     }
@@ -289,6 +313,7 @@ impl Driver {
     pub fn from_options_bash(opts: &hplugin::config::Options) -> anyhow::Result<Self> {
         Ok(Self {
             search_path: decode_path(opts)?,
+            default_runner: decode_runner(opts)?,
             ..Self::new_bash()
         })
     }
@@ -316,8 +341,19 @@ fn spec_path_to_target_path(
 }
 
 fn decode_path(opts: &hplugin::config::Options) -> anyhow::Result<Vec<String>> {
-    hplugin::config::deny_unknown("exec/bash/sh driver", opts, &["path"])?;
+    hplugin::config::deny_unknown("exec/bash/sh driver", opts, &["path", "runner"])?;
     Ok(hplugin::config::decode_opt(opts, "exec/bash/sh driver", "path")?.unwrap_or_default())
+}
+
+/// The workspace-wide default runner, from `options.runner`.
+///
+/// Unlike its sibling `path` — which reaches the child's `PATH` and, today,
+/// no def hash at all — this must be indistinguishable from an explicit
+/// per-target `runner =` by the time `parse` is done. See `Driver::default_runner`.
+fn decode_runner(opts: &hplugin::config::Options) -> anyhow::Result<Option<String>> {
+    let runner: Option<String> =
+        hplugin::config::decode_opt(opts, "exec/bash/sh driver", "runner")?;
+    Ok(runner.filter(|r| !r.is_empty()))
 }
 
 /// RAII guard that restores the parent terminal's cooked mode when dropped.
@@ -881,6 +917,59 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             .map(|p| spec_path_to_target_path(p, &pkg, &CodegenMode::None))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
+        // Per-target field wins, then the driver's workspace-wide default.
+        // `"local"` is the explicit opt-out — the one value that is not an
+        // address, so a per-package override of a workspace default can be
+        // spelled without inventing a second knob.
+        let (runner_spec, from_default) = if spec.runner.is_empty() {
+            (self.default_runner.as_deref(), true)
+        } else {
+            (Some(spec.runner.as_str()), false)
+        };
+        let runner_spec = runner_spec.filter(|r| *r != "local");
+
+        let runner = match runner_spec {
+            None => None,
+            Some(raw) => {
+                let target = TargetAddr::parse(raw, &pkg).with_context(|| {
+                    format!(
+                        "`runner` must be a target address producing a runner.json, or the \
+                         literal \"local\"; got {raw:?}"
+                    )
+                })?;
+                // A runner target written with the `exec`/`bash` driver would
+                // otherwise inherit the workspace-wide default and become its
+                // own runner — the headline configuration cycling on the very
+                // first build. Only the *implicit* default is excluded: an
+                // explicit `runner = <self>` is a mistake the author made and
+                // must surface as the dependency cycle it is, not be silently
+                // turned into a local spawn.
+                //
+                // This is what `parse` can see. A runner target whose own
+                // *dependencies* are exec targets still needs an explicit
+                // `runner = "local"`; without one it gets a CycleError rather
+                // than a hang, because the runner is a hashed Input and the
+                // engine's synchronous cycle check covers it.
+                if from_default && target.r#ref == req.target_spec.addr {
+                    None
+                } else {
+                    Some(target)
+                }
+            }
+        };
+
+        // hashed + NOT runtime: the config keys the cache but never enters the
+        // sandbox. `runtime: false` also keeps `collect_transitive_deps` from
+        // merging the runner target's own tools/deps/env into every consumer.
+        let runner_input = runner.as_ref().map(|target| Input {
+            r#ref: target.clone(),
+            mode: InputMode::Standard,
+            origin_id: "runner".to_string(),
+            annotations: BTreeMap::new(),
+            hashed: true,
+            runtime: false,
+        });
+
         let def = TargetDef {
             run: spec.run,
             dep_group_inputs,
@@ -892,6 +981,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             pass_env,
             runtime_pass_env: spec.runtime_pass_env,
             runtime_env: spec.runtime_env,
+            runner: runner.clone(),
         };
 
         let hash = {
@@ -923,6 +1013,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .chain(hash_dep_inputs.into_iter().map(|(_, v)| v))
                     .chain(runtime_dep_inputs.into_iter().map(|(_, v)| v))
                     .chain(tool_inputs.into_iter().map(|(_, v)| v))
+                    .chain(runner_input)
                     .collect(),
                 outputs,
                 support_files,
@@ -1456,21 +1547,38 @@ impl Driver {
         // and `req` are still fully owned locals at this point (only cloned
         // versions of their fields were moved into `spec` above), so no work
         // happens on the far more common spawn-succeeds path.
-        // PR 01 wires the seam with the local runner at every site; the
-        // `runner` field that makes this non-local lands next. The spawn error
-        // stays a typed `io::Error` so the NotFound arm below can still render
-        // the sandbox-PATH diagnostic.
-        let (spawned, _) = hexecrunner::spawn_io(RunnerRef::local(), spec, ctoken).await?;
+        // The runner was resolved at parse and is already a hashed input, so
+        // the host's lookup here is a memoizer hit. The spawn error stays a
+        // typed `io::Error` so the NotFound arm below can still render the
+        // sandbox-PATH diagnostic — and `spawned_as` carries the program that
+        // was *actually* executed, which under a runner is the wrapper rather
+        // than the target's own command.
+        let runner_ref = match &def.runner {
+            Some(target) => RunnerRef::target(rreq.request_id, &target.r#ref),
+            None => RunnerRef::local(),
+        };
+        let (spawned, spawned_as) = hexecrunner::spawn_io(runner_ref, spec, ctoken).await?;
         let mut handle = spawned.map_err(|e| {
             let program = run.first().map_or("", String::as_str);
+            // Under a runner the program that failed to exec is the wrapper,
+            // not the target's command — say which, or the message sends the
+            // reader looking for the wrong binary.
+            let via = match &def.runner {
+                Some(target) => format!(
+                    " (via exec runner {}, which spawned {:?})",
+                    target.r#ref.format(),
+                    spawned_as.program,
+                ),
+                None => String::new(),
+            };
             if e.kind() == std::io::ErrorKind::NotFound {
                 anyhow::anyhow!(
-                    "spawn child process {program:?}: {e} — not found in the driver's sandbox PATH ({path}). This PATH is set by the driver's `path` option in .hephconfig and is independent of the invoking shell's PATH — a program on your interactive PATH can still be missing here. Also check that the working directory {cwd:?} exists.",
+                    "spawn child process {program:?}{via}: {e} — not found in the driver's sandbox PATH ({path}). This PATH is set by the driver's `path` option in .hephconfig and is independent of the invoking shell's PATH — a program on your interactive PATH can still be missing here. Also check that the working directory {cwd:?} exists.",
                     path = self.sandbox_path_display(),
                     cwd = req.sandbox_pkg_dir,
                 )
             } else {
-                anyhow::Error::new(e).context(format!("spawn child process {program:?}"))
+                anyhow::Error::new(e).context(format!("spawn child process {program:?}{via}"))
             }
         })?;
 
@@ -1736,7 +1844,7 @@ mod tests {
     use enclose::enclose;
     use hcore::hasync::StdCancellationToken;
     use hdriver_support::driver_managed::ManagedDriver;
-    use hmodel::htaddr::Addr;
+    use hmodel::htaddr::{Addr, parse_addr};
     use hplugin::driver::RunRequest;
     use hplugin::driver::targetdef::CacheConfig;
 
@@ -1969,6 +2077,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -2297,6 +2406,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["echo".to_string(), "hello".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -2355,6 +2465,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["definitely-not-a-real-binary-xyz".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -2423,6 +2534,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -2482,6 +2594,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -2551,6 +2664,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 // Ignore SIGINT and hang, forcing the grace → SIGKILL path.
                 run: vec!["trap '' INT; sleep 30".to_string()],
                 dep_group_inputs: BTreeMap::new(),
@@ -2617,6 +2731,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec![format!("head -c {payload_bytes} /dev/urandom | base64")],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -2786,6 +2901,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec![
                     "echo out-first; echo err-first >&2; sleep 1; echo out-last; echo err-last >&2"
                         .to_string(),
@@ -2871,6 +2987,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec![
                     "echo a; sleep 0.3; echo b >&2; sleep 0.3; echo c; sleep 0.3; echo d >&2"
                         .to_string(),
@@ -2937,6 +3054,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 // Interleaved rather than sequential so both drains are live
                 // at once and each can stall the other. No pipeline: the
                 // wrapper runs under `pipefail`, and a producer killed by
@@ -3090,6 +3208,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 // `wc -c`'s count goes to a *file*, not stdout: stdout is
                 // deliberately paced slower than the child can produce (see
                 // `PacedSink` below) so its trailing bytes are subject to a
@@ -3199,6 +3318,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec![run_cmd.to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -3536,6 +3656,218 @@ mod tests {
         // hash; otherwise the cache key would depend on runtime-only state.
         assert_eq!(base.hash, with_runtime.hash);
         Ok(())
+    }
+
+    // ---- exec runner ----
+
+    fn runner_val(v: &str) -> hcore::htvalue::Value {
+        hcore::htvalue::Value::String(v.to_string())
+    }
+
+    async fn parse_with_driver_at(
+        driver: &Driver,
+        addr: Addr,
+        extra: HashMap<String, hcore::htvalue::Value>,
+    ) -> anyhow::Result<hplugin::driver::targetdef::TargetDef> {
+        let ctoken = StdCancellationToken::new();
+        let mut config = HashMap::from([(
+            "run".to_string(),
+            hcore::htvalue::Value::String("echo".to_string()),
+        )]);
+        config.extend(extra);
+        Ok(driver
+            .parse(
+                hplugin::driver::ParseRequest {
+                    request_id: "test".to_string(),
+                    target_spec: std::sync::Arc::new(hplugin::provider::TargetSpec {
+                        addr,
+                        driver: "exec".to_string(),
+                        config,
+                        ..Default::default()
+                    }),
+                },
+                &ctoken,
+            )
+            .await?
+            .target_def)
+    }
+
+    async fn parse_with_driver(
+        driver: &Driver,
+        extra: HashMap<String, hcore::htvalue::Value>,
+    ) -> anyhow::Result<hplugin::driver::targetdef::TargetDef> {
+        parse_with_driver_at(driver, Addr::default(), extra).await
+    }
+
+    fn runner_inputs(def: &hplugin::driver::targetdef::TargetDef) -> Vec<&Input> {
+        def.inputs
+            .iter()
+            .filter(|i| i.origin_id == "runner")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_runner_absent_by_default() -> anyhow::Result<()> {
+        let def = parse_with(HashMap::new()).await?;
+        assert!(def.def::<TargetDef>().runner.is_none());
+        assert!(runner_inputs(&def).is_empty());
+        Ok(())
+    }
+
+    /// The runner reaches the cache key through its hashout, exactly as a
+    /// `hash_dep` does — so `def.hash` must not move. This is what makes
+    /// landing the feature invalidate nobody's cache, and what keeps two runner
+    /// targets that emit identical `runner.json` sharing entries.
+    #[tokio::test]
+    async fn test_runner_excluded_from_def_hash() -> anyhow::Result<()> {
+        let base = parse_with(HashMap::new()).await?;
+        let with_runner =
+            parse_with(HashMap::from([("runner".to_string(), runner_val("//t:r"))])).await?;
+        assert_eq!(
+            base.hash, with_runner.hash,
+            "runner must not enter def.hash; it keys the cache via the hashout \
+             of the Input parse emits for it"
+        );
+        Ok(())
+    }
+
+    /// hashed, so it folds into `hashin`; not runtime, so it never reaches the
+    /// sandbox and its transitives never merge into the consumer's.
+    #[tokio::test]
+    async fn test_runner_is_a_hash_dep() -> anyhow::Result<()> {
+        let def = parse_with(HashMap::from([("runner".to_string(), runner_val("//t:r"))])).await?;
+        let inputs = runner_inputs(&def);
+        assert_eq!(inputs.len(), 1);
+        let input = inputs.first().expect("one runner input");
+        assert!(input.hashed, "must fold into hashin");
+        assert!(
+            !input.runtime,
+            "must never be materialized into the sandbox"
+        );
+        assert_eq!(input.r#ref.r#ref.format(), "//t:r");
+
+        // And it must not be wired into SRC_*/LIST_* routing.
+        let xdef = def.def::<TargetDef>();
+        assert!(
+            xdef.dep_group_inputs
+                .values()
+                .flatten()
+                .all(|i| i.origin_id != "runner")
+        );
+        assert!(
+            xdef.runtime_dep_group_inputs
+                .values()
+                .flatten()
+                .all(|i| i.origin_id != "runner")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_runner_local_is_the_opt_out() -> anyhow::Result<()> {
+        let def = parse_with(HashMap::from([("runner".to_string(), runner_val("local"))])).await?;
+        assert!(def.def::<TargetDef>().runner.is_none());
+        assert!(runner_inputs(&def).is_empty());
+        Ok(())
+    }
+
+    /// A bare word that is not the reserved `local` must say what the field
+    /// takes, rather than failing later as "target not found".
+    #[tokio::test]
+    async fn test_runner_bare_word_is_rejected_with_the_shape() {
+        let err =
+            match parse_with(HashMap::from([("runner".to_string(), runner_val("locl"))])).await {
+                Ok(_) => panic!("bare word must be rejected"),
+                Err(e) => e,
+            };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("runner"), "{msg}");
+        assert!(msg.contains("target address"), "{msg}");
+    }
+
+    /// The driver option is the workspace-wide door, and it must produce
+    /// exactly the same Input an explicit field does — a default that reached
+    /// the child without reaching the key would serve stale artifacts when
+    /// switched on.
+    #[tokio::test]
+    async fn test_driver_default_runner_hashes_like_an_explicit_field() -> anyhow::Result<()> {
+        let mut driver = Driver::new_exec();
+        driver.default_runner = Some("//t:r".to_string());
+        let defaulted = parse_with_driver(&driver, HashMap::new()).await?;
+        let explicit =
+            parse_with(HashMap::from([("runner".to_string(), runner_val("//t:r"))])).await?;
+
+        assert_eq!(defaulted.hash, explicit.hash);
+        let a = runner_inputs(&defaulted);
+        let b = runner_inputs(&explicit);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a[0].r#ref.r#ref, b[0].r#ref.r#ref);
+        assert_eq!(a[0].hashed, b[0].hashed);
+        assert_eq!(a[0].runtime, b[0].runtime);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_target_field_beats_the_driver_default() -> anyhow::Result<()> {
+        let mut driver = Driver::new_exec();
+        driver.default_runner = Some("//t:default".to_string());
+        let def = parse_with_driver(
+            &driver,
+            HashMap::from([("runner".to_string(), runner_val("//t:explicit"))]),
+        )
+        .await?;
+        let inputs = runner_inputs(&def);
+        assert_eq!(inputs[0].r#ref.r#ref.format(), "//t:explicit");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_target_can_opt_out_of_the_driver_default() -> anyhow::Result<()> {
+        let mut driver = Driver::new_exec();
+        driver.default_runner = Some("//t:default".to_string());
+        let def = parse_with_driver(
+            &driver,
+            HashMap::from([("runner".to_string(), runner_val("local"))]),
+        )
+        .await?;
+        assert!(def.def::<TargetDef>().runner.is_none());
+        Ok(())
+    }
+
+    /// The natural way to write a runner is an `exec`/`bash` target, which
+    /// would otherwise inherit the workspace-wide default and become its own
+    /// runner — the headline configuration cycling on the very first build.
+    #[tokio::test]
+    async fn test_the_default_runner_does_not_become_its_own_runner() -> anyhow::Result<()> {
+        let me = parse_addr("//tools/devenv:runner")?;
+        let mut driver = Driver::new_exec();
+        driver.default_runner = Some(me.format());
+        let def = parse_with_driver_at(&driver, me, HashMap::new()).await?;
+        assert!(
+            def.def::<TargetDef>().runner.is_none(),
+            "a target that IS the default runner must not inherit it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_driver_option_runner_is_accepted_and_empty_means_unset() {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "runner".to_string(),
+            serde_yaml::from_str("\"//t:r\"").expect("yaml"),
+        );
+        let d = Driver::from_options_exec(&opts).expect("from_options");
+        assert_eq!(d.default_runner.as_deref(), Some("//t:r"));
+
+        let mut empty = hplugin::config::Options::new();
+        empty.insert(
+            "runner".to_string(),
+            serde_yaml::from_str("\"\"").expect("yaml"),
+        );
+        let d = Driver::from_options_exec(&empty).expect("from_options");
+        assert_eq!(d.default_runner, None);
     }
 
     #[tokio::test]
@@ -3915,6 +4247,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run,
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -4051,6 +4384,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["echo $PATH".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -4199,6 +4533,7 @@ mod tests {
             ),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -4389,6 +4724,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -4454,6 +4790,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -4552,6 +4889,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -4636,6 +4974,7 @@ mod tests {
             addr: Addr::default(),
             labels: vec![],
             raw_def: Arc::new(TargetDef {
+                runner: None,
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
