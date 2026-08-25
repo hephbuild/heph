@@ -105,6 +105,16 @@ fn build() -> PluginComponents {
         driver: make_dyn_managed_driver(platform),
     });
 
+    // Describes a container other targets run inside. Emits a `runner.json`
+    // naming the builtin `session` runner: the container is held open for the
+    // build and targets run in it over the agent protocol, so this plugin needs
+    // no runner implementation of its own.
+    let runner: Arc<dyn ManagedDriver> = Arc::new(pluginoci::runner::Driver::new());
+    drivers.push(NamedDriver {
+        name: pluginoci::runner::DRIVER_NAME.into(),
+        driver: make_dyn_managed_driver(runner),
+    });
+
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(pluginoci::platform::Provider);
 
     PluginComponents {
