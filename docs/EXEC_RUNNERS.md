@@ -268,8 +268,11 @@ sentence.
   `go list`-heavy build that is worth measuring before turning it on; the
   captured-env wrap runner has no such cost. The number under `2 × ncpu`
   contention, and the peak RSS of that many concurrent clients, are unmeasured.
-- **The devenv and OCI runners have no end-to-end test.** `bin-e2e` covers the
-  session machinery with a passthrough launch (`/usr/bin/env`), which is what
-  isolates the runner from the environment. Whether `devenv shell` and
-  `docker run` behave as their drivers assume is untested — both would make the
-  suite depend on a toolchain being installed.
+- **Running a target inside a container is untested.** The `oci_runner` suite
+  covers digest resolution and the launch argv against a real daemon, but not a
+  target actually executing in the container: that needs the heph binary to run
+  inside the image, and on macOS the binary is Darwin while the container is
+  Linux, so the test could never pass there.
+- **The devenv suite is opt-in** (`HEPH_E2E_DEVENV=1`), because an environment
+  nix has never evaluated costs ~2m40s and CI runners are ephemeral. Run it when
+  touching the devenv driver.

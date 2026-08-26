@@ -103,12 +103,60 @@ const DEFAULT_PASS_ENV: &[&str] = &[
 
 /// Variables dropped from the *captured* environment.
 ///
-/// Per-process bookkeeping the shell sets for itself, which would otherwise
-/// make the runner's hashout differ per invocation and full-miss every consumer
-/// on every build. This is a denylist, and it is only sound because the *input*
-/// environment is a strict hashed allowlist: with the input pinned, whatever
-/// devenv adds is a function of the declared inputs.
-const CAPTURE_DENY: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_", "TMPDIR", "TMP", "TEMP"];
+/// Everything here varies per invocation or per directory, and the runner's
+/// output is a cache key: one of these surviving makes the hashout move on
+/// every build and full-misses every consumer in the workspace, forever, with
+/// nothing erroring and nothing pointing at the cause.
+///
+/// The `DEVENV_*` entries are not just noise, they are actively wrong to pass
+/// on. They point at the runner target's **sandbox**, which is deleted as soon
+/// as the target is cached — so a consumer receiving them would get paths that
+/// no longer exist. `DEVENV_PROFILE` is deliberately absent from this list: it
+/// is a content-addressed store path, it is stable, and it is what the
+/// fingerprint is derived from.
+///
+/// This is a denylist, which is only sound because the *input* environment is a
+/// strict hashed allowlist: with the input pinned, what devenv adds is a
+/// function of the declared inputs plus these known-volatile few.
+const CAPTURE_DENY: &[&str] = &[
+    "PWD",
+    "OLDPWD",
+    "SHLVL",
+    "_",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    // Per-invocation or per-directory devenv bookkeeping.
+    "DEVENV_CMDLINE",
+    "DEVENV_DOTFILE",
+    "DEVENV_ROOT",
+    "DEVENV_RUNTIME",
+    "DEVENV_STATE",
+    "DEVENV_TASK_FILE",
+];
+
+/// The variable carrying devenv's resolved profile — a content-addressed nix
+/// store path, and the strongest fingerprint available.
+const DEVENV_PROFILE: &str = "DEVENV_PROFILE";
+
+/// Strip per-invocation noise from *inside* a value.
+///
+/// `NIX_CFLAGS_COMPILE` carries `-frandom-seed=<token>`, which nix regenerates
+/// on every invocation. A name-based denylist cannot see it — the variable is
+/// wanted, only that fragment is volatile — and leaving it in was enough on its
+/// own to make the capture differ between two evaluations of an identical
+/// environment. The seed only feeds symbol-name generation, so dropping it
+/// costs nothing.
+fn normalize_value(value: &str) -> String {
+    if !value.contains("-frandom-seed=") {
+        return value.to_string();
+    }
+    value
+        .split_whitespace()
+        .filter(|tok| !tok.starts_with("-frandom-seed="))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 #[derive(Spec)]
 pub(crate) struct TargetSpec {
@@ -215,6 +263,7 @@ impl ManagedDriver for Driver {
         let spec = TargetSpec::from(&req.target_spec.config)?;
         let pkg = req.target_spec.addr.package.clone();
         let mode = Mode::parse(&spec.mode)?;
+        check_root(&spec.root)?;
 
         let names: Vec<String> = if spec.pass_env.is_empty() {
             DEFAULT_PASS_ENV.iter().map(|s| (*s).to_string()).collect()
@@ -442,6 +491,36 @@ impl Driver {
     }
 }
 
+/// Reject a `root` that would escape the sandbox.
+///
+/// `run` resolves the devenv root as `sandbox_pkg_dir.join(root)`, and
+/// `PathBuf::join` *discards the base* when handed an absolute path — so a bare
+/// `root = "/etc"` would evaluate a devenv outside the sandbox entirely, and
+/// `..` would climb out of it. Both would make the capture depend on tree state
+/// the target never declared, which is the whole thing the declared deps exist
+/// to prevent. Caught at parse so the error names the field rather than
+/// surfacing as a confusing evaluation somewhere else on the disk.
+fn check_root(root: &str) -> anyhow::Result<()> {
+    let path = std::path::Path::new(root);
+    if path.is_absolute() {
+        anyhow::bail!(
+            "devenv_runner: `root` must be relative to the package, got the absolute path \
+             {root:?}. An absolute root would evaluate a devenv outside the sandbox, against \
+             files this target never declared."
+        );
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "devenv_runner: `root` must stay inside the package, got {root:?}. A `..` component \
+             climbs out of the sandbox, against files this target never declared."
+        );
+    }
+    Ok(())
+}
+
 /// Parse NUL-separated `KEY=VALUE` records, dropping per-process noise.
 fn parse_env0(bytes: &[u8]) -> BTreeMap<String, String> {
     bytes
@@ -453,18 +532,31 @@ fn parse_env0(bytes: &[u8]) -> BTreeMap<String, String> {
             if CAPTURE_DENY.contains(&k) {
                 return None;
             }
-            Some((k.to_string(), v.to_string()))
+            Some((k.to_string(), normalize_value(v)))
         })
         .collect()
 }
 
-/// A digest of the resolved environment.
+/// A fingerprint for the resolved environment.
 ///
-/// Derived, never authored, and derived from the environment devenv actually
-/// produced rather than from the files it was asked to read — `devenv.nix` can
-/// import files nobody declared, so a source-file hash would miss exactly the
-/// change that matters.
+/// Derived, never authored, and derived from what devenv actually produced
+/// rather than from the files it was asked to read — `devenv.nix` can import
+/// files nobody declared, so a source-file hash would miss exactly the change
+/// that matters.
+///
+/// Prefers `DEVENV_PROFILE`, the nix store path devenv resolved the environment
+/// to. It is content-addressed, so it changes when and only when the
+/// environment changes, and it is identical across machines and directories —
+/// which a digest of the whole environment is not, however carefully the
+/// volatile parts are filtered. The digest is the fallback for a devenv that
+/// does not export it.
 fn fingerprint_of(env: &BTreeMap<String, String>) -> String {
+    if let Some(profile) = env.get(DEVENV_PROFILE)
+        && let Some(hash) = profile.rsplit('/').next()
+        && !hash.is_empty()
+    {
+        return format!("devenv:{hash}");
+    }
     let mut h = Xxh3::new();
     h.update(b"devenv/v1");
     for (k, v) in env {
@@ -515,6 +607,60 @@ mod tests {
         assert_eq!(env.keys().collect::<Vec<_>>(), vec!["KEEP"]);
     }
 
+    /// The three ways a real capture was non-deterministic, before an e2e test
+    /// against a real devenv caught them. Any one of them makes every consumer
+    /// in the workspace full-miss forever, silently.
+    #[test]
+    fn the_volatile_parts_of_a_real_capture_are_dropped() {
+        let raw = b"DEVENV_ROOT=/tmp/a\0DEVENV_DOTFILE=/tmp/a/.devenv\0DEVENV_STATE=/tmp/a/.devenv/state\0DEVENV_RUNTIME=/tmp/devenv-c555f66\0DEVENV_TASK_FILE=/nix/store/zzz-tasks.json\0DEVENV_CMDLINE=shell -- env -0\0DEVENV_PROFILE=/nix/store/qb2i0-devenv-profile\0KEEP=yes\0";
+        let env = parse_env0(raw);
+        assert_eq!(
+            env.keys().collect::<Vec<_>>(),
+            vec!["DEVENV_PROFILE", "KEEP"],
+            "only the content-addressed profile and real variables survive"
+        );
+    }
+
+    /// `-frandom-seed` lives *inside* `NIX_CFLAGS_COMPILE`, so no name-based
+    /// filter can see it — and on its own it was enough to make two evaluations
+    /// of an identical environment differ.
+    #[test]
+    fn the_random_seed_is_stripped_from_inside_a_value() {
+        let a = normalize_value("-frandom-seed=35f61pidv5 -isystem /nix/store/x/include");
+        let b = normalize_value("-frandom-seed=wqqzvajh47 -isystem /nix/store/x/include");
+        assert_eq!(a, b);
+        assert_eq!(a, "-isystem /nix/store/x/include");
+    }
+
+    #[test]
+    fn a_value_without_a_seed_is_untouched() {
+        let v = "-isystem  /nix/store/x/include";
+        assert_eq!(normalize_value(v), v);
+    }
+
+    /// The profile is a content-addressed store path, so it is the same on
+    /// every machine and in every directory for a given environment — which a
+    /// digest of the whole environment is not, however carefully filtered.
+    #[test]
+    fn the_fingerprint_prefers_the_profile_store_path() {
+        let env = BTreeMap::from([
+            (
+                DEVENV_PROFILE.to_string(),
+                "/nix/store/qb2i0ily2jm27sv7qckfs8sjsylnrp5n-devenv-profile".to_string(),
+            ),
+            ("PATH".to_string(), "/whatever".to_string()),
+        ]);
+        assert_eq!(
+            fingerprint_of(&env),
+            "devenv:qb2i0ily2jm27sv7qckfs8sjsylnrp5n-devenv-profile"
+        );
+
+        // And it tracks the profile rather than the rest of the environment.
+        let mut other = env.clone();
+        other.insert("PATH".to_string(), "/different".to_string());
+        assert_eq!(fingerprint_of(&env), fingerprint_of(&other));
+    }
+
     #[test]
     fn an_empty_capture_still_fingerprints() {
         assert!(fingerprint_of(&BTreeMap::new()).starts_with("devenv:"));
@@ -537,6 +683,27 @@ mod tests {
         let mut b = a.clone();
         b.insert("B".to_string(), "2".to_string());
         assert_ne!(fingerprint_of(&a), fingerprint_of(&b));
+    }
+
+    /// `PathBuf::join` discards the base when given an absolute path, so an
+    /// unchecked `root` is a silent sandbox escape rather than an error.
+    #[test]
+    fn an_escaping_root_is_rejected_at_parse() {
+        for bad in ["/etc", "/", "../sibling", "nested/../../out"] {
+            let err = match check_root(bad) {
+                Ok(()) => panic!("`root = {bad:?}` escapes the sandbox and must be rejected"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(err.contains("root"), "{err}");
+            assert!(err.contains("sandbox"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_relative_root_is_accepted() {
+        for ok in ["", "tools", "tools/devenv", "./tools"] {
+            check_root(ok).unwrap_or_else(|e| panic!("`root = {ok:?}` should be fine: {e:#}"));
+        }
     }
 
     #[test]
