@@ -11,6 +11,21 @@
 //! ends up living inside whatever `launch` sets up. Everything after is the
 //! protocol in [`crate::agent`].
 //!
+//! # The environment is the agent's, not a declaration
+//!
+//! Nothing here says what the environment *contains*, and that is the point of
+//! agent mode: the agent is a process the launch put inside the environment, so
+//! its own `environ` **is** the environment. Targets are built from it (see
+//! [`crate::agent`]) rather than from a map somebody had to transcribe into
+//! `runner.json`.
+//!
+//! That is sound for the cache because a consumer names the runner *target*,
+//! whose hashout is one of its hashed inputs — so whatever the runner provides
+//! is already in the consumer's cache key by construction. A declared copy
+//! would add a second thing to keep in sync with the first, and re-deriving the
+//! environment somewhere it is not is exactly the drift the fingerprint exists
+//! to catch.
+//!
 //! The consequence is worth stating: **a plugin that only wants agent mode
 //! needs no runner code at all.** It writes a `runner.json` naming `session`
 //! with the right `launch` prefix, and the mechanics — descriptor passing,
@@ -455,6 +470,13 @@ async fn await_socket(
 impl ExecRunner for SessionRunner {
     fn name(&self) -> &str {
         "session"
+    }
+
+    /// The environment is the agent's `environ`, which this process cannot see.
+    /// The agent composes the final `PATH` from what the client forwards; a
+    /// fallback reinstated here would arrive ahead of it.
+    fn supplies_environment(&self) -> bool {
+        true
     }
 
     /// Kill every agent this runner started.

@@ -49,8 +49,8 @@ plugins:
   # installs them from the release an installed `heph` reports.
   #
   # The devenv runner describes a build environment. A target enters it with
-  # `runner = "//execrunner:devenv"`, or a whole workspace does it once with
-  # `runner:` in the exec/bash driver options above.
+  # `runner = "//execrunner:devenv_wrap"`, or a whole workspace does it once
+  # with `runner:` in the exec/bash driver options above.
   - path: ~/.heph/plugins/devenv/heph-devenv-plugin.json
     options:
       # Which `devenv` to resolve against. Defaults to `devenv` on PATH.

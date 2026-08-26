@@ -106,6 +106,68 @@ pub struct SpecRewrite {
     pub cwd: PathBuf,
 }
 
+/// How `PATH` is composed when the target may not be the one supplying it.
+///
+/// `PATH` is the one variable a runner and its target both always have an
+/// opinion about, and it is a *list*, so "who wins" is the wrong question — the
+/// answer is an order:
+///
+/// ```text
+/// PATH = prefix ++ what the target declared ++ what the runner provides
+/// ```
+///
+/// - **prefix** is the target's own tools. They lead, so a target that declares
+///   a tool gets *that* one even when the environment it runs in ships another.
+/// - **the target's** own `env`/`pass_env` next: it asked for it explicitly.
+/// - **the runner's** last: the environment is the base, not an override.
+///
+/// [`PathPolicy::fallback`] is what a *local* spawn falls back to when none of
+/// the three produced anything — the driver's sandbox `PATH`. It is deliberately
+/// not part of the composition: a driver that injected it unconditionally would
+/// put `/usr/bin` ahead of the environment the target asked to run in, and a
+/// host-installed tool would quietly shadow the runner's.
+#[derive(Debug, Clone, Default)]
+pub struct PathPolicy {
+    /// Entries that lead wherever the target runs — its declared tools.
+    pub prefix: Vec<OsString>,
+    /// Used only when nothing else provides a `PATH`, and never under a runner
+    /// that supplies an environment of its own.
+    pub fallback: Option<OsString>,
+}
+
+/// The `PATH` key, as an `OsStr` comparison target.
+fn is_path_key(k: &OsString) -> bool {
+    k == "PATH"
+}
+
+fn get_env(env: &[(OsString, OsString)], key: &str) -> Option<OsString> {
+    env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
+/// Join `PATH` fragments in order, dropping empties and repeats.
+///
+/// Deduplicated because the fragments genuinely overlap — a runner's `PATH` and
+/// a driver's fallback both tend to end in `/usr/bin` — and a `PATH` that grows
+/// a duplicate per exec is a real cost on every `execvp` the target makes.
+pub fn join_path(fragments: impl IntoIterator<Item = OsString>) -> Option<OsString> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<OsString> = Vec::new();
+    for fragment in fragments {
+        for entry in std::env::split_paths(&fragment) {
+            if entry.as_os_str().is_empty() {
+                continue;
+            }
+            if seen.insert(entry.clone()) {
+                out.push(entry.into_os_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    std::env::join_paths(out).ok()
+}
+
 impl SpecRewrite {
     /// Split the rewritable half out of a spec, leaving the descriptors and the
     /// process-group flags behind.
@@ -160,7 +222,20 @@ pub trait RunnerHost: Send + Sync {
         addr: &Addr,
         rewrite: SpecRewrite,
         ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<SpecRewrite>;
+    ) -> anyhow::Result<PrepareOutcome>;
+}
+
+/// What a runner did, beyond the rewrite itself.
+#[derive(Debug)]
+pub struct PrepareOutcome {
+    pub rewrite: SpecRewrite,
+    /// The runner puts the target in an environment of its own, so the driver's
+    /// fallback `PATH` must not be reinstated here — see [`PathPolicy`].
+    ///
+    /// True for an agent runner, whose environment is not visible from this
+    /// process at all: it is the agent's `environ`, and the agent composes the
+    /// final `PATH` from what this side sends it.
+    pub supplies_environment: bool,
 }
 
 /// The installed hosts, newest last.
@@ -218,9 +293,15 @@ fn host_for(request_id: &str) -> Option<Arc<dyn RunnerHost>> {
 async fn prepare(
     runner: RunnerRef<'_>,
     spec: &mut proc_exec::Spec,
+    path: &PathPolicy,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<()> {
     let Some(addr) = runner.addr else {
+        // Nothing supplies an environment, so the target's own `PATH` is the
+        // whole of it and the driver's fallback stands behind it — the plain
+        // local spawn, unchanged.
+        let declared = get_env(&spec.env, "PATH");
+        compose_path(&mut spec.env, path, declared, true);
         return Ok(());
     };
 
@@ -244,11 +325,68 @@ async fn prepare(
         }
     })?;
 
-    let rewritten = host
+    // Captured before the runner touches it, so what the *target* declared can
+    // still be told apart from what the runner provides afterwards. Without the
+    // distinction there is no order to compose: a `PATH` in the env on the far
+    // side could equally be either.
+    let declared = get_env(&spec.env, "PATH");
+
+    let outcome = host
         .prepare(runner.request_id, addr, SpecRewrite::split(spec), ctoken)
         .await?;
-    rewritten.apply(spec);
+    let supplies_environment = outcome.supplies_environment;
+    outcome.rewrite.apply(spec);
+
+    // Whatever the runner put there, minus what was already there — i.e. the
+    // runner's own contribution.
+    let provided = get_env(&spec.env, "PATH").filter(|now| Some(now) != declared.as_ref());
+    compose_path(
+        &mut spec.env,
+        path,
+        declared,
+        // An agent runner's environment lives in the agent, not here, so there
+        // is nothing to compose against yet and the fallback must not be
+        // reinstated: it would put the driver's `/usr/bin` ahead of the
+        // environment the target asked to run in. The agent finishes the job.
+        !supplies_environment,
+    );
+    if let Some(provided) = provided {
+        let so_far = get_env(&spec.env, "PATH");
+        if let Some(joined) = join_path(so_far.into_iter().chain(std::iter::once(provided))) {
+            set_path(&mut spec.env, joined);
+        }
+    }
     Ok(())
+}
+
+/// `prefix ++ declared`, plus the fallback when `use_fallback` and nothing else
+/// produced anything.
+fn compose_path(
+    env: &mut Vec<(OsString, OsString)>,
+    path: &PathPolicy,
+    declared: Option<OsString>,
+    use_fallback: bool,
+) {
+    let composed = join_path(path.prefix.iter().cloned().chain(declared));
+    let composed = match composed {
+        Some(p) => Some(p),
+        None if use_fallback => path.fallback.clone(),
+        None => None,
+    };
+    // A `None` says nothing about PATH: leave whatever is there (a runner may
+    // have just set it) rather than inserting an empty one, which would make
+    // every `execvp` in the target fail with a confusing ENOENT.
+    if let Some(p) = composed {
+        set_path(env, p);
+    }
+}
+
+fn set_path(env: &mut Vec<(OsString, OsString)>, value: OsString) {
+    if let Some(slot) = env.iter_mut().find(|(k, _)| is_path_key(k)) {
+        slot.1 = value;
+    } else {
+        env.push((OsString::from("PATH"), value));
+    }
 }
 
 /// Batch run under `runner`: spawn, capture stdout/stderr, wait, return.
@@ -256,10 +394,20 @@ async fn prepare(
 /// The runner equivalent of [`proc_exec::output`].
 pub async fn output(
     runner: RunnerRef<'_>,
-    mut spec: proc_exec::Spec,
+    spec: proc_exec::Spec,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<std::process::Output> {
-    prepare(runner, &mut spec, ctoken).await?;
+    output_with_path(runner, spec, &PathPolicy::default(), ctoken).await
+}
+
+/// [`output`], with the caller's `PATH` composition.
+pub async fn output_with_path(
+    runner: RunnerRef<'_>,
+    mut spec: proc_exec::Spec,
+    path: &PathPolicy,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<std::process::Output> {
+    prepare(runner, &mut spec, path, ctoken).await?;
     Ok(proc_exec::output(spec, ctoken).await?)
 }
 
@@ -294,10 +442,24 @@ pub async fn spawn(
 /// the caller asked for — under a runner those differ.
 pub async fn spawn_io(
     runner: RunnerRef<'_>,
-    mut spec: proc_exec::Spec,
+    spec: proc_exec::Spec,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<(std::io::Result<proc_exec::Handle>, SpawnedAs)> {
-    prepare(runner, &mut spec, ctoken).await?;
+    spawn_io_with_path(runner, spec, &PathPolicy::default(), ctoken).await
+}
+
+/// [`spawn_io`], with the caller's `PATH` composition — see [`PathPolicy`].
+///
+/// The exec driver is the caller that needs it: it is the one that knows which
+/// `PATH` entries are the target's declared tools and which are only its own
+/// sandbox default.
+pub async fn spawn_io_with_path(
+    runner: RunnerRef<'_>,
+    mut spec: proc_exec::Spec,
+    path: &PathPolicy,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<(std::io::Result<proc_exec::Handle>, SpawnedAs)> {
+    prepare(runner, &mut spec, path, ctoken).await?;
     let spawned_as = SpawnedAs {
         program: spec.program.clone(),
         cwd: spec.cwd.clone(),
@@ -335,6 +497,96 @@ mod tests {
             setsid: false,
             ctty: false,
         }
+    }
+
+    fn os(s: &str) -> OsString {
+        OsString::from(s)
+    }
+
+    fn path_of(env: &[(OsString, OsString)]) -> Option<String> {
+        get_env(env, "PATH").map(|v| v.to_string_lossy().into_owned())
+    }
+
+    fn policy(prefix: &[&str], fallback: Option<&str>) -> PathPolicy {
+        PathPolicy {
+            prefix: prefix.iter().map(|p| os(p)).collect(),
+            fallback: fallback.map(os),
+        }
+    }
+
+    /// The order the whole feature rests on: the target's tools, then what the
+    /// target declared, then the environment it runs in.
+    #[test]
+    fn the_targets_tools_lead_and_what_it_declared_follows() {
+        let mut env = vec![(os("PATH"), os("/declared"))];
+        compose_path(
+            &mut env,
+            &policy(&["/tools"], Some("/fallback")),
+            Some(os("/declared")),
+            true,
+        );
+        assert_eq!(path_of(&env).as_deref(), Some("/tools:/declared"));
+    }
+
+    /// The driver's sandbox `PATH` is a fallback, not a contribution: it applies
+    /// when nothing else produced one, and never ahead of what did.
+    #[test]
+    fn the_fallback_applies_only_when_nothing_else_did() {
+        let mut env = vec![];
+        compose_path(&mut env, &policy(&[], Some("/usr/bin:/bin")), None, true);
+        assert_eq!(path_of(&env).as_deref(), Some("/usr/bin:/bin"));
+
+        let mut env = vec![];
+        compose_path(
+            &mut env,
+            &policy(&["/tools"], Some("/usr/bin:/bin")),
+            None,
+            true,
+        );
+        assert_eq!(
+            path_of(&env).as_deref(),
+            Some("/tools"),
+            "the fallback must not follow the target's own tools onto PATH"
+        );
+    }
+
+    /// A runner that supplies an environment gets no fallback: reinstating
+    /// `/usr/bin` here would arrive ahead of the environment the target asked to
+    /// run in, and a host-installed tool would quietly shadow the runner's.
+    #[test]
+    fn a_runner_that_supplies_an_environment_gets_no_fallback() {
+        let mut env = vec![];
+        compose_path(&mut env, &policy(&[], Some("/usr/bin:/bin")), None, false);
+        assert_eq!(path_of(&env), None);
+    }
+
+    /// The regression the local branch nearly shipped: composing from the
+    /// policy alone would have replaced a target's whole `PATH` with its tool
+    /// dir, dropping the driver's sandbox `PATH` on every target that declares
+    /// a tool and no runner.
+    #[tokio::test]
+    async fn a_local_spawn_keeps_the_path_it_already_had_behind_its_tools() {
+        let mut spec = spec("/bin/true");
+        spec.env.push((os("PATH"), os("/usr/local/bin:/usr/bin")));
+        let ctoken = StdCancellationToken::new();
+        let policy = policy(&["/sandbox/bin"], Some("/fallback"));
+        prepare(RunnerRef::local(), &mut spec, &policy, &ctoken)
+            .await
+            .expect("local prepare");
+        assert_eq!(
+            path_of(&spec.env).as_deref(),
+            Some("/sandbox/bin:/usr/local/bin:/usr/bin")
+        );
+    }
+
+    #[test]
+    fn joining_a_path_drops_empties_and_repeats() {
+        let joined = join_path([os("/a:/b"), os(""), os("/b:/c")]);
+        assert_eq!(
+            joined.map(|v| v.to_string_lossy().into_owned()).as_deref(),
+            Some("/a:/b:/c")
+        );
+        assert_eq!(join_path([os(""), os("")]), None);
     }
 
     #[test]

@@ -647,6 +647,45 @@ async fn handle_conn(conn: UnixStream, fds: [OwnedFd; 3]) {
     }
 }
 
+/// `env_clear` + the runner's environment + the target's.
+///
+/// The runner's half is this process's own `environ` — whatever the launch
+/// command (`devenv shell --`, `docker run …`) put the agent inside. The
+/// target's half is `request`, which is the client's `environ` and therefore
+/// exactly the environment heph built for the target.
+///
+/// Two keys are the agent's own business rather than either side's:
+/// [`SOCK_ENV`], which is how the client found this agent, and `PATH`, which is
+/// a list both sides legitimately contribute to — the target's entries (its
+/// tools, then anything it declared) lead, the environment's follow. The client
+/// has already composed its half in that order, so this is one join.
+fn agent_environment(request: Vec<(OsString, OsString)>) -> Vec<(OsString, OsString)> {
+    let target_path = request
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone());
+
+    let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(k, _)| k != SOCK_ENV && k != "PATH")
+        .collect();
+    let runner_path = std::env::var_os("PATH");
+
+    for (k, v) in request {
+        if k == "PATH" || k == SOCK_ENV {
+            continue;
+        }
+        match env.iter_mut().find(|(existing, _)| *existing == k) {
+            Some(slot) => slot.1 = v,
+            None => env.push((k, v)),
+        }
+    }
+
+    if let Some(path) = crate::join_path(target_path.into_iter().chain(runner_path)) {
+        env.push((OsString::from("PATH"), path));
+    }
+    env
+}
+
 async fn run_one(conn: &mut UnixStream, fds: [OwnedFd; 3]) -> anyhow::Result<ExecOutcome> {
     let body = read_frame(conn).map_err(|e| anyhow::anyhow!("read exec request: {e}"))?;
     let req = ExecRequest::decode(&body[..]).map_err(|e| anyhow::anyhow!("decode request: {e}"))?;
@@ -660,11 +699,18 @@ async fn run_one(conn: &mut UnixStream, fds: [OwnedFd; 3]) -> anyhow::Result<Exe
     let spec = proc_exec::Spec {
         program: req.program.clone(),
         args: req.args,
-        // `env_clear` semantics: the target gets exactly what the client
-        // forwarded. Inheriting the agent's environment instead would put the
-        // developer's ambient state into every build, unhashed, under a
-        // fingerprint-pinned cache key.
-        env: req.env,
+        // `env_clear`, then the runner's environment, then the target's.
+        //
+        // The runner's environment is this agent's own `environ`: the launch put
+        // the agent inside it, so there is nothing to declare and nothing to
+        // keep in sync — the environment *is* the process it lives in. It is in
+        // the consumer's cache key already, because a consumer names the runner
+        // target and that target's hashout is one of its hashed inputs.
+        //
+        // The target's own values go on top, so a target that declares a
+        // variable, a dep or a tool gets what it declared even when the
+        // environment it runs in has an opinion of its own.
+        env: agent_environment(req.env),
         cwd: req.cwd,
         stdin: proc_exec::StdioSpec::Fd(stdin),
         stdout: proc_exec::StdioSpec::Fd(stdout),

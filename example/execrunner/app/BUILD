@@ -15,9 +15,20 @@
 # The env var is hashed along with the rest of the captured environment, so
 # editing `env` in devenv.nix rebuilds this target.
 target(
-    name = "config",
+    name = "config_wrap",
     driver = "bash",
-    runner = "//execrunner:devenv",
+    runner = "//execrunner:devenv_wrap",
+    deps = [glob("service.json")],
+    run = [
+        "jq --arg channel \"$APP_CHANNEL\" '. + {channel: $channel}' service.json > config.json",
+        "yq -P '.' config.json > $OUT",
+    ],
+    out = "config.yaml",
+)
+target(
+    name = "config_session",
+    driver = "bash",
+    runner = "//execrunner:devenv_session",
     deps = [glob("service.json")],
     run = [
         "jq --arg channel \"$APP_CHANNEL\" '. + {channel: $channel}' service.json > config.json",

@@ -19,9 +19,18 @@
 # `mode = "session"` when the environment is more than variables — services it
 # starts, state under .devenv/ — and one shell is held open for the build.
 target(
-    name = "devenv",
+    name = "devenv_wrap",
     driver = "devenv_runner",
     mode = "wrap",
+    # What the environment is made of. The fingerprint is NOT derived from
+    # these — devenv.nix can import files nobody declared — but they are what
+    # makes the runner rebuild when you edit them.
+    deps = [glob("devenv.*")],
+)
+target(
+    name = "devenv_session",
+    driver = "devenv_runner",
+    mode = "session",
     # What the environment is made of. The fingerprint is NOT derived from
     # these — devenv.nix can import files nobody declared — but they are what
     # makes the runner rebuild when you edit them.

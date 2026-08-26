@@ -105,10 +105,17 @@ fn output_reaches_the_passed_descriptor() {
 /// let a target inherit its own environment instead, the developer's ambient
 /// state would reach every build unhashed, under a fingerprint-pinned key.
 #[test]
-fn the_target_gets_the_requests_environment_and_not_the_agents() {
+fn the_target_gets_the_agents_environment_with_the_requests_on_top() {
+    // The agent is the process the launch put *inside* the environment, so its
+    // own `environ` is the environment — that is what agent mode is for. The
+    // request is the target's own, and wins where the two disagree.
+    //
     // SAFETY: set before the agent thread forks anything; this test process is
     // the only writer.
-    unsafe { std::env::set_var("XR_AGENT_ONLY", "leaked") };
+    unsafe { std::env::set_var("XR_AGENT_ONLY", "from-the-environment") };
+    // SAFETY: as above. `sh()` puts `XR_ENV=from-request` in the request, so
+    // this is the collision case.
+    unsafe { std::env::set_var("XR_ENV", "from-the-environment") };
     let agent = Agent::start();
     let out = capture();
     let outcome = run(
@@ -118,13 +125,64 @@ fn the_target_gets_the_requests_environment_and_not_the_agents() {
     );
     assert_eq!(outcome, ExecOutcome::Exited(0));
     let got = read_back(out);
-    assert!(got.contains("env=from-request"), "got {got:?}");
     assert!(
-        got.contains("agent_only=absent"),
-        "the agent's own environment must not reach the target; got {got:?}"
+        got.contains("env=from-request"),
+        "the target's own value must win over the environment's; got {got:?}"
+    );
+    assert!(
+        got.contains("agent_only=from-the-environment"),
+        "the environment the agent lives in must reach the target; got {got:?}"
     );
     // SAFETY: as above.
     unsafe { std::env::remove_var("XR_AGENT_ONLY") };
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("XR_ENV") };
+}
+
+/// `PATH` is a list, so neither side simply wins: the target's entries lead and
+/// the environment's follow. A target that declares a tool gets *that* one even
+/// when the environment it runs in ships another by the same name.
+#[test]
+fn the_targets_path_entries_lead_and_the_environments_follow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let from_target = dir.path().join("target-bin");
+    let from_env = dir.path().join("env-bin");
+    for (d, who) in [(&from_target, "target"), (&from_env, "environment")] {
+        std::fs::create_dir_all(d).expect("mkdir");
+        let tool = d.join("xr-tool");
+        std::fs::write(&tool, format!("#!/bin/sh\necho from-the-{who}\n")).expect("write");
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+    }
+
+    // The agent's own PATH is the environment's half.
+    // SAFETY: set before the agent thread forks anything; this test process is
+    // the only writer.
+    unsafe {
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                from_env.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+    };
+    let agent = Agent::start();
+
+    let out = capture();
+    let mut req = sh("xr-tool");
+    req.env.push((
+        OsString::from("PATH"),
+        OsString::from(from_target.as_os_str()),
+    ));
+    let outcome = run(&agent, &req, &out);
+    assert_eq!(outcome, ExecOutcome::Exited(0));
+    let got = read_back(out);
+    assert!(
+        got.contains("from-the-target"),
+        "the target's own PATH entry must lead; got {got:?}"
+    );
 }
 
 #[test]

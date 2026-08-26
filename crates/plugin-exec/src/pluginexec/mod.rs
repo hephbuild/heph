@@ -1182,7 +1182,15 @@ impl Driver {
         if shell && let Ok(term) = std::env::var("TERM") {
             env.insert("TERM".to_string(), term);
         }
-        env.insert("PATH".to_string(), self.sandbox_path_display());
+        // Only when nothing else supplies an environment. Under a runner the
+        // environment is the runner's, and injecting `/usr/local/bin:/usr/bin:/bin`
+        // here would put the host's copy of a tool ahead of the one the target
+        // asked to run beside — silently, and inside a cache key that claims the
+        // runner's environment. It travels as `PathPolicy::fallback` instead, so
+        // a local spawn still gets it and an agent decides for itself.
+        if def.runner.is_none() {
+            env.insert("PATH".to_string(), self.sandbox_path_display());
+        }
         env.insert(
             "WORKSPACE_ROOT".to_string(),
             req.sandbox_ws_dir.to_string_lossy().to_string(),
@@ -1430,19 +1438,18 @@ impl Driver {
 
         env.extend(def.runtime_env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-        if let Some(bin_dir) = tool_bin_dir {
-            let bin_dir_str = bin_dir
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("bin dir path is not valid UTF-8"))?
-                .to_string();
-            let path_entry = env.entry("PATH".to_string()).or_default();
-            if path_entry.is_empty() {
-                *path_entry = bin_dir_str;
-            } else {
-                let old = path_entry.clone();
-                *path_entry = format!("{}:{}", bin_dir_str, old);
-            }
-        }
+        // The target's own tools lead, wherever it ends up running — composed by
+        // `hexecrunner` rather than spliced into the string here, because under
+        // a runner the rest of `PATH` is not known until the runner (or its
+        // agent) has had its say.
+        let path_policy = hexecrunner::PathPolicy {
+            prefix: tool_bin_dir
+                .as_ref()
+                .map(|d| d.as_os_str().to_os_string())
+                .into_iter()
+                .collect(),
+            fallback: Some(std::ffi::OsString::from(self.sandbox_path_display())),
+        };
 
         let output_log_path = req.sandbox_dir.join("log.txt");
         let output_log =
@@ -1557,7 +1564,8 @@ impl Driver {
             Some(target) => RunnerRef::target(rreq.request_id, &target.r#ref),
             None => RunnerRef::local(),
         };
-        let (spawned, spawned_as) = hexecrunner::spawn_io(runner_ref, spec, ctoken).await?;
+        let (spawned, spawned_as) =
+            hexecrunner::spawn_io_with_path(runner_ref, spec, &path_policy, ctoken).await?;
         let mut handle = spawned.map_err(|e| {
             let program = run.first().map_or("", String::as_str);
             // Under a runner the program that failed to exec is the wrapper,

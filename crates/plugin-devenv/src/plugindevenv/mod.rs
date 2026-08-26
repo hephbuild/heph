@@ -69,7 +69,14 @@ pub const DRIVER_NAME: &str = "devenv_runner";
 
 /// Bump to re-derive every runner this driver produced, when the shape of what
 /// it writes changes.
-const FORMAT_VERSION: u32 = 1;
+///
+/// 2: a `session` target's environment now reaches it. The shape of this file
+/// did not change — the agent did (it composes a target's environment from its
+/// own, which is the shell the launch put it in, instead of starting from an
+/// empty one) — but every result produced under a session runner before that
+/// was built without the environment, so they have to re-derive rather than be
+/// served from the cache.
+const FORMAT_VERSION: u32 = 2;
 
 /// The file a runner target must produce.
 const OUT_FILE: &str = "runner.json";
@@ -384,27 +391,7 @@ impl ManagedDriver for Driver {
             })?;
 
         let fingerprint = fingerprint_of(&captured);
-        let config = match def.mode {
-            Mode::Wrap => serde_json::json!({
-                "env": captured,
-            }),
-            Mode::Session => {
-                let mut launch = vec![self.devenv_bin.clone()];
-                if !def.profile.is_empty() {
-                    launch.push("--profile".to_string());
-                    launch.push(def.profile.clone());
-                }
-                launch.push("shell".to_string());
-                launch.push("--".to_string());
-                serde_json::json!({
-                    "launch": launch,
-                    // The launch resolves its environment relative to where it
-                    // runs, and the runner target's sandbox is gone by then —
-                    // so point it at the real tree, not the sandbox copy.
-                    "cwd": self.real_root(&req, &def),
-                })
-            }
-        };
+        let config = self.runner_config(&def, self.real_root(&req, &def), captured);
 
         let doc = serde_json::json!({
             "version": 1,
@@ -423,6 +410,44 @@ impl ManagedDriver for Driver {
 }
 
 impl Driver {
+    /// The runner-specific half of `runner.json`.
+    ///
+    /// Extracted from `run` so both shapes are assertable without a sandbox, a
+    /// nix store, or a `devenv` on PATH — the capture is the slow, impure part,
+    /// and what it is turned *into* is the part that decides whether a target
+    /// gets an environment.
+    /// `wrap` hands the environment over as data; `session` hands over the argv
+    /// that enters it and lets the agent's own `environ` be the environment (see
+    /// `hexecrunner::agent`). Both fingerprint the same capture.
+    fn runner_config(
+        &self,
+        def: &DevenvDef,
+        real_root: String,
+        captured: BTreeMap<String, String>,
+    ) -> serde_json::Value {
+        match def.mode {
+            Mode::Wrap => serde_json::json!({
+                "env": captured,
+            }),
+            Mode::Session => {
+                let mut launch = vec![self.devenv_bin.clone()];
+                if !def.profile.is_empty() {
+                    launch.push("--profile".to_string());
+                    launch.push(def.profile.clone());
+                }
+                launch.push("shell".to_string());
+                launch.push("--".to_string());
+                serde_json::json!({
+                    "launch": launch,
+                    // The launch resolves its environment relative to where it
+                    // runs, and the runner target's sandbox is gone by then —
+                    // so point it at the real tree, not the sandbox copy.
+                    "cwd": real_root,
+                })
+            }
+        }
+    }
+
     /// The devenv root in the *real* tree.
     ///
     /// A session outlives the runner target's sandbox, which is deleted as soon
@@ -577,6 +602,58 @@ mod tests {
         assert_eq!(Mode::parse("").expect("default"), Mode::Wrap);
         assert_eq!(Mode::parse("wrap").expect("wrap"), Mode::Wrap);
         assert_eq!(Mode::parse("session").expect("session"), Mode::Session);
+    }
+
+    fn def(mode: Mode) -> DevenvDef {
+        DevenvDef {
+            mode,
+            root: String::new(),
+            profile: String::new(),
+            pass_env: BTreeMap::new(),
+        }
+    }
+
+    fn captured() -> BTreeMap<String, String> {
+        BTreeMap::from([("APP_CHANNEL".to_string(), "stable".to_string())])
+    }
+
+    /// Each mode carries the environment the way that mode can use it.
+    ///
+    /// `wrap` spawns targets here, so the environment has to be data. `session`
+    /// puts an agent inside the environment, so the agent's own `environ` is the
+    /// environment — declaring a copy would be a second thing to keep in sync
+    /// with the first, and the fingerprint (which both modes derive from the
+    /// same capture) is what the consumer's cache key rests on either way.
+    #[test]
+    fn wrap_carries_the_environment_and_session_carries_the_way_in() {
+        let d = Driver::new();
+
+        let wrap = d.runner_config(&def(Mode::Wrap), "/ws".to_string(), captured());
+        assert_eq!(wrap["env"]["APP_CHANNEL"], "stable");
+
+        let session = d.runner_config(&def(Mode::Session), "/ws".to_string(), captured());
+        assert_eq!(session["cwd"], "/ws");
+        assert_eq!(
+            session["launch"],
+            serde_json::json!(["devenv", "shell", "--"])
+        );
+        assert!(
+            session.get("env").is_none(),
+            "the agent's own environ is the environment; a declared copy would drift from it"
+        );
+    }
+
+    /// The launch has to resolve the environment somewhere that still exists
+    /// when a target runs — the runner target's sandbox is deleted as soon as it
+    /// is cached.
+    #[test]
+    fn a_session_launch_points_at_the_real_tree() {
+        let cfg = Driver::new().runner_config(
+            &def(Mode::Session),
+            "/real/tree".to_string(),
+            BTreeMap::new(),
+        );
+        assert_eq!(cfg["cwd"], "/real/tree");
     }
 
     #[test]

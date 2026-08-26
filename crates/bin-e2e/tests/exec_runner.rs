@@ -239,6 +239,138 @@ target(
     }
 }
 
+/// A session runner whose launch script sets up an environment before handing
+/// over to the agent.
+///
+/// Nothing about the environment is declared in `runner.json` — that is the
+/// point of agent mode. The script exports variables and extends `PATH`, then
+/// `exec "$@"`s the agent, so the agent's own `environ` *is* the environment,
+/// exactly as `devenv shell --` or `docker run` would leave it.
+///
+/// The script is written by the runner target rather than inlined into the
+/// launch argv because Starlark eats backslash escapes inside a triple-quoted
+/// string, which silently produces malformed JSON (see `passthrough_runner`).
+fn env_runner(name: &str, script: &str, setup: &str) -> String {
+    format!(
+        r#"
+target(
+    name = "{name}",
+    driver = "bash",
+    run = """cat > {script} <<'SH'
+#!/bin/sh
+{setup}
+exec "$@"
+SH
+chmod +x {script}
+cat > $OUT <<'JSON'
+{{"version": 1,
+ "fingerprint": "e2e-env-runner-v1",
+ "runner": "session",
+ "config": {{"launch": ["/bin/sh", "{script}"]}}}}
+JSON""",
+    out = "runner.json",
+)
+"#
+    )
+}
+
+/// The environment the agent lives in reaches the target, and the target's own
+/// values win where the two disagree.
+///
+/// `env_clear` + the runner's environment + the target's. Before this, a target
+/// under a session runner started from an empty environment and got only what
+/// the client forwarded — so a devenv session target died on
+/// `APP_CHANNEL: unbound variable` while the identical wrap target passed.
+#[test]
+fn the_runners_environment_reaches_the_target_and_the_target_wins_collisions() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let marker = ws.root().join("env.txt");
+    let script = ws.root().join("launch.sh");
+
+    let mut build = env_runner(
+        "runner",
+        &script.display().to_string(),
+        "export XR_FROM_RUNNER=from-the-environment\nexport XR_BOTH=from-the-environment",
+    );
+    build.push_str(&format!(
+        r#"
+target(
+    name = "reads_env",
+    driver = "bash",
+    env = {{"XR_BOTH": "from-the-target"}},
+    run = "echo $XR_FROM_RUNNER-$XR_BOTH > {}",
+    out = [],
+    runner = "//xr:runner",
+)
+"#,
+        marker.display()
+    ));
+    ws.write("xr/BUILD", &build).expect("write BUILD");
+
+    let out = ws.run(&dist, &["run", "//xr:reads_env"]).expect("run");
+    assert!(out.status.success(), "{}", describe(&out));
+
+    let got = std::fs::read_to_string(&marker)
+        .unwrap_or_else(|e| panic!("the target never ran ({e})\n{}", describe(&out)));
+    assert_eq!(
+        got.trim(),
+        "from-the-environment-from-the-target",
+        "the runner's environment must reach the target, and the target's own value must win\n{}",
+        describe(&out)
+    );
+}
+
+/// A tool that exists only on the runner's `PATH` resolves inside the target.
+///
+/// This is the whole reason the exec driver no longer injects its own
+/// `/usr/local/bin:/usr/bin:/bin` under a runner: that default used to be the
+/// target's entire `PATH`, so nothing the environment provided was reachable.
+#[test]
+fn a_tool_on_the_runners_path_resolves_in_the_target() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let marker = ws.root().join("tool.txt");
+    let script = ws.root().join("launch.sh");
+    let bin = ws.root().join("runner-bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    let tool = bin.join("xr-only-here");
+    std::fs::write(&tool, "#!/bin/sh\necho found-on-the-runners-path\n").expect("write tool");
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod");
+
+    let mut build = env_runner(
+        "runner",
+        &script.display().to_string(),
+        &format!("export PATH={}:$PATH", bin.display()),
+    );
+    build.push_str(&format!(
+        r#"
+target(
+    name = "uses_tool",
+    driver = "bash",
+    run = "xr-only-here > {}",
+    out = [],
+    runner = "//xr:runner",
+)
+"#,
+        marker.display()
+    ));
+    ws.write("xr/BUILD", &build).expect("write BUILD");
+
+    let out = ws.run(&dist, &["run", "//xr:uses_tool"]).expect("run");
+    assert!(out.status.success(), "{}", describe(&out));
+
+    let got = std::fs::read_to_string(&marker)
+        .unwrap_or_else(|e| panic!("the target never ran ({e})\n{}", describe(&out)));
+    assert_eq!(
+        got.trim(),
+        "found-on-the-runners-path",
+        "{}",
+        describe(&out)
+    );
+}
+
 /// Run by hand, `__runner-exec` must explain itself rather than panicking or
 /// hanging on a socket nobody is listening to. It appears in every `ps` output
 /// of every agent build, so someone will paste it into a shell.

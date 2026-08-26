@@ -13,7 +13,7 @@ use crate::engine::result::{OutputMatcher, ResultOptions};
 use hcore::hasync::Cancellable;
 use hexecrunner::config::{RUNNER_JSON, RunnerConfig};
 use hexecrunner::registry::RunnerRegistry;
-use hexecrunner::{RunnerHost, SpecRewrite};
+use hexecrunner::{PrepareOutcome, RunnerHost, SpecRewrite};
 use hmodel::htaddr::Addr;
 use hplugin::eresult::EResult;
 use std::collections::HashMap;
@@ -204,7 +204,7 @@ impl RunnerHost for EngineRunnerHost {
         addr: &Addr,
         rewrite: SpecRewrite,
         ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<SpecRewrite> {
+    ) -> anyhow::Result<PrepareOutcome> {
         let cfg = self.resolve(request_id, addr).await?;
         self.registry
             .prepare(&addr.format(), &cfg, rewrite, ctoken)

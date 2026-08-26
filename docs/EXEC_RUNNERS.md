@@ -121,6 +121,41 @@ absent because every absolute path the driver computed — tool symlinks, `$OUT`
 - `cwd` — where to run `launch`. Not where targets run; they get their own
   sandbox.
 
+There is no `env`, deliberately. The agent is a process the launch put *inside*
+the environment, so its own `environ` **is** the environment — a declared copy
+would be a second thing to keep in sync with the first. That is sound for the
+cache because a consumer names the runner *target*, whose hashout is one of its
+hashed inputs: whatever the environment provides is already in the consumer's
+cache key by construction.
+
+## The environment a target actually gets
+
+```text
+env_clear  +  the runner's environment  +  the target's own
+```
+
+For `wrap` the runner's half is the `env` map in its config; for `session` it is
+the agent's `environ`. The target's half — its `env`, its `pass_env`, its deps
+and tools — goes on top, so a target that declares something gets what it
+declared even when the environment it runs in has an opinion.
+
+`PATH` is the exception, because it is a *list* and both sides legitimately
+contribute:
+
+```text
+PATH = the target's tools  ++  what the target declared  ++  the runner's PATH
+```
+
+Tools lead, so a target that declares a tool gets that one even when the
+environment ships another by the same name.
+
+What is **not** in there is the exec driver's own sandbox `PATH`
+(`/usr/local/bin:/usr/bin:/bin`, or its `path:` option). Under a runner the
+driver does not inject it at all: it is a fallback for a local spawn, and
+putting it in front of the environment would let a host-installed tool silently
+shadow the one the target asked to run beside — inside a cache key that claims
+the runner's environment.
+
 ## The fingerprint, and why it exists
 
 A consumer's cache key comes from the runner target's **hashout** — the hash of
@@ -169,9 +204,10 @@ literal env map. Targets then spawn locally with that environment: no devenv
 process per target, no shell evaluation on the hot path. **Start here.**
 
 `session` holds one `devenv shell` open for the build and runs targets inside
-it. It earns its cost when the environment is not a set of variables — shell
-activation with side effects, services devenv starts, state under `.devenv/` —
-i.e. when what matters is process ancestry rather than `environ`.
+it. Targets get that shell's environment because they are started from inside it
+(see above), plus everything the environment *is* beyond its variables: shell
+activation with side effects, services devenv starts, state under `.devenv/`. It
+earns its cost when what matters is process ancestry rather than `environ` alone.
 
 Both modes resolve the environment to fingerprint it, so `session` pays one
 evaluation it would not strictly need in exchange for a fingerprint that

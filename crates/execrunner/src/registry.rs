@@ -49,6 +49,18 @@ pub trait ExecRunner: Send + Sync {
         rewrite: SpecRewrite,
     ) -> anyhow::Result<SpecRewrite>;
 
+    /// Whether this runner puts the target into an environment of its own.
+    ///
+    /// Decides one thing: whether the driver's fallback `PATH` may be reinstated
+    /// when neither the target nor the runner produced one here (see
+    /// [`crate::PathPolicy`]). An agent runner answers yes — its environment is
+    /// the agent's `environ`, which this process cannot see, so reinstating a
+    /// fallback would put the driver's `/usr/bin` ahead of the environment the
+    /// target asked to run in and let a host-installed tool shadow it.
+    fn supplies_environment(&self) -> bool {
+        false
+    }
+
     /// Release anything held open — a session, a container.
     ///
     /// Synchronous, because the only caller is `Engine`'s `Drop`. It cannot be
@@ -144,7 +156,7 @@ impl RunnerRegistry {
         cfg: &RunnerConfig,
         rewrite: SpecRewrite,
         ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<SpecRewrite> {
+    ) -> anyhow::Result<crate::PrepareOutcome> {
         self.validate(addr, cfg)?;
         let runner = self
             .get(&cfg.runner)
@@ -155,7 +167,10 @@ impl RunnerRegistry {
             config: &cfg.config,
             ctoken,
         };
-        runner.prepare(&ctx, rewrite).await
+        Ok(crate::PrepareOutcome {
+            rewrite: runner.prepare(&ctx, rewrite).await?,
+            supplies_environment: runner.supplies_environment(),
+        })
     }
 }
 
@@ -240,7 +255,7 @@ impl ExecRunner for WrapRunner {
 
 /// Set or replace a variable in a cleared-env list, preserving position on
 /// replace so the resulting order is stable across runs.
-fn set_env(env: &mut Vec<(OsString, OsString)>, key: OsString, value: OsString) {
+pub(crate) fn set_env(env: &mut Vec<(OsString, OsString)>, key: OsString, value: OsString) {
     if let Some(slot) = env.iter_mut().find(|(k, _)| *k == key) {
         slot.1 = value;
     } else {
@@ -290,7 +305,9 @@ mod tests {
     async fn run(c: &RunnerConfig, r: SpecRewrite) -> anyhow::Result<SpecRewrite> {
         let reg = RunnerRegistry::with_builtins();
         let ctoken = StdCancellationToken::new();
-        reg.prepare("//x:r", c, r, &ctoken).await
+        reg.prepare("//x:r", c, r, &ctoken)
+            .await
+            .map(|outcome| outcome.rewrite)
     }
 
     #[tokio::test]
