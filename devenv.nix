@@ -175,6 +175,11 @@ in
     gen
     gen-go-large
     install-go-plugin
+    # The example workspace's `execrunner` package needs both: a
+    # `devenv_runner` for the build environment and an `oci_runner` for the
+    # runtime one. Neither is compiled into the CLI.
+    install-devenv-plugin
+    install-oci-plugin
   '';
   # Three clippy passes — default features, `--all-features`, and
   # `--no-default-features` — then fmt-check all hand-written crates
@@ -540,6 +545,29 @@ in
   # Build + install the devenv exec-runner plugin (a cdylib + manifest), the same
   # publish flow as `install-gha-plugin`. Reference it from config with a
   # `path: ~/.heph/plugins/devenv/heph-devenv-plugin.json` entry.
+  # Build + install the OCI plugin (a cdylib + manifest), the same publish flow
+  # as `install-gha-plugin`. Reference it from config with a
+  # `path: ~/.heph/plugins/oci/heph-oci-plugin.json` entry.
+  scripts.install-oci-plugin.exec = ''
+    cargo build --release -p plugin-oci-cdylib
+    target="$(target-dir)"
+    if [ "$(uname -s)" = "Darwin" ]; then
+      lib="$target/release/libplugin_oci_cdylib.dylib"
+      name="heph-oci-plugin.dylib"
+      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
+    else
+      lib="$target/release/libplugin_oci_cdylib.so"
+      name="heph-oci-plugin.so"
+    fi
+    dest="$HOME/.heph/plugins/oci"
+    mkdir -p "$dest"
+    cp "$lib" "$dest/$name.new"
+    mv -f "$dest/$name.new" "$dest/$name"
+    ( cd "$DEVENV_ROOT/tools/pluginmanifest" \
+        && go run . -name oci -host-path "$name" -checksum-from "$dest/$name" -out "$dest/heph-oci-plugin.json" )
+    echo "installed oci plugin -> $dest"
+  '';
+
   scripts.install-devenv-plugin.exec = ''
     cargo build --release -p plugin-devenv-cdylib
     target="$(target-dir)"

@@ -20,6 +20,10 @@ Two identifiers, two jobs. The **address** is what you write and what reaches
 the cache key — only a target has a hashout. The **name** inside the file
 selects code.
 
+A worked example of both, wired together, is `example/execrunner`: a service
+whose config is built under a devenv toolchain, packaged into an image, and
+checked inside that image.
+
 ## Using one
 
 Per target:

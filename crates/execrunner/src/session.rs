@@ -54,14 +54,15 @@ pub struct SessionConfig {
 /// A live agent.
 struct Session {
     socket: PathBuf,
-    /// Held for the session's lifetime. Dropping a `proc_exec::Handle` reaps
-    /// its child, so this field *is* the session's lifetime.
+    /// The task waiting on the agent process.
     ///
-    /// Behind a `Mutex` because the handle is `Send` but not `Sync` on macOS
-    /// (it owns an `mpsc::Receiver`), and a session is shared across every
-    /// target using it. Never locked — the mutex is here to make the handle
-    /// shareable, not to coordinate anything.
-    _agent: Mutex<proc_exec::Handle>,
+    /// Not merely held to keep the child reaped — it is how the session knows
+    /// the agent is *alive*. `is_finished()` turns "the launch command died" into
+    /// an immediate, explanatory failure; without it a `docker run` that exits
+    /// on the spot leaves every consumer polling a socket that will never
+    /// appear until the handshake timeout expires, which is minutes of a build
+    /// looking hung for a reason nothing reports.
+    waiter: tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
     pgid: i32,
 }
 
@@ -71,6 +72,7 @@ impl Drop for Session {
             // SAFETY: a pgid this process created via `setsid`.
             unsafe { libc::killpg(self.pgid, libc::SIGTERM) };
         }
+        self.waiter.abort();
         _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -206,19 +208,24 @@ impl SessionRunner {
             )
         })?;
         let pgid = agent.pid();
+        // Never cancelled: the session's lifetime is the pool's, and teardown
+        // goes through `Drop`'s killpg rather than this token.
+        let waiter = agent.spawn_wait(Arc::new(hcore::hasync::StdCancellationToken::new()));
 
-        await_socket(&socket, ctx).await.inspect_err(|_failed| {
-            // Reap the half-started environment rather than leaving it behind
-            // for the rest of the process's life.
-            if pgid > 0 {
-                // SAFETY: a pgid this process created via `setsid`.
-                unsafe { libc::killpg(pgid, libc::SIGKILL) };
-            }
-        })?;
+        await_socket(&socket, &waiter, ctx)
+            .await
+            .inspect_err(|_failed| {
+                // Reap the half-started environment rather than leaving it behind
+                // for the rest of the process's life.
+                if pgid > 0 {
+                    // SAFETY: a pgid this process created via `setsid`.
+                    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                }
+            })?;
 
         Ok(Session {
             socket,
-            _agent: Mutex::new(agent),
+            waiter,
             pgid,
         })
     }
@@ -251,6 +258,14 @@ fn short_digest(ctx: &RunnerCtx<'_>) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// The launch argv, for a diagnostic — re-read from the config rather than
+/// threaded through, since this is a cold error path.
+fn cfg_launch_hint(ctx: &RunnerCtx<'_>) -> Vec<String> {
+    serde_json::from_value::<SessionConfig>(ctx.config.clone())
+        .map(|c| c.launch)
+        .unwrap_or_default()
+}
+
 /// macOS `sun_path` is 104 bytes, Linux 108. Checked rather than discovered as
 /// an `ENAMETOOLONG` from `bind`, or — worse on some libcs — a silent
 /// truncation that makes two sessions share one socket.
@@ -273,7 +288,11 @@ fn assert_socket_path_fits(socket: &Path) -> anyhow::Result<()> {
 /// checked every tick: a cold environment start is the single most likely
 /// moment for a user to press Ctrl-C, and a timeout alone would ignore it for
 /// minutes.
-async fn await_socket(socket: &Path, ctx: &RunnerCtx<'_>) -> anyhow::Result<()> {
+async fn await_socket(
+    socket: &Path,
+    waiter: &tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    ctx: &RunnerCtx<'_>,
+) -> anyhow::Result<()> {
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
         if ctx.ctoken.is_cancelled() {
@@ -284,6 +303,25 @@ async fn await_socket(socket: &Path, ctx: &RunnerCtx<'_>) -> anyhow::Result<()> 
         }
         if std::os::unix::net::UnixStream::connect(socket).is_ok() {
             return Ok(());
+        }
+        // Checked *after* the connect, so an agent that started and exited in
+        // the same tick is still noticed as started.
+        //
+        // This is the difference between "the container image cannot run the
+        // agent" reported in a second and a build that looks hung for the whole
+        // handshake window. The launch command's own output is already on
+        // heph's stderr — it inherits it — so the message points there rather
+        // than trying to recover it.
+        if waiter.is_finished() {
+            anyhow::bail!(
+                "runner {}: the session agent exited before it started listening. Its launch \
+                 command was {:?}; whatever it printed is on heph's stderr above. A container \
+                 runner most often fails here because the image cannot execute the heph binary \
+                 — heph is mounted in from the host, so a macOS binary cannot run in a Linux \
+                 image.",
+                ctx.addr,
+                cfg_launch_hint(ctx),
+            );
         }
         if Instant::now() >= deadline {
             anyhow::bail!(

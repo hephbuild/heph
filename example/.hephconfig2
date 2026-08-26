@@ -9,7 +9,6 @@ plugins:
         - BUILD
   - builtin: exec
   - builtin: bash
-  - builtin: sh
   # The go plugin: one manifest names the cdylib for this host. The provider + its
   # go_* drivers all come from that one library. Installed to the user-global
   # ~/.heph by the `gen-example` script (which runs `install-go-plugin`).
@@ -36,15 +35,21 @@ plugins:
       # no release publishes: point it at a build target in *this* workspace, or
       # at a released tag's download target.
       #govet: "//@heph/go/govet/v0.1.234:heph-govet"
-  # The devenv exec runner: a `devenv_runner` target describes a devenv
-  # environment, and targets run inside it by naming that target with
-  # `runner = "//tools/devenv:runner"` — or the whole workspace does it once
-  # with `runner:` in the exec/bash driver options above. Installed to
-  # ~/.heph by `install-devenv-plugin`.
-  #- path: ~/.heph/plugins/devenv/heph-devenv-plugin.json
-  #  options:
-  #    # Which `devenv` to resolve against. Defaults to `devenv` on PATH.
-  #    bin: "devenv"
+  # Exec runners: a target can say *where* its command runs. See the
+  # `execrunner` package for a worked example, and docs/EXEC_RUNNERS.md for the
+  # contract. Neither plugin is compiled into the CLI; `gen-example` installs
+  # both into ~/.heph.
+  #
+  # The devenv runner describes a build environment. A target enters it with
+  # `runner = "//execrunner:devenv"`, or a whole workspace does it once with
+  # `runner:` in the exec/bash driver options above.
+  - path: ~/.heph/plugins/devenv/heph-devenv-plugin.json
+    options:
+      # Which `devenv` to resolve against. Defaults to `devenv` on PATH.
+      bin: "devenv"
+  # The oci plugin: `docker_build` / `oci_load` / `oci_pull` / `oci_push`, plus
+  # the `oci_runner` that runs targets inside a built image.
+  - path: ~/.heph/plugins/oci/heph-oci-plugin.json
 #fuse:
 #  enabled: true
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus

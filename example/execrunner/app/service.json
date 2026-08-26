@@ -1,0 +1,6 @@
+{
+  "name": "billing",
+  "version": "2.4.1",
+  "listen": 8080,
+  "features": ["invoices", "refunds"]
+}

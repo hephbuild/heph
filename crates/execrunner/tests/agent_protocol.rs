@@ -294,3 +294,66 @@ fn wait_until_gone(pid: i32, within: Duration) -> bool {
     }
     false
 }
+
+/// A session whose launch command dies must fail immediately, not wait out the
+/// handshake window.
+///
+/// Found by an example: a container image that cannot execute the agent left
+/// `docker run` exiting on the spot, and the build then sat for the full
+/// handshake timeout — minutes of looking hung with nothing reporting why. The
+/// launch here exits before the agent it was asked to run ever starts.
+///
+/// `/bin/sh -c 'exit 1'` rather than `/bin/false`: `/bin/sh` is the one binary
+/// this repo's suites treat as present everywhere (see `proc_exec`'s own
+/// tests), and `/bin/false` is genuinely absent on some of the hosts here.
+#[test]
+fn a_session_whose_launch_dies_fails_fast() {
+    use execrunner::registry::{RunnerCtx, RunnerRegistry};
+    use execrunner::session::SessionRunner;
+    use hcore::hasync::StdCancellationToken;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut reg = RunnerRegistry::default();
+    reg.register(Arc::new(SessionRunner::new(dir.path().to_path_buf())))
+        .expect("register");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let started = Instant::now();
+    let err = rt.block_on(async {
+        let ctoken = StdCancellationToken::new();
+        let config = serde_json::json!({ "launch": ["/bin/sh", "-c", "exit 1"] });
+        let ctx = RunnerCtx {
+            addr: "//x:runner",
+            fingerprint: "fp",
+            config: &config,
+            ctoken: &ctoken,
+        };
+        let runner = reg.get("session").expect("session runner").clone();
+        runner
+            .prepare(
+                &ctx,
+                execrunner::SpecRewrite {
+                    program: PathBuf::from("/bin/echo"),
+                    args: vec![],
+                    env: vec![],
+                    cwd: PathBuf::from("/"),
+                },
+            )
+            .await
+            .expect_err("a launch that exits must not be waited on")
+    });
+
+    let msg = format!("{err:#}");
+    assert!(msg.contains("exited before it started listening"), "{msg}");
+    assert!(msg.contains("/bin/sh"), "must name the launch: {msg}");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "must fail fast, took {:?}",
+        started.elapsed()
+    );
+}
