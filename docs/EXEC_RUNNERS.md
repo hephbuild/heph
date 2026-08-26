@@ -244,10 +244,49 @@ paths that do not exist, silently.
 
 ## Go
 
-Every Go driver takes a `runner`, so `go list`, `go tool compile`/`asm`/`pack`,
-`gofmt` and `heph-govet` can each run inside an environment.
+Go targets are generated, not authored, so the knob is the plugin's own option
+in the config yaml rather than a field on a target. It sets the environment
+every Go **tool** runs in — `go list`, `go tool compile`/`asm`/`pack`, `gofmt`
+and `heph-govet`:
 
-Test targets go through the `go` provider state:
+```yaml
+plugins:
+  - path: ~/.heph/plugins/go/heph-go-plugin.json
+    options:
+      gotool: "1.26.4"
+      runner: "//tools/devenv:runner"
+```
+
+Unset, or `"local"`, spawns on the host as before. The runner is a hashed
+dependency of every Go target it applies to, so changing the environment re-keys
+the whole Go build; its address is not in any def hash, so turning the option on
+in a workspace that had none invalidates nothing by itself.
+
+`gotool` composes with it. `gotool: "host"` means "the `go` this build's
+environment provides" — so under a runner it is the *runner's* `go`, found on
+the runner's `PATH`, with `GOROOT` asked by running `go env GOROOT` inside that
+environment (once per build, not once per package). Without a runner it is
+heph's own `PATH`, exactly as before. `gotool: "<version>"` and
+`gotool: "//pkg:go"` are unaffected either way: both resolve to a staged path
+inside the sandbox and never probe a host.
+
+> Before this composed, `gotool: "host"` under a runner resolved `go` from
+> heph's `PATH` and then executed that host binary *inside* the runner's
+> environment — the host's toolchain under a cache key claiming the
+> environment's.
+
+A hand-written target using one of these drivers can name its own `runner`,
+which wins over the option — including `runner = "local"` to escape it. There is
+no per-package override for *generated* targets: the option is workspace-wide.
+Note the consequence — a runner target whose `runner.json` is produced by a Go
+build cannot exist under this option, because the Go build would depend on the
+runner it produces. That surfaces as a `CycleError` naming both, not as a wrong
+answer.
+
+**Tests are deliberately not covered by it.** A test is an exec/bash target, and
+building the toolchain somewhere and running the tests there are separate
+decisions — a build wants the compiler's environment, a test often wants the
+runtime's. Test targets go through the `go` provider state:
 
 ```python
 provider_state(
@@ -258,7 +297,9 @@ provider_state(
 
 That reaches the generated target as the exec driver's own `runner` field —
 which is the argument for `runner` living on that driver rather than being
-reinvented per plugin.
+reinvented per plugin. With the state unset, a test falls back to the
+exec/bash driver's own `runner:` option, so a workspace that wants *everything*
+in one environment sets it there and needs nothing per package.
 
 ## Agent mode, in one picture
 

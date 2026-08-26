@@ -71,6 +71,19 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let walk_db = hplugin::config::decode_opt::<PathBuf>(&options, "go", "walk_db")?
         .unwrap_or_else(|| home.join("heph-plugin-go-fswalk.db"));
     options.remove("walk_db");
+    // The environment every Go *tool* runs in — `go list`, `go tool compile`,
+    // `heph-govet`, `gofmt`. A target address producing a `runner.json`, or the
+    // literal "local" (the default) to spawn on the host. Like `walk_db` this is
+    // consumed here rather than declared to the provider, whose `from_options`
+    // rejects unknown keys — it configures the drivers, not package discovery.
+    //
+    // Deliberately NOT the runner for generated *test* targets: a test is an
+    // exec/bash target, and it takes its runner from `provider_state(provider =
+    // "go", test = {"runner": ...})`, falling back to the exec/bash driver's own
+    // `runner:` option. Building the toolchain somewhere and running the tests
+    // there are separate decisions — a build wants the compiler's environment, a
+    // test often wants the runtime's.
+    let go_runner = hplugin_go::plugingo::runner::take_runner_option(&mut options)?;
 
     let walker = Arc::new(hwalk::CachedWalker::open(&walk_db));
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(Provider::from_options(
@@ -87,9 +100,10 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // walker db and for the same reason: it is heph-owned scratch, not repo
     // content, and a plugin is handed its writable locations rather than
     // discovering them.
-    let golist: Arc<dyn ManagedDriver> = Arc::new(GoGolistDriver::with_gocache_root(
-        home.join("go-golist-gocache"),
-    ));
+    let golist: Arc<dyn ManagedDriver> = Arc::new(
+        GoGolistDriver::with_gocache_root(home.join("go-golist-gocache"))
+            .with_default_runner(go_runner.clone()),
+    );
     drivers.push(NamedDriver {
         name: "go_golist".into(),
         driver: make_dyn_managed_driver(golist),
@@ -101,7 +115,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         name: "go_toolchain".into(),
         driver: make_dyn_managed_driver(toolchain),
     });
-    let compile: Arc<dyn ManagedDriver> = Arc::new(GoCompileDriver::new());
+    let compile: Arc<dyn ManagedDriver> = Arc::new(GoCompileDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_compile".into(),
         driver: make_dyn_managed_driver(compile),
@@ -112,7 +126,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         driver: make_dyn_managed_driver(testmain),
     });
     // Per-package go/analysis (vet) with serialized facts, nogo-style.
-    let lint: Arc<dyn ManagedDriver> = Arc::new(GoLintDriver::new());
+    let lint: Arc<dyn ManagedDriver> = Arc::new(GoLintDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_lint".into(),
         driver: make_dyn_managed_driver(lint),
@@ -130,12 +144,12 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         driver: make_dyn_managed_driver(lint_fix),
     });
     // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
-    let format: Arc<dyn ManagedDriver> = Arc::new(GoFormatDriver::new());
+    let format: Arc<dyn ManagedDriver> = Arc::new(GoFormatDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_format".into(),
         driver: make_dyn_managed_driver(format),
     });
-    let format_check: Arc<dyn ManagedDriver> = Arc::new(GoFormatCheckDriver::new());
+    let format_check: Arc<dyn ManagedDriver> = Arc::new(GoFormatCheckDriver::new().with_default_runner(go_runner));
     drivers.push(NamedDriver {
         name: "go_format_check".into(),
         driver: make_dyn_managed_driver(format_check),

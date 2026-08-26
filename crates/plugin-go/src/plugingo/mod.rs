@@ -31,4 +31,4 @@ pub use driver_testmain::GoTestmainDriver;
 pub use provider::{Config, Provider};
 pub use toolchain::GoToolchainDriver;
 
-pub(crate) mod runner;
+pub mod runner;

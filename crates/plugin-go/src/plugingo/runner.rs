@@ -58,6 +58,45 @@ pub(crate) fn parse_runner(
     Ok((Some(target), Some(input)))
 }
 
+/// Resolve the runner for one target: the spec's own `runner` field when it
+/// names one, otherwise the driver-wide default from the plugin's `runner:`
+/// option in the config yaml.
+///
+/// `"local"` means "spawn here" at either level, and a spec that says it beats
+/// a default — the field is the escape hatch from a workspace-wide setting,
+/// which is what makes turning that setting on safe.
+pub(crate) fn parse_runner_with_default(
+    raw: &str,
+    default: Option<&str>,
+    pkg: &PkgBuf,
+) -> anyhow::Result<(Option<TargetAddr>, Option<Input>)> {
+    let effective = if raw.is_empty() {
+        default.unwrap_or_default()
+    } else {
+        raw
+    };
+    parse_runner(effective, pkg)
+}
+
+/// Read and consume the plugin's `runner` option — the environment every Go
+/// tool runs in — from the config-yaml `options:` map.
+///
+/// Consuming it matters: the go provider's `from_options` rejects keys it does
+/// not know, and this one configures the drivers rather than package discovery.
+///
+/// Split out so the config key itself is under test. A typo here fails nothing
+/// — the provider never sees the key, so a misspelling would leave the option
+/// silently inert and every Go tool on the host while the config says
+/// otherwise.
+pub fn take_runner_option(
+    options: &mut hplugin::config::Options,
+) -> anyhow::Result<Option<String>> {
+    let runner = hplugin::config::decode_opt::<String>(options, "go", "runner")?
+        .filter(|r| !r.is_empty());
+    options.remove("runner");
+    Ok(runner)
+}
+
 /// The runner to spawn this driver's tool under.
 pub(crate) fn runner_ref<'a>(
     request_id: &'a str,
@@ -107,6 +146,83 @@ mod tests {
     fn a_relative_address_resolves_against_the_package() {
         let (target, _) = parse_runner(":runner", &pkg()).expect("parse");
         assert_eq!(target.expect("target").r#ref.format(), "//some/pkg:runner");
+    }
+
+    /// The driver-wide default applies only where the spec is silent.
+    #[test]
+    fn the_default_fills_in_for_a_spec_that_names_no_runner() {
+        let (target, input) =
+            parse_runner_with_default("", Some("//tools/devenv:runner"), &pkg()).expect("parse");
+        assert_eq!(
+            target.expect("target").r#ref.format(),
+            "//tools/devenv:runner"
+        );
+        assert!(input.expect("input").hashed);
+    }
+
+    /// The spec wins over the default, so a hand-written Go target can name a
+    /// different environment than the workspace-wide one.
+    #[test]
+    fn a_spec_runner_beats_the_default() {
+        let (target, _) =
+            parse_runner_with_default(":own", Some("//tools/devenv:runner"), &pkg()).expect("parse");
+        assert_eq!(target.expect("target").r#ref.format(), "//some/pkg:own");
+    }
+
+    /// **The escape hatch.** Without this a workspace-wide default would be
+    /// unopt-out-able for the one target that must not have it — which is what
+    /// makes turning the default on a safe thing to do.
+    #[test]
+    fn a_spec_saying_local_escapes_the_default() {
+        let (target, input) =
+            parse_runner_with_default("local", Some("//tools/devenv:runner"), &pkg()).expect("parse");
+        assert!(target.is_none());
+        assert!(input.is_none());
+    }
+
+    /// A default of `"local"` (or absent) leaves everything on the host, so the
+    /// option can be set to the opt-out value rather than deleted.
+    #[test]
+    fn a_local_or_absent_default_means_no_runner() {
+        for default in [None, Some("local"), Some("")] {
+            let (target, input) = parse_runner_with_default("", default, &pkg()).expect("parse");
+            assert!(target.is_none(), "{default:?}");
+            assert!(input.is_none(), "{default:?}");
+        }
+    }
+
+    fn opts(pairs: &[(&str, &str)]) -> hplugin::config::Options {
+        let mut o = hplugin::config::Options::new();
+        for (k, v) in pairs {
+            o.insert((*k).to_string(), serde_yaml::Value::String((*v).to_string()));
+        }
+        o
+    }
+
+    /// The config-yaml key the drivers are actually configured by.
+    #[test]
+    fn the_runner_option_is_read_and_consumed() {
+        let mut o = opts(&[("gotool", "host"), ("runner", "//tools/devenv:runner")]);
+        assert_eq!(
+            take_runner_option(&mut o).expect("decode").as_deref(),
+            Some("//tools/devenv:runner")
+        );
+        assert!(
+            !o.contains_key("runner"),
+            "must be consumed — the go provider rejects keys that are not its own"
+        );
+        assert!(o.contains_key("gotool"), "unrelated options are untouched");
+    }
+
+    /// Absent and empty both mean "spawn on the host", so the option can be
+    /// blanked rather than deleted.
+    #[test]
+    fn an_absent_or_empty_option_means_no_runner() {
+        assert_eq!(take_runner_option(&mut opts(&[])).expect("decode"), None);
+        assert_eq!(
+            take_runner_option(&mut opts(&[("runner", "")])).expect("decode"),
+            None
+        );
     }
 
     /// A bare word that is not the reserved `local` must say what the field

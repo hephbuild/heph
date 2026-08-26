@@ -36,11 +36,31 @@ use std::io::BufRead;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-pub struct GoCompileDriver;
+pub struct GoCompileDriver {
+    /// Default exec runner for this driver's tool, from the plugin's `runner:`
+    /// option in the config yaml. A target's own `runner` field overrides it,
+    /// and `"local"` there opts back out. See [`crate::plugingo::runner`].
+    default_runner: Option<String>,
+    /// Host `go` resolved in whatever environment the runner names — see
+    /// [`crate::plugingo::toolchain::HostGoCache`]. Only ever touched by
+    /// `gotool = "host"`.
+    host_go: crate::plugingo::toolchain::HostGoCache,
+}
 
 impl GoCompileDriver {
     pub fn new() -> Self {
-        Self
+        Self {
+            default_runner: None,
+            host_go: Default::default(),
+        }
+    }
+
+    /// Set the driver-wide default runner (the plugin's `runner:` option).
+    /// `None` and `Some("local")` both mean "spawn on the host".
+    #[must_use]
+    pub fn with_default_runner(mut self, runner: Option<String>) -> Self {
+        self.default_runner = runner;
+        self
     }
 }
 
@@ -295,7 +315,11 @@ impl ManagedDriver for GoCompileDriver {
             })?
         };
 
-        let (runner, runner_input) = super::runner::parse_runner(&spec.runner, &pkg)?;
+        let (runner, runner_input) = super::runner::parse_runner_with_default(
+            &spec.runner,
+            self.default_runner.as_deref(),
+            &pkg,
+        )?;
         inputs.extend(runner_input);
 
         let def = GoCompileDef {
@@ -389,12 +413,17 @@ impl ManagedDriver for GoCompileDriver {
         // GOROOT / go binary for the selected toolchain — host, target-ref, or
         // hermetic staged SDK (mirrors go_golist, see `resolve_toolchain_go`).
         use crate::plugingo::toolchain::Toolchain;
+        let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
         let (goroot, go_bin) = crate::plugingo::toolchain::resolve_toolchain_go(
             &def.go_version,
             &req.inputs,
             &req.sandbox_ws_dir,
             "go_compile",
-        )?;
+            runner,
+            &self.host_go,
+            ctoken,
+        )
+        .await?;
 
         let gocache = pkg_dir.join(".heph-gocache");
         std::fs::create_dir_all(&gocache)
@@ -478,7 +507,6 @@ impl ManagedDriver for GoCompileDriver {
         // Every `go tool` step below runs under the target's exec runner, so a
         // compile configured to happen inside an environment happens there for
         // asm and pack too, not only for the compile itself.
-        let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
 
         // 4. asm step 0+1: seed go_asm.h, then -gensymabis → symabis.
         if has_asm {
@@ -1010,6 +1038,42 @@ mod driver_tests {
             .await
             .unwrap()
             .target_def
+    }
+
+
+    /// The plugin's `runner:` config-yaml option reaches a generated target.
+    /// Nothing populates the `runner` spec field for provider-generated Go
+    /// targets, so the option is the only path to a non-host runner here.
+    #[tokio::test]
+    async fn the_driver_default_runner_reaches_the_parsed_inputs() {
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let def = GoCompileDriver::new()
+            .with_default_runner(Some("//tools/devenv:runner".to_string()))
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: std::sync::Arc::new(spec_with_buildmode(BuildMode::Exe)),
+                },
+                &ct,
+            )
+            .await
+            .expect("parse")
+            .target_def;
+        let runner: Vec<_> = def
+            .inputs
+            .iter()
+            .filter(|i| i.origin_id == crate::plugingo::runner::RUNNER_ORIGIN)
+            .collect();
+        assert_eq!(
+            runner.len(),
+            1,
+            "expected exactly one runner input, got {}",
+            runner.len()
+        );
+        let input = runner.first().expect("runner input");
+        assert_eq!(input.r#ref.r#ref.format(), "//tools/devenv:runner");
+        assert!(input.hashed, "must key the cache");
+        assert!(!input.runtime, "must not reach the sandbox");
     }
 
     #[tokio::test]

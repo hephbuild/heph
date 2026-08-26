@@ -257,10 +257,18 @@ impl Provider {
         //   - a target address like `"//@heph/bin:go"` (host `go` via the hostbin
         //     provider) or `"//some/pkg:go"` (e.g. a nix-built `go`) → use the
         //     `go` produced by that target (see [`toolchain::is_target_ref`]).
+        // `runner` and `walk_db` configure the drivers and the cdylib's walker
+        // db, not package discovery — the cdylib consumes both before calling
+        // this, so neither can actually be present here. They are listed anyway
+        // because this list is also what a typo'd key is told the plugin
+        // accepts, and a message that omits a valid key sends the reader
+        // looking for a different mistake than the one they made.
         hplugin::config::deny_unknown(
             "go provider",
             opts,
-            &["gotool", "govet", "cctool", "skip", "checksums"],
+            &[
+                "gotool", "govet", "cctool", "skip", "checksums", "runner", "walk_db",
+            ],
         )?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
             .ok_or_else(|| {

@@ -182,11 +182,26 @@ fn parse_inputs(spec: &GoFormatSpec, pkg: &hmodel::htpkg::PkgBuf) -> anyhow::Res
 // Fix driver (`go_format`): reformat sources, codegen=in_place.
 // ---------------------------------------------------------------------------
 
-pub struct GoFormatDriver;
+pub struct GoFormatDriver {
+    /// Default exec runner for this driver's tool, from the plugin's `runner:`
+    /// option in the config yaml. A target's own `runner` field overrides it,
+    /// and `"local"` there opts back out. See [`crate::plugingo::runner`].
+    default_runner: Option<String>,
+}
 
 impl GoFormatDriver {
     pub fn new() -> Self {
-        Self
+        Self {
+            default_runner: None,
+        }
+    }
+
+    /// Set the driver-wide default runner (the plugin's `runner:` option).
+    /// `None` and `Some("local")` both mean "spawn on the host".
+    #[must_use]
+    pub fn with_default_runner(mut self, runner: Option<String>) -> Self {
+        self.default_runner = runner;
+        self
     }
 }
 
@@ -217,7 +232,11 @@ impl ManagedDriver for GoFormatDriver {
         let pkg_str = pkg.as_str();
         let spec = GoFormatSpec::from(&req.target_spec.config).context("parse go_format")?;
         let mut inputs = parse_inputs(&spec, &pkg)?;
-        let (runner, runner_input) = super::runner::parse_runner(&spec.runner, &pkg)?;
+        let (runner, runner_input) = super::runner::parse_runner_with_default(
+            &spec.runner,
+            self.default_runner.as_deref(),
+            &pkg,
+        )?;
         inputs.extend(runner_input);
 
         let outputs: Vec<Output> = spec
@@ -315,11 +334,26 @@ impl ManagedDriver for GoFormatDriver {
 // Check driver (`go_format_check`): fail when any file is not formatted.
 // ---------------------------------------------------------------------------
 
-pub struct GoFormatCheckDriver;
+pub struct GoFormatCheckDriver {
+    /// Default exec runner for this driver's tool, from the plugin's `runner:`
+    /// option in the config yaml. A target's own `runner` field overrides it,
+    /// and `"local"` there opts back out. See [`crate::plugingo::runner`].
+    default_runner: Option<String>,
+}
 
 impl GoFormatCheckDriver {
     pub fn new() -> Self {
-        Self
+        Self {
+            default_runner: None,
+        }
+    }
+
+    /// Set the driver-wide default runner (the plugin's `runner:` option).
+    /// `None` and `Some("local")` both mean "spawn on the host".
+    #[must_use]
+    pub fn with_default_runner(mut self, runner: Option<String>) -> Self {
+        self.default_runner = runner;
+        self
     }
 }
 
@@ -349,7 +383,11 @@ impl ManagedDriver for GoFormatCheckDriver {
         let pkg = req.target_spec.addr.package.clone();
         let spec = GoFormatSpec::from(&req.target_spec.config).context("parse go_format_check")?;
         let mut inputs = parse_inputs(&spec, &pkg)?;
-        let (runner, runner_input) = super::runner::parse_runner(&spec.runner, &pkg)?;
+        let (runner, runner_input) = super::runner::parse_runner_with_default(
+            &spec.runner,
+            self.default_runner.as_deref(),
+            &pkg,
+        )?;
         inputs.extend(runner_input);
 
         let hash = {
@@ -548,6 +586,76 @@ mod tests {
             go_files: &[],
             config_addr: cfg,
         }
+    }
+
+    /// The plugin's `runner:` config-yaml option reaches a generated target.
+    /// Nothing populates the `runner` spec field for provider-generated Go
+    /// targets, so the option is the only path to a non-host runner here.
+    #[tokio::test]
+    async fn the_format_driver_default_runner_reaches_the_parsed_inputs() {
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let def = GoFormatDriver::new()
+            .with_default_runner(Some("//tools/devenv:runner".to_string()))
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: std::sync::Arc::new(build_format_spec(params(&govet(), None))),
+                },
+                &ct,
+            )
+            .await
+            .expect("parse")
+            .target_def;
+        let runner: Vec<_> = def
+            .inputs
+            .iter()
+            .filter(|i| i.origin_id == crate::plugingo::runner::RUNNER_ORIGIN)
+            .collect();
+        assert_eq!(
+            runner.len(),
+            1,
+            "expected exactly one runner input, got {}",
+            runner.len()
+        );
+        let input = runner.first().expect("runner input");
+        assert_eq!(input.r#ref.r#ref.format(), "//tools/devenv:runner");
+        assert!(input.hashed, "must key the cache");
+        assert!(!input.runtime, "must not reach the sandbox");
+    }
+
+    /// The plugin's `runner:` config-yaml option reaches a generated target.
+    /// Nothing populates the `runner` spec field for provider-generated Go
+    /// targets, so the option is the only path to a non-host runner here.
+    #[tokio::test]
+    async fn the_format_check_driver_default_runner_reaches_the_parsed_inputs() {
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let def = GoFormatCheckDriver::new()
+            .with_default_runner(Some("//tools/devenv:runner".to_string()))
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: std::sync::Arc::new(build_format_check_spec(params(&govet(), None))),
+                },
+                &ct,
+            )
+            .await
+            .expect("parse")
+            .target_def;
+        let runner: Vec<_> = def
+            .inputs
+            .iter()
+            .filter(|i| i.origin_id == crate::plugingo::runner::RUNNER_ORIGIN)
+            .collect();
+        assert_eq!(
+            runner.len(),
+            1,
+            "expected exactly one runner input, got {}",
+            runner.len()
+        );
+        let input = runner.first().expect("runner input");
+        assert_eq!(input.r#ref.r#ref.format(), "//tools/devenv:runner");
+        assert!(input.hashed, "must key the cache");
+        assert!(!input.runtime, "must not reach the sandbox");
     }
 
     fn dep_groups(s: &TargetSpec) -> Vec<String> {
