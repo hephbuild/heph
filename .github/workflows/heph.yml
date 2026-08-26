@@ -287,6 +287,7 @@ jobs:
           echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
           echo "plugin_gha_name=$PLUGIN_GHA_NAME" >> $GITHUB_OUTPUT
           echo "plugin_oci_name=$PLUGIN_OCI_NAME" >> $GITHUB_OUTPUT
+          echo "plugin_devenv_name=$PLUGIN_DEVENV_NAME" >> $GITHUB_OUTPUT
           echo "bench_bin_name=$BENCH_BIN_NAME" >> $GITHUB_OUTPUT
           echo "debug_bin_name=$DEBUG_BIN_NAME" >> $GITHUB_OUTPUT
           OUT="target/${{ matrix.target }}/release"
@@ -363,7 +364,8 @@ jobs:
           # default govet target address from the version, so a dev-stamped
           # cdylib would resolve the wrong address at runtime.
           for artifact in \
-            $BENCH_BIN_NAME $PLUGIN_GO_NAME $PLUGIN_GHA_NAME $PLUGIN_OCI_NAME
+            $BENCH_BIN_NAME $PLUGIN_GO_NAME $PLUGIN_GHA_NAME $PLUGIN_OCI_NAME \
+            $PLUGIN_DEVENV_NAME
           do
             bash scripts/patch-slot.sh "$artifact" "version=$VERSION"
           done
@@ -493,6 +495,12 @@ jobs:
               name: ${{steps.build.outputs.plugin_oci_name}}
               path: ${{steps.build.outputs.plugin_oci_name}}
 
+          - name: Upload devenv plugin artifact
+            uses: actions/upload-artifact@v6
+            with:
+              name: ${{steps.build.outputs.plugin_devenv_name}}
+              path: ${{steps.build.outputs.plugin_devenv_name}}
+
       # Last, deliberately. This is the only job with steps after its compile,
       # and the drain must not sit in front of them: it would still be correct
       # today (nothing after `Build` compiles) but only by accident, and a
@@ -549,9 +557,14 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
-          # Matches the CLI, both release flavours (`heph_<os>_<arch>` std,
-          # `heph_debug_<os>_<arch>` debug) and the go plugin cdylib
-          # (`heph-go-plugin_<os>_<arch>.{so,dylib}`); excludes the `repo` source artifact.
+          # Matches every published artifact — both CLI flavours
+          # (`heph_<os>_<arch>` std, `heph_debug_<os>_<arch>` debug),
+          # `heph-bench`, and every plugin cdylib
+          # (`heph-<name>-plugin_<os>_<arch>.{so,dylib}`) — and excludes the
+          # `repo` source artifact. Deliberately a pattern rather than a list:
+          # the enumeration this replaces still said "the go plugin cdylib"
+          # after gha, oci and bench had been added, so a new artifact was
+          # silently absent here until something downstream failed on it.
           pattern: "heph*"
           path: dist
           merge-multiple: true

@@ -285,3 +285,62 @@ fn shipped_oci_cdylib_parses_across_the_abi_without_aborting() {
         describe(&out)
     );
 }
+
+/// The devenv cdylib loads across the ABI and its driver is reachable.
+///
+/// Every other shipped cdylib has a load test here; without this one the devenv
+/// plugin would be the one artifact heph publishes whose `dlopen` nothing
+/// proves — and an ABI mismatch in a cdylib is an abort at load, not an error a
+/// user can read.
+///
+/// Deliberately does not run a `devenv_runner` target: that needs `devenv` and
+/// a nix evaluation, which is what `crates/e2e/tests/devenv_runner.rs` covers
+/// behind an opt-in. What is asserted here is what only the shipped artifact
+/// can answer — that the library maps, the create entry's type report matches,
+/// and the driver it exports is registered under the name a BUILD file uses.
+#[test]
+fn shipped_devenv_cdylib_loads_and_registers_its_driver() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("devenv");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-devenv-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash devenv cdylib");
+    write_manifest(&manifest, "devenv", &dylib, Some(&sum)).expect("write manifest");
+    ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
+        .expect("write config");
+
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"runner\", driver = \"devenv_runner\", mode = \"wrap\")\n",
+    )
+    .expect("write BUILD");
+
+    // `inspect def` parses the target without executing it, so this reaches the
+    // driver across the seam and stops short of running devenv.
+    let out = ws
+        .run(&dist, &["inspect", "def", "//pkg:runner"])
+        .expect("run");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.code().is_some(),
+        "heph was killed by a signal — the plugin panicked across the ABI seam: {}",
+        describe(&out)
+    );
+    assert!(
+        !combined.contains("driver not found"),
+        "the devenv plugin loaded but did not register `devenv_runner`: {}",
+        describe(&out)
+    );
+    assert!(
+        out.status.success(),
+        "parsing a devenv_runner target should succeed: {}",
+        describe(&out)
+    );
+}
