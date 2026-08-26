@@ -588,6 +588,30 @@ in
     echo "installed devenv plugin -> $dest"
   '';
 
+  # The counterpart to every `install-<name>-plugin` above: instead of building a
+  # cdylib from this tree, install the plugin manifests published alongside the
+  # *installed* binary — the release `heph version` reports.
+  #
+  # It matters which one you want. A cdylib and the host are linked at load time
+  # through stabby, so a plugin built from a different commit than the binary
+  # loading it fails the ABI check with a page of type-report text and no hint
+  # about the cause. Building from source is right while developing a plugin;
+  # this is right for running an installed `heph` (the `example/` workspace, say,
+  # whose `.hephconfig2` names the go, devenv and oci plugins by path).
+  #
+  # Which plugins it installs is whatever the release published, not a list kept
+  # here — a new plugin needs no change. The released manifests reference their
+  # cdylibs by `url` + `sha256`, so nothing is downloaded per-platform here:
+  # heph pulls and verifies the one matching the host on first load.
+  #
+  #   install-release-plugins                 # from `heph version`
+  #   install-release-plugins --bin heph3     # ask a different binary
+  #   install-release-plugins --version vX    # skip asking, pin a tag
+  #   install-release-plugins --dry-run
+  scripts.install-release-plugins.exec = ''
+    python3 "$DEVENV_ROOT/scripts/install-release-plugins.py" "''${@}"
+  '';
+
   scripts.install-dev-build.exec = ''
     cargo build
     mkdir -p $(dirname "${binLocation}")
