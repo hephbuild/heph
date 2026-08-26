@@ -21,7 +21,6 @@
 use crate::SpecRewrite;
 use crate::agent::{AGENT_SUBCOMMAND, CLIENT_SUBCOMMAND, SOCK_ENV};
 use crate::registry::{ExecRunner, RunnerCtx};
-use hproc::proc_exec;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -36,6 +35,10 @@ use std::time::{Duration, Instant};
 /// answer, not a latency budget; the cancellation token is what a user's Ctrl-C
 /// travels through.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How much of the launch command's output to keep for a failure message.
+/// A tail, because the useful part of a nix or docker failure is the end.
+const LAUNCH_TAIL_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -54,15 +57,14 @@ pub struct SessionConfig {
 /// A live agent.
 struct Session {
     socket: PathBuf,
-    /// The task waiting on the agent process.
+    /// The write end of the agent's stdin, held open for the session's life.
     ///
-    /// Not merely held to keep the child reaped — it is how the session knows
-    /// the agent is *alive*. `is_finished()` turns "the launch command died" into
-    /// an immediate, explanatory failure; without it a `docker run` that exits
-    /// on the spot leaves every consumer polling a socket that will never
-    /// appear until the handshake timeout expires, which is minutes of a build
-    /// looking hung for a reason nothing reports.
-    waiter: tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    /// This is the parent-death channel, and it is the only teardown that works
+    /// unconditionally: the OS closes descriptors at process exit whether or
+    /// not destructors run, so the agent sees EOF and exits even when heph
+    /// panics, calls `process::exit`, or is `SIGKILL`ed. `shutdown` is the
+    /// tidy path; this is the one that cannot be skipped.
+    _keepalive: Option<std::process::ChildStdin>,
     pgid: i32,
 }
 
@@ -72,7 +74,6 @@ impl Drop for Session {
             // SAFETY: a pgid this process created via `setsid`.
             unsafe { libc::killpg(self.pgid, libc::SIGTERM) };
         }
-        self.waiter.abort();
         _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -88,6 +89,17 @@ type SessionKey = (String, String);
 
 /// One lazily-started session, behind a per-key async lock.
 type SessionSlot = Arc<tokio::sync::Mutex<Option<Arc<Session>>>>;
+
+/// A started agent, remembered for teardown.
+///
+/// Kept separately from `slots` because teardown runs from `Drop`, which cannot
+/// await the per-key async lock a slot sits behind. A plain list of pgids is
+/// all the killpg needs and it can be taken synchronously.
+#[derive(Debug, Clone)]
+struct Live {
+    pgid: i32,
+    socket: PathBuf,
+}
 
 pub struct SessionRunner {
     /// Where agent sockets live. Handed over rather than discovered.
@@ -107,6 +119,8 @@ pub struct SessionRunner {
     /// transient failure (a network blip during nix evaluation) must not
     /// poison every remaining target in the process.
     slots: Mutex<HashMap<SessionKey, SessionSlot>>,
+    /// Every agent this runner has started, for [`ExecRunner::shutdown`].
+    live: Mutex<Vec<Live>>,
 }
 
 impl SessionRunner {
@@ -114,6 +128,7 @@ impl SessionRunner {
         Self {
             socket_dir,
             slots: Mutex::new(HashMap::new()),
+            live: Mutex::new(Vec::new()),
         }
     }
 
@@ -173,61 +188,145 @@ impl SessionRunner {
 
         let (program, args) = build_launch_argv(cfg, &exe, &socket)?;
 
-        // `setsid` so the supervisor sidecar's killpg reaps the agent *and* the
-        // environment wrapper around it on a hard shutdown.
-        let spec =
-            proc_exec::Spec {
-                program,
-                args,
-                // The agent inherits heph's environment plus the socket path. Its
-                // own environment is never what a target gets — the agent
-                // `env_clear`s and applies exactly what the client forwards.
-                env: std::env::vars_os()
-                    .chain(std::iter::once((
-                        OsString::from(SOCK_ENV),
-                        socket.clone().into_os_string(),
-                    )))
-                    .collect(),
-                cwd: cfg.cwd.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+        // `std::process::Command`, not `proc_exec`, and the reason is the whole
+        // shape of this function.
+        //
+        // `proc_exec`'s only public wait is `spawn_wait`, which parks a blocking
+        // task for the child's whole life. A session agent outlives every
+        // request, so that task never completes — and tokio's runtime shutdown
+        // *joins* blocking threads, so the runtime would wait for the agent
+        // while the agent waits to be killed by teardown. That is a deadlock on
+        // exit, and it is not fixable by ordering: by the time the runtime is
+        // shutting down, `Engine::drop` has already run.
+        //
+        // `Child::try_wait` is non-blocking and needs no thread at all, which
+        // removes the dependency entirely.
+        let mut cmd = std::process::Command::new(&program);
+        cmd.args(&args)
+            .current_dir(
+                cfg.cwd.as_ref().map(PathBuf::from).unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
                 }),
-                stdin: proc_exec::StdioSpec::Null,
-                // Inherited so a failing `devenv shell` says why on heph's stderr
-                // rather than into a pipe nobody drains.
-                stdout: proc_exec::StdioSpec::Inherit,
-                stderr: proc_exec::StdioSpec::Inherit,
-                setsid: true,
-                ctty: false,
-            };
+            )
+            .env(SOCK_ENV, &socket)
+            // Piped, emphatically not inherited. An inherited descriptor makes
+            // the agent a co-owner of heph's own stdout and stderr, and the
+            // agent outlives the request that started it — so anything reading
+            // heph's output to EOF waits on the *agent*, forever. That is a
+            // hang with no error; it cost a 30-minute CI timeout to find.
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // The parent-death channel. heph holds the write end; the agent
+            // reads it and exits on EOF. The OS closes descriptors at process
+            // exit whether or not destructors run, so this survives a panic, a
+            // `process::exit`, and a `SIGKILL` — none of which any teardown
+            // hook would see.
+            .stdin(std::process::Stdio::piped());
 
-        let agent = proc_exec::spawn(spec).map_err(|e| {
+        use std::os::unix::process::CommandExt as _;
+        // Its own session, so one target's cancellation cannot reach another's
+        // and the agent's killpg reaches its whole tree. Declared outside the
+        // `unsafe` below so each block holds exactly one unsafe operation.
+        let new_session = || {
+            // SAFETY: async-signal-safe, and the only call in the post-fork
+            // window.
+            if unsafe { libc::setsid() } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        // SAFETY: `pre_exec`'s contract is that the closure be
+        // async-signal-safe. This one is a single `setsid` — no allocation, no
+        // locks, nothing that can deadlock against a lock held across the fork.
+        unsafe { cmd.pre_exec(new_session) };
+
+        let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
                 "runner {}: start the session agent via {:?}: {e}",
                 ctx.addr,
                 cfg.launch
             )
         })?;
-        let pgid = agent.pid();
-        // Never cancelled: the session's lifetime is the pool's, and teardown
-        // goes through `Drop`'s killpg rather than this token.
-        let waiter = agent.spawn_wait(Arc::new(hcore::hasync::StdCancellationToken::new()));
+        let pgid = child.id() as i32;
+        let keepalive = child.stdin.take();
 
-        await_socket(&socket, &waiter, ctx)
+        // Drained continuously, not just on failure: a piped agent that fills
+        // the pipe blocks in `write(2)`, so reading only on failure would
+        // deadlock exactly the environments that are chatty at startup. The
+        // tail is bounded — this is a diagnostic, not a log.
+        let tail = Arc::new(Mutex::new(String::new()));
+        for stream in [
+            child.stdout.take().map(TailSource::Out),
+            child.stderr.take().map(TailSource::Err),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let tail = Arc::clone(&tail);
+            std::thread::spawn(move || stream.drain_into(&tail));
+        }
+
+        let child = Arc::new(Mutex::new(child));
+        if let Ok(mut live) = self.live.lock() {
+            live.push(Live {
+                pgid,
+                socket: socket.clone(),
+            });
+        }
+
+        await_socket(&socket, &child, &tail, ctx)
             .await
             .inspect_err(|_failed| {
-                // Reap the half-started environment rather than leaving it behind
-                // for the rest of the process's life.
+                // Reap the half-started environment rather than leaving it
+                // behind for the rest of the process's life.
                 if pgid > 0 {
                     // SAFETY: a pgid this process created via `setsid`.
                     unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                }
+                if let Ok(mut c) = child.lock() {
+                    _ = c.wait();
                 }
             })?;
 
         Ok(Session {
             socket,
-            waiter,
+            _keepalive: keepalive,
             pgid,
         })
+    }
+}
+
+/// One of the agent's output streams, drained into the shared tail.
+enum TailSource {
+    Out(std::process::ChildStdout),
+    Err(std::process::ChildStderr),
+}
+
+impl TailSource {
+    fn drain_into(self, tail: &Arc<Mutex<String>>) {
+        use std::io::Read as _;
+        let mut reader: Box<dyn std::io::Read> = match self {
+            TailSource::Out(o) => Box::new(o),
+            TailSource::Err(e) => Box::new(e),
+        };
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut chunk) {
+            if n == 0 {
+                return;
+            }
+            let Ok(mut buf) = tail.lock() else { return };
+            let Some(fresh) = chunk.get(..n) else { return };
+            buf.push_str(&String::from_utf8_lossy(fresh));
+            if buf.len() > LAUNCH_TAIL_BYTES {
+                let cut = buf.len() - LAUNCH_TAIL_BYTES;
+                // Trim on a char boundary; a split UTF-8 sequence would panic
+                // the drain and lose the rest of the output.
+                let cut = (cut..buf.len())
+                    .find(|i| buf.is_char_boundary(*i))
+                    .unwrap_or(buf.len());
+                buf.replace_range(..cut, "");
+            }
+        }
     }
 }
 
@@ -256,6 +355,15 @@ fn short_digest(ctx: &RunnerCtx<'_>) -> String {
     ctx.addr.hash(&mut h);
     ctx.fingerprint.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// The launch command's captured output, for a diagnostic.
+fn launch_output(tail: &Arc<Mutex<String>>) -> String {
+    match tail.lock() {
+        Ok(buf) if buf.trim().is_empty() => "(it printed nothing)".to_string(),
+        Ok(buf) => format!("\n{}", buf.trim_end()),
+        Err(_poisoned) => "(unavailable)".to_string(),
+    }
 }
 
 /// The launch argv, for a diagnostic — re-read from the config rather than
@@ -290,7 +398,8 @@ fn assert_socket_path_fits(socket: &Path) -> anyhow::Result<()> {
 /// minutes.
 async fn await_socket(
     socket: &Path,
-    waiter: &tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    child: &Arc<Mutex<std::process::Child>>,
+    tail: &Arc<Mutex<String>>,
     ctx: &RunnerCtx<'_>,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
@@ -312,23 +421,30 @@ async fn await_socket(
         // handshake window. The launch command's own output is already on
         // heph's stderr — it inherits it — so the message points there rather
         // than trying to recover it.
-        if waiter.is_finished() {
+        let exited = child
+            .lock()
+            .ok()
+            .and_then(|mut c| c.try_wait().ok().flatten())
+            .is_some();
+        if exited {
             anyhow::bail!(
-                "runner {}: the session agent exited before it started listening. Its launch \
-                 command was {:?}; whatever it printed is on heph's stderr above. A container \
-                 runner most often fails here because the image cannot execute the heph binary \
-                 — heph is mounted in from the host, so a macOS binary cannot run in a Linux \
-                 image.",
+                "runner {}: the session agent exited before it started listening.\n  launch: \
+                 {:?}\n  output: {}\nA container runner most often fails here because the \
+                 image cannot execute the heph binary — heph is mounted in from the host, so a \
+                 macOS binary cannot run in a Linux image.",
                 ctx.addr,
                 cfg_launch_hint(ctx),
+                launch_output(tail),
             );
         }
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "runner {}: the session agent did not start within {}s. Its launch command's \
-                 output is on heph's stderr above.",
+                "runner {}: the session agent did not start within {}s.\n  launch: {:?}\n  \
+                 output: {}",
                 ctx.addr,
-                HANDSHAKE_TIMEOUT.as_secs()
+                HANDSHAKE_TIMEOUT.as_secs(),
+                cfg_launch_hint(ctx),
+                launch_output(tail),
             );
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -339,6 +455,24 @@ async fn await_socket(
 impl ExecRunner for SessionRunner {
     fn name(&self) -> &str {
         "session"
+    }
+
+    /// Kill every agent this runner started.
+    ///
+    /// The sessions are also behind `slots`, but teardown runs from `Drop` and
+    /// cannot await the per-key async lock those sit behind — hence the flat
+    /// `live` list, which a synchronous caller can take.
+    fn shutdown(&self) {
+        let Ok(mut live) = self.live.lock() else {
+            return;
+        };
+        for session in live.drain(..) {
+            if session.pgid > 0 {
+                // SAFETY: a pgid this process created via `setsid`.
+                unsafe { libc::killpg(session.pgid, libc::SIGTERM) };
+            }
+            _ = std::fs::remove_file(&session.socket);
+        }
     }
 
     async fn prepare(

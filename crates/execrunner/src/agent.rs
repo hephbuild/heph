@@ -493,6 +493,11 @@ fn finish(outcome: ExecOutcome) -> ! {
 /// clap like the client, but it *does* take flags, so it parses its own tiny
 /// argument list.
 pub fn agent_main(socket: PathBuf) -> ! {
+    // Only here, never in `serve` — `serve_for_test` shares that loop in-process,
+    // and a test harness's stdin is closed, so watching it there would read EOF
+    // immediately and kill the test runner's own process group.
+    watch_parent(socket.clone());
+
     let code = match serve(&socket) {
         Ok(()) => 0,
         Err(e) => {
@@ -580,6 +585,42 @@ fn serve(socket: &Path) -> anyhow::Result<()> {
         rt.spawn(handle_conn(conn, fds));
     }
     Ok(())
+}
+
+/// Exit when heph goes away.
+///
+/// stdin is a pipe whose write end heph holds for the session's lifetime, so
+/// EOF here means the parent is gone. This is the only teardown that cannot be
+/// skipped: the OS closes descriptors at process exit whether or not the parent
+/// ran any destructor, so it covers a panic, a `process::exit`, and a
+/// `SIGKILL` — none of which a teardown hook would ever see.
+///
+/// Without it a session agent outlives every heph that started one. Each
+/// survivor holds a socket, its own process group, and whatever descriptors it
+/// was handed, and they accumulate one per build.
+///
+/// `killpg` on our own group on the way out, so targets mid-flight go too
+/// rather than being reparented and left running.
+fn watch_parent(socket: PathBuf) {
+    std::thread::spawn(move || {
+        let mut sink = [0u8; 64];
+        loop {
+            match std::io::stdin().read(&mut sink) {
+                // EOF: the parent's write end is closed.
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        _ = std::fs::remove_file(&socket);
+        // SAFETY: reads this process's own process-group id.
+        let pgrp = unsafe { libc::getpgrp() };
+        // SAFETY: our own process group, which `setsid` in the parent made us
+        // the leader of.
+        unsafe { libc::killpg(pgrp, libc::SIGTERM) };
+        std::process::exit(0);
+    });
 }
 
 fn raise_fd_limit() {

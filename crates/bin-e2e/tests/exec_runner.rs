@@ -175,6 +175,70 @@ target(
     }
 }
 
+/// The session agent must not outlive the heph process that started it.
+///
+/// This is the one that cost a 30-minute CI timeout. The agent used to inherit
+/// heph's stdout and stderr, and the registry that owns the session pool is
+/// reachable from a process-global — which Rust never drops — so nothing killed
+/// the agent at exit. Anything reading heph's output to EOF then waited on the
+/// *agent* rather than on heph, forever, with no error and no obvious culprit.
+///
+/// Two things are asserted because either alone would have passed while the bug
+/// was live on the other: that the run returns at all (the EOF half), and that
+/// no agent is left behind (the leak half).
+#[test]
+fn a_session_agent_does_not_outlive_the_run() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let marker = ws.root().join("ran.txt");
+
+    let mut build = passthrough_runner("runner");
+    build.push_str(&format!(
+        r#"
+target(
+    name = "hello",
+    driver = "bash",
+    run = "echo ran > {}",
+    out = [],
+    runner = "//xr:runner",
+)
+"#,
+        marker.display()
+    ));
+    ws.write("xr/BUILD", &build).expect("write BUILD");
+
+    // Returning at all is half the assertion: `run` reads both streams to EOF,
+    // which an agent holding an inherited descriptor would never allow.
+    let out = ws.run(&dist, &["run", "//xr:hello"]).expect("run");
+    assert!(out.status.success(), "{}", describe(&out));
+
+    // The socket path carries this workspace's home, so it identifies agents
+    // this test started and nobody else's.
+    let home = ws.root().display().to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let ps = std::process::Command::new("ps")
+            .args(["ax", "-o", "args="])
+            .output()
+            .expect("ps");
+        let listing = String::from_utf8_lossy(&ps.stdout);
+        let leaked: Vec<&str> = listing
+            .lines()
+            .filter(|l| l.contains("__runner-agent") && l.contains(&home))
+            .collect();
+        if leaked.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session agent outlived the run — it will hold heph's descriptors \
+             and hang whatever reads them:\n  {}",
+            leaked.join("\n  ")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// Run by hand, `__runner-exec` must explain itself rather than panicking or
 /// hanging on a socket nobody is listening to. It appears in every `ps` output
 /// of every agent build, so someone will paste it into a shell.

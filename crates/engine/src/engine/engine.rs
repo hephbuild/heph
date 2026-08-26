@@ -244,6 +244,20 @@ impl EngineFuse {
     }
 }
 
+/// Release anything the exec runners hold open.
+///
+/// Not left to the runners' own `Drop`: the registry is also reachable from
+/// `hexecrunner`'s process-global installed host, and Rust never runs
+/// destructors for statics — so nothing in that chain is ever dropped at exit.
+/// A session runner relying on `Drop` therefore leaves its agent running after
+/// heph is gone, and an agent that inherited a descriptor will hang whatever is
+/// reading heph's output to EOF.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.exec_runners.shutdown_all();
+    }
+}
+
 impl Drop for EngineFuse {
     fn drop(&mut self) {
         // Drop the mount on a worker thread with a bounded wait. The

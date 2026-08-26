@@ -249,6 +249,13 @@ costs one small process per target.
 Both subcommands are hidden and internal. Run by hand they fail with a
 sentence.
 
+The agent holds heph's stdin as a **keepalive pipe** and exits when it reads
+EOF. That is the only teardown that cannot be skipped: the OS closes descriptors
+at process exit whether or not any destructor runs, so it covers a panic, a
+`process::exit`, and a `SIGKILL`. Its stdout and stderr are piped rather than
+inherited, for the same reason in reverse — an agent that co-owned heph's own
+descriptors would outlive it and hang anything reading heph's output to EOF.
+
 ## Diagnosability
 
 - An unknown runner name is caught at **resolution**, before any consumer

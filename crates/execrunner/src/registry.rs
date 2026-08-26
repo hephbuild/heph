@@ -48,6 +48,19 @@ pub trait ExecRunner: Send + Sync {
         ctx: &RunnerCtx<'_>,
         rewrite: SpecRewrite,
     ) -> anyhow::Result<SpecRewrite>;
+
+    /// Release anything held open — a session, a container.
+    ///
+    /// Synchronous, because the only caller is `Engine`'s `Drop`. It cannot be
+    /// left to the runner's own `Drop`: the registry is reachable from a
+    /// process-global (the installed host), and Rust never runs destructors for
+    /// statics. A runner relying on `Drop` therefore leaks its processes on
+    /// every exit — and a leaked agent that inherited a descriptor can hang
+    /// whatever is reading it.
+    ///
+    /// Best-effort and idempotent: it runs during teardown, where there is
+    /// nowhere to report an error to.
+    fn shutdown(&self) {}
 }
 
 /// Every runner this host knows, by name.
@@ -90,6 +103,13 @@ impl RunnerRegistry {
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn ExecRunner>> {
         self.by_name.get(name)
+    }
+
+    /// Tear down every runner. See [`ExecRunner::shutdown`].
+    pub fn shutdown_all(&self) {
+        for runner in self.by_name.values() {
+            runner.shutdown();
+        }
     }
 
     /// Registered names, sorted. Surfaced in the unknown-runner diagnostic and
