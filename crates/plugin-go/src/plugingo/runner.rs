@@ -78,23 +78,21 @@ pub(crate) fn parse_runner_with_default(
     parse_runner(effective, pkg)
 }
 
-/// Read and consume the plugin's `runner` option — the environment every Go
-/// tool runs in — from the config-yaml `options:` map.
+/// Read the plugin's `runner` option — the environment every Go tool runs in —
+/// from the config-yaml `options:` map.
 ///
-/// Consuming it matters: the go provider's `from_options` rejects keys it does
-/// not know, and this one configures the drivers rather than package discovery.
+/// Deliberately **not** consumed. The provider reads the same key: some Go
+/// targets are `go_*` driver targets and take the runner as a driver default,
+/// and some are bash targets (the std install, the thirdparty download) that
+/// take it as a spec field. Both halves are required — see `Config::runner`.
 ///
-/// Split out so the config key itself is under test. A typo here fails nothing
-/// — the provider never sees the key, so a misspelling would leave the option
-/// silently inert and every Go tool on the host while the config says
-/// otherwise.
-pub fn take_runner_option(
-    options: &mut hplugin::config::Options,
-) -> anyhow::Result<Option<String>> {
-    let runner =
-        hplugin::config::decode_opt::<String>(options, "go", "runner")?.filter(|r| !r.is_empty());
-    options.remove("runner");
-    Ok(runner)
+/// Split out so the config key itself is under test. A misspelling is caught by
+/// the provider's `deny_unknown`, but a *mismatch* between this key and the
+/// provider's would not be: it would move the bash targets into the environment
+/// and leave the compile drivers on the host, which is the object-version
+/// failure `Config::runner` describes.
+pub fn read_runner_option(options: &hplugin::config::Options) -> anyhow::Result<Option<String>> {
+    Ok(hplugin::config::decode_opt::<String>(options, "go", "runner")?.filter(|r| !r.is_empty()))
 }
 
 /// The runner to spawn this driver's tool under.
@@ -203,28 +201,29 @@ mod tests {
         o
     }
 
-    /// The config-yaml key the drivers are actually configured by.
+    /// The config-yaml key the drivers are actually configured by, and that the
+    /// provider reads too — so it must survive being read here.
     #[test]
-    fn the_runner_option_is_read_and_consumed() {
-        let mut o = opts(&[("gotool", "host"), ("runner", "//tools/devenv:runner")]);
+    fn the_runner_option_is_read_and_left_for_the_provider() {
+        let o = opts(&[("gotool", "host"), ("runner", "//tools/devenv:runner")]);
         assert_eq!(
-            take_runner_option(&mut o).expect("decode").as_deref(),
+            read_runner_option(&o).expect("decode").as_deref(),
             Some("//tools/devenv:runner")
         );
         assert!(
-            !o.contains_key("runner"),
-            "must be consumed — the go provider rejects keys that are not its own"
+            o.contains_key("runner"),
+            "the provider reads the same key: consuming it here would move the bash targets \
+             (std install, thirdparty download) and leave the compile drivers behind"
         );
-        assert!(o.contains_key("gotool"), "unrelated options are untouched");
     }
 
     /// Absent and empty both mean "spawn on the host", so the option can be
     /// blanked rather than deleted.
     #[test]
     fn an_absent_or_empty_option_means_no_runner() {
-        assert_eq!(take_runner_option(&mut opts(&[])).expect("decode"), None);
+        assert_eq!(read_runner_option(&opts(&[])).expect("decode"), None);
         assert_eq!(
-            take_runner_option(&mut opts(&[("runner", "")])).expect("decode"),
+            read_runner_option(&opts(&[("runner", "")])).expect("decode"),
             None
         );
     }

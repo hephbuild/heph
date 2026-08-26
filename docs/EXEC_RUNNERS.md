@@ -262,6 +262,14 @@ dependency of every Go target it applies to, so changing the environment re-keys
 the whole Go build; its address is not in any def hash, so turning the option on
 in a workspace that had none invalidates nothing by itself.
 
+It reaches every Go target, not only the ones with a `go_*` driver. Four of
+them are **bash** targets — the std install, the thirdparty download, and the
+binary and test-binary links — and they invoke `go` just as much. A build where
+only half moved into the environment is not half-right: under `gotool: "host"`
+the two halves are different toolchains, and the compiler rejects the objects
+outright with `could not import fmt (object is [… go1.26.2 …] expected
+[… go1.26.5 …])`.
+
 `gotool` composes with it. `gotool: "host"` means "the `go` this build's
 environment provides" — so under a runner it is the *runner's* `go`, found on
 the runner's `PATH`, with `GOROOT` asked by running `go env GOROOT` inside that
@@ -269,6 +277,14 @@ environment (once per build, not once per package). Without a runner it is
 heph's own `PATH`, exactly as before. `gotool: "<version>"` and
 `gotool: "//pkg:go"` are unaffected either way: both resolve to a staged path
 inside the sandbox and never probe a host.
+
+One consequence is worth knowing, because it is invisible otherwise: a host
+toolchain normally passes `PATH` through to the sandbox so a non-hermetic `go`
+is findable there. Under a runner that is dropped. A target's own environment
+wins over the runner's, so passing the host's `PATH` would select the host's
+`go` *inside* the named environment. Everything else in that pass-through stays
+— it is module-cache and proxy config, which the download target deliberately
+shares with the host.
 
 > Before this composed, `gotool: "host"` under a runner resolved `go` from
 > heph's `PATH` and then executed that host binary *inside* the runner's

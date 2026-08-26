@@ -83,7 +83,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // `runner:` option. Building the toolchain somewhere and running the tests
     // there are separate decisions — a build wants the compiler's environment, a
     // test often wants the runtime's.
-    let go_runner = hplugin_go::plugingo::runner::take_runner_option(&mut options)?;
+    let go_runner = hplugin_go::plugingo::runner::read_runner_option(&options)?;
 
     let walker = Arc::new(hwalk::CachedWalker::open(&walk_db));
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(Provider::from_options(

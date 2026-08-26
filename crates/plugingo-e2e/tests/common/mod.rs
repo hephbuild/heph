@@ -298,6 +298,12 @@ pub fn govet_addr() -> String {
 /// Like [`make_workspace`] but with `fs.skip` entries, mirroring a config file's
 /// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
 /// package lives under a skipped subtree (e.g. a generated `gen/**` tree).
+/// Host toolchain (`gotool = "host"`), with every Go tool defaulting to the
+/// exec runner at `runner`. See [`make_workspace_ordered_runner`].
+pub fn make_workspace_host_under_runner(dir: TempDir, runner: &str) -> anyhow::Result<Workspace> {
+    make_workspace_ordered_runner(dir, true, true, &[], HOST_GO, Some(runner))
+}
+
 pub fn make_workspace_fs_skip(dir: TempDir, skip: &[&str]) -> anyhow::Result<Workspace> {
     make_workspace_ordered(dir, false, true, skip, HOST_GO)
 }
@@ -324,6 +330,25 @@ fn make_workspace_ordered(
     fs_skip: &[&str],
     gotool: &str,
 ) -> anyhow::Result<Workspace> {
+    make_workspace_ordered_runner(dir, go_first, foreign_name_guard, fs_skip, gotool, None)
+}
+
+/// A workspace whose Go **tool** drivers default to `runner` — the plugin's
+/// `runner:` config-yaml option, which is the only way a generated Go target
+/// ever names one. `None` is the plain host, as every other fixture uses.
+///
+/// Registers the `devenv_runner` driver too, so a fixture can declare the
+/// runner target it points at.
+fn make_workspace_ordered_runner(
+    dir: TempDir,
+    go_first: bool,
+    foreign_name_guard: bool,
+    fs_skip: &[&str],
+    gotool: &str,
+    runner: Option<&str>,
+) -> anyhow::Result<Workspace> {
+    let runner = runner.map(str::to_string);
+    let provider_runner = runner.clone();
     let gotool = gotool.to_string();
     let go_bin = go_bin_path();
     let cc_bin = cc_bin_path();
@@ -336,6 +361,7 @@ fn make_workspace_ordered(
 
     if go_first {
         let gotool = gotool.clone();
+        let provider_runner = provider_runner.clone();
         b = b.with_provider(move |init| {
             Box::new(
                 plugingo::Provider::with_config(
@@ -345,6 +371,11 @@ fn make_workspace_ordered(
                         sdk_checksums: sdk_checksums_for(&gotool),
                         go_version: gotool,
                         govet: govet_addr(),
+                        // The bash half of the runner: the std install and the
+                        // thirdparty download invoke `go` too, and a build whose
+                        // compile drivers moved into the environment while these
+                        // stayed on the host fails on mismatched object versions.
+                        runner: provider_runner.clone(),
                         ..Default::default()
                     },
                     init.runtime.clone(),
@@ -395,6 +426,7 @@ fn make_workspace_ordered(
 
     if !go_first {
         let gotool = gotool.clone();
+        let provider_runner = provider_runner.clone();
         b = b.with_provider(move |init| {
             Box::new(
                 plugingo::Provider::with_config(
@@ -404,6 +436,11 @@ fn make_workspace_ordered(
                         sdk_checksums: sdk_checksums_for(&gotool),
                         go_version: gotool,
                         govet: govet_addr(),
+                        // The bash half of the runner: the std install and the
+                        // thirdparty download invoke `go` too, and a build whose
+                        // compile drivers moved into the environment while these
+                        // stayed on the host fails on mismatched object versions.
+                        runner: provider_runner.clone(),
                         ..Default::default()
                     },
                     init.runtime.clone(),
@@ -413,18 +450,30 @@ fn make_workspace_ordered(
         });
     }
 
+    let r = || runner.clone();
     b.with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
-        .with_managed_driver(Box::new(plugingo::GoGolistDriver::new()))
+        .with_managed_driver(Box::new(hplugin_devenv::plugindevenv::Driver::new()))
+        .with_managed_driver(Box::new(
+            plugingo::GoGolistDriver::new().with_default_runner(r()),
+        ))
         .with_managed_driver(Box::new(plugingo::GoToolchainDriver))
         .with_managed_driver(Box::new(pluginhttp::Driver))
-        .with_managed_driver(Box::new(plugingo::GoCompileDriver::new()))
+        .with_managed_driver(Box::new(
+            plugingo::GoCompileDriver::new().with_default_runner(r()),
+        ))
         .with_managed_driver(Box::new(plugingo::GoTestmainDriver))
-        .with_managed_driver(Box::new(plugingo::GoLintDriver::new()))
+        .with_managed_driver(Box::new(
+            plugingo::GoLintDriver::new().with_default_runner(r()),
+        ))
         .with_managed_driver(Box::new(plugingo::GoLintGateDriver::new()))
         .with_managed_driver(Box::new(plugingo::GoLintFixDriver::new()))
-        .with_managed_driver(Box::new(plugingo::GoFormatDriver::new()))
-        .with_managed_driver(Box::new(plugingo::GoFormatCheckDriver::new()))
+        .with_managed_driver(Box::new(
+            plugingo::GoFormatDriver::new().with_default_runner(r()),
+        ))
+        .with_managed_driver(Box::new(
+            plugingo::GoFormatCheckDriver::new().with_default_runner(runner),
+        ))
         .build()
         .context("build plugingo workspace")
 }

@@ -77,6 +77,17 @@ pub struct Config {
     /// Nothing references it unless a race target is built, so an ordinary build
     /// — and a darwin race build — never resolves it.
     pub cctool: String,
+    /// Exec runner every generated Go target runs its tooling under — the
+    /// plugin's `runner:` option. Reaches the `go_*` drivers as their default,
+    /// and the **bash** targets this provider generates (the std install, the
+    /// thirdparty download) as their `runner` field.
+    ///
+    /// Both halves are needed. A `gotool = "host"` build under a runner where
+    /// only the compile drivers followed it compiles packages with the
+    /// environment's Go against a standard library the *host's* Go built, and
+    /// the linker rejects the mismatch: `could not import fmt (object is [...
+    /// go1.26.2 ...] expected [... go1.26.5 ...])`.
+    pub runner: Option<String>,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
     pub skip: Arc<Ignore>,
@@ -104,6 +115,7 @@ impl Default for Config {
             sdk_checksums: HashMap::new(),
             govet: govet::default_addr(),
             cctool: cc_toolchain::default_addr(),
+            runner: None,
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
             walker: Arc::new(CachedWalker::disabled()),
@@ -131,6 +143,8 @@ pub(crate) struct ProviderInner {
     /// Addr of the C compiler a cgo-needing race build stages (see
     /// [`Config::cctool`]).
     cctool: String,
+    /// See [`Config::runner`].
+    runner: Option<String>,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
     /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
@@ -302,6 +316,12 @@ impl Provider {
         // (linux only; see `factors::cgo_required`). Unset → the host `cc` via
         // the hostbin provider, as `gotool = "//@heph/bin:go"` does for `go`.
         // Never resolved unless a race target is actually built.
+        // The environment the Go toolchain runs in. Consumed here as well as by
+        // the drivers: some Go targets are bash targets (std install, the
+        // thirdparty download) and take it as a spec field instead.
+        let runner: Option<String> =
+            hplugin::config::decode_opt::<String>(opts, "go provider", "runner")?
+                .filter(|r| !r.is_empty());
         let cctool: String = hplugin::config::decode_opt(opts, "go provider", "cctool")?
             .unwrap_or_else(cc_toolchain::default_addr);
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
@@ -318,6 +338,7 @@ impl Provider {
                 sdk_checksums,
                 govet,
                 cctool,
+                runner,
                 skip,
                 walker,
                 ..Default::default()
@@ -338,6 +359,7 @@ impl Provider {
                 sdk_checksums: config.sdk_checksums,
                 govet: config.govet,
                 cctool: config.cctool,
+                runner: config.runner,
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
@@ -1638,8 +1660,9 @@ impl ProviderInner {
                 variant::resolve(addr, &req.states, "", req.executor.as_ref(), true)
                     .await
                     .map_err(GetError::Other)?;
-            let spec =
+            let mut spec =
                 target_std::install_spec(addr.clone(), &factors, &self.go_version, &self.cctool);
+            self.apply_runner(&mut spec);
             return Ok(GetResponse { target_spec: spec });
         }
 
@@ -1703,12 +1726,13 @@ impl ProviderInner {
                 if !subpath.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let spec = thirdparty::build_download_spec(
+                let mut spec = thirdparty::build_download_spec(
                     addr.clone(),
                     module,
                     version,
                     &self.go_version,
                 );
+                self.apply_runner(&mut spec);
                 return Ok(GetResponse { target_spec: spec });
             }
             return Err(GetError::NotFound);
@@ -2112,7 +2136,7 @@ impl ProviderInner {
 
                 let link =
                     pick_link(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
-                let spec = target_bin::build_spec(
+                let mut spec = target_bin::build_spec(
                     addr.clone(),
                     &import_path,
                     &factors,
@@ -2120,6 +2144,7 @@ impl ProviderInner {
                     &link,
                     &self.go_version,
                 );
+                self.apply_runner(&mut spec);
                 Ok(GetResponse { target_spec: spec })
             }
             // Generates testmain.go for the INTERNAL test bin (only `_test` imports).
@@ -2447,13 +2472,14 @@ impl ProviderInner {
 
                 let testmain_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_testmain_lib", &vref);
-                let spec = target_test::build_test_spec(
+                let mut spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
                     &testmain_lib_addr,
                     &all_libs,
                     &self.go_version,
                 );
+                self.apply_runner(&mut spec);
                 Ok(GetResponse { target_spec: spec })
             }
             // Link the EXTERNAL (xtest) test bin.
@@ -2547,13 +2573,14 @@ impl ProviderInner {
 
                 let testmain_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_xtestmain_lib", &vref);
-                let spec = target_test::build_test_spec(
+                let mut spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
                     &testmain_lib_addr,
                     &all_libs,
                     &self.go_version,
                 );
+                self.apply_runner(&mut spec);
                 Ok(GetResponse { target_spec: spec })
             }
             // Run the INTERNAL test bin.
@@ -2841,6 +2868,35 @@ impl ProviderInner {
     /// here. A lint/format spec must still resolve on a dev build, or a bulk
     /// `query` / `//...` walk (which asks every target for its spec) would die on
     /// a machine that has no business owning a heph-govet.
+    /// Put this provider's `runner` on a generated **bash** target.
+    ///
+    /// The `go_*` drivers take the runner as a driver-level default; the Go
+    /// targets that are bash targets — the std install, the thirdparty
+    /// download, the binary and test-binary links — take it as a spec field,
+    /// and they invoke `go` just as much. A build where only half of them moved
+    /// into the environment is not half-right: with `gotool = "host"` the two
+    /// halves are different toolchains, and the compiler rejects the objects
+    /// outright with `could not import fmt (object is [... go1.26.2 ...]
+    /// expected [... go1.26.5 ...])`.
+    ///
+    /// `PATH` comes back out of `runtime_pass_env` here. A host toolchain puts
+    /// it there so a non-hermetic `go` is findable in the sandbox, which is
+    /// right when this host is the one supplying it — but a target's own
+    /// environment wins over the runner's, so passing the host's `PATH` under a
+    /// runner selects the host's `go` inside the named environment. Everything
+    /// else in that list stays: it is module-cache and proxy config, which the
+    /// download target deliberately shares with the host.
+    fn apply_runner(&self, spec: &mut hplugin::provider::TargetSpec) {
+        let Some(runner) = self.runner.as_deref() else {
+            return;
+        };
+        spec.config
+            .insert("runner".to_string(), Value::String(runner.to_string()));
+        if let Some(Value::List(names)) = spec.config.get_mut("runtime_pass_env") {
+            names.retain(|v| !matches!(v, Value::String(s) if s == "PATH"));
+        }
+    }
+
     fn govet_tool_addr(&self) -> anyhow::Result<Addr> {
         let addr = hmodel::htaddr::parse_addr(&self.govet).with_context(|| {
             format!(
