@@ -32,11 +32,24 @@ pub fn build_download_spec(
     // Multi-line bash. `awk` parses `Dir` out of the JSON `go mod download`
     // emits. The stub go.mod blocks Go from reading the project go.mod.
     //
-    // `cp` choice: BSD/macOS cp copies xattrs (com.apple.quarantine on
-    // Go's mod cache files) by default, which fails with EPERM on FUSE
-    // overlays that reject xattr writes. `cp -X` on macOS suppresses
-    // xattr copy; on GNU cp `-X` means `--one-file-system`, so branch
-    // on `uname`.
+    // A plain `cp -R`, with no platform branch. This used to pick `cp -RX` on
+    // Darwin — BSD `cp` copies xattrs (`com.apple.quarantine` on Go's mod cache
+    // files), which EPERMs on a FUSE overlay that rejects xattr writes, and `-X`
+    // suppresses that.
+    //
+    // `-X` is BSD-only — GNU `cp` rejects it outright (`invalid option -- 'X'`)
+    // — and `uname` no longer tells you which `cp` you have: it says Darwin for
+    // a Mac inside a devenv, where `PATH` leads with nixpkgs coreutils and the
+    // build broke. `PATH` is the host's under `gotool = "host"` and entirely the
+    // runner's under a `runner:`, so nothing here can know the dialect. Naming
+    // `/bin/cp` would answer the dialect and lose the sandbox: it is a host path
+    // that a container image or a NixOS box need not have at all.
+    //
+    // So the flag goes. Its only exposure is macOS under `fuse.enabled`, where
+    // the EPERM may return; elsewhere the copied xattrs are inert metadata on
+    // scratch files, and Linux has none to copy. FUSE is already an untested
+    // gap for runners (`docs/EXEC_RUNNERS.md`). Deliberate call, taken to keep
+    // the copy hermetic and dialect-neutral.
     //
     // GOROOT/`go` come from the staged hermetic SDK. We use the GOROOT-only
     // prelude (no sandbox GOCACHE) because the `**/*` output glob would
@@ -54,8 +67,7 @@ pub fn build_download_spec(
            exit 1\n\
          fi"
         .to_string(),
-        "if [ \"$(uname)\" = Darwin ]; then CP=\"cp -RX\"; else CP=\"cp -R\"; fi".to_string(),
-        "$CP \"$MOD_DIR/.\" .".to_string(),
+        "cp -R \"$MOD_DIR/.\" .".to_string(),
         "rm mod.json".to_string(),
         "chmod -R u+w .".to_string(),
     ]);
@@ -271,6 +283,34 @@ mod tests {
     }
 
     // ---- download spec ----
+
+    /// The module copy must run under whatever `cp` the environment provides.
+    ///
+    /// It used to be `/bin/cp -RX` on Darwin. `-X` (suppress xattr copy) is a
+    /// BSD flag that GNU `cp` rejects outright, and `uname` cannot tell the two
+    /// apart any more: a Mac inside a devenv reports Darwin while its `PATH`
+    /// leads with nixpkgs coreutils. `/bin/cp` answered the dialect by reaching
+    /// outside the sandbox for a host binary a container or a NixOS box need not
+    /// have.
+    ///
+    /// So neither may come back. Dropping `-X` is a deliberate trade: its only
+    /// exposure is macOS under `fuse.enabled`, where the EPERM it avoided may
+    /// return.
+    #[test]
+    fn test_download_spec_copies_module_with_a_portable_cp() {
+        let spec = build_download_spec(download_addr(), "github.com/go-logr/logr", "v1.4.2", V);
+        let run = run_str(&spec);
+        assert!(
+            run.contains("cp -R \"$MOD_DIR/.\" ."),
+            "the module copy must be a plain, PATH-resolved `cp -R`: {run}"
+        );
+        assert!(!run.contains("/bin/cp"), "must not name a host path: {run}");
+        assert!(
+            !run.contains("uname"),
+            "the OS does not determine the `cp` dialect once a runner supplies \
+             the environment: {run}"
+        );
+    }
 
     #[test]
     fn test_download_spec_driver() {

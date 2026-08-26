@@ -73,17 +73,25 @@ pub fn install_spec(
         // populate pkg/. `-L` dereferences symlinks: staged dep files may be
         // symlinks into the read-only artifact cache, and a plain copy would
         // leave LGOROOT pointing back at it (so `chmod -R u+w` would try to
-        // mutate the cache). BSD/macOS `cp` also copies xattrs and trips EPERM
-        // on the FUSE overlay; `cp -X` suppresses that (GNU `cp -X` differs, so
-        // branch on uname). Use the absolute system `cp` (`/bin/cp`) so the flag
-        // set matches the platform regardless of `$PATH` — under the host
-        // toolchain (`gotool = "host"`) the sandbox inherits the host `PATH`,
-        // which may put a GNU `cp` (no `-X`) ahead of the BSD system one.
-        "if [ \"$(uname)\" = Darwin ]; then CP=\"/bin/cp -RLX\"; else CP=\"/bin/cp -RL\"; fi"
-            .to_string(),
+        // mutate the cache).
+        //
+        // No platform branch and no absolute path. This used to pick
+        // `/bin/cp -RLX` on Darwin, because BSD `cp` copies xattrs and trips
+        // EPERM on the FUSE overlay, and `-X` suppresses that.
+        //
+        // Both halves of that were wrong once an environment can be named. `-X`
+        // is BSD-only and GNU `cp` rejects it outright, while `uname` says
+        // Darwin for a Mac inside a devenv whose `PATH` leads with nixpkgs
+        // coreutils; and `/bin/cp` reaches outside the sandbox for a host
+        // binary a container image or a NixOS box need not have.
+        //
+        // So the flag goes. Its only exposure is macOS under `fuse.enabled`;
+        // elsewhere the copied xattrs are inert metadata on a scratch GOROOT,
+        // and Linux has none to copy. Deliberate call — see the matching note
+        // in `thirdparty::build_download_spec`.
         "LGOROOT=\"$PWD/goroot\"".to_string(),
         "rm -rf \"$LGOROOT\"".to_string(),
-        "$CP \"$GOROOT\" \"$LGOROOT\"".to_string(),
+        "cp -RL \"$GOROOT\" \"$LGOROOT\"".to_string(),
         "export GOROOT=\"$LGOROOT\"".to_string(),
         "chmod -R u+w \"$GOROOT\"".to_string(),
         // A throwaway module keeps `go` from reading the workspace go.mod.
@@ -254,6 +262,39 @@ mod tests {
 
     fn test_vref() -> VariantRef {
         VariantRef::new("dev", "")
+    }
+
+    /// The GOROOT copy must run under whatever `cp` the environment provides.
+    ///
+    /// It used to be `/bin/cp -RLX` on Darwin. `-X` (suppress xattr copy) is a
+    /// BSD flag that GNU `cp` rejects outright, and `uname` cannot tell the two
+    /// apart any more: a Mac inside a devenv reports Darwin while its `PATH`
+    /// leads with nixpkgs coreutils. `/bin/cp` answered the dialect by reaching
+    /// outside the sandbox for a host binary a container or a NixOS box need not
+    /// have.
+    ///
+    /// So neither may come back. Dropping `-X` is a deliberate trade: its only
+    /// exposure is macOS under `fuse.enabled`, where the EPERM it avoided may
+    /// return.
+    #[test]
+    fn test_install_copies_goroot_with_a_portable_cp() {
+        let spec = install_spec(
+            install_addr(&test_vref()),
+            &test_factors(),
+            V,
+            "//@heph/bin:cc",
+        );
+        let run = run_str(&spec);
+        assert!(
+            run.contains("cp -RL \"$GOROOT\" \"$LGOROOT\""),
+            "the GOROOT copy must be a plain, PATH-resolved `cp -RL`: {run}"
+        );
+        assert!(!run.contains("/bin/cp"), "must not name a host path: {run}");
+        assert!(
+            !run.contains("uname"),
+            "the OS does not determine the `cp` dialect once a runner supplies \
+             the environment: {run}"
+        );
     }
 
     #[test]
