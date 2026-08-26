@@ -91,8 +91,8 @@ pub(crate) fn parse_runner_with_default(
 pub fn take_runner_option(
     options: &mut hplugin::config::Options,
 ) -> anyhow::Result<Option<String>> {
-    let runner = hplugin::config::decode_opt::<String>(options, "go", "runner")?
-        .filter(|r| !r.is_empty());
+    let runner =
+        hplugin::config::decode_opt::<String>(options, "go", "runner")?.filter(|r| !r.is_empty());
     options.remove("runner");
     Ok(runner)
 }
@@ -164,8 +164,8 @@ mod tests {
     /// different environment than the workspace-wide one.
     #[test]
     fn a_spec_runner_beats_the_default() {
-        let (target, _) =
-            parse_runner_with_default(":own", Some("//tools/devenv:runner"), &pkg()).expect("parse");
+        let (target, _) = parse_runner_with_default(":own", Some("//tools/devenv:runner"), &pkg())
+            .expect("parse");
         assert_eq!(target.expect("target").r#ref.format(), "//some/pkg:own");
     }
 
@@ -175,7 +175,8 @@ mod tests {
     #[test]
     fn a_spec_saying_local_escapes_the_default() {
         let (target, input) =
-            parse_runner_with_default("local", Some("//tools/devenv:runner"), &pkg()).expect("parse");
+            parse_runner_with_default("local", Some("//tools/devenv:runner"), &pkg())
+                .expect("parse");
         assert!(target.is_none());
         assert!(input.is_none());
     }
@@ -194,7 +195,10 @@ mod tests {
     fn opts(pairs: &[(&str, &str)]) -> hplugin::config::Options {
         let mut o = hplugin::config::Options::new();
         for (k, v) in pairs {
-            o.insert((*k).to_string(), serde_yaml::Value::String((*v).to_string()));
+            o.insert(
+                (*k).to_string(),
+                serde_yaml::Value::String((*v).to_string()),
+            );
         }
         o
     }

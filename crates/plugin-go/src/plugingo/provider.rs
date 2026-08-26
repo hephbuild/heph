@@ -267,7 +267,13 @@ impl Provider {
             "go provider",
             opts,
             &[
-                "gotool", "govet", "cctool", "skip", "checksums", "runner", "walk_db",
+                "gotool",
+                "govet",
+                "cctool",
+                "skip",
+                "checksums",
+                "runner",
+                "walk_db",
             ],
         )?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?

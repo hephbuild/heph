@@ -1040,7 +1040,6 @@ mod driver_tests {
             .target_def
     }
 
-
     /// The plugin's `runner:` config-yaml option reaches a generated target.
     /// Nothing populates the `runner` spec field for provider-generated Go
     /// targets, so the option is the only path to a non-host runner here.

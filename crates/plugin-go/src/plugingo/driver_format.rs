@@ -634,7 +634,10 @@ mod tests {
             .parse(
                 ParseRequest {
                     request_id: "t".to_string(),
-                    target_spec: std::sync::Arc::new(build_format_check_spec(params(&govet(), None))),
+                    target_spec: std::sync::Arc::new(build_format_check_spec(params(
+                        &govet(),
+                        None,
+                    ))),
                 },
                 &ct,
             )

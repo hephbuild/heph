@@ -115,7 +115,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         name: "go_toolchain".into(),
         driver: make_dyn_managed_driver(toolchain),
     });
-    let compile: Arc<dyn ManagedDriver> = Arc::new(GoCompileDriver::new().with_default_runner(go_runner.clone()));
+    let compile: Arc<dyn ManagedDriver> =
+        Arc::new(GoCompileDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_compile".into(),
         driver: make_dyn_managed_driver(compile),
@@ -126,7 +127,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         driver: make_dyn_managed_driver(testmain),
     });
     // Per-package go/analysis (vet) with serialized facts, nogo-style.
-    let lint: Arc<dyn ManagedDriver> = Arc::new(GoLintDriver::new().with_default_runner(go_runner.clone()));
+    let lint: Arc<dyn ManagedDriver> =
+        Arc::new(GoLintDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_lint".into(),
         driver: make_dyn_managed_driver(lint),
@@ -144,12 +146,14 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         driver: make_dyn_managed_driver(lint_fix),
     });
     // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
-    let format: Arc<dyn ManagedDriver> = Arc::new(GoFormatDriver::new().with_default_runner(go_runner.clone()));
+    let format: Arc<dyn ManagedDriver> =
+        Arc::new(GoFormatDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_format".into(),
         driver: make_dyn_managed_driver(format),
     });
-    let format_check: Arc<dyn ManagedDriver> = Arc::new(GoFormatCheckDriver::new().with_default_runner(go_runner));
+    let format_check: Arc<dyn ManagedDriver> =
+        Arc::new(GoFormatCheckDriver::new().with_default_runner(go_runner));
     drivers.push(NamedDriver {
         name: "go_format_check".into(),
         driver: make_dyn_managed_driver(format_check),

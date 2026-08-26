@@ -206,7 +206,6 @@ pub fn staged_goroot(version: &str) -> String {
     format!("{}/{SDK_DIR}", toolchain_pkg(version))
 }
 
-
 /// The host toolchain, resolved **in the environment the tools will run in**.
 ///
 /// `gotool = "host"` means "whatever `go` this build's environment provides".
