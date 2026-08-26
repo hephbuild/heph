@@ -266,4 +266,10 @@ sentence.
 - **Client startup cost.** Agent mode costs one `execve` of the heph binary per
   target (measured at ~3 ms on darwin/arm64, warm and uncontended). For a
   `go list`-heavy build that is worth measuring before turning it on; the
-  captured-env wrap runner has no such cost.
+  captured-env wrap runner has no such cost. The number under `2 × ncpu`
+  contention, and the peak RSS of that many concurrent clients, are unmeasured.
+- **The devenv and OCI runners have no end-to-end test.** `bin-e2e` covers the
+  session machinery with a passthrough launch (`/usr/bin/env`), which is what
+  isolates the runner from the environment. Whether `devenv shell` and
+  `docker run` behave as their drivers assume is untested — both would make the
+  suite depend on a toolchain being installed.
