@@ -4004,7 +4004,6 @@ dependencies = [
  "smart-default",
  "tempfile",
  "tokio",
- "walk",
 ]
 
 [[package]]

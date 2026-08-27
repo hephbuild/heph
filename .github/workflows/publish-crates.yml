@@ -1,0 +1,74 @@
+name: Publish crates
+
+# Publishes the heph plugin SDK + its dependency closure to crates.io as a
+# renamed `heph-*` chain (see scripts/publish/publish-crates.sh). Tag pushes
+# publish for real; manual dispatch defaults to a dry run.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (defaults to the tag / git-describe)."
+        required: false
+        type: string
+      dry_run:
+        description: "Run cargo publish --dry-run (no upload)."
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+env:
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
+  SCCACHE_CACHE_SIZE: "2G"
+  CARGO_INCREMENTAL: "0"
+  # Use the runner's system Python for the manifest rewrite (stdlib only), so it
+  # works regardless of what the devenv shell provides.
+  PYTHON: /usr/bin/python3
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+
+      - name: Compute version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(.github/workflows/version.sh "${{ github.run_number }}")"
+            VERSION="${VERSION#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Publish Version::$VERSION"
+
+      - name: Gen
+        shell: devenv shell bash -- -e {0}
+        run: gen
+
+      - name: Publish
+        shell: devenv shell bash -- -e {0}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          DRY=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            DRY="--dry-run"
+          fi
+          scripts/publish/publish-crates.sh "${{ steps.version.outputs.version }}" "$DRY"
