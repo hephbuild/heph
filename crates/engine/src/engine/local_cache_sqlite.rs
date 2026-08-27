@@ -965,9 +965,10 @@ struct OwnedBlob {
 }
 
 // SAFETY: rusqlite::Connection is Send. The blob holds a raw sqlite3
-// statement pointer whose ownership transfers with the connection. Both
-// fields are Send-compatible; the borrow we extended to 'static is local
-// to this struct and never observed externally.
+// blob handle whose ownership transfers with the connection. Both fields
+// are Send-compatible; the boxed connection keeps a stable address so the
+// borrow we extended to 'static stays valid after the value is moved, and
+// it is never observed externally.
 unsafe impl Send for OwnedBlob {}
 
 impl OwnedBlob {

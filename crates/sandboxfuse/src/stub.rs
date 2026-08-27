@@ -53,7 +53,11 @@ pub struct Mount;
     reason = "verb matches the operation: mounting yields a Mount handle"
 )]
 impl Mount {
-    pub fn mount(_mountpoint: &Path, _fs: Arc<LayeredFs>) -> anyhow::Result<Self> {
+    pub fn mount(
+        _mountpoint: &Path,
+        _fs: Arc<LayeredFs>,
+        _backend: crate::MountBackend,
+    ) -> anyhow::Result<Self> {
         anyhow::bail!("FUSE sandbox is unavailable on this build")
     }
 }

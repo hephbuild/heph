@@ -1,5 +1,22 @@
 use std::sync::OnceLock;
 
+/// Which userspace FUSE backend a mount should use.
+///
+/// Only meaningful on macOS, where macFUSE exposes two backends. On Linux the
+/// kernel FUSE driver is the only path and this is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MountBackend {
+    /// Linux kernel FUSE, or macOS macFUSE kernel-extension backend. The
+    /// fastest path; on macOS it requires the macFUSE system extension to be
+    /// approved. This is the default.
+    #[default]
+    Kernel,
+    /// Apple FSKit backend (macOS 15.4+). Unprivileged — no kernel extension —
+    /// but mounts only under `/Volumes` and has reduced feature support. The
+    /// mountpoint volume is created by macFUSE's privileged mount service.
+    Fskit,
+}
+
 /// Outcome of the FUSE probe.
 #[derive(Debug, Clone)]
 pub enum FuseSupport {
