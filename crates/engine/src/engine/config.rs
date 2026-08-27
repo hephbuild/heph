@@ -22,6 +22,9 @@ pub struct Config {
     ///
     /// [`Engine::skip_dirs`]: crate::engine::Engine::skip_dirs
     pub fs_skip: Vec<String>,
+    /// Whether the codegen write-back may add `**/.hephgen` to
+    /// `.git/info/exclude`. From `codegen.gitExclude`; defaults to `true`.
+    pub codegen_git_exclude: bool,
     pub parallelism: Option<usize>,
     /// In-memory tier fronting the durable (SQLite) local cache.
     pub mem_cache: MemCacheOptions,
@@ -60,6 +63,7 @@ impl Default for Config {
             root: PathBuf::new(),
             home_dir: PathBuf::new(),
             fs_skip: Vec::new(),
+            codegen_git_exclude: true,
             parallelism: None,
             mem_cache: MemCacheOptions::default(),
             tmp_cache: MemCacheOptions::default_tmp(),
@@ -139,6 +143,11 @@ impl ConfigYamlExt for ConfigYaml {
                 .map(|p| root.join(p))
                 .unwrap_or_else(|| root.join(".heph3")),
             fs_skip: self.fs.as_ref().map(|f| f.skip.clone()).unwrap_or_default(),
+            codegen_git_exclude: self
+                .codegen
+                .as_ref()
+                .and_then(|c| c.git_exclude)
+                .unwrap_or(true),
             parallelism: None,
             mem_cache: self
                 .mem_cache

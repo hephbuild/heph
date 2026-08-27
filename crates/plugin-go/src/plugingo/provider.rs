@@ -2963,6 +2963,9 @@ impl ProviderInner {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(anyhow::Error::new(e).context(format!("read go pkg dir {dir:?}"))),
         };
+        // One read of this directory's codegen registry for the whole scan,
+        // rather than a provenance probe per `.go` file.
+        let registry = hwalk::codegen::Registry::load(&dir);
         let mut files: Vec<String> = Vec::new();
         for entry in entries {
             let entry = entry.with_context(|| format!("read go pkg dir entry in {dir:?}"))?;
@@ -2976,7 +2979,9 @@ impl ProviderInner {
             if !path.is_file() {
                 continue;
             }
-            if pluginfs::has_codegen_xattr(&path) || pluginfs::resolves_into_heph_dir(&path) {
+            if pluginfs::codegen_owner(&registry, &self.walker, &path, name).is_some()
+                || pluginfs::resolves_into_heph_dir(&path)
+            {
                 continue;
             }
             files.push(name.to_string());

@@ -23,6 +23,7 @@ pub use plugin_load::clear_plugin_cache;
 pub mod approval;
 pub mod diag;
 pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest};
+mod codegen_tree;
 mod cwd;
 mod result;
 pub use cwd::get_cwp;

@@ -68,7 +68,10 @@ pub const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(14 *
 ///
 /// - 1: `read_dir_uncached` errors on a non-UTF-8 entry name instead of dropping
 ///   it (rows written before this may be missing entries).
-const DIR_LISTING_VERSION: i64 = 1;
+/// - 2: the listing carries the directory's parsed [`codegen`](crate::codegen)
+///   registry (rows written before this have none, and serving one would report
+///   every generated file in the directory as raw source).
+const DIR_LISTING_VERSION: i64 = 2;
 
 /// Escape hatch: set `HEPH_DEBUG_CACHED_WALKER=0` to bypass caching entirely and
 /// fall back to reading every directory listing and file hash straight from disk
@@ -105,6 +108,18 @@ pub struct DirEntry {
 #[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
 pub struct DirListing {
     pub entries: Vec<DirEntry>,
+    /// The directory's parsed `.hephgen` codegen registry (empty when it has
+    /// none) — which files here are generated outputs rather than source.
+    ///
+    /// It rides in the listing rather than being read per lookup because the two
+    /// are validated by the same thing: the registry is only ever published by
+    /// renaming a new file over the old one, and a rename bumps the directory's
+    /// mtime, which is exactly what invalidates this row. So the registry cannot
+    /// go stale relative to the directory it describes, and no second
+    /// invalidation path exists to get wrong. It also makes the common case
+    /// free: a directory with no `.hephgen` has nothing to read, and one that
+    /// has it parses once per change instead of once per consulted file.
+    pub codegen: crate::codegen::Registry,
 }
 
 /// A cached file content hash plus the stat fields that validate it.
@@ -143,6 +158,19 @@ pub fn file_hashout(path: &Path, x: bool) -> Result<String> {
     }
     h.update(&[x as u8]);
     Ok(format!("{:x}", h.digest()))
+}
+
+/// [`file_hashout`] over bytes already in memory.
+///
+/// Same digest, so a hash computed from what is about to be written to a file
+/// compares equal to one the walker later reads back off disk — which is what
+/// lets the codegen registry record a file's identity at the moment it writes
+/// it. Any change here must change both.
+pub fn hashout_bytes(bytes: &[u8], x: bool) -> String {
+    let mut h = Xxh3::new();
+    h.update(bytes);
+    h.update(&[x as u8]);
+    format!("{:x}", h.digest())
 }
 
 #[cfg(unix)]
@@ -454,7 +482,17 @@ fn read_dir_uncached(dir: &Path) -> Result<DirListing> {
         });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(DirListing { entries })
+    // Only when the directory actually has one: the listing was just read, so
+    // its absence is already known and costs nothing to act on.
+    let codegen = if entries
+        .iter()
+        .any(|e| e.name == crate::codegen::REGISTRY_NAME)
+    {
+        crate::codegen::Registry::load(dir)
+    } else {
+        crate::codegen::Registry::empty()
+    };
+    Ok(DirListing { entries, codegen })
 }
 
 /// A path's db key.
@@ -702,6 +740,24 @@ impl FsWalkStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The registry records a file's hash from the bytes about to be written;
+    /// the walk later reads that hash back off disk. If these two ever disagree,
+    /// every generated file silently reads as foreign content.
+    #[test]
+    fn hashout_bytes_matches_hashout_of_the_written_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f");
+        let bytes = b"some generated content\n";
+        std::fs::write(&path, bytes).expect("write");
+        for x in [false, true] {
+            assert_eq!(
+                hashout_bytes(bytes, x),
+                file_hashout(&path, x).expect("hash"),
+                "in-memory and on-disk hashes must agree (exec={x})",
+            );
+        }
+    }
 
     fn walker(dir: &Path) -> CachedWalker {
         CachedWalker::open(&dir.join("fswalk.db"))

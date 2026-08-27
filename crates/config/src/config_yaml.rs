@@ -61,6 +61,8 @@ pub struct ConfigYaml {
     #[serde(default)]
     pub fs: Option<FsConfig>,
     #[serde(default)]
+    pub codegen: Option<CodegenConfig>,
+    #[serde(default)]
     pub cache: Option<CacheConfig>,
     /// Named remote (shared) caches. Each entry is keyed by a name and carries a
     /// `uri` plus `read`/`write` permissions. Parsed as patches so a profile can
@@ -264,6 +266,21 @@ impl Default for TelemetryConfig {
 pub struct FsConfig {
     #[serde(default)]
     pub skip: Vec<String>,
+}
+
+/// Codegen write-back config. `codegen: { gitExclude: false }`.
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CodegenConfig {
+    /// Whether heph may add `**/.hephgen` to `.git/info/exclude` the first time
+    /// it writes a codegen registry into the tree. Defaults to `true`.
+    ///
+    /// The registry files are heph machinery that exists only where heph has
+    /// run — a per-clone fact, which is what `info/exclude` is for — so ignoring
+    /// them needs no committed change and nothing to remember. Set `false` to
+    /// keep heph out of `.git/` entirely; the files then show up as untracked
+    /// unless the workspace ignores them some other way.
+    pub git_exclude: Option<bool>,
 }
 
 /// Byte limits for one in-memory cache store. Shared shape for `mem_cache`
