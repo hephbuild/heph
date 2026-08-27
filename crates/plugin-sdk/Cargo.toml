@@ -12,6 +12,8 @@ workspace = true
 hplugin = { package = "plugin", path = "../plugin" }
 hmodel = { package = "model", path = "../model" }
 hcore = { package = "core", path = "../core" }
+# The runner registry this cdylib forwards into the host's, plus the wire shape.
+hexecrunner = { package = "execrunner", path = "../execrunner" }
 anyhow = "1.0.102"
 
 # Transport: the in-process stable-ABI cdylib (stabby). Opt-in — a consumer

@@ -6,9 +6,9 @@
 
 use crate::abi::{
     CREATE_SYMBOL, CreateFn, DynExecutor, DynHook, DynItemStream, DynManagedDriver, DynProvider,
-    SET_LOG_SINK_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogSinkFn, SetSupervisorFn, StableCancelDyn,
-    StableHookDyn, StableItemStream, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
-    StableProviderDyn,
+    SET_LOG_SINK_SYMBOL, SET_RUNNER_HOST_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogSinkFn,
+    SetRunnerHostFn, SetSupervisorFn, StableCancelDyn, StableHookDyn, StableItemStream,
+    StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn, StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use crate::vtable::dynify;
@@ -119,6 +119,22 @@ pub fn load(
         let set_supervisor = unsafe { lib.get_stabbied::<SetSupervisorFn>(SET_SUPERVISOR_SYMBOL) };
         if let Ok(set_supervisor) = set_supervisor {
             set_supervisor(crate::host::HostSupervisor::wrap());
+        }
+        // Hand the plugin a handle to the host's exec-runner registry. Same
+        // reason as the supervisor: this cdylib links its own `execrunner`,
+        // whose registry `Engine::install_exec_runner_host` never reached, so
+        // without this a driver in here whose target names a runner fails with
+        // "no runner host is installed in this component". It does not degrade
+        // to a local spawn — that would run the target outside the environment
+        // its cache key claims. Same older-SDK tolerance as the two above.
+        // SAFETY: get_stabbied checks the symbol's stabby type report against
+        // `SetRunnerHostFn` before returning it.
+        let set_runner = unsafe { lib.get_stabbied::<SetRunnerHostFn>(SET_RUNNER_HOST_SYMBOL) };
+        if let Ok(set_runner) = set_runner {
+            set_runner(match tokio::runtime::Handle::try_current() {
+                Ok(handle) => crate::host::HostRunnerHost::wrap(handle),
+                Err(_) => crate::host::HostRunnerHost::wrap_inline(),
+            });
         }
         // SAFETY: get_stabbied verifies the symbol's stabby type report matches
         // `CreateFn` before returning it; calling it is then ABI-sound.

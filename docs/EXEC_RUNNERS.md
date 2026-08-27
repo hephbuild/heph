@@ -349,6 +349,40 @@ at process exit whether or not any destructor runs, so it covers a panic, a
 inherited, for the same reason in reverse — an agent that co-owned heph's own
 descriptors would outlive it and hang anything reading heph's output to EOF.
 
+## Plugins
+
+A driver in a **cdylib** plugin runs its target under a runner the same way a
+builtin does, but the wiring is not the same and the difference is worth
+knowing.
+
+A cdylib statically links its own copy of every crate it uses, `hexecrunner`
+included, and statics are not shared across a dylib boundary. So the registry
+the engine fills with `install_exec_runner_host` is the *binary's*; the
+plugin's is empty. The host hands each plugin a handle to its own at load time,
+through the optional `heph_plugin_set_runner_host` symbol, and the SDK installs
+a forwarder behind it. This is the same shape as the log sink (a cdylib's
+`tracing` has no subscriber) and the supervisor (its `proc` tracker is
+uninstalled) — the third instance of one problem.
+
+```
+plugin driver ──prepare──▶ SDK forwarder ──ABI──▶ host registry ──▶ wrap/session
+```
+
+The **whole** `prepare` crosses, not just the resolution: resolving builds the
+runner target, and a `session` runner holds an environment open. Keeping the
+pool on the host is what stops two plugins in one build from opening two
+`devenv shell`s for one environment. A plugin sends a spec and gets a spec back.
+
+The payload is bytes rather than a stabby struct (`hexecrunner::wire`), because
+a program, an argv entry or an environment value need not be UTF-8 and
+`SpecRewrite` holds `OsString` for that reason. That shape is frozen with
+`ABI_SEMVER`, since `get_stabbied` cannot type-check inside a byte buffer.
+
+A plugin built against an SDK older than that symbol does not export it. Its
+targets then fail with "no runner host is installed in this component" rather
+than running locally — the same refusal to silently spawn in the wrong
+environment that applies everywhere else here.
+
 ## Diagnosability
 
 - An unknown runner name is caught at **resolution**, before any consumer

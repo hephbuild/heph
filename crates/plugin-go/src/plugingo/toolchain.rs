@@ -283,11 +283,17 @@ async fn probe_host_go(
         setsid: false,
         ctty: false,
     };
+    // Name the runner in the failure. Under a runner the program that failed to
+    // exec is the runner's, not `go` — a bare `No such file or directory` here
+    // reads as "no Go toolchain" when it can equally mean the runner's own
+    // prefix or launch command is missing.
+    let via = runner
+        .addr
+        .map(|a| format!(" (via exec runner {})", a.format()))
+        .unwrap_or_default();
     let out = hexecrunner::output(runner, spec, ctoken)
         .await
-        .with_context(|| {
-            format!("{driver}: run `go env GOROOT` in the environment the runner describes")
-        })?;
+        .with_context(|| format!("{driver}: run `go env GOROOT`{via}"))?;
     if !out.status.success() {
         anyhow::bail!(
             "{driver}: `go env GOROOT` failed in the runner's environment: {}\n  \

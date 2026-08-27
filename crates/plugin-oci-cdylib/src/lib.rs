@@ -18,9 +18,12 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_oci::pluginoci;
-use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedDriver, PluginComponents};
+use plugin_sdk::stabby::abi::{
+    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
+};
 use plugin_sdk::stabby::{
-    install_log_sink, install_supervisor, make_dyn_managed_driver, make_dyn_provider,
+    install_log_sink, install_runner_host, install_supervisor, make_dyn_managed_driver,
+    make_dyn_provider,
 };
 use std::sync::Arc;
 
@@ -52,6 +55,16 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
 #[stabby::export]
 pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
     install_supervisor(sup);
+}
+
+/// Stable ABI exec-runner entry: the host hands the plugin a handle to its
+/// runner registry. This cdylib links its own `execrunner`, whose registry the
+/// engine's `install_exec_runner_host` never reached — without this, a target
+/// here that names a `runner` fails with "no runner host is installed in this
+/// component" rather than running in the environment it asked for.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
+    install_runner_host(host);
 }
 
 fn build() -> PluginComponents {

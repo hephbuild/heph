@@ -37,14 +37,22 @@ anything `get_stabbied` would reject:
 - Add, remove, reorder, or re-sign a method on a `#[stabby::stabby]` trait — the
   vtable slots: `StableProvider`, `StableManagedDriver` (the `invoke*` slots),
   `StableExecutor`, `StableItemStream`, `StableRead`, `StableArtifactContent`,
-  `StableFunctionRegistry`, `StableMeta`, `StableCancel`, `StableHook`.
+  `StableFunctionRegistry`, `StableMeta`, `StableCancel`, `StableHook`,
+  `StableLogSink`, `StableSupervisor`, `StableRunnerHost`.
 - Add, remove, or reorder a field on a `#[stabby::stabby]` struct: `StableAddr`,
   `StableArg`, `NoteDepOutcome`, `ResultOutcome`, `QueryOutcome`, `NamedDriver`,
   `NamedHook`, `PluginComponents`.
 - Change a `dynptr!` / type-alias: `DynRead`, `DynArtifact`, `DynItemStream`,
   `DynExecutor`, `DynProvider`, `DynManagedDriver`, `DynFunctionRegistry`,
-  `DynHook`.
+  `DynHook`, `DynLogSink`, `DynSupervisor`, `DynRunnerHost`.
+- Change the shape `hexecrunner::wire` encodes. It is not a stabby type — the
+  `StableRunnerHost` method is bytes in, bytes out — so `get_stabbied` cannot
+  reject a mismatch and a plugin would misparse a `prepare` instead of failing
+  to load. It is frozen with this contract for exactly that reason.
 - Rename or retype `CREATE_SYMBOL` or `CreateFn` — the entry point.
+- Rename or retype an optional load-time symbol: `SET_LOG_SINK_SYMBOL`,
+  `SET_SUPERVISOR_SYMBOL`, `SET_RUNNER_HOST_SYMBOL`. *Adding* one is additive —
+  the host tolerates its absence — but changing one that exists is not.
 - Change the `stabby` dependency version in any crate that links the boundary
   (`plugin-stabby`, `plugin-sdk`, `plugin-go-cdylib`). stabby keys its type reports
   to its own version; a mismatch fails `get_stabbied`.

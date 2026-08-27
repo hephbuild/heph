@@ -377,6 +377,33 @@ pub trait StableSupervisor {
 /// An owned, ABI-stable handle to the host's process supervisor.
 pub type DynSupervisor = stabby::dynptr!(stabby::boxed::Box<dyn StableSupervisor + Send + Sync>);
 
+/// The host's exec-runner registry, called by a plugin driver whose target names
+/// a runner.
+///
+/// The third instance of the same problem as [`StableLogSink`] and
+/// [`StableSupervisor`]: a cdylib links its own copy of `execrunner`, whose
+/// host registry the engine's `install_exec_runner_host` never reached, so
+/// without this a plugin driver under a runner fails with "no runner host is
+/// installed in this component". It is not allowed to degrade to a local spawn
+/// — that would run the target outside the environment its cache key claims.
+///
+/// One method, bytes in and bytes out: the payload is mostly `OsString`
+/// (a program, argv, environment values, none of which need be UTF-8), and
+/// `hexecrunner::wire` owns the shape so there is no struct to freeze here.
+/// `req` is an encoded `wire::PrepareRequest`; the reply is an encoded
+/// `wire::PrepareReply`, which carries the error as a message rather than
+/// failing the call.
+///
+/// Async, because resolving a runner *builds its target* — and, for a session
+/// runner, may launch the environment.
+#[stabby::stabby]
+pub trait StableRunnerHost {
+    extern "C" fn prepare<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+}
+
+/// An owned, ABI-stable handle to the host's exec-runner registry.
+pub type DynRunnerHost = stabby::dynptr!(stabby::boxed::Box<dyn StableRunnerHost + Send + Sync>);
+
 /// The cdylib create-entry symbol name (exported with `#[stabby::export]`,
 /// loaded host-side with `get_stabbied`).
 pub const CREATE_SYMBOL: &[u8] = b"heph_plugin_create";
@@ -394,6 +421,16 @@ pub type SetLogSinkFn = extern "C" fn(DynLogSink);
 /// after load if present; a plugin built against an older SDK does not export it
 /// and keeps the previous (unregistered) behaviour.
 pub const SET_SUPERVISOR_SYMBOL: &[u8] = b"heph_plugin_set_supervisor";
+
+/// Optional cdylib symbol: install a host [`DynRunnerHost`] so a driver in this
+/// plugin can run its target in an environment a runner describes. A plugin
+/// built against an older SDK does not export it, and its targets can then only
+/// run locally — which the exec-runner seam reports as an error rather than
+/// silently doing.
+pub const SET_RUNNER_HOST_SYMBOL: &[u8] = b"heph_plugin_set_runner_host";
+
+/// The set-runner-host entry's function-pointer type.
+pub type SetRunnerHostFn = extern "C" fn(DynRunnerHost);
 
 /// The set-supervisor entry's function-pointer type.
 pub type SetSupervisorFn = extern "C" fn(DynSupervisor);

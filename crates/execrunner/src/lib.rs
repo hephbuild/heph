@@ -34,6 +34,7 @@ pub mod agent;
 pub mod config;
 pub mod registry;
 pub mod session;
+pub mod wire;
 
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;
@@ -98,7 +99,7 @@ impl<'a> RunnerRef<'a> {
 /// `args`/`env`/`cwd` stay in OS-string form end to end: a non-UTF-8 env value
 /// or path is legal on every supported target, and lossy conversion here would
 /// corrupt it invisibly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecRewrite {
     pub program: PathBuf,
     pub args: Vec<OsString>,
@@ -279,6 +280,37 @@ fn host_for(request_id: &str) -> Option<Arc<dyn RunnerHost>> {
         .map(Arc::clone)
 }
 
+/// Run one `prepare` against the host installed in *this* component, on behalf
+/// of a caller that has none of its own.
+///
+/// This is the host side of the plugin seam: a cdylib's copy of this crate has
+/// an empty registry (statics are not shared across a dylib boundary), so the
+/// plugin forwards its `prepare` here through the ABI handle it was given at
+/// load time, and the host answers from the registry the engine installed.
+///
+/// Keeping the *whole* `prepare` on this side is deliberate. The alternative —
+/// shipping the resolved `runner.json` to the plugin and letting it run the
+/// registry locally — would give every cdylib its own session pool, so a build
+/// touching two plugins would hold two `devenv shell`s open for one environment
+/// and each would have to tear down its own. The host owns the pool; a plugin
+/// sends a spec and gets a spec.
+pub async fn prepare_for_plugin(
+    request_id: &str,
+    addr: &Addr,
+    rewrite: SpecRewrite,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<PrepareOutcome> {
+    let host = host_for(request_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "exec runner {}: no runner host owns request '{}' on the host side of the plugin \
+             seam",
+            addr.format(),
+            request_id,
+        )
+    })?;
+    host.prepare(request_id, addr, rewrite, ctoken).await
+}
+
 /// Resolve the runner and rewrite the spec in place.
 ///
 /// A local runner returns immediately, having touched nothing — that is the
@@ -317,9 +349,10 @@ async fn prepare(
         } else {
             anyhow::anyhow!(
                 "target requests exec runner {} but no runner host is installed in this \
-                 component. A plugin cdylib links its own copy of the exec-runner crate and must \
-                 be handed the host's runner registry at load time; a plugin built against an \
-                 older SDK will not be.",
+                 component. A plugin cdylib links its own copy of the exec-runner crate, so it is \
+                 handed a handle to the host's at load time via `heph_plugin_set_runner_host`; a \
+                 plugin built against an SDK older than that symbol does not export it and cannot \
+                 run targets anywhere but locally. Rebuild the plugin against this heph's SDK.",
                 addr.format(),
             )
         }
@@ -407,8 +440,22 @@ pub async fn output_with_path(
     path: &PathPolicy,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<std::process::Output> {
+    let named = runner.addr.map(Addr::format);
     prepare(runner, &mut spec, path, ctoken).await?;
-    Ok(proc_exec::output(spec, ctoken).await?)
+    // Name what was *actually* executed when a runner changed it. Under a wrap
+    // runner the program is the prefix head, not the caller's — so a bare
+    // `No such file or directory` sends the reader looking for the wrong binary.
+    // The exec driver already does this by hand for its own spawn; every other
+    // caller of this function gets it here instead of not at all.
+    let program = spec.program.clone();
+    proc_exec::output(spec, ctoken)
+        .await
+        .map_err(|e| match named {
+            Some(addr) => {
+                anyhow::Error::new(e).context(format!("exec runner {addr} spawned {program:?}"))
+            }
+            None => anyhow::Error::new(e),
+        })
 }
 
 /// Streaming spawn under `runner`, returning a real [`proc_exec::Handle`].

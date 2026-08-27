@@ -2,9 +2,10 @@
 //! a loaded plugin can call back via direct stabby vtable dispatch.
 
 use crate::abi::{
-    DynArtifact, DynExecutor, DynFunctionRegistry, DynLogSink, DynRead, DynSupervisor,
-    NoteDepOutcome, QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent, StableExecutor,
-    StableFunctionRegistry, StableLogSink, StableRead, StableSupervisor, StatesOutcome,
+    DynArtifact, DynExecutor, DynFunctionRegistry, DynLogSink, DynRead, DynRunnerHost,
+    DynSupervisor, NoteDepOutcome, QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent,
+    StableExecutor, StableFunctionRegistry, StableLogSink, StableRead, StableRunnerHost,
+    StableSupervisor, StatesOutcome,
 };
 use crate::seam::panic_text;
 use crate::vtable::dynify;
@@ -387,6 +388,70 @@ impl StableFunctionRegistry for HostFunctionRegistry {
             |m| unary(err_body(m)),
         )))
     }
+}
+
+/// The host end of the exec-runner seam, handed to a plugin as a
+/// [`DynRunnerHost`].
+///
+/// It carries no state of its own: the registry it answers from is the one the
+/// engine installed in *this* component, reached by request id. The plugin's
+/// copy is empty, which is the whole reason this handle exists.
+pub struct HostRunnerHost {
+    seam: SeamSpawn,
+}
+
+impl HostRunnerHost {
+    /// Wrap as an ABI-stable [`DynRunnerHost`], running `prepare` bodies on
+    /// `handle` rather than on the guest worker that polls them.
+    pub fn wrap(handle: tokio::runtime::Handle) -> DynRunnerHost {
+        dynify(stabby::boxed::Box::new(HostRunnerHost {
+            seam: SeamSpawn::on(handle, tracing::Span::current()),
+        }))
+    }
+
+    /// Run `prepare` bodies inline on the polling thread. For the in-process
+    /// harnesses that drive futures themselves and have no tokio runtime — the
+    /// same fork [`wrap_executor`](crate::load_stable) makes, for the same
+    /// reason.
+    pub fn wrap_inline() -> DynRunnerHost {
+        dynify(stabby::boxed::Box::new(HostRunnerHost {
+            seam: SeamSpawn::inline(tracing::Span::current()),
+        }))
+    }
+}
+
+impl StableRunnerHost for HostRunnerHost {
+    extern "C" fn prepare<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+        let bytes = req.to_vec();
+        let fut = async move {
+            let reply = match run_prepare(bytes).await {
+                Ok(outcome) => hexecrunner::wire::PrepareReply::ok(outcome),
+                Err(e) => hexecrunner::wire::PrepareReply::Err(format!("{e:#}")),
+            };
+            SVec::from(reply.encode().as_slice())
+        };
+        dynify(stabby::boxed::Box::new(self.seam.run(
+            "prepare_runner",
+            String::new(),
+            fut,
+            |m| SVec::from(hexecrunner::wire::PrepareReply::Err(m).encode().as_slice()),
+        )))
+    }
+}
+
+/// Decode, resolve against this component's registry, and hand back the
+/// rewritten spec.
+///
+/// Cancellation is deliberately not forwarded across the seam. The guest holds
+/// the only handle to this future, so abandoning the call drops it and
+/// `HostTask` aborts the spawned body — which is the same effect a token would
+/// have had, without a second cancellation path to keep in sync.
+async fn run_prepare(bytes: Vec<u8>) -> anyhow::Result<hexecrunner::PrepareOutcome> {
+    let req = hexecrunner::wire::PrepareRequest::decode(&bytes)?;
+    let addr = hmodel::htaddr::parse_addr(&req.addr)
+        .map_err(|e| anyhow::anyhow!("exec-runner seam: bad runner address {:?}: {e}", req.addr))?;
+    let ctoken = hcore::hasync::StdCancellationToken::new();
+    hexecrunner::prepare_for_plugin(&req.request_id, &addr, req.rewrite, &ctoken).await
 }
 
 /// Wraps the per-request engine executor; handed to the plugin as a [`DynExecutor`].
