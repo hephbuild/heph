@@ -420,6 +420,80 @@ target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt",
     Ok(())
 }
 
+/// Serialization is the reason `access` exists: two targets sharing one cache
+/// must not be inside it at the same time, or a tool that assumes sole ownership
+/// of its cache directory corrupts it. Nothing else in this file asserts it —
+/// every other test runs one target at a time, where a lock that was never taken
+/// looks identical to one that was.
+///
+/// Each target refuses to proceed if it finds the other's in-progress marker, so
+/// the assertion is on the targets' own observation rather than on timing.
+#[tokio::test]
+async fn exclusive_targets_never_share_the_directory() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C",
+       access = "exclusive")"#,
+    );
+    // Claim, linger, release. `mkdir` is the atomic test-and-set every shell
+    // has: it fails if the directory is already there, so a target that finds
+    // the marker knows another one is inside the cache right now.
+    let t = |name: &str| {
+        format!(
+            r#"target(name = "{name}", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = [
+         "if ! mkdir \"$C/busy\" 2>/dev/null; then echo OVERLAP > $OUT; exit 0; fi",
+         "sleep 0.3",
+         "rmdir \"$C/busy\"",
+         "echo alone > $OUT",
+       ])"#
+        )
+    };
+    ws.write_build_file("app", &format!("{}\n{}", t("a"), t("b")));
+
+    let (a, b) = tokio::join!(ws.run("//app:a"), ws.run("//app:b"));
+    let (a, b) = (a?, b?);
+    let (sa, sb) = (
+        common::artifact_string(&a).trim().to_string(),
+        common::artifact_string(&b).trim().to_string(),
+    );
+    drop((a, b));
+    assert_eq!(
+        (sa.as_str(), sb.as_str()),
+        ("alone", "alone"),
+        "two `exclusive` consumers of one cache overlapped"
+    );
+    Ok(())
+}
+
+/// `shared` is the "trust the tool" escape hatch — Go's build cache is safe under
+/// concurrent use, and forcing those targets through one lock would serialize a
+/// whole build for nothing. Both must complete; the point is that neither is
+/// blocked, not that they overlap (asserting overlap would be a race).
+#[tokio::test]
+async fn shared_targets_are_not_serialized_against_each_other() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C",
+       access = "shared")"#,
+    );
+    let t = |name: &str| {
+        format!(
+            r#"target(name = "{name}", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["echo {name} > \"$C/{name}\"", "echo ok > $OUT"])"#
+        )
+    };
+    ws.write_build_file("app", &format!("{}\n{}", t("a"), t("b")));
+
+    let (a, b) = tokio::join!(ws.run("//app:a"), ws.run("//app:b"));
+    let (a, b) = (a?, b?);
+    assert_eq!(common::artifact_string(&a).trim(), "ok");
+    assert_eq!(common::artifact_string(&b).trim(), "ok");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Mounting: the point of the whole thing.
 // ---------------------------------------------------------------------------
