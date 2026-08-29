@@ -59,7 +59,7 @@ target(
     name = "image",
     driver = "docker_build",
     dockerfile = ":dockerfile",
-    context = {"cfg": [":config"]},
+    context = {"cfg": [":config_wrap"]},
     format = "docker",
 )
 
