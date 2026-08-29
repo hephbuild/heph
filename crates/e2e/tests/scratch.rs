@@ -1148,6 +1148,71 @@ async fn a_branch_reads_from_master_and_publishes_to_itself() -> anyhow::Result<
     Ok(())
 }
 
+/// `heph tool scratch head` is the "why did my branch start cold?" answer, and the
+/// question is only answerable if the trace shows the scopes that held *nothing*.
+/// Resolution itself stops at the first hit, so a trace that reported only the
+/// winner would be no better than the resolution it explains.
+#[tokio::test]
+async fn the_resolution_trace_reports_every_candidate_including_the_empty_ones()
+-> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+    let mk = || -> anyhow::Result<tempfile::TempDir> {
+        let d = tempfile::tempdir()?;
+        std::fs::create_dir_all(d.path().join("build"))?;
+        std::fs::create_dir_all(d.path().join("app"))?;
+        std::fs::write(d.path().join("build").join("BUILD"), REMOTE_DECL)?;
+        std::fs::write(d.path().join("app").join("BUILD"), remote_target("x"))?;
+        Ok(d)
+    };
+
+    // Only `master` ever publishes. `release` never does.
+    let m = mk()?;
+    let em = remote_engine(m.path(), &uri, "master", &[]);
+    build(&em).await?;
+    let slot = em.scratch_slots()?[0].slot.clone();
+    let mdir = heph::engine::scratch_remote::scope_head_dir(&em.home, &slot, "master");
+    em.scratch_push(&slot, "master", &mdir, None, "ci-42")
+        .await?;
+
+    // Asked from `pr-1`, falling back to `release` then `master`.
+    let trace = em
+        .scratch_remote_trace(
+            &slot,
+            "pr-1",
+            &["release".to_string(), "master".to_string()],
+        )
+        .await;
+
+    assert_eq!(
+        trace.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+        ["pr-1", "release", "master"],
+        "the trace must be the consult order, own scope first"
+    );
+    assert!(
+        trace[0].1.is_none() && trace[1].1.is_none(),
+        "a scope nobody published to holds nothing: {trace:?}"
+    );
+    let winner = trace[2].1.as_ref().expect("master holds the snapshot");
+    assert_eq!(winner.meta.scope, "master");
+    // The producer is the field that turns "it came from master" into "it came
+    // from *that* run", which is the whole point of recording it.
+    assert_eq!(winner.meta.producer, "ci-42");
+
+    // And the trace agrees with the resolution it explains — the first scope with
+    // anything is what a cold build here would restore.
+    let resolved = em
+        .scratch_remote_head(
+            &slot,
+            "pr-1",
+            &["release".to_string(), "master".to_string()],
+        )
+        .await
+        .expect("resolves to master");
+    assert_eq!(resolved.stem, winner.stem);
+    Ok(())
+}
+
 /// A remote that is unreachable is a cold build, never a failed one — the scratch
 /// contract in its most load-bearing form.
 #[tokio::test]

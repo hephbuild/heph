@@ -235,6 +235,38 @@ impl Engine {
         None
     }
 
+    /// Every candidate scope that would be consulted, with the head found in it.
+    ///
+    /// The resolution in [`scratch_remote_head`](Self::scratch_remote_head) stops
+    /// at the first scope with anything, which is right for resolving and useless
+    /// for explaining. This returns the whole walk so a person can see *why* a
+    /// build started cold: which lineages were looked at, in what order, and what
+    /// each held.
+    pub async fn scratch_remote_trace(
+        &self,
+        slot: &str,
+        scope: &str,
+        fallbacks: &[String],
+    ) -> Vec<(String, Option<RemoteHead>)> {
+        let backends = self.remote_caches().readable_backends().await;
+        let mut scopes = vec![scope.to_string()];
+        scopes.extend(fallbacks.iter().cloned());
+
+        let mut out = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            let mut best: Option<RemoteHead> = None;
+            for (name, backend) in &backends {
+                for head in heads_in(backend.as_ref(), name, slot, &scope).await {
+                    if best.as_ref().is_none_or(|b| better(&head, b).is_lt()) {
+                        best = Some(head);
+                    }
+                }
+            }
+            out.push((scope, best));
+        }
+        out
+    }
+
     /// Fetch a head's snapshot and unpack it into `dir`.
     pub async fn scratch_pull(&self, head: &RemoteHead, dir: &Path) -> anyhow::Result<u64> {
         let backends = self.remote_caches().readable_backends().await;
