@@ -619,7 +619,6 @@ dependencies = [
  "futures",
  "glob",
  "itertools 0.15.0",
- "minijinja",
  "model",
  "parking_lot",
  "plugin",
@@ -628,6 +627,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "template",
  "tokio",
  "tracing",
  "walk",
@@ -1071,6 +1071,7 @@ dependencies = [
  "regex-syntax",
  "tar",
  "tempfile",
+ "template",
  "uu_base64",
  "uu_basename",
  "uu_cat",
@@ -7150,6 +7151,14 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "template"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "minijinja",
 ]
 
 [[package]]

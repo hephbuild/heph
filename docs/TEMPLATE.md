@@ -22,6 +22,12 @@ of those (see `COREUTILS.md`); this rule removes the shell from the job
 entirely. The template is an input, the rendered file is an output, and the
 rendering happens in-process.
 
+The renderer lives in `crates/template`, shared with the `tmpl` applet
+(`COREUTILS.md`). It is small enough to be tempting to copy and exactly the
+wrong thing to copy: the two properties below are *configuration*, and
+configuration that exists in two places drifts — a loader enabled on one side
+and not the other would be a sandbox hole nobody notices.
+
 ## Two properties worth stating
 
 **A template cannot read an undeclared file.** The minijinja environment is
@@ -62,7 +68,9 @@ cache.
 `TEMPLATE_FORMAT_VERSION` is in the def hash too, for the same reason the exec
 driver hashes its own format version: the rendered bytes are a function of the
 renderer as well as of the template, so a minijinja upgrade that changes output
-must move the key. Bump it when rendering changes.
+must move the key. Bump it when rendering changes — as version 2 did, to stop
+minijinja dropping a template's trailing newline. These render *files*, and a
+config file that has lost its final newline is wrong.
 
 ## Limits
 

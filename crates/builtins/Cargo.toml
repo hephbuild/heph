@@ -24,7 +24,7 @@ xattr = "1"
 which = "8.0.3"
 tracing = "0.1"
 itertools = "0.15.0"
-minijinja = "2"
+htemplate = { package = "template", path = "../template" }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "macros", "sync", "fs", "process"] }
 
 [dev-dependencies]

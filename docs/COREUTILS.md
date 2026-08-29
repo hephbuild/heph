@@ -1,6 +1,6 @@
 # Builtin coreutils
 
-heph ships 48 POSIX utilities inside its own binary and can put them on every
+heph ships 49 POSIX utilities inside its own binary and can put them on every
 target's `PATH`, so a recipe that runs `cp`, `install` or `sha256sum` behaves
 identically on Linux and macOS.
 
@@ -141,6 +141,20 @@ The applet set is complete. `diff`/`cmp`
 are not planned: the `diffutils` crate exposes its algorithms but keeps its CLI
 in a private `main`, so wiring it up would mean reimplementing its argument
 parsing for the lowest-value pair in the set.
+
+### `tmpl`
+
+The `template` rule (`TEMPLATE.md`) is the surface to reach for: its inputs and
+outputs are declared and it needs no subprocess. `tmpl` exists for what the rule
+cannot express — filling in a file *during* a recipe, from values the recipe
+computed — which is otherwise done with `sed -i` or `envsubst`.
+
+`tmpl [-i IN] [-o OUT] [--set NAME=VALUE]... [--env]`, reading stdin and writing
+stdout by default. `--set` wins over `--env`: the environment is the broad
+default and each `--set` is a deliberate override.
+
+Rendering comes from `crates/template`, the same code the rule uses, so the two
+cannot disagree about whether a template may read `/etc/passwd`.
 
 ### `sed`, and the BRE translation
 
