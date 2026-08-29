@@ -313,7 +313,8 @@ mod tests {
             super::cache_dir(dir.path()).expect("home dir"),
         ))
         .expect("engine");
-        heph::commands::bootstrap::register_builtin_factories(&mut e).expect("register");
+        heph::commands::bootstrap::register_builtin_factories(&mut e, dir.path())
+            .expect("register");
 
         let mut builtins = 0;
         for spec in &file.plugins {
