@@ -1067,6 +1067,7 @@ dependencies = [
  "grep-printer",
  "grep-regex",
  "grep-searcher",
+ "regex",
  "regex-syntax",
  "tar",
  "tempfile",

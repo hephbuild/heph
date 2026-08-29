@@ -18,6 +18,7 @@
 mod archive;
 mod find;
 mod grep;
+mod sed;
 
 use anyhow::Context as _;
 use std::ffi::OsString;
@@ -33,7 +34,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Bump it on any observable behaviour change — an applet added or removed, an
 /// upstream upgrade that changes output, a fix to one of the hand-written parts.
-pub const COREUTILS_VERSION: u32 = 3;
+pub const COREUTILS_VERSION: u32 = 4;
 
 /// Where the applets come from, for `heph tool coreutils list`.
 pub const UPSTREAM: &str =
@@ -102,6 +103,7 @@ applets! {
     "realpath" => uu!(uu_realpath),
     "rm" => uu!(uu_rm),
     "rmdir" => uu!(uu_rmdir),
+    "sed" => crate::sed::main,
     "seq" => uu!(uu_seq),
     "sha1sum" => uu!(uu_sha1sum),
     "sha256sum" => uu!(uu_sha256sum),

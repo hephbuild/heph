@@ -1,6 +1,6 @@
 # Builtin coreutils
 
-heph ships 47 POSIX utilities inside its own binary and can put them on every
+heph ships 48 POSIX utilities inside its own binary and can put them on every
 target's `PATH`, so a recipe that runs `cp`, `install` or `sha256sum` behaves
 identically on Linux and macOS.
 
@@ -137,10 +137,40 @@ fetching, hermetically and cacheably), `git`, `uname` (normalising `arm64` vs
 `aarch64` would change recipes that already switch on it), `du`/`df` (they
 answer questions about the machine, not the build), and anything interactive.
 
-`sed` is not in yet; it is the last slice. `diff`/`cmp`
+The applet set is complete. `diff`/`cmp`
 are not planned: the `diffutils` crate exposes its algorithms but keeps its CLI
 in a private `main`, so wiring it up would mean reimplementing its argument
 parsing for the lowest-value pair in the set.
+
+### `sed`, and the BRE translation
+
+The sharpest divergence in the set: GNU's `-i` takes an *optional* attached
+suffix and BSD's requires a separate one, so `sed -i 's/a/b/' f` edits the file
+on Linux and eats the next argument as a filename on macOS. heph takes GNU's
+form, and refuses BSD's (`sed -i '' …`) with the fix spelled out rather than
+silently treating `''` as the script and doing nothing.
+
+No embeddable POSIX sed exists in Rust, so this one is written here, over the
+`regex` crate — which has **no backreferences and no lookaround, by design**.
+The rule for that gap is *reject loudly, never approximate*: an unsupported
+construct is an error naming the construct, never a silently different match.
+
+Basic regular expressions are supported by translating them to the extended
+syntax the engine speaks: `\(` becomes `(`, a bare `+` becomes `\+`, and
+bracket expressions are passed through untouched because nothing inside them
+follows either set of rules. Without that translation the single most common
+idiom in real scripts — `s/\(a\)\(b\)/\2\1/` — would not compile, and
+"reject loudly" would mean rejecting almost everything.
+
+Supported: `s` (with `g`, `p`, `i`, and a numeric flag), `y`, `d`, `p`, `q`,
+`=`, `a`, `i`, `c`; addresses by line, `$`, `/re/`, ranges and `!`; `-n`, `-e`,
+`-f`, `-i[SUFFIX]`, `-E`/`-r`. Command groups (`{ … }`) are refused rather than
+half-supported. Both `a text` (GNU) and `a\` + newline (BSD) are accepted, since
+the point is that one script runs on both hosts.
+
+In-place editing writes through a temporary in the same directory and renames.
+A truncate-then-write loses the file if anything fails halfway, and this is
+editing someone's source.
 
 ### `grep`, and where it departs from GNU
 

@@ -58,6 +58,7 @@ walkdir = "2"
 tar = "0.4"
 flate2 = "1"
 zstd = "0.13"
+regex = "1"
 regex-syntax = "0.8"
 grep-matcher = "0.1"
 
