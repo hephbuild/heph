@@ -487,7 +487,15 @@ impl ProviderTrait for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         let inner = Arc::clone(&self.inner);
-        Box::pin(async move { inner.handle_get(req).await })
+        Box::pin(async move {
+            let mut resp = Arc::clone(&inner).handle_get(req).await?;
+            // Every target this provider generates, in one place. Doing it at
+            // each construction site meant 23 of them and a new target type
+            // silently opting out; here a generated target cannot escape the
+            // runner by being added later.
+            inner.apply_runner(&mut resp.target_spec);
+            Ok(resp)
+        })
     }
 
     fn probe<'a>(
@@ -697,6 +705,20 @@ impl ProviderFn for BuildAddrFn {
         Ok(Value::String(addr.format()))
     }
 }
+
+/// Drivers whose spec accepts a `runner` field. Anything else rejects unknown
+/// keys, so a blanket apply would turn a generated target into a parse error —
+/// and `go_toolchain` / `http_fetch` / `textfile` fetch or write bytes rather
+/// than run a toolchain, so an environment has nothing to change about them.
+const RUNNER_AWARE_DRIVERS: &[&str] = &[
+    "bash",
+    "exec",
+    "go_golist",
+    "go_compile",
+    "go_lint",
+    "go_format",
+    "go_format_check",
+];
 
 impl ProviderInner {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -1660,9 +1682,8 @@ impl ProviderInner {
                 variant::resolve(addr, &req.states, "", req.executor.as_ref(), true)
                     .await
                     .map_err(GetError::Other)?;
-            let mut spec =
+            let spec =
                 target_std::install_spec(addr.clone(), &factors, &self.go_version, &self.cctool);
-            self.apply_runner(&mut spec);
             return Ok(GetResponse { target_spec: spec });
         }
 
@@ -1726,13 +1747,12 @@ impl ProviderInner {
                 if !subpath.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let mut spec = thirdparty::build_download_spec(
+                let spec = thirdparty::build_download_spec(
                     addr.clone(),
                     module,
                     version,
                     &self.go_version,
                 );
-                self.apply_runner(&mut spec);
                 return Ok(GetResponse { target_spec: spec });
             }
             return Err(GetError::NotFound);
@@ -2136,7 +2156,7 @@ impl ProviderInner {
 
                 let link =
                     pick_link(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
-                let mut spec = target_bin::build_spec(
+                let spec = target_bin::build_spec(
                     addr.clone(),
                     &import_path,
                     &factors,
@@ -2144,7 +2164,6 @@ impl ProviderInner {
                     &link,
                     &self.go_version,
                 );
-                self.apply_runner(&mut spec);
                 Ok(GetResponse { target_spec: spec })
             }
             // Generates testmain.go for the INTERNAL test bin (only `_test` imports).
@@ -2472,14 +2491,13 @@ impl ProviderInner {
 
                 let testmain_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_testmain_lib", &vref);
-                let mut spec = target_test::build_test_spec(
+                let spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
                     &testmain_lib_addr,
                     &all_libs,
                     &self.go_version,
                 );
-                self.apply_runner(&mut spec);
                 Ok(GetResponse { target_spec: spec })
             }
             // Link the EXTERNAL (xtest) test bin.
@@ -2573,14 +2591,13 @@ impl ProviderInner {
 
                 let testmain_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_xtestmain_lib", &vref);
-                let mut spec = target_test::build_test_spec(
+                let spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
                     &testmain_lib_addr,
                     &all_libs,
                     &self.go_version,
                 );
-                self.apply_runner(&mut spec);
                 Ok(GetResponse { target_spec: spec })
             }
             // Run the INTERNAL test bin.
@@ -2868,28 +2885,46 @@ impl ProviderInner {
     /// here. A lint/format spec must still resolve on a dev build, or a bulk
     /// `query` / `//...` walk (which asks every target for its spec) would die on
     /// a machine that has no business owning a heph-govet.
-    /// Put this provider's `runner` on a generated **bash** target.
+    /// Put this provider's `runner` on a generated target.
     ///
-    /// The `go_*` drivers take the runner as a driver-level default; the Go
-    /// targets that are bash targets — the std install, the thirdparty
-    /// download, the binary and test-binary links — take it as a spec field,
-    /// and they invoke `go` just as much. A build where only half of them moved
-    /// into the environment is not half-right: with `gotool = "host"` the two
-    /// halves are different toolchains, and the compiler rejects the objects
-    /// outright with `could not import fmt (object is [... go1.26.2 ...]
-    /// expected [... go1.26.5 ...])`.
+    /// Applies to **every** target this plugin generates that can accept one,
+    /// not just the `go_*` driver targets. Half the things that invoke `go` are
+    /// bash targets — the std install, the thirdparty download, the binary and
+    /// test-binary links, and the test run itself — and a build where only some
+    /// of them moved into the environment is not half-right: under
+    /// `gotool = "host"` the two halves are different toolchains, and the
+    /// compiler rejects the objects outright with `could not import fmt (object
+    /// is [... go1.26.2 ...] expected [... go1.26.5 ...])`.
     ///
-    /// `PATH` comes back out of `runtime_pass_env` here. A host toolchain puts
-    /// it there so a non-hermetic `go` is findable in the sandbox, which is
-    /// right when this host is the one supplying it — but a target's own
-    /// environment wins over the runner's, so passing the host's `PATH` under a
-    /// runner selects the host's `go` inside the named environment. Everything
-    /// else in that list stays: it is module-cache and proxy config, which the
-    /// download target deliberately shares with the host.
+    /// Gated on the driver, because a spec carrying a key its driver does not
+    /// know is a hard parse error, not an ignored field: `go_toolchain`,
+    /// `http_fetch` and `textfile` targets have no `runner` and must not be
+    /// given one. That is also the honest boundary — those three fetch and write
+    /// bytes rather than run a toolchain, so there is nothing about them for an
+    /// environment to change.
+    ///
+    /// Never overwrites. A `runner` already on the spec came from something more
+    /// specific than a plugin-wide option — today that is
+    /// `provider_state(provider = "go", test = {"runner": ...})`, which is how a
+    /// package says its tests run somewhere other than its build.
+    ///
+    /// `PATH` comes back out of `runtime_pass_env`. A host toolchain puts it
+    /// there so a non-hermetic `go` is findable in the sandbox, which is right
+    /// when this host supplies it — but a target's own environment wins over the
+    /// runner's, so passing the host's `PATH` under a runner selects the host's
+    /// `go` inside the named environment. Everything else in that list stays: it
+    /// is module-cache and proxy config, which the download target deliberately
+    /// shares with the host.
     fn apply_runner(&self, spec: &mut hplugin::provider::TargetSpec) {
         let Some(runner) = self.runner.as_deref() else {
             return;
         };
+        if !RUNNER_AWARE_DRIVERS.contains(&spec.driver.as_str()) {
+            return;
+        }
+        if spec.config.contains_key("runner") {
+            return;
+        }
         spec.config
             .insert("runner".to_string(), Value::String(runner.to_string()));
         if let Some(Value::List(names)) = spec.config.get_mut("runtime_pass_env") {
@@ -5595,6 +5630,124 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     // ---- race ----
+
+    // ---- the runner reaches every generated target ----
+
+    fn spec_with(driver: &str, cfg: &[(&str, Value)]) -> hplugin::provider::TargetSpec {
+        let mut config: HashMap<String, Value> = HashMap::new();
+        for (k, v) in cfg {
+            config.insert((*k).to_string(), v.clone());
+        }
+        hplugin::provider::TargetSpec {
+            addr: Default::default(),
+            driver: driver.to_string(),
+            config,
+            ..Default::default()
+        }
+    }
+
+    fn provider_with_runner(runner: Option<&str>) -> Arc<ProviderInner> {
+        let p = Provider::with_config(
+            std::path::PathBuf::from("/ws"),
+            Config {
+                go_version: toolchain::HOST.to_string(),
+                runner: runner.map(str::to_string),
+                ..Default::default()
+            },
+            tokio::runtime::Handle::current(),
+        )
+        .expect("provider");
+        Arc::clone(&p.inner)
+    }
+
+    /// The whole point: a bash target this plugin generates — the std install,
+    /// the thirdparty download, a link — runs in the environment too. Half a
+    /// build in the named environment is two toolchains, not a partial win.
+    #[tokio::test]
+    async fn a_generated_bash_target_gets_the_runner() {
+        let inner = provider_with_runner(Some("//tools/devenv:runner"));
+        let mut spec = spec_with("bash", &[]);
+        inner.apply_runner(&mut spec);
+        assert_eq!(
+            spec.config.get("runner"),
+            Some(&Value::String("//tools/devenv:runner".to_string()))
+        );
+    }
+
+    /// Gated on the driver, because a spec carrying a key its driver does not
+    /// know is a hard parse error. `textfile` has no `runner`, so a blanket
+    /// apply would turn every generated textfile target into a build failure.
+    #[tokio::test]
+    async fn a_driver_without_a_runner_field_is_left_alone() {
+        let inner = provider_with_runner(Some("//tools/devenv:runner"));
+        for driver in ["textfile", "http_fetch", "go_toolchain", "go_testmain"] {
+            let mut spec = spec_with(driver, &[]);
+            inner.apply_runner(&mut spec);
+            assert!(
+                !spec.config.contains_key("runner"),
+                "{driver} rejects unknown keys; giving it a runner is a parse error"
+            );
+        }
+    }
+
+    /// A runner already on the spec came from something more specific — today
+    /// `provider_state(provider = "go", test = {"runner": ...})`, which is how a
+    /// package says its tests run somewhere other than its build.
+    #[tokio::test]
+    async fn a_more_specific_runner_is_not_overwritten() {
+        let inner = provider_with_runner(Some("//tools/devenv:runner"));
+        let mut spec = spec_with(
+            "bash",
+            &[("runner", Value::String("//tools/ci:runner".to_string()))],
+        );
+        inner.apply_runner(&mut spec);
+        assert_eq!(
+            spec.config.get("runner"),
+            Some(&Value::String("//tools/ci:runner".to_string()))
+        );
+    }
+
+    /// A workspace that configures no runner is untouched — this must cost
+    /// nothing and change nothing for everyone who does not use it.
+    #[tokio::test]
+    async fn no_configured_runner_changes_nothing() {
+        let inner = provider_with_runner(None);
+        let mut spec = spec_with("bash", &[]);
+        inner.apply_runner(&mut spec);
+        assert!(!spec.config.contains_key("runner"));
+    }
+
+    /// Under a runner the host's `PATH` must come back out of the pass-through:
+    /// a target's own environment wins over the runner's, so forwarding the
+    /// host's `PATH` would select the host's `go` *inside* the environment —
+    /// the object-version mismatch this plugin's runner support exists to avoid.
+    #[tokio::test]
+    async fn the_host_path_is_dropped_under_a_runner() {
+        let inner = provider_with_runner(Some("//tools/devenv:runner"));
+        let mut spec = spec_with(
+            "bash",
+            &[(
+                "runtime_pass_env",
+                Value::List(vec![
+                    Value::String("PATH".to_string()),
+                    Value::String("GOMODCACHE".to_string()),
+                ]),
+            )],
+        );
+        inner.apply_runner(&mut spec);
+        let names = match spec.config.get("runtime_pass_env") {
+            Some(Value::List(v)) => v.clone(),
+            other => panic!("expected a list, got {other:?}"),
+        };
+        assert!(
+            !names.contains(&Value::String("PATH".to_string())),
+            "the host PATH selects the host toolchain inside the environment"
+        );
+        assert!(
+            names.contains(&Value::String("GOMODCACHE".to_string())),
+            "module-cache config is deliberately still shared with the host"
+        );
+    }
 
     /// Options a `from_options` test needs beyond the one under test: `gotool` is
     /// required, everything else is optional.
