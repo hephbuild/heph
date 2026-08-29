@@ -21,6 +21,17 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.8.0: `RunRequest`/`ManagedRunRequest` gained `repeated ScratchMount
+/// scratch` — persistent cache directories the host resolved, locked and created
+/// for the run, which the driver symlinks into the sandbox and announces through
+/// an env var. Additive and cold-path: it is a prost wire field, not a vtable
+/// change, so an old plugin decodes a new host's request fine and simply ignores
+/// the mounts. Its targets then run without a scratch, which costs a cold cache
+/// and never a wrong build — the lock is keyed on a declaration the old plugin
+/// cannot see, so there is no shared directory for it to race either. Minor,
+/// therefore, not major: no plugin *must* be rebuilt, but one must be to mount a
+/// scratch.
+///
 /// 0.5.0: `StableExecutor` gained a `states` method (fetch a package's provider
 /// states for cross-subtree config resolution — the go variant `vp` lookup). A
 /// new method on a `#[stabby::stabby]` vtable trait changes its type-report, so
@@ -35,7 +46,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.7.0";
+pub const ABI_SEMVER: &str = "0.8.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

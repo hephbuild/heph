@@ -123,6 +123,7 @@ pub struct Engine {
     /// Guards the execute phase so at most one execute runs per target addr at
     /// a time (cross-process with the filesystem backend, in-process with mem).
     pub(crate) result_lock: ResultLock,
+    pub(crate) scratch_lock: crate::engine::scratch::ScratchLock,
 
     /// Ordered set of remote (shared) caches fronting the local cache. Empty
     /// (a cheap no-op on every path) unless `caches:` is configured.
@@ -437,7 +438,15 @@ impl Engine {
         let lock_dir = home.join("lock");
         std::fs::create_dir_all(&lock_dir)
             .with_context(|| format!("create lock dir {lock_dir:?}"))?;
-        let result_lock = ResultLock::new(cfg.lock_backend, lock_dir);
+        let result_lock = ResultLock::new(cfg.lock_backend, lock_dir.clone());
+        // Separate keyed lock, separate files: a scratch slot is keyed by slot id
+        // and an addr's result by addr, and colliding those namespaces would let
+        // one wait on the other for no reason.
+        let scratch_lock_dir = lock_dir.join("scratch");
+        std::fs::create_dir_all(&scratch_lock_dir)
+            .with_context(|| format!("create scratch lock dir {scratch_lock_dir:?}"))?;
+        let scratch_lock =
+            crate::engine::scratch::ScratchLock::new(cfg.lock_backend, scratch_lock_dir);
 
         // Remote caches: backends are constructed synchronously here (no
         // network); latency ordering is measured lazily on first use.
@@ -507,11 +516,13 @@ impl Engine {
             managed_driver_factories: HashMap::new(),
             fuse,
             result_lock,
+            scratch_lock,
             remote_caches,
             provider_functions_wired: std::sync::Once::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
         };
         engine.register_driver(|_| Box::new(hbuiltins::plugingroup::Driver))?;
+        engine.register_driver(|_| Box::new(hbuiltins::pluginscratch::Driver))?;
         engine.register_provider(|_| Box::new(hplugin_query::pluginquery::Provider))?;
 
         // The `fs` provider + driver are always-on built-ins. Each builds its

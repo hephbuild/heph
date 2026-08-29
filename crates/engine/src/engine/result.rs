@@ -3658,6 +3658,17 @@ impl Engine {
             anyhow::bail!("missing hash");
         }
 
+        // Scratch references: resolve each to its declaration and reject an
+        // incoherent set (a non-scratch addr, two claiming one env var, two
+        // mounting over each other). Done here, on the finalized def, so every
+        // driver gets the checks and a BUILD-file mistake surfaces at `get_def`
+        // — where the author is still looking at the file — rather than as a
+        // mount that quietly does nothing much later.
+        //
+        // Returns immediately for a target with no references, which is nearly
+        // all of them.
+        self.resolve_scratch(&rs, addr, &def.inputs).await?;
+
         // Validate approval notices against the finalized input set at definition
         // time — before any result resolution or execution — so a notice naming a
         // non-existent input group fails fast and identically on every path.

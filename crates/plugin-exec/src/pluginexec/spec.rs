@@ -24,6 +24,11 @@ pub(crate) struct TargetSpec {
     /// mutates (e.g. a hermetic toolchain). No effect under the FUSE sandbox,
     /// which already shares inputs lazily.
     pub read_only_deps: Vec<String>,
+    /// Scratch caches this target uses, as a list of `scratch` target addresses.
+    /// Each is mounted at the path *its declaration* names, and its declared
+    /// `env` variable is set for the run. A scratch is not an input: it is never
+    /// materialized from artifacts and never affects this target's cache key.
+    pub scratch: Vec<String>,
     /// Build tools, grouped by name → list of target addresses; symlinked under `tools/`.
     pub tools: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths the target writes.
