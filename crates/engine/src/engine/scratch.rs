@@ -228,6 +228,8 @@ pub(crate) enum Prepared {
     Cold,
     /// Cold locally, restored from the remote store.
     Pulled,
+    /// Over its declared `max_size`, so it was dropped whole and starts cold.
+    DroppedOverMax,
     /// `--no-scratch`: a throwaway directory, deliberately empty.
     Audit,
 }
@@ -241,6 +243,7 @@ impl Prepared {
             Prepared::Seeded => "seeded",
             Prepared::Cold => "cold",
             Prepared::Pulled => "pulled",
+            Prepared::DroppedOverMax => "dropped_over_max",
             Prepared::Audit => "audit",
         }
     }
@@ -276,6 +279,45 @@ const INTERRUPTED: &str = "interrupted";
 /// on the first build after a branch switch — and is measured against a cold
 /// rebuild, not against nothing. `scratch.seedOnFork: false` turns it off for a
 /// large slot on a filesystem without reflink, at the cost of every new branch
+/// Drop a lineage that has outgrown its declaration's `max_size`.
+///
+/// Best-effort in both directions: an unparseable cap and a failed delete are
+/// both a cache that is merely too big, never a failed build. The cap is parsed
+/// per acquisition rather than at declaration time because it is a string on the
+/// spec; `pluginscratch::parse_declaration` rejects a malformed one up front, so
+/// reaching the `Err` arm here means a spec that bypassed it.
+/// Returns whether the cache was dropped, so the caller can report that as the
+/// prepare outcome — "your 12 GiB cache was deleted and this build runs cold" is
+/// the single most consequential thing this module does, and it is not something
+/// a user should have to find in a log at `info`.
+async fn enforce_max_size(dir: &Path, max: Option<&str>, addr: &Addr) -> bool {
+    let Some(max) = max else { return false };
+    let cap = match hcore::units::parse_size(max) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(%addr, max, error = %err, "ignoring unparseable scratch max_size");
+            return false;
+        }
+    };
+    let d = dir.to_path_buf();
+    let (bytes, _) = hcore::blocking::run(move || crate::engine::scratch_store::measure(&d)).await;
+    if bytes <= cap {
+        return false;
+    }
+    tracing::info!(
+        %addr, bytes, cap, dir = %dir.display(),
+        "scratch cache exceeded max_size; dropping it whole",
+    );
+    let d = dir.to_path_buf();
+    if let Err(err) = hcore::blocking::run(move || std::fs::remove_dir_all(&d)).await {
+        // A cache that could not be dropped is a cache that is too big, which is
+        // exactly the state we were already in. Nothing else is at risk.
+        tracing::warn!(%addr, error = %err, "could not drop oversized scratch cache");
+        return false;
+    }
+    true
+}
+
 /// starting cold.
 async fn resolve_scope_dir(
     home: &Path,
@@ -538,15 +580,14 @@ impl Engine {
             crate::engine::scratch_store::write_slot_meta(
                 &self.home,
                 &slot,
-                &crate::engine::scratch_store::SlotMeta {
-                    format: 1,
-                    addr: r.addr.format(),
-                    path: r.def.path.clone(),
-                    env: r.def.env.clone(),
-                    access: r.def.access.as_str().to_string(),
-                    version: r.def.version.clone(),
-                    remote: r.def.remote,
-                },
+                &crate::engine::scratch_store::SlotMeta::new(
+                    r.addr.format(),
+                    r.def.path.clone(),
+                    r.def.env.clone(),
+                    r.def.access.as_str().to_string(),
+                    r.def.version.clone(),
+                    r.def.remote,
+                ),
             );
 
             mounts.push(ScratchMount {
@@ -761,6 +802,26 @@ impl Engine {
                         .with_context(|| format!("audit scratch dir for {}", r.addr))?
                 };
 
+                // Over its declared cap? Drop it whole and start cold.
+                //
+                // Whole, not trimmed, because heph does not know which of a
+                // foreign tool's entries are hot — evicting a guess would
+                // degrade the cache while claiming to manage it. Dropping is
+                // honest and self-correcting: the next run refills it.
+                //
+                // Before the `create_dir_all` below, not after: dropping removes
+                // the directory itself, and a consumer whose env var points at a
+                // path that does not exist fails at its first write rather than
+                // starting cold.
+                //
+                // Skipped for an audit: that directory is fresh by construction,
+                // so there is nothing over a cap and nothing to drop.
+                let dropped = !no_scratch
+                    && enforce_max_size(&dir, r.def.max_size.as_deref(), &r.addr).await;
+                if dropped {
+                    cell.lock().prepared = Some(Prepared::DroppedOverMax);
+                }
+
                 let d = dir.clone();
                 hcore::blocking::run(move || std::fs::create_dir_all(&d))
                     .await
@@ -776,8 +837,15 @@ impl Engine {
                 // degrades to a cold build. Publishing is the opposite on all
                 // three counts and is therefore a command
                 // (`heph tool scratch push`), never a side effect of building.
+                // Not after a cap drop, and this is the whole reason `dropped`
+                // is threaded down here. The pull would see the freshly-emptied
+                // directory, decide it is cold, and fetch back the very snapshot
+                // that was just judged too big — so every run would drop,
+                // re-pull and drop again, paying the egress forever while
+                // reporting `pulled` and never once surfacing the drop.
                 if r.def.remote
                     && !no_scratch
+                    && !dropped
                     && let Some((bytes, path_mismatch)) =
                         self.pull_if_cold(slot, &dir, &r.addr).await
                 {

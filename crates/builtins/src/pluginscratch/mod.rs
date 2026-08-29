@@ -241,6 +241,14 @@ impl ScratchDef {
             Some(e) => e,
             None => default_env_name(target_name),
         };
+        // Rejected here rather than ignored at acquisition: a cap that silently
+        // does nothing is worse than no cap, because the author believes the
+        // cache is bounded.
+        if let Some(max) = &spec.max_size {
+            hcore::units::parse_size(max).with_context(|| {
+                format!("scratch `max_size` on {target_name}: {max:?} is not a size")
+            })?;
+        }
         Ok(Self {
             path: spec.path,
             env,
@@ -397,6 +405,24 @@ mod tests {
     fn env_can_be_the_tools_own_variable() {
         let d = parse(&[("path", s("c")), ("env", s("GOCACHE"))], "gocache").expect("parse");
         assert_eq!(d.env, "GOCACHE");
+    }
+
+    #[test]
+    fn a_max_size_that_is_not_a_size_is_rejected_at_the_declaration() {
+        let err = parse(&[("max_size", s("plenty"))], "c").expect_err("must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("max_size"), "{msg}");
+        // The author needs to see what they typed, not just that it was wrong.
+        assert!(msg.contains("plenty"), "{msg}");
+    }
+
+    #[test]
+    fn a_max_size_in_the_units_people_type_is_accepted() {
+        for v in ["1024", "5GiB", "500MB", " 8 MiB "] {
+            let d = parse(&[("max_size", s(v))], "c")
+                .unwrap_or_else(|e| panic!("{v:?} must parse: {e:#}"));
+            assert_eq!(d.max_size.as_deref(), Some(v));
+        }
     }
 
     #[test]

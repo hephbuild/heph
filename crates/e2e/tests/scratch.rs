@@ -480,6 +480,103 @@ async fn a_scratch_carries_state_between_runs() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `max_size` was accepted on the declaration and enforced nowhere — an author
+/// could bound a cache, believe it bounded, and watch it grow without limit. The
+/// cap drops the lineage **whole** rather than trimming it: heph cannot tell
+/// which of a foreign tool's entries are hot, so evicting a guess would quietly
+/// degrade the cache while claiming to manage it.
+#[tokio::test]
+async fn a_scratch_over_its_max_size_is_dropped_whole() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "MYCACHE",
+       max_size = "4KiB")"#,
+    );
+    // Writes ~64KiB, well past the cap, and reports whether anything survived
+    // from the run before it.
+    let build = |marker: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = [
+         "if [ -f \"$MYCACHE/marker\" ]; then cat \"$MYCACHE/marker\" > $OUT; else echo cold > $OUT; fi",
+         "echo {marker} > \"$MYCACHE/marker\"",
+         "printf '%*s' 65536 '' > \"$MYCACHE/bulk\"",
+       ])"#
+        )
+    };
+
+    ws.write_build_file("app", &build("first"));
+    let first = ws.run("//app:a").await?;
+    let first_out = common::artifact_string(&first).trim().to_string();
+    drop(first);
+    assert_eq!(first_out, "cold");
+
+    ws.write_build_file("app", &build("second"));
+    let engine = ws.reopen()?;
+    let addr = heph::htaddr::parse_addr("//app:a")?;
+    let second = engine
+        .clone()
+        .result_addr(
+            engine.new_state(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        common::artifact_string(&second).trim(),
+        "cold",
+        "a cache past its cap must be dropped, so the next run starts cold"
+    );
+    Ok(())
+}
+
+/// The cap must not fire on a cache that is merely non-empty — a cap that drops
+/// everything is indistinguishable from no cache at all, and would make the
+/// feature silently useless rather than loudly broken.
+#[tokio::test]
+async fn a_scratch_under_its_max_size_is_kept() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "MYCACHE",
+       max_size = "1GiB")"#,
+    );
+    let build = |marker: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = [
+         "if [ -f \"$MYCACHE/marker\" ]; then cat \"$MYCACHE/marker\" > $OUT; else echo cold > $OUT; fi",
+         "echo {marker} > \"$MYCACHE/marker\"",
+       ])"#
+        )
+    };
+
+    ws.write_build_file("app", &build("first"));
+    let first = ws.run("//app:a").await?;
+    drop(first);
+
+    ws.write_build_file("app", &build("second"));
+    let engine = ws.reopen()?;
+    let addr = heph::htaddr::parse_addr("//app:a")?;
+    let second = engine
+        .clone()
+        .result_addr(
+            engine.new_state(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        common::artifact_string(&second).trim(),
+        "first",
+        "a cache inside its cap must survive"
+    );
+    Ok(())
+}
+
 /// The declaration's `env` is what makes a reference sufficient: the consumer
 /// wires nothing, and the variable holds the canonical slot path — an absolute
 /// path outside the sandbox, not the in-sandbox mount. Tools bake absolute paths

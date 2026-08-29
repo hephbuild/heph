@@ -219,7 +219,7 @@ fn read_slot_meta(home: &Path, slot: &str) -> Option<SlotMeta> {
 /// Walks rather than caching: a size is only ever asked for by `ls`, `gc` and
 /// the per-slot cap, none of which is on a build's hot path, and a cached total
 /// would be wrong the moment a target wrote into the slot — which is constantly.
-fn measure(dir: &Path) -> (u64, Option<SystemTime>) {
+pub(crate) fn measure(dir: &Path) -> (u64, Option<SystemTime>) {
     let (mut bytes, mut newest) = (0u64, None::<SystemTime>);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (bytes, newest);
