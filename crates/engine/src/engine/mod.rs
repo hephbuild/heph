@@ -91,6 +91,7 @@ pub mod matcher_target;
 mod meta;
 pub mod sandbox_cleaner;
 pub mod scratch;
+pub mod scratch_remote;
 pub mod scratch_store;
 pub mod validate;
 pub mod worker_pool;

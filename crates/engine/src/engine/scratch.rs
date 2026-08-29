@@ -360,6 +360,19 @@ impl Engine {
                 .await
                 .with_context(|| format!("create scratch dir {dir:?} for {}", r.addr))?;
 
+            // Still cold after the local fallbacks? Try the remote lineage. This
+            // is the CI case and the reason `remote` exists: a fresh runner is
+            // cold in every lineage, so without it every job starts from nothing.
+            //
+            // Pull is automatic — and safe to be, because it is read-only, costs
+            // one list plus one fetch, and every way it can fail degrades to a
+            // cold build. Publishing is the opposite on all three counts and is
+            // therefore a command (`heph tool scratch push`), never a side effect
+            // of building.
+            if r.def.remote {
+                self.pull_if_cold(&slot, &dir, &r.addr).await;
+            }
+
             // Record what this slot came from, so the store can describe itself
             // without resolving the graph (see `scratch_store`). Idempotent and
             // best-effort: it is a diagnostic, not part of the build.
@@ -386,6 +399,63 @@ impl Engine {
             });
         }
         Ok((mounts, guards))
+    }
+}
+
+impl Engine {
+    /// Seed a locally-cold lineage from the remote, if there is anything to seed
+    /// from.
+    ///
+    /// Never fails a build. A remote that is down, a head that will not decode, a
+    /// transfer that dies halfway — every one of them means "cold", which by the
+    /// scratch contract is a slowdown and nothing more. A partial unpack is
+    /// cleared rather than left for the next run to mistake for a warm cache.
+    async fn pull_if_cold(&self, slot: &str, dir: &Path, addr: &Addr) {
+        // Unreadable counts as cold: if the directory cannot be listed, nothing
+        // useful is in it either way.
+        let cold = std::fs::read_dir(dir).map_or(true, |mut d| d.next().is_none());
+        if !cold {
+            return;
+        }
+        let opts = &self.cfg.scratch;
+        let Some(head) = self
+            .scratch_remote_head(slot, &opts.scope, &opts.restore_scopes)
+            .await
+        else {
+            return;
+        };
+
+        match self.scratch_pull(&head, dir).await {
+            Ok(bytes) => {
+                // A cache whose entries embed absolute paths restores fine at a
+                // different path and is then inert — present, and useless, which
+                // looks exactly like a hit. Naming both paths is what makes that
+                // diagnosable rather than mysterious.
+                if head.meta.produced_at != dir.to_string_lossy() {
+                    tracing::debug!(
+                        %addr, produced_at = %head.meta.produced_at, restored_at = %dir.display(),
+                        "scratch snapshot restored at a different path than it was produced at; \
+                         a path-sensitive cache will be inert",
+                    );
+                }
+                tracing::debug!(
+                    %addr, slot, scope = %head.meta.scope, generation = head.meta.generation, bytes,
+                    "pulled scratch snapshot",
+                );
+                crate::engine::scratch_remote::write_local_meta(
+                    &self.home,
+                    slot,
+                    &opts.scope,
+                    &head.meta,
+                );
+            }
+            Err(err) => {
+                tracing::debug!(%addr, slot, error = %err, "could not pull scratch snapshot");
+                let dead = dir.to_path_buf();
+                drop(hcore::blocking::run(move || std::fs::remove_dir_all(&dead)).await);
+                drop(std::fs::create_dir_all(dir));
+            }
+        }
     }
 }
 
