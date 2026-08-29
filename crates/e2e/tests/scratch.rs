@@ -1218,3 +1218,53 @@ async fn a_glob_that_cannot_reach_the_mount_is_allowed() -> anyhow::Result<()> {
     assert!(!ws.run("//app:a").await?.artifacts.is_empty());
     Ok(())
 }
+
+/// `pull` must work on a machine that has never built — warming exactly that
+/// machine is what it is for. Selecting from the local store instead of the graph
+/// made it a no-op in its only real use case.
+///
+/// And a pull-warmed slot must still describe itself, or the store stops being
+/// listable and removable the moment it is populated any way but by building.
+#[tokio::test]
+async fn a_cold_machine_can_pull_what_it_has_never_built() -> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+
+    // Machine one publishes.
+    let a = tempfile::tempdir()?;
+    std::fs::create_dir_all(a.path().join("build"))?;
+    std::fs::create_dir_all(a.path().join("app"))?;
+    std::fs::write(a.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    std::fs::write(
+        a.path().join("app").join("BUILD"),
+        remote_target("published"),
+    )?;
+    let e1 = remote_engine(a.path(), &uri, "master", &[]);
+    build(&e1).await?;
+    let slot = e1.scratch_slots()?[0].slot.clone();
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.home, &slot, "master");
+    e1.scratch_push(&slot, "master", &dir, None, "run-1")
+        .await?;
+
+    // Machine two has built nothing at all, so it has no slots to enumerate.
+    let b = tempfile::tempdir()?;
+    std::fs::create_dir_all(b.path().join("build"))?;
+    std::fs::write(b.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    let e2 = remote_engine(b.path(), &uri, "master", &[]);
+    assert!(
+        e2.scratch_slots()?.is_empty(),
+        "precondition: the second machine is genuinely cold"
+    );
+
+    // The head is discoverable without any local state — which is what makes a
+    // graph-driven `pull` possible.
+    let head = e2
+        .scratch_remote_head(&slot, "master", &[])
+        .await
+        .expect("a cold machine must still find the published head");
+    let dir2 = heph::engine::scratch_remote::scope_head_dir(&e2.home, &slot, "master");
+    let bytes = e2.scratch_pull(&head, &dir2).await?;
+    assert!(bytes > 0);
+    assert!(dir2.join("marker").exists(), "the payload must have landed");
+    Ok(())
+}

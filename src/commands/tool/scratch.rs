@@ -116,6 +116,17 @@ impl ScratchArgs {
     }
 }
 
+/// Name a lineage for a human. The default lineage has an empty name, and
+/// printing `` for it reads like something went wrong.
+fn describe_scope(scope: &str) -> String {
+    if scope.is_empty() {
+        "the default lineage".to_string()
+    } else {
+        format!("`{scope}`")
+    }
+}
+
+
 fn describe(slot: &SlotEntry) -> (String, String) {
     match &slot.meta {
         Some(m) => {
@@ -293,46 +304,117 @@ async fn push(addr: Option<&str>, all: bool, force: bool, producer: String) -> a
     Ok(())
 }
 
+/// Every `scratch` declaration in the workspace, resolved from the graph.
+///
+/// **Not from the local store.** A machine that has never built has no slots, and
+/// warming exactly that machine is what `pull` exists for — reading the store
+/// would make the command useless in its only real use case. Costs a spec
+/// resolution per target, which is why this is a rare explicit command and not
+/// something a build does.
+async fn declared_scratches(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+) -> anyhow::Result<Vec<(crate::htaddr::Addr, hbuiltins::pluginscratch::ScratchDef)>> {
+    use futures::StreamExt as _;
+
+    // Every package: the workspace-wide selector `clean` and the gitignore walk
+    // already use.
+    let matcher = crate::htmatcher::Matcher::PackagePrefix(crate::htpkg::PkgBuf::from(""));
+    let rs = engine.new_state();
+    let mut stream = Box::pin(std::sync::Arc::clone(engine).query_spec(rs, &matcher));
+
+    let mut out = Vec::new();
+    while let Some(spec) = stream.next().await {
+        // A target whose spec will not resolve is not this command's problem — it
+        // is reported by anything that actually builds it. Skipping keeps one
+        // broken package from making the whole workspace unwarmable.
+        let Ok(spec) = spec else { continue };
+        if spec.driver != hbuiltins::pluginscratch::DRIVER_NAME {
+            continue;
+        }
+        match hbuiltins::pluginscratch::parse_declaration(&spec) {
+            Ok(def) => out.push((spec.addr.clone(), def)),
+            Err(err) => println!("{}: skipped — {err:#}", spec.addr),
+        }
+    }
+    Ok(out)
+}
+
 async fn pull(addr: Option<&str>, all: bool) -> anyhow::Result<()> {
+    if all == addr.is_some() {
+        anyhow::bail!("pass either an address or --all, not both or neither");
+    }
     let (engine, _shutdown) = bootstrap::new_engine()?;
-    let selected = select(engine.scratch_slots()?, addr, all)?;
+
+    let selected: Vec<_> = declared_scratches(&engine)
+        .await?
+        .into_iter()
+        .filter(|(a, def)| match addr {
+            // Naming one is an explicit instruction; honour it whatever the
+            // declaration says about travelling.
+            Some(want) => a.format() == want,
+            // `--all` means every cache that opted in, not every cache: a
+            // local-only one has nowhere to fetch from.
+            None => def.remote,
+        })
+        .collect();
+
     if selected.is_empty() {
-        println!(
-            "Nothing to fetch. A cache must have been built at least once, and declared `remote = True`."
-        );
+        match addr {
+            Some(want) => anyhow::bail!(
+                "no `scratch` target named {want}. `heph query //...` lists what the workspace \
+                 declares"
+            ),
+            None => println!("No scratch cache declares `remote = True`; nothing to fetch."),
+        }
         return Ok(());
     }
 
     let scope = engine.scratch_scope().to_string();
     let fallbacks = engine.scratch_restore_scopes().to_vec();
-    for slot in &selected {
-        let name = slot
-            .meta
-            .as_ref()
-            .map(|m| m.addr.clone())
-            .unwrap_or_else(|| slot.slot.clone());
-        let Some(head) = engine
-            .scratch_remote_head(&slot.slot, &scope, &fallbacks)
-            .await
-        else {
-            println!("{name}: nothing published for this branch");
+    for (addr, def) in &selected {
+        let slot = crate::engine::scratch::ResolvedScratch {
+            addr: addr.clone(),
+            def: def.clone(),
+        }
+        .slot();
+        let Some(head) = engine.scratch_remote_head(&slot, &scope, &fallbacks).await else {
+            println!("{addr}: nothing published for this branch");
             continue;
         };
-        let dir = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot.slot, &scope);
+        let dir = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, &scope);
         match engine.scratch_pull(&head, &dir).await {
             Ok(bytes) => {
                 crate::engine::scratch_remote::write_local_meta(
                     &engine.home,
-                    &slot.slot,
+                    &slot,
                     &scope,
                     &head.meta,
                 );
+                // Record what the slot came from, exactly as a build would. A
+                // machine warmed purely by `pull` would otherwise hold a cache
+                // that `ls` cannot name and `rm <addr>` cannot find — the store
+                // stops describing itself the moment it is populated any way but
+                // by building.
+                crate::engine::scratch_store::write_slot_meta(
+                    &engine.home,
+                    &slot,
+                    &crate::engine::scratch_store::SlotMeta {
+                        format: 1,
+                        addr: addr.format(),
+                        path: def.path.clone(),
+                        env: def.env.clone(),
+                        access: def.access.as_str().to_string(),
+                        version: def.version.clone(),
+                        remote: def.remote,
+                    },
+                );
                 println!(
-                    "{name}: fetched generation {} from `{}` ({bytes} bytes)",
-                    head.meta.generation, head.meta.scope
+                    "{addr}: fetched generation {} from {} ({bytes} bytes)",
+                    head.meta.generation,
+                    describe_scope(&head.meta.scope),
                 );
             }
-            Err(err) => println!("{name}: FAILED — {err:#}"),
+            Err(err) => println!("{addr}: FAILED — {err:#}"),
         }
     }
     Ok(())
@@ -342,6 +424,14 @@ async fn pull(addr: Option<&str>, all: bool) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::engine::scratch_store::SlotMeta;
+
+    #[test]
+    fn a_lineage_is_named_for_a_human() {
+        assert_eq!(describe_scope("main"), "`main`");
+        // The default lineage has an empty name; printing `` for it reads like
+        // something went wrong.
+        assert_eq!(describe_scope(""), "the default lineage");
+    }
 
     #[test]
     fn human_bytes_reads_like_a_person_wrote_it() {
