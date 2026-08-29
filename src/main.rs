@@ -26,6 +26,14 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    // The builtin coreutils, dispatched first because this is the hottest entry
+    // point in the binary — a recipe may invoke `cp` thousands of times in one
+    // build, and every one of those is a fresh `heph` process. Nothing above it
+    // may allocate a runtime, install a subscriber, or parse with clap.
+    if let Some(argv) = parse_coreutils_args() {
+        coreutils_main(argv);
+    }
+
     // Hidden re-exec for the process supervisor sidecar. Must run BEFORE any
     // logging, tokio runtime, or clap parsing so the supervisor stays small
     // and predictable. Format: `heph __supervisor --ipc-fd <N>`.
@@ -229,6 +237,73 @@ fn parse_runner_args() -> Option<RunnerInvocation> {
 
 /// Detect the hidden `__supervisor --ipc-fd <N>` invocation without dragging
 /// clap into a hot path that runs at every startup.
+/// The applet argv for `heph __coreutils <applet> …`, or for a shim symlink
+/// whose `argv[0]` names one — the busybox-style path that
+/// [`hcoreutils::shim_dir`] materializes and the exec driver puts on `PATH`.
+///
+/// Returns argv with the *applet* name at index 0, which is what every
+/// `uumain` expects. Reads `args_os`, because a non-UTF-8 operand (a filename)
+/// would panic `args()` — and filenames are exactly what these take.
+fn parse_coreutils_args() -> Option<Vec<std::ffi::OsString>> {
+    coreutils_argv(std::env::args_os())
+}
+
+/// The argv split, over any iterator so it can be tested against the other
+/// fast paths `main` dispatches — this one runs first, so it must decline
+/// `__supervisor` and `__runner-exec` cleanly or it would eat them.
+fn coreutils_argv(
+    mut argv: impl Iterator<Item = std::ffi::OsString>,
+) -> Option<Vec<std::ffi::OsString>> {
+    let arg0 = argv.next()?;
+
+    // Shim symlink: `<shim dir>/cp` -> this binary, invoked as `cp`.
+    if let Some(base) = std::path::Path::new(&arg0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        && hcoreutils::is_applet(base)
+    {
+        let mut out = vec![std::ffi::OsString::from(base)];
+        out.extend(argv);
+        return Some(out);
+    }
+
+    // Explicit form, for a caller that has the binary but not the shim dir.
+    if argv.next()? != "__coreutils" {
+        return None;
+    }
+    let name = argv.next()?;
+    let mut out = vec![name];
+    out.extend(argv);
+    Some(out)
+}
+
+/// Run the applet named by `argv[0]` and exit. Never returns.
+///
+/// An applet owns stdout/stderr and may exit on its own; that is contained
+/// because this is always a dedicated process, which is also why the engine
+/// must never call into `hcoreutils` in-process.
+fn coreutils_main(argv: Vec<std::ffi::OsString>) -> ! {
+    let name = argv
+        .first()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match hcoreutils::dispatch(&name, argv) {
+        Some(code) => std::process::exit(code),
+        // Only reachable through the explicit `__coreutils` form; the shim path
+        // already checked the name. 127 is the shell's "command not found",
+        // which is what this is. `eprintln!` because no subscriber exists yet —
+        // this runs before logging is initialized, by design.
+        None => {
+            eprintln!(
+                "heph __coreutils: no builtin utility named {name:?}. \
+                 `heph tool coreutils list` shows the {} that exist.",
+                hcoreutils::APPLETS.len()
+            );
+            std::process::exit(127)
+        }
+    }
+}
+
 fn parse_supervisor_args() -> Option<i32> {
     let mut args = std::env::args().skip(1);
     if args.next()? != "__supervisor" {
@@ -269,6 +344,62 @@ mod tests {
 
     fn soft(args: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
         Cli::command().try_get_matches_from(args)
+    }
+
+    fn osv(parts: &[&str]) -> Vec<std::ffi::OsString> {
+        parts.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    fn split(parts: &[&str]) -> Option<Vec<String>> {
+        coreutils_argv(osv(parts).into_iter())
+            .map(|v| v.iter().map(|s| s.to_string_lossy().into_owned()).collect())
+    }
+
+    #[test]
+    fn coreutils_dispatch_declines_the_other_fast_paths() {
+        // This runs *first* in `main`, ahead of the supervisor and runner
+        // branches. Eating one of their invocations would kill the sidecar with
+        // a broken pipe rather than an error anyone could read.
+        assert_eq!(
+            split(&["/usr/local/bin/heph", "__supervisor", "--ipc-fd", "3"]),
+            None
+        );
+        assert_eq!(
+            split(&["/usr/local/bin/heph", "__runner-exec", "cc", "-c", "a.c"]),
+            None
+        );
+        assert_eq!(split(&["/usr/local/bin/heph", "run", "//pkg:target"]), None);
+        assert_eq!(split(&["/usr/local/bin/heph"]), None);
+    }
+
+    #[test]
+    fn coreutils_dispatch_reads_the_explicit_form() {
+        // The applet name leads the argv it is handed, which is what every
+        // `uumain` expects.
+        assert_eq!(
+            split(&["/usr/local/bin/heph", "__coreutils", "cp", "-r", "a", "b"]),
+            Some(vec!["cp".into(), "-r".into(), "a".into(), "b".into()])
+        );
+        // Named, but not one of ours: still parsed here, and rejected with a
+        // "command not found" by the caller rather than falling into clap.
+        assert_eq!(
+            split(&["/usr/local/bin/heph", "__coreutils", "awk"]),
+            Some(vec!["awk".to_string()])
+        );
+        assert_eq!(split(&["/usr/local/bin/heph", "__coreutils"]), None);
+    }
+
+    #[test]
+    fn coreutils_dispatch_reads_a_shim_symlink() {
+        // `<shim dir>/cp -r a b`: argv[0] is the applet, and the rest is the
+        // recipe's own arguments untouched.
+        assert_eq!(
+            split(&["/heph-home/coreutils/v1-abc/bin/cp", "-r", "a", "b"]),
+            Some(vec!["cp".into(), "-r".into(), "a".into(), "b".into()])
+        );
+        // A binary that merely *contains* an applet name is not one.
+        assert_eq!(split(&["/usr/local/bin/cp-helper", "x"]), None);
+        assert_eq!(split(&["/usr/local/bin/heph", "cp", "x"]), None);
     }
 
     #[test]
