@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hexecrunner::RunnerRef;
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
@@ -171,7 +172,7 @@ async fn lock_flake_url(
         ctty: false,
     };
 
-    let output = proc_exec::output(spec, ctoken)
+    let output = hexecrunner::output(RunnerRef::local(), spec, ctoken)
         .await
         .context("wait for nix flake metadata")?;
     if !output.status.success() {
@@ -420,7 +421,7 @@ impl ManagedDriver for Driver {
             ctty: false,
         };
 
-        let output = proc_exec::output(spec, ctoken)
+        let output = hexecrunner::output(RunnerRef::local(), spec, ctoken)
             .await
             .with_context(|| format!("wait for nix build for {addr_str}"))?;
 

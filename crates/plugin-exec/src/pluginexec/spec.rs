@@ -43,6 +43,11 @@ pub(crate) struct TargetSpec {
     pub runtime_pass_env: Vec<String>,
     /// Environment variables set at runtime only (not hashed).
     pub runtime_env: HashMap<String, String>,
+    /// Exec runner this command runs under: a target address producing a
+    /// `runner.json`. Absent (or the literal `"local"`) spawns on this host as
+    /// before. The runner is a hashed dependency, so changing it changes this
+    /// target's cache key.
+    pub runner: String,
 }
 
 #[cfg(test)]
@@ -82,6 +87,7 @@ mod tests {
             "pass_env",
             "runtime_pass_env",
             "runtime_env",
+            "runner",
         ] {
             assert!(by_name.contains_key(key), "schema missing field `{key}`");
         }

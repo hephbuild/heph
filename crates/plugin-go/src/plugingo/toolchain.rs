@@ -216,6 +216,114 @@ pub fn staged_goroot(version: &str) -> String {
     format!("{}/{SDK_DIR}", toolchain_pkg(version))
 }
 
+/// The host toolchain, resolved **in the environment the tools will run in**.
+///
+/// `gotool = "host"` means "whatever `go` this build's environment provides".
+/// Without a runner that is heph's own `PATH`, as it always was. With one it has
+/// to be the runner's — reading heph's `PATH` there would compile with the
+/// laptop's toolchain inside the named environment, under a cache key that
+/// claims the environment's. That is a silently wrong build, not a degraded one.
+///
+/// `go env GOROOT` is asked *through the runner*, and the binary is taken as
+/// `$GOROOT/bin/go` — the same derivation the shell prelude already uses for
+/// host mode (`addr_util::go_goroot_prelude`), so the two paths cannot disagree
+/// about which `go` a host build used.
+///
+/// One probe is a subprocess per target, which for a `go list`-heavy build is
+/// the wrong order of magnitude — hence the cache. It holds a single slot: one
+/// build uses one toolchain in one environment, so a single entry is very nearly
+/// a 100% hit rate and cannot grow, and a key that does not match simply
+/// re-probes. The lock is held **across** the probe so concurrent targets at
+/// build start queue behind the first rather than each spawning their own.
+#[derive(Default)]
+pub(crate) struct HostGoCache {
+    slot: tokio::sync::Mutex<Option<(String, (std::path::PathBuf, std::path::PathBuf))>>,
+}
+
+impl HostGoCache {
+    async fn resolve(
+        &self,
+        runner: hexecrunner::RunnerRef<'_>,
+        driver: &str,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+        // Two host builds under different runners are different toolchains, so
+        // the runner is the key. `None` is the local host.
+        let key = runner
+            .addr
+            .map(hmodel::htaddr::Addr::format)
+            .unwrap_or_else(|| "local".to_string());
+        let mut slot = self.slot.lock().await;
+        if let Some((cached_key, resolved)) = slot.as_ref()
+            && cached_key == &key
+        {
+            return Ok(resolved.clone());
+        }
+        let resolved = probe_host_go(runner, driver, ctoken).await?;
+        *slot = Some((key, resolved.clone()));
+        Ok(resolved)
+    }
+}
+
+/// Ask the environment where its Go lives. See [`HostGoCache`].
+async fn probe_host_go(
+    runner: hexecrunner::RunnerRef<'_>,
+    driver: &str,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    // No runner: resolve from heph's own PATH exactly as before, so a workspace
+    // that names no runner sees no change at all — including the error text when
+    // there is no `go`.
+    if runner.addr.is_none() {
+        let go_bin = resolve_host_go()?;
+        let goroot = host_goroot(&go_bin)?;
+        return Ok((goroot, go_bin));
+    }
+
+    let spec = hproc::proc_exec::Spec {
+        // Bare name on purpose: the runner's `PATH` is what must resolve it, and
+        // it is the same `PATH` that the `go` answering below is found on.
+        program: std::path::PathBuf::from("go"),
+        args: vec!["env".into(), "GOROOT".into()],
+        env: vec![],
+        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
+        stdin: hproc::proc_exec::StdioSpec::Null,
+        stdout: hproc::proc_exec::StdioSpec::Piped,
+        stderr: hproc::proc_exec::StdioSpec::Piped,
+        setsid: false,
+        ctty: false,
+    };
+    // Name the runner in the failure. Under a runner the program that failed to
+    // exec is the runner's, not `go` — a bare `No such file or directory` here
+    // reads as "no Go toolchain" when it can equally mean the runner's own
+    // prefix or launch command is missing.
+    let via = runner
+        .addr
+        .map(|a| format!(" (via exec runner {})", a.format()))
+        .unwrap_or_default();
+    let out = hexecrunner::output(runner, spec, ctoken)
+        .await
+        .with_context(|| format!("{driver}: run `go env GOROOT`{via}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{driver}: `go env GOROOT` failed in the runner's environment: {}\n  \
+             `gotool: \"host\"` takes the `go` that environment provides, so it must have one \
+             on its PATH — install it there, or pin a toolchain with `gotool: \"<version>\"`.",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let goroot = String::from_utf8(out.stdout)
+        .with_context(|| format!("{driver}: `go env GOROOT` output is not utf8"))?
+        .trim()
+        .to_string();
+    if goroot.is_empty() {
+        anyhow::bail!("{driver}: `go env GOROOT` returned empty in the runner's environment");
+    }
+    let goroot = std::path::PathBuf::from(goroot);
+    let go_bin = goroot.join("bin").join("go");
+    Ok((goroot, go_bin))
+}
+
 /// Resolve the host `go` binary from this process's `PATH` — used when the
 /// provider selects `gotool = "host"`.
 pub(crate) fn resolve_host_go() -> anyhow::Result<std::path::PathBuf> {
@@ -312,18 +420,17 @@ pub(crate) fn pick_go_binary(
 ///   `staged_goroot` path under `sandbox_ws_dir`.
 ///
 /// `driver` names the caller for the hermetic "not staged" error message.
-pub(crate) fn resolve_toolchain_go(
+pub(crate) async fn resolve_toolchain_go(
     version: &str,
     inputs: &[ManagedRunInput],
     sandbox_ws_dir: &std::path::Path,
     driver: &str,
+    runner: hexecrunner::RunnerRef<'_>,
+    host_go: &HostGoCache,
+    ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
     match classify(version) {
-        Toolchain::Host => {
-            let go_bin = resolve_host_go()?;
-            let goroot = host_goroot(&go_bin)?;
-            Ok((goroot, go_bin))
-        }
+        Toolchain::Host => host_go.resolve(runner, driver, ctoken).await,
         Toolchain::Target(_) => {
             let go_bin = resolve_target_go(inputs)?;
             let goroot = host_goroot(&go_bin)?;
@@ -614,6 +721,191 @@ fn verify_checksum(expected: &str, got: &str, version: &str, url: &str) -> anyho
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod host_go_tests {
+    use super::*;
+    use hexecrunner::{PrepareOutcome, RunnerHost, RunnerRef, SpecRewrite};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Stands in for "the environment the runner describes".
+    ///
+    /// Its whole job is to answer a bare `go` with a `go` that is **not** on
+    /// heph's `PATH` — which is precisely the thing `gotool = "host"` under a
+    /// runner has to get right, and precisely what it got wrong before: the
+    /// binary was resolved from heph's own `PATH` and then executed inside the
+    /// runner's environment.
+    struct FakeEnv {
+        go: std::path::PathBuf,
+        probes: Arc<AtomicUsize>,
+        /// The registry is process-global and every test in this binary installs
+        /// into it, so a host that claimed every request would serve its
+        /// neighbours' too. Each test gets its own request id.
+        request_id: String,
+    }
+
+    #[async_trait]
+    impl RunnerHost for FakeEnv {
+        fn owns(&self, request_id: &str) -> bool {
+            request_id == self.request_id
+        }
+        fn alive(&self) -> bool {
+            true
+        }
+        async fn prepare(
+            &self,
+            _request_id: &str,
+            _addr: &Addr,
+            mut rewrite: SpecRewrite,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<PrepareOutcome> {
+            assert_eq!(
+                rewrite.program,
+                std::path::PathBuf::from("go"),
+                "the probe must ask the environment for a bare `go`, not hand it a host path"
+            );
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            rewrite.program = self.go.clone();
+            Ok(PrepareOutcome {
+                rewrite,
+                supplies_environment: true,
+            })
+        }
+    }
+
+    /// A `go` that reports `goroot` and nothing else.
+    fn fake_go(dir: &std::path::Path, goroot: &str) -> std::path::PathBuf {
+        let go = dir.join("fake-go");
+        std::fs::write(&go, format!("#!/bin/sh\necho {goroot}\n")).expect("write fake go");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        go
+    }
+
+    fn addr() -> Addr {
+        Addr::new(
+            PkgBuf::from("tools/devenv"),
+            "runner".to_string(),
+            Default::default(),
+        )
+    }
+
+    /// **The fix.** `GOROOT` comes from the `go` the *runner's* environment
+    /// provides, and the binary is that environment's, not the host's.
+    #[tokio::test]
+    async fn host_mode_under_a_runner_asks_the_runners_go() {
+        const REQ: &str = "req-host-go";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probes = Arc::new(AtomicUsize::new(0));
+        hexecrunner::install_host(Arc::new(FakeEnv {
+            go: fake_go(dir.path(), "/env/goroot"),
+            probes: Arc::clone(&probes),
+            request_id: REQ.to_string(),
+        }));
+
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let a = addr();
+        let cache = HostGoCache::default();
+        let (goroot, go_bin) = cache
+            .resolve(RunnerRef::target(REQ, &a), "go_golist", &ct)
+            .await
+            .expect("resolve");
+
+        assert_eq!(goroot, std::path::PathBuf::from("/env/goroot"));
+        assert_eq!(
+            go_bin,
+            std::path::PathBuf::from("/env/goroot/bin/go"),
+            "the binary must be derived from the environment's GOROOT, the same way the shell \
+             prelude does it"
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+    }
+
+    /// One probe serves the whole build. Without this a `go list`-heavy build
+    /// pays a subprocess per package for a value that cannot change within it.
+    #[tokio::test]
+    async fn the_probe_is_paid_once_per_environment() {
+        const REQ: &str = "req-once";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probes = Arc::new(AtomicUsize::new(0));
+        hexecrunner::install_host(Arc::new(FakeEnv {
+            go: fake_go(dir.path(), "/env/goroot"),
+            probes: Arc::clone(&probes),
+            request_id: REQ.to_string(),
+        }));
+
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let a = addr();
+        let cache = HostGoCache::default();
+        for _ in 0..5 {
+            cache
+                .resolve(RunnerRef::target(REQ, &a), "go_golist", &ct)
+                .await
+                .expect("resolve");
+        }
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "five targets in one environment must share one probe"
+        );
+    }
+
+    /// **No runner: nothing changes.** A workspace that names none must still
+    /// resolve from heph's own `PATH` and report the same `GOROOT` it always
+    /// did — this path is not routed through a runner at all, and the whole
+    /// change is meant to be invisible to it.
+    #[tokio::test]
+    async fn host_mode_without_a_runner_still_uses_this_process_path() {
+        let Ok(expected) = resolve_host_go() else {
+            eprintln!("skipping: no `go` on PATH to compare against");
+            return;
+        };
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let (goroot, go_bin) = HostGoCache::default()
+            .resolve(RunnerRef::local(), "go_golist", &ct)
+            .await
+            .expect("resolve");
+        assert_eq!(go_bin, expected);
+        assert_eq!(goroot, host_goroot(&expected).expect("goroot"));
+    }
+
+    /// A different runner is a different toolchain, so it must not be served
+    /// the previous one's answer — the cache is keyed on the runner, and a
+    /// single slot must re-probe rather than return a stale GOROOT.
+    #[tokio::test]
+    async fn a_different_runner_re_probes() {
+        const REQ: &str = "req-reprobe";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probes = Arc::new(AtomicUsize::new(0));
+        hexecrunner::install_host(Arc::new(FakeEnv {
+            go: fake_go(dir.path(), "/env/goroot"),
+            probes: Arc::clone(&probes),
+            request_id: REQ.to_string(),
+        }));
+
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let cache = HostGoCache::default();
+        let one = addr();
+        let two = Addr::new(
+            PkgBuf::from("tools/other"),
+            "runner".to_string(),
+            Default::default(),
+        );
+        cache
+            .resolve(RunnerRef::target(REQ, &one), "go_golist", &ct)
+            .await
+            .expect("one");
+        cache
+            .resolve(RunnerRef::target(REQ, &two), "go_golist", &ct)
+            .await
+            .expect("two");
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
 }
 
 #[cfg(test)]

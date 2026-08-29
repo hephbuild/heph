@@ -18,9 +18,12 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_oci::pluginoci;
-use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedDriver, PluginComponents};
+use plugin_sdk::stabby::abi::{
+    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, NamedRunner, PluginComponents,
+};
 use plugin_sdk::stabby::{
-    install_log_sink, install_supervisor, make_dyn_managed_driver, make_dyn_provider,
+    install_log_sink, install_runner_host, install_supervisor, make_dyn_managed_driver,
+    make_dyn_provider, make_dyn_runner,
 };
 use std::sync::Arc;
 
@@ -52,6 +55,16 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
 #[stabby::export]
 pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
     install_supervisor(sup);
+}
+
+/// Stable ABI exec-runner entry: the host hands the plugin a handle to its
+/// runner registry. This cdylib links its own `execrunner`, whose registry the
+/// engine's `install_exec_runner_host` never reached — without this, a target
+/// here that names a `runner` fails with "no runner host is installed in this
+/// component" rather than running in the environment it asked for.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
+    install_runner_host(host);
 }
 
 fn build() -> PluginComponents {
@@ -105,13 +118,35 @@ fn build() -> PluginComponents {
         driver: make_dyn_managed_driver(platform),
     });
 
+    // Describes a container other targets run inside. Emits a `runner.json`
+    // naming the builtin `session` runner: the container is held open for the
+    // build and targets run in it over the agent protocol, so this plugin needs
+    // no runner implementation of its own.
+    let runner: Arc<dyn ManagedDriver> = Arc::new(pluginoci::runner::Driver::new());
+    drivers.push(NamedDriver {
+        name: pluginoci::runner::DRIVER_NAME.into(),
+        driver: make_dyn_managed_driver(runner),
+    });
+
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(pluginoci::platform::Provider);
+
+    // The runner this plugin *implements*, as opposed to the `oci_runner`
+    // driver above, which only writes the `runner.json` naming it. Registered
+    // by the host beside `local`/`wrap`/`session`: a container's lifecycle is
+    // one no builtin expresses, since a target's cwd is per-exec and a session
+    // launch argv is fixed when the runner target is built.
+    let mut runners = stabby::vec::Vec::new();
+    runners.push(NamedRunner {
+        name: pluginoci::exec_runner::RUNNER_NAME.into(),
+        runner: make_dyn_runner(Arc::new(pluginoci::exec_runner::OciRunner::new())),
+    });
 
     PluginComponents {
         provider_name: "oci".into(),
         provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
         hooks: stabby::vec::Vec::new(),
+        runners,
         meta: stabby::vec::Vec::new(),
     }
 }

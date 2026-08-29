@@ -33,3 +33,5 @@ pub mod vtable;
 pub mod host;
 #[cfg(feature = "host")]
 pub mod load_stable;
+#[cfg(feature = "host")]
+pub mod runner;

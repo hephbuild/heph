@@ -46,6 +46,106 @@ fn shipped_go_cdylib_loads_and_answers_across_the_abi() {
     );
 }
 
+/// **A driver inside a cdylib runs its target in the environment a runner
+/// describes.**
+///
+/// This is the seam nothing else covers, and it shipped broken because of that.
+/// A cdylib links its own copy of `execrunner`, whose host registry the engine
+/// populated only in the *binary* — so a plugin driver under a runner failed
+/// with "no runner host is installed in this component" no matter how correct
+/// the engine side was. Every in-process test passed: `plugingo-e2e` links
+/// `plugin-go` directly, and `exec_runner.rs` drives the builtin bash/exec
+/// drivers. Neither crosses a real `dlopen`.
+///
+/// The proof does not need Go to succeed, or even to exist. `gotool = "host"`
+/// resolves the toolchain by spawning a bare `go` **through the runner**, so a
+/// `wrap` prefix that announces itself on stderr is evidence that a driver
+/// living in the cdylib reached the host's registry across the ABI. Whatever
+/// the Go build then does is beside the point.
+#[test]
+fn a_cdylib_driver_runs_its_target_through_the_hosts_runner() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("go");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-go-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash go cdylib");
+    write_manifest(&manifest, "go", &dylib, Some(&sum)).expect("write manifest");
+
+    // The go plugin's `runner:` option is the only way a *generated* Go target
+    // ever names a runner, so it is also the only way to reach this seam.
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n    options:\n      gotool: \"host\"\n      runner: \"//:runner\"\n",
+        manifest.display()
+    ))
+    .expect("write config");
+
+    // A `wrap` runner written by hand, which is the point of `runner.json` being
+    // a plain artifact: no plugin is needed to produce one, so this test needs
+    // neither devenv nor docker.
+    //
+    // The prefix is a program that deliberately does not exist. A `wrap` runner
+    // makes its prefix head the program, so the driver's `go env GOROOT` probe
+    // tries to exec *this* — and `hexecrunner::output` names what a runner
+    // substituted, so the marker lands in the failure. Only reachable if the
+    // rewrite crossed back from the host.
+    //
+    // No shell and no quoting on purpose: Starlark strips backslash escapes
+    // inside a triple-quoted string, which silently turns an `exec "$@"` prefix
+    // into malformed JSON.
+    let runner_json = r#"{
+  "version": 1,
+  "fingerprint": "test:cdylib-seam",
+  "runner": "wrap",
+  "config": { "prefix": ["/heph-runner-reached-the-host"] }
+}
+"#;
+    let (goos, goarch) = common::host_os_arch();
+    // Both at the workspace root: `provider_state` applies to its own package and
+    // descendants, and the Go package is `cmd/`, so a state in `pkg/` would not
+    // reach it — the variant lookup walks *ancestors* within the module.
+    ws.write(
+        "BUILD",
+        &format!(
+            r#"target(
+    name = "runner",
+    driver = "textfile",
+    text = """{runner_json}""",
+    out = "runner.json",
+)
+provider_state(
+    provider = "go",
+    variants = {{"host": {{"goos": "{goos}", "goarch": "{goarch}"}}}},
+)
+"#
+        ),
+    )
+    .expect("write BUILD");
+    ws.write("go.mod", "module example.com/seam\n\ngo 1.21\n")
+        .expect("write go.mod");
+    ws.write("cmd/main.go", "package main\n\nfunc main() {}\n")
+        .expect("write main.go");
+
+    let out = ws.run(&dist, &["run", "//cmd:build@v=host"]).expect("run");
+    let combined = describe(&out);
+
+    // The failure this test exists for. Named separately so a regression reports
+    // the cause rather than "the marker was missing".
+    assert!(
+        !combined.contains("no runner host is installed"),
+        "the cdylib was not handed the host's runner registry — \
+         `heph_plugin_set_runner_host` is the wiring that does it: {combined}"
+    );
+    // Only reachable if the rewrite crossed back: the driver in the cdylib built
+    // a spec naming `go`, and what it actually tried to spawn was the host wrap
+    // runner's prefix.
+    assert!(
+        combined.contains("/heph-runner-reached-the-host"),
+        "a driver in the cdylib must spawn through the host's wrap runner: {combined}"
+    );
+}
+
 /// The second shipped cdylib, exporting a hook rather than a provider — a
 /// different export kind over the same seam, so a loader that only handles
 /// providers fails here and nowhere else.
@@ -282,6 +382,65 @@ fn shipped_oci_cdylib_parses_across_the_abi_without_aborting() {
     assert!(
         out.status.success() || combined.contains("docker"),
         "expected a def or a docker-shaped failure, got: {}",
+        describe(&out)
+    );
+}
+
+/// The devenv cdylib loads across the ABI and its driver is reachable.
+///
+/// Every other shipped cdylib has a load test here; without this one the devenv
+/// plugin would be the one artifact heph publishes whose `dlopen` nothing
+/// proves — and an ABI mismatch in a cdylib is an abort at load, not an error a
+/// user can read.
+///
+/// Deliberately does not run a `devenv_runner` target: that needs `devenv` and
+/// a nix evaluation, which is what `crates/e2e/tests/devenv_runner.rs` covers
+/// behind an opt-in. What is asserted here is what only the shipped artifact
+/// can answer — that the library maps, the create entry's type report matches,
+/// and the driver it exports is registered under the name a BUILD file uses.
+#[test]
+fn shipped_devenv_cdylib_loads_and_registers_its_driver() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("devenv");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-devenv-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash devenv cdylib");
+    write_manifest(&manifest, "devenv", &dylib, Some(&sum)).expect("write manifest");
+    ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
+        .expect("write config");
+
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"runner\", driver = \"devenv_runner\", mode = \"wrap\")\n",
+    )
+    .expect("write BUILD");
+
+    // `inspect def` parses the target without executing it, so this reaches the
+    // driver across the seam and stops short of running devenv.
+    let out = ws
+        .run(&dist, &["inspect", "def", "//pkg:runner"])
+        .expect("run");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.code().is_some(),
+        "heph was killed by a signal — the plugin panicked across the ABI seam: {}",
+        describe(&out)
+    );
+    assert!(
+        !combined.contains("driver not found"),
+        "the devenv plugin loaded but did not register `devenv_runner`: {}",
+        describe(&out)
+    );
+    assert!(
+        out.status.success(),
+        "parsing a devenv_runner target should succeed: {}",
         describe(&out)
     );
 }

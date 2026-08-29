@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 pub mod archive;
 pub mod docker_build;
+pub mod exec_runner;
 pub mod image;
 pub mod index;
 pub mod layer;
@@ -31,6 +32,7 @@ pub mod platform;
 pub mod pull;
 pub mod push;
 pub mod registry;
+pub mod runner;
 
 /// Archive format an image is built/consumed as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

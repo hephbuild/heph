@@ -87,6 +87,18 @@ pub struct Engine {
     pub(crate) hooks: Vec<Arc<dyn SDKHook>>,
 
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
+    /// Every exec runner this host knows, by name: `local`, `wrap`, `session`.
+    ///
+    /// Builtins only. A plugin that wants agent mode does not implement a
+    /// runner — it emits a `runner.json` naming `session` with the argv that
+    /// enters its environment, and the descriptor passing, cancellation and
+    /// pooling are shared. Both in-tree plugins that run targets somewhere else
+    /// (devenv, oci) work that way, which is why there is no ABI surface for a
+    /// plugin-exported runner.
+    ///
+    /// Held behind an `Arc` so `install_exec_runner_host` can hand the resolver
+    /// a clone.
+    pub(crate) exec_runners: Arc<hexecrunner::registry::RunnerRegistry>,
     pub home: PathBuf,
     /// The runtime every request's memoizers spawn their computations on.
     /// Captured once at construction — the engine is handed its runtime, the
@@ -229,6 +241,20 @@ impl EngineFuse {
     /// Returns the shared `LayeredFs` when FUSE was successfully mounted.
     pub fn layered_fs(&self) -> Option<Arc<sandboxfuse::LayeredFs>> {
         self.mount.as_ref().map(|m| m.fs.clone())
+    }
+}
+
+/// Release anything the exec runners hold open.
+///
+/// Not left to the runners' own `Drop`: the registry is also reachable from
+/// `hexecrunner`'s process-global installed host, and Rust never runs
+/// destructors for statics — so nothing in that chain is ever dropped at exit.
+/// A session runner relying on `Drop` therefore leaves its agent running after
+/// heph is gone, and an agent that inherited a descriptor will hang whatever is
+/// reading heph's output to EOF.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.exec_runners.shutdown_all();
     }
 }
 
@@ -446,6 +472,19 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             hooks: vec![],
             requests: Mutex::new(HashMap::new()),
+            exec_runners: Arc::new({
+                let mut registry = hexecrunner::registry::RunnerRegistry::with_builtins();
+                // The agent-mode runner needs a directory for its sockets, and
+                // is handed one rather than discovering `$TMPDIR`: a macOS
+                // `sun_path` is 104 bytes and a macOS `$TMPDIR` is most of that
+                // on its own. heph controls the depth of its own home.
+                registry
+                    .register(Arc::new(hexecrunner::session::SessionRunner::new(
+                        home.join("run"),
+                    )))
+                    .context("register the builtin session exec runner")?;
+                registry
+            }),
             result_permits: {
                 let pool = crate::engine::worker_pool::WorkerPool::new(max_workers);
                 // Two readers of the same pool, for two different lines: the
@@ -680,6 +719,47 @@ impl Engine {
         self.providers_by_name
             .insert(provider.name.clone(), provider);
         Ok(())
+    }
+
+    /// Hand `hexecrunner` the resolver for this engine.
+    ///
+    /// Must be called once the engine is behind an `Arc`, because the resolver
+    /// holds a `Weak` back to it. Both the CLI and the test harness do this
+    /// immediately after `Arc::new`; without it, a target naming a runner fails
+    /// with "no runner host is installed" rather than silently spawning
+    /// locally.
+    pub fn install_exec_runner_host(self: &Arc<Self>) {
+        hexecrunner::install_host(Arc::new(
+            crate::engine::execrunner_host::EngineRunnerHost::new(
+                Arc::downgrade(self),
+                Arc::clone(&self.exec_runners),
+            ),
+        ));
+    }
+
+    /// Register an exec runner a plugin implements, as a peer of the builtins.
+    ///
+    /// Takes `&mut self` deliberately. Plugins are loaded while the engine is
+    /// still owned (`register_plugins` runs before `Arc::new`), so the registry
+    /// is still uniquely referenced and `Arc::get_mut` succeeds. Once the engine
+    /// is behind an `Arc` and the resolver holds a clone, the set of runners is
+    /// fixed for the process — which is the property the by-name dispatch wants:
+    /// no runner can appear after a target has already been told the name is
+    /// unknown.
+    pub fn register_exec_runner(
+        &mut self,
+        runner: Arc<dyn hexecrunner::registry::ExecRunner>,
+    ) -> anyhow::Result<()> {
+        let name = runner.name().to_string();
+        Arc::get_mut(&mut self.exec_runners)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "exec runner '{name}' registered after the engine was shared. Runners must be \
+                     registered during plugin load, before the resolver is handed a clone of the \
+                     registry."
+                )
+            })?
+            .register(runner)
     }
 
     /// Register a build-event hook. Hooks are observers — fed every emitted

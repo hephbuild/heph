@@ -98,7 +98,7 @@ fn load_dylib_plugins(
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     // Engine mutation is single-threaded; register the loaded components in order.
-    for (provider, drivers, hooks) in loaded {
+    for (provider, drivers, hooks, runners) in loaded {
         if let Some(p) = provider {
             e.register_provider(|_| Box::new(p))?;
         }
@@ -107,6 +107,9 @@ fn load_dylib_plugins(
         }
         for (_name, hook) in hooks {
             e.register_hook(std::sync::Arc::new(hook))?;
+        }
+        for runner in runners {
+            e.register_exec_runner(runner)?;
         }
     }
     Ok(())

@@ -122,7 +122,9 @@ impl Workspace {
         engine
             .register_managed_driver(|_| Box::new(pluginhttp::Driver))
             .context("reopen: register http driver")?;
-        Ok(Arc::new(engine))
+        let engine = Arc::new(engine);
+        engine.install_exec_runner_host();
+        Ok(engine)
     }
 
     pub fn with_static(targets: Vec<pluginstatictarget::Target>) -> Result<Self> {

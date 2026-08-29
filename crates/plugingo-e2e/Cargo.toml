@@ -11,6 +11,8 @@ workspace = true
 heph = { path = "../.." }
 # go is no longer a heph built-in; the e2e harness constructs it directly.
 plugin-go = { path = "../plugin-go" }
+# The `devenv_runner` driver, for the sanity test that builds Go inside a devenv.
+hplugin-devenv = { package = "plugin-devenv", path = "../plugin-devenv" }
 htestkit = { package = "testkit", path = "../testkit" }
 hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }

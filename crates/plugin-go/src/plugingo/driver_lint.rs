@@ -87,11 +87,26 @@ fn import_path_to_facts_group(import_path: &str) -> String {
     format!("facts_{sanitized}")
 }
 
-pub struct GoLintDriver;
+pub struct GoLintDriver {
+    /// Default exec runner for this driver's tool, from the plugin's `runner:`
+    /// option in the config yaml. A target's own `runner` field overrides it,
+    /// and `"local"` there opts back out. See [`crate::plugingo::runner`].
+    default_runner: Option<String>,
+}
 
 impl GoLintDriver {
     pub fn new() -> Self {
-        Self
+        Self {
+            default_runner: None,
+        }
+    }
+
+    /// Set the driver-wide default runner (the plugin's `runner:` option).
+    /// `None` and `Some("local")` both mean "spawn on the host".
+    #[must_use]
+    pub fn with_default_runner(mut self, runner: Option<String>) -> Self {
+        self.default_runner = runner;
+        self
     }
 }
 
@@ -128,6 +143,12 @@ struct GoLintSpec {
     deps: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths.
     out: HashMap<String, Vec<String>>,
+    /// Exec runner this tool runs under: a target address producing a
+    /// `runner.json`, so the tool runs inside a described environment (a devenv
+    /// shell, a container) instead of on the bare host. Absent, or the literal
+    /// `"local"`, spawns here as before. A hashed dependency, so changing the
+    /// environment re-keys this target.
+    runner: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -139,6 +160,10 @@ struct GoLintDef {
     build_tags: Vec<String>,
     goexperiment: Vec<String>,
     import_paths: Vec<String>,
+    /// Exec runner for this target's tool. Deliberately absent from `Hash` —
+    /// see `plugingo::runner`: it reaches the cache key through the hashout of
+    /// the input `parse` emits, exactly as a `hash_dep` does.
+    runner: Option<TargetAddr>,
 }
 
 /// Bump to invalidate every cached `go_lint` result whenever the cfg shape or
@@ -252,7 +277,15 @@ impl ManagedDriver for GoLintDriver {
             }
         }
 
+        let (runner, runner_input) = super::runner::parse_runner_with_default(
+            &spec.runner,
+            self.default_runner.as_deref(),
+            &pkg,
+        )?;
+        inputs.extend(runner_input);
+
         let def = GoLintDef {
+            runner,
             import_path: spec.import_path,
             goos: spec.goos,
             goarch: spec.goarch,
@@ -422,6 +455,7 @@ impl ManagedDriver for GoLintDriver {
                 ],
                 &env,
                 pkg_dir,
+                super::runner::runner_ref(req.request.request_id, def.runner.as_ref()),
                 ctoken,
             )
             .await?;
@@ -499,6 +533,7 @@ impl GoLintDriver {
         args: Vec<OsString>,
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
+        runner: hexecrunner::RunnerRef<'_>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<Vec<u8>> {
         let env_pairs: Vec<(OsString, OsString)> = env
@@ -516,7 +551,7 @@ impl GoLintDriver {
             setsid: false,
             ctty: false,
         };
-        let output = proc_exec::output(spec, ctoken)
+        let output = hexecrunner::output(runner, spec, ctoken)
             .await
             .context("wait for heph-govet")?;
         if !output.status.success() {
@@ -1469,6 +1504,41 @@ mod tests {
 
     fn spec(libs: &[(String, Addr)], facts: &[(String, Addr)]) -> TargetSpec {
         spec_cfg(libs, facts, None)
+    }
+
+    /// The plugin's `runner:` config-yaml option reaches a generated target.
+    /// Nothing populates the `runner` spec field for provider-generated Go
+    /// targets, so the option is the only path to a non-host runner here.
+    #[tokio::test]
+    async fn the_driver_default_runner_reaches_the_parsed_inputs() {
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let def = GoLintDriver::new()
+            .with_default_runner(Some("//tools/devenv:runner".to_string()))
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: std::sync::Arc::new(spec(&[], &[])),
+                },
+                &ct,
+            )
+            .await
+            .expect("parse")
+            .target_def;
+        let runner: Vec<_> = def
+            .inputs
+            .iter()
+            .filter(|i| i.origin_id == crate::plugingo::runner::RUNNER_ORIGIN)
+            .collect();
+        assert_eq!(
+            runner.len(),
+            1,
+            "expected exactly one runner input, got {}",
+            runner.len()
+        );
+        let input = runner.first().expect("runner input");
+        assert_eq!(input.r#ref.r#ref.format(), "//tools/devenv:runner");
+        assert!(input.hashed, "must key the cache");
+        assert!(!input.runtime, "must not reach the sandbox");
     }
 
     fn spec_cfg(

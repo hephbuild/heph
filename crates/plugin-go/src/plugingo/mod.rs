@@ -37,3 +37,5 @@ pub use provider::{Config, Provider};
 // warns), so a drifted copy leaves the suite green while it tests an unverified
 // toolchain.
 pub use toolchain::{DEFAULT_GO_VERSION, GoToolchainDriver, HOST, checksum_key};
+
+pub mod runner;

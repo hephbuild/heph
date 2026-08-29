@@ -317,6 +317,51 @@ pub struct NamedHook {
     pub hook: DynHook,
 }
 
+/// An exec runner a plugin implements, rather than one it merely names.
+///
+/// A plugin has two ways to run targets somewhere else, and they are for
+/// different situations:
+///
+/// - **Name a builtin.** Emit a `runner.json` saying `"runner": "session"` with
+///   the argv that enters your environment, and the descriptor passing,
+///   pooling, cancellation and signal fidelity are shared. This is right
+///   whenever "hold a process open inside the environment" describes the job —
+///   it is what the devenv plugin does.
+/// - **Export one of these.** For a lifecycle a held process cannot express: a
+///   per-exec `docker exec` carrying the target's own cwd, which a static wrap
+///   prefix cannot produce, or a remote executor with a queue of its own.
+///
+/// A runner exported here is a *peer* of the builtins — same registry, same
+/// by-name dispatch, same collision guard — which is what
+/// `hexecrunner::registry` was built for and could not previously be handed.
+#[stabby::stabby]
+pub trait StableRunner {
+    /// Rewrite the spec. `req` is an encoded `hexecrunner::wire::RunnerRequest`;
+    /// the reply is an encoded `hexecrunner::wire::RunnerReply`, which carries
+    /// an error as a message rather than failing the call.
+    extern "C" fn prepare<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+
+    /// Whether this runner puts the target into an environment of its own —
+    /// `hexecrunner::registry::ExecRunner::supplies_environment`. Sync and
+    /// constant per runner, so it does not pay for a future.
+    extern "C" fn supplies_environment(&self) -> bool;
+
+    /// Release anything held open. Called from the engine's teardown, because a
+    /// runner reachable from a process-global never has its destructor run.
+    extern "C" fn shutdown(&self);
+}
+
+/// An owned, ABI-stable handle to a plugin-exported exec runner.
+pub type DynRunner = stabby::dynptr!(stabby::boxed::Box<dyn StableRunner + Send + Sync>);
+
+/// A named exec runner in a plugin's component bundle. The name is what a
+/// `runner.json` selects it by.
+#[stabby::stabby]
+pub struct NamedRunner {
+    pub name: SString,
+    pub runner: DynRunner,
+}
+
 /// What a cdylib's create entry returns: an optional provider + named drivers +
 /// named hooks, all as owned ABI-stable handles that the host wraps with
 /// [`crate::load_stable`]. A plugin populates only what it exports — a hook-only
@@ -338,6 +383,9 @@ pub struct PluginComponents {
     /// plugins. A hook-only plugin leaves `provider_name` empty (its `provider` is
     /// a no-op the host drops) and carries its hooks here.
     pub hooks: SVec<NamedHook>,
+    /// Exec runners the plugin *implements*. Empty for a plugin that only names
+    /// a builtin in its `runner.json` — see [`StableRunner`] for which is which.
+    pub runners: SVec<NamedRunner>,
     pub meta: SVec<u8>,
 }
 
@@ -377,6 +425,33 @@ pub trait StableSupervisor {
 /// An owned, ABI-stable handle to the host's process supervisor.
 pub type DynSupervisor = stabby::dynptr!(stabby::boxed::Box<dyn StableSupervisor + Send + Sync>);
 
+/// The host's exec-runner registry, called by a plugin driver whose target names
+/// a runner.
+///
+/// The third instance of the same problem as [`StableLogSink`] and
+/// [`StableSupervisor`]: a cdylib links its own copy of `execrunner`, whose
+/// host registry the engine's `install_exec_runner_host` never reached, so
+/// without this a plugin driver under a runner fails with "no runner host is
+/// installed in this component". It is not allowed to degrade to a local spawn
+/// — that would run the target outside the environment its cache key claims.
+///
+/// One method, bytes in and bytes out: the payload is mostly `OsString`
+/// (a program, argv, environment values, none of which need be UTF-8), and
+/// `hexecrunner::wire` owns the shape so there is no struct to freeze here.
+/// `req` is an encoded `wire::PrepareRequest`; the reply is an encoded
+/// `wire::PrepareReply`, which carries the error as a message rather than
+/// failing the call.
+///
+/// Async, because resolving a runner *builds its target* — and, for a session
+/// runner, may launch the environment.
+#[stabby::stabby]
+pub trait StableRunnerHost {
+    extern "C" fn prepare<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+}
+
+/// An owned, ABI-stable handle to the host's exec-runner registry.
+pub type DynRunnerHost = stabby::dynptr!(stabby::boxed::Box<dyn StableRunnerHost + Send + Sync>);
+
 /// The cdylib create-entry symbol name (exported with `#[stabby::export]`,
 /// loaded host-side with `get_stabbied`).
 pub const CREATE_SYMBOL: &[u8] = b"heph_plugin_create";
@@ -394,6 +469,16 @@ pub type SetLogSinkFn = extern "C" fn(DynLogSink);
 /// after load if present; a plugin built against an older SDK does not export it
 /// and keeps the previous (unregistered) behaviour.
 pub const SET_SUPERVISOR_SYMBOL: &[u8] = b"heph_plugin_set_supervisor";
+
+/// Optional cdylib symbol: install a host [`DynRunnerHost`] so a driver in this
+/// plugin can run its target in an environment a runner describes. A plugin
+/// built against an older SDK does not export it, and its targets can then only
+/// run locally — which the exec-runner seam reports as an error rather than
+/// silently doing.
+pub const SET_RUNNER_HOST_SYMBOL: &[u8] = b"heph_plugin_set_runner_host";
+
+/// The set-runner-host entry's function-pointer type.
+pub type SetRunnerHostFn = extern "C" fn(DynRunnerHost);
 
 /// The set-supervisor entry's function-pointer type.
 pub type SetSupervisorFn = extern "C" fn(DynSupervisor);

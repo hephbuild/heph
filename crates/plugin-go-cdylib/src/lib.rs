@@ -14,10 +14,12 @@ use hplugin_go::plugingo::{
     GoCompileDriver, GoFormatCheckDriver, GoFormatDriver, GoGolistDriver, GoLintDriver,
     GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
 };
-use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedDriver, PluginComponents};
+use plugin_sdk::stabby::abi::{
+    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
+};
 use plugin_sdk::stabby::{
-    create_config_from_bytes, install_log_sink, install_supervisor, make_dyn_managed_driver,
-    make_dyn_provider, options_from_pb_map,
+    create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
+    make_dyn_managed_driver, make_dyn_provider, options_from_pb_map,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +58,16 @@ pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
     install_supervisor(sup);
 }
 
+/// Stable ABI exec-runner entry: the host hands the plugin a handle to its
+/// runner registry. This cdylib links its own `execrunner`, whose registry the
+/// engine's `install_exec_runner_host` never reached — without this, a target
+/// here that names a `runner` fails with "no runner host is installed in this
+/// component" rather than running in the environment it asked for.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
+    install_runner_host(host);
+}
+
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let cfg = create_config_from_bytes(cfg)?;
     let root = PathBuf::from(cfg.root);
@@ -71,6 +83,19 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let walk_db = hplugin::config::decode_opt::<PathBuf>(&options, "go", "walk_db")?
         .unwrap_or_else(|| home.join("heph-plugin-go-fswalk.db"));
     options.remove("walk_db");
+    // The environment every Go *tool* runs in — `go list`, `go tool compile`,
+    // `heph-govet`, `gofmt`. A target address producing a `runner.json`, or the
+    // literal "local" (the default) to spawn on the host. Like `walk_db` this is
+    // consumed here rather than declared to the provider, whose `from_options`
+    // rejects unknown keys — it configures the drivers, not package discovery.
+    //
+    // Deliberately NOT the runner for generated *test* targets: a test is an
+    // exec/bash target, and it takes its runner from `provider_state(provider =
+    // "go", test = {"runner": ...})`, falling back to the exec/bash driver's own
+    // `runner:` option. Building the toolchain somewhere and running the tests
+    // there are separate decisions — a build wants the compiler's environment, a
+    // test often wants the runtime's.
+    let go_runner = hplugin_go::plugingo::runner::read_runner_option(&options)?;
 
     let walker = Arc::new(hwalk::CachedWalker::open(&walk_db));
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(Provider::from_options(
@@ -87,9 +112,10 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // walker db and for the same reason: it is heph-owned scratch, not repo
     // content, and a plugin is handed its writable locations rather than
     // discovering them.
-    let golist: Arc<dyn ManagedDriver> = Arc::new(GoGolistDriver::with_gocache_root(
-        home.join("go-golist-gocache"),
-    ));
+    let golist: Arc<dyn ManagedDriver> = Arc::new(
+        GoGolistDriver::with_gocache_root(home.join("go-golist-gocache"))
+            .with_default_runner(go_runner.clone()),
+    );
     drivers.push(NamedDriver {
         name: "go_golist".into(),
         driver: make_dyn_managed_driver(golist),
@@ -101,7 +127,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         name: "go_toolchain".into(),
         driver: make_dyn_managed_driver(toolchain),
     });
-    let compile: Arc<dyn ManagedDriver> = Arc::new(GoCompileDriver::new());
+    let compile: Arc<dyn ManagedDriver> =
+        Arc::new(GoCompileDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_compile".into(),
         driver: make_dyn_managed_driver(compile),
@@ -112,7 +139,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         driver: make_dyn_managed_driver(testmain),
     });
     // Per-package go/analysis (vet) with serialized facts, nogo-style.
-    let lint: Arc<dyn ManagedDriver> = Arc::new(GoLintDriver::new());
+    let lint: Arc<dyn ManagedDriver> =
+        Arc::new(GoLintDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_lint".into(),
         driver: make_dyn_managed_driver(lint),
@@ -130,12 +158,14 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         driver: make_dyn_managed_driver(lint_fix),
     });
     // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
-    let format: Arc<dyn ManagedDriver> = Arc::new(GoFormatDriver::new());
+    let format: Arc<dyn ManagedDriver> =
+        Arc::new(GoFormatDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_format".into(),
         driver: make_dyn_managed_driver(format),
     });
-    let format_check: Arc<dyn ManagedDriver> = Arc::new(GoFormatCheckDriver::new());
+    let format_check: Arc<dyn ManagedDriver> =
+        Arc::new(GoFormatCheckDriver::new().with_default_runner(go_runner));
     drivers.push(NamedDriver {
         name: "go_format_check".into(),
         driver: make_dyn_managed_driver(format_check),
@@ -148,6 +178,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         // The go plugin exports no hooks.
         hooks: stabby::vec::Vec::new(),
         // No return-side metadata to report yet.
+        runners: stabby::vec::Vec::new(),
         meta: stabby::vec::Vec::new(),
     })
 }

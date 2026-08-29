@@ -77,6 +77,17 @@ pub struct Config {
     /// Nothing references it unless a race target is built, so an ordinary build
     /// — and a darwin race build — never resolves it.
     pub cctool: String,
+    /// Exec runner every generated Go target runs its tooling under — the
+    /// plugin's `runner:` option. Reaches the `go_*` drivers as their default,
+    /// and the **bash** targets this provider generates (the std install, the
+    /// thirdparty download) as their `runner` field.
+    ///
+    /// Both halves are needed. A `gotool = "host"` build under a runner where
+    /// only the compile drivers followed it compiles packages with the
+    /// environment's Go against a standard library the *host's* Go built, and
+    /// the linker rejects the mismatch: `could not import fmt (object is [...
+    /// go1.26.2 ...] expected [... go1.26.5 ...])`.
+    pub runner: Option<String>,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
     pub skip: Arc<Ignore>,
@@ -104,6 +115,7 @@ impl Default for Config {
             sdk_checksums: HashMap::new(),
             govet: govet::default_addr(),
             cctool: cc_toolchain::default_addr(),
+            runner: None,
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
             walker: Arc::new(CachedWalker::disabled()),
@@ -131,6 +143,8 @@ pub(crate) struct ProviderInner {
     /// Addr of the C compiler a cgo-needing race build stages (see
     /// [`Config::cctool`]).
     cctool: String,
+    /// See [`Config::runner`].
+    runner: Option<String>,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
     /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
@@ -257,10 +271,24 @@ impl Provider {
         //   - a target address like `"//@heph/bin:go"` (host `go` via the hostbin
         //     provider) or `"//some/pkg:go"` (e.g. a nix-built `go`) → use the
         //     `go` produced by that target (see [`toolchain::is_target_ref`]).
+        // `runner` and `walk_db` configure the drivers and the cdylib's walker
+        // db, not package discovery — the cdylib consumes both before calling
+        // this, so neither can actually be present here. They are listed anyway
+        // because this list is also what a typo'd key is told the plugin
+        // accepts, and a message that omits a valid key sends the reader
+        // looking for a different mistake than the one they made.
         hplugin::config::deny_unknown(
             "go provider",
             opts,
-            &["gotool", "govet", "cctool", "skip", "checksums"],
+            &[
+                "gotool",
+                "govet",
+                "cctool",
+                "skip",
+                "checksums",
+                "runner",
+                "walk_db",
+            ],
         )?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
             .ok_or_else(|| {
@@ -288,6 +316,12 @@ impl Provider {
         // (linux only; see `factors::cgo_required`). Unset → the host `cc` via
         // the hostbin provider, as `gotool = "//@heph/bin:go"` does for `go`.
         // Never resolved unless a race target is actually built.
+        // The environment the Go toolchain runs in. Consumed here as well as by
+        // the drivers: some Go targets are bash targets (std install, the
+        // thirdparty download) and take it as a spec field instead.
+        let runner: Option<String> =
+            hplugin::config::decode_opt::<String>(opts, "go provider", "runner")?
+                .filter(|r| !r.is_empty());
         let cctool: String = hplugin::config::decode_opt(opts, "go provider", "cctool")?
             .unwrap_or_else(cc_toolchain::default_addr);
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
@@ -304,6 +338,7 @@ impl Provider {
                 sdk_checksums,
                 govet,
                 cctool,
+                runner,
                 skip,
                 walker,
                 ..Default::default()
@@ -324,6 +359,7 @@ impl Provider {
                 sdk_checksums: config.sdk_checksums,
                 govet: config.govet,
                 cctool: config.cctool,
+                runner: config.runner,
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
@@ -451,7 +487,15 @@ impl ProviderTrait for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         let inner = Arc::clone(&self.inner);
-        Box::pin(async move { inner.handle_get(req).await })
+        Box::pin(async move {
+            let mut resp = Arc::clone(&inner).handle_get(req).await?;
+            // Every target this provider generates, in one place. Doing it at
+            // each construction site meant 23 of them and a new target type
+            // silently opting out; here a generated target cannot escape the
+            // runner by being added later.
+            inner.apply_runner(&mut resp.target_spec);
+            Ok(resp)
+        })
     }
 
     fn probe<'a>(
@@ -547,6 +591,7 @@ impl ProviderTrait for Provider {
                             ("runtime_env", ParamType::map(ParamType::String)),
                             ("runtime_pass_env", ParamType::list(ParamType::String)),
                             ("pre_run", ParamType::list(ParamType::String)),
+                            ("runner", ParamType::String),
                         ]),
                     ]),
                     "Test settings for this package. `test = False` skips its tests, \
@@ -557,7 +602,11 @@ impl ProviderTrait for Provider {
                      `env`/`runtime_env` (map[string]) and \
                      `pass_env`/`runtime_pass_env` (list[string]) set env, and \
                      `pre_run` (list[string]) runs shell lines before the test binary \
-                     (switching the target to the bash driver). By default applies \
+                     (switching the target to the bash driver), and `runner` (string) \
+                     names an exec-runner target so the tests run inside a described \
+                     environment — a devenv shell or a container — instead of on the \
+                     bare host. The runner is a hashed dependency, so changing the \
+                     environment re-keys every test under it. By default applies \
                      only to this package; set `recursive = True` to apply to \
                      descendant packages too.",
                 ),
@@ -670,6 +719,20 @@ impl ProviderFn for BuildAddrFn {
         Ok(Value::String(addr.format()))
     }
 }
+
+/// Drivers whose spec accepts a `runner` field. Anything else rejects unknown
+/// keys, so a blanket apply would turn a generated target into a parse error —
+/// and `go_toolchain` / `http_fetch` / `textfile` fetch or write bytes rather
+/// than run a toolchain, so an environment has nothing to change about them.
+const RUNNER_AWARE_DRIVERS: &[&str] = &[
+    "bash",
+    "exec",
+    "go_golist",
+    "go_compile",
+    "go_lint",
+    "go_format",
+    "go_format_check",
+];
 
 impl ProviderInner {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -1253,6 +1316,7 @@ const TEST_STATE_KEYS: &[&str] = &[
     "pass_env",
     "runtime_pass_env",
     "pre_run",
+    "runner",
 ];
 
 /// Whether a state opts its per-package config into descendant packages via
@@ -1320,6 +1384,11 @@ fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test
         if let Some(v) = test_map.get("pre_run") {
             out.pre_run
                 .extend(parse_strings(v).context("parsing test pre_run from go provider_state")?);
+        }
+        if let Some(Value::String(runner)) = test_map.get("runner")
+            && !runner.is_empty()
+        {
+            out.runner = Some(runner.clone());
         }
     }
     Ok(out)
@@ -2861,6 +2930,53 @@ impl ProviderInner {
     /// here. A lint/format spec must still resolve on a dev build, or a bulk
     /// `query` / `//...` walk (which asks every target for its spec) would die on
     /// a machine that has no business owning a heph-govet.
+    /// Put this provider's `runner` on a generated target.
+    ///
+    /// Applies to **every** target this plugin generates that can accept one,
+    /// not just the `go_*` driver targets. Half the things that invoke `go` are
+    /// bash targets — the std install, the thirdparty download, the binary and
+    /// test-binary links, and the test run itself — and a build where only some
+    /// of them moved into the environment is not half-right: under
+    /// `gotool = "host"` the two halves are different toolchains, and the
+    /// compiler rejects the objects outright with `could not import fmt (object
+    /// is [... go1.26.2 ...] expected [... go1.26.5 ...])`.
+    ///
+    /// Gated on the driver, because a spec carrying a key its driver does not
+    /// know is a hard parse error, not an ignored field: `go_toolchain`,
+    /// `http_fetch` and `textfile` targets have no `runner` and must not be
+    /// given one. That is also the honest boundary — those three fetch and write
+    /// bytes rather than run a toolchain, so there is nothing about them for an
+    /// environment to change.
+    ///
+    /// Never overwrites. A `runner` already on the spec came from something more
+    /// specific than a plugin-wide option — today that is
+    /// `provider_state(provider = "go", test = {"runner": ...})`, which is how a
+    /// package says its tests run somewhere other than its build.
+    ///
+    /// `PATH` comes back out of `runtime_pass_env`. A host toolchain puts it
+    /// there so a non-hermetic `go` is findable in the sandbox, which is right
+    /// when this host supplies it — but a target's own environment wins over the
+    /// runner's, so passing the host's `PATH` under a runner selects the host's
+    /// `go` inside the named environment. Everything else in that list stays: it
+    /// is module-cache and proxy config, which the download target deliberately
+    /// shares with the host.
+    fn apply_runner(&self, spec: &mut hplugin::provider::TargetSpec) {
+        let Some(runner) = self.runner.as_deref() else {
+            return;
+        };
+        if !RUNNER_AWARE_DRIVERS.contains(&spec.driver.as_str()) {
+            return;
+        }
+        if spec.config.contains_key("runner") {
+            return;
+        }
+        spec.config
+            .insert("runner".to_string(), Value::String(runner.to_string()));
+        if let Some(Value::List(names)) = spec.config.get_mut("runtime_pass_env") {
+            names.retain(|v| !matches!(v, Value::String(s) if s == "PATH"));
+        }
+    }
+
     fn govet_tool_addr(&self) -> anyhow::Result<Addr> {
         let addr = hmodel::htaddr::parse_addr(&self.govet).with_context(|| {
             format!(
@@ -5618,6 +5734,124 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
 
     // ---- race ----
 
+    // ---- the runner reaches every generated target ----
+
+    fn spec_with(driver: &str, cfg: &[(&str, Value)]) -> hplugin::provider::TargetSpec {
+        let mut config: HashMap<String, Value> = HashMap::new();
+        for (k, v) in cfg {
+            config.insert((*k).to_string(), v.clone());
+        }
+        hplugin::provider::TargetSpec {
+            addr: Default::default(),
+            driver: driver.to_string(),
+            config,
+            ..Default::default()
+        }
+    }
+
+    fn provider_with_runner(runner: Option<&str>) -> Arc<ProviderInner> {
+        let p = Provider::with_config(
+            std::path::PathBuf::from("/ws"),
+            Config {
+                go_version: toolchain::HOST.to_string(),
+                runner: runner.map(str::to_string),
+                ..Default::default()
+            },
+            tokio::runtime::Handle::current(),
+        )
+        .expect("provider");
+        Arc::clone(&p.inner)
+    }
+
+    /// The whole point: a bash target this plugin generates — the std install,
+    /// the thirdparty download, a link — runs in the environment too. Half a
+    /// build in the named environment is two toolchains, not a partial win.
+    #[tokio::test]
+    async fn a_generated_bash_target_gets_the_runner() {
+        let inner = provider_with_runner(Some("//tools/devenv:runner"));
+        let mut spec = spec_with("bash", &[]);
+        inner.apply_runner(&mut spec);
+        assert_eq!(
+            spec.config.get("runner"),
+            Some(&Value::String("//tools/devenv:runner".to_string()))
+        );
+    }
+
+    /// Gated on the driver, because a spec carrying a key its driver does not
+    /// know is a hard parse error. `textfile` has no `runner`, so a blanket
+    /// apply would turn every generated textfile target into a build failure.
+    #[tokio::test]
+    async fn a_driver_without_a_runner_field_is_left_alone() {
+        let inner = provider_with_runner(Some("//tools/devenv:runner"));
+        for driver in ["textfile", "http_fetch", "go_toolchain", "go_testmain"] {
+            let mut spec = spec_with(driver, &[]);
+            inner.apply_runner(&mut spec);
+            assert!(
+                !spec.config.contains_key("runner"),
+                "{driver} rejects unknown keys; giving it a runner is a parse error"
+            );
+        }
+    }
+
+    /// A runner already on the spec came from something more specific — today
+    /// `provider_state(provider = "go", test = {"runner": ...})`, which is how a
+    /// package says its tests run somewhere other than its build.
+    #[tokio::test]
+    async fn a_more_specific_runner_is_not_overwritten() {
+        let inner = provider_with_runner(Some("//tools/devenv:runner"));
+        let mut spec = spec_with(
+            "bash",
+            &[("runner", Value::String("//tools/ci:runner".to_string()))],
+        );
+        inner.apply_runner(&mut spec);
+        assert_eq!(
+            spec.config.get("runner"),
+            Some(&Value::String("//tools/ci:runner".to_string()))
+        );
+    }
+
+    /// A workspace that configures no runner is untouched — this must cost
+    /// nothing and change nothing for everyone who does not use it.
+    #[tokio::test]
+    async fn no_configured_runner_changes_nothing() {
+        let inner = provider_with_runner(None);
+        let mut spec = spec_with("bash", &[]);
+        inner.apply_runner(&mut spec);
+        assert!(!spec.config.contains_key("runner"));
+    }
+
+    /// Under a runner the host's `PATH` must come back out of the pass-through:
+    /// a target's own environment wins over the runner's, so forwarding the
+    /// host's `PATH` would select the host's `go` *inside* the environment —
+    /// the object-version mismatch this plugin's runner support exists to avoid.
+    #[tokio::test]
+    async fn the_host_path_is_dropped_under_a_runner() {
+        let inner = provider_with_runner(Some("//tools/devenv:runner"));
+        let mut spec = spec_with(
+            "bash",
+            &[(
+                "runtime_pass_env",
+                Value::List(vec![
+                    Value::String("PATH".to_string()),
+                    Value::String("GOMODCACHE".to_string()),
+                ]),
+            )],
+        );
+        inner.apply_runner(&mut spec);
+        let names = match spec.config.get("runtime_pass_env") {
+            Some(Value::List(v)) => v.clone(),
+            other => panic!("expected a list, got {other:?}"),
+        };
+        assert!(
+            !names.contains(&Value::String("PATH".to_string())),
+            "the host PATH selects the host toolchain inside the environment"
+        );
+        assert!(
+            names.contains(&Value::String("GOMODCACHE".to_string())),
+            "module-cache config is deliberately still shared with the host"
+        );
+    }
+
     /// Options a `from_options` test needs beyond the one under test: `gotool` is
     /// required, everything else is optional.
     fn opts_with(extra: &[(&str, &str)]) -> hplugin::config::Options {
@@ -7035,6 +7269,46 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         )];
         let env = pick_test_env(&states, "foo").unwrap();
         assert_eq!(env.pre_run, vec!["a", "b", "c"]);
+    }
+
+    /// The `test = {"runner": ...}` state is how a package says its tests run
+    /// somewhere other than the bare host — a devenv shell, a container.
+    #[test]
+    fn pick_test_env_reads_the_runner() {
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![("runner", Value::String("//tools/devenv:runner".to_string()))],
+        )];
+        let env = pick_test_env(&states, "foo").unwrap();
+        assert_eq!(env.runner.as_deref(), Some("//tools/devenv:runner"));
+    }
+
+    /// Absent is the overwhelmingly common case and must stay distinguishable
+    /// from empty: an empty string is not an address, and emitting one would
+    /// fail the target rather than mean "no runner".
+    #[test]
+    fn pick_test_env_runner_is_absent_by_default_and_when_empty() {
+        let none = pick_test_env(&[], "foo").unwrap();
+        assert_eq!(none.runner, None);
+
+        let empty = vec![state_with_test_map(
+            "foo",
+            vec![("runner", Value::String(String::new()))],
+        )];
+        assert_eq!(pick_test_env(&empty, "foo").unwrap().runner, None);
+    }
+
+    /// A typo in the `test = {...}` map must be rejected by name rather than
+    /// silently dropped — otherwise a misspelled `runner` reads as "my tests
+    /// run in devenv" while they run on the host.
+    #[test]
+    fn pick_test_env_rejects_an_unknown_key() {
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![("runnr", Value::String("//x:y".to_string()))],
+        )];
+        let err = pick_test_env(&states, "foo").expect_err("typo must be rejected");
+        assert!(format!("{err:#}").contains("runnr"), "{err:#}");
     }
 
     #[test]

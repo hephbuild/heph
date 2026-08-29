@@ -1503,6 +1503,7 @@ dependencies = [
  "anyhow",
  "core",
  "heph",
+ "plugin-devenv",
  "plugin-oci",
  "serde_json",
  "sha2 0.10.9",
@@ -1560,6 +1561,7 @@ dependencies = [
  "driver-bridge",
  "driver-support",
  "enclose",
+ "execrunner",
  "flate2",
  "futures",
  "glob",
@@ -1702,6 +1704,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "execrunner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "libc",
+ "model",
+ "proc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2231,6 +2252,7 @@ dependencies = [
  "enclose",
  "engine",
  "erased-serde 0.4.10",
+ "execrunner",
  "flate2",
  "futures",
  "glob",
@@ -2250,6 +2272,7 @@ dependencies = [
  "parking_lot",
  "plugin",
  "plugin-buildfile",
+ "plugin-devenv",
  "plugin-exec",
  "plugin-http",
  "plugin-nix",
@@ -4056,6 +4079,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-devenv"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "driver-support",
+ "execrunner",
+ "model",
+ "plugin",
+ "proc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "plugin-devenv-cdylib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "driver-support",
+ "plugin",
+ "plugin-devenv",
+ "plugin-sdk",
+ "stabby",
+ "tracing",
+]
+
+[[package]]
 name = "plugin-exec"
 version = "0.1.0"
 dependencies = [
@@ -4065,6 +4121,7 @@ dependencies = [
  "crossterm",
  "driver-support",
  "enclose",
+ "execrunner",
  "glob",
  "libc",
  "minijinja",
@@ -4121,6 +4178,7 @@ dependencies = [
  "core",
  "driver-support",
  "enclose",
+ "execrunner",
  "flate2",
  "futures",
  "glob",
@@ -4186,6 +4244,7 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
+ "execrunner",
  "model",
  "plugin",
  "proc",
@@ -4208,6 +4267,7 @@ dependencies = [
  "core",
  "docker_credential",
  "driver-support",
+ "execrunner",
  "futures",
  "model",
  "oci-client",
@@ -4257,6 +4317,7 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
+ "execrunner",
  "futures",
  "model",
  "plugin",
@@ -4281,6 +4342,7 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
+ "execrunner",
  "futures",
  "libloading",
  "model",
@@ -4305,6 +4367,7 @@ dependencies = [
  "model",
  "object 0.37.3",
  "plugin",
+ "plugin-devenv",
  "plugin-go",
  "tempfile",
  "testkit",
@@ -6172,6 +6235,7 @@ name = "testkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "execrunner",
  "heph",
  "tempfile",
  "tokio",

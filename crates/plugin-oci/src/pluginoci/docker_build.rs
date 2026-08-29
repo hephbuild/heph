@@ -86,6 +86,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
 use hplugin::driver::targetdef::{Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -1432,7 +1433,11 @@ pub(crate) async fn run_tool(
         ctty: false,
     };
 
-    let mut handle = proc_exec::spawn(spec).map_err(|e| missing_tool_error(e, bin, what))?;
+    // Always the local runner: `docker buildx` is a host tool this driver
+    // invokes for itself, not the target's command, so it does not inherit the
+    // target's execution environment.
+    let (spawned, _) = hexecrunner::spawn_io(RunnerRef::local(), spec, ctoken).await?;
+    let mut handle = spawned.map_err(|e| missing_tool_error(e, bin, what))?;
     let output_reader = handle.take_output();
 
     let out_tail = std::sync::Mutex::new(TailBuf::default());

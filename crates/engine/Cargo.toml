@@ -12,6 +12,7 @@ hconfig = { package = "config", path = "../config" }
 hmodel = { package = "model", path = "../model" }
 hwalk = { package = "walk", path = "../walk" }
 hproc = { package = "proc", path = "../proc" }
+hexecrunner = { package = "execrunner", path = "../execrunner" }
 hlock = { package = "lock", path = "../lock" }
 hsandboxfuse = { package = "sandboxfuse", path = "../sandboxfuse", default-features = false }
 hplugin = { package = "plugin", path = "../plugin" }
