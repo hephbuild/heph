@@ -984,7 +984,7 @@ mod tests {
             import_path: "example.com/mylib".to_string(),
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
-            go_version: crate::plugingo::toolchain::DEFAULT_GO_VERSION.to_string(),
+            go_version: crate::plugingo::toolchain::HASH_GOLDEN_GO_VERSION.to_string(),
             build_tags,
             goexperiment: vec![],
             race: false,

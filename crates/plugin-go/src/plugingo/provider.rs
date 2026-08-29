@@ -252,7 +252,7 @@ impl Provider {
         // implicit default. Set it to:
         //   - `"host"` → use the host `go` (read from PATH / `go env GOROOT`
         //     inside the sandbox; non-hermetic, see [`toolchain::HOST`]),
-        //   - a pinned version like `"1.26.4"` → download + manage that SDK
+        //   - a pinned version like `"1.27.0"` → download + manage that SDK
         //     hermetically (`//@heph/go/toolchain/<version>:go`), or
         //   - a target address like `"//@heph/bin:go"` (host `go` via the hostbin
         //     provider) or `"//some/pkg:go"` (e.g. a nix-built `go`) → use the
