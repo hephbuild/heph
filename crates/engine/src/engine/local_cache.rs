@@ -1208,6 +1208,8 @@ mod tests {
                 read: true,
                 write: true,
                 concurrency: 10,
+                endpoint: None,
+                region: None,
             }],
             ..Default::default()
         })

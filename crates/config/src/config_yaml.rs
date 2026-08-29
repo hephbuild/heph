@@ -79,6 +79,10 @@ pub struct ConfigYaml {
 /// `file://` for tests/local use. `read`/`write` gate whether the cache is
 /// consulted on lookups and pushed to on writes; both default to `true`.
 ///
+/// `endpoint`/`region` point an `s3://` cache at an S3-compatible service that
+/// is not AWS — the URI still names the bucket and prefix, the endpoint names
+/// the host to talk to.
+///
 /// Produced from one or more layered [`RemoteCacheConfigPatch`]es — see
 /// [`ConfigYaml::resolved_caches`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +93,14 @@ pub struct RemoteCacheConfig {
     /// Max in-flight requests to this cache (object_store `LimitStore`). Caps how
     /// many connections a wide build fan-out opens at once. Defaults to 10.
     pub concurrency: usize,
+    /// Base URL of an S3-compatible service to talk to instead of AWS, e.g.
+    /// `https://<account>.r2.cloudflarestorage.com` or `http://localhost:9000`.
+    /// `s3://` caches only; unset means AWS.
+    pub endpoint: Option<String>,
+    /// Region to sign S3 requests for. `s3://` caches only; unset leaves the
+    /// choice to the environment (`AWS_REGION`), which in turn defaults to
+    /// `us-east-1`.
+    pub region: Option<String>,
 }
 
 /// Parse/overlay shape for one named cache. Every field is optional so a profile
@@ -106,6 +118,10 @@ pub struct RemoteCacheConfigPatch {
     pub write: Option<bool>,
     #[serde(default)]
     pub concurrency: Option<usize>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 impl RemoteCacheConfigPatch {
@@ -125,6 +141,12 @@ impl RemoteCacheConfigPatch {
         if other.concurrency.is_some() {
             self.concurrency = other.concurrency;
         }
+        if other.endpoint.is_some() {
+            self.endpoint = other.endpoint;
+        }
+        if other.region.is_some() {
+            self.region = other.region;
+        }
     }
 
     /// Finalize into a [`RemoteCacheConfig`], applying defaults for omitted
@@ -139,6 +161,8 @@ impl RemoteCacheConfigPatch {
             read: self.read.unwrap_or(true),
             write: self.write.unwrap_or(true),
             concurrency: self.concurrency.unwrap_or(DEFAULT_CACHE_CONCURRENCY),
+            endpoint: self.endpoint.clone(),
+            region: self.region.clone(),
         })
     }
 }
@@ -811,6 +835,37 @@ caches:
     }
 
     #[test]
+    fn cache_endpoint_and_region_are_configurable() {
+        // An S3-compatible service that isn't AWS: the uri still names the
+        // bucket and prefix, the endpoint names the host.
+        let yaml = concat!(
+            "caches:\n",
+            "  remote:\n",
+            "    uri: s3://my-bucket/heph\n",
+            "    endpoint: https://accountid.r2.cloudflarestorage.com\n",
+            "    region: auto\n",
+        );
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let caches = cfg.resolved_caches().expect("resolve");
+        let remote = caches.get("remote").expect("present");
+        assert_eq!(
+            remote.endpoint.as_deref(),
+            Some("https://accountid.r2.cloudflarestorage.com")
+        );
+        assert_eq!(remote.region.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn cache_endpoint_and_region_default_to_unset() {
+        let cfg: ConfigYaml =
+            serde_yaml::from_str("caches:\n  c:\n    uri: s3://b/p\n").expect("parse");
+        let caches = cfg.resolved_caches().expect("resolve");
+        let c = caches.get("c").expect("present");
+        assert_eq!(c.endpoint, None);
+        assert_eq!(c.region, None);
+    }
+
+    #[test]
     fn resolved_caches_errors_on_missing_uri() {
         // A cache that only ever sets read/write (no base uri) cannot resolve.
         let cfg: ConfigYaml =
@@ -1038,6 +1093,32 @@ caches:
         assert_eq!(caches.get("b").expect("b").uri, "s3://prof/b");
         // New key is added.
         assert_eq!(caches.get("c").expect("c").uri, "s3://prof/c");
+    }
+
+    #[test]
+    fn merge_deep_merges_cache_endpoint_and_region() {
+        // A profile can re-point a cache at a different S3-compatible service
+        // (e.g. a local MinIO) while inheriting the base bucket and prefix.
+        let mut base: ConfigYaml = serde_yaml::from_str(concat!(
+            "caches:\n",
+            "  remote:\n",
+            "    uri: s3://bucket/heph\n",
+            "    endpoint: https://accountid.r2.cloudflarestorage.com\n",
+            "    region: auto\n",
+        ))
+        .expect("parse base");
+        let overlay: ConfigYaml =
+            serde_yaml::from_str("caches:\n  remote:\n    endpoint: http://localhost:9000\n")
+                .expect("parse overlay");
+
+        base.merge(overlay);
+
+        let caches = base.resolved_caches().expect("resolve");
+        let remote = caches.get("remote").expect("present");
+        assert_eq!(remote.uri, "s3://bucket/heph");
+        assert_eq!(remote.endpoint.as_deref(), Some("http://localhost:9000"));
+        // Untouched by the overlay, so the base value survives.
+        assert_eq!(remote.region.as_deref(), Some("auto"));
     }
 
     #[test]

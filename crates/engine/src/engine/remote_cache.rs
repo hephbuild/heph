@@ -66,7 +66,7 @@ use crate::engine::local_cache::{
     ManifestArtifactEncoding, ManifestArtifactType,
 };
 use crate::engine::remote_cache_latency::{UNREACHABLE, load_order, store_order};
-use crate::engine::remote_cache_objstore::ObjStoreBackend;
+use crate::engine::remote_cache_objstore::{ObjStoreBackend, StoreOptions};
 use anyhow::Context;
 use async_trait::async_trait;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -375,6 +375,11 @@ pub struct RemoteCacheDef {
     pub write: bool,
     /// Max in-flight requests to this cache (object_store `LimitStore`).
     pub concurrency: usize,
+    /// Base URL of an S3-compatible service to talk to instead of AWS. `s3://`
+    /// caches only — see [`StoreOptions`].
+    pub endpoint: Option<String>,
+    /// Region to sign S3 requests for. `s3://` caches only.
+    pub region: Option<String>,
 }
 
 impl RemoteCacheDef {
@@ -883,8 +888,15 @@ impl RemoteCacheSet {
     pub fn new(defs: &[RemoteCacheDef], home: PathBuf) -> anyhow::Result<Arc<Self>> {
         let mut caches = Vec::with_capacity(defs.len());
         for def in defs {
-            let backend = ObjStoreBackend::from_uri(&def.uri, def.concurrency)
-                .with_context(|| format!("configure remote cache `{}`", def.name))?;
+            let backend = ObjStoreBackend::from_uri(
+                &def.uri,
+                def.concurrency,
+                &StoreOptions {
+                    endpoint: def.endpoint.as_deref(),
+                    region: def.region.as_deref(),
+                },
+            )
+            .with_context(|| format!("configure remote cache `{}`", def.name))?;
             caches.push(ConfiguredCache::new(def.clone(), Arc::new(backend)));
         }
         let config_hash = config_hash(defs);
@@ -908,6 +920,8 @@ impl RemoteCacheSet {
                     read: true,
                     write: true,
                     concurrency: 4,
+                    endpoint: None,
+                    region: None,
                 },
                 backend,
             )],
@@ -1506,7 +1520,9 @@ fn copy_file_to(src: &Path, mut writer: impl std::io::Write) -> anyhow::Result<(
 }
 
 /// Stable hash of the definition set (order-independent) used to invalidate the
-/// persisted latency order when caches are added, removed, or re-pointed.
+/// persisted latency order when caches are added, removed, or re-pointed —
+/// including re-pointed at a different `endpoint`/`region`, which changes what
+/// host a cache talks to and so what its measured latency means.
 /// `concurrency` is excluded — it does not affect which caches exist or how fast
 /// they are, so changing it must not force a re-measure.
 fn config_hash(defs: &[RemoteCacheDef]) -> String {
@@ -1517,6 +1533,10 @@ fn config_hash(defs: &[RemoteCacheDef]) -> String {
         h.update(d.name.as_bytes());
         h.update(&[0]);
         h.update(d.uri.as_bytes());
+        h.update(&[0]);
+        h.update(d.endpoint.as_deref().unwrap_or_default().as_bytes());
+        h.update(&[0]);
+        h.update(d.region.as_deref().unwrap_or_default().as_bytes());
         h.update(&[d.read as u8, d.write as u8]);
         h.update(&[0xff]);
     }
@@ -2072,6 +2092,8 @@ mod tests {
             read,
             write,
             concurrency: DEFAULT_CACHE_CONCURRENCY,
+            endpoint: None,
+            region: None,
         }
     }
 
@@ -2217,6 +2239,39 @@ mod tests {
             def("y", "memory:///CHANGED", true, false),
         ];
         assert_ne!(config_hash(&a), config_hash(&c), "uri change must matter");
+    }
+
+    /// Endpoint and region decide which host a cache actually talks to, so a
+    /// change to either has to invalidate the persisted latency order the same
+    /// way a uri change does — otherwise a cache re-pointed at a different
+    /// service keeps the read position it earned against the old one.
+    #[test]
+    fn config_hash_covers_endpoint_and_region() {
+        let base = vec![def("x", "s3://bucket/p", true, true)];
+
+        let mut with_endpoint = base.clone();
+        with_endpoint[0].endpoint = Some("https://accountid.r2.cloudflarestorage.com".to_string());
+        assert_ne!(
+            config_hash(&base),
+            config_hash(&with_endpoint),
+            "endpoint change must matter"
+        );
+
+        let mut other_endpoint = with_endpoint.clone();
+        other_endpoint[0].endpoint = Some("http://localhost:9000".to_string());
+        assert_ne!(
+            config_hash(&with_endpoint),
+            config_hash(&other_endpoint),
+            "a different endpoint must matter"
+        );
+
+        let mut with_region = base.clone();
+        with_region[0].region = Some("auto".to_string());
+        assert_ne!(
+            config_hash(&base),
+            config_hash(&with_region),
+            "region change must matter"
+        );
     }
 
     #[test]

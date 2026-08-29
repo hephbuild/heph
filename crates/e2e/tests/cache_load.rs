@@ -105,6 +105,8 @@ fn build_engine(root: &Path, remote_uri: &str, parallelism: Option<usize>) -> Ar
             read: true,
             write: true,
             concurrency: 10,
+            endpoint: None,
+            region: None,
         }]
     };
     let mut e = Engine::new(Config {
