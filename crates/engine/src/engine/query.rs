@@ -497,8 +497,7 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        let provider =
-            pluginstatictarget::Provider::new(vec![target("foo", "a", &["//labels:lint"])])?;
+        let provider = pluginstatictarget::Provider::new(vec![target("foo", "a", &["lint"])])?;
         engine.register_provider(move |_| Box::new(provider))?;
         engine.register_provider(|_| Box::new(PhantomLister))?;
         let engine = Arc::new(engine);
@@ -691,14 +690,11 @@ mod tests {
 
     #[tokio::test]
     async fn query_by_label_calls_get_spec() -> anyhow::Result<()> {
-        let engine = make_engine(vec![
-            target("foo", "a", &["//labels:lint"]),
-            target("foo", "b", &[]),
-        ])?;
+        let engine = make_engine(vec![target("foo", "a", &["lint"]), target("foo", "b", &[])])?;
 
         let rs = engine.new_state();
         let addrs: Vec<Addr> = engine
-            .query(rs, &Matcher::Label("//labels:lint".to_string()))
+            .query(rs, &Matcher::Label("lint".to_string()))
             .try_collect()
             .await?;
 

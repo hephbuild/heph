@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::htaddr::Addr;
 use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
-use crate::{engine, htaddr, htpkg, htquery};
+use crate::{engine, htaddr, htlabel, htpkg, htquery};
 use anyhow::Context;
 
 /// Resolve a CLI target argument into an `Addr`, relative to package `cwp` under
@@ -85,6 +85,7 @@ pub fn matcher_from_args(
 
             htpkg::parse(package_matcher, &engine::get_cwp()?)
         } else {
+            validate_positional_label(label)?;
             Ok(Matcher::And(vec![
                 Matcher::Label(label.into()),
                 htpkg::parse(package_matcher, &engine::get_cwp()?)?,
@@ -96,6 +97,28 @@ pub fn matcher_from_args(
             .with_context(|| format!("parse {}", addr_str))?;
         Ok(Matcher::Addr(addr))
     }
+}
+
+/// Check the positional `<LABEL> <PACKAGE_MATCHER>` form's first argument
+/// against the label grammar.
+///
+/// The positional form has no delimiters, so before this check any string at
+/// all was a "label" — `heph run 'lint && !go-lint' //...` asked for the label
+/// literally spelled `lint && !go-lint`, matched nothing, and exited 0, which
+/// is indistinguishable from a build that passed. When the argument reads like
+/// a query expression, point at `-e`, which is where that syntax belongs.
+fn validate_positional_label(label: &str) -> anyhow::Result<()> {
+    let Err(err) = htlabel::validate(label) else {
+        return Ok(());
+    };
+    if htlabel::looks_like_query_expr(label) {
+        return Err(err).context(
+            "the first positional argument is a bare label, not a query expression — \
+             for `&&`, `||`, `!` or grouping use `-e`, e.g. \
+             -e 'label(lint) && !label(go-lint) && //...'",
+        );
+    }
+    Err(err)
 }
 
 /// Tally a parsed query matcher's nodes into telemetry counts. Walks the tree
@@ -266,6 +289,44 @@ mod tests {
             format!("{err:#}").contains("cannot combine"),
             "expected conflict message: {err:#}"
         );
+    }
+
+    #[test]
+    fn positional_label_outside_the_grammar_is_rejected() {
+        // The motivating bug: this is a well-formed request for the label
+        // literally spelled `lint && !go-lint`, which no target carries — so it
+        // used to select nothing and exit 0.
+        let pkg = PkgBuf::from("");
+        let err = matcher_from_args("lint && !go-lint", &Some("//...".to_string()), &pkg, false)
+            .err()
+            .expect("expected label validation error");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("invalid label"), "{chain}");
+        assert!(chain.contains("-e"), "expected a pointer to -e: {chain}");
+    }
+
+    #[test]
+    fn positional_label_error_omits_the_query_hint_for_a_plain_typo() {
+        let pkg = PkgBuf::from("");
+        let err = matcher_from_args("go:lint", &Some("//...".to_string()), &pkg, false)
+            .err()
+            .expect("expected label validation error");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("invalid label"), "{chain}");
+        assert!(
+            !chain.contains("query expression"),
+            "no operators typed, so no -e hint: {chain}"
+        );
+    }
+
+    #[test]
+    fn positional_label_within_the_grammar_is_accepted() {
+        // Checked directly: the accepting path goes on to resolve the package
+        // matcher against the ambient workspace root, which a unit test has no
+        // business depending on.
+        for l in ["lint", "go-lint", "go_lint2", "Lint"] {
+            validate_positional_label(l).unwrap_or_else(|e| panic!("{l:?}: {e:#}"));
+        }
     }
 
     #[test]

@@ -923,6 +923,14 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                 "target name cannot be empty"
             )));
         }
+        // Reject a label outside the grammar here, where the BUILD file and
+        // target name are still in the error, rather than letting it become a
+        // tag no `label(...)` query can ever name.
+        for l in &labels {
+            hmodel::htlabel::validate(l)
+                .with_context(|| format!("target {name:?} labels"))
+                .map_err(starlark::Error::new_other)?;
+        }
         // An empty driver is allowed here: the provider resolves it against the
         // configured `defaultDriver` (and errors if neither is set).
 
@@ -2289,6 +2297,41 @@ target(name = "direct", driver = "exec")
         let result = run_pkg_blocking(&provider, pkg).unwrap();
         assert_eq!(result.targets.len(), 1);
         assert_eq!(result.targets[0].name, "t");
+    }
+
+    /// A label outside `[A-Za-z0-9_-]+` fails at declaration, naming the
+    /// target — not silently becoming a tag `label(...)` can never select.
+    #[test]
+    fn label_outside_the_grammar_fails_the_package() {
+        for bad in [
+            r#"["//team:foo"]"#,
+            r#"["needs review"]"#,
+            r#"[""]"#,
+            r#""a&b""#,
+        ] {
+            let tmp_dir = tempdir().unwrap();
+            let pkg_path = tmp_dir.path().join("mypkg");
+            fs::create_dir_all(&pkg_path).unwrap();
+            fs::write(
+                pkg_path.join("BUILD"),
+                format!(r#"target(name = "t", driver = "d", labels = {bad})"#),
+            )
+            .unwrap();
+
+            let provider = Provider {
+                root: tmp_dir.path().to_path_buf(),
+                ..Provider::default()
+            };
+            let err = run_pkg_blocking(&provider, "mypkg")
+                .err()
+                .unwrap_or_else(|| panic!("labels = {bad} should not evaluate"));
+            let chain = format!("{err:#}");
+            assert!(chain.contains("label"), "labels = {bad}: {chain}");
+            assert!(
+                chain.contains("\"t\""),
+                "error must name the target: {chain}"
+            );
+        }
     }
 
     #[test]
