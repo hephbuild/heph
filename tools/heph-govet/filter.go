@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
 	"golang.org/x/tools/go/analysis"
 )
@@ -28,6 +29,17 @@ type suppressor struct {
 	pathsExcept []*regexp.Regexp
 	// generated is "lax" (default), "strict", or "disable".
 	generated string
+	// mu guards the two lazily-filled caches below. unitchecker runs the
+	// selected analyzers concurrently, and every one of them reports through
+	// this single shared suppressor (see withFilter), so both maps are read and
+	// written from several goroutines at once.
+	//
+	// Unsynchronized, this is not a subtle corruption: Go aborts the process
+	// with "fatal error: concurrent map writes", which is unrecoverable and
+	// takes the whole lint target down with it. It stayed hidden while the
+	// default analyzer set was small — widening it to `go vet`'s full suite
+	// made two analyzers report at the same instant often enough to hit it.
+	mu sync.Mutex
 	// nolint is the lazily-scanned per-file directive index: file -> line ->
 	// set of golangci linter names ("*" = all linters).
 	nolint map[string]map[int]map[string]bool
@@ -197,11 +209,16 @@ func (s *suppressor) suppressed(linter, file string, line int, msg string) bool 
 }
 
 func (s *suppressor) nolintCovers(linter, file string, line int) bool {
+	s.mu.Lock()
 	byLine, ok := s.nolint[file]
 	if !ok {
+		// Held across the scan on purpose: the miss happens once per file, and
+		// serializing it means concurrent reporters on the same file wait for
+		// one scan rather than each running their own.
 		byLine = scanNolint(file)
 		s.nolint[file] = byLine
 	}
+	s.mu.Unlock()
 	set, ok := byLine[line]
 	if !ok {
 		return false
@@ -230,6 +247,8 @@ var laxGeneratedMarkers = []string{
 // mode, memoized per file. "strict" honors only the Go-convention marker; "lax"
 // (the default) also accepts the looser header substrings golangci uses.
 func (s *suppressor) isGenerated(file string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if g, ok := s.genCache[file]; ok {
 		return g
 	}

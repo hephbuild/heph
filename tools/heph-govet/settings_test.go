@@ -7,6 +7,7 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/printf"
 	"golang.org/x/tools/go/analysis/passes/shadow"
+	"golang.org/x/tools/go/analysis/suite/vet"
 	"honnef.co/go/tools/config"
 )
 
@@ -16,6 +17,38 @@ func names(as []*analysis.Analyzer) map[string]bool {
 		m[a.Name] = true
 	}
 	return m
+}
+
+// The contract behind govetAll: everything `go vet` runs is on by default here.
+// This is what drifted — the default set was a hand-written transcription and
+// had fallen six analyzers behind (framepointer, hostport, scannererr,
+// sqlrowserr, stdversion, waitgroup) by the time Go 1.27 landed. Comparing
+// against the upstream suite catches a reversion to a hand-maintained list, and
+// makes an x/tools bump that adds an analyzer arrive already wired.
+func TestGovetDefaultsAreExactlyTheGoVetSuite(t *testing.T) {
+	got := names(resolveGovet(govetSettings{}))
+	for _, a := range vet.Suite {
+		if !got[a.Name] {
+			t.Errorf("%s is in `go vet`'s suite but off by default here", a.Name)
+		}
+	}
+	if len(got) != len(vet.Suite) {
+		t.Errorf("default set has %d analyzers, `go vet`'s suite has %d: %v", len(got), len(vet.Suite), got)
+	}
+}
+
+// govetAll must not list a name twice. resolveGovet keys by name and takes the
+// last entry, so a duplicate is not merely redundant: an off-by-default entry
+// appended after its suite counterpart would turn a `go vet` default off, and
+// nothing else in the suite would notice.
+func TestGovetAllHasNoDuplicateNames(t *testing.T) {
+	seen := map[string]bool{}
+	for _, e := range govetAll() {
+		if seen[e.a.Name] {
+			t.Errorf("%s listed twice — the later entry silently wins in resolveGovet", e.a.Name)
+		}
+		seen[e.a.Name] = true
+	}
 }
 
 func TestResolveGovetDefaultExcludesOffByDefault(t *testing.T) {

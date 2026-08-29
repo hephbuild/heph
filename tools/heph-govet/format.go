@@ -25,7 +25,7 @@ import (
 	"sort"
 	"strings"
 
-	golangcigofmt "github.com/golangci/gofmt/gofmt"
+	golangcigofmt "github.com/golangci/gofmt"
 	"golang.org/x/tools/imports"
 	gofumpt "mvdan.cc/gofumpt/format"
 )
