@@ -66,9 +66,11 @@ pub enum Commands {
     ///
     /// Examples:
     ///
-    /// `heph query //...`
+    /// `heph query //cmd/server:bin` — resolve a single address
     ///
-    /// `heph query test //cmd/...`
+    /// `heph query test //cmd/...` — every target labelled `test`
+    ///
+    /// `heph query -e '//...'` — every target in the workspace
     ///
     /// `heph query -e '//... && !//vendor/...'` — select with exclusion
     ///
