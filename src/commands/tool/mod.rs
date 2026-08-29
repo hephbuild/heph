@@ -3,6 +3,7 @@ mod build_lsp;
 mod cache;
 mod clean;
 mod completions;
+mod coreutils;
 pub mod gc;
 mod gen_gitignore;
 mod resolve_plugins;
@@ -82,6 +83,15 @@ pub enum ToolCommands {
     ///
     /// Example: `heph tool cache measure-latency`
     Cache(cache::CacheArgs),
+    /// Inspect the POSIX utilities compiled into this binary
+    ///
+    /// The binary carries its own `cp`, `install`, `sha256sum` and friends so a
+    /// recipe behaves the same on Linux and macOS, and puts them on every
+    /// target's `PATH`. These subcommands say what is in the set and what a
+    /// name resolves to.
+    ///
+    /// Example: `heph tool coreutils list`
+    Coreutils(coreutils::CoreutilsArgs),
     /// Print a shell completion-registration script
     ///
     /// Emits the script that enables dynamic tab-completion of subcommands,
@@ -132,6 +142,7 @@ impl ToolCommands {
             ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
             ToolCommands::Scratch(args) => args.execute(sink),
             ToolCommands::Cache(args) => args.execute(sink, global),
+            ToolCommands::Coreutils(args) => args.execute(),
             ToolCommands::Completions(args) => completions::execute(args),
             ToolCommands::BuildFmt(args) => build_fmt::execute(args, sink, global),
             ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, global),

@@ -87,6 +87,17 @@ going in: a runner target's `fingerprint` is what makes a consumer's cache key
 move when the environment does, and getting it wrong is a silently wrong build
 in one direction and a permanent full-miss in the other.
 
+### Builtin coreutils
+
+heph ships 40 POSIX utilities inside the binary (`crates/coreutils`) and can put
+them on every target's `PATH`, so `cp`/`install`/`sha256sum` behave the same on
+Linux and macOS. Off by default (`coreutils: true` on the `exec`/`bash` driver).
+
+Read `docs/COREUTILS.md` before touching it. The one thing to know going in:
+`COREUTILS_VERSION` is folded into every exec target's def hash when the toolbox
+is on, so bumping it invalidates every exec target in every workspace — a
+release-gated decision, not a routine one.
+
 ### `heph-bench` — perf-regression harness
 
 `crates/bench-corpus` (deterministic synthetic corpus generator) + `crates/bench` (`heph-bench` binary: `corpus`/`run inprocess`/`run dist`/`compare`). Times `heph` scenarios in-process (Tier A, no process spawn, no plugin cdylib) or against the real prebuilt binary + plugin cdylib (Tier B, the seam only a real `dlopen` can exercise), then decides regression from a baseline-vs-candidate comparison.
