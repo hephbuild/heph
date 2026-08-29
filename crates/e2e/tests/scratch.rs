@@ -608,6 +608,7 @@ async fn a_branch_switch_seeds_from_the_fallback_and_writes_stay_put() -> anyhow
     };
 
     let on = |scope: &str| heph::engine::ScratchOptions {
+        enabled: true,
         scope: scope.to_string(),
         restore_scopes: vec!["master".to_string()],
         seed_on_fork: true,
@@ -663,6 +664,7 @@ async fn seed_on_fork_off_starts_a_new_branch_cold() -> anyhow::Result<()> {
         Ok(out)
     };
     let on = |scope: &str, seed: bool| heph::engine::ScratchOptions {
+        enabled: true,
         scope: scope.to_string(),
         restore_scopes: vec!["master".to_string()],
         seed_on_fork: seed,
@@ -677,5 +679,102 @@ async fn seed_on_fork_off_starts_a_new_branch_cold() -> anyhow::Result<()> {
         "cold",
         "with seeding off a new lineage must not inherit"
     );
+    Ok(())
+}
+
+/// `--scratch=off` is the audit mode for the whole contract: a target's outputs
+/// must be identical whether its scratch is warm, cold or absent. With it, a
+/// declared cache is not merely empty — the entire path is skipped, so nothing
+/// resolves, locks, or mounts.
+#[tokio::test]
+async fn scratch_off_runs_as_though_nothing_were_declared() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    // Reports whether the variable and the mount are there at all.
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["if [ -n \"${C:-}\" ] && [ -d .cache/x ]; then echo mounted > $OUT; else echo absent > $OUT; fi"])"#,
+    );
+
+    let on = |enabled: bool| heph::engine::ScratchOptions {
+        enabled,
+        ..Default::default()
+    };
+    // `force`, because that is what the CLI does for `--scratch=off` and why it
+    // has to: scratch never reaches `hashin`, so without it the second run is a
+    // cache hit that replays the result built *with* a warm cache — the audit
+    // would pass by reading exactly the answer it is meant to re-derive.
+    let run = async |engine: &Arc<heph::engine::Engine>, force: bool| -> anyhow::Result<String> {
+        let addr = heph::htaddr::parse_addr("//app:a")?;
+        let opts = ResultOptions {
+            force,
+            ..Default::default()
+        };
+        let r = Arc::clone(engine)
+            .result_addr(engine.new_state(), &addr, OutputMatcher::All, &opts)
+            .await?;
+        let out = common::artifact_string(&r).trim().to_string();
+        drop(r);
+        Ok(out)
+    };
+
+    assert_eq!(run(&ws.reopen_scoped(on(true))?, false).await?, "mounted");
+
+    // The trap this test originally fell into, asserted *before* the forced run
+    // so nobody "simplifies" the implication away later: scratch never reaches
+    // `hashin`, so an unforced off-run is a plain cache hit and replays the
+    // result built with a warm cache. The audit would pass by reading exactly the
+    // answer it is meant to re-derive.
+    assert_eq!(
+        run(&ws.reopen_scoped(on(false))?, false).await?,
+        "mounted",
+        "a cached result is served regardless of scratch — which is why \
+         `--scratch=off` must imply a rebuild"
+    );
+
+    // With the rebuild the CLI forces, the cache is genuinely absent — not merely
+    // mounted-and-empty.
+    assert_eq!(
+        run(&ws.reopen_scoped(on(false))?, true).await?,
+        "absent",
+        "--scratch=off must leave the cache genuinely absent, not merely empty"
+    );
+    Ok(())
+}
+
+/// The store describes itself, so it can be listed and reclaimed without reading
+/// a single BUILD file — the property that keeps a cache manageable after the
+/// target that made it is gone.
+#[tokio::test]
+async fn the_store_lists_and_reclaims_what_a_build_created() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "gocache", driver = "scratch", path = ".cache/x", env = "C",
+       access = "shared")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:gocache"],
+       run = ["echo hi > $OUT", "dd if=/dev/zero of=\"$C/blob\" bs=1024 count=8 2>/dev/null"])"#,
+    );
+    ws.run("//app:a").await?;
+
+    let slots = ws.engine.scratch_slots()?;
+    assert_eq!(slots.len(), 1, "the build must have created one slot");
+    let meta = slots[0].meta.as_ref().expect("slot describes itself");
+    assert_eq!(meta.addr, "//build:gocache");
+    assert_eq!(meta.access, "shared");
+    assert!(slots[0].bytes >= 8 * 1024, "got {} bytes", slots[0].bytes);
+
+    // Named removal finds it by the addr the meta recorded.
+    let (n, freed) = ws.engine.scratch_remove(Some("//build:gocache"))?;
+    assert_eq!(n, 1);
+    assert!(freed >= 8 * 1024);
+    assert!(ws.engine.scratch_slots()?.is_empty());
     Ok(())
 }

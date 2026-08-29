@@ -257,6 +257,13 @@ impl Engine {
         consumer: &Addr,
         inputs: &[Input],
     ) -> anyhow::Result<Vec<ResolvedScratch>> {
+        // `--scratch=off`: behave as though nothing were declared. Done here
+        // rather than at the mount so the *whole* path is skipped — no spec
+        // resolution, no lock, no directory — which is what makes it a faithful
+        // "as if absent" and not merely "mounted somewhere empty".
+        if !self.cfg.scratch.enabled {
+            return Ok(Vec::new());
+        }
         let refs: Vec<&Input> = inputs.iter().filter(|i| is_scratch_input(i)).collect();
         if refs.is_empty() {
             return Ok(Vec::new());
@@ -352,6 +359,24 @@ impl Engine {
             hcore::blocking::run(move || std::fs::create_dir_all(&d))
                 .await
                 .with_context(|| format!("create scratch dir {dir:?} for {}", r.addr))?;
+
+            // Record what this slot came from, so the store can describe itself
+            // without resolving the graph (see `scratch_store`). Idempotent and
+            // best-effort: it is a diagnostic, not part of the build.
+            crate::engine::scratch_store::write_slot_meta(
+                &self.home,
+                &slot,
+                &crate::engine::scratch_store::SlotMeta {
+                    format: 1,
+                    addr: r.addr.format(),
+                    path: r.def.path.clone(),
+                    env: r.def.env.clone(),
+                    access: r.def.access.as_str().to_string(),
+                    platform: r.def.platform.as_str().to_string(),
+                    version: r.def.version.clone(),
+                    remote: r.def.remote,
+                },
+            );
 
             mounts.push(ScratchMount {
                 addr: r.addr.clone(),
@@ -450,6 +475,7 @@ mod scope_tests {
 
     fn opts(scope: &str, fallbacks: &[&str], seed: bool) -> ScratchOptions {
         ScratchOptions {
+            enabled: true,
             scope: scope.to_string(),
             restore_scopes: fallbacks.iter().map(|s| s.to_string()).collect(),
             seed_on_fork: seed,
