@@ -92,6 +92,23 @@ pub fn telemetry_enabled_from_config() -> bool {
         .unwrap_or(true)
 }
 
+/// Run-scoped scratch switch, set once from `--scratch` before the engine is
+/// built.
+///
+/// A global rather than a parameter because `new_engine` is called from a dozen
+/// command paths that have no opinion on it, and threading a flag through all of
+/// them to reach one field would be a worse trade than one write at startup.
+static SCRATCH_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Apply `--scratch`. Called from the CLI entrypoint before any engine exists.
+pub fn set_scratch_enabled(enabled: bool) {
+    SCRATCH_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn scratch_enabled() -> bool {
+    SCRATCH_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -101,7 +118,8 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // The config file is the all-optional, profile-layered YAML; `resolve`
     // applies every default in one place and yields the engine's runtime config.
     let file = config_yaml::load_from_root(&root)?;
-    let config = file.resolve(&root)?;
+    let mut config = file.resolve(&root)?;
+    config.scratch.enabled = scratch_enabled();
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend

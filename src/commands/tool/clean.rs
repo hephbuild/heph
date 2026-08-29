@@ -37,6 +37,15 @@ pub struct CleanArgs {
         conflicts_with = "arg1"
     )]
     pub expr: Option<String>,
+    /// Also delete persistent scratch caches. With an ADDRESS, only that
+    /// declaration's cache; alone, every one in the workspace.
+    ///
+    /// A flag rather than its own command because `clean` already means "delete
+    /// what I point at", and a scratch is one more thing you can point at.
+    /// `heph tool scratch rm` is the same operation for someone who is only
+    /// thinking about scratch.
+    #[arg(long)]
+    pub scratch: bool,
 }
 
 /// Resolve the selection — `run`'s and `query`'s, with **no default**.
@@ -138,8 +147,25 @@ async fn execute_async(
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
+
+    // `--scratch` alone means "clear the scratch store", with no target
+    // selection to make — so it must not be forced through `selection`, which
+    // deliberately refuses an empty one rather than wiping the target cache.
+    if args.scratch && args.arg1.is_none() && args.expr.is_none() {
+        let (engine, _shutdown) = bootstrap::new_engine()?;
+        let (n, freed) = engine.scratch_remove(None)?;
+        println!("Removed {n} scratch cache(s), freed {freed} bytes.");
+        return Ok(());
+    }
+
     let matcher = selection(&args, &cwp)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
+    if args.scratch
+        && let Some(addr) = args.arg1.as_deref()
+    {
+        let (n, freed) = engine.scratch_remove(Some(addr))?;
+        println!("Removed {n} scratch cache(s), freed {freed} bytes.");
+    }
     let app = CleanApp {
         engine,
         matcher,
@@ -163,6 +189,7 @@ mod tests {
             arg1: arg1.map(str::to_string),
             arg2: None,
             expr: expr.map(str::to_string),
+            scratch: false,
         }
     }
 

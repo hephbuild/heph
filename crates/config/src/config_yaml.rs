@@ -52,6 +52,10 @@ pub struct ConfigYaml {
     pub plugins: Vec<PluginSpec>,
     #[serde(default)]
     pub mem_cache: Option<MemCacheConfig>,
+    /// Scratch-cache policy: which lineage a run writes to and which it may read
+    /// from. See [`ScratchConfig`].
+    #[serde(default)]
+    pub scratch: Option<ScratchConfig>,
     #[serde(default)]
     pub tmp_cache: Option<MemCacheConfig>,
     #[serde(default)]
@@ -176,6 +180,49 @@ pub struct CacheConfig {
     /// Manifests always stay in sqlite. Omit to use the engine default.
     #[serde(default)]
     pub spill_threshold_bytes: Option<u64>,
+}
+
+/// Scratch-cache policy (`scratch:` in `.hephconfig`).
+///
+/// A scratch cache's *contents* are declared by its target; this is about which
+/// **lineage** a run reads and writes. A lineage is named by a scope, and the
+/// natural scope is the branch: work done on one branch should stay there, and a
+/// branch that has none of its own should start from somewhere warm rather than
+/// from nothing.
+///
+/// Repo/CI policy rather than a property of any target, which is why it lives
+/// here and not in a BUILD file — a per-target override would let one BUILD file
+/// opt out of the isolation the repo just configured.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ScratchConfig {
+    /// The lineage this run **writes** to. Supports `${git:branch}`, which heph
+    /// resolves itself so a developer gets branch scoping without wiring
+    /// anything; CI overrides it with whatever names the branch there.
+    ///
+    /// Empty (the default) means one shared lineage — today's behaviour, and the
+    /// right answer for a single long-lived branch.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Lineages this run may **read** from when its own scope has nothing, tried
+    /// in order. `["master"]` is the usual answer; a three-level convention
+    /// (`feature` -> `develop` -> `master`) works without special-casing.
+    ///
+    /// Writes never go here — that isolation is what makes the feature safe to
+    /// enable on untrusted PR CI at all.
+    #[serde(default)]
+    pub restore_scopes: Vec<String>,
+    /// Copy the fallback lineage's directory into this scope on the first build
+    /// after a scope change, instead of starting cold.
+    ///
+    /// This is the only copy in the design: once per (slot, scope), amortized
+    /// over every later build on that branch, and measured against a *cold
+    /// rebuild* rather than against nothing. Defaults to on, because without it
+    /// branch scoping just makes every branch switch cold — which is worse than
+    /// not scoping at all. Turn it off if a slot is large and the filesystem has
+    /// no reflink.
+    #[serde(default)]
+    pub seed_on_fork: Option<bool>,
 }
 
 impl ConfigYaml {

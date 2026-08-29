@@ -9,8 +9,75 @@
 use std::path::{Path, PathBuf};
 
 use crate::engine::RemoteCacheDef;
-use crate::engine::config_yaml::{ConfigYaml, FuseConfig, LockBackendConfig, MemCacheConfig};
+use crate::engine::config_yaml::{
+    ConfigYaml, FuseConfig, LockBackendConfig, MemCacheConfig, ScratchConfig,
+};
 use crate::engine::result_lock::LockBackend;
+
+/// Expand a configured scope, resolving `${git:branch}` against `root`.
+///
+/// Done here so nothing downstream knows about git: a scope reaches the store as
+/// a plain string, and a workspace that is not a git checkout simply gets an
+/// empty scope (one shared lineage) rather than an error — a cache policy must
+/// never be the reason a build cannot start.
+fn expand_scope(raw: &str, root: &Path) -> String {
+    const GIT_BRANCH: &str = "${git:branch}";
+    if !raw.contains(GIT_BRANCH) {
+        return raw.to_string();
+    }
+    let branch = git_branch(root).unwrap_or_default();
+    raw.replace(GIT_BRANCH, &branch)
+}
+
+/// The current branch name, or `None` outside a git checkout / on a detached
+/// HEAD. Reads `.git/HEAD` directly rather than shelling out to `git`: this runs
+/// on every engine construction, and a subprocess for one line of a file that is
+/// always there is not worth it — nor is depending on `git` being installed.
+fn git_branch(root: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
+    // `ref: refs/heads/<branch>` on a branch; a bare sha when detached, which is
+    // not a lineage anyone means to share, so it reads as no scope.
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
+/// Make a scope safe to use as one path component.
+///
+/// Branch names routinely contain `/` (`feature/x`), and a raw one would silently
+/// nest the store an extra level and make two branches collide the moment one is a
+/// prefix path of another. Same sanitizer shape as the env-var one: keep what is
+/// unambiguous, fold the rest to `_`.
+pub fn sanitize_scope(scope: &str) -> String {
+    if scope.is_empty() {
+        return "_".to_string();
+    }
+    scope
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn resolve_scratch(c: &ScratchConfig, root: &Path) -> ScratchOptions {
+    let defaults = ScratchOptions::default();
+    ScratchOptions {
+        // Not configurable from the file: turning scratch off is something you do
+        // to one run to check a target, not a state a workspace sits in.
+        enabled: defaults.enabled,
+        scope: c
+            .scope
+            .as_deref()
+            .map(|s| expand_scope(s, root))
+            .unwrap_or(defaults.scope),
+        restore_scopes: c.restore_scopes.clone(),
+        seed_on_fork: c.seed_on_fork.unwrap_or(defaults.seed_on_fork),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -46,6 +113,40 @@ pub struct Config {
     ///
     /// [`RemoteCacheSet`]: crate::engine::RemoteCacheSet
     pub remote_caches: Vec<RemoteCacheDef>,
+    /// Which scratch lineage this run reads and writes. See [`ScratchOptions`].
+    pub scratch: ScratchOptions,
+}
+
+/// Resolved scratch-lineage policy. The config's `${git:branch}` is already
+/// expanded here, so nothing downstream knows about git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchOptions {
+    /// Whether declared scratch caches are used at all.
+    ///
+    /// `false` is `--scratch=off`: every target runs with its caches absent. It
+    /// is the audit mode for the scratch contract — outputs must be identical
+    /// warm, cold or absent — so it is a run-time switch and deliberately not a
+    /// config-file one.
+    pub enabled: bool,
+    /// Lineage this run writes to. Empty means one shared lineage.
+    pub scope: String,
+    /// Lineages to fall back to on read, in order. Never written to.
+    pub restore_scopes: Vec<String>,
+    /// Seed a new scope from its fallback rather than starting cold.
+    pub seed_on_fork: bool,
+}
+
+impl Default for ScratchOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scope: String::new(),
+            restore_scopes: Vec::new(),
+            // On, because branch scoping without it makes every switch cold,
+            // which is worse than not scoping at all.
+            seed_on_fork: true,
+        }
+    }
 }
 
 /// Default spill threshold: 8 MiB. Above a few MB the filesystem beats sqlite
@@ -68,6 +169,7 @@ impl Default for Config {
             spill_threshold_bytes: DEFAULT_SPILL_THRESHOLD_BYTES,
             telemetry_enabled: true,
             remote_caches: Vec::new(),
+            scratch: ScratchOptions::default(),
         }
     }
 }
@@ -151,6 +253,11 @@ impl ConfigYamlExt for ConfigYaml {
                 .map(mem_cache_opts)
                 .unwrap_or(defaults.tmp_cache),
             fuse: self.fuse.unwrap_or(defaults.fuse),
+            scratch: self
+                .scratch
+                .as_ref()
+                .map(|s| resolve_scratch(s, root))
+                .unwrap_or(defaults.scratch),
             lock_backend: self
                 .lock
                 .and_then(|l| l.backend)
@@ -185,6 +292,60 @@ impl ConfigYamlExt for ConfigYaml {
 mod tests {
     use super::*;
     use crate::engine::result_lock::LockBackend;
+
+    #[test]
+    fn a_scope_without_the_placeholder_is_passed_through() {
+        assert_eq!(expand_scope("main", Path::new("/nope")), "main");
+        assert_eq!(expand_scope("", Path::new("/nope")), "");
+    }
+
+    /// A workspace that is not a git checkout must still build. A cache policy is
+    /// never a reason a run cannot start, so an unresolvable branch reads as "no
+    /// scope" — one shared lineage — rather than an error.
+    #[test]
+    fn git_branch_outside_a_checkout_expands_to_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(expand_scope("${git:branch}", tmp.path()), "");
+    }
+
+    #[test]
+    fn git_branch_reads_the_current_branch_from_head() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".git")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".git").join("HEAD"),
+            "ref: refs/heads/feature/x\n",
+        )
+        .expect("write");
+        assert_eq!(expand_scope("${git:branch}", tmp.path()), "feature/x");
+        // Composable, so a CI config can namespace a shared bucket.
+        assert_eq!(expand_scope("ci-${git:branch}", tmp.path()), "ci-feature/x");
+    }
+
+    /// A detached HEAD is a sha, not a lineage anyone means to share.
+    #[test]
+    fn a_detached_head_expands_to_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".git")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".git").join("HEAD"),
+            "9f1027fc595e9705ae0ec764cd6264b07e5271c0\n",
+        )
+        .expect("write");
+        assert_eq!(expand_scope("${git:branch}", tmp.path()), "");
+    }
+
+    #[test]
+    fn sanitize_scope_keeps_one_path_component() {
+        assert_eq!(sanitize_scope("main"), "main");
+        assert_eq!(sanitize_scope("feature/x"), "feature_x");
+        assert_eq!(sanitize_scope("v1.2-rc_3"), "v1.2-rc_3");
+        // The empty scope is the default and still needs a name of its own.
+        assert_eq!(sanitize_scope(""), "_");
+        // No traversal can come out of a branch name.
+        assert!(!sanitize_scope("../../etc").contains('/'));
+        assert!(!sanitize_scope("..").contains('.') || sanitize_scope("..") == "..");
+    }
 
     #[test]
     fn resolve_applies_defaults_for_empty_yaml() {
