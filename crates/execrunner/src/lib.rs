@@ -25,10 +25,16 @@
 //! object ([`RunnerHost`]), handed over at engine construction the same way
 //! `hproc`'s supervisor sink is installed.
 //!
-//! A cdylib statically links its **own** copy of this crate, so its
-//! [`RunnerHost`] slot is a different global from the host binary's. An
+//! A cdylib statically links its **own** copy of this crate, so its host
+//! registry is a different global from the host binary's and starts empty. The
+//! host hands each plugin a forwarder into its own at load time
+//! (`heph_plugin_set_runner_host`); see [`wire`] for what crosses. An
 //! uninstalled host with a non-local runner is a hard error, never a silent
 //! fall back to a local spawn — see [`prepare`].
+//!
+//! The registry is a *list* of hosts purely to serve test binaries, which build
+//! many engines in one process. A shipped `heph` installs exactly one. See
+//! [`RunnerHost::owns`].
 
 pub mod agent;
 pub mod config;
@@ -199,24 +205,37 @@ impl SpecRewrite {
 /// here would close a dependency cycle.
 #[async_trait::async_trait]
 pub trait RunnerHost: Send + Sync {
+    /// Whether this host can resolve `request_id`.
+    ///
+    /// **This exists for the test harness.** A shipped `heph` runs one command
+    /// per process and constructs exactly one engine, so the installed list
+    /// always holds one host and this always answers `true`. A test binary is
+    /// the opposite: `testkit`'s `WorkspaceBuilder::build` installs a host per
+    /// workspace and one binary builds dozens, plus `Workspace::reopen` builds a
+    /// second engine over the same root — all into the same process-global.
+    ///
+    /// That is why the hosts are a list and not a `OnceLock`. With a slot the
+    /// first engine installed wins forever and every later workspace resolves
+    /// against it, which fails as `request '<id>' is no longer live` — the
+    /// actual bug that produced this design. Request ids are process-unique, so
+    /// at most one host answers.
+    ///
+    /// A plugin cdylib never has more than one either: its registry holds a
+    /// single forwarder to the host, which claims every request because the
+    /// routing happens on the far side.
+    fn owns(&self, request_id: &str) -> bool;
+
+    /// Whether the engine behind this host is still alive.
+    ///
+    /// Dead hosts are pruned on the next install. Also for the test harness —
+    /// a process that builds one engine has nothing to accumulate; a test binary
+    /// that builds dozens would otherwise keep every dead one on the list.
+    fn alive(&self) -> bool;
+
     /// Rewrite `rewrite` for the runner at `addr`, within request `request_id`.
     ///
     /// May start a session (an agent runner holds a live environment), so it is
     /// async and may be slow on first use for a given runner.
-    /// Whether this host can resolve `request_id`.
-    ///
-    /// A process can hold more than one engine — the test harness builds many,
-    /// and reopening a workspace builds a second over the same root — so the
-    /// installed hosts are a list, not a slot, and a request is routed to the
-    /// engine that owns it. Request ids are process-unique, so at most one host
-    /// answers.
-    fn owns(&self, request_id: &str) -> bool;
-
-    /// Whether the engine behind this host is still alive. Dead hosts are
-    /// pruned on the next install so a long-lived process (the test binary)
-    /// does not accumulate them.
-    fn alive(&self) -> bool;
-
     async fn prepare(
         &self,
         request_id: &str,
@@ -249,14 +268,23 @@ pub struct PrepareOutcome {
 /// engine's request registry — which fails, confusingly, as "request is no
 /// longer live". Routing by request id is what makes many engines behave the
 /// way one does.
+/// The installed hosts for *this* copy of the crate.
+///
+/// A `Vec` rather than a slot **only because of the test harness** — in a
+/// shipped `heph` this holds exactly one host for the process's lifetime. See
+/// [`RunnerHost::owns`] for why a slot does not work, and what broke when it
+/// was one.
 static HOSTS: OnceLock<std::sync::Mutex<Vec<Arc<dyn RunnerHost>>>> = OnceLock::new();
 
 fn hosts() -> &'static std::sync::Mutex<Vec<Arc<dyn RunnerHost>>> {
     HOSTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// Install a runner host. Called once per engine, and once per loaded cdylib by
-/// the plugin SDK (each cdylib has its own copy of this static).
+/// Install a runner host.
+///
+/// Called once per engine — once per process in a shipped `heph`, once per
+/// workspace in a test binary — and once per loaded cdylib by the plugin SDK,
+/// since each cdylib links its own copy of this static.
 pub fn install_host(host: Arc<dyn RunnerHost>) {
     let Ok(mut list) = hosts().lock() else {
         tracing::error!("exec-runner host registry poisoned; runner resolution will fail");
