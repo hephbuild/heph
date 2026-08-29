@@ -67,6 +67,44 @@ pub const TARGET: &str = "platform";
 pub const BUILDER_ARG: &str = "builder";
 pub const DRIVER_NAME: &str = "oci_builder_platform";
 
+/// The shared registry blob store's target name, in [`PKG`].
+///
+/// `oci_pull` caches per target, so two images sharing a base layer download it
+/// once *per target*. Registry blobs are addressed by digest, so one store can
+/// serve every pull: an entry either matches its digest or is not used.
+pub const BLOBS_TARGET: &str = "blobs";
+
+/// Where the blob store mounts in a pulling target's sandbox.
+const BLOBS_MOUNT: &str = ".heph-oci-blobs";
+
+/// Environment variable the blob store's directory is announced through.
+pub const BLOBS_ENV: &str = "HEPH_OCI_BLOBS";
+
+/// The blob store's address, as written in a dep.
+pub(crate) fn blobs_addr() -> String {
+    format!("//{PKG}:{BLOBS_TARGET}")
+}
+
+/// The scratch reference every pulling target carries.
+///
+/// `hashed: false, runtime: false` — it materializes no artifacts and must not
+/// reach the target's cache key: a pull returns the same image whether the store
+/// was warm or empty.
+pub(crate) fn blobs_input() -> hplugin::driver::targetdef::Input {
+    hplugin::driver::targetdef::Input {
+        r#ref: hplugin::driver::TargetAddr::parse(&blobs_addr(), &PkgBuf::from(""))
+            .expect("the blob store addr is a constant and always parses"),
+        mode: hplugin::driver::targetdef::InputMode::Standard,
+        origin_id: format!("{}|0", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX),
+        annotations: std::collections::BTreeMap::from([(
+            hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
+            "true".to_string(),
+        )]),
+        hashed: false,
+        runtime: false,
+    }
+}
+
 /// The file the probe writes, relative to the workspace root.
 const OUT_PATH: &str = "@heph/oci/platform.txt";
 
@@ -142,7 +180,51 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         Box::pin(async move {
-            if req.addr.package != PKG || req.addr.name != TARGET {
+            if req.addr.package != PKG {
+                return Err(GetError::NotFound);
+            }
+            // The shared blob store. A `scratch` declaration, not a buildable
+            // target: the engine resolves, locks and mounts the directory, and
+            // `oci_pull` writes registry blobs into it instead of into a
+            // per-sandbox directory that is thrown away with the sandbox.
+            if req.addr.name == BLOBS_TARGET {
+                return Ok(GetResponse {
+                    target_spec: TargetSpec {
+                        addr: req.addr,
+                        driver: "scratch".to_string(),
+                        config: std::collections::HashMap::from([
+                            (
+                                "path".to_string(),
+                                hcore::htvalue::Value::String(BLOBS_MOUNT.to_string()),
+                            ),
+                            (
+                                "env".to_string(),
+                                hcore::htvalue::Value::String(BLOBS_ENV.to_string()),
+                            ),
+                            // A digest-addressed store is safe under concurrent
+                            // writers for the same reason Go's build cache is:
+                            // an entry either matches its digest or is not used,
+                            // so two pulls racing on one blob cannot produce a
+                            // wrong answer.
+                            (
+                                "access".to_string(),
+                                hcore::htvalue::Value::String("shared".to_string()),
+                            ),
+                            // The *image* is platform-specific; the *blob store*
+                            // is not. Blobs are opaque digest-named bytes, so one
+                            // store can hold amd64 and arm64 layers side by side
+                            // and travel between machines unchanged.
+                            (
+                                "platform".to_string(),
+                                hcore::htvalue::Value::String("any".to_string()),
+                            ),
+                            ("remote".to_string(), hcore::htvalue::Value::Bool(false)),
+                        ]),
+                        ..Default::default()
+                    },
+                });
+            }
+            if req.addr.name != TARGET {
                 return Err(GetError::NotFound);
             }
             Ok(GetResponse {
