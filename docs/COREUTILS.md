@@ -1,6 +1,6 @@
 # Builtin coreutils
 
-heph ships 43 POSIX utilities inside its own binary and can put them on every
+heph ships 47 POSIX utilities inside its own binary and can put them on every
 target's `PATH`, so a recipe that runs `cp`, `install` or `sha256sum` behaves
 identically on Linux and macOS.
 
@@ -137,7 +137,7 @@ fetching, hermetically and cacheably), `git`, `uname` (normalising `arm64` vs
 `aarch64` would change recipes that already switch on it), `du`/`df` (they
 answer questions about the machine, not the build), and anything interactive.
 
-`sed`, `tar` and `gzip` are not in yet; they are the next slices. `diff`/`cmp`
+`sed` is not in yet; it is the last slice. `diff`/`cmp`
 are not planned: the `diffutils` crate exposes its algorithms but keeps its CLI
 in a private `main`, so wiring it up would mean reimplementing its argument
 parsing for the lowest-value pair in the set.
@@ -159,6 +159,30 @@ The argument parser is hand-rolled rather than clap, because `grep -e -v file`
 must treat `-v` as the *pattern*. Line numbers are always counted and only
 printed under `-n`: the `UTF8` sink asks every match for its line number and
 fails if the searcher was not tracking them.
+
+### `tar`, `gzip`/`gunzip` and `zstd` — reproducible by default
+
+The applets where the divergence is not a flag but the *bytes*. GNU tar and
+bsdtar disagree about whether `--transform`, `--sort`, `--owner` and `--mtime`
+exist at all; `gzip` writes the source filename and its mtime into the header
+unless told not to; `zstd` is installed by default on neither host.
+
+Archiving the same tree twice, on two machines, should produce the same bytes.
+With the host tools it does not — gzipping identical content a second later
+gives a different file. So the reproducible settings are the **defaults**, not
+flags anyone has to remember:
+
+* entries sorted by path, so the archive does not inherit directory order;
+* uid/gid 0 and empty owner *names*, so it does not inherit whoever built it;
+* mode normalised to the executable bit, since the rest is umask;
+* mtime from `SOURCE_DATE_EPOCH` when set, otherwise 0;
+* no gzip header name or timestamp.
+
+There is deliberately no flag to turn any of that off. A recipe that wants a
+non-reproducible archive is a recipe with a bug.
+
+Compression is detected from the magic bytes rather than the file name, so a
+`.tar` that is actually gzipped still extracts instead of failing confusingly.
 
 ### `find` and `xargs`
 

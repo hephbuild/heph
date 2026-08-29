@@ -15,6 +15,7 @@
 //!
 //! [uutils/coreutils]: https://github.com/uutils/coreutils
 
+mod archive;
 mod find;
 mod grep;
 
@@ -32,10 +33,11 @@ use std::path::{Path, PathBuf};
 ///
 /// Bump it on any observable behaviour change — an applet added or removed, an
 /// upstream upgrade that changes output, a fix to one of the hand-written parts.
-pub const COREUTILS_VERSION: u32 = 2;
+pub const COREUTILS_VERSION: u32 = 3;
 
 /// Where the applets come from, for `heph tool coreutils list`.
-pub const UPSTREAM: &str = "uutils/coreutils 0.10, uutils/findutils 0.10, ripgrep's grep-* crates";
+pub const UPSTREAM: &str =
+    "uutils/coreutils 0.10, uutils/findutils 0.10, ripgrep's grep-* crates, tar/flate2/zstd";
 
 /// One utility, and the entry point that runs it.
 #[derive(Debug)]
@@ -85,6 +87,8 @@ applets! {
     "false" => uu!(uu_false),
     "find" => crate::find::find,
     "grep" => crate::grep::main,
+    "gunzip" => crate::archive::gunzip,
+    "gzip" => crate::archive::gzip,
     "head" => uu!(uu_head),
     "install" => uu!(uu_install),
     "ln" => uu!(uu_ln),
@@ -106,6 +110,7 @@ applets! {
     "sort" => uu!(uu_sort),
     "stat" => uu!(uu_stat),
     "tail" => uu!(uu_tail),
+    "tar" => crate::archive::tar,
     "tee" => uu!(uu_tee),
     "timeout" => uu!(uu_timeout),
     "touch" => uu!(uu_touch),
@@ -114,6 +119,7 @@ applets! {
     "uniq" => uu!(uu_uniq),
     "wc" => uu!(uu_wc),
     "xargs" => crate::find::xargs,
+    "zstd" => crate::archive::zstd,
 }
 
 /// The applet called `name`, if heph ships one.
