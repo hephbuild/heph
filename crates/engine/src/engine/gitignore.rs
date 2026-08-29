@@ -657,8 +657,9 @@ mod tests {
             parallelism: None,
             ..Config::for_tests(root.path())
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         // Declared in an order that does not match the sorted pattern order, so a
         // stable result cannot come from insertion order alone.
         let provider = hbuiltins::pluginstatictarget::Provider::new(vec![

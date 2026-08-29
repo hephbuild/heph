@@ -62,8 +62,8 @@ impl Workspace {
                     std::sync::Arc::clone(&init.functions),
                 ))
             })
-            .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
-            .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+            .with_managed_driver(Box::new(pluginexec::Driver::new_exec().with_host_path()))
+            .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
             .with_managed_driver(Box::new(pluginhttp::Driver))
             .with_driver(Box::new(heph::plugintemplate::Driver));
         let builder = if let Some(p) = p {
@@ -125,10 +125,10 @@ impl Workspace {
             })
             .context("reopen: register buildfile provider")?;
         engine
-            .register_managed_driver(|_| Box::new(pluginexec::Driver::new_exec()))
+            .register_managed_driver(|_| Box::new(pluginexec::Driver::new_exec().with_host_path()))
             .context("reopen: register exec driver")?;
         engine
-            .register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash()))
+            .register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))
             .context("reopen: register bash driver")?;
         engine
             .register_managed_driver(|_| Box::new(pluginhttp::Driver))
@@ -145,8 +145,8 @@ impl Workspace {
         let provider = pluginstatictarget::Provider::new(targets)?;
         let ws = WorkspaceBuilder::new()?
             .with_provider(move |_| Box::new(provider))
-            .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
-            .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+            .with_managed_driver(Box::new(pluginexec::Driver::new_exec().with_host_path()))
+            .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
             .build()?;
         Ok(Self {
             inner: ws,

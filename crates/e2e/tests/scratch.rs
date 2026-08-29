@@ -1131,7 +1131,7 @@ fn remote_engine(
         ))
     })
     .expect("provider");
-    e.register_managed_driver(|_| Box::new(heph::pluginexec::Driver::new_bash()))
+    e.register_managed_driver(|_| Box::new(heph::pluginexec::Driver::new_bash().with_host_path()))
         .expect("bash driver");
     Arc::new(e)
 }

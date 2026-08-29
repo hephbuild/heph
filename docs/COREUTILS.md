@@ -34,18 +34,26 @@ those outputs undeclared and host-defined.
 
 ## Using it
 
-Off by default. Turning it on changes what every recipe's `cp` resolves to, and
-it moves every exec target's cache key.
+**On by default.** There is nothing to configure: a recipe that runs `cp`
+behaves the same on Linux and macOS because the toolbox is already on its
+`PATH`. A toolbox nobody enables fixes nothing.
+
+The escape hatch is per driver, for a workspace that genuinely wants the host's
+tools:
 
 ```yaml
 plugins:
   - builtin: exec
     options:
-      coreutils: true
+      coreutils: false
   - builtin: bash
     options:
-      coreutils: true
+      coreutils: false
 ```
+
+Opting out is folded into the def hash too, so it is a cache-visible decision
+rather than a silent one — turning it off invalidates the targets it affects,
+which is what you want, because their outputs may change.
 
 `heph tool coreutils list` prints the set. `heph tool coreutils which cp` says
 whether heph ships that name and what the host would supply instead — the two
@@ -61,6 +69,44 @@ environment provides:
 ```text
 PATH = the target's tools  ++  what the target declared  ++  the runner's PATH  ++  heph coreutils
 ```
+
+**The host's directories are not on that list.** A target sees what it declares
+plus heph's builtins, and nothing else: a recipe that reaches for an undeclared
+host binary is reaching outside its own cache key, and it now fails with
+`command not found` rather than succeeding on whichever machine happens to have
+it. `path:` on the driver names directories back for a workspace that needs
+them.
+
+The shell is the exception, and deliberately so. `bash` is the *driver's*
+implementation detail, not something the target declared, so **for a local
+spawn** it is resolved on the **ambient** `PATH` — the environment heph itself
+was launched in — and spawned by absolute path. Under a runner it is left
+alone: a container has its own filesystem, and an absolute path resolved from
+heph's `PATH` does not exist inside it, so the shell has to come from the
+environment the target actually runs in — which is what naming a runner asks
+for. An absolute program spawns fine regardless of the
+child's `PATH`, so the shell starts and the recipe inside it still cannot reach
+an undeclared host binary. That must never extend to the `exec` driver's
+`argv[0]`, which *is* the target's command: resolving that ambiently would hand
+back the whole hole this closes.
+
+The interactive shell from `--shell`, on a driver with no shell mode of its
+own, is the other exception: it gets the host's directories. Its entire purpose
+is poking around, a session with no `ls` on `PATH` would be useless, and it
+builds nothing and reaches no cache key — so the argument for keeping the host
+out does not apply to it.
+
+A runner supplies the environment its targets run in, `PATH` included — the
+driver's search path is not injected under one, for the same reason the host's
+directories are not injected locally. A `wrap` runner that names no `PATH` gives
+its targets only their declared tools and, where the shim directory is
+reachable, the builtins.
+
+The shell stays out of the cache key. It is unhashed, and folding the resolved
+path in would split the remote cache between every machine whose `bash` lives
+somewhere different. A provisioned shell would close that properly; until then
+it is an acknowledged hole, and macOS's bash 3.2 remains the largest cross-OS
+divergence left.
 
 **A target's own tools always win.** A recipe that provisions its own `sed` gets
 that `sed`; the builtins never override a deliberately declared tool.
@@ -120,8 +166,8 @@ deliberate:
 
 Bump it on any observable behaviour change: an applet added or removed, an
 upstream upgrade that changes output, a fix to a hand-written part. Nothing is
-hashed at all while the toolbox is off, so a workspace that never turns it on
-keeps the keys it has today.
+hashed at all while the toolbox is off, so a workspace that opts out keeps the
+keys it would have had without this feature.
 
 Resolving the shim directory is fallible on purpose. Degrading to "no builtins"
 would run the target against the host's utilities while its cache key claims

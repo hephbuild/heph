@@ -85,7 +85,7 @@ fn builder(providers: Vec<FaultProvider>) -> anyhow::Result<htestkit::Workspace>
     for p in providers {
         b = b.with_provider(move |_| Box::new(p));
     }
-    b.with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+    b.with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
         .build()
 }
 
