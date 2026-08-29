@@ -752,6 +752,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn per_file_single_file_input_has_no_symlinked_ancestor() {
+        // Regression: `link_symlinked` (the default, `per_file = false`) can
+        // symlink an *ancestor directory* of a single-file input rather than
+        // the leaf itself (`place_entry`'s "single child is a file → content
+        // root" case) — `fs.realpath()`-based resolvers (Node's `require`,
+        // notably) then see the *stage's* isolated path, not the sandbox
+        // path, and fail to find sibling `node_modules` alongside it. This
+        // is the real bug a `js_test` config-file read-only regression hit:
+        // `vitest.config.ts` staged read-only via a plain directory symlink
+        // could not resolve its own `node_modules`-installed plugins.
+        //
+        // `per_file = true` (`link_tree`) must avoid this: every ancestor
+        // directory in the destination path is a real, non-symlinked
+        // directory, and only the leaf file itself is a hardlink — so
+        // `realpath()` on the leaf returns the sandbox path itself.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        let c = content(
+            "cfg1",
+            &[("mgmt/backoffice/vitest.config.ts", "export default {}", false)],
+        );
+
+        stage_and_link(&c, &stage, "//mgmt/backoffice:file", &link, None, &[], true, &ct())
+            .await
+            .expect("per-file stage");
+
+        let leaf = link.join("mgmt/backoffice/vitest.config.ts");
+        let leaf_md = std::fs::symlink_metadata(&leaf).expect("lstat leaf");
+        assert!(
+            leaf_md.file_type().is_file() && !leaf_md.file_type().is_symlink(),
+            "leaf must be a real (hardlinked) file, not a symlink: {leaf:?}"
+        );
+        // Walk every ancestor up to (not including) `link` itself and assert
+        // none of them is a symlink — the property that keeps `realpath()`
+        // resolving inside the sandbox rather than escaping into `stage`.
+        let mut ancestor = leaf.parent().expect("leaf has a parent");
+        while ancestor != link {
+            let md = std::fs::symlink_metadata(ancestor)
+                .unwrap_or_else(|e| panic!("lstat ancestor {ancestor:?}: {e}"));
+            assert!(
+                !md.file_type().is_symlink(),
+                "ancestor {ancestor:?} must be a real directory, not a symlink — a symlinked \
+                 ancestor is exactly what breaks Node's realpath-based module resolution"
+            );
+            ancestor = ancestor.parent().expect("ancestor has a parent under link");
+        }
+        assert_eq!(
+            std::fs::canonicalize(&leaf).expect("canonicalize leaf"),
+            std::fs::canonicalize(&link)
+                .expect("canonicalize link")
+                .join("mgmt/backoffice/vitest.config.ts"),
+            "realpath of the staged leaf must resolve inside the sandbox, not into `stage/`"
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_removal_succeeds_over_readonly_hardlinks() {
         // Regression: a sandbox holds hardlinks to read-only staged files.
         // Removing the sandbox must succeed (unlink needs write on the sandbox

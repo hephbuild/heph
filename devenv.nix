@@ -53,7 +53,7 @@ let
   };
 
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
+  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p pluginjs-e2e -p htspec-derive -p core -p config -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-js -p plugin-js-cdylib -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
 in
 {
   # https://devenv.sh/basics/
@@ -72,6 +72,15 @@ in
     # A `gotool = "<version>"` workspace downloads its own hermetic SDK and is
     # unaffected by this; only the `host` toolchain reads it.
     pkgs.go
+    # The Node toolchain `pluginjs-e2e` (and `plugin-js`'s own `#[ignore]`d
+    # subprocess tests) build against. `js_test`/`js_typecheck`/`js_bundle`/
+    # `js_lint` deliberately resolve their tool from
+    # `<workspace_root>/node_modules/.bin/<tool>` then `PATH` — a disclosed
+    # non-hermetic escape hatch (see `crates/plugin-js/src/pluginjs/driver_test.rs`'s
+    # module doc) mirroring the go toolchain comment just above this one, and
+    # for the identical reason: without `npm` on PATH, every js e2e test
+    # would silently skip rather than fail loudly.
+    pkgs.nodejs_24
     pkgs.buf
     pkgs.protoc-gen-prost
     pkgs.protoc-gen-prost-serde
@@ -227,9 +236,10 @@ in
   #
   # The third pass covers `fuse-sandbox` **off**, and its selection is the
   # subtle one. `--workspace --no-default-features` looks like it turns the
-  # feature off and does not: `crates/e2e`, `crates/plugingo-e2e` and
-  # `crates/testkit` depend on the root `heph` package with default features on,
-  # and cargo unifies features across the whole selection, so that edge switches
+  # feature off and does not: `crates/e2e`, `crates/plugingo-e2e`,
+  # `crates/pluginjs-e2e` and `crates/testkit` depend on the root `heph` package
+  # with default features on, and cargo unifies features across the whole
+  # selection, so that edge switches
   # `fuse-sandbox` straight back on. Verified, not reasoned: with an
   # `indexing_slicing` error injected into `crates/sandboxfuse/src/stub.rs` — the
   # file that is compiled *only* when the feature is off — the naive invocation
@@ -277,7 +287,7 @@ in
     # off" and wave the wrong arm through, which is the silent-green failure
     # this whole gate exists to remove.
     echo '> checking --no-default-features really disables fuse-sandbox'
-    if fuser_tree=$(cargo tree --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --exclude bench --no-default-features --locked -i fuser 2>&1); then
+    if fuser_tree=$(cargo tree --workspace --exclude e2e --exclude plugingo-e2e --exclude pluginjs-e2e --exclude testkit --exclude bench --no-default-features --locked -i fuser 2>&1); then
       echo "error: --no-default-features left 'fuser' in the dependency graph, so the pass below would lint the fuse-sandbox=on arm and the feature-off code is still covered by nothing." >&2
       echo "       Some selected package pulls the root 'heph' package (or 'sandboxfuse') with default features on; exclude it here and in 'fix'." >&2
       printf '%s\n' "$fuser_tree" >&2
@@ -296,7 +306,7 @@ in
       exit 1
     fi
     echo '> clippy --no-default-features'
-    cargo clippy --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --exclude bench --all-targets --no-default-features --locked -- -D warnings
+    cargo clippy --workspace --exclude e2e --exclude plugingo-e2e --exclude pluginjs-e2e --exclude testkit --exclude bench --all-targets --no-default-features --locked -- -D warnings
     echo '> fmt'
     cargo fmt --check ${qualityCrates}
   '';
@@ -311,7 +321,7 @@ in
   scripts.fix.exec = ''
     set -euo pipefail
     cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
-    cargo clippy --fix --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --exclude bench --all-targets --no-default-features --allow-dirty --allow-staged
+    cargo clippy --fix --workspace --exclude e2e --exclude plugingo-e2e --exclude pluginjs-e2e --exclude testkit --exclude bench --all-targets --no-default-features --allow-dirty --allow-staged
     cargo fmt ${qualityCrates}
   '';
   # Test everything. The default pass covers all crates with default features; the
@@ -323,11 +333,16 @@ in
   scripts.tst.exec = "cargo test --locked --workspace --exclude bin-e2e && cargo test --locked -p plugin-stabby --features host && cargo test --locked -p plugin-sdk --features stabby";
 
   # Binary end-to-end suite: black-box tests against the artifacts CI publishes
-  # (the `heph` binary + the go/gha plugin cdylibs). ONE entrypoint, identical
-  # locally and in CI — the only difference is where the artifacts come from:
+  # (the `heph` binary + the go/gha/oci/js plugin cdylibs). ONE entrypoint,
+  # identical locally and in CI — the only difference is where the artifacts
+  # come from:
   #
   #   e2e                      # build them from this tree (local default)
   #   HEPH_E2E_FROM=dist e2e   # use an already-downloaded set (CI)
+  #
+  # Every staged artifact is named because a test actually dlopens it:
+  # `crates/bin-e2e/tests/plugin_dylib.rs` for go/gha/oci,
+  # `crates/bin-e2e/tests/plugin_dylib_js.rs` for `heph-js-plugin.$ext`.
   #
   # Both branches converge on the same normalized layout, so the tests never
   # learn which one ran. Extra args pass through to cargo test (e.g.
@@ -351,7 +366,7 @@ in
     # or a re-run started before the first finished — still collide: a fixed
     # path would let the second `rm -rf` the binaries the first is still running
     # tests against, and the failure would surface as an unrelated test blowing
-    # up somewhere else. mktemp costs one copy of three files and removes the
+    # up somewhere else. mktemp costs one copy of five files and removes the
     # whole class.
     dist_root="$target/e2e-dist"
     mkdir -p "$dist_root"
@@ -371,10 +386,11 @@ in
       cp "$src/heph-go-plugin_''${os}_''${arch}.$ext"  "$dist/heph-go-plugin.$ext"
       cp "$src/heph-gha-plugin_''${os}_''${arch}.$ext" "$dist/heph-gha-plugin.$ext"
       cp "$src/heph-oci-plugin_''${os}_''${arch}.$ext" "$dist/heph-oci-plugin.$ext"
+      cp "$src/heph-js-plugin_''${os}_''${arch}.$ext"  "$dist/heph-js-plugin.$ext"
     else
       # Local: build the same artifacts the build job builds, the same way (one
       # invocation so cargo overlaps their LTO tails — see heph.yml).
-      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib
+      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-js-cdylib
       out="$target/release"
 
       # cargo's build lock covers the build but not the gap between it and the
@@ -391,14 +407,15 @@ in
       fingerprint() {
         stat -c '%i %s %Y' "$@" 2>/dev/null || stat -f '%i %z %m' "$@"
       }
-      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext")"
+      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_js_cdylib.$ext")"
 
       cp "$out/heph"                       "$dist/heph"
       cp "$out/libplugin_go_cdylib.$ext"   "$dist/heph-go-plugin.$ext"
       cp "$out/libplugin_gha_cdylib.$ext"  "$dist/heph-gha-plugin.$ext"
       cp "$out/libplugin_oci_cdylib.$ext"  "$dist/heph-oci-plugin.$ext"
+      cp "$out/libplugin_js_cdylib.$ext"   "$dist/heph-js-plugin.$ext"
 
-      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext")"
+      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_js_cdylib.$ext")"
       if [ "$before" != "$after" ]; then
         echo "e2e: $out changed while staging — another build in this" >&2
         echo "e2e: worktree raced this one. Re-run." >&2
@@ -408,7 +425,7 @@ in
       if [ "$os" = "darwin" ]; then
         # Same post-processing the shipped macOS artifacts get, so a local run
         # tests the same bytes CI would publish.
-        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext"; do
+        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-js-plugin.$ext"; do
           bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$f"
         done
       fi

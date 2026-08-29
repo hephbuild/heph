@@ -48,6 +48,36 @@ pub struct State {
     pub state: HashMap<String, Value>,
 }
 
+/// Whether a state opts its per-package config into descendant packages via
+/// the cross-plugin `recursive = True` convention (see `plugin-go`'s and
+/// `plugin-js`'s own `provider_state` schemas for concrete examples). The
+/// engine pre-filters a `GetRequest`/`ListRequest`'s `states` to
+/// ancestors-of-or-equal-to the target package, so a `recursive` state is
+/// always a valid ancestor (or self) of whatever package it's tested against.
+pub fn state_is_recursive(state: &State) -> bool {
+    matches!(state.state.get("recursive"), Some(Value::Bool(true)))
+}
+
+/// Whether a state's per-package config applies to `addr_pkg`. By
+/// convention, config applies only to the exact declaring package unless the
+/// state also carries `recursive = True`, which extends it to all descendants.
+pub fn state_applies_to(state: &State, addr_pkg: &str) -> bool {
+    state.package.as_str() == addr_pkg || state_is_recursive(state)
+}
+
+/// Return the `states` that apply to `addr_pkg` (exact package, or
+/// `recursive` ancestors) and carry `key`, sorted shallow->deep so the
+/// closest declaration is applied last and wins over a farther ancestor on
+/// conflicting settings.
+pub fn applicable_states<'a>(states: &'a [State], addr_pkg: &str, key: &str) -> Vec<&'a State> {
+    let mut out: Vec<&State> = states
+        .iter()
+        .filter(|s| state_applies_to(s, addr_pkg) && s.state.contains_key(key))
+        .collect();
+    out.sort_by_key(|s| s.package.as_str().len());
+    out
+}
+
 /// One frame of a target's source provenance: a call site on the Starlark call
 /// stack at the moment `target(...)` ran. The innermost frame is the `target()`
 /// call itself; outer frames are the user macros / loops that led to it. Lets

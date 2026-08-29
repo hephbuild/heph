@@ -357,14 +357,22 @@ fs:
         // root-relative skip dirs; glob entries become skip globs. Both are handed
         // to the fs plugin and every provider factory.
         let (dir, e) = build_engine_from_yaml(yaml).expect("engine");
+        // `Engine::new` canonicalizes `cfg.root` (see its doc comment — on
+        // macOS, `/tmp`/`/var` are themselves symlinks to `/private/tmp`/
+        // `/private/var`, the default `TMPDIR` `tempfile::tempdir()` resolves
+        // into), so `skip_dirs()` is built off the canonical root even though
+        // this helper hands `Engine::new` the raw `dir.path()`. Compare
+        // against the same canonical form, not the raw one, or this assertion
+        // fails on any host whose tempdir happens to be symlinked.
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
         assert!(
-            e.skip_dirs().contains(&dir.path().join("vendor")),
+            e.skip_dirs().contains(&root.join("vendor")),
             "{:?}",
             e.skip_dirs()
         );
         // `./node_modules` normalizes to the bare root-relative `node_modules`.
         assert!(
-            e.skip_dirs().contains(&dir.path().join("node_modules")),
+            e.skip_dirs().contains(&root.join("node_modules")),
             "{:?}",
             e.skip_dirs()
         );

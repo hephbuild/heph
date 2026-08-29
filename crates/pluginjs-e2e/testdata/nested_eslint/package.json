@@ -1,0 +1,8 @@
+{
+  "name": "root",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "devDependencies": {
+    "eslint": "10.8.1"
+  }
+}
