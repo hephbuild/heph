@@ -252,6 +252,56 @@ fn a_missing_program_fails_the_request() {
 /// leaves compilers running inside a sandbox the cleaner is deleting.
 ///
 /// Asserts the process is *gone*, not that a call returned.
+/// **A forwarded signal reaches the target, and does not end the session.**
+///
+/// The target lives in the agent's session, so the kernel can never deliver it
+/// a terminal signal — the controlling terminal belongs to the client's
+/// session, and a process group does not span sessions. Ctrl+C lands on the
+/// client, which relays the number here.
+///
+/// Before this, the client simply died of it, which the agent reads as "the
+/// client is gone" and escalates to `SIGKILL`. Under `--shell` that meant a
+/// Ctrl+C at an interactive prompt tore down the whole session instead of
+/// interrupting the command running inside it.
+///
+/// The target traps `INT` and exits 42, so the assertion distinguishes "the
+/// signal arrived and the target decided what to do" from "something killed
+/// it" — a killed target reports `Signaled`, not `Exited(42)`.
+#[test]
+fn a_signal_from_the_client_reaches_the_target() {
+    let agent = Agent::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pidfile = dir.path().join("pid");
+    let out = capture();
+
+    let req = sh(&format!(
+        "trap 'exit 42' INT; echo $$ > {}; while :; do sleep 0.05; done",
+        pidfile.display()
+    ));
+
+    let devnull = std::fs::File::open("/dev/null").expect("/dev/null");
+    let mut conn = start_via_agent(
+        &agent.socket,
+        &req,
+        [devnull.as_fd(), out.as_fd(), out.as_fd()],
+    )
+    .expect("handshake");
+
+    wait_for_pid(&pidfile).expect("the target should have started");
+
+    // One byte, the signal number — what the client's handler writes.
+    use std::io::Write as _;
+    conn.write_all(&[libc::SIGINT as u8])
+        .expect("forward SIGINT");
+
+    let outcome = await_reply(conn);
+    assert!(
+        matches!(outcome, ExecOutcome::Exited(42)),
+        "the target must have handled the forwarded SIGINT itself; got {outcome:?}. \
+         A `Signaled` outcome means it was killed rather than interrupted."
+    );
+}
+
 #[test]
 fn a_target_dies_when_its_client_disconnects() {
     let agent = Agent::start();

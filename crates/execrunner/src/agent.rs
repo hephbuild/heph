@@ -373,6 +373,66 @@ pub fn client_main(argv_after_sep: Vec<OsString>) -> ! {
     }
 }
 
+/// The socket a forwarded signal is written to, for the handler to reach.
+///
+/// A signal handler may touch almost nothing, so the fd travels through an
+/// atomic and the handler does one `write(2)` — which is async-signal-safe.
+static SIGNAL_SOCKET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Relay a terminal signal to the agent instead of dying of it.
+extern "C" fn forward_signal(sig: i32) {
+    let fd = SIGNAL_SOCKET.load(std::sync::atomic::Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    // Signal numbers are small positive integers; a value that does not fit is
+    // not one this relay knows how to name, and dropping it is better than
+    // writing a byte that means a different signal on the far side.
+    let Ok(byte) = u8::try_from(sig) else {
+        return;
+    };
+    let byte = [byte];
+    // SAFETY: `write` is async-signal-safe, and the fd is this process's live
+    // socket to the agent. Best effort on purpose: a short or failed write
+    // loses one keystroke, where the alternative — dying — loses the session.
+    unsafe {
+        libc::write(fd, byte.as_ptr().cast(), 1);
+    }
+}
+
+/// Send terminal signals on to the target rather than letting them kill this
+/// process.
+///
+/// The client owns the controlling terminal — the exec driver asks for
+/// `setsid` + `ctty`, and under a session runner it is the client that gets
+/// them — so Ctrl+C is delivered *here*. The target is in the agent's session
+/// and can never receive it from the kernel: a process group does not span
+/// sessions.
+///
+/// Dying was therefore the wrong answer twice over. The target never saw the
+/// interrupt, and the client's death is exactly what the agent reads as "the
+/// client is gone", so it escalated to `SIGKILL` — a Ctrl+C at an interactive
+/// prompt under `--shell` killed the whole session instead of interrupting the
+/// command running in it.
+///
+/// `SIGTSTP` is deliberately not forwarded: suspending the target while this
+/// process stays running is job control the agent has no way to complete, and
+/// half of it is worse than none.
+fn forward_terminal_signals(sock: &UnixStream) {
+    use std::os::fd::AsRawFd as _;
+    SIGNAL_SOCKET.store(sock.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+    for sig in [libc::SIGINT, libc::SIGQUIT] {
+        // SAFETY: installing a handler that is async-signal-safe by
+        // construction (one `write`), on this process.
+        unsafe {
+            libc::signal(
+                sig,
+                forward_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            );
+        }
+    }
+}
+
 fn client_run(argv_after_sep: Vec<OsString>) -> anyhow::Result<ExecOutcome> {
     let sock_path = std::env::var_os(SOCK_ENV).ok_or_else(|| {
         anyhow::anyhow!(
@@ -390,7 +450,7 @@ fn client_run(argv_after_sep: Vec<OsString>) -> anyhow::Result<ExecOutcome> {
     // SAFETY: fd 2 is this process's own stderr, open for the whole call.
     let stderr = unsafe { BorrowedFd::borrow_raw(2) };
     let fds = [stdin, stdout, stderr];
-    exec_via_agent(Path::new(&sock_path), &req, fds)
+    exec_via_agent_inner(Path::new(&sock_path), &req, fds, true)
 }
 
 /// Run one request against an agent and wait for its outcome.
@@ -403,7 +463,23 @@ pub fn exec_via_agent(
     req: &ExecRequest,
     fds: [BorrowedFd<'_>; 3],
 ) -> anyhow::Result<ExecOutcome> {
+    exec_via_agent_inner(socket, req, fds, false)
+}
+
+/// [`exec_via_agent`], additionally relaying this process's terminal signals to
+/// the target. Only the `__runner-exec` subcommand asks for that: it installs
+/// process-wide handlers, which is right for a process that exists to stand in
+/// for one target and wrong for a test harness sharing its process.
+fn exec_via_agent_inner(
+    socket: &Path,
+    req: &ExecRequest,
+    fds: [BorrowedFd<'_>; 3],
+    relay_signals: bool,
+) -> anyhow::Result<ExecOutcome> {
     let mut sock = start_via_agent(socket, req, fds)?;
+    if relay_signals {
+        forward_terminal_signals(&sock);
+    }
     let body = read_frame(&mut sock).map_err(|e| {
         anyhow::anyhow!(
             "await the target's exit status from the agent: {e}. If the agent died, the target's \
@@ -728,17 +804,36 @@ async fn run_one(conn: &mut UnixStream, fds: [OwnedFd; 3]) -> anyhow::Result<Exe
     let cancel = Arc::new(hcore::hasync::StdCancellationToken::new());
     let waiter = handle.spawn_wait(cancel.clone());
 
-    // heph killing the client does *not* kill the target: different session,
-    // different tree. Socket EOF is the signal that the client is gone —
-    // guaranteed by the kernel even when the client is `SIGKILL`ed — and it is
-    // this agent's job to escalate from there.
+    // Two things arrive on this socket after the handshake, and they mean
+    // opposite things.
+    //
+    // **A byte is a signal to forward.** The target lives in this agent's
+    // session, so the kernel can never deliver it a terminal signal: the
+    // controlling terminal belongs to the *client's* session, and a process
+    // group cannot span sessions. Ctrl+C therefore reaches the client and
+    // nothing else. The client relays the signal number here, and this is the
+    // only place that can put it on the target's process group — without it,
+    // Ctrl+C in `--shell` killed the client, which tore down the whole session
+    // instead of interrupting the command running inside it.
+    //
+    // **EOF is the client being gone**, guaranteed by the kernel even when the
+    // client is `SIGKILL`ed, and it is this agent's job to escalate from there.
     let eof = tokio::task::spawn_blocking({
         let peer = conn.try_clone().ok();
         move || {
-            if let Some(mut peer) = peer {
-                let mut sink = [0u8; 1];
-                // Only EOF matters; any byte or error means the same thing.
-                _ = peer.read(&mut sink);
+            let Some(mut peer) = peer else {
+                return;
+            };
+            let mut byte = [0u8; 1];
+            loop {
+                match peer.read(&mut byte) {
+                    // Client gone — fall through to the cancel path below.
+                    Ok(0) | Err(_) => return,
+                    // `killpg`, not `kill`: the target is a process-group
+                    // leader, and a shell's own children are what a Ctrl+C is
+                    // usually aimed at.
+                    Ok(_) => killpg(pgid, i32::from(byte[0])),
+                }
             }
         }
     });
