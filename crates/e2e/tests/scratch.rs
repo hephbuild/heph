@@ -570,3 +570,112 @@ target(name = "a", driver = "bash", out = "o.txt",
     assert!(msg.contains("//build:c"), "must name the scratch: {msg}");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Lineages: one cache per branch, with a fallback.
+// ---------------------------------------------------------------------------
+
+/// Switching branches must not hand the arriving branch the departing branch's
+/// cache state, and must not hand it back mutated. Each lineage keeps its own
+/// directory; a new one is *seeded* from its fallback, so a switch costs a copy
+/// rather than a rebuild.
+///
+/// The whole story in one test: build on `master`, switch to `feat`, and see
+/// `master`'s work — then confirm `feat`'s own writes never reached `master`.
+#[tokio::test]
+async fn a_branch_switch_seeds_from_the_fallback_and_writes_stay_put() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    // Reads whatever is in the cache, then stamps its own name over it.
+    let build = |m: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["cat \"$C/marker\" > $OUT || echo cold > $OUT", "echo {m} > \"$C/marker\""])"#
+        )
+    };
+    let run = async |engine: &Arc<heph::engine::Engine>| -> anyhow::Result<String> {
+        let addr = heph::htaddr::parse_addr("//app:a")?;
+        let opts = ResultOptions::default();
+        let r = Arc::clone(engine)
+            .result_addr(engine.new_state(), &addr, OutputMatcher::All, &opts)
+            .await?;
+        let out = common::artifact_string(&r).trim().to_string();
+        drop(r); // releases the riding read lock before the next engine opens
+        Ok(out)
+    };
+
+    let on = |scope: &str| heph::engine::ScratchOptions {
+        scope: scope.to_string(),
+        restore_scopes: vec!["master".to_string()],
+        seed_on_fork: true,
+    };
+
+    // On `master`: cold, then leaves "master" behind.
+    ws.write_build_file("app", &build("master"));
+    assert_eq!(run(&ws.reopen_scoped(on("master"))?).await?, "cold");
+
+    // Switch to `feat`. Its lineage is new, so it seeds from `master` — and sees
+    // what `master` left, rather than starting cold.
+    ws.write_build_file("app", &build("feat"));
+    assert_eq!(
+        run(&ws.reopen_scoped(on("feat"))?).await?,
+        "master",
+        "a new branch must seed from its fallback, not start cold"
+    );
+
+    // Back on `master`: it must still see its own work, not the branch's. This is
+    // the isolation half — a branch cannot advance or corrupt what it forked from.
+    ws.write_build_file("app", &build("master2"));
+    assert_eq!(
+        run(&ws.reopen_scoped(on("master"))?).await?,
+        "master",
+        "the branch's writes must not have reached the lineage it forked from"
+    );
+    Ok(())
+}
+
+/// With seeding off, a new lineage starts cold rather than paying a copy. The
+/// knob exists for a large slot on a filesystem with no reflink.
+#[tokio::test]
+async fn seed_on_fork_off_starts_a_new_branch_cold() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    let build = |m: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["cat \"$C/marker\" > $OUT || echo cold > $OUT", "echo {m} > \"$C/marker\""])"#
+        )
+    };
+    let run = async |engine: &Arc<heph::engine::Engine>| -> anyhow::Result<String> {
+        let addr = heph::htaddr::parse_addr("//app:a")?;
+        let opts = ResultOptions::default();
+        let r = Arc::clone(engine)
+            .result_addr(engine.new_state(), &addr, OutputMatcher::All, &opts)
+            .await?;
+        let out = common::artifact_string(&r).trim().to_string();
+        drop(r);
+        Ok(out)
+    };
+    let on = |scope: &str, seed: bool| heph::engine::ScratchOptions {
+        scope: scope.to_string(),
+        restore_scopes: vec!["master".to_string()],
+        seed_on_fork: seed,
+    };
+
+    ws.write_build_file("app", &build("master"));
+    assert_eq!(run(&ws.reopen_scoped(on("master", false))?).await?, "cold");
+
+    ws.write_build_file("app", &build("feat"));
+    assert_eq!(
+        run(&ws.reopen_scoped(on("feat", false))?).await?,
+        "cold",
+        "with seeding off a new lineage must not inherit"
+    );
+    Ok(())
+}

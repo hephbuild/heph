@@ -94,6 +94,12 @@ impl Workspace {
     /// cannot reconstruct, and silently substituting a different provider set
     /// would resolve different targets into the same cache.
     pub fn reopen(&self) -> Result<Arc<Engine>> {
+        self.reopen_scoped(Default::default())
+    }
+
+    /// [`reopen`](Self::reopen) with an explicit scratch lineage policy — what a
+    /// second `heph` invocation sees after the branch changed under it.
+    pub fn reopen_scoped(&self, scratch: heph::engine::ScratchOptions) -> Result<Arc<Engine>> {
         let cfg = self.reopen_with.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "this workspace's provider set cannot be rebuilt; reopen is unsupported"
@@ -105,6 +111,7 @@ impl Workspace {
             home_dir: std::path::PathBuf::new(),
             parallelism: cfg.parallelism,
             fs_skip: cfg.fs_skip.clone(),
+            scratch,
             ..Default::default()
         })
         .context("reopen: build engine over the existing workspace root")?;

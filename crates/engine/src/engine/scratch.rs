@@ -127,9 +127,112 @@ impl ScratchLock {
     }
 }
 
-/// The directory a slot's contents live in.
-pub fn slot_dir(home: &Path, slot: &str) -> PathBuf {
-    home.join("scratch").join(slot)
+/// The directory a slot's contents live in, for one lineage.
+///
+/// Scope-structured, so a branch's work stays on that branch: two scopes of one
+/// slot are two directories, and nothing a feature branch does can reach the one
+/// `master` builds from. `sanitize_scope` is what keeps a branch name like
+/// `feature/x` from silently nesting an extra level.
+pub fn scope_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
+    home.join("scratch")
+        .join(slot)
+        .join(crate::engine::config::sanitize_scope(scope))
+        .join("head")
+}
+
+/// Resolve which lineage to use, and seed it if it is new.
+///
+/// The behaviour is *try this branch, then fall back* — the current scope first,
+/// then each configured `restore_scopes` entry in order. Returns the directory to
+/// mount, always inside the **current** scope: a fallback is a place to copy
+/// *from*, never a place to write to, and that asymmetry is the whole of the
+/// isolation. A PR build cannot advance `master`'s cache, and a broken experiment
+/// on a branch cannot corrupt the one you go back to.
+///
+/// Seeding is the only copy in this design. It happens once per (slot, scope) —
+/// on the first build after a branch switch — and is measured against a cold
+/// rebuild, not against nothing. `scratch.seedOnFork: false` turns it off for a
+/// large slot on a filesystem without reflink, at the cost of every new branch
+/// starting cold.
+async fn resolve_scope_dir(
+    home: &Path,
+    slot: &str,
+    opts: &crate::engine::config::ScratchOptions,
+    addr: &Addr,
+) -> anyhow::Result<PathBuf> {
+    let own = scope_dir(home, slot, &opts.scope);
+    let exists = |p: PathBuf| async move {
+        hcore::blocking::run(move || Ok::<bool, std::io::Error>(p.is_dir()))
+            .await
+            .unwrap_or(false)
+    };
+
+    if exists(own.clone()).await {
+        return Ok(own);
+    }
+
+    // Cold in this lineage. Seed from the first fallback that has anything, so a
+    // branch switch costs a copy rather than a rebuild.
+    if opts.seed_on_fork {
+        for fallback in &opts.restore_scopes {
+            if *fallback == opts.scope {
+                continue;
+            }
+            let from = scope_dir(home, slot, fallback);
+            if !exists(from.clone()).await {
+                continue;
+            }
+            let (src, dst) = (from.clone(), own.clone());
+            let seeded = hcore::blocking::run(move || copy_tree(&src, &dst)).await;
+            match seeded {
+                Ok(()) => {
+                    tracing::debug!(
+                        %addr, slot, from = %from.display(), to = %own.display(),
+                        "seeded scratch from fallback scope",
+                    );
+                    return Ok(own);
+                }
+                // A failed seed is a cold cache, never a failed build: by the
+                // scratch contract, losing one is a slowdown and nothing more.
+                // Leave no partial tree behind for the next run to mistake for a
+                // warm one.
+                Err(err) => {
+                    tracing::debug!(
+                        %addr, slot, error = %err,
+                        "could not seed scratch from fallback scope; starting cold",
+                    );
+                    let dead = own.clone();
+                    drop(hcore::blocking::run(move || std::fs::remove_dir_all(&dead)).await);
+                }
+            }
+        }
+    }
+    Ok(own)
+}
+
+/// Recursively copy `src` to `dst`, following no symlinks out of the tree.
+///
+/// Deliberately plain: a reflink would make this near-free on APFS/btrfs and is
+/// the obvious next step, but it is a per-platform optimization and this has to
+/// be correct on every filesystem first. Symlinks are recreated as symlinks
+/// rather than followed, so a slot that has acquired a link to somewhere else
+/// does not silently duplicate that somewhere else into the new scope.
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            std::os::unix::fs::symlink(target, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// True when this input is a scratch reference rather than an ordinary dep.
@@ -238,10 +341,13 @@ impl Engine {
                 .with_context(|| format!("acquire scratch lock for {}", r.addr))?;
             guards.push(guard);
 
-            // Created under the guard, so two processes racing a cold slot cannot
-            // both decide it is absent and clobber each other's setup. Creation
-            // is idempotent, which is what makes the shared-access case safe.
-            let dir = slot_dir(&self.home, &slot);
+            // Resolved and created under the guard, so two processes racing a
+            // cold lineage cannot both decide it is absent and seed it twice.
+            // Both creation and seeding are idempotent, which is what makes the
+            // shared-access case safe.
+            let dir = resolve_scope_dir(&self.home, &slot, &self.cfg.scratch, &r.addr)
+                .await
+                .with_context(|| format!("resolve scratch lineage for {}", r.addr))?;
             let d = dir.clone();
             hcore::blocking::run(move || std::fs::create_dir_all(&d))
                 .await
@@ -330,6 +436,188 @@ fn paths_overlap(a: &str, b: &str) -> bool {
     };
     let (a, b) = (comps(a), comps(b));
     a.iter().zip(b.iter()).all(|(x, y)| x == y)
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use crate::engine::config::ScratchOptions;
+    use hmodel::htpkg::PkgBuf;
+
+    fn addr() -> Addr {
+        Addr::new(PkgBuf::from("build"), "c".to_string(), Default::default())
+    }
+
+    fn opts(scope: &str, fallbacks: &[&str], seed: bool) -> ScratchOptions {
+        ScratchOptions {
+            scope: scope.to_string(),
+            restore_scopes: fallbacks.iter().map(|s| s.to_string()).collect(),
+            seed_on_fork: seed,
+        }
+    }
+
+    /// Two lineages of one slot are two directories. Without this, "branch
+    /// isolation" is a word rather than a behaviour.
+    #[test]
+    fn scopes_are_separate_directories() {
+        let home = Path::new("/h");
+        assert_ne!(
+            scope_dir(home, "abc", "master"),
+            scope_dir(home, "abc", "feat")
+        );
+        assert_eq!(
+            scope_dir(home, "abc", "master"),
+            scope_dir(home, "abc", "master")
+        );
+    }
+
+    /// A branch name with a `/` must not nest an extra level, or two branches
+    /// collide the moment one is a path prefix of another.
+    #[test]
+    fn a_slash_in_a_branch_name_stays_one_component() {
+        let d = scope_dir(Path::new("/h"), "abc", "feature/x");
+        let comps: Vec<_> = d.components().collect();
+        assert_eq!(
+            comps.len(),
+            6,
+            "/h + scratch + abc + <scope> + head is 5 components plus root, got {d:?}"
+        );
+        assert!(!d.to_string_lossy().contains("feature/x"), "{d:?}");
+    }
+
+    /// The empty scope is still a directory name — it is the default (one shared
+    /// lineage), so it cannot resolve to the slot dir itself.
+    #[test]
+    fn the_empty_scope_has_a_directory_of_its_own() {
+        let d = scope_dir(Path::new("/h"), "abc", "");
+        assert!(d.ends_with("head"));
+        assert!(d.to_string_lossy().contains("/abc/_/"), "{d:?}");
+    }
+
+    #[tokio::test]
+    async fn a_cold_lineage_with_no_fallback_resolves_to_its_own_empty_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let got = resolve_scope_dir(tmp.path(), "s", &opts("feat", &[], true), &addr())
+            .await
+            .expect("resolve");
+        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+    }
+
+    /// The branch-switch story: `master` is warm, `feat` has never been built, so
+    /// `feat` starts from a copy of `master` rather than from nothing.
+    #[tokio::test]
+    async fn a_new_scope_seeds_from_its_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let master = scope_dir(tmp.path(), "s", "master");
+        std::fs::create_dir_all(master.join("sub")).expect("mkdir");
+        std::fs::write(master.join("sub").join("f"), b"warm").expect("write");
+
+        let got = resolve_scope_dir(tmp.path(), "s", &opts("feat", &["master"], true), &addr())
+            .await
+            .expect("resolve");
+
+        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(
+            std::fs::read(got.join("sub").join("f")).expect("read seeded"),
+            b"warm"
+        );
+    }
+
+    /// Writes land in the branch's own lineage. A PR build must not be able to
+    /// advance the cache its base builds from.
+    #[tokio::test]
+    async fn seeding_leaves_the_fallback_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let master = scope_dir(tmp.path(), "s", "master");
+        std::fs::create_dir_all(&master).expect("mkdir");
+        std::fs::write(master.join("f"), b"base").expect("write");
+
+        let got = resolve_scope_dir(tmp.path(), "s", &opts("feat", &["master"], true), &addr())
+            .await
+            .expect("resolve");
+        std::fs::write(got.join("f"), b"branch work").expect("write");
+
+        assert_eq!(std::fs::read(master.join("f")).expect("read"), b"base");
+    }
+
+    #[tokio::test]
+    async fn seed_on_fork_off_starts_cold() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let master = scope_dir(tmp.path(), "s", "master");
+        std::fs::create_dir_all(&master).expect("mkdir");
+        std::fs::write(master.join("f"), b"warm").expect("write");
+
+        let got = resolve_scope_dir(tmp.path(), "s", &opts("feat", &["master"], false), &addr())
+            .await
+            .expect("resolve");
+        assert!(!got.join("f").exists(), "must not have seeded");
+    }
+
+    /// An already-warm lineage is used as-is; nothing re-seeds over live work.
+    #[tokio::test]
+    async fn a_warm_scope_is_never_reseeded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (scope, body) in [("master", b"base".as_slice()), ("feat", b"mine".as_slice())] {
+            let d = scope_dir(tmp.path(), "s", scope);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            std::fs::write(d.join("f"), body).expect("write");
+        }
+        let got = resolve_scope_dir(tmp.path(), "s", &opts("feat", &["master"], true), &addr())
+            .await
+            .expect("resolve");
+        assert_eq!(std::fs::read(got.join("f")).expect("read"), b"mine");
+    }
+
+    /// Fallbacks are ordered, so a three-level convention works without
+    /// special-casing — and an entry naming a lineage that never existed is
+    /// skipped rather than erroring.
+    #[tokio::test]
+    async fn fallbacks_are_tried_in_order_and_missing_ones_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let develop = scope_dir(tmp.path(), "s", "develop");
+        std::fs::create_dir_all(&develop).expect("mkdir");
+        std::fs::write(develop.join("f"), b"develop").expect("write");
+
+        let got = resolve_scope_dir(
+            tmp.path(),
+            "s",
+            &opts("feat", &["nonexistent", "develop", "master"], true),
+            &addr(),
+        )
+        .await
+        .expect("resolve");
+        assert_eq!(std::fs::read(got.join("f")).expect("read"), b"develop");
+    }
+
+    /// A slot listing its own scope as a fallback must not try to seed from
+    /// itself — that is a no-op at best and a self-copy at worst.
+    #[tokio::test]
+    async fn a_scope_does_not_seed_from_itself() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let got = resolve_scope_dir(tmp.path(), "s", &opts("feat", &["feat"], true), &addr())
+            .await
+            .expect("resolve");
+        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+    }
+
+    #[test]
+    fn copy_tree_recreates_symlinks_rather_than_following_them() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (src, dst) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir_all(src.join("d")).expect("mkdir");
+        std::fs::write(src.join("d").join("f"), b"x").expect("write");
+        std::os::unix::fs::symlink("/somewhere/else", src.join("link")).expect("symlink");
+
+        copy_tree(&src, &dst).expect("copy");
+
+        assert_eq!(std::fs::read(dst.join("d").join("f")).expect("read"), b"x");
+        let md = std::fs::symlink_metadata(dst.join("link")).expect("stat");
+        assert!(md.file_type().is_symlink(), "must stay a symlink");
+        assert_eq!(
+            std::fs::read_link(dst.join("link")).expect("readlink"),
+            Path::new("/somewhere/else")
+        );
+    }
 }
 
 #[cfg(test)]
