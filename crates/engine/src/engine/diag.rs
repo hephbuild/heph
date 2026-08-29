@@ -257,6 +257,9 @@ pub struct DiagState {
     base: Instant,
     /// Millis of the last state transition of *any* kind. The stall trigger.
     last_transition_ms: AtomicU64,
+    /// How many interactive holds are open on the terminal. See
+    /// [`DiagState::suppress_stall`].
+    interactive_holds: AtomicU64,
     ops: [OpState; 5],
     limiters: Vec<Limiter>,
     /// Completed / failed targets, for the progress line.
@@ -352,6 +355,7 @@ impl DiagState {
         Self {
             base: Instant::now(),
             last_transition_ms: AtomicU64::new(0),
+            interactive_holds: AtomicU64::new(0),
             ops: [
                 OpState::new(),
                 OpState::new(),
@@ -606,12 +610,40 @@ impl DiagState {
         v
     }
 
+    /// Silence the watchdog while a target owns the terminal, and restart the
+    /// quiet clock when it gives it back.
+    ///
+    /// `heph run --shell` parks a person at a prompt. No span opens or closes
+    /// and no bytes move for as long as they are thinking, which is precisely
+    /// the shape this module reads as wedged — so the watchdog would print a
+    /// stall paragraph *over the shell they are typing into*, then keep doing it
+    /// every threshold. This module's own rule applies: a diagnostic that cries
+    /// wolf is worse than none, because people learn to skip it.
+    ///
+    /// Held for the interactive window rather than the whole run, so a stall
+    /// before or after the shell is still reported normally.
+    ///
+    /// Releasing it restarts the clock. The quiet timer ran the entire time the
+    /// user was typing, so without that the first tick after the shell closes
+    /// reports a stall whose whole duration was a person reading their prompt.
+    pub fn suppress_stall(self: &std::sync::Arc<Self>) -> StallSuppression {
+        self.interactive_holds.fetch_add(1, Ordering::Relaxed);
+        StallSuppression {
+            state: std::sync::Arc::clone(self),
+        }
+    }
+
     /// Decide whether this looks stalled, as of `now_ms`.
     ///
     /// Pure: it holds no clock and does no I/O, so every scenario is testable by
     /// passing a time rather than sleeping. The watchdog thread is then a two-line
     /// loop with one wiring test instead of a suite of flaky sleepy ones.
     pub fn evaluate(&self, now_ms: u64, threshold: Duration) -> Option<StallReport> {
+        // A target owns the terminal: quiet is the expected state, not a
+        // symptom. See `suppress_stall`.
+        if self.interactive_holds.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
         let threshold_ms = u64::try_from(threshold.as_millis()).unwrap_or(60_000);
         let quiet = self.quiet_for_ms(now_ms);
         if quiet < threshold_ms {
@@ -684,6 +716,20 @@ impl DiagState {
 /// one per process, the hook needs it before the engine is wrapped in an `Arc`,
 /// and both the watchdog thread and any future reader live outside the engine's
 /// ownership graph. Same shape as the other diagnostic modules.
+/// An open interactive hold. See [`DiagState::suppress_stall`].
+pub struct StallSuppression {
+    state: std::sync::Arc<DiagState>,
+}
+
+impl Drop for StallSuppression {
+    fn drop(&mut self) {
+        // Order matters: restart the clock *before* the watchdog can look
+        // again, or it wakes to a quiet span it was told to ignore.
+        self.state.touch(self.state.now_ms());
+        self.state.interactive_holds.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub fn global() -> &'static std::sync::Arc<DiagState> {
     static STATE: std::sync::OnceLock<std::sync::Arc<DiagState>> = std::sync::OnceLock::new();
     STATE.get_or_init(|| {
@@ -1322,6 +1368,65 @@ mod tests {
     use hplugin::hook::Hook as _;
 
     const T: Duration = Duration::from_secs(60);
+
+    /// A `--shell` target owning the terminal must not read as a stall.
+    ///
+    /// A person at a prompt opens no spans, closes none and moves no bytes —
+    /// indistinguishable, to this module, from a wedged build. The watchdog
+    /// would print its paragraph *into the shell they are typing into*.
+    #[test]
+    fn an_interactive_hold_silences_the_watchdog() {
+        let s = std::sync::Arc::new(DiagState::new(vec![]));
+        let quiet_past_threshold = s.now_ms() + T.as_millis() as u64 * 4;
+        assert!(
+            s.evaluate(quiet_past_threshold, T).is_some(),
+            "the fixture must look stalled without the hold, or the test proves nothing"
+        );
+
+        let hold = s.suppress_stall();
+        assert!(
+            s.evaluate(quiet_past_threshold, T).is_none(),
+            "a target owning the terminal is not a stall"
+        );
+        drop(hold);
+    }
+
+    /// Releasing the hold restarts the quiet clock.
+    ///
+    /// The timer ran the whole time the user was typing, so a naive
+    /// implementation reports a stall on the first tick after the shell closes
+    /// — one whose entire duration was a person reading their prompt. That is
+    /// the same false positive, moved later.
+    #[test]
+    fn releasing_an_interactive_hold_restarts_the_clock() {
+        let s = std::sync::Arc::new(DiagState::new(vec![]));
+        let hold = s.suppress_stall();
+        drop(hold);
+        assert!(
+            s.evaluate(s.now_ms(), T).is_none(),
+            "the quiet span belonged to the shell; the clock must start again on release"
+        );
+    }
+
+    /// Nested holds are counted, not flagged: an outer release must not
+    /// un-silence a shell that is still open.
+    #[test]
+    fn interactive_holds_nest() {
+        let s = std::sync::Arc::new(DiagState::new(vec![]));
+        let outer = s.suppress_stall();
+        let inner = s.suppress_stall();
+        drop(outer);
+        let quiet = s.now_ms() + T.as_millis() as u64 * 4;
+        assert!(
+            s.evaluate(quiet, T).is_none(),
+            "the inner hold is still open; the terminal is still someone else's"
+        );
+        drop(inner);
+        assert!(
+            s.evaluate(quiet, T).is_some(),
+            "with every hold released the watchdog must work again"
+        );
+    }
 
     fn state() -> std::sync::Arc<DiagState> {
         std::sync::Arc::new(DiagState::new(vec![Limiter::new("workers")]))

@@ -158,6 +158,17 @@ impl App for RunApp {
                 let pauser = pauser.clone();
                 Box::pin(async move {
                     let _guard = pauser.pause_for(pause_for).await;
+                    // A `--shell` target parks a person at a prompt: nothing
+                    // opens, closes or moves bytes for as long as they think,
+                    // which is exactly what the stall watchdog reads as wedged.
+                    // Without this it prints a stall paragraph over the shell
+                    // they are typing into, and again every threshold after.
+                    // `PauseFor::Output` is not suppressed: nobody is typing,
+                    // the terminal is only on loan for the target's output, and
+                    // a target that really is stuck there still deserves the
+                    // notice.
+                    let _quiet = (pause_for == tui::PauseFor::Input)
+                        .then(|| hengine::engine::diag::global().suppress_stall());
                     // Source stdin from the client's /dev/tty via a TtyReader
                     // rather than tokio::io::stdin(): tokio's stdin spawns a
                     // global blocking thread parked on read(0, …) that cannot
