@@ -562,6 +562,19 @@ impl ProviderTrait for Provider {
                      descendant packages too.",
                 ),
                 field(
+                    "lint",
+                    ParamType::Bool,
+                    "Lint settings for this package. `lint = False` drops its \
+                     `lint-check`/`lint` targets, `lint = True` (or unset) keeps them — \
+                     within a module that opts into linting at all with a golangci config \
+                     at its go.mod root. Formatting (`format`/`format-check`) is a separate \
+                     family and is unaffected. The internal per-variant `_lint-analyze` \
+                     unit stays resolvable so packages that DO lint still get this one's \
+                     facts for interprocedural analysis — it produces no user-visible \
+                     diagnostics on its own. By default applies only to this package; set \
+                     `recursive = True` to apply to descendant packages too.",
+                ),
+                field(
                     "link",
                     ParamType::strukt(vec![
                         ("flags", ParamType::list(ParamType::String)),
@@ -580,7 +593,8 @@ impl ProviderTrait for Provider {
                 field(
                     "recursive",
                     ParamType::Bool,
-                    "Apply this state's config (the `test` toggle/struct and `link = {...}`) \
+                    "Apply this state's config (the `test` toggle/struct, the `lint` toggle \
+                     and `link = {...}`) \
                      to descendant packages, not just the exact declaring package. \
                      `go_codegen_root`/`go_codegen_deps` are unaffected — they always \
                      apply to descendants.",
@@ -784,7 +798,9 @@ impl ProviderInner {
                     // golangci config at the go.mod root, so gate them here
                     // (matching the `get`-time gate) to avoid advertising targets
                     // that would resolve to NotFound.
-                    let lint_enabled = self.golangci_config_addr(module_root).is_some();
+                    let module_lints = self.golangci_config_addr(module_root).is_some();
+                    let lint_enabled =
+                        module_lints && !pick_lint_skip(&req.states, req.package.as_str());
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
                     push_names(&mut addrs, &["_golist", "build_lib", "build"]);
                     // Magic host-default `build` (bare, no `@v`): a `group`
@@ -797,25 +813,29 @@ impl ProviderInner {
                             Default::default(),
                         ));
                     }
-                    if lint_enabled {
-                        // One bare addr per package for both families, never
-                        // multiplied across variants: formatting is syntactic and
-                        // so variant-free outright (`VARIANT_FREE_TARGET_NAMES`),
-                        // while the lint gate/fixer aggregate every ancestry
-                        // variant's analysis (`VARIANT_AGGREGATE_TARGET_NAMES`).
-                        // The per-variant `_lint-analyze` stays unlisted (as
-                        // before): it is internal, and the aggregators pull it in
-                        // as a dep.
-                        for name in VARIANT_AGGREGATE_TARGET_NAMES
-                            .iter()
-                            .chain(VARIANT_FREE_TARGET_NAMES)
-                        {
-                            addrs.push(Addr::new(
-                                req.package.clone(),
-                                (*name).to_string(),
-                                Default::default(),
-                            ));
-                        }
+                    // One bare addr per package for both families, never
+                    // multiplied across variants: formatting is syntactic and
+                    // so variant-free outright (`VARIANT_FREE_TARGET_NAMES`),
+                    // while the lint gate/fixer aggregate every ancestry
+                    // variant's analysis (`VARIANT_AGGREGATE_TARGET_NAMES`).
+                    // The per-variant `_lint-analyze` stays unlisted (as
+                    // before): it is internal, and the aggregators pull it in
+                    // as a dep.
+                    //
+                    // The two families are gated separately: `lint = False` in a
+                    // provider_state drops the lint gate/fixer, but formatting is
+                    // a different tool with a different verdict, so it keeps its
+                    // targets as long as the module opted in.
+                    let listed = VARIANT_AGGREGATE_TARGET_NAMES
+                        .iter()
+                        .filter(|_| lint_enabled)
+                        .chain(VARIANT_FREE_TARGET_NAMES.iter().filter(|_| module_lints));
+                    for name in listed {
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            (*name).to_string(),
+                            Default::default(),
+                        ));
                     }
                     if !skip_tests {
                         push_names(
@@ -1170,15 +1190,33 @@ fn pick_xtest_p_lib_name(pkg: &GoPackage) -> Option<&'static str> {
 /// `test = True` (or the struct form, which implies tests run) closer to the
 /// target re-enables tests even if a recursive ancestor disabled them.
 fn pick_test_skip(states: &[State], addr_pkg: &str) -> bool {
-    let Some(state) = applicable_states(states, addr_pkg, "test")
-        .into_iter()
-        .last()
-    else {
+    state_disables(states, addr_pkg, "test")
+}
+
+/// Return true if the closest `lint` state applying to `addr_pkg` disables lint
+/// via `lint = False`, dropping the package's `lint-check`/`lint` targets. Same
+/// scoping rules as [`pick_test_skip`].
+///
+/// Only the *user-facing* gate and fixer are dropped. The internal per-variant
+/// `_lint-analyze` unit stays resolvable: an importer in a package that does
+/// lint consumes this package's `lint.facts` for interprocedural analysis, and
+/// deciding otherwise would need this package's states while resolving the
+/// importer's — which the provider only ever sees for the target's own ancestry.
+/// Analysis produces facts, never a verdict, so nothing user-visible leaks
+/// through it.
+fn pick_lint_skip(states: &[State], addr_pkg: &str) -> bool {
+    state_disables(states, addr_pkg, "lint")
+}
+
+/// The shared "is this family switched off here?" lookup behind
+/// [`pick_test_skip`] / [`pick_lint_skip`]: true when the closest state carrying
+/// `key` sets it to the bool `False`. Any other value (`True`, or the struct
+/// form `test` accepts) leaves the family enabled.
+fn state_disables(states: &[State], addr_pkg: &str, key: &str) -> bool {
+    let Some(state) = applicable_states(states, addr_pkg, key).into_iter().last() else {
         return false;
     };
-    // Skip only when the closest `test` state is the bool `False`. `True` and the
-    // struct form (env config) both leave tests enabled.
-    matches!(state.state.get("test"), Some(Value::Bool(false)))
+    matches!(state.state.get(key), Some(Value::Bool(false)))
 }
 
 /// Parse a `map[string]string` Starlark value into a sorted map. Rejects
@@ -1725,6 +1763,13 @@ impl ProviderInner {
         // They carry no variant of their own, so they also resolve before variant
         // resolution; they enumerate the ancestry variants themselves.
         if VARIANT_AGGREGATE_TARGET_NAMES.contains(&addr.name.as_str()) {
+            // provider_state(provider="go", lint=False) opts the package out of the
+            // user-facing lint targets. Gate before the aggregate resolves so a
+            // skipped package never fans out a `go list` per ancestry variant purely
+            // to learn it has nothing to lint.
+            if pick_lint_skip(&req.states, addr.package.as_str()) {
+                return Err(GetError::NotFound);
+            }
             return Arc::clone(&self)
                 .get_lint_aggregate(&req, &kind, &module_root)
                 .await;
@@ -5365,6 +5410,64 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         );
     }
 
+    // `provider_state(provider="go", lint=False)` opts a package out of the
+    // user-facing lint targets, exactly as `test=False` does for tests: `get`
+    // resolves `lint-check`/`lint` to NotFound and `list` omits them.
+    //
+    // Two things deliberately survive: the `format`/`format-check` family (a
+    // different tool with a different verdict), and the internal `_lint-analyze`
+    // unit, whose `lint.facts` a still-linted importer needs.
+    #[tokio::test]
+    async fn test_lint_disabled_by_provider_state() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+        let states = vec![host_variant_state(), state_with_lint_skip("cmd", true)];
+
+        for name in ["lint-check", "lint"] {
+            assert!(
+                matches!(
+                    provider_get_with_states(&p, make_bare_addr("cmd", name), states.clone()).await,
+                    Err(GetError::NotFound)
+                ),
+                "{name} must be NotFound with lint = False"
+            );
+        }
+
+        // The formatters and the facts unit are untouched.
+        provider_get_with_states(&p, make_bare_addr("cmd", "format-check"), states.clone())
+            .await
+            .expect("format-check survives lint = False");
+        provider_get_with_states(&p, make_addr("cmd", "_lint-analyze"), states.clone())
+            .await
+            .expect("_lint-analyze survives lint = False (dependents need its facts)");
+
+        let names = provider_list_with_states(&p, "cmd", states.clone()).await;
+        for gated in ["lint-check", "lint"] {
+            assert!(
+                !names.iter().any(|n| n == gated),
+                "{gated} must not be listed with lint = False: {names:?}"
+            );
+        }
+        for kept in ["format-check", "format", "build_lib", "test"] {
+            assert!(
+                names.iter().any(|n| n == kept),
+                "{kept} must still be listed with lint = False: {names:?}"
+            );
+        }
+
+        // Non-recursive: the sibling package keeps its lint targets.
+        provider_get_with_states(&p, make_bare_addr("lib", "lint-check"), states.clone())
+            .await
+            .expect("lint = False at `cmd` must not reach `lib`");
+        let lib_names = provider_list_with_states(&p, "lib", states).await;
+        assert!(
+            lib_names.iter().any(|n| n == "lint-check"),
+            "lib keeps lint-check: {lib_names:?}"
+        );
+    }
+
     // A `.golangci.yaml` (the other YAML extension) opts a module in just as
     // `.golangci.yml` does.
     #[tokio::test]
@@ -6032,12 +6135,26 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     // ---- list() tests ----
 
     async fn provider_list(p: &Provider, package: &str) -> Vec<String> {
+        provider_list_with_states(p, package, vec![host_variant_state()]).await
+    }
+
+    /// `provider_list` with custom states — threaded into both the request and the
+    /// executor, as `provider_get_with_states` does for `get`.
+    async fn provider_list_with_states(
+        p: &Provider,
+        package: &str,
+        states: Vec<State>,
+    ) -> Vec<String> {
         let ctoken = StdCancellationToken::new();
         let req = ListRequest {
             request_id: "test".to_string(),
             package: PkgBuf::from(package),
-            states: vec![host_variant_state()],
-            executor: test_executor(&p.inner.workspace_root),
+            states: states.clone(),
+            executor: Arc::new(GoListTestExecutor {
+                workspace_root: p.inner.workspace_root.clone(),
+                source_map: HashMap::new(),
+                states,
+            }),
         };
         p.list(req, &ctoken)
             .await
@@ -6733,6 +6850,63 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             state: m,
         }];
         assert!(!pick_test_skip(&states, ""));
+    }
+
+    /// `skip = true` -> `lint = False` (disabled); `skip = false` -> `lint = True`.
+    fn state_with_lint_skip(pkg: &str, skip: bool) -> State {
+        let mut m = HashMap::new();
+        m.insert("lint".to_string(), Value::Bool(!skip));
+        State {
+            package: PkgBuf::from(pkg),
+            provider: "go".to_string(),
+            state: m,
+        }
+    }
+
+    #[test]
+    fn pick_lint_skip_false_when_no_states() {
+        assert!(!pick_lint_skip(&[], "foo"));
+    }
+
+    #[test]
+    fn pick_lint_skip_true_when_state_sets_skip_for_own_package() {
+        let states = vec![state_with_lint_skip("foo", true)];
+        assert!(pick_lint_skip(&states, "foo"));
+    }
+
+    #[test]
+    fn pick_lint_skip_non_recursive_does_not_reach_descendants() {
+        let states = vec![state_with_lint_skip("foo", true)];
+        assert!(pick_lint_skip(&states, "foo"));
+        assert!(!pick_lint_skip(&states, "foo/bar"));
+    }
+
+    #[test]
+    fn pick_lint_skip_recursive_reaches_descendants() {
+        let states = vec![with_recursive(state_with_lint_skip("foo", true))];
+        assert!(pick_lint_skip(&states, "foo/bar"));
+    }
+
+    #[test]
+    fn pick_lint_skip_deeper_state_overrides_recursive_ancestor() {
+        let states = vec![
+            with_recursive(state_with_lint_skip("", true)),
+            state_with_lint_skip("src/foo", false),
+        ];
+        assert!(!pick_lint_skip(&states, "src/foo"));
+    }
+
+    /// The two toggles are independent: `test = False` says nothing about lint,
+    /// and `lint = False` says nothing about tests.
+    #[test]
+    fn lint_and_test_toggles_are_independent() {
+        let states = vec![state_with_test_skip("foo", true)];
+        assert!(pick_test_skip(&states, "foo"));
+        assert!(!pick_lint_skip(&states, "foo"));
+
+        let states = vec![state_with_lint_skip("foo", true)];
+        assert!(pick_lint_skip(&states, "foo"));
+        assert!(!pick_test_skip(&states, "foo"));
     }
 
     fn test_env_is_empty(env: &target_test::TestEnv) -> bool {
