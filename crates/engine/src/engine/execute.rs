@@ -54,7 +54,7 @@ impl Engine {
         // The guards ride to the end of the run and drop with `_scratch_guards`.
         hcore::hmemoizer::set_phase("execute:scratch_acquire");
         let resolved_scratch = self
-            .resolve_scratch(&rs, addr, &def.target.inputs)
+            .resolve_scratch(&rs, addr, &def.target.inputs, &def.target.outputs)
             .await
             .with_context(|| format!("resolve scratch for {addr}"))?;
         let (scratch_mounts, _scratch_guards) = self

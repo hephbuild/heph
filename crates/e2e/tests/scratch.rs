@@ -1164,3 +1164,49 @@ async fn an_unreachable_remote_degrades_to_a_cold_build() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+/// An output that could collect a scratch mount is rejected. A broad glob beside
+/// a cache in the same package is the realistic shape, and it would sweep the
+/// whole cache into the target's artifact — bytes no `hashin` describes.
+#[tokio::test]
+async fn an_output_glob_that_could_capture_a_scratch_is_an_error() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "**/*", scratch = ["//build:c"],
+       run = ["echo hi > o.txt"])"#,
+    );
+
+    let err = expect_err(
+        ws.run("//app:a").await,
+        "a glob that can reach the mount must not resolve",
+    );
+    let msg = format!("{err:#}");
+    assert!(msg.contains("//build:c"), "must name the scratch: {msg}");
+    assert!(msg.contains("Narrow the output"), "must say the fix: {msg}");
+    Ok(())
+}
+
+/// A glob rooted somewhere the mount cannot be is fine. The check is about reach,
+/// not about the presence of a wildcard — rejecting every glob beside a scratch
+/// would make the feature unusable.
+#[tokio::test]
+async fn a_glob_that_cannot_reach_the_mount_is_allowed() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "dist/*.txt", scratch = ["//build:c"],
+       run = ["mkdir -p dist && echo hi > dist/o.txt"])"#,
+    );
+
+    assert!(!ws.run("//app:a").await?.artifacts.is_empty());
+    Ok(())
+}
