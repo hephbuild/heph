@@ -139,15 +139,15 @@ mod tests {
 
     #[test]
     fn label_yes() {
-        let s = spec("foo/bar", "baz", &["//tag:release"]);
-        let m = Matcher::Label("//tag:release".to_string());
+        let s = spec("foo/bar", "baz", &["release"]);
+        let m = Matcher::Label("release".to_string());
         assert_eq!(match_spec(&m, &s), MatchResult::MatchYes);
     }
 
     #[test]
     fn label_no() {
         let s = spec("foo/bar", "baz", &[]);
-        let m = Matcher::Label("//tag:release".to_string());
+        let m = Matcher::Label("release".to_string());
         assert_eq!(match_spec(&m, &s), MatchResult::MatchNo);
     }
 

@@ -120,12 +120,18 @@ jobs:
       # own `<name>.sha256` sidecar instead of appending to `$GITHUB_OUTPUT` —
       # concurrent appends to that file would interleave, and the collector step
       # below turns the sidecars into job outputs once they have all landed.
+      # Under `-race`, unlike the cross-builds below: the suppressor these tests
+      # cover is shared by every analyzer and written from all of them at once
+      # (unitchecker runs analyzers concurrently). That raced, and an
+      # unsynchronized map write is a `fatal error`, not a failed check — it
+      # kills the lint run outright. `-race` needs cgo, hence the override; the
+      # published binaries are still built CGO_ENABLED=0.
       - name: Test
         working-directory: tools/heph-govet
         env:
-          CGO_ENABLED: "0"
-          GOFLAGS: "-trimpath -buildvcs=false"
-        run: go test ./...
+          CGO_ENABLED: "1"
+          GOFLAGS: "-buildvcs=false"
+        run: go test -race ./...
         background: true
 
       - name: Build linux/amd64

@@ -6,7 +6,9 @@
 //! `object_store::parse_url_opts`, which dispatches on the scheme and returns
 //! the right store. Credentials are read from the process environment (e.g.
 //! `AWS_ACCESS_KEY_ID`, `GOOGLE_SERVICE_ACCOUNT`) by feeding `std::env::vars()`
-//! to the builder, mirroring each builder's `from_env`.
+//! to the builder, mirroring each builder's `from_env`. An `s3://` cache can
+//! additionally be pointed at a non-AWS S3-compatible service from the config
+//! file — see [`StoreOptions`].
 //!
 //! All transfers are streamed: reads expose the object's byte stream as an
 //! [`AsyncRead`], and writes go through object_store's multipart [`BufWriter`],
@@ -176,6 +178,44 @@ fn transfer_opts(scheme: &str) -> Vec<(String, String)> {
     }
 }
 
+/// Per-cache connection settings that have no place in the cache URI, from
+/// `caches: { <name>: { endpoint, region } }`.
+///
+/// Both are S3-only: they exist to point an `s3://bucket/prefix` cache at an
+/// S3-compatible service that is not AWS (Cloudflare R2, MinIO, Ceph, …), where
+/// the URI still names the bucket and the prefix and the endpoint names the host
+/// to talk to. Setting either on any other scheme is rejected by
+/// [`ObjStoreBackend::from_uri`] rather than silently ignored.
+///
+/// Both override the corresponding environment variable (`AWS_ENDPOINT_URL`,
+/// `AWS_REGION`), which stays supported for the case where the endpoint is a
+/// property of the machine rather than of the repo.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoreOptions<'a> {
+    /// Base URL of the service, e.g. `https://<account>.r2.cloudflarestorage.com`
+    /// or `http://localhost:9000`. An `http://` endpoint also lifts
+    /// object_store's plaintext-HTTP block, which otherwise rejects every
+    /// request to it — writing `http://` is the opt-in.
+    pub endpoint: Option<&'a str>,
+    /// Region to sign requests for. Unset leaves object_store's own resolution
+    /// (`AWS_REGION`, else `us-east-1`) in place.
+    pub region: Option<&'a str>,
+}
+
+impl StoreOptions<'_> {
+    /// Reject endpoint/region on a store that has no notion of them. Silently
+    /// dropping them would leave a cache pointed at the wrong host with nothing
+    /// in the output saying so; failing at startup names the field and the URI.
+    fn reject_non_s3(&self, uri: &str) -> anyhow::Result<()> {
+        let field = match (self.endpoint, self.region) {
+            (Some(_), _) => "endpoint",
+            (_, Some(_)) => "region",
+            _ => return Ok(()),
+        };
+        anyhow::bail!("`{field}` is only supported for s3:// remote caches, not {uri}")
+    }
+}
+
 /// One remote object store plus the path prefix carved out of its URI. Object
 /// keys handed to [`RemoteCacheBackend`] are joined under `prefix`, so two
 /// repos can share a bucket by pointing at distinct prefixes (`s3://b/repo-a`,
@@ -192,10 +232,16 @@ impl ObjStoreBackend {
     ///
     /// `max_concurrency` caps in-flight requests to this store via
     /// [`LimitStore`], so a wide build fan-out can't open thousands of
-    /// simultaneous connections.
-    pub fn from_uri(uri: &str, max_concurrency: usize) -> anyhow::Result<Self> {
+    /// simultaneous connections. `opts` carries the S3-only endpoint/region
+    /// overrides; see [`StoreOptions`].
+    pub fn from_uri(
+        uri: &str,
+        max_concurrency: usize,
+        opts_override: &StoreOptions<'_>,
+    ) -> anyhow::Result<Self> {
         let url = Url::parse(uri).with_context(|| format!("parse remote cache uri {uri}"))?;
         let (store, prefix): (Box<dyn ObjectStore>, ObjPath) = if url.scheme() == "gs" {
+            opts_override.reject_non_s3(uri)?;
             // Always drive GCS through the NegotiatingConnector so transfers use
             // HTTP/2 (falling back to HTTP/1.1) instead of object_store's
             // connection-storming HTTP/1.1-only default.
@@ -249,19 +295,41 @@ impl ObjStoreBackend {
                 .chain(transfer_opts(url.scheme()))
                 .collect();
             let store: Box<dyn ObjectStore> = match scheme {
-                ObjectStoreScheme::AmazonS3 => Box::new(
-                    build_with_opts!(AmazonS3Builder, uri, opts)
-                        .with_retry(retry_config())
-                        .build()
-                        .with_context(|| format!("build S3 store for {uri}"))?,
-                ),
-                ObjectStoreScheme::MicrosoftAzure => Box::new(
-                    build_with_opts!(MicrosoftAzureBuilder, uri, opts)
-                        .with_retry(retry_config())
-                        .build()
-                        .with_context(|| format!("build Azure store for {uri}"))?,
-                ),
+                ObjectStoreScheme::AmazonS3 => {
+                    let mut builder =
+                        build_with_opts!(AmazonS3Builder, uri, opts).with_retry(retry_config());
+                    // Applied *after* the env fold so an endpoint/region written
+                    // in `.hephconfig` wins over an ambient `AWS_ENDPOINT_URL` /
+                    // `AWS_REGION` — the repo's own config is the more specific
+                    // statement of where its cache lives.
+                    if let Some(endpoint) = opts_override.endpoint {
+                        builder = builder.with_endpoint(endpoint);
+                        if endpoint.starts_with("http://") {
+                            // object_store refuses plaintext HTTP unless asked;
+                            // spelling out `http://` in the config is the ask.
+                            builder = builder.with_allow_http(true);
+                        }
+                    }
+                    if let Some(region) = opts_override.region {
+                        builder = builder.with_region(region);
+                    }
+                    Box::new(
+                        builder
+                            .build()
+                            .with_context(|| format!("build S3 store for {uri}"))?,
+                    )
+                }
+                ObjectStoreScheme::MicrosoftAzure => {
+                    opts_override.reject_non_s3(uri)?;
+                    Box::new(
+                        build_with_opts!(MicrosoftAzureBuilder, uri, opts)
+                            .with_retry(retry_config())
+                            .build()
+                            .with_context(|| format!("build Azure store for {uri}"))?,
+                    )
+                }
                 ObjectStoreScheme::Http => {
+                    opts_override.reject_non_s3(uri)?;
                     let base = &url[..url::Position::BeforePath];
                     Box::new(
                         build_with_opts!(HttpBuilder, base, opts)
@@ -272,6 +340,7 @@ impl ObjStoreBackend {
                 }
                 // `file`/`memory`: no network client, no retry semantics.
                 _ => {
+                    opts_override.reject_non_s3(uri)?;
                     parse_url_opts(&url, opts)
                         .with_context(|| format!("open remote cache store for {uri}"))?
                         .0
@@ -732,7 +801,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_backend_streams_under_prefix() {
-        let backend = ObjStoreBackend::from_uri("memory:///repo-a", 10).expect("backend");
+        let backend = ObjStoreBackend::from_uri("memory:///repo-a", 10, &StoreOptions::default())
+            .expect("backend");
         assert!(!backend.exists("k/v").await.expect("exists"));
         assert!(get(&backend, "k/v").await.is_none());
 
@@ -759,7 +829,8 @@ mod tests {
     async fn file_backend_streams() {
         let dir = tempfile::tempdir().expect("tempdir");
         let uri = format!("file://{}", dir.path().display());
-        let backend = ObjStoreBackend::from_uri(&uri, 10).expect("backend");
+        let backend =
+            ObjStoreBackend::from_uri(&uri, 10, &StoreOptions::default()).expect("backend");
         put(&backend, "a/b/c", b"payload").await;
         assert_eq!(get(&backend, "a/b/c").await.expect("present"), b"payload");
     }
@@ -919,7 +990,9 @@ mod tests {
 
     #[test]
     fn s3_scheme_wires_retry_config_not_object_store_default() {
-        let backend = ObjStoreBackend::from_uri("s3://some-bucket/prefix", 10).expect("backend");
+        let backend =
+            ObjStoreBackend::from_uri("s3://some-bucket/prefix", 10, &StoreOptions::default())
+                .expect("backend");
         assert_wires_retry_config(&*backend.store, "S3");
     }
 
@@ -928,14 +1001,130 @@ mod tests {
         let backend = ObjStoreBackend::from_uri(
             "abfss://some-container@some-account.dfs.core.windows.net/prefix",
             10,
+            &StoreOptions::default(),
         )
         .expect("backend");
         assert_wires_retry_config(&*backend.store, "Azure");
     }
 
+    /// A custom endpoint has to reach the built client, not just the builder:
+    /// object_store folds it into `S3Config::bucket_endpoint`, which is what
+    /// every request URL is built from. Same Debug-introspection trick (and the
+    /// same never-print-the-string rule) as [`assert_wires_retry_config`].
+    #[test]
+    fn s3_endpoint_and_region_reach_the_built_store() {
+        let backend = ObjStoreBackend::from_uri(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions {
+                endpoint: Some("https://accountid.r2.cloudflarestorage.com"),
+                region: Some("auto"),
+            },
+        )
+        .expect("backend");
+        let debug = format!("{:?}", backend.store);
+        assert!(
+            debug.contains("https://accountid.r2.cloudflarestorage.com/some-bucket"),
+            "custom endpoint never reached the S3 client's request URL"
+        );
+        assert!(
+            !debug.contains("amazonaws.com"),
+            "S3 client still points at AWS despite a configured endpoint"
+        );
+        assert!(
+            debug.contains("auto"),
+            "configured region never reached the S3 client"
+        );
+    }
+
+    /// A plaintext endpoint (a local MinIO, a test double) is otherwise refused
+    /// by object_store's `allow_http` guard on the first request — writing
+    /// `http://` in the config is the opt-in, so nothing else has to be set.
+    #[test]
+    fn s3_http_endpoint_opts_into_plaintext() {
+        let backend = ObjStoreBackend::from_uri(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions {
+                endpoint: Some("http://localhost:9000"),
+                region: None,
+            },
+        )
+        .expect("backend");
+        let debug = format!("{:?}", backend.store);
+        assert!(
+            debug.contains("http://localhost:9000/some-bucket"),
+            "plaintext endpoint never reached the S3 client's request URL"
+        );
+        assert!(
+            debug.contains("allow_http: Parsed(true)"),
+            "an http:// endpoint must lift object_store's plaintext block"
+        );
+    }
+
+    /// An https endpoint must NOT lift the guard — the opt-in is scoped to the
+    /// scheme actually written, so a typo elsewhere can't silently downgrade a
+    /// TLS connection.
+    #[test]
+    fn s3_https_endpoint_leaves_plaintext_blocked() {
+        let backend = ObjStoreBackend::from_uri(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions {
+                endpoint: Some("https://accountid.r2.cloudflarestorage.com"),
+                region: None,
+            },
+        )
+        .expect("backend");
+        assert!(
+            !format!("{:?}", backend.store).contains("allow_http: Parsed(true)"),
+            "an https:// endpoint must leave plaintext HTTP blocked"
+        );
+    }
+
+    /// Endpoint/region are S3-only. On any other scheme they are a config
+    /// mistake, and silently dropping them would leave the cache pointed
+    /// somewhere the config does not say — fail at startup, naming the field.
+    #[test]
+    fn endpoint_or_region_on_a_non_s3_scheme_is_rejected() {
+        for uri in [
+            "gs://some-bucket/prefix",
+            "abfss://some-container@some-account.dfs.core.windows.net/prefix",
+            "https://example.com/prefix",
+            "memory:///repo-a",
+        ] {
+            let err = ObjStoreBackend::from_uri(
+                uri,
+                10,
+                &StoreOptions {
+                    endpoint: Some("https://example.invalid"),
+                    region: None,
+                },
+            )
+            .err()
+            .expect("endpoint on a non-s3 scheme must not be accepted");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("endpoint") && msg.contains(uri), "{msg}");
+
+            let err = ObjStoreBackend::from_uri(
+                uri,
+                10,
+                &StoreOptions {
+                    endpoint: None,
+                    region: Some("auto"),
+                },
+            )
+            .err()
+            .expect("region on a non-s3 scheme must not be accepted");
+            assert!(format!("{err:#}").contains("region"), "{err:#}");
+        }
+    }
+
     #[test]
     fn http_scheme_wires_retry_config_not_object_store_default() {
-        let backend = ObjStoreBackend::from_uri("http://example.com/prefix", 10).expect("backend");
+        let backend =
+            ObjStoreBackend::from_uri("http://example.com/prefix", 10, &StoreOptions::default())
+                .expect("backend");
         assert_wires_retry_config(&*backend.store, "HTTP");
     }
 

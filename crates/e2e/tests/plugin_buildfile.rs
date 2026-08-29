@@ -211,20 +211,42 @@ async fn test_spec_labels() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "pkg",
-        r#"target(name = "t", driver = "bash", run = "true", labels = ["//team:foo", "//ci:lint"])"#,
+        r#"target(name = "t", driver = "bash", run = "true", labels = ["team-foo", "ci_lint2"])"#,
     );
 
     let spec = ws.get_spec("//pkg:t").await?;
     assert!(
-        spec.labels.contains(&"//team:foo".to_string()),
+        spec.labels.contains(&"team-foo".to_string()),
         "labels: {:?}",
         spec.labels
     );
     assert!(
-        spec.labels.contains(&"//ci:lint".to_string()),
+        spec.labels.contains(&"ci_lint2".to_string()),
         "labels: {:?}",
         spec.labels
     );
+    Ok(())
+}
+
+/// A label outside `[A-Za-z0-9_-]+` is rejected where it is declared, not left
+/// as a tag no `label(...)` query can name.
+#[tokio::test]
+async fn test_spec_label_outside_the_grammar_is_rejected() -> anyhow::Result<()> {
+    for bad in [r#"["//team:foo"]"#, r#"["needs review"]"#, r#"[""]"#] {
+        let ws = Workspace::new();
+        ws.write_build_file(
+            "pkg",
+            &format!(r#"target(name = "t", driver = "bash", run = "true", labels = {bad})"#),
+        );
+
+        let err = ws
+            .get_spec("//pkg:t")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("labels = {bad} should not evaluate"));
+        let chain = format!("{err:#}");
+        assert!(chain.contains("label"), "labels = {bad}: {chain}");
+    }
     Ok(())
 }
 

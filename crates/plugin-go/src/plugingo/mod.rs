@@ -29,6 +29,13 @@ pub use driver_golist::GoGolistDriver;
 pub use driver_lint::{GoLintDriver, GoLintFixDriver, GoLintGateDriver};
 pub use driver_testmain::GoTestmainDriver;
 pub use provider::{Config, Provider};
-pub use toolchain::GoToolchainDriver;
+// `DEFAULT_GO_VERSION` / `HOST` / `checksum_key` are re-exported for the
+// `plugingo-e2e` harness: it must pin the same toolchain this provider does and
+// render `checksums` keys exactly as the driver looks them up. It used to spell
+// its own copies, which is a silent-failure shape — a checksum key that matches
+// nothing is not an error, it downloads the SDK unverified (the driver only
+// warns), so a drifted copy leaves the suite green while it tests an unverified
+// toolchain.
+pub use toolchain::{DEFAULT_GO_VERSION, GoToolchainDriver, HOST, checksum_key};
 
 pub mod runner;

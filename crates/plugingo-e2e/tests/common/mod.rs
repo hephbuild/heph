@@ -111,33 +111,47 @@ fn go_bin_path() -> String {
     format!("{goroot}/bin/go")
 }
 
-/// Pinned hermetic Go toolchain version the e2e suite builds against. Mirrors
-/// `plugingo::toolchain::DEFAULT_GO_VERSION`.
-pub const HERMETIC_GO: &str = "1.26.4";
-/// `gotool` sentinel selecting the host `go` (mirrors `plugingo::toolchain::HOST`).
-pub const HOST_GO: &str = "host";
+/// Pinned hermetic Go toolchain version the e2e suite builds against. Taken from
+/// the provider's own constant rather than spelled again: a second copy that
+/// drifted would key [`HERMETIC_GO_CHECKSUMS`] to a version nothing downloads,
+/// and a checksum entry that misses is not an error — the SDK is then fetched
+/// unverified (the driver only warns), so the suite would still pass while
+/// testing an unverified toolchain.
+pub const HERMETIC_GO: &str = plugingo::DEFAULT_GO_VERSION;
+/// `gotool` sentinel selecting the host `go`, from the provider's own constant.
+pub const HOST_GO: &str = plugingo::HOST;
 
-/// SDK tarball checksums for [`HERMETIC_GO`], keyed `"<version>/<goos>/<goarch>"`
-/// (see `plugingo::toolchain::checksum_key`). The provider has no built-in table
-/// — hermetic builds must supply these via the `checksums` config option — so
-/// the suite injects them for the host platforms CI runs on. Sourced from
-/// <https://go.dev/dl/?mode=json>.
-const HERMETIC_GO_CHECKSUMS: &[(&str, &str)] = &[
+/// SDK tarball SHA-256 for [`HERMETIC_GO`] on each `(goos, goarch)` CI builds
+/// on. The provider has no built-in table — hermetic builds must supply these
+/// via the `checksums` config option — so the suite injects them.
+///
+/// Only the platform pair is spelled here; the `"<version>/<goos>/<goarch>"`
+/// key is rendered by `plugingo::checksum_key` from [`HERMETIC_GO`]
+/// (see [`sdk_checksums_for`]), so bumping the version cannot leave a stale key
+/// behind that silently matches nothing. Bumping it *does* leave stale hashes —
+/// but those fail the download closed, loudly, which is the point.
+///
+/// Sourced from <https://go.dev/dl/?mode=json>.
+const HERMETIC_GO_CHECKSUMS: &[(&str, &str, &str)] = &[
     (
-        "1.26.4/linux/amd64",
-        "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f",
+        "linux",
+        "amd64",
+        "675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685",
     ),
     (
-        "1.26.4/linux/arm64",
-        "ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768",
+        "linux",
+        "arm64",
+        "51798d2c42d0e1c6ed7fd9f48728b4193abac9e8aad6dbac2fe96a81f5909bda",
     ),
     (
-        "1.26.4/darwin/amd64",
-        "05dc9b5f9997744520aaebb3d5deaa7c755371aebbfb7f97c2511a9f3367538d",
+        "darwin",
+        "amd64",
+        "d3314e25496e4381d71a5c51d2907e7af655d199f6780b549f015bd85fef4986",
     ),
     (
-        "1.26.4/darwin/arm64",
-        "b62ad2b6d7d2464f12a5bcad7ff47f19d08325773b5efd21610e445a05a9bf53",
+        "darwin",
+        "arm64",
+        "90493b3bbd5e10f91d12153198bf1994fd756399b4fec93b49b0c6e2acdeeb3e",
     ),
 ];
 
@@ -149,7 +163,12 @@ fn sdk_checksums_for(gotool: &str) -> std::collections::HashMap<String, String> 
     }
     HERMETIC_GO_CHECKSUMS
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(goos, goarch, sha)| {
+            (
+                plugingo::checksum_key(HERMETIC_GO, goos, goarch),
+                sha.to_string(),
+            )
+        })
         .collect()
 }
 

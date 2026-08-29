@@ -2,41 +2,11 @@ package main
 
 import (
 	"golang.org/x/tools/go/analysis"
-
-	"golang.org/x/tools/go/analysis/passes/appends"
-	"golang.org/x/tools/go/analysis/passes/asmdecl"
-	"golang.org/x/tools/go/analysis/passes/assign"
-	"golang.org/x/tools/go/analysis/passes/atomic"
-	"golang.org/x/tools/go/analysis/passes/bools"
-	"golang.org/x/tools/go/analysis/passes/buildtag"
-	"golang.org/x/tools/go/analysis/passes/cgocall"
-	"golang.org/x/tools/go/analysis/passes/composite"
-	"golang.org/x/tools/go/analysis/passes/copylock"
-	"golang.org/x/tools/go/analysis/passes/defers"
-	"golang.org/x/tools/go/analysis/passes/directive"
-	"golang.org/x/tools/go/analysis/passes/errorsas"
-	"golang.org/x/tools/go/analysis/passes/httpresponse"
-	"golang.org/x/tools/go/analysis/passes/ifaceassert"
-	"golang.org/x/tools/go/analysis/passes/loopclosure"
-	"golang.org/x/tools/go/analysis/passes/lostcancel"
-	"golang.org/x/tools/go/analysis/passes/nilfunc"
-	"golang.org/x/tools/go/analysis/passes/printf"
-	"golang.org/x/tools/go/analysis/passes/shift"
-	"golang.org/x/tools/go/analysis/passes/sigchanyzer"
-	"golang.org/x/tools/go/analysis/passes/slog"
-	"golang.org/x/tools/go/analysis/passes/stdmethods"
-	"golang.org/x/tools/go/analysis/passes/stringintconv"
-	"golang.org/x/tools/go/analysis/passes/structtag"
-	"golang.org/x/tools/go/analysis/passes/testinggoroutine"
-	"golang.org/x/tools/go/analysis/passes/tests"
-	"golang.org/x/tools/go/analysis/passes/timeformat"
-	"golang.org/x/tools/go/analysis/passes/unmarshal"
-	"golang.org/x/tools/go/analysis/passes/unreachable"
-	"golang.org/x/tools/go/analysis/passes/unsafeptr"
-	"golang.org/x/tools/go/analysis/passes/unusedresult"
+	"golang.org/x/tools/go/analysis/suite/vet"
 
 	// Off-by-default vet passes (as in `go vet` / golangci): opt-in via
-	// `linters.settings.govet.enable` / `enable-all`.
+	// `linters.settings.govet.enable` / `enable-all`. These are the only passes
+	// named here — the default-on set comes from `vet.Suite`, see govetAll.
 	"golang.org/x/tools/go/analysis/passes/fieldalignment"
 	"golang.org/x/tools/go/analysis/passes/nilness"
 	"golang.org/x/tools/go/analysis/passes/shadow"
@@ -77,25 +47,47 @@ type govetEntry struct {
 	defaultOn bool
 }
 
-// govetAll is every vet analyzer this binary can run, in deterministic order.
-// The default-on set matches `go vet`'s standard analyzers; the trailing few are
-// off by default (as in `go vet` / golangci) and enabled via settings.
+// govetAll is every vet analyzer this binary can run, in deterministic order:
+// `go vet`'s own suite first (default on), then the extras it deliberately
+// leaves out (default off, opt-in via settings).
+//
+// The default-on set *is* x/tools' `suite/vet.Suite` — the same slice `cmd/vet`
+// runs (`unitchecker.Main(vet.Suite...)`), not a transcription of it. It used to
+// be spelled out here, and by the time Go 1.27 landed it had drifted six
+// analyzers behind what `go vet` actually runs: framepointer, hostport,
+// scannererr, sqlrowserr, stdversion and waitgroup. Deriving it makes "matches
+// `go vet`" true by construction, so the next Go release's new checks arrive
+// wired rather than waiting for someone to notice the gap.
+//
+// Selection and settings are keyed by analyzer *name* (see resolveGovet), so a
+// suite that grows upstream needs no change here — a `.golangci.yml` naming a
+// new analyzer just starts working.
 func govetAll() []govetEntry {
-	on := func(a *analysis.Analyzer) govetEntry { return govetEntry{a, true} }
-	off := func(a *analysis.Analyzer) govetEntry { return govetEntry{a, false} }
-	return []govetEntry{
-		on(appends.Analyzer), on(asmdecl.Analyzer), on(assign.Analyzer), on(atomic.Analyzer),
-		on(bools.Analyzer), on(buildtag.Analyzer), on(cgocall.Analyzer), on(composite.Analyzer),
-		on(copylock.Analyzer), on(defers.Analyzer), on(directive.Analyzer), on(errorsas.Analyzer),
-		on(httpresponse.Analyzer), on(ifaceassert.Analyzer), on(loopclosure.Analyzer),
-		on(lostcancel.Analyzer), on(nilfunc.Analyzer), on(printf.Analyzer), on(shift.Analyzer),
-		on(sigchanyzer.Analyzer), on(slog.Analyzer), on(stdmethods.Analyzer),
-		on(stringintconv.Analyzer), on(structtag.Analyzer), on(testinggoroutine.Analyzer),
-		on(tests.Analyzer), on(timeformat.Analyzer), on(unmarshal.Analyzer),
-		on(unreachable.Analyzer), on(unsafeptr.Analyzer), on(unusedresult.Analyzer),
-		off(shadow.Analyzer), off(fieldalignment.Analyzer), off(nilness.Analyzer),
-		off(sortslice.Analyzer), off(unusedwrite.Analyzer),
+	// Off by default, as in `go vet` and golangci: noisy or expensive enough
+	// that an always-on set is the wrong default. The upstream suite omits
+	// fieldalignment by name for exactly that reason.
+	off := []*analysis.Analyzer{
+		shadow.Analyzer, fieldalignment.Analyzer, nilness.Analyzer,
+		sortslice.Analyzer, unusedwrite.Analyzer,
 	}
+	out := make([]govetEntry, 0, len(vet.Suite)+len(off))
+	inSuite := make(map[string]bool, len(vet.Suite))
+	for _, a := range vet.Suite {
+		out = append(out, govetEntry{a, true})
+		inSuite[a.Name] = true
+	}
+	for _, a := range off {
+		// Upstream can promote one of these into the suite — hostport and
+		// waitgroup arrived in `go vet` exactly that way. Appending it anyway
+		// would shadow the default-on entry, because resolveGovet keys by name
+		// and takes the last one it sees: a `go vet` default would silently
+		// switch itself off on an x/tools bump. The suite wins.
+		if inSuite[a.Name] {
+			continue
+		}
+		out = append(out, govetEntry{a, false})
+	}
+	return out
 }
 
 // honnefAnalyzers unwraps honnef.co/go/tools' lint.Analyzer wrappers into bare
