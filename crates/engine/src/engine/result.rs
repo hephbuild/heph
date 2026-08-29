@@ -5194,8 +5194,9 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok(Arc::new(engine))
@@ -5225,8 +5226,9 @@ mod tests {
             }],
             ..Default::default()
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
@@ -5449,8 +5451,9 @@ mod tests {
             }],
             ..Default::default()
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_bash()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_bash().with_host_path())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
@@ -6203,8 +6206,9 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         // Cycling provider FIRST, so `get_spec` hits it before the static one.
         let cycles_for = cycles_for.to_string();
         engine.register_provider(move |_| {
@@ -6672,8 +6676,9 @@ mod tests {
             SArc::new(AtomicUsize::new(0)),
         );
         let gate = SArc::new(tokio::sync::Semaphore::new(0));
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         let provider = AdmissionGate {
             inner: pluginstatictarget::Provider::new(targets)?,
             entered: SArc::clone(&entered),
@@ -7007,8 +7012,9 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         let targets = vec![
             static_target("//pkg:a", &[], &[]),
             static_target("//pkg:b", &[], &[]),
@@ -8237,8 +8243,9 @@ mod tests {
             parallelism: Some(parallelism),
             ..Default::default()
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets(engine.max_workers))?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
@@ -8257,8 +8264,9 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
@@ -9564,8 +9572,9 @@ mod tests {
         // so codegen targets can run real shell. The `@heph/fs` provider+driver
         // (auto-registered by `Engine::new`) resolves the synthesized
         // introspect-outputs inputs.
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_bash()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_bash().with_host_path())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
@@ -9722,8 +9731,9 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         // A dep is what makes the probe run at all: `meta` hashes a target from
         // its inputs, so it resolves `//pkg:dep` for its `hashout` — and that
         // resolution is what probes the cache under the hash-only request.

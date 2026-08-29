@@ -124,7 +124,7 @@ fn build_engine(root: &Path, remote_uri: &str, parallelism: Option<usize>) -> Ar
         ))
     })
     .expect("register buildfile provider");
-    e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash()))
+    e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))
         .expect("register bash driver");
     Arc::new(e)
 }

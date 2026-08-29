@@ -140,7 +140,9 @@ fn workspace() -> htestkit::Workspace {
                 init.runtime.clone(),
             ))
         })
-        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         .with_managed_driver(Box::new(pluginoci::runner::Driver::new()))
         // What the cdylib hands the host through `NamedRunner`; an in-process
         // harness registers it directly.

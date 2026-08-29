@@ -63,6 +63,12 @@ pub struct Driver {
     coreutils: Option<(u32, CoreutilsShims)>,
     /// Resolved on first use and reused: the steady-state cost is one `stat`.
     coreutils_dir: std::sync::OnceLock<PathBuf>,
+    /// True when this driver wraps the target's command in a shell, so `argv[0]`
+    /// is *ours* rather than the target's. Only then may it be resolved on the
+    /// ambient PATH — see [`Driver::resolve_shell`].
+    wraps_in_shell: bool,
+    /// The absolute shell, resolved once on first use.
+    shell_path: std::sync::OnceLock<PathBuf>,
     wrap_run: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
     wrap_run_shell: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
 }
@@ -278,6 +284,8 @@ impl Driver {
         Self {
             default_runner: None,
             name: "exec".to_string(),
+            wraps_in_shell: false,
+            shell_path: std::sync::OnceLock::new(),
             coreutils_enabled: false,
             coreutils: None,
             coreutils_dir: std::sync::OnceLock::new(),
@@ -304,7 +312,13 @@ impl Driver {
             std::collections::HashMap::new();
         config.insert("run".to_string(), hcore::htvalue::Value::List(vec![]));
         std::sync::Arc::new(hdriver_support::driver_managed::ShellFallback {
-            driver: std::sync::Arc::new(Driver::new_exec()),
+            // The host's directories, deliberately, unlike a build target. This
+            // is the interactive shell a human gets from `--shell` on a driver
+            // that has no shell mode of its own — its entire purpose is poking
+            // around, and a session with no `ls` on `PATH` would be useless. It
+            // builds nothing and reaches no cache key, so the argument for
+            // keeping the host out does not apply to it.
+            driver: std::sync::Arc::new(Driver::new_exec().with_host_path()),
             spec_template: std::sync::Arc::new(hplugin::provider::TargetSpec {
                 addr: Default::default(),
                 driver: "exec".to_string(),
@@ -318,6 +332,8 @@ impl Driver {
         Self {
             default_runner: None,
             name: "bash".to_string(),
+            wraps_in_shell: true,
+            shell_path: std::sync::OnceLock::new(),
             coreutils_enabled: false,
             coreutils: None,
             coreutils_dir: std::sync::OnceLock::new(),
@@ -393,6 +409,68 @@ impl Driver {
         }
         let dir = shims().context("materialize the builtin-utility shim directory")?;
         Ok(Some(self.coreutils_dir.get_or_init(|| dir).as_path()))
+    }
+
+    /// Name the directories a target's `PATH` should end with.
+    ///
+    /// The equivalent of the driver's `path:` option, for an embedder that
+    /// builds the driver directly rather than from config. A driver with none
+    /// gives its targets only their declared tools and heph's builtins — see
+    /// `docs/COREUTILS.md`.
+    #[must_use]
+    pub fn with_search_path(mut self, dirs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.search_path = dirs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The host's directories on the target's `PATH`.
+    ///
+    /// For a test harness that needs a real `cat`/`sleep`/`printf` because it
+    /// is exercising the engine or process plumbing rather than `PATH` policy.
+    /// Spelled out per harness rather than defaulted, so anything depending on
+    /// the host says so.
+    #[must_use]
+    pub fn with_host_path(self) -> Self {
+        self.with_search_path(["/usr/local/bin", "/usr/bin", "/bin"])
+    }
+
+    /// The absolute path of the shell this driver wraps commands in.
+    ///
+    /// Resolved on the **ambient** `PATH` — the environment heph itself was
+    /// launched in — and spawned by absolute path, so the shell starts even
+    /// though the target's own `PATH` has no host directories on it. The two
+    /// are deliberately different things: the shell is the driver's
+    /// implementation detail, while everything the recipe runs *inside* it must
+    /// come from a declared tool or a builtin.
+    ///
+    /// Two things this must never extend to. The `exec` driver's `argv[0]` is
+    /// the target's own command, and resolving that ambiently would hand back
+    /// the entire hole this change closes. And a target under a *runner* runs
+    /// somewhere else entirely — a container has its own filesystem, where a
+    /// path resolved from heph's `PATH` does not exist — so the caller only
+    /// reaches here for a local spawn.
+    fn resolve_shell(&self, run: Vec<String>) -> anyhow::Result<Vec<String>> {
+        let Some((program, rest)) = run.split_first() else {
+            return Ok(run);
+        };
+        if program.contains('/') {
+            return Ok(run);
+        }
+        if let Some(found) = self.shell_path.get() {
+            let mut out = vec![found.to_string_lossy().into_owned()];
+            out.extend_from_slice(rest);
+            return Ok(out);
+        }
+        let found = which::which(program).with_context(|| {
+            format!(
+                "the {} driver needs `{program}` and could not find it on the PATH heph was                  launched with. A target's own PATH deliberately has no host directories on it,                  so the shell is resolved here instead.",
+                self.name,
+            )
+        })?;
+        let found = self.shell_path.get_or_init(|| found);
+        let mut out = vec![found.to_string_lossy().into_owned()];
+        out.extend_from_slice(rest);
+        Ok(out)
     }
 
     /// The toolbox identity that reaches a target's cache key, or `None` when it
@@ -1297,7 +1375,7 @@ impl Driver {
     /// a hardcoded default.
     fn sandbox_path_display(&self) -> String {
         if self.search_path.is_empty() {
-            ["/usr/local/bin", "/usr/bin", "/bin"].join(":")
+            "the target's tools and heph's builtin utilities".to_string()
         } else {
             self.search_path.join(":")
         }
@@ -1314,10 +1392,25 @@ impl Driver {
         let def = rreq.target.def::<TargetDef>();
 
         let run = {
-            if shell {
+            let wrapped = if shell {
                 (self.wrap_run_shell)(&rreq.sandbox_dir, &def.run)?
             } else {
                 (self.wrap_run)(&rreq.sandbox_dir, &def.run)?
+            };
+            // `argv[0]` is ours whenever we wrapped the command in a shell —
+            // either because this is the bash driver, or because shell mode
+            // wrapped an exec target.
+            //
+            // Only for a *local* spawn, though. Under a runner the environment
+            // is the runner's, and an absolute path resolved from heph's own
+            // PATH is meaningless there: a container has its own filesystem,
+            // and `/nix/store/…/bash` does not exist inside it. The shell has
+            // to come from the environment the target actually runs in, which
+            // is exactly what naming a runner asks for.
+            if def.runner.is_none() && (self.wraps_in_shell || shell) {
+                self.resolve_shell(wrapped)?
+            } else {
+                wrapped
             }
         };
 
@@ -1329,14 +1422,13 @@ impl Driver {
         if shell && let Ok(term) = std::env::var("TERM") {
             env.insert("TERM".to_string(), term);
         }
-        // Only when nothing else supplies an environment. Under a runner the
-        // environment is the runner's, and injecting `/usr/local/bin:/usr/bin:/bin`
-        // here would put the host's copy of a tool ahead of the one the target
-        // asked to run beside — silently, and inside a cache key that claims the
-        // runner's environment. It travels as `PathPolicy::fallback` instead, so
-        // a local spawn still gets it and an agent decides for itself.
-        if def.runner.is_none() {
-            env.insert("PATH".to_string(), self.sandbox_path_display());
+        // The host directories are deliberately absent. A target sees its own
+        // tools and heph's builtins, and nothing else: a recipe that reaches for
+        // an undeclared host binary is reaching outside its cache key, and the
+        // failure should say so rather than silently succeed on one machine.
+        // `path:` names directories back for a workspace that needs them.
+        if def.runner.is_none() && !self.search_path.is_empty() {
+            env.insert("PATH".to_string(), self.search_path.join(":"));
         }
         env.insert(
             "WORKSPACE_ROOT".to_string(),
@@ -1642,7 +1734,9 @@ impl Driver {
                 .map(|d| d.as_os_str().to_os_string())
                 .into_iter()
                 .collect(),
-            fallback: Some(std::ffi::OsString::from(self.sandbox_path_display())),
+            // No fallback. It carried `/usr/local/bin:/usr/bin:/bin` to the seam
+            // for a local spawn, which is precisely what this change removes.
+            fallback: None,
             suffix: coreutils_dir
                 .map(|d| d.as_os_str().to_os_string())
                 .into_iter()
@@ -1779,7 +1873,7 @@ impl Driver {
             };
             if e.kind() == std::io::ErrorKind::NotFound {
                 anyhow::anyhow!(
-                    "spawn child process {program:?}{via}: {e} — not found in the driver's sandbox PATH ({path}). This PATH is set by the driver's `path` option in .hephconfig and is independent of the invoking shell's PATH — a program on your interactive PATH can still be missing here. Also check that the working directory {cwd:?} exists.",
+                    "spawn child process {program:?}{via}: {e} — not found on the target's PATH ({path}). A target sees only what it declares as a tool plus heph's builtin utilities; the host's directories are deliberately not there, so a program on your interactive PATH is still missing here. Declare it as a tool, call it by absolute path, or name the directories back with the driver's `path` option in .hephconfig. Also check that the working directory {cwd:?} exists.",
                     path = self.sandbox_path_display(),
                     cwd = req.sandbox_pkg_dir,
                 )
@@ -2875,7 +2969,7 @@ mod tests {
     /// Runs on the `multi_thread` flavor — the runtime shape that panicked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_grace_escalates_without_panicking_timer() -> anyhow::Result<()> {
-        let driver = Driver::new_bash();
+        let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
@@ -2941,7 +3035,7 @@ mod tests {
     /// draining; without that, the child blocks on `write` and never exits.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_run_large_output_does_not_deadlock_multi_thread() -> anyhow::Result<()> {
-        let driver = Driver::new_bash();
+        let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         // 256 KiB — bigger than macOS pipe buffers (16-64 KiB), so without
         // a draining stdout pump the child would block on write forever.
@@ -3115,7 +3209,7 @@ mod tests {
         /// while a starved stream (delta ~0) stays unambiguously red.
         const EARLY_BY: std::time::Duration = std::time::Duration::from_millis(500);
 
-        let driver = Driver::new_bash();
+        let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             addr: Addr::default(),
@@ -3202,7 +3296,7 @@ mod tests {
     /// sleeps make the true order unambiguous, so this is not a race.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_run_log_records_both_streams_in_arrival_order() -> anyhow::Result<()> {
-        let driver = Driver::new_bash();
+        let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             addr: Addr::default(),
@@ -3270,7 +3364,7 @@ mod tests {
     async fn test_run_output_far_beyond_drain_bound_does_not_deadlock() -> anyhow::Result<()> {
         const PER_STREAM: usize = 4 * 1024 * 1024;
 
-        let driver = Driver::new_bash();
+        let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             addr: Addr::default(),
@@ -3425,7 +3519,7 @@ mod tests {
         // the overlap deterministic rather than a race).
         const SINK_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
-        let driver = Driver::new_bash();
+        let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             addr: Addr::default(),
@@ -3536,7 +3630,7 @@ mod tests {
         runtime_pass_env: Vec<String>,
         runtime_env: HashMap<String, String>,
     ) -> anyhow::Result<String> {
-        let driver = Driver::new_bash();
+        let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             addr: Addr::default(),
@@ -4919,7 +5013,7 @@ mod tests {
     /// correct given that already-merged state).
     #[tokio::test]
     async fn test_multi_output_tool_symlinks_all_binaries() -> anyhow::Result<()> {
-        let driver = Driver::new_exec();
+        let driver = Driver::new_exec().with_host_path();
         let ctoken = StdCancellationToken::new();
         let tmp = tempfile::tempdir()?;
 
@@ -5080,7 +5174,7 @@ mod tests {
     /// upstream by `Sandbox::merge_sandbox`; here we just avoid EEXIST.
     #[tokio::test]
     async fn overlapping_tool_filenames_dedupe_silently() -> anyhow::Result<()> {
-        let driver = Driver::new_exec();
+        let driver = Driver::new_exec().with_host_path();
         let ctoken = StdCancellationToken::new();
         let tmp = tempfile::tempdir()?;
 
@@ -5177,7 +5271,7 @@ mod tests {
     /// destination once and continue.
     #[tokio::test]
     async fn same_source_tool_filename_dedupes_silently() -> anyhow::Result<()> {
-        let driver = Driver::new_exec();
+        let driver = Driver::new_exec().with_host_path();
         let ctoken = StdCancellationToken::new();
         let tmp = tempfile::tempdir()?;
 
@@ -5486,6 +5580,115 @@ mod tests {
         )
         .await?;
         assert_eq!(base.hash, off_again.hash);
+        Ok(())
+    }
+
+    #[test]
+    fn the_shell_is_not_resolved_for_a_target_under_a_runner() {
+        // A runner's environment is somewhere else — a container has its own
+        // filesystem, and an absolute path resolved from heph's PATH does not
+        // exist inside it. Rewriting `argv[0]` here would hand the runner a
+        // program that cannot run.
+        let driver = Driver::new_bash();
+        let argv = vec!["bash".to_string(), "-c".to_string(), "true".to_string()];
+        let resolved = driver.resolve_shell(argv.clone()).expect("resolve");
+        assert_ne!(
+            resolved, argv,
+            "a local spawn does resolve the shell to an absolute path"
+        );
+        assert!(
+            resolved.first().is_some_and(|p| p.contains('/')),
+            "and that path is absolute; got {resolved:?}"
+        );
+        // The runner case is decided by the caller in `run_inner`, which is
+        // covered end to end by `crates/e2e/tests/oci_runner.rs` — a container
+        // target whose `argv[0]` was rewritten to a host path cannot start.
+    }
+
+    #[tokio::test]
+    async fn a_target_that_declares_nothing_gets_no_host_directories() -> anyhow::Result<()> {
+        // The point of dropping the host `PATH`: a recipe that reaches for an
+        // undeclared binary is reaching outside its own cache key, and must
+        // fail rather than silently succeed on whichever machine has it.
+        let home = tempfile::tempdir()?;
+        let driver = Driver::new_bash()
+            .with_coreutils_enabled_for_test()
+            .with_coreutils(1, fake_shims(home.path()));
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                runner: None,
+                run: vec!["echo $PATH".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            pty: true,
+            hash: vec![],
+            transparent: false,
+        };
+        let mut stdout = Vec::new();
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: Some(&mut stdout),
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
+        };
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        let path_out = String::from_utf8(stdout)?;
+        let path_out = path_out.trim();
+        for host in ["/usr/local/bin", "/usr/bin", "/bin"] {
+            assert!(
+                !path_out.split(':').any(|e| e == host),
+                "{host} must not be on a target's PATH; got: {path_out}"
+            );
+        }
+        // What is left is exactly the builtins — and the shell still started,
+        // which is the other half of the change: it is resolved on the ambient
+        // PATH and spawned by absolute path, so it runs even though the
+        // target's own PATH could never have found it.
+        let shims = driver
+            .coreutils_dir()?
+            .expect("enabled")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            path_out, shims,
+            "a target that declares nothing sees only the builtins"
+        );
         Ok(())
     }
 

@@ -104,7 +104,9 @@ fn workspace_with_fake(fake: &Fake) -> htestkit::Workspace {
                 init.runtime.clone(),
             ))
         })
-        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
             bin.clone(),
         )))
@@ -487,7 +489,9 @@ async fn test_docker_build_build_failure_surfaces_the_builder_error() -> anyhow:
                 init.runtime.clone(),
             ))
         })
-        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
             bin.to_string_lossy().into_owned(),
         )))
