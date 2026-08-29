@@ -15,6 +15,9 @@
 //!
 //! [uutils/coreutils]: https://github.com/uutils/coreutils
 
+mod find;
+mod grep;
+
 use anyhow::Context as _;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -29,10 +32,10 @@ use std::path::{Path, PathBuf};
 ///
 /// Bump it on any observable behaviour change — an applet added or removed, an
 /// upstream upgrade that changes output, a fix to one of the hand-written parts.
-pub const COREUTILS_VERSION: u32 = 1;
+pub const COREUTILS_VERSION: u32 = 2;
 
 /// Where the applets come from, for `heph tool coreutils list`.
-pub const UPSTREAM: &str = "uutils/coreutils 0.10";
+pub const UPSTREAM: &str = "uutils/coreutils 0.10, uutils/findutils 0.10, ripgrep's grep-* crates";
 
 /// One utility, and the entry point that runs it.
 #[derive(Debug)]
@@ -49,61 +52,68 @@ pub struct Applet {
 /// named with a turbofish; the wrapper `fn` pins the iterator type and gives us
 /// something that coerces to a plain function pointer.
 macro_rules! applets {
-    ($($name:literal => $krate:ident,)*) => {
+    ($($name:literal => $run:expr,)*) => {
         /// Every applet, ordered by name so `list` and the docs agree.
         pub const APPLETS: &[Applet] = &[
-            $(Applet {
-                name: $name,
-                run: {
-                    fn run(args: Vec<OsString>) -> i32 { $krate::uumain(args.into_iter()) }
-                    run
-                },
-            },)*
+            $(Applet { name: $name, run: $run },)*
         ];
     };
 }
 
+/// Adapt a `uu_*` crate's `uumain` to the table's function-pointer shape.
+macro_rules! uu {
+    ($krate:ident) => {{
+        fn run(args: Vec<OsString>) -> i32 {
+            $krate::uumain(args.into_iter())
+        }
+        run
+    }};
+}
+
 applets! {
-    "base64" => uu_base64,
-    "basename" => uu_basename,
-    "cat" => uu_cat,
-    "chmod" => uu_chmod,
-    "comm" => uu_comm,
-    "cp" => uu_cp,
-    "cut" => uu_cut,
-    "date" => uu_date,
-    "dirname" => uu_dirname,
-    "echo" => uu_echo,
-    "env" => uu_env,
-    "false" => uu_false,
-    "head" => uu_head,
-    "install" => uu_install,
-    "ln" => uu_ln,
-    "md5sum" => uu_md5sum,
-    "mkdir" => uu_mkdir,
-    "mktemp" => uu_mktemp,
-    "mv" => uu_mv,
-    "nproc" => uu_nproc,
-    "printf" => uu_printf,
-    "readlink" => uu_readlink,
-    "realpath" => uu_realpath,
-    "rm" => uu_rm,
-    "rmdir" => uu_rmdir,
-    "seq" => uu_seq,
-    "sha1sum" => uu_sha1sum,
-    "sha256sum" => uu_sha256sum,
-    "sha512sum" => uu_sha512sum,
-    "sleep" => uu_sleep,
-    "sort" => uu_sort,
-    "stat" => uu_stat,
-    "tail" => uu_tail,
-    "tee" => uu_tee,
-    "timeout" => uu_timeout,
-    "touch" => uu_touch,
-    "tr" => uu_tr,
-    "true" => uu_true,
-    "uniq" => uu_uniq,
-    "wc" => uu_wc,
+    "base64" => uu!(uu_base64),
+    "basename" => uu!(uu_basename),
+    "cat" => uu!(uu_cat),
+    "chmod" => uu!(uu_chmod),
+    "comm" => uu!(uu_comm),
+    "cp" => uu!(uu_cp),
+    "cut" => uu!(uu_cut),
+    "date" => uu!(uu_date),
+    "dirname" => uu!(uu_dirname),
+    "echo" => uu!(uu_echo),
+    "env" => uu!(uu_env),
+    "false" => uu!(uu_false),
+    "find" => crate::find::find,
+    "grep" => crate::grep::main,
+    "head" => uu!(uu_head),
+    "install" => uu!(uu_install),
+    "ln" => uu!(uu_ln),
+    "md5sum" => uu!(uu_md5sum),
+    "mkdir" => uu!(uu_mkdir),
+    "mktemp" => uu!(uu_mktemp),
+    "mv" => uu!(uu_mv),
+    "nproc" => uu!(uu_nproc),
+    "printf" => uu!(uu_printf),
+    "readlink" => uu!(uu_readlink),
+    "realpath" => uu!(uu_realpath),
+    "rm" => uu!(uu_rm),
+    "rmdir" => uu!(uu_rmdir),
+    "seq" => uu!(uu_seq),
+    "sha1sum" => uu!(uu_sha1sum),
+    "sha256sum" => uu!(uu_sha256sum),
+    "sha512sum" => uu!(uu_sha512sum),
+    "sleep" => uu!(uu_sleep),
+    "sort" => uu!(uu_sort),
+    "stat" => uu!(uu_stat),
+    "tail" => uu!(uu_tail),
+    "tee" => uu!(uu_tee),
+    "timeout" => uu!(uu_timeout),
+    "touch" => uu!(uu_touch),
+    "tr" => uu!(uu_tr),
+    "true" => uu!(uu_true),
+    "uniq" => uu!(uu_uniq),
+    "wc" => uu!(uu_wc),
+    "xargs" => crate::find::xargs,
 }
 
 /// The applet called `name`, if heph ships one.

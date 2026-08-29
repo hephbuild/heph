@@ -1,6 +1,6 @@
 # Builtin coreutils
 
-heph ships 40 POSIX utilities inside its own binary and can put them on every
+heph ships 43 POSIX utilities inside its own binary and can put them on every
 target's `PATH`, so a recipe that runs `cp`, `install` or `sha256sum` behaves
 identically on Linux and macOS.
 
@@ -120,7 +120,8 @@ exists to prevent.
 ## The applets
 
 Forty MIT-licensed [uutils/coreutils] crates, tested upstream against the GNU
-test suite. Adding one is a line in the `applets!` table in
+test suite; `find` and `xargs` from [uutils/findutils]; and a `grep` built on
+ripgrep's search engine. Adding one is a line in the `applets!` table in
 `crates/coreutils/src/lib.rs` plus its crate in `Cargo.toml` — and a
 `COREUTILS_VERSION` bump.
 
@@ -136,8 +137,35 @@ fetching, hermetically and cacheably), `git`, `uname` (normalising `arm64` vs
 `aarch64` would change recipes that already switch on it), `du`/`df` (they
 answer questions about the machine, not the build), and anything interactive.
 
-`sed`, `grep`, `find`, `xargs`, `tar`, `gzip` and a template renderer are not in
-yet; they are the next slices.
+`sed`, `tar` and `gzip` are not in yet; they are the next slices. `diff`/`cmp`
+are not planned: the `diffutils` crate exposes its algorithms but keeps its CLI
+in a private `main`, so wiring it up would mean reimplementing its argument
+parsing for the lowest-value pair in the set.
+
+### `grep`, and where it departs from GNU
+
+Built on `grep-searcher`/`grep-regex` — the engine ripgrep uses — with a POSIX
+flag surface of our own (`-EFivnclLqwxrhHs`, `-m`, `-e`, `-f`, `--`). Two
+departures, both deliberate:
+
+* **No `-P`.** The `regex` crate has no backreferences or lookaround, by
+  design. `-P` fails with that explanation rather than with "invalid option",
+  because a pattern needing it has to be rewritten, not retried.
+* **Never colourised.** Output goes into build logs and gets parsed; a
+  `--color=auto` that guessed from a tty would make a recipe's behaviour depend
+  on how it was invoked.
+
+The argument parser is hand-rolled rather than clap, because `grep -e -v file`
+must treat `-v` as the *pattern*. Line numbers are always counted and only
+printed under `-n`: the `UTF8` sink asks every match for its line number and
+fails if the searcher was not tracking them.
+
+### `find` and `xargs`
+
+Straight adapters over findutils. Its entry points take `&[&str]`, so a
+non-UTF-8 argument is refused by name rather than lossily converted — GNU `find`
+accepts arbitrary bytes in a path and this cannot, and searching a *different*
+path than the one asked for is worse than saying so.
 
 ## One process per invocation
 
@@ -151,3 +179,4 @@ self-update check, and before any runtime exists. A build may invoke `cp`
 thousands of times, and each one is a fresh `heph` process.
 
 [uutils/coreutils]: https://github.com/uutils/coreutils
+[uutils/findutils]: https://github.com/uutils/findutils

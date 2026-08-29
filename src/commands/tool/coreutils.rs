@@ -71,7 +71,21 @@ impl CoreutilsArgs {
     }
 }
 
+/// `heph tool coreutils list | head` closes the pipe under us. That is the
+/// reader saying "enough", not an error worth printing — and printing one turns
+/// a normal shell idiom into a scary line in a build log.
+fn ignore_broken_pipe(res: std::io::Result<()>) -> anyhow::Result<()> {
+    match res {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
+    }
+}
+
 fn list(args: &ListArgs) -> anyhow::Result<()> {
+    ignore_broken_pipe(list_inner(args))
+}
+
+fn list_inner(args: &ListArgs) -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     if args.json {
@@ -80,7 +94,9 @@ fn list(args: &ListArgs) -> anyhow::Result<()> {
             "upstream": hcoreutils::UPSTREAM,
             "applets": hcoreutils::APPLETS.iter().map(|a| a.name).collect::<Vec<_>>(),
         });
-        writeln!(out, "{}", serde_json::to_string_pretty(&doc)?)?;
+        let rendered = serde_json::to_string_pretty(&doc)
+            .map_err(|e| std::io::Error::other(format!("render applet list as JSON: {e}")))?;
+        writeln!(out, "{rendered}")?;
         return Ok(());
     }
 
