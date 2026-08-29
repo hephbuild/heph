@@ -108,14 +108,13 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     )?);
 
     let mut drivers = stabby::vec::Vec::new();
-    // The shared golist GOCACHE lives in the engine's home dir, next to the
-    // walker db and for the same reason: it is heph-owned scratch, not repo
-    // content, and a plugin is handed its writable locations rather than
-    // discovering them.
-    let golist: Arc<dyn ManagedDriver> = Arc::new(
-        GoGolistDriver::with_gocache_root(home.join("go-golist-gocache"))
-            .with_default_runner(go_runner.clone()),
-    );
+    // The shared golist GOCACHE is no longer this plugin's to place: it is a
+    // `scratch` target the provider declares, and the host resolves, locks and
+    // mounts it. So there is no writable root to hand in here — which is the
+    // point, since the plugin also stops owning the eviction, the locking and
+    // the visibility it never had.
+    let golist: Arc<dyn ManagedDriver> =
+        Arc::new(GoGolistDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "go_golist".into(),
         driver: make_dyn_managed_driver(golist),

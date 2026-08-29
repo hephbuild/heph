@@ -5,6 +5,7 @@ use crate::plugingo::addr_util::{
 use crate::plugingo::cc_toolchain;
 use crate::plugingo::errors::NoGoFilesError;
 use crate::plugingo::factors::{self, Factors, VariantRef, current_goarch, current_goos};
+use crate::plugingo::gocache;
 use crate::plugingo::govet;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
@@ -1673,6 +1674,17 @@ impl ProviderInner {
                 .unwrap_or("");
             let spec = toolchain::build_spec(addr.clone(), version, &goos, &goarch, sha256);
             return Ok(GetResponse { target_spec: spec });
+        }
+
+        // The shared Go build cache: `//@heph/go/gocache:cache@<factors>` is a
+        // `scratch` declaration, not a buildable target. Matched here — before
+        // package decoding, exactly like the toolchain above — because there is
+        // no such directory on disk and asking the filesystem about it would only
+        // produce a confusing "not found".
+        if addr.name == gocache::GOCACHE_NAME && gocache::is_gocache_pkg(addr.package.as_str()) {
+            return Ok(GetResponse {
+                target_spec: gocache::build_spec(addr.clone()),
+            });
         }
 
         // `heph-govet`, the analysis/format binary the lint and format targets
