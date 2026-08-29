@@ -178,6 +178,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         // The go plugin exports no hooks.
         hooks: stabby::vec::Vec::new(),
         // No return-side metadata to report yet.
+        runners: stabby::vec::Vec::new(),
         meta: stabby::vec::Vec::new(),
     })
 }

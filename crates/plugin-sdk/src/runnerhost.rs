@@ -21,10 +21,12 @@
 //! environment. A plugin sends a spec and gets a spec.
 
 use hcore::hasync::Cancellable;
-use hexecrunner::wire::{PrepareReply, PrepareRequest};
+use hexecrunner::registry::ExecRunner as RunnerImpl;
+use hexecrunner::wire::{PrepareReply, PrepareRequest, RunnerReply, RunnerRequest};
 use hexecrunner::{PrepareOutcome, RunnerHost, SpecRewrite};
 use hmodel::htaddr::Addr;
 use hplugin_stabby::abi::{DynRunnerHost, StableRunnerHostDyn};
+use stabby::future::DynFutureUnsync as DynFuture;
 use stabby::vec::Vec as SVec;
 use std::sync::Arc;
 
@@ -92,4 +94,67 @@ impl RunnerHost for HostForwarder {
 /// host invokes right after load.
 pub fn install_runner_host(host: DynRunnerHost) {
     hexecrunner::install_host(Arc::new(HostForwarder { host }));
+}
+
+/// Guest side of a plugin-**exported** exec runner: wrap a real
+/// [`hexecrunner::registry::ExecRunner`] as an ABI-stable
+/// [`DynRunner`](hplugin_stabby::abi::DynRunner) the host registers beside its
+/// builtins.
+///
+/// The mirror of [`install_runner_host`]. That one lets a plugin *use* the
+/// host's runners; this lets a plugin *be* one, for a lifecycle no builtin
+/// expresses — a per-exec `docker exec` carrying the target's own cwd, say.
+/// When `session` fits, name it in a `runner.json` instead and inherit its
+/// descriptor passing, pooling and signal fidelity.
+pub fn make_dyn_runner(runner: Arc<dyn RunnerImpl>) -> hplugin_stabby::abi::DynRunner {
+    hplugin_stabby::vtable::dynify(stabby::boxed::Box::new(GuestRunner { runner }))
+}
+
+/// The plugin's own runner, wrapped for the seam.
+struct GuestRunner {
+    runner: Arc<dyn RunnerImpl>,
+}
+
+impl hplugin_stabby::abi::StableRunner for GuestRunner {
+    extern "C" fn prepare<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+        let runner = Arc::clone(&self.runner);
+        let fut = async move {
+            let reply = match run_guest_prepare(runner.as_ref(), &req).await {
+                Ok(rewrite) => RunnerReply::Ok(rewrite),
+                Err(e) => RunnerReply::Err(format!("{e:#}")),
+            };
+            SVec::from(reply.encode().as_slice())
+        };
+        hplugin_stabby::vtable::dynify(stabby::boxed::Box::new(fut))
+    }
+
+    extern "C" fn supplies_environment(&self) -> bool {
+        self.runner.supplies_environment()
+    }
+
+    extern "C" fn shutdown(&self) {
+        self.runner.shutdown();
+    }
+}
+
+/// Decode, run the plugin's runner, hand back its rewrite.
+///
+/// The cancellation token is this side's own: a cdylib runs in the host
+/// process, so the host dropping the returned future is what stops the work,
+/// and `RunnerCtx` still needs *a* token to hand the implementation.
+async fn run_guest_prepare(
+    runner: &dyn RunnerImpl,
+    req: &[u8],
+) -> anyhow::Result<hexecrunner::SpecRewrite> {
+    let req = RunnerRequest::decode(req)?;
+    let config: serde_json::Value = serde_json::from_str(&req.config_json)
+        .map_err(|e| anyhow::anyhow!("exec runner {}: parse config: {e}", req.addr))?;
+    let ctoken = hcore::hasync::StdCancellationToken::new();
+    let ctx = hexecrunner::registry::RunnerCtx {
+        addr: &req.addr,
+        fingerprint: &req.fingerprint,
+        config: &config,
+        ctoken: &ctoken,
+    };
+    runner.prepare(&ctx, req.rewrite).await
 }

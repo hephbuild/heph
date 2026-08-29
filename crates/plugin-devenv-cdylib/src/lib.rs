@@ -40,6 +40,7 @@ pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginCompone
                 provider: stabby::option::Option::None(),
                 drivers: stabby::vec::Vec::new(),
                 hooks: stabby::vec::Vec::new(),
+                runners: stabby::vec::Vec::new(),
                 meta: stabby::vec::Vec::new(),
             }
         }
@@ -88,6 +89,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         provider: stabby::option::Option::None(),
         drivers,
         hooks: stabby::vec::Vec::new(),
+        runners: stabby::vec::Vec::new(),
         meta: stabby::vec::Vec::new(),
     })
 }

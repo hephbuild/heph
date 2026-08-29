@@ -19,11 +19,11 @@
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_oci::pluginoci;
 use plugin_sdk::stabby::abi::{
-    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
+    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, NamedRunner, PluginComponents,
 };
 use plugin_sdk::stabby::{
     install_log_sink, install_runner_host, install_supervisor, make_dyn_managed_driver,
-    make_dyn_provider,
+    make_dyn_provider, make_dyn_runner,
 };
 use std::sync::Arc;
 
@@ -130,11 +130,23 @@ fn build() -> PluginComponents {
 
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(pluginoci::platform::Provider);
 
+    // The runner this plugin *implements*, as opposed to the `oci_runner`
+    // driver above, which only writes the `runner.json` naming it. Registered
+    // by the host beside `local`/`wrap`/`session`: a container's lifecycle is
+    // one no builtin expresses, since a target's cwd is per-exec and a session
+    // launch argv is fixed when the runner target is built.
+    let mut runners = stabby::vec::Vec::new();
+    runners.push(NamedRunner {
+        name: pluginoci::exec_runner::RUNNER_NAME.into(),
+        runner: make_dyn_runner(Arc::new(pluginoci::exec_runner::OciRunner::new())),
+    });
+
     PluginComponents {
         provider_name: "oci".into(),
         provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
         hooks: stabby::vec::Vec::new(),
+        runners,
         meta: stabby::vec::Vec::new(),
     }
 }

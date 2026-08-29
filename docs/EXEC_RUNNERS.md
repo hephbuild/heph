@@ -90,13 +90,19 @@ is the field the correctness of the whole feature rests on.
 | `wrap` | static rewrite: argv prefix, environment | just the config |
 | `session` | holds an environment open, runs targets inside it | a `launch` argv |
 
-There is no plugin-exported runner, and that is a deliberate absence. `session`
-takes the argv that enters an environment and appends the agent invocation to
-it, so a plugin that wants agent mode writes a `runner.json` and no runner code
-— the descriptor passing, cancellation, signal fidelity and pooling are shared.
-Both in-tree plugins that run targets elsewhere (devenv, oci) work that way. A
-runner with a lifecycle the `session` pool cannot express would need an ABI
-surface; none exists yet, so none is carried.
+A plugin can also **implement** a runner, registered by name beside these. Two
+ways in, for two situations:
+
+- **Name a builtin.** Emit a `runner.json` saying `"runner": "session"` with the
+  argv that enters your environment, and the descriptor passing, cancellation,
+  signal fidelity and pooling are shared. Right whenever "hold a process open
+  inside the environment" describes the job — the devenv plugin works this way.
+- **Export a `NamedRunner`.** For a lifecycle a held process does not express.
+  The oci plugin does: a container needs a per-exec cwd, and a `session` launch
+  argv is fixed when the runner target is built.
+
+A plugin-exported runner is a peer, not a special case — same registry, same
+by-name dispatch, same duplicate-name guard.
 
 `wrap` config:
 
@@ -232,10 +238,13 @@ is a moving pointer; retagging `:latest` moves the digest, which re-keys every
 consumer. The container is launched **by digest**, so the container that runs
 the build is the one the fingerprint describes even if the tag moves mid-build.
 
-One container is held open and targets run inside it, rather than a fresh
-`docker run` per exec — partly for speed, but mostly because a per-exec run
-needs the *target's* sandbox and cwd in its argv, and a wrap prefix is static by
-construction.
+One container is held open and each target enters it with `docker exec`. The
+plugin implements the `oci` runner itself rather than naming `session`, for two
+reasons that only a real runner can address: `docker exec -w` carries the
+target's own cwd, which a launch argv fixed at runner-build time cannot; and
+nothing of heph needs to exist inside the image. The `session` form ran
+`heph __runner-agent` in the container, so heph's binary had to be mounted in
+and runnable there — which on a macOS host it is not.
 
 The workspace root and heph's home are bind-mounted **at the same paths**
 inside. This is correctness, not preference: every absolute path the driver
@@ -406,11 +415,10 @@ environment that applies everywhere else here.
   `go list`-heavy build that is worth measuring before turning it on; the
   captured-env wrap runner has no such cost. The number under `2 × ncpu`
   contention, and the peak RSS of that many concurrent clients, are unmeasured.
-- **Running a target inside a container is untested.** The `oci_runner` suite
-  covers digest resolution and the launch argv against a real daemon, but not a
-  target actually executing in the container: that needs the heph binary to run
-  inside the image, and on macOS the binary is Darwin while the container is
-  Linux, so the test could never pass there.
+- ~~Running a target inside a container is untested.~~ **Closed.** It needed
+  heph's binary inside the image, which on a macOS host is the wrong platform;
+  `docker exec` needs nothing of heph inside, so
+  `oci_runner::a_target_runs_inside_the_container` runs anywhere a daemon does.
 - **The devenv suite is opt-in** (`HEPH_E2E_DEVENV=1`), because an environment
   nix has never evaluated costs ~2m40s and CI runners are ephemeral. Run it when
   touching the devenv driver.

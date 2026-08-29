@@ -231,41 +231,39 @@ impl ManagedDriver for Driver {
             );
         }
 
-        let heph_bin = std::env::current_exe()
-            .context("locate the heph binary to mount into the container")?;
-        let heph_bin = heph_bin.to_string_lossy().into_owned();
+        // No heph binary is mounted any more. The `session` form needed one —
+        // it worked by running `heph __runner-agent` inside the environment —
+        // and that is exactly what stopped a container check from working on a
+        // macOS host, where the binary is Darwin and the image is Linux.
+        // `docker exec` needs nothing of heph inside the image.
         let tree_root = req.request.tree_root_path.to_string_lossy().into_owned();
         // Sandboxes and the agent socket both live under heph's home, and the
         // container needs to see both at their own paths.
         let heph_home = heph_home_of(&req);
 
-        let mut launch = vec![
-            self.docker_bin.clone(),
-            "run".to_string(),
-            "--rm".to_string(),
-            // Keep stdin attached: the container lives exactly as long as the
-            // agent it runs, and `--rm` reaps it when that exits.
-            "-i".to_string(),
-        ];
-        for (host, container) in [
-            (tree_root.clone(), tree_root.clone()),
-            (heph_home.clone(), heph_home.clone()),
-        ] {
-            launch.push("-v".to_string());
-            launch.push(format!("{host}:{container}"));
-        }
-        launch.push("-v".to_string());
-        launch.push(format!("{heph_bin}:{heph_bin}:ro"));
-        launch.extend(def.run_args.iter().cloned());
-        // By digest, not by tag: the container that runs the build must be the
-        // one the fingerprint describes, even if the tag moves mid-build.
-        launch.push(digest.clone());
-
+        // Named `oci`, not `session`: this plugin implements the runner. See
+        // `pluginoci::exec_runner` for why a held `docker run` was the wrong
+        // shape — it needed heph's own binary runnable inside the image, which
+        // on a macOS host it is not, and a session launch argv cannot carry a
+        // per-exec cwd.
+        //
+        // Mounts are declared here rather than in the runner because they are a
+        // property of *this workspace*: every absolute path the driver computed
+        // is a host path, so the workspace root and heph's home must appear
+        // inside at the same paths.
         let doc = serde_json::json!({
             "version": 1,
             "fingerprint": format!("oci:{digest}"),
-            "runner": "session",
-            "config": { "launch": launch },
+            "runner": crate::pluginoci::exec_runner::RUNNER_NAME,
+            "config": {
+                // By digest, not by tag: the container that runs the build must
+                // be the one the fingerprint describes, even if the tag moves
+                // mid-build.
+                "image": digest,
+                "mounts": [tree_root, heph_home],
+                "run_args": def.run_args.clone(),
+                "docker": self.docker_bin.clone(),
+            },
         });
 
         let out = req.sandbox_pkg_dir.join(OUT_FILE);

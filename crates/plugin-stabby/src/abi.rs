@@ -317,6 +317,51 @@ pub struct NamedHook {
     pub hook: DynHook,
 }
 
+/// An exec runner a plugin implements, rather than one it merely names.
+///
+/// A plugin has two ways to run targets somewhere else, and they are for
+/// different situations:
+///
+/// - **Name a builtin.** Emit a `runner.json` saying `"runner": "session"` with
+///   the argv that enters your environment, and the descriptor passing,
+///   pooling, cancellation and signal fidelity are shared. This is right
+///   whenever "hold a process open inside the environment" describes the job —
+///   it is what the devenv plugin does.
+/// - **Export one of these.** For a lifecycle a held process cannot express: a
+///   per-exec `docker exec` carrying the target's own cwd, which a static wrap
+///   prefix cannot produce, or a remote executor with a queue of its own.
+///
+/// A runner exported here is a *peer* of the builtins — same registry, same
+/// by-name dispatch, same collision guard — which is what
+/// `hexecrunner::registry` was built for and could not previously be handed.
+#[stabby::stabby]
+pub trait StableRunner {
+    /// Rewrite the spec. `req` is an encoded `hexecrunner::wire::RunnerRequest`;
+    /// the reply is an encoded `hexecrunner::wire::RunnerReply`, which carries
+    /// an error as a message rather than failing the call.
+    extern "C" fn prepare<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+
+    /// Whether this runner puts the target into an environment of its own —
+    /// `hexecrunner::registry::ExecRunner::supplies_environment`. Sync and
+    /// constant per runner, so it does not pay for a future.
+    extern "C" fn supplies_environment(&self) -> bool;
+
+    /// Release anything held open. Called from the engine's teardown, because a
+    /// runner reachable from a process-global never has its destructor run.
+    extern "C" fn shutdown(&self);
+}
+
+/// An owned, ABI-stable handle to a plugin-exported exec runner.
+pub type DynRunner = stabby::dynptr!(stabby::boxed::Box<dyn StableRunner + Send + Sync>);
+
+/// A named exec runner in a plugin's component bundle. The name is what a
+/// `runner.json` selects it by.
+#[stabby::stabby]
+pub struct NamedRunner {
+    pub name: SString,
+    pub runner: DynRunner,
+}
+
 /// What a cdylib's create entry returns: an optional provider + named drivers +
 /// named hooks, all as owned ABI-stable handles that the host wraps with
 /// [`crate::load_stable`]. A plugin populates only what it exports — a hook-only
@@ -338,6 +383,9 @@ pub struct PluginComponents {
     /// plugins. A hook-only plugin leaves `provider_name` empty (its `provider` is
     /// a no-op the host drops) and carries its hooks here.
     pub hooks: SVec<NamedHook>,
+    /// Exec runners the plugin *implements*. Empty for a plugin that only names
+    /// a builtin in its `runner.json` — see [`StableRunner`] for which is which.
+    pub runners: SVec<NamedRunner>,
     pub meta: SVec<u8>,
 }
 

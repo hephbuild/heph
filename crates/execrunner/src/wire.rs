@@ -46,6 +46,85 @@ pub enum PrepareReply {
     Err(String),
 }
 
+/// One `prepare` on a **plugin-exported runner**, crossing the seam the other
+/// way: the host asks the plugin, where [`PrepareRequest`] has the plugin ask
+/// the host.
+///
+/// It carries what `registry::RunnerCtx` carries, minus the cancellation token
+/// — a cdylib runs in this process, so dropping the returned future is what
+/// stops the work, and a second cancellation path would be one more thing to
+/// keep in sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerRequest {
+    /// The runner target's address, for diagnostics.
+    pub addr: String,
+    /// The environment digest the runner target declared. A runner keyed on
+    /// this is what makes a pool entry survive across execs and re-key when the
+    /// environment moves.
+    pub fingerprint: String,
+    /// The runner-specific half of `runner.json`, still unparsed — the plugin
+    /// owns its own config shape, exactly as it would in-process.
+    pub config_json: String,
+    pub rewrite: SpecRewrite,
+}
+
+/// The reply. `supplies_environment` is not here: it is a separate sync ABI
+/// method, constant per runner rather than per exec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerReply {
+    Ok(SpecRewrite),
+    Err(String),
+}
+
+impl RunnerRequest {
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        put(&mut out, self.addr.as_bytes());
+        put(&mut out, self.fingerprint.as_bytes());
+        put(&mut out, self.config_json.as_bytes());
+        put_rewrite(&mut out, &self.rewrite);
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> anyhow::Result<Self> {
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            addr: r.string()?,
+            fingerprint: r.string()?,
+            config_json: r.string()?,
+            rewrite: read_rewrite(&mut r)?,
+        })
+    }
+}
+
+impl RunnerReply {
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        match self {
+            Self::Ok(rewrite) => {
+                out.push(1);
+                put_rewrite(&mut out, rewrite);
+            }
+            Self::Err(msg) => {
+                out.push(0);
+                put(&mut out, msg.as_bytes());
+            }
+        }
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> anyhow::Result<Self> {
+        let mut r = Reader::new(buf);
+        if r.bool()? {
+            Ok(Self::Ok(read_rewrite(&mut r)?))
+        } else {
+            Ok(Self::Err(r.string()?))
+        }
+    }
+}
+
 fn put(out: &mut Vec<u8>, bytes: &[u8]) {
     // Length-prefixed, so a value containing any byte — including NUL — round
     // trips. `u32` is ample: the largest field here is an argv entry, bounded by
@@ -288,6 +367,25 @@ mod tests {
         assert_eq!(PrepareReply::decode(&ok.encode()).expect("decode"), ok);
         let err = PrepareReply::Err("boom".to_string());
         assert_eq!(PrepareReply::decode(&err.encode()).expect("decode"), err);
+    }
+
+    #[test]
+    fn a_runner_request_round_trips() {
+        let req = RunnerRequest {
+            addr: "//svc:container".to_string(),
+            fingerprint: "oci:sha256:abc".to_string(),
+            config_json: r#"{"image":"x@sha256:abc"}"#.to_string(),
+            rewrite: rewrite(),
+        };
+        assert_eq!(RunnerRequest::decode(&req.encode()).expect("decode"), req);
+    }
+
+    #[test]
+    fn a_runner_reply_round_trips_both_ways() {
+        let ok = RunnerReply::Ok(rewrite());
+        assert_eq!(RunnerReply::decode(&ok.encode()).expect("decode"), ok);
+        let err = RunnerReply::Err("no such image".to_string());
+        assert_eq!(RunnerReply::decode(&err.encode()).expect("decode"), err);
     }
 
     /// A truncated frame is an error, not a panic or a silently short value:

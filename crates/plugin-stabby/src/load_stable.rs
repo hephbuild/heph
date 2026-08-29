@@ -64,6 +64,9 @@ pub type LoadedComponents = (
     Option<StableRemoteProvider>,
     Vec<(String, StableRemoteManagedDriver)>,
     Vec<(String, StableRemoteHook)>,
+    // Exec runners the plugin implements, ready to register beside the
+    // builtins. Empty for a plugin that only names one in its `runner.json`.
+    Vec<std::sync::Arc<dyn hexecrunner::registry::ExecRunner>>,
 );
 
 /// Load a plugin cdylib and construct the host-side handles. The library's ABI is
@@ -151,6 +154,7 @@ pub fn load(
         provider,
         drivers,
         hooks,
+        runners,
         // Reserved return-side metadata; nothing consumes it yet.
         meta: _,
     } = comps;
@@ -172,7 +176,14 @@ pub fn load(
         let name = nh.name.to_string();
         host_hooks.push((name.clone(), StableRemoteHook::new(nh.hook, name)));
     }
-    Ok((host_provider, host_drivers, host_hooks))
+    let mut host_runners: Vec<std::sync::Arc<dyn hexecrunner::registry::ExecRunner>> = Vec::new();
+    for nr in runners {
+        let name = nr.name.to_string();
+        host_runners.push(std::sync::Arc::new(crate::runner::PluginRunner::new(
+            name, nr.runner,
+        )));
+    }
+    Ok((host_provider, host_drivers, host_hooks, host_runners))
 }
 
 fn decode_unary(bytes: &[u8]) -> anyhow::Result<Body> {

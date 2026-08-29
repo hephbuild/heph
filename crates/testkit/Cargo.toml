@@ -8,6 +8,8 @@ publish = false
 workspace = true
 
 [dependencies]
+# Register an exec runner in a harness workspace, as a cdylib does via NamedRunner.
+hexecrunner = { package = "execrunner", path = "../execrunner" }
 heph = { path = "../.." }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"

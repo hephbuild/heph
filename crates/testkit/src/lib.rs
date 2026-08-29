@@ -66,6 +66,15 @@ impl WorkspaceBuilder {
         self
     }
 
+    /// Register an exec runner as a peer of the builtins — what a cdylib does
+    /// through `NamedRunner`, done directly for an in-process harness.
+    pub fn with_exec_runner(mut self, runner: Arc<dyn hexecrunner::registry::ExecRunner>) -> Self {
+        self.setups.push(Box::new(move |e: &mut Engine| {
+            e.register_exec_runner(runner)
+        }));
+        self
+    }
+
     pub fn with_driver(mut self, driver: Box<dyn SDKDriver>) -> Self {
         self.setups.push(Box::new(move |e: &mut Engine| {
             e.register_driver(|_| driver)

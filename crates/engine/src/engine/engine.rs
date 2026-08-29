@@ -737,6 +737,31 @@ impl Engine {
         ));
     }
 
+    /// Register an exec runner a plugin implements, as a peer of the builtins.
+    ///
+    /// Takes `&mut self` deliberately. Plugins are loaded while the engine is
+    /// still owned (`register_plugins` runs before `Arc::new`), so the registry
+    /// is still uniquely referenced and `Arc::get_mut` succeeds. Once the engine
+    /// is behind an `Arc` and the resolver holds a clone, the set of runners is
+    /// fixed for the process — which is the property the by-name dispatch wants:
+    /// no runner can appear after a target has already been told the name is
+    /// unknown.
+    pub fn register_exec_runner(
+        &mut self,
+        runner: Arc<dyn hexecrunner::registry::ExecRunner>,
+    ) -> anyhow::Result<()> {
+        let name = runner.name().to_string();
+        Arc::get_mut(&mut self.exec_runners)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "exec runner '{name}' registered after the engine was shared. Runners must be \
+                     registered during plugin load, before the resolver is handed a clone of the \
+                     registry."
+                )
+            })?
+            .register(runner)
+    }
+
     /// Register a build-event hook. Hooks are observers — fed every emitted
     /// `BuildEvent` and never queried — so they need no name-uniqueness guard
     /// (two CI summary hooks would just both run). Loaded from out-of-process

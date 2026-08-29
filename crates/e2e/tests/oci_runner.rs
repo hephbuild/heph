@@ -16,14 +16,17 @@
 //! `oci_docker.rs` gates on `docker buildx`, which passes on a host whose daemon
 //! is down; this gate asks the daemon a question instead.
 //!
-//! # What is deliberately not here
+//! # Running a target in the container
 //!
-//! Actually *running* a target inside the container. That needs the heph binary
-//! to execute inside the image, and on macOS — where much of this is developed —
-//! the binary is a Darwin executable and the container is Linux, so the test
-//! could never pass there. Covering it would mean a Linux-only test whose
-//! failure mode on every other machine is "skipped", which is worse than an
-//! honest gap. It is listed as one in `docs/EXEC_RUNNERS.md`.
+//! This used to be impossible to test. The plugin emitted a `session` config,
+//! which works by launching `heph __runner-agent` *inside* the environment — so
+//! the container needed heph's own binary, and on macOS, where much of this is
+//! developed, that binary is Darwin while the image is Linux. The suite carried
+//! an honest gap instead.
+//!
+//! Now the plugin implements the runner itself and enters the container with
+//! `docker exec`, which needs nothing of heph inside the image. So the test
+//! that could never pass is here, and it runs anywhere a daemon does.
 
 mod common;
 
@@ -36,6 +39,9 @@ use std::sync::OnceLock;
 /// nothing is ever pulled and the suite stays off the network.
 const TEST_IMAGE: &str = "heph-e2e-oci-runner:v1";
 const OTHER_IMAGE: &str = "heph-e2e-oci-runner:v2";
+/// An image with a shell and a file that exists nowhere else, so "did this run
+/// inside?" has an unambiguous answer.
+const MARKER_IMAGE: &str = "heph-e2e-oci-runner:marker";
 
 /// A daemon that answers, not merely a `docker` on PATH.
 ///
@@ -92,6 +98,28 @@ fn build_image(tag: &str, marker: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Build the marker image: a real base (the runner needs a shell to hold the
+/// container open) plus a file that only exists inside it.
+fn build_marker_image() -> bool {
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    if std::fs::write(
+        dir.path().join("Dockerfile"),
+        "FROM debian:stable-slim\nRUN echo in-the-container > /etc/heph-e2e-marker\n",
+    )
+    .is_err()
+    {
+        return false;
+    }
+    Command::new("docker")
+        .args(["build", "-t", MARKER_IMAGE, "."])
+        .current_dir(dir.path())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// The digest docker itself reports, to compare the driver's answer against.
 fn image_id(tag: &str) -> Option<String> {
     let out = Command::new("docker")
@@ -114,6 +142,9 @@ fn workspace() -> htestkit::Workspace {
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginoci::runner::Driver::new()))
+        // What the cdylib hands the host through `NamedRunner`; an in-process
+        // harness registers it directly.
+        .with_exec_runner(std::sync::Arc::new(pluginoci::exec_runner::OciRunner::new()))
         .build()
         .expect("build workspace")
 }
@@ -160,17 +191,18 @@ async fn the_fingerprint_is_the_image_digest() -> anyhow::Result<()> {
         "the fingerprint must be the digest docker reports ({digest}); got {doc}"
     );
     assert!(
-        doc.contains("\"runner\": \"session\""),
-        "an oci runner holds one container open rather than running one per exec; got {doc}"
+        doc.contains("\"runner\": \"oci\""),
+        "this plugin implements its own runner rather than naming a builtin — a container's \
+         lifecycle is one no builtin expresses; got {doc}"
     );
     Ok(())
 }
 
-/// The container is launched **by digest**, not by the tag it was configured
-/// with — so the container that runs the build is the one the fingerprint
-/// describes, even if the tag moves mid-build.
+/// The container is named **by digest**, not by the tag it was configured with
+/// — so the container that runs the build is the one the fingerprint describes,
+/// even if the tag moves mid-build.
 #[tokio::test]
-async fn the_launch_uses_the_digest_not_the_tag() -> anyhow::Result<()> {
+async fn the_config_uses_the_digest_not_the_tag() -> anyhow::Result<()> {
     skip_unless_docker!();
     if !build_image(TEST_IMAGE, "one") {
         eprintln!("skipping: could not build the fixture image");
@@ -185,17 +217,17 @@ async fn the_launch_uses_the_digest_not_the_tag() -> anyhow::Result<()> {
     write_runner(&ws, TEST_IMAGE);
     let doc = common::artifact_string(&*ws.run("//svc:runner").await?);
 
-    let launch = doc
-        .split_once("\"launch\"")
+    let config = doc
+        .split_once("\"config\"")
         .map(|(_, rest)| rest)
         .unwrap_or_default();
     assert!(
-        launch.contains(&digest),
-        "the launch argv must name the digest; got {doc}"
+        config.contains(&digest),
+        "the config must name the digest; got {doc}"
     );
     assert!(
-        !launch.contains(TEST_IMAGE),
-        "the launch argv must not name the tag — it can move under the build; got {doc}"
+        !config.contains(TEST_IMAGE),
+        "the config must not name the tag — it can move under the build; got {doc}"
     );
     Ok(())
 }
@@ -234,6 +266,77 @@ async fn two_images_produce_two_fingerprints() -> anyhow::Result<()> {
         doc_a, doc_b,
         "two different images must not emit identical runner output, or their consumers \
          would share a cache entry across containers"
+    );
+    Ok(())
+}
+
+/// **The reason this is a runner and not a `session` config.** The old form
+/// launched `heph __runner-agent` inside the container, so heph's own binary
+/// had to be mounted in and runnable there — which on a macOS host it is not,
+/// the binary being Darwin and the image Linux. `docker exec` needs nothing of
+/// heph inside the image, and this asserts the mount does not come back.
+#[tokio::test]
+async fn the_container_does_not_need_the_heph_binary() -> anyhow::Result<()> {
+    skip_unless_docker!();
+    if !build_image(TEST_IMAGE, "one") {
+        eprintln!("skipping: could not build the fixture image");
+        return Ok(());
+    }
+    let ws = workspace();
+    write_runner(&ws, TEST_IMAGE);
+    let doc = common::artifact_string(&*ws.run("//svc:runner").await?);
+
+    let heph = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "heph".to_string());
+    assert!(
+        !doc.contains(&heph),
+        "the container config must not mount the heph binary; got {doc}"
+    );
+    Ok(())
+}
+
+/// **The whole point: a target runs inside the container.**
+///
+/// Not the emitted config — the actual execution. The command asserts on
+/// something only true *inside* the image: `/etc/heph-e2e-marker` is written by
+/// the fixture's Dockerfile and exists on no host. A target that quietly ran
+/// locally fails here rather than passing.
+#[tokio::test]
+async fn a_target_runs_inside_the_container() -> anyhow::Result<()> {
+    skip_unless_docker!();
+    if !build_marker_image() {
+        eprintln!("skipping: could not build the fixture image");
+        return Ok(());
+    }
+
+    let ws = workspace();
+    ws.write_build_file(
+        "svc",
+        &format!(
+            r#"
+target(
+    name = "runner",
+    driver = "oci_runner",
+    image = "{MARKER_IMAGE}",
+)
+target(
+    name = "inside",
+    driver = "bash",
+    runner = ":runner",
+    run = "cat /etc/heph-e2e-marker > $OUT",
+    out = "where.txt",
+)
+"#
+        ),
+    );
+
+    let got = common::artifact_string(&*ws.run("//svc:inside").await?);
+    assert!(
+        got.contains("in-the-container"),
+        "the target must have run inside the image, which is the only place that marker \
+         exists; got {got:?}"
     );
     Ok(())
 }

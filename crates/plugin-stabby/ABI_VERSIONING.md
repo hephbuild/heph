@@ -38,14 +38,16 @@ anything `get_stabbied` would reject:
   vtable slots: `StableProvider`, `StableManagedDriver` (the `invoke*` slots),
   `StableExecutor`, `StableItemStream`, `StableRead`, `StableArtifactContent`,
   `StableFunctionRegistry`, `StableMeta`, `StableCancel`, `StableHook`,
-  `StableLogSink`, `StableSupervisor`, `StableRunnerHost`.
+  `StableLogSink`, `StableSupervisor`, `StableRunnerHost`, `StableRunner`.
 - Add, remove, or reorder a field on a `#[stabby::stabby]` struct: `StableAddr`,
   `StableArg`, `NoteDepOutcome`, `ResultOutcome`, `QueryOutcome`, `NamedDriver`,
-  `NamedHook`, `PluginComponents`.
+  `NamedHook`, `NamedRunner`, `PluginComponents`.
 - Change a `dynptr!` / type-alias: `DynRead`, `DynArtifact`, `DynItemStream`,
   `DynExecutor`, `DynProvider`, `DynManagedDriver`, `DynFunctionRegistry`,
-  `DynHook`, `DynLogSink`, `DynSupervisor`, `DynRunnerHost`.
-- Change the shape `hexecrunner::wire` encodes. It is not a stabby type — the
+  `DynHook`, `DynLogSink`, `DynSupervisor`, `DynRunnerHost`, `DynRunner`.
+- Change the shape `hexecrunner::wire` encodes (both directions —
+  `PrepareRequest`/`PrepareReply` for a plugin calling the host,
+  `RunnerRequest`/`RunnerReply` for the host calling a plugin's runner). It is not a stabby type — the
   `StableRunnerHost` method is bytes in, bytes out — so `get_stabbied` cannot
   reject a mismatch and a plugin would misparse a `prepare` instead of failing
   to load. It is frozen with this contract for exactly that reason.
