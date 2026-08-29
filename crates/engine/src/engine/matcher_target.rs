@@ -243,13 +243,13 @@ mod tests {
 
     #[test]
     fn def_label_match() {
-        let d = def_with_labels("foo", "bar", &["//labels:lint"]);
+        let d = def_with_labels("foo", "bar", &["lint"]);
         assert_eq!(
-            match_target(&Matcher::Label("//labels:lint".to_string()), &d),
+            match_target(&Matcher::Label("lint".to_string()), &d),
             MatchResult::MatchYes
         );
         assert_eq!(
-            match_target(&Matcher::Label("//labels:other".to_string()), &d),
+            match_target(&Matcher::Label("other".to_string()), &d),
             MatchResult::MatchNo
         );
     }
@@ -292,15 +292,15 @@ mod tests {
 
     #[test]
     fn def_and_match() {
-        let d = def_with_labels("foo", "bar", &["//labels:lint"]);
+        let d = def_with_labels("foo", "bar", &["lint"]);
         let m = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("foo")),
-            Matcher::Label("//labels:lint".to_string()),
+            Matcher::Label("lint".to_string()),
         ]);
         assert_eq!(match_target(&m, &d), MatchResult::MatchYes);
         let m2 = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("foo")),
-            Matcher::Label("//labels:other".to_string()),
+            Matcher::Label("other".to_string()),
         ]);
         assert_eq!(match_target(&m2, &d), MatchResult::MatchNo);
     }

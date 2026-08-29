@@ -70,9 +70,9 @@ mod tests {
     #[tokio::test]
     async fn collects_unique_labels_across_matched_targets() -> anyhow::Result<()> {
         let engine = make_engine(vec![
-            target("foo/bar", "a", &["//labels:lint", "//labels:test"]),
-            target("foo/bar", "b", &["//labels:lint"]),
-            target("foo/baz", "c", &["//labels:fmt"]),
+            target("foo/bar", "a", &["lint", "test"]),
+            target("foo/bar", "b", &["lint"]),
+            target("foo/baz", "c", &["fmt"]),
         ])?;
 
         let rs = engine.new_state();
@@ -85,11 +85,7 @@ mod tests {
         // Sorted, deduped: lint appears on two targets but once here.
         assert_eq!(
             labels,
-            vec![
-                "//labels:fmt".to_string(),
-                "//labels:lint".to_string(),
-                "//labels:test".to_string(),
-            ]
+            vec!["fmt".to_string(), "lint".to_string(), "test".to_string(),]
         );
         Ok(())
     }
@@ -97,8 +93,8 @@ mod tests {
     #[tokio::test]
     async fn scopes_labels_to_the_matcher() -> anyhow::Result<()> {
         let engine = make_engine(vec![
-            target("foo", "a", &["//labels:lint"]),
-            target("other", "b", &["//labels:fmt"]),
+            target("foo", "a", &["lint"]),
+            target("other", "b", &["fmt"]),
         ])?;
 
         let rs = engine.new_state();
@@ -108,7 +104,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        assert_eq!(labels, vec!["//labels:lint".to_string()]);
+        assert_eq!(labels, vec!["lint".to_string()]);
         Ok(())
     }
 

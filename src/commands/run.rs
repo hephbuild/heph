@@ -21,6 +21,9 @@ Selecting targets:
   heph run <label> //pkg/...          all targets with <label> under //pkg
   heph run -e '<expr>'                a query expression (see below)
 
+  A label is [A-Za-z0-9_-]+ — the positional form takes one bare label, never
+  an expression. For &&, ||, ! or grouping, use -e.
+
 Query language (-e / --expr):
   Patterns:
     //pkg                package //pkg
@@ -28,7 +31,7 @@ Query language (-e / --expr):
     //pkg:name           one target address
     ./sub, ../x, .       relative to the current package
   Functions:
-    label(x)             targets carrying label x   (e.g. label(\"//tag:release\"))
+    label(x)             targets carrying label x   (e.g. label(go-lint))
     tree_output(pkg)     targets whose codegen tree writes into pkg
     addr(//pkg:name)     an explicit target address
     package(//pkg)       an explicit package

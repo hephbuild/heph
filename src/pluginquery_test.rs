@@ -39,13 +39,13 @@ mod tests {
     #[tokio::test]
     async fn query_by_label_returns_group_spec() -> anyhow::Result<()> {
         let engine = make_engine(vec![
-            labeled_target("foo", "a", &["//labels:lint"]),
+            labeled_target("foo", "a", &["lint"]),
             labeled_target("foo", "b", &[]),
-            labeled_target("bar", "c", &["//labels:lint"]),
+            labeled_target("bar", "c", &["lint"]),
         ])?;
 
         let rs = engine.new_state();
-        let addr = parse_addr(&format!("//{PACKAGE}:q@expr=label(//labels:lint)"))?;
+        let addr = parse_addr(&format!("//{PACKAGE}:q@expr=label(lint)"))?;
         let spec = engine.get_spec(rs, &addr).await?;
 
         assert_eq!(spec.driver, crate::plugingroup::DRIVER_NAME);
@@ -111,14 +111,14 @@ mod tests {
     #[tokio::test]
     async fn query_multiple_matchers_combined_as_and() -> anyhow::Result<()> {
         let engine = make_engine(vec![
-            labeled_target("src/foo", "a", &["//labels:lint"]),
+            labeled_target("src/foo", "a", &["lint"]),
             labeled_target("src/foo", "b", &[]),
-            labeled_target("other", "c", &["//labels:lint"]),
+            labeled_target("other", "c", &["lint"]),
         ])?;
 
         let rs = engine.new_state();
         let addr = parse_addr(&format!(
-            "//{PACKAGE}:q@expr=\"package(src/foo) && label(//labels:lint)\""
+            "//{PACKAGE}:q@expr=\"package(src/foo) && label(lint)\""
         ))?;
         let spec = engine.get_spec(rs, &addr).await?;
 
@@ -215,13 +215,13 @@ mod tests {
         // Single provider registered: pluginstatictarget. exclude_provider=
         // pluginstatictarget should yield an empty result.
         let engine = make_engine(vec![
-            labeled_target("foo", "a", &["//labels:lint"]),
-            labeled_target("foo", "b", &["//labels:lint"]),
+            labeled_target("foo", "a", &["lint"]),
+            labeled_target("foo", "b", &["lint"]),
         ])?;
 
         let rs = engine.new_state();
         let addr = parse_addr(&format!(
-            "//{PACKAGE}:q@expr=label(//labels:lint),exclude_provider=pluginstatictarget"
+            "//{PACKAGE}:q@expr=label(lint),exclude_provider=pluginstatictarget"
         ))?;
         let spec = engine.get_spec(rs, &addr).await?;
 

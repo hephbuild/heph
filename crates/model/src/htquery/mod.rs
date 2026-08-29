@@ -7,7 +7,9 @@
 //!   ([`Matcher::PackagePrefix`]), `//pkg:name` ([`Matcher::Addr`]); relative
 //!   forms (`./x`, `../x`, `.`, `..`) resolve against the base package.
 //! - functions — `label(x)`, `tree_output(pkg)`, plus the explicit
-//!   `addr(x)`, `package(x)`, `package_prefix(x)` forms.
+//!   `addr(x)`, `package(x)`, `package_prefix(x)` forms. `label`'s argument
+//!   must be a well-formed label (`[A-Za-z0-9_-]+`, see [`crate::htlabel`]);
+//!   anything else is a parse error rather than a label nothing carries.
 //! - operators — `&&` ([`Matcher::And`]), `||` ([`Matcher::Or`]),
 //!   `!` ([`Matcher::Not`]), and `( … )` grouping.
 //!
@@ -17,6 +19,7 @@
 //! See [`parse`] for the entry point.
 
 use crate::htaddr::parse_addr_with_base;
+use crate::htlabel;
 use crate::htmatcher::Matcher;
 use crate::htpkg::{self, PkgBuf, join_rel_checked_pkg};
 use anyhow::{Context, Result, bail};
@@ -61,6 +64,8 @@ fn fmt_prec(m: &Matcher, parent_prec: u8, out: &mut String) {
                 out.push_str("/...");
             }
         }
+        // Never needs quoting: a label is `[A-Za-z0-9_-]+`, which contains no
+        // tokenizer metacharacter.
         Matcher::Label(l) => {
             out.push_str("label(");
             out.push_str(l);
@@ -135,7 +140,10 @@ impl Tok {
 
 /// Split a query into tokens. Words are runs of any character except
 /// whitespace and the operator metacharacters `( ) & | !`; `"…"` wraps a word
-/// that needs those characters (e.g. a label with a space).
+/// that needs those characters. Nothing in the grammar requires quoting today
+/// — labels exclude every metacharacter by construction — but a quoted word
+/// still tokenizes so that the resulting *validation* error names the label
+/// instead of a stray `"`.
 fn tokenize(input: &str) -> Result<Vec<Tok>> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
@@ -329,7 +337,10 @@ impl<'a> Parser<'a> {
 
     fn func_to_matcher(&self, name: &str, arg: &str) -> Result<Matcher> {
         match name {
-            "label" => Ok(Matcher::Label(arg.to_string())),
+            "label" => {
+                htlabel::validate(arg).with_context(|| format!("parsing label({arg})"))?;
+                Ok(Matcher::Label(arg.to_string()))
+            }
             "tree_output" | "tree_output_to" => Ok(Matcher::TreeOutputTo(
                 to_pkg(arg).with_context(|| format!("parsing {name}({arg})"))?,
             )),
@@ -426,10 +437,26 @@ mod tests {
     #[test]
     fn label_func() {
         assert_eq!(p("label(foo)"), Matcher::Label("foo".to_string()));
-        assert_eq!(
-            p("label(//tag:release)"),
-            Matcher::Label("//tag:release".to_string())
-        );
+        assert_eq!(p("label(go-lint)"), Matcher::Label("go-lint".to_string()));
+        assert_eq!(p("label(go_lint2)"), Matcher::Label("go_lint2".to_string()));
+    }
+
+    #[test]
+    fn err_label_outside_the_grammar() {
+        // A label is `[A-Za-z0-9_-]+`. Address-shaped and quoted-with-spaces
+        // forms used to parse into a label no target could ever carry.
+        for src in [
+            "label(//tag:release)",
+            "label(\"my label\")",
+            "label()",
+            "label(caf\u{e9})",
+        ] {
+            let err = parse(src, &base())
+                .err()
+                .unwrap_or_else(|| panic!("{src} should not parse"));
+            let chain = format!("{err:#}");
+            assert!(chain.contains("label"), "{chain}");
+        }
     }
 
     #[test]
@@ -590,14 +617,6 @@ mod tests {
             let m2 = parse(&rendered, &base).expect("parse rendered");
             assert_eq!(m1, m2, "round-trip mismatch: {src:?} -> {rendered:?}");
         }
-    }
-
-    #[test]
-    fn quoted_label_with_spaces() {
-        assert_eq!(
-            p("label(\"my label\")"),
-            Matcher::Label("my label".to_string())
-        );
     }
 
     #[test]
