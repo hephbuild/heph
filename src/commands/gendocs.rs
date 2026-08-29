@@ -192,6 +192,139 @@ mod tests {
         );
     }
 
+    /// Split a documented command line into argv, honouring the single quotes the
+    /// examples use around query expressions (`-e '//... && !//vendor/...'`).
+    fn argv(example: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut started = false;
+        let mut quoted = false;
+        for c in example.chars() {
+            match c {
+                '\'' => {
+                    quoted = !quoted;
+                    started = true;
+                }
+                c if c.is_whitespace() && !quoted => {
+                    if started {
+                        out.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// Every `heph …` command line documented in `text`, from both the backticked
+    /// form the doc comments use and the bare form of the after-help reference
+    /// block. Lines carrying a `<PLACEHOLDER>` describe a form rather than name a
+    /// runnable command, so they are left out.
+    fn examples_in(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let mut found: Vec<&str> = line
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|span| span.starts_with("heph "))
+                .collect();
+            // Bare `heph …` line in the after-help block, with prose aligned two
+            // or more spaces to its right.
+            let bare = line.trim_start();
+            if found.is_empty()
+                && bare.starts_with("heph ")
+                && let Some(cmd) = bare.split("  ").next()
+            {
+                found.push(cmd);
+            }
+            out.extend(
+                found
+                    .into_iter()
+                    .map(str::trim)
+                    .filter(|e| !e.contains('<'))
+                    .map(str::to_string),
+            );
+        }
+        out
+    }
+
+    fn collect_examples(cmd: &clap::Command, out: &mut Vec<String>) {
+        for text in [
+            cmd.get_long_about().or_else(|| cmd.get_about()),
+            cmd.get_after_long_help().or_else(|| cmd.get_after_help()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.extend(examples_in(&text.to_string()));
+        }
+        for child in cmd.get_subcommands() {
+            collect_examples(child, out);
+        }
+    }
+
+    /// Every command line the help advertises must be one the CLI accepts.
+    ///
+    /// `heph query //...` shipped in the `query` help while the single-positional
+    /// form parses its argument as an *address*, so the advertised command could
+    /// not run at all — the whole-workspace selection needs `-e '//...'`. Copying
+    /// an example out of `--help` is the first thing anyone does, so an example
+    /// that does not parse is a bug in the CLI, not just in its prose.
+    #[test]
+    fn documented_examples_are_accepted() {
+        use crate::commands::utils::resolve_matcher;
+        use crate::htpkg::PkgBuf;
+
+        let root = cli_command();
+        let mut examples = Vec::new();
+        collect_examples(&root, &mut examples);
+        assert!(
+            examples.len() > 20,
+            "example extraction found almost nothing ({examples:?}) — the scan is broken, \
+             not the help"
+        );
+
+        for example in &examples {
+            let matches = root
+                .clone()
+                .try_get_matches_from(argv(example))
+                .unwrap_or_else(|e| panic!("`{example}` is not accepted by the CLI:\n{e}"));
+
+            // Walk to the leaf subcommand; the selection args only exist there.
+            let mut leaf = (String::from("heph"), &matches);
+            while let Some((name, sub)) = leaf.1.subcommand() {
+                leaf = (format!("{} {name}", leaf.0), sub);
+            }
+            let (path, m) = leaf;
+
+            // `run`/`query`/`tool clean` share the selection form, and clap
+            // accepting the string says nothing about whether it resolves.
+            let ids: Vec<_> = m.ids().map(|i| i.as_str()).collect();
+            if !ids.contains(&"arg1") && !ids.contains(&"expr") {
+                continue;
+            }
+            let get = |id| m.try_get_one::<String>(id).ok().flatten().cloned();
+            // `run` is the one selection that rejects the `all` label.
+            let allow_all = path != "heph run";
+            resolve_matcher(
+                &get("expr"),
+                &get("arg1"),
+                &get("arg2"),
+                &PkgBuf::from(""),
+                allow_all,
+            )
+            .unwrap_or_else(|e| panic!("`{example}` parses but selects nothing: {e:#}"));
+        }
+    }
+
     #[test]
     fn hidden_command_is_omitted() {
         let md = render_markdown(&cli_command());

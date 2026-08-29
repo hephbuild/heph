@@ -83,20 +83,44 @@ pub fn matcher_from_args(
                 anyhow::bail!("label `all` not allowed")
             }
 
-            htpkg::parse(package_matcher, &engine::get_cwp()?)
+            htpkg::parse(package_matcher, base_pkg)
         } else {
             validate_positional_label(label)?;
             Ok(Matcher::And(vec![
                 Matcher::Label(label.into()),
-                htpkg::parse(package_matcher, &engine::get_cwp()?)?,
+                htpkg::parse(package_matcher, base_pkg)?,
             ]))
         }
     } else {
         let addr_str = arg1;
         let addr = htaddr::parse_addr_with_base(addr_str, base_pkg)
+            .map_err(|err| annotate_lone_package_matcher(err, addr_str, base_pkg))
             .with_context(|| format!("parse {}", addr_str))?;
         Ok(Matcher::Addr(addr))
     }
+}
+
+/// Turn the address parse error for a lone `//pkg/...` into a pointer at `-e`.
+///
+/// A single positional argument is an *address*, so `heph query //...` — the
+/// obvious way to ask for the whole workspace, and what the `query` help itself
+/// used to show — failed with a raw parser error about a missing `:name`, with
+/// nothing to suggest that the selection belongs behind `-e`. Only annotate
+/// when the argument really is a well-formed package matcher; a genuine typo in
+/// an address keeps its own error.
+fn annotate_lone_package_matcher(
+    err: anyhow::Error,
+    input: &str,
+    base_pkg: &PkgBuf,
+) -> anyhow::Error {
+    if htpkg::parse(input, base_pkg).is_err() {
+        return err;
+    }
+    err.context(format!(
+        "`{input}` is a package matcher, not a target address — the single-argument \
+         form takes one address (`//pkg:name`); to select a package use `-e '{input}'`, \
+         or name a label first, e.g. `test {input}`"
+    ))
 }
 
 /// Check the positional `<LABEL> <PACKAGE_MATCHER>` form's first argument
@@ -316,6 +340,44 @@ mod tests {
         assert!(
             !chain.contains("query expression"),
             "no operators typed, so no -e hint: {chain}"
+        );
+    }
+
+    #[test]
+    fn lone_package_matcher_points_at_the_query_flag() {
+        // `heph query //...` — what the query help itself used to advertise. It
+        // is a package matcher in the address slot, so it cannot resolve; the
+        // error has to say where that selection belongs.
+        let pkg = PkgBuf::from("");
+        for input in ["//...", "//cmd/...", "//cmd/server", "./sub/..."] {
+            let err = matcher_from_args(input, &None, &pkg, true)
+                .err()
+                .unwrap_or_else(|| panic!("{input:?} unexpectedly resolved as an address"));
+            let chain = format!("{err:#}");
+            assert!(
+                chain.contains("package matcher, not a target address"),
+                "{input:?}: {chain}"
+            );
+            assert!(
+                chain.contains(&format!("-e '{input}'")),
+                "{input:?} should be quoted back behind -e: {chain}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_address_keeps_its_own_error() {
+        // Not a valid package matcher either, so there is no `-e` form to
+        // suggest — the address parse error is the useful one.
+        let pkg = PkgBuf::from("");
+        let err = matcher_from_args("cmd/server:bin", &None, &pkg, true)
+            .err()
+            .expect("expected parse error");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("parse cmd/server:bin"), "{chain}");
+        assert!(
+            !chain.contains("package matcher"),
+            "no package matcher hint for a malformed address: {chain}"
         );
     }
 
