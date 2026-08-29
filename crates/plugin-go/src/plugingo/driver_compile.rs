@@ -375,12 +375,46 @@ impl ManagedDriver for GoCompileDriver {
             format!("{:x}", h.finish()).into_bytes()
         };
 
+        // The shared `GOCACHE`, as a scratch reference — the same slot the golist
+        // targets use when the factors agree (see `plugingo::gocache`). Until
+        // now every compile target created and tore down an *empty* cache inside
+        // its own sandbox: the exact pattern the golist sharing was written to
+        // remove, left in place here because that fix was driver-local.
+        //
+        // Build tags are absent deliberately. They decide which *files* `go list`
+        // selected, and by the time a compile runs that set is already fixed — so
+        // a compile's cache entries do not depend on them, and claiming they did
+        // would split the slot for nothing.
+        let gocache_key = crate::plugingo::gocache::GocacheKey {
+            go_version: def.go_version.clone(),
+            goos: def.goos.clone(),
+            goarch: def.goarch.clone(),
+            build_tags: vec![],
+            goexperiment: def.goexperiment.clone(),
+            race: def.race,
+        };
+        let gocache_input = Input {
+            r#ref: TargetAddr {
+                r#ref: gocache_key.addr(),
+                output: None,
+                filters: vec![],
+            },
+            mode: InputMode::Standard,
+            origin_id: format!("{}|0", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX),
+            annotations: std::collections::BTreeMap::from([(
+                hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
+                "true".to_string(),
+            )]),
+            hashed: false,
+            runtime: false,
+        };
+
         Ok(ParseResponse {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                inputs,
+                inputs: inputs.into_iter().chain([gocache_input]).collect(),
                 outputs,
                 support_files: vec![],
                 cache: CacheConfig::on(true),
@@ -425,9 +459,19 @@ impl ManagedDriver for GoCompileDriver {
         )
         .await?;
 
-        let gocache = pkg_dir.join(".heph-gocache");
-        std::fs::create_dir_all(&gocache)
-            .with_context(|| format!("create gocache dir {gocache:?}"))?;
+        // Resolved and locked by the host from this target's scratch reference.
+        // Falls back to a sandbox-local directory when the mount is absent — an
+        // older host that does not carry scratch mounts on `RunRequest` must
+        // still run this driver, and a cold cache is slow, never wrong.
+        let gocache = match req.request.scratch.iter().find(|m| m.env == "GOCACHE") {
+            Some(mount) => mount.dir.clone(),
+            None => {
+                let local = pkg_dir.join(".heph-gocache");
+                std::fs::create_dir_all(&local)
+                    .with_context(|| format!("create gocache dir {local:?}"))?;
+                local
+            }
+        };
 
         let mut env: HashMap<String, String> = HashMap::new();
         env.insert("GOOS".to_string(), def.goos.clone());
