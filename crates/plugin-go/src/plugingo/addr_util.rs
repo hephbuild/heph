@@ -666,11 +666,11 @@ mod tests {
         // Host: no SDK dep.
         assert!(go_sdk_dep("host").is_none());
         // Hermetic: deps the synthesized toolchain download target.
-        let (group, val) = go_sdk_dep("1.26.4").expect("hermetic deps SDK");
+        let (group, val) = go_sdk_dep("1.27.0").expect("hermetic deps SDK");
         assert_eq!(group, GO_SDK_DEP_GROUP);
         match val {
             Value::List(v) => match &v[0] {
-                Value::String(s) => assert!(s.contains("@heph/go/toolchain/1.26.4")),
+                Value::String(s) => assert!(s.contains("@heph/go/toolchain/1.27.0")),
                 _ => panic!("addr must be a string"),
             },
             _ => panic!("dep value must be a list"),
@@ -692,7 +692,7 @@ mod tests {
         assert!(go_host_runtime_pass_env("//@heph/bin:go").contains(&"GOMODCACHE".to_string()));
         assert!(go_sdk_read_only_config("//@heph/bin:go").is_some());
         // Hermetic passes no host env; host passes the full set.
-        assert!(go_host_runtime_pass_env("1.26.4").is_empty());
+        assert!(go_host_runtime_pass_env("1.27.0").is_empty());
         assert!(go_host_runtime_pass_env("host").contains(&"PATH".to_string()));
     }
 
@@ -706,8 +706,8 @@ mod tests {
         assert!(p.contains("if [ -d"), "must auto-detect dir vs file: {p}");
         assert!(p.contains("env GOROOT"), "must derive GOROOT: {p}");
         // Hermetic instead points at the deterministic staged path.
-        let h = go_goroot_prelude("1.26.4").join("\n");
-        assert!(h.contains("$WORKSPACE_ROOT/@heph/go/toolchain/1.26.4/go"));
+        let h = go_goroot_prelude("1.27.0").join("\n");
+        assert!(h.contains("$WORKSPACE_ROOT/@heph/go/toolchain/1.27.0/go"));
         assert!(!h.contains("$SRC_GOSDK"));
     }
 
