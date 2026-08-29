@@ -173,6 +173,8 @@ impl ConfigYamlExt for ConfigYaml {
                     read: c.read,
                     write: c.write,
                     concurrency: c.concurrency,
+                    endpoint: c.endpoint,
+                    region: c.region,
                 })
                 .collect(),
         })
@@ -219,6 +221,25 @@ mod tests {
         assert_eq!(r.uri, "s3://b/p");
         assert!(r.read);
         assert!(!r.write);
+    }
+
+    #[test]
+    fn resolve_carries_cache_endpoint_and_region() {
+        let yaml: ConfigYaml = serde_yaml::from_str(concat!(
+            "caches:\n",
+            "  r:\n",
+            "    uri: s3://b/p\n",
+            "    endpoint: https://accountid.r2.cloudflarestorage.com\n",
+            "    region: auto\n",
+        ))
+        .expect("parse");
+        let cfg = yaml.resolve(Path::new("/repo")).expect("resolve");
+        let r = &cfg.remote_caches[0];
+        assert_eq!(
+            r.endpoint.as_deref(),
+            Some("https://accountid.r2.cloudflarestorage.com")
+        );
+        assert_eq!(r.region.as_deref(), Some("auto"));
     }
 
     #[test]

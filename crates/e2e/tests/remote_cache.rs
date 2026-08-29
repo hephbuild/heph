@@ -33,6 +33,8 @@ fn build_engine(root: &Path, remote_uri: &str) -> Arc<Engine> {
             read: true,
             write: true,
             concurrency: 10,
+            endpoint: None,
+            region: None,
         }],
         ..Default::default()
     })
