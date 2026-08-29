@@ -141,7 +141,9 @@ fn workspace() -> htestkit::Workspace {
                 std::sync::Arc::clone(&init.functions),
             ))
         })
-        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         // The runner is what the cdylib hands the host through `NamedRunner`;
         // an in-process harness puts it in the plugin's parts directly.
         .with_plugin("oci", |init| {

@@ -297,7 +297,9 @@ fn workspace() -> htestkit::Workspace {
                 std::sync::Arc::clone(&init.functions),
             ))
         })
-        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         .with_plugin("oci", |init| {
             Ok(heph::engine::PluginParts::default()
                 .with_provider(Box::new(pluginoci::platform::Provider::new(&init.name)))
