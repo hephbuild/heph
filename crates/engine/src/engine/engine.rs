@@ -561,6 +561,16 @@ impl Engine {
     }
 
     /// The per-addr execute-phase lock.
+    /// The scratch lineage this run writes to.
+    pub fn scratch_scope(&self) -> &str {
+        &self.cfg.scratch.scope
+    }
+
+    /// Lineages this run may read from when its own has nothing.
+    pub fn scratch_restore_scopes(&self) -> &[String] {
+        &self.cfg.scratch.restore_scopes
+    }
+
     pub fn result_lock(&self) -> &ResultLock {
         &self.result_lock
     }

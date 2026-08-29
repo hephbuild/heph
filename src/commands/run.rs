@@ -111,6 +111,9 @@ struct RunApp {
     matcher: Matcher,
     fail_fast: bool,
     auto_approve: bool,
+    /// `--scratch=off`: run with every declared scratch cache absent. Implies a
+    /// forced rebuild — see where `force` is set.
+    scratch_off: bool,
     /// Shared approval queue: attached to the TUI view (so prompts render) and to
     /// the TUI approval handler (so keypresses resolve them). Unused in non-TUI
     /// mode, which prompts on the terminal instead.
@@ -194,7 +197,17 @@ impl App for RunApp {
         };
 
         let opts = ResultOptions {
-            force: self.args.force,
+            // `--scratch=off` implies `--force`, and must: the whole point is to
+            // check that a target produces the same outputs without its carried
+            // -over state, and a cached result was produced *with* it. Serving
+            // one back would make the audit vacuous — it would pass by reading
+            // exactly the answer it is supposed to be re-deriving.
+            //
+            // Note this does not change any cache key: scratch never reaches
+            // `hashin`, so the audit run writes its revision under the same key
+            // and a divergence surfaces as a rebuilt-hashout mismatch rather
+            // than as two unrelated entries.
+            force: self.args.force || self.scratch_off,
             shell: self.args.shell.is_some(),
             interactive,
             frozen: self.args.frozen,
@@ -313,6 +326,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         matcher: m,
         fail_fast: global.fail_fast,
         auto_approve: global.auto_approve,
+        scratch_off: global.scratch == crate::commands::ScratchMode::Off,
         approval: tui::ApprovalCenter::new(),
     };
     let interactive = tui::should_use_tui(global.no_tui);

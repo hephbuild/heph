@@ -6,6 +6,7 @@ mod completions;
 pub mod gc;
 mod gen_gitignore;
 mod resolve_plugins;
+mod scratch;
 
 use clap::{Args, Subcommand};
 
@@ -63,6 +64,18 @@ pub enum ToolCommands {
     /// Example: `heph tool gen-gitignore`
     #[command(name = "gen-gitignore")]
     GenGitignore(gen_gitignore::Args),
+    /// Inspect and reclaim persistent scratch caches
+    ///
+    /// A scratch cache is a directory a target declares and carries between runs
+    /// to go faster — a compiler cache, a dependency cache. Nothing else bounds
+    /// their growth, so this is where you look when disk is short, and
+    /// `heph tool gc` is what sweeps them on a schedule.
+    ///
+    /// Removing one is always safe: a target's outputs are identical whether its
+    /// scratch is warm, cold or absent, so it costs time and nothing else.
+    ///
+    /// Example: `heph tool scratch ls`
+    Scratch(scratch::ScratchArgs),
     /// Remote cache maintenance
     ///
     /// Subcommands for the shared remote cache(s) configured in `.hephconfig2`.
@@ -117,6 +130,7 @@ impl ToolCommands {
             ToolCommands::Gc(args) => gc::execute(args, sink, global),
             ToolCommands::Clean(args) => clean::execute(args, sink, global),
             ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
+            ToolCommands::Scratch(args) => args.execute(sink, global),
             ToolCommands::Cache(args) => args.execute(sink, global),
             ToolCommands::Completions(args) => completions::execute(args),
             ToolCommands::BuildFmt(args) => build_fmt::execute(args, sink, global),

@@ -629,3 +629,464 @@ target(name = "a", driver = "bash", out = "o.txt",
     assert!(msg.contains("//build:c"), "must name the scratch: {msg}");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Lineages: one cache per branch, with a fallback.
+// ---------------------------------------------------------------------------
+
+/// Switching branches must not hand the arriving branch the departing branch's
+/// cache state, and must not hand it back mutated. Each lineage keeps its own
+/// directory; a new one is *seeded* from its fallback, so a switch costs a copy
+/// rather than a rebuild.
+///
+/// The whole story in one test: build on `master`, switch to `feat`, and see
+/// `master`'s work — then confirm `feat`'s own writes never reached `master`.
+#[tokio::test]
+async fn a_branch_switch_seeds_from_the_fallback_and_writes_stay_put() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    // Reads whatever is in the cache, then stamps its own name over it.
+    let build = |m: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["cat \"$C/marker\" > $OUT || echo cold > $OUT", "echo {m} > \"$C/marker\""])"#
+        )
+    };
+    let run = async |engine: &Arc<heph::engine::Engine>| -> anyhow::Result<String> {
+        let addr = heph::htaddr::parse_addr("//app:a")?;
+        let opts = ResultOptions::default();
+        let r = Arc::clone(engine)
+            .result_addr(engine.new_state(), &addr, OutputMatcher::All, &opts)
+            .await?;
+        let out = common::artifact_string(&r).trim().to_string();
+        drop(r); // releases the riding read lock before the next engine opens
+        Ok(out)
+    };
+
+    let on = |scope: &str| heph::engine::ScratchOptions {
+        enabled: true,
+        scope: scope.to_string(),
+        restore_scopes: vec!["master".to_string()],
+        seed_on_fork: true,
+    };
+
+    // On `master`: cold, then leaves "master" behind.
+    ws.write_build_file("app", &build("master"));
+    assert_eq!(run(&ws.reopen_scoped(on("master"))?).await?, "cold");
+
+    // Switch to `feat`. Its lineage is new, so it seeds from `master` — and sees
+    // what `master` left, rather than starting cold.
+    ws.write_build_file("app", &build("feat"));
+    assert_eq!(
+        run(&ws.reopen_scoped(on("feat"))?).await?,
+        "master",
+        "a new branch must seed from its fallback, not start cold"
+    );
+
+    // Back on `master`: it must still see its own work, not the branch's. This is
+    // the isolation half — a branch cannot advance or corrupt what it forked from.
+    ws.write_build_file("app", &build("master2"));
+    assert_eq!(
+        run(&ws.reopen_scoped(on("master"))?).await?,
+        "master",
+        "the branch's writes must not have reached the lineage it forked from"
+    );
+    Ok(())
+}
+
+/// With seeding off, a new lineage starts cold rather than paying a copy. The
+/// knob exists for a large slot on a filesystem with no reflink.
+#[tokio::test]
+async fn seed_on_fork_off_starts_a_new_branch_cold() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    let build = |m: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["cat \"$C/marker\" > $OUT || echo cold > $OUT", "echo {m} > \"$C/marker\""])"#
+        )
+    };
+    let run = async |engine: &Arc<heph::engine::Engine>| -> anyhow::Result<String> {
+        let addr = heph::htaddr::parse_addr("//app:a")?;
+        let opts = ResultOptions::default();
+        let r = Arc::clone(engine)
+            .result_addr(engine.new_state(), &addr, OutputMatcher::All, &opts)
+            .await?;
+        let out = common::artifact_string(&r).trim().to_string();
+        drop(r);
+        Ok(out)
+    };
+    let on = |scope: &str, seed: bool| heph::engine::ScratchOptions {
+        enabled: true,
+        scope: scope.to_string(),
+        restore_scopes: vec!["master".to_string()],
+        seed_on_fork: seed,
+    };
+
+    ws.write_build_file("app", &build("master"));
+    assert_eq!(run(&ws.reopen_scoped(on("master", false))?).await?, "cold");
+
+    ws.write_build_file("app", &build("feat"));
+    assert_eq!(
+        run(&ws.reopen_scoped(on("feat", false))?).await?,
+        "cold",
+        "with seeding off a new lineage must not inherit"
+    );
+    Ok(())
+}
+
+/// `--scratch=off` is the audit mode for the whole contract: a target's outputs
+/// must be identical whether its scratch is warm, cold or absent. With it, a
+/// declared cache is not merely empty — the entire path is skipped, so nothing
+/// resolves, locks, or mounts.
+#[tokio::test]
+async fn scratch_off_runs_as_though_nothing_were_declared() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    // Reports whether the variable and the mount are there at all.
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["if [ -n \"${C:-}\" ] && [ -d .cache/x ]; then echo mounted > $OUT; else echo absent > $OUT; fi"])"#,
+    );
+
+    let on = |enabled: bool| heph::engine::ScratchOptions {
+        enabled,
+        ..Default::default()
+    };
+    // `force`, because that is what the CLI does for `--scratch=off` and why it
+    // has to: scratch never reaches `hashin`, so without it the second run is a
+    // cache hit that replays the result built *with* a warm cache — the audit
+    // would pass by reading exactly the answer it is meant to re-derive.
+    let run = async |engine: &Arc<heph::engine::Engine>, force: bool| -> anyhow::Result<String> {
+        let addr = heph::htaddr::parse_addr("//app:a")?;
+        let opts = ResultOptions {
+            force,
+            ..Default::default()
+        };
+        let r = Arc::clone(engine)
+            .result_addr(engine.new_state(), &addr, OutputMatcher::All, &opts)
+            .await?;
+        let out = common::artifact_string(&r).trim().to_string();
+        drop(r);
+        Ok(out)
+    };
+
+    assert_eq!(run(&ws.reopen_scoped(on(true))?, false).await?, "mounted");
+
+    // The trap this test originally fell into, asserted *before* the forced run
+    // so nobody "simplifies" the implication away later: scratch never reaches
+    // `hashin`, so an unforced off-run is a plain cache hit and replays the
+    // result built with a warm cache. The audit would pass by reading exactly the
+    // answer it is meant to re-derive.
+    assert_eq!(
+        run(&ws.reopen_scoped(on(false))?, false).await?,
+        "mounted",
+        "a cached result is served regardless of scratch — which is why \
+         `--scratch=off` must imply a rebuild"
+    );
+
+    // With the rebuild the CLI forces, the cache is genuinely absent — not merely
+    // mounted-and-empty.
+    assert_eq!(
+        run(&ws.reopen_scoped(on(false))?, true).await?,
+        "absent",
+        "--scratch=off must leave the cache genuinely absent, not merely empty"
+    );
+    Ok(())
+}
+
+/// The store describes itself, so it can be listed and reclaimed without reading
+/// a single BUILD file — the property that keeps a cache manageable after the
+/// target that made it is gone.
+#[tokio::test]
+async fn the_store_lists_and_reclaims_what_a_build_created() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "gocache", driver = "scratch", path = ".cache/x", env = "C",
+       access = "shared")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:gocache"],
+       run = ["echo hi > $OUT", "dd if=/dev/zero of=\"$C/blob\" bs=1024 count=8 2>/dev/null"])"#,
+    );
+    ws.run("//app:a").await?;
+
+    let slots = ws.engine.scratch_slots()?;
+    assert_eq!(slots.len(), 1, "the build must have created one slot");
+    let meta = slots[0].meta.as_ref().expect("slot describes itself");
+    assert_eq!(meta.addr, "//build:gocache");
+    assert_eq!(meta.access, "shared");
+    assert!(slots[0].bytes >= 8 * 1024, "got {} bytes", slots[0].bytes);
+
+    // Named removal finds it by the addr the meta recorded.
+    let (n, freed) = ws.engine.scratch_remove(Some("//build:gocache"))?;
+    assert_eq!(n, 1);
+    assert!(freed >= 8 * 1024);
+    assert!(ws.engine.scratch_slots()?.is_empty());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The remote lineage: publish here, pick it up cold there.
+// ---------------------------------------------------------------------------
+
+/// Build an engine rooted at `root` with one read+write remote cache and an
+/// explicit lineage policy — a stand-in for one CI runner.
+fn remote_engine(
+    root: &std::path::Path,
+    remote_uri: &str,
+    scope: &str,
+    fallbacks: &[&str],
+) -> Arc<heph::engine::Engine> {
+    use heph::engine::{Config, Engine, RemoteCacheDef, ScratchOptions};
+    let mut e = Engine::new(Config {
+        root: root.to_path_buf(),
+        home_dir: std::path::PathBuf::new(),
+        remote_caches: vec![RemoteCacheDef {
+            name: "shared".to_string(),
+            uri: remote_uri.to_string(),
+            read: true,
+            write: true,
+            concurrency: 10,
+            endpoint: None,
+            region: None,
+        }],
+        scratch: ScratchOptions {
+            enabled: true,
+            scope: scope.to_string(),
+            restore_scopes: fallbacks.iter().map(|s| s.to_string()).collect(),
+            seed_on_fork: true,
+        },
+        ..Default::default()
+    })
+    .expect("engine");
+    e.register_provider(|init| {
+        Box::new(heph::pluginbuildfile::Provider::new(
+            init.root.to_path_buf(),
+            init.runtime.clone(),
+        ))
+    })
+    .expect("provider");
+    e.register_managed_driver(|_| Box::new(heph::pluginexec::Driver::new_bash()))
+        .expect("bash driver");
+    Arc::new(e)
+}
+
+const REMOTE_DECL: &str = r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C",
+       remote = True)"#;
+
+fn remote_target(marker: &str) -> String {
+    format!(
+        r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["cat \"$C/marker\" > $OUT || echo cold > $OUT", "echo {marker} > \"$C/marker\""])"#
+    )
+}
+
+async fn build(engine: &Arc<heph::engine::Engine>) -> anyhow::Result<String> {
+    let addr = heph::htaddr::parse_addr("//app:a")?;
+    let opts = ResultOptions::default();
+    let r = Arc::clone(engine)
+        .result_addr(engine.new_state(), &addr, OutputMatcher::All, &opts)
+        .await?;
+    let out = common::artifact_string(&r).trim().to_string();
+    drop(r);
+    Ok(out)
+}
+
+/// The CI story end to end: one machine builds and publishes; a second machine,
+/// cold in every lineage, picks the snapshot up automatically and sees the first
+/// machine's work.
+///
+/// Publishing is explicit; picking up is not. That asymmetry is the design —
+/// a pull is read-only, cheap, and degrades to a cold build, so it is safe to do
+/// on its own. A push is none of those.
+#[tokio::test]
+async fn a_published_snapshot_warms_a_cold_machine() -> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+
+    // Machine one: build, then publish.
+    let a = tempfile::tempdir()?;
+    std::fs::create_dir_all(a.path().join("build"))?;
+    std::fs::create_dir_all(a.path().join("app"))?;
+    std::fs::write(a.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    std::fs::write(
+        a.path().join("app").join("BUILD"),
+        remote_target("machine-one"),
+    )?;
+
+    let e1 = remote_engine(a.path(), &uri, "master", &[]);
+    assert_eq!(build(&e1).await?, "cold", "the first machine starts cold");
+
+    let slots = e1.scratch_slots()?;
+    assert_eq!(slots.len(), 1);
+    let slot = slots[0].slot.clone();
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.home, &slot, "master");
+    let (generation, bytes) = e1
+        .scratch_push(&slot, "master", &dir, None, "run-1")
+        .await?;
+    assert_eq!(generation, 0, "a first publish starts the lineage at 0");
+    assert!(bytes > 0);
+
+    // Machine two: a different root, nothing local at all.
+    let b = tempfile::tempdir()?;
+    std::fs::create_dir_all(b.path().join("build"))?;
+    std::fs::create_dir_all(b.path().join("app"))?;
+    std::fs::write(b.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    std::fs::write(
+        b.path().join("app").join("BUILD"),
+        remote_target("machine-two"),
+    )?;
+
+    let e2 = remote_engine(b.path(), &uri, "master", &[]);
+    assert_eq!(
+        build(&e2).await?,
+        "machine-one",
+        "a cold machine must pick up the published snapshot without being asked"
+    );
+    Ok(())
+}
+
+/// Generations advance at publish time and are `parent + 1` within a lineage, so
+/// a later publish wins — and republishing identical contents adds nothing.
+#[tokio::test]
+async fn publishing_advances_the_lineage_and_skips_unchanged_contents() -> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+    let ws = tempfile::tempdir()?;
+    std::fs::create_dir_all(ws.path().join("build"))?;
+    std::fs::create_dir_all(ws.path().join("app"))?;
+    std::fs::write(ws.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    std::fs::write(ws.path().join("app").join("BUILD"), remote_target("one"))?;
+
+    let e = remote_engine(ws.path(), &uri, "master", &[]);
+    build(&e).await?;
+    let slot = e.scratch_slots()?[0].slot.clone();
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e.home, &slot, "master");
+
+    let (g0, _) = e.scratch_push(&slot, "master", &dir, None, "r1").await?;
+    assert_eq!(g0, 0);
+
+    // Nothing changed on disk, so there is nothing to say. Publishing anyway
+    // would grow the chain with every no-op CI run.
+    let parent = heph::engine::scratch_remote::read_local_meta(&e.home, &slot, "master");
+    let (g_same, bytes) = e
+        .scratch_push(&slot, "master", &dir, parent.as_ref(), "r2")
+        .await?;
+    assert_eq!(
+        (g_same, bytes),
+        (0, 0),
+        "unchanged contents must not publish"
+    );
+
+    // Change the contents, and the lineage advances.
+    std::fs::write(dir.join("marker"), b"two\n")?;
+    let parent = heph::engine::scratch_remote::read_local_meta(&e.home, &slot, "master");
+    let (g1, _) = e
+        .scratch_push(&slot, "master", &dir, parent.as_ref(), "r3")
+        .await?;
+    assert_eq!(g1, 1, "a changed publish is parent + 1");
+
+    let head = e
+        .scratch_remote_head(&slot, "master", &[])
+        .await
+        .expect("a head");
+    assert_eq!(head.meta.generation, 1, "the newest generation wins");
+    Ok(())
+}
+
+/// Reads fall back across branches; writes never do. A PR job picks up `master`'s
+/// snapshot and publishes into its own lineage, leaving `master`'s head where it
+/// was — the isolation that makes this safe on untrusted CI.
+#[tokio::test]
+async fn a_branch_reads_from_master_and_publishes_to_itself() -> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+    let mk = |marker: &str| -> anyhow::Result<tempfile::TempDir> {
+        let d = tempfile::tempdir()?;
+        std::fs::create_dir_all(d.path().join("build"))?;
+        std::fs::create_dir_all(d.path().join("app"))?;
+        std::fs::write(d.path().join("build").join("BUILD"), REMOTE_DECL)?;
+        std::fs::write(d.path().join("app").join("BUILD"), remote_target(marker))?;
+        Ok(d)
+    };
+
+    // `master` publishes.
+    let m = mk("from-master")?;
+    let em = remote_engine(m.path(), &uri, "master", &[]);
+    build(&em).await?;
+    let slot = em.scratch_slots()?[0].slot.clone();
+    let mdir = heph::engine::scratch_remote::scope_head_dir(&em.home, &slot, "master");
+    em.scratch_push(&slot, "master", &mdir, None, "master-run")
+        .await?;
+
+    // A PR runner, cold, on `pr-1` with `master` as its fallback.
+    let p = mk("from-pr")?;
+    let ep = remote_engine(p.path(), &uri, "pr-1", &["master"]);
+    assert_eq!(
+        build(&ep).await?,
+        "from-master",
+        "a branch must pick up its base's snapshot"
+    );
+
+    let pdir = heph::engine::scratch_remote::scope_head_dir(&ep.home, &slot, "pr-1");
+    let parent = heph::engine::scratch_remote::read_local_meta(&ep.home, &slot, "pr-1");
+    ep.scratch_push(&slot, "pr-1", &pdir, parent.as_ref(), "pr-run")
+        .await?;
+
+    // `master`'s lineage is untouched: still generation 0, still its own bytes.
+    let master_head = em
+        .scratch_remote_head(&slot, "master", &[])
+        .await
+        .expect("master head");
+    assert_eq!(master_head.meta.scope, "master");
+    assert_eq!(
+        master_head.meta.generation, 0,
+        "a PR publish must not advance master's lineage"
+    );
+
+    // And the branch has a lineage of its own.
+    let pr_head = ep
+        .scratch_remote_head(&slot, "pr-1", &[])
+        .await
+        .expect("pr head");
+    assert_eq!(pr_head.meta.scope, "pr-1");
+    Ok(())
+}
+
+/// A remote that is unreachable is a cold build, never a failed one — the scratch
+/// contract in its most load-bearing form.
+#[tokio::test]
+async fn an_unreachable_remote_degrades_to_a_cold_build() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    std::fs::create_dir_all(ws.path().join("build"))?;
+    std::fs::create_dir_all(ws.path().join("app"))?;
+    std::fs::write(ws.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    std::fs::write(ws.path().join("app").join("BUILD"), remote_target("x"))?;
+
+    // A path that does not exist and cannot be created.
+    let e = remote_engine(
+        ws.path(),
+        "file:///nonexistent/heph-scratch-test",
+        "master",
+        &[],
+    );
+    assert_eq!(
+        build(&e).await?,
+        "cold",
+        "a dead remote must not fail a build"
+    );
+    Ok(())
+}
