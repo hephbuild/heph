@@ -63,8 +63,58 @@ use std::collections::{BTreeMap, HashMap};
 /// Synthetic package holding the shared Go build caches.
 pub const GOCACHE_PKG: &str = "@heph/go/gocache";
 
-/// Target name within [`GOCACHE_PKG`].
+/// Target name within [`GOCACHE_PKG`] for the build cache.
 pub const GOCACHE_NAME: &str = "cache";
+
+/// Target name within [`GOCACHE_PKG`] for the **module** cache.
+///
+/// Separate from the build cache because they are different things with
+/// different portability: `GOCACHE` holds host-toolchain artifacts, `GOMODCACHE`
+/// holds downloaded module *source*.
+pub const GOMODCACHE_NAME: &str = "modcache";
+
+/// The module cache's address.
+///
+/// Keyed on nothing but the target name. Module cache entries are
+/// `module@version` source trees, verified against `go.sum` — the same bytes on
+/// every platform, under every toolchain and every set of build tags. Keying it
+/// on anything would fragment a cache that has no reason to be fragmented.
+pub fn modcache_addr() -> Addr {
+    Addr::new(
+        PkgBuf::from(GOCACHE_PKG),
+        GOMODCACHE_NAME.to_string(),
+        Default::default(),
+    )
+}
+
+/// Build the `scratch` spec for the shared module cache.
+///
+/// **No `path`.** `go mod download` finds the cache through `GOMODCACHE`, so the
+/// directory is never placed in the sandbox tree — which is what makes this
+/// possible at all: the thirdparty download target collects `out = "**/*"` from
+/// its package, and an in-tree mount there would be swept into the artifact. Its
+/// own source comment already recorded working around exactly that by hand.
+pub fn build_modcache_spec(addr: Addr) -> TargetSpec {
+    let config: HashMap<String, Value> = HashMap::from([
+        ("env".to_string(), Value::String("GOMODCACHE".to_string())),
+        // Go's module cache is content-addressed and `go.sum`-verified, and
+        // concurrent `go mod download` is ordinary — the same trust heph already
+        // extended to the host modcache passthrough this replaces.
+        ("access".to_string(), Value::String("shared".to_string())),
+        // Module source, not objects. The showcase for `any`: one cache serves a
+        // Linux CI runner and a macOS laptop alike.
+        ("platform".to_string(), Value::String("any".to_string())),
+        ("remote".to_string(), Value::Bool(false)),
+    ]);
+
+    TargetSpec {
+        addr,
+        driver: "scratch".to_string(),
+        config,
+        labels: vec!["go-gomodcache".to_string()],
+        ..Default::default()
+    }
+}
 
 /// Where the cache is mounted in a consuming sandbox.
 ///

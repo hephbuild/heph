@@ -118,23 +118,31 @@ async fn two_packages_can_declare_the_same_name() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `path` is what a consumer mounts, so a missing one is not a defaultable
-/// omission — it is an incomplete declaration, and the error must land at parse
-/// time in the package that wrote it.
+/// A declaration without a `path` is the env-var-only form, not an incomplete
+/// one: the cache is announced through its variable and never placed in the tree.
+/// That is what lets a target whose output is a broad glob use one at all —
+/// nothing is in the tree for the glob to collect.
 #[tokio::test]
-async fn a_declaration_without_a_path_fails_at_parse() -> anyhow::Result<()> {
+async fn a_declaration_without_a_path_is_env_var_only() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "build",
-        r#"target(name = "c", driver = "scratch", version = "1")"#,
+        r#"target(name = "c", driver = "scratch", env = "MYCACHE")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "**/*", scratch = ["//build:c"],
+       run = ["echo \"$MYCACHE\" > o.txt"])"#,
     );
 
-    let err = expect_err(
-        ws.run("//build:c").await,
-        "a scratch without `path` must not resolve",
-    );
-    let msg = format!("{err:#}");
-    assert!(msg.contains("path"), "error must name the field: {msg}");
+    // The `**/*` glob would be rejected against a mounted scratch; with no mount
+    // there is nothing in the tree to collect.
+    let out = common::artifact_string(&*ws.run("//app:a").await?);
+    let path = out.trim();
+    assert!(path.starts_with('/'), "the variable must be set: {path:?}");
+    assert!(path.contains("/scratch/"), "{path:?}");
+    // And the directory really is absent from the sandbox tree.
+    assert!(!out.contains("MYCACHE="), "{out:?}");
     Ok(())
 }
 

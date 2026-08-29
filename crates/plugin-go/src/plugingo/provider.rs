@@ -1681,10 +1681,17 @@ impl ProviderInner {
         // package decoding, exactly like the toolchain above — because there is
         // no such directory on disk and asking the filesystem about it would only
         // produce a confusing "not found".
-        if addr.name == gocache::GOCACHE_NAME && gocache::is_gocache_pkg(addr.package.as_str()) {
-            return Ok(GetResponse {
-                target_spec: gocache::build_spec(addr.clone()),
-            });
+        if gocache::is_gocache_pkg(addr.package.as_str()) {
+            if addr.name == gocache::GOCACHE_NAME {
+                return Ok(GetResponse {
+                    target_spec: gocache::build_spec(addr.clone()),
+                });
+            }
+            if addr.name == gocache::GOMODCACHE_NAME {
+                return Ok(GetResponse {
+                    target_spec: gocache::build_modcache_spec(addr.clone()),
+                });
+            }
         }
 
         // `heph-govet`, the analysis/format binary the lint and format targets

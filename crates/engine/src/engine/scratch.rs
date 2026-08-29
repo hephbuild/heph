@@ -832,6 +832,9 @@ fn check_env_collisions(consumer: &Addr, resolved: &[ResolvedScratch]) -> anyhow
 fn check_mount_overlaps(consumer: &Addr, resolved: &[ResolvedScratch]) -> anyhow::Result<()> {
     for (i, a) in resolved.iter().enumerate() {
         for b in resolved.iter().skip(i + 1) {
+            // An env-var-only cache is never placed in the tree, so it cannot
+            // overlap anything — `paths_overlap` defines an empty path as
+            // colliding with nothing, so this needs no guard of its own.
             if hcore::paths::paths_overlap(&a.def.path, &b.def.path) {
                 anyhow::bail!(
                     "{consumer} references two scratches whose mount points overlap: {} at {:?} \
@@ -884,6 +887,9 @@ fn check_output_overlaps(
     };
 
     for r in resolved {
+        if r.def.path.is_empty() {
+            continue;
+        }
         let mount = anchored(&r.def.path);
         for output in outputs {
             for path in &output.paths {
