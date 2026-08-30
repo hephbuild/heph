@@ -14,6 +14,7 @@ pub fn build_spec_firstparty(
     import_path: &str,
     factors: &Factors,
     go_version: &str,
+    go_module: &str,
     go_mod_addr: &Addr,
     go_src_addr: &Addr,
     go_src_query_addr: Option<&Addr>,
@@ -30,6 +31,7 @@ pub fn build_spec_firstparty(
         import_path,
         factors,
         go_version,
+        go_module,
         &[
             ("modfiles", &[go_mod_addr.format()][..]),
             ("srcfiles", &srcfiles),
@@ -57,7 +59,10 @@ pub fn build_spec_stdlib(
     // std ships `_test.go` files, but heph never builds std's tests: `list`
     // emits only `_golist`/`build_lib` for a Stdlib package. Loading the test
     // variants is pure cost.
-    build_spec_inner(addr, import_path, factors, go_version, &[], false)
+    // No `go_module`: the standard library belongs to no module, so it lands in
+    // the module-less cache rather than being attributed to whichever module
+    // happened to ask for it first.
+    build_spec_inner(addr, import_path, factors, go_version, "", &[], false)
 }
 
 pub fn build_spec_thirdparty(
@@ -65,6 +70,7 @@ pub fn build_spec_thirdparty(
     import_path: &str,
     factors: &Factors,
     go_version: &str,
+    go_module: &str,
     go_mod_addr: &Addr,
     download_addr: &Addr,
 ) -> anyhow::Result<TargetSpec> {
@@ -73,6 +79,7 @@ pub fn build_spec_thirdparty(
         import_path,
         factors,
         go_version,
+        go_module,
         &[("modfiles", &[go_mod_addr.format()][..])],
         // Same as stdlib: `list` emits no test targets for a ThirdParty
         // package, so nothing downstream can read a test field.
@@ -93,6 +100,7 @@ fn build_spec_inner(
     import_path: &str,
     factors: &Factors,
     go_version: &str,
+    go_module: &str,
     extra_deps: &[(&str, &[String])],
     with_test: bool,
 ) -> anyhow::Result<TargetSpec> {
@@ -124,6 +132,13 @@ fn build_spec_inner(
     config.insert(
         "go_version".to_string(),
         Value::String(go_version.to_string()),
+    );
+    // Which module's `GOCACHE` this listing uses. Carried in the config because
+    // the driver cannot work it out: finding a package's `go.mod` means walking
+    // the filesystem, and a driver sees only its sandbox.
+    config.insert(
+        "go_module".to_string(),
+        Value::String(go_module.to_string()),
     );
     // Whether `go list` gets `-test`. Carried in the config (not inferred in the
     // driver) so it reaches the def hash — flipping it changes the artifact.
@@ -219,6 +234,40 @@ mod tests {
         )
     }
 
+    /// The module has to reach the driver through the config: the driver sees
+    /// only its sandbox, so it cannot find a `go.mod` to work it out itself.
+    #[test]
+    fn the_spec_carries_the_module_for_the_gocache() {
+        let spec = build_spec_firstparty(
+            test_addr(),
+            "example.com/mylib",
+            &test_factors(),
+            V,
+            "svc",
+            &go_mod_addr(),
+            &go_src_addr(),
+            None,
+            &[],
+            false,
+        )
+        .expect("spec");
+        assert_eq!(
+            spec.config.get("go_module"),
+            Some(&Value::String("svc".to_string()))
+        );
+    }
+
+    /// Stdlib belongs to no module, so it must not be attributed to whichever
+    /// module happened to ask for it first.
+    #[test]
+    fn stdlib_lands_in_the_module_less_cache() {
+        let spec = build_spec_stdlib(test_addr(), "fmt", &test_factors(), V).expect("spec");
+        assert_eq!(
+            spec.config.get("go_module"),
+            Some(&Value::String(String::new()))
+        );
+    }
+
     #[test]
     fn test_driver_is_go_golist() {
         let spec = build_spec_firstparty(
@@ -226,6 +275,7 @@ mod tests {
             "example.com/mylib",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -243,6 +293,7 @@ mod tests {
             "example.com/mylib",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -265,6 +316,7 @@ mod tests {
             "example.com/mylib",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -288,6 +340,7 @@ mod tests {
             "example.com/mylib",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -350,6 +403,7 @@ mod tests {
             "github.com/foo/bar",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &tp_download_addr(),
         )
@@ -372,6 +426,7 @@ mod tests {
                 "example.com/mylib",
                 &test_factors(),
                 V,
+                "",
                 &go_mod_addr(),
                 &go_src_addr(),
                 None,
@@ -394,6 +449,7 @@ mod tests {
             "example.com/mylib",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -419,6 +475,7 @@ mod tests {
             "example.com/mylib",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -438,6 +495,7 @@ mod tests {
             "example.com/mylib",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -474,6 +532,7 @@ mod tests {
             "github.com/foo/bar",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &tp_download_addr(),
         )
@@ -505,6 +564,7 @@ mod tests {
             "github.com/foo/bar",
             &test_factors(),
             V,
+            "",
             &go_mod_addr(),
             &tp_download_addr(),
         )

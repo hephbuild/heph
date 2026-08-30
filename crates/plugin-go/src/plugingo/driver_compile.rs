@@ -117,6 +117,10 @@ struct GoCompileSpec {
     /// Go release whose staged hermetic SDK provides GOROOT + the `go` binary.
     #[spec(required)]
     go_version: String,
+    /// Workspace-relative `go.mod` directory of this package's module, selecting
+    /// which module's shared `GOCACHE` the compile runs against. Empty for the
+    /// root module and for stdlib.
+    go_module: String,
     /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
     goexperiment: Vec<String>,
     /// Extra flags passed verbatim to `go tool compile` (the variant's gcflags).
@@ -157,6 +161,12 @@ struct GoCompileDef {
     goos: String,
     goarch: String,
     go_version: String,
+    /// Which module's shared `GOCACHE` to use. Deliberately absent from `Hash`,
+    /// for the same reason the scratch input is `hashed: false`: a compile
+    /// produces the same archive whether its cache is warm, cold or absent, so
+    /// folding this in would make moving a package between modules rebuild the
+    /// world for no change in output.
+    go_module: String,
     goexperiment: Vec<String>,
     gcflags: Vec<String>,
     buildmode: BuildMode,
@@ -329,6 +339,7 @@ impl ManagedDriver for GoCompileDriver {
             goos: spec.goos,
             goarch: spec.goarch,
             go_version: spec.go_version,
+            go_module: spec.go_module,
             goexperiment: spec.goexperiment,
             gcflags: spec.gcflags,
             buildmode,
@@ -386,6 +397,7 @@ impl ManagedDriver for GoCompileDriver {
         // a compile's cache entries do not depend on them, and claiming they did
         // would split the slot for nothing.
         let gocache_key = crate::plugingo::gocache::GocacheKey {
+            module: def.go_module.clone(),
             go_version: def.go_version.clone(),
             goos: def.goos.clone(),
             goarch: def.goarch.clone(),
@@ -903,6 +915,8 @@ pub struct CompileParams<'a> {
     pub out_file: String,
     pub factors: &'a Factors,
     pub go_version: &'a str,
+    /// Workspace-relative `go.mod` directory selecting the module's `GOCACHE`.
+    pub go_module: &'a str,
     /// `(import_path, lib archive addr)` — importcfg entries + `lib_*` dep groups.
     pub transitive_libs: &'a [(String, Addr)],
     /// Compile sources (`.go`) → the default (`""`) dep group.
@@ -985,6 +999,10 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
     config.insert(
         "go_version".to_string(),
         Value::String(p.go_version.to_string()),
+    );
+    config.insert(
+        "go_module".to_string(),
+        Value::String(p.go_module.to_string()),
     );
     config.insert(
         "goexperiment".to_string(),
@@ -1136,6 +1154,7 @@ mod driver_tests {
             out_file: "x.a".to_string(),
             factors: &factors(),
             go_version: V,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1182,6 +1201,7 @@ mod driver_tests {
             out_file: "x.a".to_string(),
             factors: &factors(),
             go_version: V,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1210,6 +1230,7 @@ mod driver_tests {
             out_file: "x.a".to_string(),
             factors: &factors(),
             go_version: V,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1249,6 +1270,7 @@ mod driver_tests {
                 ..factors()
             },
             go_version: V,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1321,6 +1343,7 @@ mod driver_tests {
             out_file: "x.a".to_string(),
             factors: &factors(),
             go_version: V,
+            go_module: "",
             transitive_libs: libs,
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1404,6 +1427,7 @@ mod driver_tests {
             out_file: "mylib.a".to_string(),
             factors: f,
             go_version: crate::plugingo::toolchain::DEFAULT_GO_VERSION,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &[],
             s_files: &[],
@@ -1451,6 +1475,7 @@ mod driver_tests {
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
             go_version: crate::plugingo::toolchain::HASH_GOLDEN_GO_VERSION.to_string(),
+            go_module: String::new(),
             goexperiment: vec![],
             gcflags: vec![],
             buildmode: BuildMode::default(),
@@ -1472,6 +1497,7 @@ mod driver_tests {
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
             go_version: crate::plugingo::toolchain::HASH_GOLDEN_GO_VERSION.to_string(),
+            go_module: String::new(),
             goexperiment: vec![],
             gcflags: vec![],
             buildmode: BuildMode::default(),

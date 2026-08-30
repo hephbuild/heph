@@ -56,6 +56,10 @@ struct GoGolistSpec {
     /// Go release whose staged hermetic SDK provides GOROOT + the `go` binary.
     #[spec(required)]
     go_version: String,
+    /// Workspace-relative `go.mod` directory of this package's module, selecting
+    /// which module's shared `GOCACHE` the listing runs against. Empty for the
+    /// root module and for stdlib.
+    go_module: String,
     /// Go build tags.
     build_tags: Vec<String>,
     /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
@@ -337,6 +341,7 @@ impl ManagedDriver for GoGolistDriver {
         // must not touch this target's cache key, because a `go list` produces
         // the same package metadata warm or cold.
         let gocache_key = crate::plugingo::gocache::GocacheKey {
+            module: spec.go_module.clone(),
             go_version: spec.go_version.clone(),
             goos: spec.goos.clone(),
             goarch: spec.goarch.clone(),

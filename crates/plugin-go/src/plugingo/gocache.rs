@@ -129,6 +129,21 @@ const GOCACHE_MOUNT: &str = ".heph-gocache";
 /// GOROOT is deliberately absent — see the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GocacheKey {
+    /// The Go module this cache belongs to: the `go.mod` directory, relative to
+    /// the workspace root, and empty for the root module or for stdlib (which
+    /// belongs to no module).
+    ///
+    /// One cache per module rather than one per workspace. Sharing is *correct*
+    /// either way — Go's cache is content-addressed and self-verifying — so this
+    /// buys management rather than correctness: a module's cache is bounded,
+    /// evicted, published and inspected on its own, and a monorepo where one
+    /// module churns does not push another module's entries out.
+    ///
+    /// The cost is honest and worth stating: each module's first `go list` pays
+    /// for the standard library's metadata again, because Go writes whatever it
+    /// computes into whichever `GOCACHE` it was pointed at. That is once per
+    /// module, not once per target, and it is the price of the isolation.
+    pub module: String,
     /// Pinned Go release, or the host toolchain's version.
     pub go_version: String,
     pub goos: String,
@@ -156,6 +171,11 @@ impl GocacheKey {
             ("goos".to_string(), self.goos.clone()),
             ("goarch".to_string(), self.goarch.clone()),
         ]);
+        // Omitted when empty, so the root module and stdlib share the bare form
+        // rather than carrying a `mod=` that says nothing.
+        if !self.module.is_empty() {
+            args.insert("mod".to_string(), self.module.clone());
+        }
         if !self.build_tags.is_empty() {
             args.insert("tags".to_string(), self.build_tags.join("+"));
         }
@@ -232,6 +252,7 @@ mod tests {
 
     fn key() -> GocacheKey {
         GocacheKey {
+            module: String::new(),
             go_version: "1.27.0".to_string(),
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
@@ -239,6 +260,33 @@ mod tests {
             goexperiment: vec![],
             race: false,
         }
+    }
+
+    /// One cache per module, so two modules in one workspace never share a
+    /// `GOCACHE` — the whole point of keying on it.
+    #[test]
+    fn two_modules_get_two_caches() {
+        let mut a = key();
+        a.module = "svc/api".to_string();
+        let mut b = key();
+        b.module = "tools".to_string();
+        assert_ne!(a.addr(), b.addr());
+        // And the arg is legible rather than hashed, because `heph tool scratch
+        // ls` has to answer "which module is this?".
+        assert!(
+            a.addr().format().contains("mod=svc/api"),
+            "{}",
+            a.addr().format()
+        );
+    }
+
+    /// The root module and stdlib carry no `mod=` at all. A `mod=` that is empty
+    /// would be noise in every addr for the common single-module workspace, and
+    /// it must not read as "a module named empty-string".
+    #[test]
+    fn the_module_less_cache_carries_no_mod_arg() {
+        let formatted = key().addr().format();
+        assert!(!formatted.contains("mod="), "{formatted}");
     }
 
     #[test]
@@ -257,6 +305,9 @@ mod tests {
         let base = key().addr();
         let mut cases: Vec<(&str, GocacheKey)> = Vec::new();
 
+        let mut k = key();
+        k.module = "svc".to_string();
+        cases.push(("module", k));
         let mut k = key();
         k.go_version = "1.26.0".to_string();
         cases.push(("go_version", k));

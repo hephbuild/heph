@@ -173,6 +173,7 @@ pub fn build_lib_spec(
     golist_addr: Option<&Addr>,
     embed_file_addrs: &[String],
     go_version: &str,
+    go_module: &str,
 ) -> TargetSpec {
     let import_path = &pkg.import_path;
     let package_name = pkg.name.as_deref().unwrap_or("");
@@ -197,6 +198,7 @@ pub fn build_lib_spec(
         out_file,
         factors,
         go_version,
+        go_module,
         transitive_libs,
         src_addrs,
         s_files: &pkg.s_files,
@@ -518,6 +520,7 @@ mod tests {
             golist,
             embed_files,
             V,
+            "",
         )
     }
 
@@ -612,6 +615,7 @@ mod tests {
             None,
             &[],
             V,
+            "",
         );
         assert_eq!(cfg_list(&s, "s_files"), vec!["asm_amd64.s".to_string()]);
         assert!(deps_map(&s).contains_key("asm"));
@@ -639,6 +643,7 @@ mod tests {
             None,
             &[],
             V,
+            "",
         );
         let hdr = deps_map(&s).get("hdr").cloned().unwrap_or_default();
         assert!(
