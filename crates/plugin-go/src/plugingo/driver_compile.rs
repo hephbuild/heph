@@ -121,6 +121,11 @@ struct GoCompileSpec {
     /// which module's shared `GOCACHE` the compile runs against. Empty for the
     /// root module and for stdlib.
     go_module: String,
+    /// The variant this compile belongs to, from `Factors::variant_id` — the
+    /// other half of the cache's `(module, variant)` identity. Absent from
+    /// `Hash` for the same reason as `go_module`: it selects a cache, it does
+    /// not change the archive.
+    go_variant: String,
     /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
     goexperiment: Vec<String>,
     /// Extra flags passed verbatim to `go tool compile` (the variant's gcflags).
@@ -167,6 +172,11 @@ struct GoCompileDef {
     /// folding this in would make moving a package between modules rebuild the
     /// world for no change in output.
     go_module: String,
+    /// The variant this compile belongs to, from `Factors::variant_id` — the
+    /// other half of the cache's `(module, variant)` identity. Absent from
+    /// `Hash` for the same reason as `go_module`: it selects a cache, it does
+    /// not change the archive.
+    go_variant: String,
     goexperiment: Vec<String>,
     gcflags: Vec<String>,
     buildmode: BuildMode,
@@ -340,6 +350,7 @@ impl ManagedDriver for GoCompileDriver {
             goarch: spec.goarch,
             go_version: spec.go_version,
             go_module: spec.go_module,
+            go_variant: spec.go_variant,
             goexperiment: spec.goexperiment,
             gcflags: spec.gcflags,
             buildmode,
@@ -386,24 +397,28 @@ impl ManagedDriver for GoCompileDriver {
             format!("{:x}", h.finish()).into_bytes()
         };
 
-        // The shared `GOCACHE`, as a scratch reference — the same slot the golist
-        // targets use when the factors agree (see `plugingo::gocache`). Until
-        // now every compile target created and tore down an *empty* cache inside
-        // its own sandbox: the exact pattern the golist sharing was written to
-        // remove, left in place here because that fix was driver-local.
+        // The shared `GOCACHE`, as a scratch reference — one cache per Go module
+        // per variant, the same slot the golist targets of that module and
+        // variant use (see `plugingo::gocache`). Until recently every compile
+        // target created and tore down an *empty* cache inside its own sandbox:
+        // the exact pattern the golist sharing was written to remove, left in
+        // place here because that fix was driver-local.
         //
-        // Build tags are absent deliberately. They decide which *files* `go list`
-        // selected, and by the time a compile runs that set is already fixed — so
-        // a compile's cache entries do not depend on them, and claiming they did
-        // would split the slot for nothing.
+        // This used to drop `build_tags` from the key, reasoning that a compile's
+        // entries cannot depend on a file set that `go list` already fixed. True
+        // in itself, and still the wrong call: `go_golist` *did* key on them, so
+        // a tagged variant got two caches and neither warmed the other. The
+        // variant now travels whole, from `Factors::variant_id`, so the two
+        // drivers cannot key on different subsets. The cost is a cold start on a
+        // variant that differs only in a factor its entries ignore; the thing it
+        // buys is that "one cache per module per variant" is true rather than
+        // approximately true.
         let gocache_key = crate::plugingo::gocache::GocacheKey {
             module: def.go_module.clone(),
             go_version: def.go_version.clone(),
             goos: def.goos.clone(),
             goarch: def.goarch.clone(),
-            build_tags: vec![],
-            goexperiment: def.goexperiment.clone(),
-            race: def.race,
+            variant: def.go_variant.clone(),
         };
         let gocache_input = Input {
             r#ref: TargetAddr {
@@ -1004,6 +1019,12 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         "go_module".to_string(),
         Value::String(p.go_module.to_string()),
     );
+    // Computed here rather than passed in: `build_compile_spec` already holds the
+    // variant, so there is no call site that could hand it a different one.
+    config.insert(
+        "go_variant".to_string(),
+        Value::String(p.factors.variant_id()),
+    );
     config.insert(
         "goexperiment".to_string(),
         str_list(&p.factors.goexperiment),
@@ -1476,6 +1497,7 @@ mod driver_tests {
             goarch: "amd64".to_string(),
             go_version: crate::plugingo::toolchain::HASH_GOLDEN_GO_VERSION.to_string(),
             go_module: String::new(),
+            go_variant: String::new(),
             goexperiment: vec![],
             gcflags: vec![],
             buildmode: BuildMode::default(),
@@ -1498,6 +1520,7 @@ mod driver_tests {
             goarch: "amd64".to_string(),
             go_version: crate::plugingo::toolchain::HASH_GOLDEN_GO_VERSION.to_string(),
             go_module: String::new(),
+            go_variant: String::new(),
             goexperiment: vec![],
             gcflags: vec![],
             buildmode: BuildMode::default(),

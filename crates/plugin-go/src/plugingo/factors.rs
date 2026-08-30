@@ -122,6 +122,52 @@ pub struct Factors {
     pub race: bool,
 }
 
+impl Factors {
+    /// A legible identifier for everything in this variant *except* `goos` and
+    /// `goarch`, which callers carry as their own addr args.
+    ///
+    /// This is what makes the shared Go caches "one per module per variant"
+    /// (`plugingo::gocache`): every driver that wants the variant's cache passes
+    /// this one string rather than picking its own subset of the factors. That
+    /// subset-picking is exactly what went wrong before — `go_golist` keyed on
+    /// `build_tags` and `go_compile` deliberately did not, so one variant got two
+    /// caches and neither warmed the other.
+    ///
+    /// Legible rather than hashed, for the same reason the rest of the addr is:
+    /// it shows up in `heph tool scratch ls`, and "which cache is this?" is a
+    /// question a hash cannot answer. Empty for a plain variant, so the common
+    /// case carries no arg at all.
+    ///
+    /// Deliberately the *whole* variant, including `gcflags`, `ldflags` and
+    /// `buildmode` — even though `go list` reads none of them and only
+    /// `buildmode` reaches a compile. Splitting a cache by a factor its entries
+    /// do not depend on costs a cold start on a rare variant; letting two drivers
+    /// disagree about which factors count costs a permanently split cache on
+    /// every variant. The predictable rule is worth the rare miss.
+    pub fn variant_id(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.build_tags.is_empty() {
+            parts.push(format!("tags={}", self.build_tags.join("+")));
+        }
+        if !self.goexperiment.is_empty() {
+            parts.push(format!("exp={}", self.goexperiment.join("+")));
+        }
+        if !self.gcflags.is_empty() {
+            parts.push(format!("gc={}", self.gcflags.join("+")));
+        }
+        if !self.ldflags.is_empty() {
+            parts.push(format!("ld={}", self.ldflags.join("+")));
+        }
+        if self.buildmode != BuildMode::default() {
+            parts.push(format!("mode={}", self.buildmode.as_str()));
+        }
+        if self.race {
+            parts.push("race".to_string());
+        }
+        parts.join(",")
+    }
+}
+
 /// Whether a build for `goos` with race mode `race` needs cgo.
 ///
 /// Only race builds ever do, and only off darwin. Go's `runtime/race` — the
@@ -244,6 +290,93 @@ pub fn current_goarch() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The plain variant carries nothing, so the common workspace's cache addr
+    /// stays short and an empty `var=` never appears.
+    #[test]
+    fn a_plain_variant_has_an_empty_id() {
+        assert_eq!(Factors::default().variant_id(), "");
+    }
+
+    /// Every factor must move the id. A factor that does not silently shares one
+    /// cache between two variants — which is what `go_golist` and `go_compile`
+    /// used to do to each other by keying on different subsets.
+    #[test]
+    fn every_factor_moves_the_variant_id() {
+        let base = Factors::default().variant_id();
+        let mut cases: Vec<(&str, Factors)> = Vec::new();
+
+        cases.push((
+            "build_tags",
+            Factors {
+                build_tags: vec!["integration".to_string()],
+                ..Default::default()
+            },
+        ));
+        cases.push((
+            "goexperiment",
+            Factors {
+                goexperiment: vec!["arenas".to_string()],
+                ..Default::default()
+            },
+        ));
+        cases.push((
+            "gcflags",
+            Factors {
+                gcflags: vec!["-N".to_string()],
+                ..Default::default()
+            },
+        ));
+        cases.push((
+            "ldflags",
+            Factors {
+                ldflags: vec!["-s".to_string()],
+                ..Default::default()
+            },
+        ));
+        cases.push((
+            "buildmode",
+            Factors {
+                buildmode: BuildMode::Pie,
+                ..Default::default()
+            },
+        ));
+        cases.push((
+            "race",
+            Factors {
+                race: true,
+                ..Default::default()
+            },
+        ));
+
+        for (what, f) in cases {
+            assert_ne!(f.variant_id(), base, "{what} must move the variant id");
+        }
+    }
+
+    /// `goos`/`goarch` are deliberately absent — callers carry them as their own
+    /// addr args, and duplicating them here would put each in the addr twice.
+    #[test]
+    fn the_variant_id_excludes_goos_and_goarch() {
+        let f = Factors {
+            goos: "darwin".to_string(),
+            goarch: "arm64".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(f.variant_id(), "");
+    }
+
+    /// Two variants that agree land on one id, so the sharing is not a coin flip.
+    #[test]
+    fn equal_variants_share_one_id() {
+        let a = Factors {
+            build_tags: vec!["x".to_string(), "y".to_string()],
+            race: true,
+            ..Default::default()
+        };
+        let b = a.clone();
+        assert_eq!(a.variant_id(), b.variant_id());
+    }
+
     use super::*;
 
     #[test]

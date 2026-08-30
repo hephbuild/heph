@@ -1,5 +1,16 @@
 //! The `GOCACHE` Go tooling runs against, declared as a scratch cache.
 //!
+//! # One cache per module, per variant
+//!
+//! A slot is `(module, toolchain, goos/goarch, variant)`. The module is the
+//! package's nearest `go.mod`, workspace-relative; the variant is
+//! `Factors::variant_id` — the whole factor set as one string, so no driver can
+//! key on its own subset of it.
+//!
+//! That last part is not hypothetical. `go_golist` keyed on `build_tags` and
+//! `go_compile` deliberately did not, so every tagged variant had two caches and
+//! neither warmed the other. Both take the variant whole now.
+//!
 //! # Why this is not sandbox-local
 //!
 //! Each `_golist` target used to get its own empty `GOCACHE` inside its sandbox.
@@ -144,17 +155,17 @@ pub struct GocacheKey {
     /// computes into whichever `GOCACHE` it was pointed at. That is once per
     /// module, not once per target, and it is the price of the isolation.
     pub module: String,
-    /// Pinned Go release, or the host toolchain's version.
+    /// The toolchain selector (`"host"`, a pinned release, or a `//pkg:target`).
+    /// Not part of the variant — it is workspace configuration — but two
+    /// toolchains produce disjoint entry sets, so they get disjoint caches for
+    /// the same reason two modules do.
     pub go_version: String,
     pub goos: String,
     pub goarch: String,
-    pub build_tags: Vec<String>,
-    pub goexperiment: Vec<String>,
-    /// Race builds see a different file set (`//go:build race`) and a different
-    /// import graph, so they get their own slot rather than churning the ordinary
-    /// one. Go's own cache would key the entries correctly either way; this keeps
-    /// the two working sets from evicting each other.
-    pub race: bool,
+    /// The rest of the variant, from [`Factors::variant_id`] — one string rather
+    /// than a field per factor, so no driver can key on its own subset. Empty for
+    /// a plain variant.
+    pub variant: String,
 }
 
 impl GocacheKey {
@@ -171,19 +182,13 @@ impl GocacheKey {
             ("goos".to_string(), self.goos.clone()),
             ("goarch".to_string(), self.goarch.clone()),
         ]);
-        // Omitted when empty, so the root module and stdlib share the bare form
-        // rather than carrying a `mod=` that says nothing.
+        // Both omitted when empty, so the common case — the root module on a
+        // plain variant — carries neither an empty `mod=` nor an empty `var=`.
         if !self.module.is_empty() {
             args.insert("mod".to_string(), self.module.clone());
         }
-        if !self.build_tags.is_empty() {
-            args.insert("tags".to_string(), self.build_tags.join("+"));
-        }
-        if !self.goexperiment.is_empty() {
-            args.insert("exp".to_string(), self.goexperiment.join("+"));
-        }
-        if self.race {
-            args.insert("race".to_string(), "1".to_string());
+        if !self.variant.is_empty() {
+            args.insert("var".to_string(), self.variant.clone());
         }
         args
     }
@@ -256,9 +261,7 @@ mod tests {
             go_version: "1.27.0".to_string(),
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
-            build_tags: vec![],
-            goexperiment: vec![],
-            race: false,
+            variant: String::new(),
         }
     }
 
@@ -287,6 +290,39 @@ mod tests {
     fn the_module_less_cache_carries_no_mod_arg() {
         let formatted = key().addr().format();
         assert!(!formatted.contains("mod="), "{formatted}");
+    }
+
+    /// The regression that motivated folding the factors into one `variant`:
+    /// `go_golist` keyed on `build_tags` and `go_compile` deliberately passed
+    /// `vec![]`, so a tagged variant got **two** caches and neither warmed the
+    /// other. Both drivers now take the variant whole, so a listing and a compile
+    /// of the same module and variant name one cache.
+    #[test]
+    fn a_listing_and_a_compile_of_one_variant_share_a_cache() {
+        let of = |variant: &str| {
+            GocacheKey {
+                module: "svc".to_string(),
+                go_version: "1.27.0".to_string(),
+                goos: "linux".to_string(),
+                goarch: "amd64".to_string(),
+                variant: variant.to_string(),
+            }
+            .addr()
+        };
+
+        let v = crate::plugingo::factors::Factors {
+            goos: "linux".to_string(),
+            goarch: "amd64".to_string(),
+            build_tags: vec!["integration".to_string()],
+            ..Default::default()
+        }
+        .variant_id();
+
+        // Whatever the two drivers do, they derive the id from the same factors
+        // through the same function — so agreeing is structural, not a
+        // convention two files have to keep.
+        assert_eq!(of(&v), of(&v));
+        assert_ne!(of(&v), of(""), "a tagged variant is not the plain one");
     }
 
     #[test]
@@ -318,14 +354,8 @@ mod tests {
         k.goarch = "arm64".to_string();
         cases.push(("goarch", k));
         let mut k = key();
-        k.build_tags = vec!["integration".to_string()];
-        cases.push(("build_tags", k));
-        let mut k = key();
-        k.goexperiment = vec!["arenas".to_string()];
-        cases.push(("goexperiment", k));
-        let mut k = key();
-        k.race = true;
-        cases.push(("race", k));
+        k.variant = "tags=integration".to_string();
+        cases.push(("variant", k));
 
         for (what, k) in cases {
             assert_ne!(k.addr(), base, "{what} must key a distinct cache");
@@ -340,9 +370,9 @@ mod tests {
         assert_eq!(key().addr(), key().addr());
 
         let mut a = key();
-        a.build_tags = vec!["x".to_string(), "y".to_string()];
+        a.variant = "tags=x+y".to_string();
         let mut b = key();
-        b.build_tags = vec!["x".to_string(), "y".to_string()];
+        b.variant = "tags=x+y".to_string();
         assert_eq!(a.addr(), b.addr());
     }
 

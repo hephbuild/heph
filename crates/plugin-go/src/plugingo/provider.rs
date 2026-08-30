@@ -554,6 +554,16 @@ impl ProviderTrait for Provider {
                             ParamType::list(ParamType::String),
                             Value::List(vec![]),
                         ),
+                        Param::optional(
+                            "gcflags",
+                            ParamType::list(ParamType::String),
+                            Value::List(vec![]),
+                        ),
+                        Param::optional(
+                            "ldflags",
+                            ParamType::list(ParamType::String),
+                            Value::List(vec![]),
+                        ),
                         Param::optional("race", ParamType::Bool, Value::Bool(false)),
                     ],
                     variadic: None,
@@ -798,14 +808,24 @@ impl ProviderFn for GocacheAddrFn {
         // The workspace root from the call context, not `self`: a BUILD file is
         // evaluated against the root that loaded it.
         let _ = ctx.root;
+        // Built through `Factors` rather than by hand, so this function and the
+        // drivers cannot disagree about what a variant is.
+        let factors = crate::plugingo::factors::Factors {
+            goos: goos.clone(),
+            goarch: goarch.clone(),
+            build_tags: Self::list_named(&args, "tags")?,
+            goexperiment: Self::list_named(&args, "goexperiment")?,
+            gcflags: Self::list_named(&args, "gcflags")?,
+            ldflags: Self::list_named(&args, "ldflags")?,
+            buildmode: Default::default(),
+            race,
+        };
         let key = crate::plugingo::gocache::GocacheKey {
             module: module_of_pkg(&hmodel::htpkg::PkgBuf::from(ctx.pkg), &self.workspace_root),
             go_version: gotool,
             goos,
             goarch,
-            build_tags: Self::list_named(&args, "tags")?,
-            goexperiment: Self::list_named(&args, "goexperiment")?,
-            race,
+            variant: factors.variant_id(),
         };
         Ok(Value::String(key.addr().format()))
     }

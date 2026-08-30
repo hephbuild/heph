@@ -140,6 +140,13 @@ fn build_spec_inner(
         "go_module".to_string(),
         Value::String(go_module.to_string()),
     );
+    // Computed from the factors this builder already holds, exactly as
+    // `build_compile_spec` does — the two must agree or one variant gets two
+    // caches and neither warms the other.
+    config.insert(
+        "go_variant".to_string(),
+        Value::String(factors.variant_id()),
+    );
     // Whether `go list` gets `-test`. Carried in the config (not inferred in the
     // driver) so it reaches the def hash — flipping it changes the artifact.
     config.insert("with_test".to_string(), Value::Bool(with_test));

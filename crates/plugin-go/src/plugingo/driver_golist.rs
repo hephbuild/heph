@@ -60,6 +60,11 @@ struct GoGolistSpec {
     /// which module's shared `GOCACHE` the listing runs against. Empty for the
     /// root module and for stdlib.
     go_module: String,
+    /// The variant this listing belongs to, from `Factors::variant_id` — the
+    /// other half of the cache's `(module, variant)` identity. Carried whole so
+    /// this driver cannot key on a different subset of the factors than
+    /// `go_compile` does.
+    go_variant: String,
     /// Go build tags.
     build_tags: Vec<String>,
     /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
@@ -345,9 +350,7 @@ impl ManagedDriver for GoGolistDriver {
             go_version: spec.go_version.clone(),
             goos: spec.goos.clone(),
             goarch: spec.goarch.clone(),
-            build_tags: spec.build_tags.clone(),
-            goexperiment: spec.goexperiment.clone(),
-            race: spec.race,
+            variant: spec.go_variant.clone(),
         };
         let gocache_input = Input {
             r#ref: TargetAddr {
