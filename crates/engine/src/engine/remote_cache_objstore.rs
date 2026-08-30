@@ -6,7 +6,10 @@
 //! `object_store::parse_url_opts`, which dispatches on the scheme and returns
 //! the right store. Credentials are read from the process environment (e.g.
 //! `AWS_ACCESS_KEY_ID`, `GOOGLE_SERVICE_ACCOUNT`) by feeding `std::env::vars()`
-//! to the builder, mirroring each builder's `from_env`. An `s3://` cache can
+//! to the builder, mirroring each builder's `from_env` — or, when the ambient
+//! cloud environment belongs to something other than the cache, from heph's own
+//! `HEPH_CACHE_<NAME>_*` / `HEPH_S3_*` / `HEPH_GCS_*` / `HEPH_AZURE_*` /
+//! `HEPH_HTTP_*` namespaces; see [`SchemeEnv`]. An `s3://` cache can
 //! additionally be pointed at a non-AWS S3-compatible service from the config
 //! file — see [`StoreOptions`].
 //!
@@ -30,17 +33,20 @@ use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
 use futures::TryStreamExt;
+use google_cloud_auth::credentials::external_account::Builder as ExternalAccountBuilder;
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as AdcBuilder};
-use object_store::aws::AmazonS3Builder;
-use object_store::azure::MicrosoftAzureBuilder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::buffered::BufWriter;
 use object_store::client::{HttpClient, HttpConnector};
-use object_store::gcp::{GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder};
+use object_store::gcp::{
+    GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder, GoogleConfigKey,
+};
 use object_store::http::HttpBuilder;
 use object_store::limit::LimitStore;
 use object_store::{
-    ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt, ObjectStoreScheme, RetryConfig,
-    parse_url_opts, path::Path as ObjPath,
+    ClientConfigKey, ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt,
+    ObjectStoreScheme, RetryConfig, parse_url_opts, path::Path as ObjPath,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -178,6 +184,172 @@ fn transfer_opts(scheme: &str) -> Vec<(String, String)> {
     }
 }
 
+/// Env-var prefix that scopes a remote-cache setting to heph, one per store kind.
+///
+/// The ambient cloud environment is not heph's to claim: it is shared with every
+/// other tool on the machine *and* with the targets heph builds. A repo whose
+/// cache lives in Cloudflare R2 needs `AWS_ACCESS_KEY_ID` to hold an R2 key —
+/// which is then the wrong key for every rule that talks to real AWS, and there
+/// is only one of that name. These prefixes give the cache credentials of its
+/// own instead of fighting over the shared names. The suffix is the store's own
+/// setting name, so the translation is mechanical: `HEPH_S3_ACCESS_KEY_ID` for
+/// `AWS_ACCESS_KEY_ID`, `HEPH_S3_ENDPOINT_URL` for `AWS_ENDPOINT_URL`,
+/// `HEPH_GCS_SERVICE_ACCOUNT` for `GOOGLE_SERVICE_ACCOUNT`,
+/// `HEPH_AZURE_ACCOUNT_NAME` for `AZURE_STORAGE_ACCOUNT_NAME`. The vendor half
+/// of the name is optional and equivalent (`HEPH_S3_AWS_ACCESS_KEY_ID` names the
+/// same setting), because the builders accept both spellings themselves.
+///
+/// A store kind is not always specific enough — two `s3://` caches can live in
+/// two different accounts — so each cache also has a namespace of its own,
+/// [`cache_env_prefix`], which outranks this one.
+const S3_ENV_PREFIX: &str = "HEPH_S3_";
+/// `gs://` counterpart of [`S3_ENV_PREFIX`].
+const GCS_ENV_PREFIX: &str = "HEPH_GCS_";
+/// `az://`/`abfss://` counterpart of [`S3_ENV_PREFIX`].
+const AZURE_ENV_PREFIX: &str = "HEPH_AZURE_";
+/// `http(s)://` counterpart of [`S3_ENV_PREFIX`].
+const HTTP_ENV_PREFIX: &str = "HEPH_HTTP_";
+/// Namespace under which each individual cache gets its own prefix.
+const CACHE_ENV_PREFIX: &str = "HEPH_CACHE_";
+
+/// The env-var prefix carrying one named cache's settings:
+/// `HEPH_CACHE_<NAME>_`, the cache's own name from `caches:` uppercased with
+/// every character outside `[A-Za-z0-9]` replaced by `_` — a shell variable
+/// cannot spell the rest, and a cache named `build-cache` should not be
+/// unreachable for it.
+///
+/// This is what lets two caches of the same kind hold different credentials:
+/// `caches: { r2: …, corp: … }` reads `HEPH_CACHE_R2_ACCESS_KEY_ID` and
+/// `HEPH_CACHE_CORP_ACCESS_KEY_ID`. No config field selects it — the name in
+/// `caches:` already identifies the cache, and a second place to write it down
+/// is a second place for it to be wrong.
+///
+/// Because the mapping is not injective (`a-b` and `a_b` collide),
+/// [`RemoteCacheSet::new`](crate::engine::RemoteCacheSet::new) rejects a config
+/// whose caches share a prefix rather than letting one silently answer for the
+/// other.
+pub fn cache_env_prefix(name: &str) -> String {
+    let mut prefix = String::with_capacity(CACHE_ENV_PREFIX.len() + name.len() + 1);
+    prefix.push_str(CACHE_ENV_PREFIX);
+    prefix.extend(name.chars().map(|c| {
+        if c.is_ascii_alphanumeric() {
+            c.to_ascii_uppercase()
+        } else {
+            '_'
+        }
+    }));
+    prefix.push('_');
+    prefix
+}
+
+/// The environment one store builder should see, split by whether it was aimed
+/// at heph.
+///
+/// Three sources can describe a store, in order of how specifically they name
+/// it: this one cache (`HEPH_CACHE_<NAME>_*`), any cache of this kind
+/// (`HEPH_S3_*` and friends), and the ambient cloud environment. **The most
+/// specific source that says anything configures the store, alone** — the
+/// sources never merge, not even with each other.
+///
+/// That is deliberate, because a credential set is atomic. Merging per key
+/// would let an `AWS_SESSION_TOKEN` left over from an SSO login ride along with
+/// a `HEPH_S3_ACCESS_KEY_ID` / `HEPH_S3_SECRET_ACCESS_KEY` pair meant for R2,
+/// signing every request with a token that key never issued — a 403 with no
+/// trace of its cause in either the config or the variables the user set. So
+/// naming one setting in a namespace means naming all of them there, which is
+/// the point: the cache's credentials stop being a function of whatever else
+/// the shell happens to carry.
+///
+/// The config file's `endpoint`/`region` (see [`StoreOptions`]) still win over
+/// all three — they are the repo's own statement of where its cache lives.
+#[derive(Debug, Default)]
+struct SchemeEnv {
+    /// `HEPH_<KIND>_*` entries: prefix stripped, name lowercased, each already
+    /// validated against the builder's own `ConfigKey`.
+    scoped: Vec<(String, String)>,
+    /// Everything else, verbatim — the ambient environment the builder's own
+    /// `from_env` would read. Empty whenever `scoped` is not.
+    ambient: Vec<(String, String)>,
+}
+
+impl SchemeEnv {
+    /// Split `env` around `prefixes` — most specific first — rejecting a scoped
+    /// name the builder does not know.
+    ///
+    /// `K` is the builder's own config-key type, whose `FromStr` decides what is
+    /// a real setting. Unlike the ambient environment — where most variables
+    /// have nothing to do with object storage and silently skipping them is the
+    /// only option — every `prefixes` entry is heph's namespace, so a name that
+    /// does not parse is a typo. Failing here names it at engine startup instead
+    /// of surfacing later as an unexplained missing credential. A typo is
+    /// rejected even in a namespace this store ends up not using: it is still a
+    /// mistake, and reporting it only once a *different* variable is unset would
+    /// be the worst of both.
+    fn split<K: std::str::FromStr>(
+        prefixes: &[&str],
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> anyhow::Result<Self> {
+        // One bucket per namespace, in the order given — most specific first.
+        let mut buckets: Vec<(&str, Vec<(String, String)>)> = prefixes
+            .iter()
+            .map(|prefix| (*prefix, Vec::new()))
+            .collect();
+        let mut ambient = Vec::new();
+        for (name, value) in env {
+            let matched = buckets.iter_mut().find_map(|(prefix, bucket)| {
+                let rest = strip_prefix_ascii_case(&name, prefix)?;
+                Some((*prefix, rest.to_ascii_lowercase(), bucket))
+            });
+            let Some((prefix, key, bucket)) = matched else {
+                ambient.push((name, value));
+                continue;
+            };
+            if key.parse::<K>().is_err() {
+                anyhow::bail!(
+                    "unknown remote cache setting `{name}`: `{prefix}` is heph's own \
+                     namespace, and `{key}` is not a setting this store understands"
+                );
+            }
+            bucket.push((key, value));
+        }
+        // The most specific namespace that says anything takes the store; the
+        // ambient environment only survives if none of them did.
+        let scoped = buckets
+            .into_iter()
+            .map(|(_, bucket)| bucket)
+            .find(|bucket| !bucket.is_empty())
+            .unwrap_or_default();
+        if !scoped.is_empty() {
+            ambient.clear();
+        }
+        Ok(Self { scoped, ambient })
+    }
+
+    /// The `(key, value)` list to fold onto a builder. Order *is* precedence,
+    /// since `with_config` overwrites: the ambient environment first, then
+    /// heph's fixed transfer settings — so a stray `TIMEOUT` in the environment,
+    /// aimed at nothing in particular, cannot chop a multi-GiB transfer — then
+    /// the scoped namespace last, because `HEPH_<KIND>_TIMEOUT` *is* aimed at
+    /// this cache and gets the last word.
+    fn opts(self, scheme: &str) -> Vec<(String, String)> {
+        self.ambient
+            .into_iter()
+            .chain(transfer_opts(scheme))
+            .chain(self.scoped)
+            .collect()
+    }
+}
+
+/// `str::strip_prefix`, case-insensitive over ASCII. Environment variable names
+/// are conventionally uppercase, but nothing enforces it and a lowercase
+/// `heph_s3_access_key_id` should not silently become an ambient variable.
+fn strip_prefix_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    // `split_at_checked` rather than indexing: a name shorter than the prefix,
+    // or one whose first character is multi-byte, has no boundary there.
+    let (head, rest) = s.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
+}
+
 /// Per-cache connection settings that have no place in the cache URI, from
 /// `caches: { <name>: { endpoint, region } }`.
 ///
@@ -200,6 +372,12 @@ pub struct StoreOptions<'a> {
     /// Region to sign requests for. Unset leaves object_store's own resolution
     /// (`AWS_REGION`, else `us-east-1`) in place.
     pub region: Option<&'a str>,
+    /// This cache's own env-var namespace, `HEPH_CACHE_<NAME>_` — see
+    /// [`cache_env_prefix`], which builds it, and [`SchemeEnv`], which ranks it
+    /// above the per-kind namespace and the ambient environment. Unlike
+    /// `endpoint`/`region` this applies to every scheme, so it is not part of
+    /// [`StoreOptions::reject_non_s3`].
+    pub cache_env_prefix: Option<&'a str>,
 }
 
 impl StoreOptions<'_> {
@@ -213,6 +391,16 @@ impl StoreOptions<'_> {
             _ => return Ok(()),
         };
         anyhow::bail!("`{field}` is only supported for s3:// remote caches, not {uri}")
+    }
+
+    /// The namespaces this store reads, most specific first: this one cache,
+    /// then every cache of this kind. See [`SchemeEnv`] for what "most specific
+    /// first" buys.
+    fn prefixes<'p>(&'p self, scheme_prefix: &'p str) -> Vec<&'p str> {
+        self.cache_env_prefix
+            .into_iter()
+            .chain(std::iter::once(scheme_prefix))
+            .collect()
     }
 }
 
@@ -239,23 +427,62 @@ impl ObjStoreBackend {
         max_concurrency: usize,
         opts_override: &StoreOptions<'_>,
     ) -> anyhow::Result<Self> {
+        Self::from_uri_with_env(uri, max_concurrency, opts_override, std::env::vars())
+    }
+
+    /// [`from_uri`](Self::from_uri) with the environment passed in, so the
+    /// credential-namespace rules of [`SchemeEnv`] are testable without mutating
+    /// — and racing on — the process environment.
+    ///
+    /// One seam is not covered by `env`: the `gs://` *ambient* path delegates to
+    /// object_store's own `from_env`, which reads the process environment
+    /// directly (and reads it more narrowly than folding everything would — see
+    /// there). `env` still decides whether that path is taken at all.
+    fn from_uri_with_env(
+        uri: &str,
+        max_concurrency: usize,
+        opts_override: &StoreOptions<'_>,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> anyhow::Result<Self> {
         let url = Url::parse(uri).with_context(|| format!("parse remote cache uri {uri}"))?;
         let (store, prefix): (Box<dyn ObjectStore>, ObjPath) = if url.scheme() == "gs" {
             opts_override.reject_non_s3(uri)?;
+            let genv =
+                SchemeEnv::split::<GoogleConfigKey>(&opts_override.prefixes(GCS_ENV_PREFIX), env)?;
+            let external = external_account_source(&genv);
+            // Ambient: object_store's own `from_env`, which also honors the bare
+            // `SERVICE_ACCOUNT` variable and restricts itself to `GOOGLE_*` —
+            // folding the whole environment here instead would let a bare
+            // `BUCKET` or `BASE_URL` redirect the cache. Scoped: only what the
+            // `HEPH_GCS_*` namespace says, nothing ambient.
+            let mut builder = if genv.scoped.is_empty() {
+                GoogleCloudStorageBuilder::from_env()
+            } else {
+                genv.scoped.iter().fold(
+                    GoogleCloudStorageBuilder::new(),
+                    |builder, (key, value)| {
+                        match key.parse() {
+                            Ok(k) => builder.with_config(k, value),
+                            // Unreachable: `split` already parsed every key.
+                            Err(_) => builder,
+                        }
+                    },
+                )
+            };
             // Always drive GCS through the NegotiatingConnector so transfers use
             // HTTP/2 (falling back to HTTP/1.1) instead of object_store's
             // connection-storming HTTP/1.1-only default.
-            let mut builder = GoogleCloudStorageBuilder::from_env()
+            builder = builder
                 .with_url(uri)
                 .with_retry(retry_config())
                 .with_http_connector(NegotiatingConnector);
-            if adc_is_external_account() {
-                // object_store can't decode an external_account ADC. Inject a
-                // `google-cloud-auth`-backed bearer provider so the builder skips
-                // ADC parsing; the federation handshake happens lazily on the
-                // first request inside the provider.
+            if let Some(source) = external {
+                // object_store can't decode an external_account credential.
+                // Inject a `google-cloud-auth`-backed bearer provider so the
+                // builder skips ADC parsing; the federation handshake happens
+                // lazily on the first request inside the provider.
                 let provider: GcpCredentialProvider =
-                    Arc::new(ExternalAccountCredentialProvider::new());
+                    Arc::new(ExternalAccountCredentialProvider::new(source));
                 builder = builder.with_credentials(provider);
             }
             let store = builder
@@ -284,18 +511,20 @@ impl ObjStoreBackend {
             // builder, not a change to which store a URI resolves to.
             let (scheme, path) = ObjectStoreScheme::parse(&url)
                 .with_context(|| format!("recognize remote cache uri scheme {uri}"))?;
-            // Environment pass-through, same as the GCS `from_env()` builder
-            // above: each builder's `ConfigKey::from_str` accepts only its
-            // own known aliases, so unrelated vars are silently skipped.
-            // Also carries a lifted-but-finite request timeout — chained
-            // after the env vars, so `transfer_opts`'s fixed value always
-            // wins over an env-supplied `timeout` (`fold` applies entries in
-            // order and `with_config` overwrites), not the other way round.
-            let opts: Vec<(String, String)> = std::env::vars()
-                .chain(transfer_opts(url.scheme()))
-                .collect();
+            // Environment pass-through, same as the GCS builder above: each
+            // builder's `ConfigKey::from_str` accepts only its own known
+            // aliases, so unrelated vars are silently skipped — unless they
+            // carry the builder's `HEPH_<KIND>_*` prefix, which replaces the
+            // ambient environment outright ([`SchemeEnv`]). The list also
+            // carries a lifted-but-finite request timeout; see
+            // [`SchemeEnv::opts`] for why it sits where it does.
             let store: Box<dyn ObjectStore> = match scheme {
                 ObjectStoreScheme::AmazonS3 => {
+                    let opts = SchemeEnv::split::<AmazonS3ConfigKey>(
+                        &opts_override.prefixes(S3_ENV_PREFIX),
+                        env,
+                    )?
+                    .opts(url.scheme());
                     let mut builder =
                         build_with_opts!(AmazonS3Builder, uri, opts).with_retry(retry_config());
                     // Applied *after* the env fold so an endpoint/region written
@@ -321,6 +550,11 @@ impl ObjStoreBackend {
                 }
                 ObjectStoreScheme::MicrosoftAzure => {
                     opts_override.reject_non_s3(uri)?;
+                    let opts = SchemeEnv::split::<AzureConfigKey>(
+                        &opts_override.prefixes(AZURE_ENV_PREFIX),
+                        env,
+                    )?
+                    .opts(url.scheme());
                     Box::new(
                         build_with_opts!(MicrosoftAzureBuilder, uri, opts)
                             .with_retry(retry_config())
@@ -330,6 +564,11 @@ impl ObjStoreBackend {
                 }
                 ObjectStoreScheme::Http => {
                     opts_override.reject_non_s3(uri)?;
+                    let opts = SchemeEnv::split::<ClientConfigKey>(
+                        &opts_override.prefixes(HTTP_ENV_PREFIX),
+                        env,
+                    )?
+                    .opts(url.scheme());
                     let base = &url[..url::Position::BeforePath];
                     Box::new(
                         build_with_opts!(HttpBuilder, base, opts)
@@ -338,10 +577,11 @@ impl ObjStoreBackend {
                             .with_context(|| format!("build HTTP store for {uri}"))?,
                     )
                 }
-                // `file`/`memory`: no network client, no retry semantics.
+                // `file`/`memory`: no network client, no retry semantics — and
+                // no credentials, so no `HEPH_*` namespace to carve out either.
                 _ => {
                     opts_override.reject_non_s3(uri)?;
-                    parse_url_opts(&url, opts)
+                    parse_url_opts(&url, env)
                         .with_context(|| format!("open remote cache store for {uri}"))?
                         .0
                 }
@@ -523,7 +763,22 @@ impl RemoteCacheBackend for ObjStoreBackend {
     }
 }
 
-/// Mints GCS bearer tokens from an `external_account` ADC via `google-cloud-auth`.
+/// Where an `external_account` credential is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExternalAccountSource {
+    /// The ambient Application Default Credentials, resolved by
+    /// `google-cloud-auth`'s own environment lookup — the same file
+    /// object_store would have loaded.
+    Adc,
+    /// The file named by `HEPH_GCS_APPLICATION_CREDENTIALS`. In scoped mode the
+    /// ambient ADC is deliberately not consulted, so the file is read here and
+    /// handed to `google-cloud-auth` directly rather than through its env
+    /// resolution, which would find the ambient one instead.
+    File(PathBuf),
+}
+
+/// Mints GCS bearer tokens from an `external_account` credential via
+/// `google-cloud-auth`.
 ///
 /// object_store calls [`get_credential`](CredentialProvider::get_credential) on
 /// every request; the underlying [`AccessTokenCredentials`] caches the token and
@@ -532,12 +787,14 @@ impl RemoteCacheBackend for ObjStoreBackend {
 /// (and memoized via [`OnceCell`]) so `from_uri` stays synchronous and a
 /// misconfigured cache never blocks engine startup on a network handshake.
 struct ExternalAccountCredentialProvider {
+    source: ExternalAccountSource,
     creds: OnceCell<AccessTokenCredentials>,
 }
 
 impl ExternalAccountCredentialProvider {
-    fn new() -> Self {
+    fn new(source: ExternalAccountSource) -> Self {
         Self {
+            source,
             creds: OnceCell::new(),
         }
     }
@@ -546,6 +803,7 @@ impl ExternalAccountCredentialProvider {
 impl std::fmt::Debug for ExternalAccountCredentialProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExternalAccountCredentialProvider")
+            .field("source", &self.source)
             .field("initialized", &self.creds.initialized())
             .finish()
     }
@@ -560,37 +818,75 @@ impl CredentialProvider for ExternalAccountCredentialProvider {
             .creds
             .get_or_try_init(|| async {
                 ensure_rustls_provider_installed();
-                AdcBuilder::default()
-                    .with_scopes([GCS_SCOPE])
-                    .build_access_token_credentials()
+                match &self.source {
+                    ExternalAccountSource::Adc => AdcBuilder::default()
+                        .with_scopes([GCS_SCOPE])
+                        .build_access_token_credentials()
+                        .map_err(gcs_error),
+                    ExternalAccountSource::File(path) => {
+                        let bytes = std::fs::read(path).map_err(|e| {
+                            gcs_error(anyhow::anyhow!(
+                                "read {GCS_ENV_PREFIX}APPLICATION_CREDENTIALS ({}): {e}",
+                                path.display()
+                            ))
+                        })?;
+                        let json = serde_json::from_slice(&bytes).map_err(|e| {
+                            gcs_error(anyhow::anyhow!("parse {}: {e}", path.display()))
+                        })?;
+                        ExternalAccountBuilder::new(json)
+                            .with_scopes([GCS_SCOPE])
+                            .build_access_token_credentials()
+                            .map_err(gcs_error)
+                    }
+                }
             })
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "GCS",
-                source: Box::new(e),
-            })?;
-        let token = creds
-            .access_token()
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "GCS",
-                source: Box::new(e),
-            })?;
+            .await?;
+        let token = creds.access_token().await.map_err(gcs_error)?;
         Ok(Arc::new(GcpCredential {
             bearer: token.token,
         }))
     }
 }
 
-/// True when the active GCP Application Default Credentials are an
-/// `external_account` file (workload identity federation) — the one ADC shape
-/// object_store's GCS builder refuses to decode.
-fn adc_is_external_account() -> bool {
-    adc_credential_path()
-        .as_deref()
-        .and_then(read_adc_type)
-        .as_deref()
-        == Some("external_account")
+/// Wrap any error as an object_store GCS error.
+fn gcs_error(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "GCS",
+        source: source.into(),
+    }
+}
+
+/// Which `external_account` credential — if any — object_store's GCS builder
+/// would choke on, and where to read it from.
+///
+/// `external_account` (workload identity federation, e.g. what
+/// `google-github-actions/auth` writes in CI) is the one credential shape
+/// object_store refuses to decode, so it has to be minted out-of-band. Which
+/// file that is follows the same rule as every other setting: ambient mode looks
+/// at the ADC object_store itself would load, scoped mode looks only at
+/// `HEPH_GCS_APPLICATION_CREDENTIALS`. Without the second half, a scoped cache
+/// pointed at a federated identity would fail inside object_store's parser with
+/// no mention of the variable that selected the file.
+fn external_account_source(env: &SchemeEnv) -> Option<ExternalAccountSource> {
+    if env.scoped.is_empty() {
+        let path = adc_credential_path()?;
+        return is_external_account(&path).then_some(ExternalAccountSource::Adc);
+    }
+    let path = env.scoped.iter().find_map(|(key, value)| {
+        // `split` lowercases and strips the prefix; object_store accepts the
+        // name with or without its `google_` half, so both spellings arrive.
+        matches!(
+            key.as_str(),
+            "application_credentials" | "google_application_credentials"
+        )
+        .then(|| PathBuf::from(value))
+    })?;
+    is_external_account(&path).then_some(ExternalAccountSource::File(path))
+}
+
+/// True when `path` holds an `external_account` credential file.
+fn is_external_account(path: &Path) -> bool {
+    read_adc_type(path).as_deref() == Some("external_account")
 }
 
 /// Resolve the ADC file the GCS builder would read: `GOOGLE_APPLICATION_CREDENTIALS`
@@ -1019,6 +1315,7 @@ mod tests {
             &StoreOptions {
                 endpoint: Some("https://accountid.r2.cloudflarestorage.com"),
                 region: Some("auto"),
+                cache_env_prefix: None,
             },
         )
         .expect("backend");
@@ -1048,6 +1345,7 @@ mod tests {
             &StoreOptions {
                 endpoint: Some("http://localhost:9000"),
                 region: None,
+                cache_env_prefix: None,
             },
         )
         .expect("backend");
@@ -1073,6 +1371,7 @@ mod tests {
             &StoreOptions {
                 endpoint: Some("https://accountid.r2.cloudflarestorage.com"),
                 region: None,
+                cache_env_prefix: None,
             },
         )
         .expect("backend");
@@ -1099,6 +1398,7 @@ mod tests {
                 &StoreOptions {
                     endpoint: Some("https://example.invalid"),
                     region: None,
+                    cache_env_prefix: None,
                 },
             )
             .err()
@@ -1112,6 +1412,7 @@ mod tests {
                 &StoreOptions {
                     endpoint: None,
                     region: Some("auto"),
+                    cache_env_prefix: None,
                 },
             )
             .err()
@@ -1136,5 +1437,511 @@ mod tests {
         assert_eq!(read_adc_type(&garbage), None);
         let no_type = write_adc(dir.path(), r#"{"audience": "x"}"#);
         assert_eq!(read_adc_type(&no_type), None);
+    }
+
+    /// Env pairs, spelled the way a shell would.
+    fn env(vars: &[(&str, &str)]) -> Vec<(String, String)> {
+        vars.iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// The whole point of the namespace: one `HEPH_S3_*` variable takes the
+    /// environment, it does not merge into it. Merging per-key is what leaks a
+    /// stale `AWS_SESSION_TOKEN` into a static R2 key pair.
+    #[test]
+    fn one_scoped_var_replaces_the_whole_ambient_environment() {
+        let split = SchemeEnv::split::<AmazonS3ConfigKey>(
+            &[S3_ENV_PREFIX],
+            env(&[
+                ("AWS_ACCESS_KEY_ID", "ambient"),
+                ("AWS_SECRET_ACCESS_KEY", "ambient-secret"),
+                ("AWS_SESSION_TOKEN", "ambient-token"),
+                ("PATH", "/usr/bin"),
+                ("HEPH_S3_ACCESS_KEY_ID", "scoped"),
+            ]),
+        )
+        .expect("split");
+        assert_eq!(
+            split.scoped,
+            env(&[("access_key_id", "scoped")]),
+            "prefix must be stripped and the name lowercased"
+        );
+        assert!(
+            split.ambient.is_empty(),
+            "a scoped variable must drop the ambient environment, not merge with it"
+        );
+    }
+
+    /// With nothing scoped, the ambient environment passes through untouched —
+    /// the behaviour every existing cache relies on.
+    #[test]
+    fn without_a_scoped_var_the_ambient_environment_passes_through() {
+        let split = SchemeEnv::split::<AmazonS3ConfigKey>(
+            &[S3_ENV_PREFIX],
+            env(&[("AWS_ACCESS_KEY_ID", "ambient"), ("PATH", "/usr/bin")]),
+        )
+        .expect("split");
+        assert!(split.scoped.is_empty());
+        assert_eq!(
+            split.ambient,
+            env(&[("AWS_ACCESS_KEY_ID", "ambient"), ("PATH", "/usr/bin")])
+        );
+    }
+
+    /// `HEPH_S3_` is heph's own namespace, so a name the store does not know is
+    /// a typo, not an unrelated variable. Silently skipping it — the only
+    /// option for the ambient environment — would surface much later as a
+    /// missing credential with nothing pointing at the misspelling.
+    #[test]
+    fn an_unknown_scoped_setting_is_rejected_by_name() {
+        let err = SchemeEnv::split::<AmazonS3ConfigKey>(
+            &[S3_ENV_PREFIX],
+            env(&[("HEPH_S3_ACCES_KEY_ID", "typo")]),
+        )
+        .expect_err("an unknown scoped setting must not be ignored");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HEPH_S3_ACCES_KEY_ID") && msg.contains("acces_key_id"),
+            "{msg}"
+        );
+
+        // Every scheme's namespace validates against its own store's keys: an
+        // Azure setting is not an S3 setting.
+        assert!(
+            SchemeEnv::split::<AmazonS3ConfigKey>(
+                &[S3_ENV_PREFIX],
+                env(&[("HEPH_S3_ACCOUNT_NAME", "not-an-s3-setting")])
+            )
+            .is_err()
+        );
+        for (prefix, name) in [
+            (GCS_ENV_PREFIX, "HEPH_GCS_NOPE"),
+            (AZURE_ENV_PREFIX, "HEPH_AZURE_NOPE"),
+            (HTTP_ENV_PREFIX, "HEPH_HTTP_NOPE"),
+        ] {
+            let one = env(&[(name, "x")]);
+            let rejected = match prefix {
+                GCS_ENV_PREFIX => SchemeEnv::split::<GoogleConfigKey>(&[prefix], one).is_err(),
+                AZURE_ENV_PREFIX => SchemeEnv::split::<AzureConfigKey>(&[prefix], one).is_err(),
+                _ => SchemeEnv::split::<ClientConfigKey>(&[prefix], one).is_err(),
+            };
+            assert!(rejected, "{name} must be rejected");
+        }
+    }
+
+    /// A bare `HEPH_S3_` with nothing after it names no setting at all.
+    #[test]
+    fn a_bare_prefix_is_rejected() {
+        assert!(
+            SchemeEnv::split::<AmazonS3ConfigKey>(&[S3_ENV_PREFIX], env(&[("HEPH_S3_", "x")]))
+                .is_err()
+        );
+    }
+
+    /// Environment variable names are conventionally uppercase but nothing
+    /// enforces it; a lowercase spelling must not fall through to the ambient
+    /// side, where it would be silently ignored *and* leave the real
+    /// credentials in play.
+    #[test]
+    fn the_prefix_matches_case_insensitively() {
+        let split = SchemeEnv::split::<AmazonS3ConfigKey>(
+            &[S3_ENV_PREFIX],
+            env(&[("heph_s3_access_key_id", "scoped")]),
+        )
+        .expect("split");
+        assert_eq!(split.scoped, env(&[("access_key_id", "scoped")]));
+    }
+
+    /// A short name cannot be indexed at the prefix length, and a multi-byte
+    /// first character cannot be sliced there at all.
+    #[test]
+    fn prefix_matching_survives_short_and_non_ascii_names() {
+        let split = SchemeEnv::split::<AmazonS3ConfigKey>(
+            &[S3_ENV_PREFIX],
+            env(&[("H", "short"), ("ÉCOLE", "non-ascii")]),
+        )
+        .expect("split");
+        assert!(split.scoped.is_empty());
+        assert_eq!(split.ambient.len(), 2);
+    }
+
+    /// Order is precedence. heph's fixed transfer settings outrank the ambient
+    /// environment (an untargeted `TIMEOUT` must not chop a multi-GiB
+    /// transfer), and the scoped namespace outranks both — it is an explicit
+    /// statement about this cache.
+    #[test]
+    fn opts_rank_scoped_over_transfer_defaults_over_ambient() {
+        let opts = SchemeEnv {
+            ambient: Vec::new(),
+            scoped: env(&[("timeout", "42s")]),
+        }
+        .opts("s3");
+        let last = opts
+            .iter()
+            .rposition(|(k, _)| k == "timeout")
+            .expect("timeout present");
+        assert_eq!(
+            opts[last].1, "42s",
+            "a scoped setting must have the last word"
+        );
+
+        let opts = SchemeEnv {
+            ambient: env(&[("TIMEOUT", "1s")]),
+            scoped: Vec::new(),
+        }
+        .opts("s3");
+        assert_eq!(
+            opts.last().map(|(_, v)| v.as_str()),
+            Some(format!("{}s", REQUEST_TIMEOUT.as_secs()).as_str()),
+            "heph's transfer timeout must outrank an ambient one"
+        );
+    }
+
+    /// The reported bug, end to end: the shell holds real AWS credentials for
+    /// the rules being built, and the cache lives in R2. The store must sign
+    /// with the heph key — and must *not* carry the ambient session token,
+    /// which would make every request fail a signature it never issued.
+    #[test]
+    fn s3_scoped_env_replaces_ambient_aws_credentials() {
+        let backend = ObjStoreBackend::from_uri_with_env(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions::default(),
+            env(&[
+                ("AWS_ACCESS_KEY_ID", "AMBIENTKEYID"),
+                ("AWS_SECRET_ACCESS_KEY", "ambient-secret"),
+                ("AWS_SESSION_TOKEN", "ambient-session-token"),
+                ("HEPH_S3_ACCESS_KEY_ID", "SCOPEDKEYID"),
+                ("HEPH_S3_SECRET_ACCESS_KEY", "scoped-secret"),
+            ]),
+        )
+        .expect("backend");
+        // Same never-print-the-Debug-string rule as `assert_wires_retry_config`:
+        // `AwsCredential`'s Debug redacts the secret but not the key id.
+        let debug = format!("{:?}", backend.store);
+        assert!(
+            debug.contains("SCOPEDKEYID"),
+            "the HEPH_S3_ key id never reached the S3 client"
+        );
+        assert!(
+            !debug.contains("AMBIENTKEYID"),
+            "the ambient AWS key id must not survive a HEPH_S3_ override"
+        );
+        assert!(
+            debug.contains("token: None"),
+            "an ambient session token must not ride along with scoped static keys"
+        );
+    }
+
+    /// Control for the above: with no `HEPH_S3_*` set, the ambient AWS
+    /// environment is still exactly what configures the store.
+    #[test]
+    fn s3_ambient_aws_credentials_still_configure_the_store() {
+        let backend = ObjStoreBackend::from_uri_with_env(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions::default(),
+            env(&[
+                ("AWS_ACCESS_KEY_ID", "AMBIENTKEYID"),
+                ("AWS_SECRET_ACCESS_KEY", "ambient-secret"),
+                ("AWS_SESSION_TOKEN", "ambient-session-token"),
+            ]),
+        )
+        .expect("backend");
+        let debug = format!("{:?}", backend.store);
+        assert!(debug.contains("AMBIENTKEYID"));
+        assert!(
+            debug.contains("token: Some"),
+            "an ambient session token belongs to the ambient credential set"
+        );
+    }
+
+    /// The endpoint is how an `s3://` URI reaches a non-AWS service, so it has
+    /// to be settable from the namespace too — a machine whose cache endpoint
+    /// is not the repo's business.
+    #[test]
+    fn s3_scoped_env_can_redirect_the_endpoint() {
+        let backend = ObjStoreBackend::from_uri_with_env(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions::default(),
+            env(&[
+                ("AWS_ENDPOINT_URL", "https://ambient.invalid"),
+                ("HEPH_S3_ENDPOINT_URL", "https://scoped.invalid"),
+                ("HEPH_S3_REGION", "auto"),
+            ]),
+        )
+        .expect("backend");
+        let debug = format!("{:?}", backend.store);
+        assert!(
+            debug.contains("https://scoped.invalid/some-bucket"),
+            "the scoped endpoint never reached the S3 client's request URL"
+        );
+        assert!(!debug.contains("ambient.invalid"));
+        assert!(debug.contains("auto"));
+    }
+
+    /// The config file is the repo's own statement of where its cache lives, so
+    /// it outranks the environment — the scoped namespace included.
+    #[test]
+    fn config_endpoint_outranks_the_scoped_env() {
+        let backend = ObjStoreBackend::from_uri_with_env(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions {
+                endpoint: Some("https://from-config.invalid"),
+                region: None,
+                cache_env_prefix: None,
+            },
+            env(&[("HEPH_S3_ENDPOINT_URL", "https://scoped.invalid")]),
+        )
+        .expect("backend");
+        let debug = format!("{:?}", backend.store);
+        assert!(
+            debug.contains("https://from-config.invalid/some-bucket"),
+            "the config endpoint must outrank a scoped one"
+        );
+        assert!(!debug.contains("scoped.invalid"));
+    }
+
+    #[test]
+    fn azure_scoped_env_replaces_the_ambient_endpoint() {
+        let backend = ObjStoreBackend::from_uri_with_env(
+            "abfss://some-container@some-account.dfs.core.windows.net/prefix",
+            10,
+            &StoreOptions::default(),
+            env(&[
+                ("AZURE_STORAGE_ENDPOINT", "https://ambient.invalid"),
+                ("HEPH_AZURE_ENDPOINT", "https://scoped.invalid"),
+            ]),
+        )
+        .expect("backend");
+        let debug = format!("{:?}", backend.store);
+        assert!(
+            debug.contains("scoped.invalid"),
+            "the HEPH_AZURE_ endpoint never reached the Azure client"
+        );
+        assert!(!debug.contains("ambient.invalid"));
+    }
+
+    #[test]
+    fn http_scoped_env_reaches_the_built_store() {
+        let backend = ObjStoreBackend::from_uri_with_env(
+            "https://example.com/prefix",
+            10,
+            &StoreOptions::default(),
+            env(&[
+                ("PROXY_URL", "http://ambient.invalid:3128"),
+                ("HEPH_HTTP_PROXY_URL", "http://scoped.invalid:3128"),
+            ]),
+        )
+        .expect("backend");
+        let debug = format!("{:?}", backend.store);
+        assert!(
+            debug.contains("scoped.invalid:3128"),
+            "the HEPH_HTTP_ proxy never reached the HTTP client"
+        );
+        assert!(!debug.contains("ambient.invalid"));
+    }
+
+    /// GCS's ambient path is object_store's own `from_env`, which reads the
+    /// process environment; the scoped path must not, so a `HEPH_GCS_*`
+    /// credential has to configure the store on its own.
+    #[test]
+    fn gcs_scoped_env_configures_the_store() {
+        let backend = ObjStoreBackend::from_uri_with_env(
+            "gs://some-bucket/prefix",
+            10,
+            &StoreOptions::default(),
+            env(&[("HEPH_GCS_BEARER_TOKEN", "scoped-bearer-token")]),
+        )
+        .expect("backend");
+        assert!(
+            format!("{:?}", backend.store).contains("scoped-bearer-token"),
+            "the HEPH_GCS_ bearer token never reached the GCS client"
+        );
+        assert_eq!(backend.prefix.as_ref(), "prefix");
+    }
+
+    /// `external_account` is the one credential shape object_store cannot
+    /// decode, so it is minted out-of-band — and in scoped mode the file to
+    /// mint it from is the scoped one, never the ambient ADC.
+    #[test]
+    fn external_account_source_follows_the_scoped_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let federated = write_adc(dir.path(), r#"{"type": "external_account"}"#);
+        let scoped = SchemeEnv::split::<GoogleConfigKey>(
+            &[GCS_ENV_PREFIX],
+            env(&[(
+                "HEPH_GCS_APPLICATION_CREDENTIALS",
+                &federated.to_string_lossy(),
+            )]),
+        )
+        .expect("split");
+        assert_eq!(
+            external_account_source(&scoped),
+            Some(ExternalAccountSource::File(federated))
+        );
+
+        // A service-account key is decodable by object_store itself — no
+        // out-of-band provider, or the native path would be bypassed for a
+        // credential type that works.
+        let sa = dir.path().join("sa.json");
+        std::fs::write(&sa, r#"{"type": "service_account"}"#).expect("write");
+        let scoped = SchemeEnv::split::<GoogleConfigKey>(
+            &[GCS_ENV_PREFIX],
+            env(&[("HEPH_GCS_APPLICATION_CREDENTIALS", &sa.to_string_lossy())]),
+        )
+        .expect("split");
+        assert_eq!(external_account_source(&scoped), None);
+
+        // Scoped, but saying nothing about credentials: the ambient ADC is out
+        // of scope, so there is nothing to mint from.
+        let scoped = SchemeEnv::split::<GoogleConfigKey>(
+            &[GCS_ENV_PREFIX],
+            env(&[("HEPH_GCS_BUCKET", "b")]),
+        )
+        .expect("split");
+        assert_eq!(external_account_source(&scoped), None);
+    }
+
+    /// A shell variable can only spell `[A-Za-z0-9_]`, so every other character
+    /// in a cache name has to flatten to `_` — otherwise a cache named
+    /// `build-cache` would have a namespace nobody can set.
+    #[test]
+    fn cache_env_prefix_flattens_a_name_to_something_a_shell_can_spell() {
+        assert_eq!(cache_env_prefix("r2"), "HEPH_CACHE_R2_");
+        assert_eq!(cache_env_prefix("build-cache"), "HEPH_CACHE_BUILD_CACHE_");
+        assert_eq!(cache_env_prefix("eu.west"), "HEPH_CACHE_EU_WEST_");
+        assert_eq!(cache_env_prefix("Café"), "HEPH_CACHE_CAF__");
+        assert_eq!(cache_env_prefix(""), "HEPH_CACHE__");
+    }
+
+    /// The whole point of the per-cache namespace: two `s3://` caches in two
+    /// accounts, each signing with its own key, from one shell.
+    #[test]
+    fn each_cache_reads_its_own_namespace() {
+        let shell = env(&[
+            ("AWS_ACCESS_KEY_ID", "AMBIENTKEYID"),
+            ("AWS_SECRET_ACCESS_KEY", "ambient-secret"),
+            ("HEPH_CACHE_R2_ACCESS_KEY_ID", "R2KEYID"),
+            ("HEPH_CACHE_R2_SECRET_ACCESS_KEY", "r2-secret"),
+            ("HEPH_CACHE_CORP_ACCESS_KEY_ID", "CORPKEYID"),
+            ("HEPH_CACHE_CORP_SECRET_ACCESS_KEY", "corp-secret"),
+        ]);
+        for (cache, want, other) in [
+            ("r2", "R2KEYID", "CORPKEYID"),
+            ("corp", "CORPKEYID", "R2KEYID"),
+        ] {
+            let prefix = cache_env_prefix(cache);
+            let backend = ObjStoreBackend::from_uri_with_env(
+                "s3://some-bucket/prefix",
+                10,
+                &StoreOptions {
+                    cache_env_prefix: Some(&prefix),
+                    ..Default::default()
+                },
+                shell.clone(),
+            )
+            .expect("backend");
+            // Never printed: `AwsCredential`'s Debug redacts the secret but not
+            // the key id.
+            let debug = format!("{:?}", backend.store);
+            assert!(
+                debug.contains(want),
+                "cache `{cache}` did not read its own namespace"
+            );
+            assert!(
+                !debug.contains(other),
+                "cache `{cache}` read another cache's key"
+            );
+            assert!(!debug.contains("AMBIENTKEYID"));
+        }
+    }
+
+    /// Specificity decides, and only the winner applies: naming this cache beats
+    /// naming its kind, which beats the ambient environment. The loser does not
+    /// contribute leftovers — that is the same atomicity rule that keeps a
+    /// session token from riding along with a static key pair.
+    #[test]
+    fn the_most_specific_namespace_takes_the_store_alone() {
+        let prefix = cache_env_prefix("r2");
+        let backend = ObjStoreBackend::from_uri_with_env(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions {
+                cache_env_prefix: Some(&prefix),
+                ..Default::default()
+            },
+            env(&[
+                ("AWS_ACCESS_KEY_ID", "AMBIENTKEYID"),
+                ("AWS_SESSION_TOKEN", "ambient-session-token"),
+                ("HEPH_S3_ACCESS_KEY_ID", "KINDKEYID"),
+                ("HEPH_S3_SESSION_TOKEN", "kind-session-token"),
+                ("HEPH_CACHE_R2_ACCESS_KEY_ID", "CACHEKEYID"),
+                ("HEPH_CACHE_R2_SECRET_ACCESS_KEY", "cache-secret"),
+            ]),
+        )
+        .expect("backend");
+        let debug = format!("{:?}", backend.store);
+        assert!(debug.contains("CACHEKEYID"));
+        assert!(
+            !debug.contains("KINDKEYID"),
+            "the per-kind namespace must not outrank the cache's own"
+        );
+        assert!(!debug.contains("AMBIENTKEYID"));
+        assert!(
+            debug.contains("token: None"),
+            "a session token from a namespace that lost must not survive"
+        );
+    }
+
+    /// A cache that says nothing about itself still falls back through the same
+    /// ladder — the per-cache namespace is opt-in, not a wall.
+    #[test]
+    fn a_cache_without_its_own_namespace_falls_back_to_the_kind() {
+        let prefix = cache_env_prefix("corp");
+        let backend = ObjStoreBackend::from_uri_with_env(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions {
+                cache_env_prefix: Some(&prefix),
+                ..Default::default()
+            },
+            env(&[
+                ("AWS_ACCESS_KEY_ID", "AMBIENTKEYID"),
+                ("HEPH_S3_ACCESS_KEY_ID", "KINDKEYID"),
+                ("HEPH_S3_SECRET_ACCESS_KEY", "kind-secret"),
+                ("HEPH_CACHE_R2_ACCESS_KEY_ID", "OTHERCACHEKEYID"),
+            ]),
+        )
+        .expect("backend");
+        let debug = format!("{:?}", backend.store);
+        assert!(debug.contains("KINDKEYID"));
+        assert!(!debug.contains("OTHERCACHEKEYID"));
+        assert!(!debug.contains("AMBIENTKEYID"));
+    }
+
+    /// The namespace is heph's whichever prefix it arrived under, so a typo in
+    /// the per-cache one is caught the same way.
+    #[test]
+    fn an_unknown_setting_in_a_cache_namespace_is_rejected() {
+        let prefix = cache_env_prefix("r2");
+        let err = ObjStoreBackend::from_uri_with_env(
+            "s3://some-bucket/prefix",
+            10,
+            &StoreOptions {
+                cache_env_prefix: Some(&prefix),
+                ..Default::default()
+            },
+            env(&[("HEPH_CACHE_R2_ACCES_KEY_ID", "typo")]),
+        )
+        .err()
+        .expect("a typo in the cache namespace must not be ignored");
+        assert!(
+            format!("{err:#}").contains("HEPH_CACHE_R2_ACCES_KEY_ID"),
+            "{err:#}"
+        );
     }
 }
