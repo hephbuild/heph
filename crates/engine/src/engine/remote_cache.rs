@@ -66,7 +66,7 @@ use crate::engine::local_cache::{
     ManifestArtifactEncoding, ManifestArtifactType,
 };
 use crate::engine::remote_cache_latency::{UNREACHABLE, load_order, store_order};
-use crate::engine::remote_cache_objstore::{ObjStoreBackend, StoreOptions};
+use crate::engine::remote_cache_objstore::{ObjStoreBackend, StoreOptions, cache_env_prefix};
 use anyhow::Context;
 use async_trait::async_trait;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -367,9 +367,10 @@ pub trait RemoteCacheBackend: Send + Sync {
 
 /// One cache entry from `caches:` — name plus URI, permissions, and request cap.
 ///
-/// Credentials are not part of it: they come from the environment, either the
-/// ambient cloud variables or heph's own `HEPH_<KIND>_*` namespace — see
-/// [`crate::engine::remote_cache_objstore::SchemeEnv`].
+/// Credentials are not part of it: they come from the environment — the ambient
+/// cloud variables, heph's per-kind `HEPH_S3_*` namespace, or this cache's own
+/// `HEPH_CACHE_<NAME>_*` namespace, which is why `name` is load-bearing beyond
+/// diagnostics.
 /// Plain data so it can live in [`crate::engine::Config`] (Clone/Debug/PartialEq).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteCacheDef {
@@ -890,14 +891,35 @@ impl RemoteCacheSet {
     /// Build the set from definitions. Backend construction is synchronous (no
     /// network), so a bad URI fails here, at engine startup, with context.
     pub fn new(defs: &[RemoteCacheDef], home: PathBuf) -> anyhow::Result<Arc<Self>> {
+        // Each cache reads credentials from a namespace derived from its name.
+        // The derivation is not injective — `a-b` and `a_b` both flatten to
+        // `HEPH_CACHE_A_B_` — so two caches can end up sharing one namespace.
+        // That is always a config mistake, and the cost of not catching it is a
+        // cache silently signing with another cache's credentials, so it is
+        // rejected by name rather than resolved by position.
+        let mut namespaces: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::with_capacity(defs.len());
+        for def in defs {
+            let prefix = cache_env_prefix(&def.name);
+            if let Some(other) = namespaces.insert(prefix.clone(), &def.name) {
+                anyhow::bail!(
+                    "caches `{other}` and `{}` both read their credentials from `{prefix}*`; \
+                     rename one so each cache has an environment namespace of its own",
+                    def.name
+                );
+            }
+        }
+
         let mut caches = Vec::with_capacity(defs.len());
         for def in defs {
+            let cache_env_prefix = cache_env_prefix(&def.name);
             let backend = ObjStoreBackend::from_uri(
                 &def.uri,
                 def.concurrency,
                 &StoreOptions {
                     endpoint: def.endpoint.as_deref(),
                     region: def.region.as_deref(),
+                    cache_env_prefix: Some(&cache_env_prefix),
                 },
             )
             .with_context(|| format!("configure remote cache `{}`", def.name))?;
@@ -2099,6 +2121,40 @@ mod tests {
             endpoint: None,
             region: None,
         }
+    }
+
+    /// Each cache reads credentials from a namespace derived from its name, and
+    /// the derivation flattens everything a shell cannot spell — so two names
+    /// can land on one namespace. Resolving that by position would have one
+    /// cache silently signing with the other's credentials; name both and stop.
+    #[test]
+    fn caches_that_share_an_environment_namespace_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = RemoteCacheSet::new(
+            &[
+                def("build-cache", "memory:///a", true, true),
+                def("build.cache", "memory:///b", true, true),
+            ],
+            dir.path().to_path_buf(),
+        )
+        .err()
+        .expect("a shared namespace must not be accepted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("build-cache") && msg.contains("build.cache"),
+            "{msg}"
+        );
+        assert!(msg.contains("HEPH_CACHE_BUILD_CACHE_"), "{msg}");
+
+        // Distinct namespaces are of course fine.
+        RemoteCacheSet::new(
+            &[
+                def("build-cache", "memory:///a", true, true),
+                def("other", "memory:///b", true, true),
+            ],
+            dir.path().to_path_buf(),
+        )
+        .expect("distinct namespaces");
     }
 
     /// A token that is never cancelled — the default for tests that aren't
