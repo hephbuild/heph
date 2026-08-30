@@ -366,6 +366,10 @@ pub trait RemoteCacheBackend: Send + Sync {
 }
 
 /// One cache entry from `caches:` — name plus URI, permissions, and request cap.
+///
+/// Credentials are not part of it: they come from the environment, either the
+/// ambient cloud variables or heph's own `HEPH_<KIND>_*` namespace — see
+/// [`crate::engine::remote_cache_objstore::SchemeEnv`].
 /// Plain data so it can live in [`crate::engine::Config`] (Clone/Debug/PartialEq).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteCacheDef {

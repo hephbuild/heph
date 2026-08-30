@@ -79,6 +79,14 @@ pub struct ConfigYaml {
 /// `file://` for tests/local use. `read`/`write` gate whether the cache is
 /// consulted on lookups and pushed to on writes; both default to `true`.
 ///
+/// When the ambient cloud environment belongs to something other than the cache
+/// — an `s3://` cache in Cloudflare R2 on a machine whose `AWS_ACCESS_KEY_ID` is
+/// a real AWS key the build itself needs — the credentials can come from heph's
+/// own `HEPH_S3_*` / `HEPH_GCS_*` / `HEPH_AZURE_*` / `HEPH_HTTP_*` namespace
+/// instead. Setting one of those replaces the ambient environment for that store
+/// outright rather than merging into it, so a leftover `AWS_SESSION_TOKEN`
+/// cannot ride along with a static key pair.
+///
 /// `endpoint`/`region` point an `s3://` cache at an S3-compatible service that
 /// is not AWS — the URI still names the bucket and prefix, the endpoint names
 /// the host to talk to.
