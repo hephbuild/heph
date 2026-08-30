@@ -325,6 +325,30 @@ mod tests {
         assert_ne!(of(&v), of(""), "a tagged variant is not the plain one");
     }
 
+    /// A variant with more than one factor contains the addr's own arg
+    /// separator. The formatter quotes such a value, so the addr round-trips —
+    /// asserted here because the slot key *is* the formatted addr, and a spelling
+    /// that did not round-trip would be a cache nothing could name twice.
+    #[test]
+    fn a_multi_factor_variant_survives_formatting() {
+        let k = GocacheKey {
+            module: "svc/api".to_string(),
+            go_version: "1.27.0".to_string(),
+            goos: "linux".to_string(),
+            goarch: "amd64".to_string(),
+            variant: "tags=integration,race".to_string(),
+        };
+        let formatted = k.addr().format();
+        assert!(
+            formatted.contains(r#"var="tags=integration,race""#),
+            "{formatted}"
+        );
+        assert_eq!(
+            hmodel::htaddr::parse_addr(&formatted).expect("round-trip"),
+            k.addr()
+        );
+    }
+
     #[test]
     fn the_package_is_recognized_and_nothing_else_is() {
         assert!(is_gocache_pkg(GOCACHE_PKG));
