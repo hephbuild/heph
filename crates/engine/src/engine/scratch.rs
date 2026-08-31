@@ -918,28 +918,6 @@ fn check_mount_overlaps(consumer: &Addr, resolved: &[ResolvedScratch]) -> anyhow
     Ok(())
 }
 
-/// True when two mount paths name the same directory, or one contains the other.
-///
-/// Compared component-wise rather than by string prefix, so `.cache/go` and
-/// `.cache/golang` are correctly *not* an overlap — a raw `starts_with` would
-/// call them one, and the resulting error would be nonsense the author cannot act
-/// on. Trailing slashes and `.` segments are normalized away first so two
-/// spellings of one path still collide.
-fn paths_overlap(a: &str, b: &str) -> bool {
-    let comps = |p: &str| -> Vec<String> {
-        std::path::Path::new(p)
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-                std::path::Component::ParentDir => Some("..".to_string()),
-                _ => None,
-            })
-            .collect()
-    };
-    let (a, b) = (comps(a), comps(b));
-    a.iter().zip(b.iter()).all(|(x, y)| x == y)
-}
-
 #[cfg(test)]
 mod scope_tests {
     use super::*;
