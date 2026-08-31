@@ -168,6 +168,92 @@ struct GoGolistDef {
 /// v17: `firstparty` joined the def, changing every golist target's def hash.
 const GO_GOLIST_FORMAT_VERSION: u32 = 17;
 
+/// The environment `go list` runs under.
+///
+/// Extracted from `run` so it is testable: what reaches this map is a
+/// hermeticity boundary, and the interesting cases (which host variables get
+/// through, whether `CGO_ENABLED` is pinned, whether a hermetic toolchain sees
+/// `PATH`) are all decided here and nowhere else.
+///
+/// `host` looks a variable up in the host environment. Injected rather than
+/// calling `std::env::var` directly so a test can describe an environment
+/// without mutating the process's own — which is global, and would make these
+/// tests race every other test in the binary.
+fn golist_env(
+    def: &GoGolistDef,
+    goroot: &std::path::Path,
+    gocache: &std::path::Path,
+    host: impl Fn(&str) -> Option<String>,
+) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = HashMap::new();
+    env.insert("GOOS".to_string(), def.goos.clone());
+    env.insert("GOARCH".to_string(), def.goarch.clone());
+    env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
+    env.insert(
+        "GOCACHE".to_string(),
+        gocache.to_string_lossy().into_owned(),
+    );
+    // Pin the toolchain to the staged SDK and ignore any workspace go.work so
+    // resolution is reproducible regardless of host config.
+    env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
+    env.insert("GOWORK".to_string(), "off".to_string());
+    // Pin CGO_ENABLED rather than letting Go autodetect it: autodetection is
+    // PATH-dependent and drifts across hosts — e.g. an Ubuntu host with gcc on
+    // PATH pulls runtime/cgo in here but later link steps run without it,
+    // breaking importcfg. The value must match what the compile/link sandboxes
+    // use, which is `0` for every ordinary build and `1` only for a race build
+    // off darwin (see `factors::cgo_required`).
+    env.insert(
+        "CGO_ENABLED".to_string(),
+        crate::plugingo::factors::cgo_enabled_value(&def.goos, def.race).to_string(),
+    );
+    if !def.goexperiment.is_empty() {
+        env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
+    }
+    for name in MODULE_FETCH_PASS_ENV {
+        if let Some(v) = host(name) {
+            env.insert(name.to_string(), v);
+        }
+    }
+    // Non-hermetic toolchains: the `go` subprocess (or a hostbin/nix wrapper)
+    // may need PATH — to locate ancillary tools, or for the wrapper itself.
+    // Hermetic mode deliberately omits it to stay PATH-independent.
+    if !matches!(
+        crate::plugingo::toolchain::classify(&def.go_version),
+        crate::plugingo::toolchain::Toolchain::Hermetic(_)
+    ) && let Some(v) = host("PATH")
+    {
+        env.insert("PATH".to_string(), v);
+    }
+    env
+}
+
+/// Host environment `go list` is allowed to see.
+///
+/// Every entry decides **where module bytes come from**, never *what* is built:
+/// thirdparty metadata listing still consults the host module cache and proxy,
+/// and those bytes are content-addressed and `go.sum`-verified, so a different
+/// proxy cannot produce a different answer. First-party and stdlib reads stay
+/// fully hermetic via the staged SDK.
+///
+/// That rule is what makes the passthrough safe, because **none of these reach
+/// any hash** — not `GoGolistDef`'s, not the shared `GOCACHE` key. A variable
+/// that changed the *listing* would therefore be served from cache to a build
+/// that set it differently.
+///
+/// `GOFLAGS` used to be here and was exactly that variable: it carries
+/// `-mod=vendor`, `-tags=…`, `-buildvcs=…` — flags that change which files
+/// `go list` selects and what it reports. It is gone. Nothing goes back on this
+/// list unless it only answers "where do the bytes come from".
+const MODULE_FETCH_PASS_ENV: &[&str] = &[
+    "GOPATH",
+    "GOMODCACHE",
+    "HOME",
+    "GONOSUMDB",
+    "GOPRIVATE",
+    "GOPROXY",
+];
+
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         GO_GOLIST_FORMAT_VERSION.hash(state);
@@ -344,7 +430,6 @@ impl ManagedDriver for GoGolistDriver {
 
         // GOROOT and the `go` binary depend on the selected toolchain (host,
         // target-ref, or hermetic) — see [`toolchain::resolve_toolchain_go`].
-        use crate::plugingo::toolchain::Toolchain;
         let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
         let (goroot, go_bin) = crate::plugingo::toolchain::resolve_toolchain_go(
             &def.go_version,
@@ -374,58 +459,7 @@ impl ManagedDriver for GoGolistDriver {
             &req.sandbox_pkg_dir.join(".heph-gocache"),
         )?;
 
-        let mut env: HashMap<String, String> = HashMap::new();
-        env.insert("GOOS".to_string(), def.goos.clone());
-        env.insert("GOARCH".to_string(), def.goarch.clone());
-        env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
-        env.insert(
-            "GOCACHE".to_string(),
-            gocache.to_string_lossy().into_owned(),
-        );
-        // Pin the toolchain to the staged SDK and ignore any workspace go.work so
-        // resolution is reproducible regardless of host config.
-        env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
-        env.insert("GOWORK".to_string(), "off".to_string());
-        // Pin CGO_ENABLED rather than letting Go autodetect it: autodetection is
-        // PATH-dependent and drifts across hosts — e.g. an Ubuntu host with gcc on
-        // PATH pulls runtime/cgo in here but later link steps run without it,
-        // breaking importcfg. The value must match what the compile/link sandboxes
-        // use, which is `0` for every ordinary build and `1` only for a race build
-        // off darwin (see `factors::cgo_required`).
-        env.insert(
-            "CGO_ENABLED".to_string(),
-            crate::plugingo::factors::cgo_enabled_value(&def.goos, def.race).to_string(),
-        );
-        if !def.goexperiment.is_empty() {
-            env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
-        }
-        // Thirdparty module *metadata* listing still consults the host module
-        // cache / proxy (modules are content-addressed and verified by go.sum),
-        // matching the v1 plugin; first-party and stdlib reads stay fully
-        // hermetic via the staged SDK above.
-        for name in &[
-            "GOPATH",
-            "GOMODCACHE",
-            "HOME",
-            "GONOSUMDB",
-            "GOFLAGS",
-            "GOPRIVATE",
-            "GOPROXY",
-        ] {
-            if let Ok(v) = std::env::var(name) {
-                env.insert(name.to_string(), v);
-            }
-        }
-        // Non-hermetic toolchains: the `go` subprocess (or a hostbin/nix wrapper)
-        // may need PATH — to locate ancillary tools, or for the wrapper itself.
-        // Hermetic mode deliberately omits it to stay PATH-independent.
-        if !matches!(
-            crate::plugingo::toolchain::classify(&def.go_version),
-            Toolchain::Hermetic(_)
-        ) && let Ok(v) = std::env::var("PATH")
-        {
-            env.insert("PATH".to_string(), v);
-        }
+        let env = golist_env(def, &goroot, &gocache, |n| std::env::var(n).ok());
 
         // A first-party directory with no `.go` file staged into it cannot be a
         // Go package — a Go package needs at least one `.go` file, and every
@@ -1074,6 +1108,111 @@ mod tests {
             thirdparty_download_addr: None,
             firstparty: true,
         }
+    }
+
+    /// A host environment where every variable heph has ever passed through is
+    /// set to something recognizable, so a test can see exactly what leaks.
+    fn everything_set(name: &str) -> Option<String> {
+        Some(format!("host-{name}"))
+    }
+
+    fn env_for(
+        def: &GoGolistDef,
+        host: impl Fn(&str) -> Option<String>,
+    ) -> HashMap<String, String> {
+        golist_env(
+            def,
+            std::path::Path::new("/goroot"),
+            std::path::Path::new("/gocache"),
+            host,
+        )
+    }
+
+    /// `GOFLAGS` carries `-mod=vendor`, `-tags=…`, `-buildvcs=…` — flags that
+    /// change which files `go list` selects and what it reports. It reached no
+    /// hash: not `GoGolistDef`'s, not the shared `GOCACHE` key. So a listing
+    /// produced under one `GOFLAGS` was served from cache to a build that set it
+    /// differently — a wrong answer, not a slow one.
+    #[test]
+    fn goflags_never_reaches_go_list() {
+        let env = env_for(&def_with(false, vec![]), everything_set);
+        assert!(
+            !env.contains_key("GOFLAGS"),
+            "GOFLAGS changes the listing and keys nothing: {env:?}"
+        );
+    }
+
+    /// The passthrough is a hermeticity boundary, so the rule is what it decides,
+    /// not which names are on it: everything that gets through may choose *where
+    /// module bytes come from* (content-addressed, `go.sum`-verified) and nothing
+    /// else. Asserted as the whole set so adding a name is a deliberate act.
+    #[test]
+    fn only_module_fetch_location_is_passed_through() {
+        let env = env_for(&def_with(false, vec![]), everything_set);
+        let mut passed: Vec<&str> = env
+            .keys()
+            .filter(|k| env.get(*k).is_some_and(|v| v.starts_with("host-")))
+            .map(|k| k.as_str())
+            .collect();
+        passed.sort_unstable();
+        assert_eq!(
+            passed,
+            [
+                "GOMODCACHE",
+                "GONOSUMDB",
+                "GOPATH",
+                "GOPRIVATE",
+                "GOPROXY",
+                "HOME"
+            ],
+            "only where-the-bytes-come-from may cross this boundary"
+        );
+    }
+
+    /// A hermetic toolchain must not see `PATH` — it resolves `go` from the
+    /// staged SDK, and a `PATH` leak is how a host tool silently substitutes for
+    /// a pinned one.
+    #[test]
+    fn a_hermetic_toolchain_gets_no_path() {
+        let mut def = def_with(false, vec![]);
+        def.go_version = "1.27.0".to_string();
+        assert!(!env_for(&def, everything_set).contains_key("PATH"));
+
+        // A host toolchain does need it: `go` itself is found there.
+        def.go_version = "host".to_string();
+        assert_eq!(
+            env_for(&def, everything_set)
+                .get("PATH")
+                .map(String::as_str),
+            Some("host-PATH")
+        );
+    }
+
+    /// `CGO_ENABLED` is pinned rather than autodetected, because autodetection
+    /// reads `PATH` and drifts across hosts — and the value here must match what
+    /// the compile and link sandboxes use or `importcfg` breaks.
+    #[test]
+    fn cgo_is_pinned_not_autodetected() {
+        let env = env_for(&def_with(false, vec![]), everything_set);
+        assert_eq!(env.get("CGO_ENABLED").map(String::as_str), Some("0"));
+        // And it is never inherited, whatever the host says.
+        assert_ne!(
+            env.get("CGO_ENABLED").map(String::as_str),
+            Some("host-CGO_ENABLED")
+        );
+    }
+
+    /// An unset host is not an error and not an empty string — the variable is
+    /// simply absent, so `go` applies its own default.
+    #[test]
+    fn an_unset_host_variable_is_absent_rather_than_empty() {
+        let env = env_for(&def_with(false, vec![]), |_| None);
+        for name in MODULE_FETCH_PASS_ENV {
+            assert!(!env.contains_key(*name), "{name} must be absent, not empty");
+        }
+        // The pinned values are still there.
+        assert_eq!(env.get("GOTOOLCHAIN").map(String::as_str), Some("local"));
+        assert_eq!(env.get("GOWORK").map(String::as_str), Some("off"));
     }
 
     #[test]
