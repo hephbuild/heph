@@ -788,6 +788,41 @@ fn is_passthrough(use_tmp_cache: bool, content: &outputartifact::Content) -> boo
         }
 }
 
+impl Engine {
+    /// What a *consumer* of `addr` may take from it: everything, minus any
+    /// `codegen = "in_place"` group.
+    ///
+    /// [`crate::engine::link`] applies this rule to dependency edges. Transparent
+    /// groups do not go through `link` — they inline their members' results
+    /// directly — so they ask here instead, and the two agree by construction.
+    ///
+    /// `All` for a target with no in_place output (the overwhelmingly common
+    /// case), which keeps the group path allocation-free, and `All` for a
+    /// transparent member too: its own inlining applies the rule to *its* members,
+    /// and its def declares no outputs of its own to enumerate.
+    async fn consumable_outputs(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<OutputMatcher> {
+        let def = self.get_def_no_track(rs, addr).await?;
+        if def.target_def.transparent {
+            return Ok(OutputMatcher::All);
+        }
+        let in_place = crate::engine::link::in_place_groups(&def.target_def);
+        if in_place.is_empty() {
+            return Ok(OutputMatcher::All);
+        }
+        Ok(OutputMatcher::Exact(
+            def.target_def
+                .output_names()
+                .into_iter()
+                .filter(|g| !in_place.contains(g))
+                .collect(),
+        ))
+    }
+}
+
 /// The output groups a codegen target reconciles with the tree — every group with
 /// at least one non-`None` codegen path, in either mode.
 fn codegen_groups(def: &LinkedTargetDef) -> Vec<String> {
@@ -1448,13 +1483,25 @@ impl Engine {
                 .map(|input| {
                     let dep_addr = input.r#ref.r#ref.clone();
                     enclose!((self => engine, rs, opts) async move {
+                        // A group is a name for its members, so consuming the
+                        // group must not hand out what depending on a member
+                        // directly would not: an `in_place` member's outputs are
+                        // tracked sources, and `link` withholds them from every
+                        // dependent (see `in_place_groups`). Without this, wrapping
+                        // a formatter in a group would smuggle its files into
+                        // whatever depends on the group.
+                        let outputs = engine
+                            .clone()
+                            .consumable_outputs(rs.clone(), &dep_addr)
+                            .await
+                            .unwrap_or(OutputMatcher::All);
                         // The one surviving GrowStack site: group inlining
                         // recurses without a task hop (deliberately — nothing
                         // to memoize), so a deep group chain nests one boxed
                         // poll frame per level. See the pinned 2 MiB
                         // deep_transparent_group test.
                         crate::engine::grow_stack::grow_stack(
-                            engine.result_addr(rs, &dep_addr, OutputMatcher::All, &opts),
+                            engine.result_addr(rs, &dep_addr, outputs, &opts),
                         )
                         .await
                     })
@@ -10341,12 +10388,183 @@ mod tests {
         Ok(())
     }
 
+    /// An `in_place` target whose single output group is named `src`, plus a
+    /// consumer depending on it through `dep_ref` (`//pkg:fmt`, or `//pkg:fmt|src`
+    /// to name the group). The consumer's script asserts that nothing was staged.
+    fn in_place_target_with_consumer(dep_ref: &str) -> Vec<pluginstatictarget::Target> {
+        let mut out = HashMap::new();
+        out.insert("src".to_string(), vec!["in.txt".to_string()]);
+        let mut deps = HashMap::new();
+        deps.insert(
+            "".to_string(),
+            vec!["//@heph/introspect:outputs".to_string()],
+        );
+        vec![
+            pluginstatictarget::Target {
+                addr: "//pkg:fmt".to_string(),
+                driver: "bash".to_string(),
+                run: Some(
+                    "printf '%s\\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.t && mv in.txt.t in.txt"
+                        .to_string(),
+                ),
+                out,
+                codegen: Some("in_place".to_string()),
+                deps,
+                labels: vec![],
+                ..Default::default()
+            },
+            pluginstatictarget::Target {
+                addr: "//pkg:consumer".to_string(),
+                driver: "bash".to_string(),
+                // Fails the target if anything was staged from the dep.
+                run: Some("test -z \"${SRC_SRC:-}\"".to_string()),
+                out: HashMap::new(),
+                codegen: None,
+                deps: HashMap::from([("src".to_string(), vec![dep_ref.to_string()])]),
+                labels: vec![],
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// An `in_place` target's outputs are tracked source files, so a dependent
+    /// must not receive them as artifacts: the tree stays their single producer.
+    /// The edge still does its job — the target resolves, the transform runs, and
+    /// the write-back lands it where `glob()`/`file()` will read it.
+    #[tokio::test]
+    async fn in_place_outputs_are_not_staged_into_a_dependent() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(in_place_target_with_consumer("//pkg:fmt"))?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+
+        let consumer = hmodel::htaddr::parse_addr("//pkg:consumer")?;
+        let (res, _ev) = resolve_collecting_events(&engine, &consumer).await;
+        res.expect("the consumer must resolve, and see no staged in_place artifact");
+
+        // The edge still ran the transform and wrote it back.
+        assert_eq!(
+            std::fs::read(pkg_dir.join("in.txt"))?,
+            b"HELLO\n",
+            "the dep edge must still resolve the in_place target and land its transform"
+        );
+        Ok(())
+    }
+
+    /// Wrapping the formatter in a transparent group must not smuggle its outputs
+    /// past the rule. A group is a name for its members, so consuming the group
+    /// hands out exactly what depending on a member directly would — and groups
+    /// inline their members' results without going through `link`, so they apply
+    /// the rule themselves.
+    #[tokio::test]
+    async fn a_group_does_not_leak_its_in_place_members_outputs() -> anyhow::Result<()> {
+        let mut targets = in_place_target_with_consumer("//pkg:fmt-all");
+        targets.push(pluginstatictarget::Target {
+            addr: "//pkg:fmt-all".to_string(),
+            driver: "group".to_string(),
+            raw_config: HashMap::from([(
+                "deps".to_string(),
+                hcore::htvalue::Value::List(vec![hcore::htvalue::Value::String(
+                    "//pkg:fmt".to_string(),
+                )]),
+            )]),
+            ..Default::default()
+        });
+        let (engine, root) = engine_with_home_fs(targets)?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+
+        let consumer = hmodel::htaddr::parse_addr("//pkg:consumer")?;
+        let (res, _ev) = resolve_collecting_events(&engine, &consumer).await;
+        res.expect("the consumer must resolve, and see no staged in_place artifact");
+        assert_eq!(
+            std::fs::read(pkg_dir.join("in.txt"))?,
+            b"HELLO\n",
+            "the group edge must still resolve the in_place member and land its transform"
+        );
+        Ok(())
+    }
+
+    /// The group rule must not starve an ordinary member: a group of a plain
+    /// target still hands its dependent every output, and a group of a group
+    /// still resolves through to the leaf.
+    #[tokio::test]
+    async fn a_group_still_passes_a_plain_members_outputs_through() -> anyhow::Result<()> {
+        let mut out = HashMap::new();
+        out.insert("o".to_string(), vec!["made.txt".to_string()]);
+        let (engine, _root) = engine_with_home_fs(vec![
+            pluginstatictarget::Target {
+                addr: "//pkg:leaf".to_string(),
+                driver: "bash".to_string(),
+                run: Some("echo made > made.txt".to_string()),
+                out,
+                deps: HashMap::new(),
+                labels: vec![],
+                ..Default::default()
+            },
+            pluginstatictarget::Target {
+                addr: "//pkg:inner".to_string(),
+                driver: "group".to_string(),
+                raw_config: HashMap::from([(
+                    "deps".to_string(),
+                    hcore::htvalue::Value::List(vec![hcore::htvalue::Value::String(
+                        "//pkg:leaf".to_string(),
+                    )]),
+                )]),
+                ..Default::default()
+            },
+            pluginstatictarget::Target {
+                addr: "//pkg:outer".to_string(),
+                driver: "group".to_string(),
+                raw_config: HashMap::from([(
+                    "deps".to_string(),
+                    hcore::htvalue::Value::List(vec![hcore::htvalue::Value::String(
+                        "//pkg:inner".to_string(),
+                    )]),
+                )]),
+                ..Default::default()
+            },
+        ])?;
+
+        let outer = hmodel::htaddr::parse_addr("//pkg:outer")?;
+        let (res, _ev) = resolve_collecting_events(&engine, &outer).await;
+        let res = res.expect("the nested group must resolve");
+        assert_eq!(
+            res.artifacts.len(),
+            1,
+            "a group of a group must still surface the leaf's output"
+        );
+        Ok(())
+    }
+
+    /// Naming an `in_place` output group explicitly is an error rather than a
+    /// silent empty stage — the dep asked for bytes that this edge will never
+    /// deliver, and the message says where to read them instead.
+    #[tokio::test]
+    async fn naming_an_in_place_output_as_a_dep_fails() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(in_place_target_with_consumer("//pkg:fmt|src"))?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+
+        let consumer = hmodel::htaddr::parse_addr("//pkg:consumer")?;
+        let (res, _ev) = resolve_collecting_events(&engine, &consumer).await;
+        let err = match res {
+            Ok(_) => panic!("depending on an in_place output group must fail"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("is `codegen = \"in_place\"`") && err.contains("glob()/file()"),
+            "the error must explain that in_place outputs are read from the tree, got: {err}"
+        );
+        Ok(())
+    }
+
     /// A plain (non-codegen) consumer of a `copy` codegen target. The generated
     /// file is the copy target's wherever the run reached it from, so building the
     /// consumer must land it in the tree — stamped — even though the copy target
-    /// is only a dependency. The mirror image of
-    /// [`in_place_dep_is_not_written_back`], which pins the opposite rule for the
-    /// mode that rewrites tracked sources.
+    /// is only a dependency.
     fn copy_target_with_consumer() -> Vec<pluginstatictarget::Target> {
         vec![
             codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
