@@ -421,7 +421,6 @@ impl Engine {
         rs: &Arc<RequestState>,
         consumer: &Addr,
         inputs: &[Input],
-        outputs: &[crate::engine::driver::targetdef::Output],
     ) -> anyhow::Result<Vec<ResolvedScratch>> {
         let refs: Vec<&Input> = inputs.iter().filter(|i| is_scratch_input(i)).collect();
         if refs.is_empty() {
@@ -458,7 +457,6 @@ impl Engine {
 
         check_env_collisions(consumer, &resolved)?;
         check_mount_overlaps(consumer, &resolved)?;
-        check_output_overlaps(consumer, &resolved, outputs)?;
         Ok(resolved)
     }
 
@@ -580,14 +578,15 @@ impl Engine {
             crate::engine::scratch_store::write_slot_meta(
                 &self.home,
                 &slot,
-                &crate::engine::scratch_store::SlotMeta::new(
-                    r.addr.format(),
-                    r.def.path.clone(),
-                    r.def.env.clone(),
-                    r.def.access.as_str().to_string(),
-                    r.def.version.clone(),
-                    r.def.remote,
-                ),
+                &crate::engine::scratch_store::SlotMeta {
+                    format: 1,
+                    addr: r.addr.format(),
+                    path: r.def.path.clone(),
+                    env: r.def.env.clone(),
+                    access: r.def.access.as_str().to_string(),
+                    version: r.def.version.clone(),
+                    remote: r.def.remote,
+                },
             );
 
             mounts.push(ScratchMount {
@@ -919,79 +918,27 @@ fn check_mount_overlaps(consumer: &Addr, resolved: &[ResolvedScratch]) -> anyhow
     Ok(())
 }
 
-/// Reject an output that could collect a scratch mount.
+/// True when two mount paths name the same directory, or one contains the other.
 ///
-/// An output gathered from inside a scratch directory is an artifact whose bytes
-/// came from an unhashed, mutable source, cached under a `hashin` that does not
-/// describe them. The realistic shape is a broad glob — `out = "**/*"` beside a
-/// cache mounted in the same package — which would sweep the whole cache into the
-/// target's artifact, and, if collection ever followed the mount symlink, into
-/// the local *and* remote caches with it.
-///
-/// Not hypothetical: `plugin-go`'s thirdparty download target emits exactly that
-/// glob, and its comment already records working around this by hand ("the `**/*`
-/// output glob would otherwise capture the cache dir").
-///
-/// Globs are compared conservatively on their literal prefix — the part before
-/// the first wildcard. "Might match" is treated as "does match", because the
-/// alternative is a check that passes until the day a file appears.
-fn check_output_overlaps(
-    consumer: &Addr,
-    resolved: &[ResolvedScratch],
-    outputs: &[crate::engine::driver::targetdef::Output],
-) -> anyhow::Result<()> {
-    use crate::engine::driver::targetdef::path::Content;
-
-    // Output paths are root-anchored (the driver prefixes the package); a mount
-    // path is relative to the target's cwd, which is that package. Compare in the
-    // output's frame.
-    let pkg = consumer.package.as_str();
-    let anchored = |p: &str| {
-        if pkg.is_empty() {
-            p.to_string()
-        } else {
-            format!("{pkg}/{p}")
-        }
+/// Compared component-wise rather than by string prefix, so `.cache/go` and
+/// `.cache/golang` are correctly *not* an overlap — a raw `starts_with` would
+/// call them one, and the resulting error would be nonsense the author cannot act
+/// on. Trailing slashes and `.` segments are normalized away first so two
+/// spellings of one path still collide.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let comps = |p: &str| -> Vec<String> {
+        std::path::Path::new(p)
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                std::path::Component::ParentDir => Some("..".to_string()),
+                _ => None,
+            })
+            .collect()
     };
-
-    for r in resolved {
-        if r.def.path.is_empty() {
-            continue;
-        }
-        let mount = anchored(&r.def.path);
-        for output in outputs {
-            for path in &output.paths {
-                let candidate = match &path.content {
-                    Content::FilePath(p) | Content::DirPath(p) => p.as_str(),
-                    // Everything up to the first wildcard is what the glob is
-                    // guaranteed to be rooted at; below that it may match
-                    // anything, including the mount.
-                    Content::Glob(g) => g
-                        .find(['*', '?', '['])
-                        .map_or(g.as_str(), |i| g.split_at(i).0),
-                };
-                let candidate = candidate.trim_end_matches('/');
-                if hcore::paths::paths_overlap(candidate, &mount) {
-                    anyhow::bail!(
-                        "{consumer} declares output {:?} in group {:?}, which can collect the \
-                         scratch {} mounted at {:?}. A scratch is mutable, unhashed state — an \
-                         artifact built from it would be cached under a key that does not \
-                         describe its bytes. Narrow the output, or mount the cache outside it.",
-                        match &path.content {
-                            Content::FilePath(p) | Content::DirPath(p) => p,
-                            Content::Glob(g) => g,
-                        },
-                        output.group,
-                        r.addr,
-                        r.def.path,
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
+    let (a, b) = (comps(a), comps(b));
+    a.iter().zip(b.iter()).all(|(x, y)| x == y)
 }
-
 
 #[cfg(test)]
 mod scope_tests {

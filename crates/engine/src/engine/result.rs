@@ -3695,8 +3695,7 @@ impl Engine {
         //
         // Returns immediately for a target with no references, which is nearly
         // all of them.
-        self.resolve_scratch(&rs, addr, &def.inputs, &def.outputs)
-            .await?;
+        self.resolve_scratch(&rs, addr, &def.inputs).await?;
 
         // Validate approval notices against the finalized input set at definition
         // time — before any result resolution or execution — so a notice naming a

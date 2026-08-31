@@ -1409,11 +1409,26 @@ async fn an_unreachable_remote_degrades_to_a_cold_build() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// An output that could collect a scratch mount is rejected. A broad glob beside
-/// a cache in the same package is the realistic shape, and it would sweep the
-/// whole cache into the target's artifact — bytes no `hashin` describes.
+/// What a broad glob beside a mounted scratch actually does.
+///
+/// It used to be rejected at *parse* time, on the reasoning that the glob would
+/// sweep the cache into the artifact. That reasoning was wrong: collection uses
+/// `symlink_metadata` and takes `is_file() || is_symlink()`, and `walkdir` does
+/// not follow symlinks — so a glob reaching a mount collects the *symlink*, never
+/// what is behind it. The parse-time guard was also redundant, because the packer
+/// already refuses an absolute symlink, and says so precisely.
+///
+/// So this is the behaviour today: the build runs, and packing fails naming the
+/// mount. **Still not right** — heph created that symlink, the author did not, so
+/// collection ought to skip it rather than hand the author an error about it.
+/// Fixing that means threading the mount paths into `collect_outputs`; until
+/// then this test pins what actually happens rather than what should.
+///
+/// The overlap that is genuinely invalid is a mount landing on a materialized
+/// input — that destroys a real file, and is covered by
+/// `a_scratch_cannot_mount_over_a_materialized_input`.
 #[tokio::test]
-async fn an_output_glob_that_could_capture_a_scratch_is_an_error() -> anyhow::Result<()> {
+async fn a_broad_glob_beside_a_mount_fails_in_the_packer_not_the_parser() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "build",
@@ -1422,36 +1437,20 @@ async fn an_output_glob_that_could_capture_a_scratch_is_an_error() -> anyhow::Re
     ws.write_build_file(
         "app",
         r#"target(name = "a", driver = "bash", out = "**/*", scratch = ["//build:c"],
-       run = ["echo hi > o.txt"])"#,
+       run = ["echo hi > o.txt", "echo cached > \"$C/entry\""])"#,
     );
 
     let err = expect_err(
         ws.run("//app:a").await,
-        "a glob that can reach the mount must not resolve",
+        "packing must refuse the mount symlink",
     );
     let msg = format!("{err:#}");
-    assert!(msg.contains("//build:c"), "must name the scratch: {msg}");
-    assert!(msg.contains("Narrow the output"), "must say the fix: {msg}");
-    Ok(())
-}
-
-/// A glob rooted somewhere the mount cannot be is fine. The check is about reach,
-/// not about the presence of a wildcard — rejecting every glob beside a scratch
-/// would make the feature unusable.
-#[tokio::test]
-async fn a_glob_that_cannot_reach_the_mount_is_allowed() -> anyhow::Result<()> {
-    let ws = Workspace::new();
-    ws.write_build_file(
-        "build",
-        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    assert!(
+        msg.contains("absolute symlink not allowed"),
+        "the packer's own check is what rejects it now: {msg}"
     );
-    ws.write_build_file(
-        "app",
-        r#"target(name = "a", driver = "bash", out = "dist/*.txt", scratch = ["//build:c"],
-       run = ["mkdir -p dist && echo hi > dist/o.txt"])"#,
-    );
-
-    assert!(!ws.run("//app:a").await?.artifacts.is_empty());
+    // And it names the mount, which is the part a person needs.
+    assert!(msg.contains(".cache/x"), "must name the mount: {msg}");
     Ok(())
 }
 
