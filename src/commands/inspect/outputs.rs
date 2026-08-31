@@ -109,7 +109,7 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
     let base = crate::engine::get_cwp()?;
     let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
         .with_context(|| format!("parse {}", args.addr))?;
-    let (engine, shutdown) = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine(&global)?;
     let app = OutputsApp {
         engine,
         addr,

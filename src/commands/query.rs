@@ -95,7 +95,7 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &cwp, true)?;
-    let (engine, shutdown) = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine(&global)?;
     let app = QueryApp {
         engine,
         matcher: m,

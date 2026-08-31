@@ -9,8 +9,8 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
     bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
 }
 
-async fn execute_async(_args: Args, _sink: LogSink, _global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine()?;
+async fn execute_async(_args: Args, _sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine(&global)?;
     for (provider, _func, rendered) in engine.provider_functions() {
         println!("{provider}.{rendered}");
     }

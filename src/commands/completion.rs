@@ -31,11 +31,16 @@ pub fn complete_target_addr(current: &OsStr) -> Vec<CompletionCandidate> {
 
 /// Build the engine and drive the async listing. Kept separate from
 /// [`complete_target_addr`] so the error path is a single `?`-chain.
+/// Shell completion runs outside any command, so there are no parsed globals to
+/// pass — clap's completion hook has a fixed signature. Defaults are right here:
+/// completion only lists targets, and never executes one, so nothing it does can
+/// touch a scratch cache.
 fn candidates(partial: &str) -> anyhow::Result<Vec<String>> {
     let base = get_cwp()?;
     bootstrap::block_on(async move {
         // `new_engine` spawns tokio tasks, so it must run inside the runtime.
-        let (engine, _shutdown) = bootstrap::new_engine()?;
+        let (engine, _shutdown) =
+            bootstrap::new_engine(&crate::commands::global::GlobalOptions::default())?;
         addr_candidates(&engine, &base, partial).await
     })?
 }

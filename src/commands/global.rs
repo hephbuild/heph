@@ -19,24 +19,23 @@ fn parse_stall_notice(s: &str) -> Result<std::time::Duration, String> {
 /// subcommand, then plumbed to each command's `execute`.
 #[derive(Args, Clone, Debug, Default)]
 pub struct GlobalOptions {
-    /// Persistent scratch caches: `on` (default) or `off`.
+    /// Run with every scratch cache absent.
     ///
-    /// `off` runs every target with its scratch caches absent. That is how the
-    /// scratch contract gets audited — a target's outputs must be identical
-    /// whether its scratch is warm, cold or absent, so a build with `off` should
-    /// produce the same `hashout`s as one without. If it does not, the target is
-    /// depending on carried-over state and is already broken.
+    /// This is how the scratch contract gets audited — a target's outputs must be
+    /// identical whether its scratch is warm, cold or absent, so a build with
+    /// `--no-scratch` should produce the same `hashout`s as one without. If it
+    /// does not, the target depends on carried-over state and is already broken.
+    /// It implies `--force`: a scratch never reaches `hashin`, so without a
+    /// rebuild the run would just replay the result built *with* a warm cache.
     ///
-    /// A build flag rather than a `heph tool scratch` subcommand: it modifies a
-    /// build rather than being one, so it belongs next to `--force`.
-    #[arg(
-        long = "scratch",
-        value_name = "MODE",
-        default_value = "on",
-        value_parser = parse_scratch_mode,
-        global = true
-    )]
-    pub scratch: ScratchMode,
+    /// A build flag rather than a `heph tool scratch` subcommand — it modifies a
+    /// build rather than being one, so it belongs next to `--force`. And a bool
+    /// rather than `--scratch=on|off`: there are exactly two states, `off` is the
+    /// only one anyone types, and a valued flag named `scratch` collides with
+    /// every subcommand that wants a `--scratch` of its own (see
+    /// `tool::clean`'s test).
+    #[arg(long = "no-scratch", global = true)]
+    pub no_scratch: bool,
     /// Sample CPU and write a pprof profile to PATH. `kill -USR2 <pid>`
     /// snapshots the profile so far without stopping the run — this is the point
     /// of the flag, since a hung build never reaches exit. A filtered final
@@ -123,46 +122,5 @@ mod tests {
     fn auto_approve_is_opt_in() {
         assert!(!parse(&["heph"]).auto_approve);
         assert!(parse(&["heph", "--auto-approve"]).auto_approve);
-    }
-}
-
-/// Whether a run uses its declared scratch caches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ScratchMode {
-    /// Mount and use them. The default.
-    #[default]
-    On,
-    /// Pretend none were declared. The audit mode — see `--scratch`.
-    Off,
-}
-
-fn parse_scratch_mode(s: &str) -> Result<ScratchMode, String> {
-    match s {
-        "on" => Ok(ScratchMode::On),
-        "off" => Ok(ScratchMode::Off),
-        other => Err(format!(
-            "unknown scratch mode {other:?} — expected `on` (default) or `off` \
-             (run with every scratch cache absent, to check a target does not \
-             depend on carried-over state)"
-        )),
-    }
-}
-
-#[cfg(test)]
-mod scratch_mode_tests {
-    use super::*;
-
-    #[test]
-    fn scratch_mode_parses_its_two_words() {
-        assert_eq!(parse_scratch_mode("on"), Ok(ScratchMode::On));
-        assert_eq!(parse_scratch_mode("off"), Ok(ScratchMode::Off));
-        assert_eq!(ScratchMode::default(), ScratchMode::On);
-    }
-
-    #[test]
-    fn an_unknown_scratch_mode_explains_what_off_is_for() {
-        let err = parse_scratch_mode("readonly").expect_err("unknown");
-        assert!(err.contains("readonly"), "{err}");
-        assert!(err.contains("carried-over state"), "{err}");
     }
 }

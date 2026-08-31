@@ -92,24 +92,15 @@ pub fn telemetry_enabled_from_config() -> bool {
         .unwrap_or(true)
 }
 
-/// Run-scoped scratch switch, set once from `--scratch` before the engine is
-/// built.
+/// Build the engine for this invocation.
 ///
-/// A global rather than a parameter because `new_engine` is called from a dozen
-/// command paths that have no opinion on it, and threading a flag through all of
-/// them to reach one field would be a worse trade than one write at startup.
-static SCRATCH_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Apply `--scratch`. Called from the CLI entrypoint before any engine exists.
-pub fn set_scratch_enabled(enabled: bool) {
-    SCRATCH_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn scratch_enabled() -> bool {
-    SCRATCH_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
+/// Takes the CLI's global options rather than reading them from a static: a
+/// process-global switch makes `scratch.enabled` arrive from nowhere as far as
+/// this function's signature is concerned, and every caller here already holds
+/// `global` — it is threaded into `execute` for exactly this reason.
+pub fn new_engine(
+    global: &crate::commands::global::GlobalOptions,
+) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
         Err(inner) => anyhow::bail!("Error: {}", inner),
@@ -119,7 +110,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // applies every default in one place and yields the engine's runtime config.
     let file = config_yaml::load_from_root(&root)?;
     let mut config = file.resolve(&root)?;
-    config.scratch.enabled = scratch_enabled();
+    config.scratch.enabled = !global.no_scratch;
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend

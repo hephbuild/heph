@@ -90,7 +90,7 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
             .with_context(|| format!("parse scope {s}"))?,
         None => Matcher::PackagePrefix(PkgBuf::from("")),
     };
-    let (engine, shutdown) = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine(&global)?;
     let app = RevdepsApp {
         engine,
         addr,

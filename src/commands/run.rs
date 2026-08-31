@@ -111,7 +111,7 @@ struct RunApp {
     matcher: Matcher,
     fail_fast: bool,
     auto_approve: bool,
-    /// `--scratch=off`: run with every declared scratch cache absent. Implies a
+    /// `--no-scratch`: run with every declared scratch cache absent. Implies a
     /// forced rebuild — see where `force` is set.
     scratch_off: bool,
     /// Shared approval queue: attached to the TUI view (so prompts render) and to
@@ -197,7 +197,7 @@ impl App for RunApp {
         };
 
         let opts = ResultOptions {
-            // `--scratch=off` implies `--force`, and must: the whole point is to
+            // `--no-scratch` implies `--force`, and must: the whole point is to
             // check that a target produces the same outputs without its carried
             // -over state, and a cached result was produced *with* it. Serving
             // one back would make the audit vacuous — it would pass by reading
@@ -319,14 +319,14 @@ pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow:
 async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
-    let (engine, shutdown) = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine(&global)?;
     let app = RunApp {
         args,
         engine: std::sync::Arc::clone(&engine),
         matcher: m,
         fail_fast: global.fail_fast,
         auto_approve: global.auto_approve,
-        scratch_off: global.scratch == crate::commands::ScratchMode::Off,
+        scratch_off: global.no_scratch,
         approval: tui::ApprovalCenter::new(),
     };
     let interactive = tui::should_use_tui(global.no_tui);

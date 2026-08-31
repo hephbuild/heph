@@ -152,14 +152,14 @@ async fn execute_async(
     // selection to make — so it must not be forced through `selection`, which
     // deliberately refuses an empty one rather than wiping the target cache.
     if args.scratch && args.arg1.is_none() && args.expr.is_none() {
-        let (engine, _shutdown) = bootstrap::new_engine()?;
+        let (engine, _shutdown) = bootstrap::new_engine(&global)?;
         let (n, freed) = engine.scratch_remove(None)?;
         println!("Removed {n} scratch cache(s), freed {freed} bytes.");
         return Ok(());
     }
 
     let matcher = selection(&args, &cwp)?;
-    let (engine, shutdown) = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine(&global)?;
     if args.scratch
         && let Some(addr) = args.arg1.as_deref()
     {
@@ -179,6 +179,43 @@ async fn execute_async(
 mod tests {
     use super::*;
     use clap::Subcommand as _;
+
+    /// Global options and a subcommand's own args live in one clap command, so
+    /// two flags sharing an *id* is a runtime panic on access — not a build
+    /// error, and not something `--help` surfaces.
+    ///
+    /// This bit: `clean` has `--scratch` (a bool) and the globals once had
+    /// `--scratch` (a mode), both under the id `scratch`. Every `heph tool clean`
+    /// died with "Mismatch between definition and access of `scratch`". Nothing
+    /// caught it, because the only CLI test harness flattened the globals with no
+    /// subcommand attached — the one arrangement where the two never meet.
+    ///
+    /// So this harness is the point of the test: globals *and* a subcommand,
+    /// parsed together, with both values read.
+    #[test]
+    fn clean_and_the_globals_do_not_share_an_argument_id() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            global: crate::commands::global::GlobalOptions,
+            #[command(subcommand)]
+            cmd: TestCmd,
+        }
+
+        #[derive(clap::Subcommand)]
+        enum TestCmd {
+            Clean(CleanArgs),
+        }
+
+        let cli = TestCli::try_parse_from(["heph", "clean", "--scratch", "--no-scratch"])
+            .expect("both flags must parse together");
+        // Reading both is what trips a shared id; parsing alone would not.
+        assert!(cli.global.no_scratch, "the global flag must be readable");
+        let TestCmd::Clean(clean) = cli.cmd;
+        assert!(clean.scratch, "clean's own flag must be readable");
+    }
 
     /// The positional/expr forms, as clap would fill them. The `<LABEL>
     /// <PACKAGE_MATCHER>` pair is deliberately absent: `matcher_from_args`

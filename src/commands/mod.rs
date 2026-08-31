@@ -13,7 +13,6 @@ pub mod validate;
 pub mod version;
 
 pub use global::GlobalOptions;
-pub use global::ScratchMode;
 
 use clap::Subcommand;
 
