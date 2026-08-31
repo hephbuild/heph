@@ -36,3 +36,6 @@ bollard = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
+# For the test that the `blobs` scratch spec this crate emits actually parses as
+# a declaration — the driver that parses it lives there.
+hbuiltins = { package = "builtins", path = "../builtins" }

@@ -4263,6 +4263,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bollard",
+ "builtins",
  "bytes",
  "core",
  "docker_credential",

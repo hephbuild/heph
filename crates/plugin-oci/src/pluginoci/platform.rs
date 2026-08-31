@@ -213,11 +213,8 @@ impl EProvider for Provider {
                             // The *image* is platform-specific; the *blob store*
                             // is not. Blobs are opaque digest-named bytes, so one
                             // store can hold amd64 and arm64 layers side by side
-                            // and travel between machines unchanged.
-                            (
-                                "platform".to_string(),
-                                hcore::htvalue::Value::String("any".to_string()),
-                            ),
+                            // and travel between machines unchanged — hence no
+                            // `version`, which is what declares a slot portable.
                             ("remote".to_string(), hcore::htvalue::Value::Bool(false)),
                         ]),
                         ..Default::default()
@@ -400,6 +397,33 @@ mod tests {
     use hcore::hasync::StdCancellationToken;
     use hplugin::provider::TargetSpec;
     use std::collections::HashMap;
+
+    /// The `blobs` spec must survive the driver that will actually parse it.
+    ///
+    /// A `scratch` declaration rejects unknown fields, so emitting one is not a
+    /// warning — it is a hard failure of every target that references the cache.
+    /// This crate shipped exactly that: it kept setting `platform` after the
+    /// field was removed from the declaration, and nothing here noticed because
+    /// no test parsed the spec it builds. `oci_docker`'s e2e caught it, which is
+    /// three minutes of CI later than it needed to be.
+    #[tokio::test]
+    async fn the_blobs_spec_parses_as_a_declaration() {
+        let addr = hmodel::htaddr::parse_addr(&blobs_addr()).expect("addr");
+        let resp = Provider
+            .get(
+                GetRequest {
+                    request_id: "req".to_string(),
+                    addr,
+                    states: vec![],
+                    executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
+                },
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("the provider serves the blob store");
+        hbuiltins::pluginscratch::parse_declaration(&resp.target_spec)
+            .expect("the blobs spec must parse as a scratch declaration");
+    }
 
     #[test]
     fn addr_carries_the_builder_as_an_arg() {
