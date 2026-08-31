@@ -72,54 +72,6 @@ impl Access {
     }
 }
 
-/// What the cache's *contents* are specific to, and therefore how widely one slot
-/// can be shared.
-///
-/// This is not a per-platform behavioural difference — the mechanism is identical
-/// on every supported target. It is the author stating a property of their cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum Platform {
-    /// Contents are specific to both the OS and the architecture. The default,
-    /// because the mistake it prevents is the bad one: a `GOCACHE` from
-    /// `darwin/arm64` restored on `linux/amd64`, or a dependency tree holding
-    /// native addons built for the wrong host.
-    OsArch,
-    /// Contents depend on the OS but not the instruction set.
-    Os,
-    /// Portable: one slot serves every machine. The interesting case — a
-    /// package-manager cache, a resolver's metadata, a content-addressed blob
-    /// store — because it lets CI on `linux/amd64` warm a laptop on
-    /// `darwin/arm64` from the same lineage.
-    ///
-    /// It asserts **two** things, not one: that the contents do not depend on the
-    /// host, *and* that they do not embed absolute paths. A cache that is
-    /// genuinely platform-independent but path-sensitive will restore and be
-    /// inert — present, and useless.
-    Any,
-}
-
-impl Platform {
-    fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "os_arch" => Ok(Self::OsArch),
-            "os" => Ok(Self::Os),
-            "any" => Ok(Self::Any),
-            other => anyhow::bail!(
-                "unknown scratch `platform` {other:?} — expected \"os_arch\" (default), \"os\", \
-                 or \"any\" (portable across every machine)"
-            ),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OsArch => "os_arch",
-            Self::Os => "os",
-            Self::Any => "any",
-        }
-    }
-}
-
 /// Config for a `scratch` target. `#[derive(Spec)]` provides the parser and the
 /// LSP schema.
 ///
@@ -141,12 +93,25 @@ struct ScratchSpec {
     /// for a cache that is safe under concurrent access by construction.
     #[spec(ty = ParamType::String)]
     access: Option<String>,
-    /// What the contents are specific to: `"os_arch"` (default), `"os"`, or
-    /// `"any"` for a cache portable across every machine.
-    #[spec(ty = ParamType::String)]
-    platform: Option<String>,
-    /// Opaque string folded into the slot key — the author's cache-bust handle.
-    /// Changing it yields a fresh, empty slot and invalidates no cached result.
+    /// Everything the contents depend on, beyond the declaring address —
+    /// **the whole of it**. Two declarations sharing an addr share a directory
+    /// if and only if they agree here.
+    ///
+    /// heph does not guess. If a cache is specific to the host, say so with
+    /// `heph.core.os()` / `heph.core.arch()`; if it is specific to a toolchain
+    /// release, a target triple, or a set of build tags, put those in too. An
+    /// empty `version` (the default) declares a cache portable across every
+    /// machine — which is right for a content-addressed blob store or a
+    /// package-manager download cache, and wrong for a compiler cache.
+    ///
+    /// It doubles as the cache-bust handle: changing it yields a fresh, empty
+    /// slot and invalidates no cached result.
+    ///
+    /// ```python
+    /// version = heph.core.os() + "/" + heph.core.arch()   # host-specific
+    /// version = goos + "/" + goarch + "/" + go_version    # target-specific
+    /// version = ""                                        # portable
+    /// ```
     version: String,
     /// Whether the slot may be pulled from the remote cache automatically and
     /// published to it by `heph tool scratch push`.
@@ -170,7 +135,6 @@ pub struct ScratchDef {
     pub path: String,
     pub env: String,
     pub access: Access,
-    pub platform: Platform,
     pub version: String,
     pub remote: bool,
     pub max_size: Option<String>,
@@ -263,12 +227,6 @@ impl ScratchDef {
             .map(Access::parse)
             .transpose()?
             .unwrap_or(Access::Exclusive);
-        let platform = spec
-            .platform
-            .as_deref()
-            .map(Platform::parse)
-            .transpose()?
-            .unwrap_or(Platform::OsArch);
         let env = match spec.env {
             Some(e) if e.trim().is_empty() => {
                 anyhow::bail!("scratch `env` must not be empty — omit it to get `SCRATCH_<NAME>`")
@@ -280,7 +238,6 @@ impl ScratchDef {
             path: spec.path,
             env,
             access,
-            platform,
             version: spec.version,
             remote: spec.remote,
             max_size: spec.max_size,
@@ -321,7 +278,6 @@ impl hplugin::driver::Driver for Driver {
         h.update(def.path.as_bytes());
         h.update(def.env.as_bytes());
         h.update(def.access.as_str().as_bytes());
-        h.update(def.platform.as_str().as_bytes());
         h.update(def.version.as_bytes());
         h.update(&[def.remote as u8]);
         h.update(def.max_size.as_deref().unwrap_or("").as_bytes());
@@ -419,7 +375,6 @@ mod tests {
         assert_eq!(d.access, Access::Exclusive);
         // os_arch, because restoring a host-specific cache onto the wrong host is
         // the one mistake here that is not merely slow.
-        assert_eq!(d.platform, Platform::OsArch);
         assert!(!d.remote);
         assert_eq!(d.version, "");
         assert_eq!(d.max_size, None);
@@ -449,18 +404,26 @@ mod tests {
     }
 
     #[test]
-    fn access_and_platform_parse_their_words() {
+    fn access_parses_its_words() {
+        let d = parse(&[("path", s("c")), ("access", s("shared"))], "n").expect("parse");
+        assert_eq!(d.access, Access::Shared);
+    }
+
+    /// `version` is the *whole* of a slot's identity beyond its addr, so the
+    /// default has to be the portable one. heph knowing the host and folding it
+    /// in silently would be a guess about a cache it knows nothing about — and a
+    /// closed set of guesses (os, arch) could never express a toolchain release,
+    /// a target triple, or a set of build tags anyway.
+    #[test]
+    fn version_is_empty_by_default_and_carries_whatever_the_author_puts_there() {
+        assert_eq!(parse(&[("path", s("c"))], "n").expect("parse").version, "");
+        // Whatever it is, it is opaque — heph never parses or interprets it.
         let d = parse(
-            &[
-                ("path", s("c")),
-                ("access", s("shared")),
-                ("platform", s("any")),
-            ],
+            &[("path", s("c")), ("version", s("linux/amd64/go1.27"))],
             "n",
         )
         .expect("parse");
-        assert_eq!(d.access, Access::Shared);
-        assert_eq!(d.platform, Platform::Any);
+        assert_eq!(d.version, "linux/amd64/go1.27");
     }
 
     #[test]
@@ -470,13 +433,6 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("concurrent"), "{msg}");
         assert!(msg.contains("exclusive") && msg.contains("shared"), "{msg}");
-    }
-
-    #[test]
-    fn an_unknown_platform_is_rejected() {
-        let err = parse(&[("path", s("c")), ("platform", s("linux"))], "n")
-            .expect_err("unknown platform must fail");
-        assert!(format!("{err:#}").contains("os_arch"));
     }
 
     #[test]
@@ -582,7 +538,6 @@ mod tests {
         for (field, value) in [
             ("version", s("v2")),
             ("access", s("shared")),
-            ("platform", s("any")),
             ("env", s("GOCACHE")),
             ("remote", Value::Bool(true)),
             ("max_size", s("1GiB")),

@@ -19,7 +19,9 @@ extern crate core;
 // Foundational leaves now live in `heph-core`; re-export them at their original
 // module paths so `crate::hasync::…` etc. keep resolving unchanged across the
 // monolith.
-pub use hbuiltins::{pluginfs, plugingroup, pluginhostbin, pluginstatictarget, plugintextfile};
+pub use hbuiltins::{
+    pluginfs, plugingroup, pluginhostbin, pluginscratch, pluginstatictarget, plugintextfile,
+};
 pub use hcore::{
     debug_hash, defer, hartifactcontent, hasync, hmemoizer, htplatform, htvalue, version,
 };

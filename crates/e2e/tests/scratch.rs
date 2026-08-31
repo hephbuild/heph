@@ -509,6 +509,45 @@ target(name = "b", driver = "bash", out = "b.txt", scratch = ["//build:c"],
 
 /// Two declarations differing only in `version` are different caches — that is
 /// what makes `version` a bust handle rather than a label.
+/// heph contributes nothing to a slot's identity beyond the addr and `version`.
+/// Everything else on the declaration is policy about how a cache is *used*, not
+/// a statement about what is in it, so none of it may split the slot — otherwise
+/// changing where a cache mounts, or who may hold it, silently starts a new one.
+#[tokio::test]
+async fn identity_is_the_addr_and_version_and_nothing_else() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C",
+       access = "shared", remote = True)"#,
+    );
+    let engine = ws.reopen()?;
+    let a = slot_of(&engine, "//build:c").await?;
+
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/y", env = "D",
+       access = "exclusive")"#,
+    );
+    let engine = ws.reopen()?;
+    let b = slot_of(&engine, "//build:c").await?;
+
+    assert_eq!(
+        a, b,
+        "path/env/access/remote are policy, not identity — they must not split the slot"
+    );
+    Ok(())
+}
+
+/// Resolve a declaration's slot the way the engine does.
+async fn slot_of(engine: &Arc<heph::engine::Engine>, addr: &str) -> anyhow::Result<String> {
+    let addr = heph::htaddr::parse_addr(addr)?;
+    let rs = engine.new_state();
+    let spec = Arc::clone(engine).get_spec(rs, &addr).await?;
+    let def = heph::pluginscratch::parse_declaration(&spec)?;
+    Ok(heph::engine::scratch::ResolvedScratch { addr, def }.slot())
+}
+
 #[tokio::test]
 async fn version_selects_a_different_slot() -> anyhow::Result<()> {
     let ws = Workspace::new();

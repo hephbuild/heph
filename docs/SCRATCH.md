@@ -186,7 +186,6 @@ target(
     path     = ".cache/go-build",   # where it mounts, in every consumer
     env      = "GOCACHE",           # the variable the tool reads it from
     access   = "shared",            # "exclusive" (default) | "shared"
-    platform = "os_arch",           # what the contents are specific to (§6.1)
     remote   = True,                # may be pulled/pushed (§10)
     version  = "go1.23",            # busts the slot when it changes
     max_size = "10GiB",
@@ -206,8 +205,7 @@ already have defined.
 | `path` | required | mount point in a consumer's sandbox, relative to that target's cwd. The same for every consumer (§5.2) |
 | `env` | `SCRATCH_<NAME>` | environment variable carrying the directory's path (§5.5) |
 | `access` | `"exclusive"` | `exclusive` = one consumer at a time (the ask). `shared` = "trust the tool": concurrent, for caches safe by construction (§8.1) |
-| `platform` | `"os_arch"` | `os_arch` = contents are specific to both. `os` = arch-independent. `any` = portable, and shareable across every machine (§6.1) |
-| `version` | `""` | opaque string folded into the slot key; the author's bust handle |
+| `version` | `""` | opaque string folded into the slot key: **everything the contents depend on**, and the bust handle. Empty = portable across every machine. Use `heph.core.os()` / `heph.core.arch()` for a host-specific cache (§6.1) |
 | `remote` | `False` | may be pulled from the remote automatically and pushed to it by `heph tool scratch push` |
 | `max_size` | config default | per-slot cap; over it the slot is dropped (§11) |
 
@@ -407,12 +405,12 @@ long, still overloads "cache"). **A `product-vision` call, not settled here.**
 ### 6.1 Slot key
 
 ```
-slot = H( addr, version, platform_components(platform) )
-
-platform_components("os_arch") = (os, arch)     # default
-platform_components("os")      = (os,)
-platform_components("any")     = ()
+slot = H( addr, version )
 ```
+
+heph contributes **no dimension of its own**. Whatever a cache's contents depend
+on, the author says so; an empty `version` declares a cache portable across every
+machine.
 
 - **`addr`** — the declaring target's address. The addr *is* the cache's identity,
   so packages give namespacing for free: `//go:gocache` and `//rust:gocache` are
@@ -421,24 +419,31 @@ platform_components("any")     = ()
   Moving or renaming the declaration busts the slot, which is the same rule every
   other target already follows.
 - **`version`** — the author's bust handle.
-- **`platform`** — how much of the host the contents are specific to. Not a
-  behavioural difference between platforms (which CLAUDE.md reserves for the
-  user); it is the author stating a property of *their cache*, and the mechanism
-  is identical on all three supported targets.
+- **`version`** — everything else the contents depend on, and the author's bust
+  handle. One opaque string, never parsed by heph. The Starlark builtins
+  `heph.core.os()` and `heph.core.arch()` already exist, so a host-specific cache
+  says so in userland:
 
-  `os_arch` is the default because the failure it prevents is the bad one: a
-  `GOCACHE` from `darwin/arm64` restored on `linux/amd64`, or a `node_modules`
-  holding native addons built for the wrong host. `os` suits a cache keyed on
-  OS-shaped paths or APIs but not on instruction set. **`any` makes the cache one
-  slot for every machine**, which is the interesting case — a JS package cache, a
-  resolver's metadata, a download cache — and it means CI on `linux/amd64` warms a
-  laptop on `darwin/arm64` from the same lineage.
+  ```python
+  version = heph.core.os() + "/" + heph.core.arch()   # host-specific
+  version = goos + "/" + goarch + "/" + go_version    # target-specific
+  version = ""                                        # portable (default)
+  ```
 
-  `any` is an author assertion in the same class as `access = "shared"`, and it
-  asserts **two** things, not one: that the contents do not depend on the host
-  *and* that they do not embed absolute paths (§10.9). A cache that is genuinely
-  platform-independent but path-sensitive will restore and be inert — present, and
-  useless. The narrower `platform` is the safer mistake.
+  A closed `platform = "os_arch" | "os" | "any"` enum was the obvious
+  alternative and is the wrong shape twice over. It is *incomplete*: a chain
+  (`os_arch ⊃ os ⊃ any`) that cannot say "arch but not OS", "OS plus libc", or
+  anything about a toolchain release, a target triple or a set of build tags. And
+  it is *wrong*: it would hash the **host**, while a cross-compiled toolchain's
+  cache contents depend on the **target** — so a laptop cross-compiling to
+  `linux/amd64` and a CI runner building it natively would get different slots for
+  byte-identical content, defeating the transfer a shared lineage exists for.
+
+  An empty `version` on a `remote = True` cache is an author assertion in the same
+  class as `access = "shared"`, and it asserts **two** things, not one: that the
+  contents do not depend on the machine *and* that they do not embed absolute
+  paths (§10.9). A cache that is genuinely portable but path-sensitive will
+  restore and be inert — present, and useless.
 
 Deliberately **not** in the key: `path` (where a cache lives is not what is in
 it — and since §5.2 fixes it per declaration, it cannot vary anyway), `env`,
@@ -883,7 +888,7 @@ dimensions as first-class things, so the flattening has nothing to do:
 
 | GHA key fragment | here |
 |---|---|
-| `${{ runner.os }}-${{ runner.arch }}` | `platform` on the declaration (§6.1) |
+| `${{ runner.os }}-${{ runner.arch }}` | `version = heph.core.os() + "/" + heph.core.arch()` (§6.1) |
 | a name like `go-build-` | the declaring target's addr (§6.1) |
 | `${{ hashFiles('go.sum') }}` | `version` |
 | the branch, when people remember to add it | `scope` (§10.3) |
@@ -911,8 +916,7 @@ target(
     path             = "node_modules/.cache",
     version          = hash_files("package-lock.json"),
     version_fallback = True,     # inherit the previous version's cache
-    platform         = "any",
-)
+)                                # no host in `version` — a JS package cache is portable
 ```
 
 With it on, resolution — having exhausted every scope for the current version —
@@ -1163,14 +1167,13 @@ target(
     path     = ".heph-gocache",
     env      = "GOCACHE",
     access   = "shared",          # Go's cache is concurrency-safe by design (§8.1)
-    platform = "os_arch",
     version  = go_cache_version(...),   # goroot + tags + goexperiment + race
     remote   = True,
 )
 ```
 
 Everything the module hand-rolls maps onto something declared: the key's variable
-parts become `version`, the fixed ones become `platform`, and the "concurrent
+parts become `version`, and the "concurrent
 access is fine" property that today is expressed by *having no lock at all*
 becomes `access = "shared"` — stated rather than implied. The fallback-to-
 sandbox-local path disappears: a slot always resolves, and a cold one is just cold.
@@ -1203,7 +1206,7 @@ content-addressed and `go.sum`-verified. A declared scratch is strictly better o
 every axis: heph owns the directory instead of borrowing the host's, it is bounded
 and evictable, it is visible in `heph tool scratch ls`, and it can be published so
 a CI runner does not re-download the module graph on every job. It is also a clean
-`platform = "any"` — the module cache holds source, not objects.
+portable — no `version` at all, since the module cache holds source, not objects.
 
 This is the change with the largest CI effect and the one to sequence last, since
 it narrows a hole rather than widening one and deserves its own before/after.
@@ -1554,7 +1557,7 @@ generations spanning the zero-padding width; scope precedence.
   Watch this when the mounting path lands: pluginexec's `apply_transitive`
   re-seeds the def hash, so routing anything scratch-shaped through the transitive
   sandbox would move the key of every consumer that has one
-- **`platform`:** `os_arch` gives different slots on different os/arch; `any`
+- **`version`:** a host-specific `version` gives different slots on different os/arch; an empty one
   gives one slot across all of them; `os` splits on os only — asserted on the key,
   not on behaviour
 - **`version_fallback`:** off, a version bump is fully cold; on, it seeds from the
@@ -1745,7 +1748,7 @@ than after.
   build throws away its own incremental work; too high and the guard never fires.
   It is configurable and observable (`heph tool scratch head`) precisely because the
   default will be wrong for someone.
-- **A wrongly-declared `platform = "any"` is a real wrong-answer risk**, and the
+- **A `version` that omits something the contents depend on is a real wrong-answer risk**, and the
   only author assertion here that is. `access = "shared"` and `version_fallback`
   fail into slowness; a cache that turns out to be host-specific — a
   `node_modules` with native addons, a store holding compiled objects — restores
@@ -1767,9 +1770,10 @@ than after.
 - **A scratch mounts at its declared `path`, everywhere.** No per-consumer
   override; `scratch = [addrs]` is the only reference form. Location is part of
   what a cache is (§5.2).
-- **`platform` is declared, not assumed.** `os_arch` by default, `any` for a
-  cache that is genuinely portable — which makes one slot serve every machine on
-  the lineage. §6.1.
+- **The slot key is `(addr, version)` and nothing else — heph contributes no
+  dimension of its own.** What a cache is specific to is userland: a closed
+  `platform` enum over the host's os/arch would be both inexpressive and, for a
+  cross-compiled toolchain, keyed on the wrong machine. §6.1.
 - **`version` gets an opt-in fallback**, credited to GHA's `restore-keys`: a
   `version` that is a lockfile fingerprint should inherit the previous version's
   cache, while a `version` that is a bust handle must not. §10.5.

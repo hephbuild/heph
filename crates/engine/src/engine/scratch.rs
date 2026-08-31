@@ -25,7 +25,7 @@ use crate::engine::driver::targetdef::Input;
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::LockBackend;
 use anyhow::Context as _;
-use hbuiltins::pluginscratch::{Access, DRIVER_NAME, Platform, ScratchDef, parse_declaration};
+use hbuiltins::pluginscratch::{Access, DRIVER_NAME, ScratchDef, parse_declaration};
 use hcore::hasync::Cancellable;
 use hlock::hlock::{FRWLock, KeyedRWLock, MemRWLock};
 use hmodel::htaddr::Addr;
@@ -46,7 +46,7 @@ pub struct ResolvedScratch {
 impl ResolvedScratch {
     /// Stable id for this cache's storage slot.
     ///
-    /// The identity is `(addr, version, platform-components)` — see
+    /// The identity is `(addr, version)` — see
     /// `docs/SCRATCH.md` §6.1 for what is deliberately *absent*: `path`, `env`,
     /// `access`, `remote` and `max_size` are all policy about how a cache is used
     /// rather than what is in it, and changing one must not throw the contents
@@ -59,20 +59,20 @@ impl ResolvedScratch {
         /// On-disk layout version for a slot directory.
         const SLOT_FORMAT: u32 = 1;
 
+        // Addr and `version`, and nothing else. heph contributes no dimension of
+        // its own: what a cache's contents depend on is the author's statement,
+        // not heph's guess. A closed enum over the host's os/arch — the obvious
+        // alternative — cannot express a toolchain release, a target triple or a
+        // set of build tags, and for a cross-compiled toolchain it would key on
+        // the *host* while the contents depend on the *target*.
+        //
+        // `heph.core.os()` and `heph.core.arch()` are Starlark builtins, so a
+        // host-specific cache says so in userland; an empty `version` means
+        // portable.
         let mut h = xxhash_rust::xxh3::Xxh3Default::new();
         SLOT_FORMAT.hash(&mut h);
         self.addr.format().hash(&mut h);
         self.def.version.hash(&mut h);
-        // Only the components the declaration says the contents depend on. This
-        // is what lets `platform = "any"` give one slot for every machine.
-        match self.def.platform {
-            Platform::OsArch => {
-                std::env::consts::OS.hash(&mut h);
-                std::env::consts::ARCH.hash(&mut h);
-            }
-            Platform::Os => std::env::consts::OS.hash(&mut h),
-            Platform::Any => {}
-        }
         format!("{:016x}", h.finish())
     }
 }
@@ -348,7 +348,6 @@ mod tests {
                 path: path.to_string(),
                 env: env.to_string(),
                 access: hbuiltins::pluginscratch::Access::Exclusive,
-                platform: hbuiltins::pluginscratch::Platform::OsArch,
                 version: String::new(),
                 remote: false,
                 max_size: None,
