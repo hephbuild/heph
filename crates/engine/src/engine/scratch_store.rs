@@ -48,8 +48,6 @@ pub struct SlotMeta {
     pub env: String,
     /// `"exclusive"` / `"shared"`.
     pub access: String,
-    /// `"os_arch"` / `"os"` / `"any"`.
-    pub platform: String,
     /// The declaration's bust handle.
     pub version: String,
     /// Whether the declaration opted into the remote lineage.
@@ -280,7 +278,6 @@ mod tests {
             path: ".cache/x".to_string(),
             env: "C".to_string(),
             access: "exclusive".to_string(),
-            platform: "os_arch".to_string(),
             version: String::new(),
             remote: false,
         }

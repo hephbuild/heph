@@ -142,9 +142,6 @@ fn describe(slot: &SlotEntry) -> (String, String) {
             if !m.version.is_empty() {
                 detail.push_str(&format!(" v={}", m.version));
             }
-            if m.platform != "os_arch" {
-                detail.push_str(&format!(" platform={}", m.platform));
-            }
             if m.remote {
                 detail.push_str(" remote");
             }
@@ -374,7 +371,6 @@ mod tests {
             path: ".cache/go-build".to_string(),
             env: "GOCACHE".to_string(),
             access: "shared".to_string(),
-            platform: "os_arch".to_string(),
             version: String::new(),
             remote: false,
         }
@@ -386,7 +382,6 @@ mod tests {
         assert_eq!(name, "//build:gocache");
         assert!(detail.contains("shared"), "{detail}");
         assert!(detail.contains(".cache/go-build"), "{detail}");
-        // The default platform is not worth a column of noise.
         assert!(!detail.contains("os_arch"), "{detail}");
         assert!(!detail.contains("remote"), "{detail}");
     }
@@ -394,11 +389,9 @@ mod tests {
     #[test]
     fn non_default_settings_are_called_out() {
         let mut m = meta();
-        m.platform = "any".to_string();
         m.version = "go1.23".to_string();
         m.remote = true;
         let (_, detail) = describe(&entry(Some(m)));
-        assert!(detail.contains("platform=any"), "{detail}");
         assert!(detail.contains("v=go1.23"), "{detail}");
         assert!(detail.contains("remote"), "{detail}");
     }

@@ -461,7 +461,6 @@ impl Engine {
                     path: r.def.path.clone(),
                     env: r.def.env.clone(),
                     access: r.def.access.as_str().to_string(),
-                    platform: r.def.platform.as_str().to_string(),
                     version: r.def.version.clone(),
                     remote: r.def.remote,
                 },
