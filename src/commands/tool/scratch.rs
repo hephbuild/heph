@@ -141,7 +141,6 @@ fn describe_scope(scope: &str) -> String {
     }
 }
 
-
 fn describe(slot: &SlotEntry) -> (String, String) {
     match &slot.meta {
         Some(m) => {
@@ -336,7 +335,7 @@ async fn head(addr: &str) -> anyhow::Result<()> {
                     if wins { "*" } else { " " },
                     describe_scope(scope),
                     h.meta.generation,
-                    human_bytes(h.meta.bytes),
+                    hcore::units::human_bytes(h.meta.bytes),
                     h.cache,
                 );
                 if !h.meta.producer.is_empty() {
@@ -616,19 +615,6 @@ mod tests {
         // The default lineage has an empty name; printing `` for it reads like
         // something went wrong.
         assert_eq!(describe_scope(""), "the default lineage");
-    }
-
-    #[test]
-    fn human_bytes_reads_like_a_person_wrote_it() {
-        assert_eq!(hcore::units::human_bytes(0), "0 B");
-        assert_eq!(hcore::units::human_bytes(999), "999 B");
-        // Exact powers stay exact rather than becoming "1024.0 B".
-        assert_eq!(hcore::units::human_bytes(1024), "1.0 KiB");
-        assert_eq!(hcore::units::human_bytes(1536), "1.5 KiB");
-        assert_eq!(
-            hcore::units::human_bytes(10 * 1024 * 1024 * 1024),
-            "10.0 GiB"
-        );
     }
 
     fn entry(meta: Option<SlotMeta>) -> SlotEntry {
