@@ -146,6 +146,12 @@ pub fn is_gocache_pkg(pkg: &str) -> bool {
 /// The factors are already in the addr, so `version` stays empty: the slot key
 /// folds the addr in, and duplicating the factors into `version` would only give
 /// two ways to say the same thing.
+///
+/// Note what is deliberately *not* in it: the host OS and arch. A Go build
+/// cache's entries depend on the **target** (`GOOS`/`GOARCH`) and the toolchain,
+/// both already in the addr — not on the machine that ran the compiler. Keying on
+/// the host would give a laptop cross-compiling to `linux/amd64` and a CI runner
+/// building it natively different slots for identical content.
 pub fn build_spec(addr: Addr) -> TargetSpec {
     let config: HashMap<String, Value> = HashMap::from([
         ("path".to_string(), Value::String(GOCACHE_MOUNT.to_string())),
@@ -154,10 +160,6 @@ pub fn build_spec(addr: Addr) -> TargetSpec {
         // is what `go build -p N` does — and serializing it would turn the win
         // above into a large loss.
         ("access".to_string(), Value::String("shared".to_string())),
-        // Entries are host-toolchain artifacts, so a cache from one host is inert
-        // on another. `os_arch` here is the *host*; the Go target platform is in
-        // the addr.
-        ("platform".to_string(), Value::String("os_arch".to_string())),
         // Local-only for now. Publishing a Go build cache is worth doing and is a
         // separate change with its own before/after: the contents are large, and
         // whether the transfer beats a cold `go list` is a measurement, not a
@@ -267,5 +269,20 @@ mod tests {
         // The factors live in the addr; duplicating them into `version` would be
         // two ways to say one thing.
         assert!(!spec.config.contains_key("version"));
+    }
+
+    /// The spec must survive the driver that will actually parse it.
+    ///
+    /// Asserting individual config keys, as the test above does, cannot catch a
+    /// key the driver does not accept — and a `scratch` declaration rejects
+    /// unknown fields, so emitting one is not a warning but a hard failure of
+    /// every Go target that references the cache. This plugin shipped exactly
+    /// that: it kept setting `platform` after the field was removed from the
+    /// declaration, and no unit test noticed because none of them parsed.
+    #[test]
+    fn the_spec_parses_as_a_declaration() {
+        let spec = build_spec(key().addr());
+        hbuiltins::pluginscratch::parse_declaration(&spec)
+            .unwrap_or_else(|e| panic!("the gocache spec must parse as a declaration: {e:#}"));
     }
 }
