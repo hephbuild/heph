@@ -5,24 +5,21 @@
 # the team through git — the settings-pane equivalent is "local settings",
 # stored per-machine, so a teammate's worktrees would not get any of this.
 #
-# Orca prompts to trust this file the first time it appears; neither the hook
-# nor these tabs run until that is accepted.
-
-# Terminal tabs opened in every new worktree.
+# Orca prompts to trust this file the first time it appears; the hook does not
+# run until that is accepted.
 #
-# Wrapped in `devenv shell`, not bare `claude`: all development in this repo
-# happens inside the devenv shell (see CLAUDE.md), and an agent started outside
-# it gets a different — usually absent — toolchain. It would find no `cargo`, no
-# `buf`, no `gen`/`tst`/`lint`/`e2e` scripts, and no `kache`, so builds would
-# either fail outright or silently bypass the build cache by running an ambient
-# rustc with no `RUSTC_WRAPPER`. Wrapping the agent is what makes "just run
-# `lint`" work in a fresh worktree.
+# There are deliberately no `defaultTabs`. Whatever opens a shell or an agent
+# in a new worktree has to enter the devenv shell itself — all development in
+# this repo happens inside it (see CLAUDE.md), and a process started outside it
+# gets a different, usually absent, toolchain: no `cargo`, no `buf`, no
+# `gen`/`tst`/`lint`/`e2e` scripts, no `kache`. The failure worth knowing about
+# is the quiet one — an ambient `rustc` with no `RUSTC_WRAPPER` builds fine and
+# silently bypasses the build cache. So:
+#
+#     devenv shell -- claude --permission-mode auto
 #
 # The `--` matters: it ends devenv's own option parsing, so `--permission-mode`
 # reaches claude instead of being eaten as a devenv flag.
-defaultTabs:
-  - title: claude
-    command: devenv shell -- claude --permission-mode auto
 
 scripts:
   setup: |
