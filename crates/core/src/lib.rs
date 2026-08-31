@@ -25,5 +25,6 @@ pub mod hasync;
 pub mod hmemoizer;
 pub mod htplatform;
 pub mod htvalue;
+pub mod paths;
 pub mod shutdown;
 pub mod version;
