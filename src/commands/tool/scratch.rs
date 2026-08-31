@@ -128,7 +128,15 @@ impl ScratchArgs {
 fn describe(slot: &SlotEntry) -> (String, String) {
     match &slot.meta {
         Some(m) => {
-            let mut detail = format!("{} @ {}", m.access, m.path);
+            // A mountless cache has no path, and `exclusive @ ` with nothing
+            // after it reads like a truncated line rather than a deliberate
+            // absence. The env-var-only form is the common one, so this is not
+            // a rare case worth tolerating.
+            let mut detail = if m.path.is_empty() {
+                format!("{} (env {})", m.access, m.env)
+            } else {
+                format!("{} @ {}", m.access, m.path)
+            };
             if !m.version.is_empty() {
                 detail.push_str(&format!(" v={}", m.version));
             }
@@ -393,6 +401,22 @@ mod tests {
         assert!(detail.contains(".cache/go-build"), "{detail}");
         assert!(!detail.contains("os_arch"), "{detail}");
         assert!(!detail.contains("remote"), "{detail}");
+    }
+
+    /// A mountless cache is the common shape, and `exclusive @ ` with nothing
+    /// after it reads like a line that got cut off. It names the variable
+    /// instead — which is how a consumer finds it, and the only locating
+    /// information there is.
+    #[test]
+    fn a_mountless_cache_names_its_variable_instead_of_an_empty_path() {
+        let mut m = meta();
+        m.path = String::new();
+        let (_, detail) = describe(&entry(Some(m)));
+        assert!(detail.contains("GOCACHE"), "{detail}");
+        assert!(
+            !detail.contains(" @ "),
+            "no dangling mount marker: {detail}"
+        );
     }
 
     #[test]
