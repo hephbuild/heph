@@ -1521,21 +1521,7 @@ impl ProgressCore {
     }
 }
 
-/// Format a byte count as a compact human-readable size (`512 B`, `3.4 KiB`,
-/// `1.2 GiB`). Binary units; one decimal past the bytes band.
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut v = bytes as f64;
-    let mut unit = 0;
-    while v >= 1024.0 && unit < UNITS.len() - 1 {
-        v /= 1024.0;
-        unit += 1;
-    }
-    format!("{v:.1} {}", UNITS.get(unit).copied().unwrap_or("B"))
-}
+pub use hcore::units::human_bytes;
 
 /// Per-command header content for [`TuiProgressView`]. The view owns the box
 /// chrome, the elapsed clock, and the body (slow rows / lock waits / idle art);

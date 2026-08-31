@@ -1019,16 +1019,6 @@ fn signed(n: i64) -> String {
     format!("{n:+}")
 }
 
-fn human_bytes(b: u64) -> String {
-    const U: [(u64, &str); 4] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB"), (1, "B")];
-    for (unit, label) in U {
-        if b >= unit {
-            return format!("{:.1} {label}", b as f64 / unit as f64);
-        }
-    }
-    "0 B".to_string()
-}
-
 /// Render a stall report as the paragraph appended to the [`StallLog`].
 ///
 /// The wording deliberately avoids the vocabulary of a *failure* — no "error",
@@ -1076,7 +1066,7 @@ pub fn render_stall(r: &StallReport) -> String {
         if op.reports_bytes() && r.open.iter().any(|(o, _, _)| o == op) {
             out.push_str(&format!(
                 "  bytes        {} in the last {}s on {}\n",
-                human_bytes(*b),
+                hcore::units::human_bytes(*b),
                 BYTES_WINDOW.as_secs(),
                 op.label()
             ));

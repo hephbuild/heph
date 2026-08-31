@@ -125,24 +125,6 @@ impl ScratchArgs {
     }
 }
 
-/// Render a byte count the way a person reads one.
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
-    let mut v = n as f64;
-    let mut chosen: Option<&str> = None;
-    for unit in UNITS {
-        if v < 1024.0 {
-            break;
-        }
-        v /= 1024.0;
-        chosen = Some(unit);
-    }
-    match chosen {
-        None => format!("{n} B"),
-        Some(unit) => format!("{v:.1} {unit}"),
-    }
-}
-
 fn describe(slot: &SlotEntry) -> (String, String) {
     match &slot.meta {
         Some(m) => {
@@ -188,13 +170,20 @@ async fn ls(global: &GlobalOptions) -> anyhow::Result<()> {
         } else {
             slot.scopes.join(", ")
         };
-        println!("{name:<width$}  {:>10}  {scopes}", human_bytes(slot.bytes));
+        println!(
+            "{name:<width$}  {:>10}  {scopes}",
+            hcore::units::human_bytes(slot.bytes)
+        );
         if !detail.is_empty() {
             println!("{:<width$}  {:>10}  {detail}", "", "");
         }
     }
     println!();
-    println!("{} cache(s), {} total", slots.len(), human_bytes(total));
+    println!(
+        "{} cache(s), {} total",
+        slots.len(),
+        hcore::units::human_bytes(total)
+    );
     Ok(())
 }
 
@@ -227,7 +216,10 @@ async fn rm(addr: Option<&str>, all: bool, global: &GlobalOptions) -> anyhow::Re
     if removed == 0 {
         println!("Nothing to remove.");
     } else {
-        println!("Removed {removed} cache(s), freed {}.", human_bytes(freed));
+        println!(
+            "Removed {removed} cache(s), freed {}.",
+            hcore::units::human_bytes(freed)
+        );
     }
     Ok(())
 }
@@ -360,12 +352,15 @@ mod tests {
 
     #[test]
     fn human_bytes_reads_like_a_person_wrote_it() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(hcore::units::human_bytes(0), "0 B");
+        assert_eq!(hcore::units::human_bytes(999), "999 B");
         // Exact powers stay exact rather than becoming "1024.0 B".
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(1536), "1.5 KiB");
-        assert_eq!(human_bytes(10 * 1024 * 1024 * 1024), "10.0 GiB");
+        assert_eq!(hcore::units::human_bytes(1024), "1.0 KiB");
+        assert_eq!(hcore::units::human_bytes(1536), "1.5 KiB");
+        assert_eq!(
+            hcore::units::human_bytes(10 * 1024 * 1024 * 1024),
+            "10.0 GiB"
+        );
     }
 
     fn entry(meta: Option<SlotMeta>) -> SlotEntry {
