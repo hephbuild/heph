@@ -44,7 +44,6 @@ target(
     path = ".cache/go-build",
     env = "GOCACHE",
     access = "shared",
-    platform = "os_arch",
     version = "go1.23",
     remote = True,
 )
@@ -53,6 +52,27 @@ target(
 
     let spec = ws.get_spec("//build:gocache").await?;
     assert_eq!(spec.driver, "scratch");
+    Ok(())
+}
+
+/// An unknown field is rejected rather than ignored. This is the guard that makes
+/// removing a declaration field safe: `platform` used to exist, and a workspace
+/// still setting it must be told so rather than silently getting a cache keyed
+/// differently than its author believes.
+#[tokio::test]
+async fn an_unknown_field_on_a_declaration_is_rejected() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", platform = "os_arch")"#,
+    );
+    let spec = ws.get_spec("//build:c").await?;
+    let err = heph::pluginscratch::parse_declaration(&spec).expect_err("must reject");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("platform"),
+        "the message must name the field: {msg}"
+    );
     Ok(())
 }
 
