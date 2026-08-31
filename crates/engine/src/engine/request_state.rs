@@ -271,9 +271,11 @@ pub struct RequestStateData {
     /// Speculative `RequestState`s alive on this request — see
     /// [`RequestState::speculative_live`].
     speculative_live: std::sync::atomic::AtomicUsize,
-    // Key includes `is_top`: top-level vs dependency resolution of the same
-    // (addr, outputs) must not share a cell, because only the top-level frame
-    // writes a codegen target's tree back / stores its fixpoint.
+    // Key includes `is_top`: a top-level frame surfaces a failure as the run's own
+    // (`surface_top`) where a dependency frame reports it as collateral, so the two
+    // do not produce interchangeable results and must not share a cell. The codegen
+    // tree write-back used to be the reason and no longer is — it is
+    // is_top-independent and single-flights on `mem_codegen_tree`.
     pub mem_result: Memoizer<
         (AddrKey, OutputMatcher, bool),
         Result<Arc<crate::engine::result::EResult>, ArcErr>,
@@ -286,6 +288,14 @@ pub struct RequestStateData {
     /// addr can never both hold the non-reentrant per-addr lock — the
     /// self-deadlock this prevents.
     pub(crate) mem_locked_result: Memoizer<AddrKey, Result<Arc<LockedResolution>, ArcErr>>,
+    /// Single-flights the codegen tree write-back, keyed by `Addr` alone. Every
+    /// frame that resolves the target offers it — the top-level one, each
+    /// dependent that reads an output group, and the `meta` walk that only hashes
+    /// it — and exactly one performs it, so the tree is written once per addr per
+    /// request no matter how many ways the target was reached. The in_place
+    /// write-back guard and the fixpoint registration ride inside it, for the same
+    /// reason: one write, one guard, one fixpoint.
+    pub(crate) mem_codegen_tree: Memoizer<AddrKey, Result<(), ArcErr>>,
     /// Single-flights the lazy pull of one remote blob, keyed by
     /// `(addr, hashin, blob name)`. Two `outputs` cells of the same addr both need
     /// its support files, so without this they would download and write the same
@@ -330,6 +340,14 @@ pub struct RequestStateData {
     ///
     /// [`emit`]: RequestState::emit
     pub hooks: Vec<Arc<dyn crate::engine::hook::Hook>>,
+    /// `--frozen`: this run verifies the codegen tree instead of writing it.
+    ///
+    /// Request-scoped, not per-call, because the `copy` write-back fires on
+    /// dependency frames too and those resolve with `ResultOptions::default()` —
+    /// the flag on `ResultOptions` reaches only the frame the user's options were
+    /// built for. Stamped by that frame (the top-level one) before it resolves any
+    /// dependency, so every frame beneath it reads the run's real mode.
+    pub(crate) frozen: std::sync::atomic::AtomicBool,
     /// Guards the one-shot `RequestConfig` announcement so it fires once per request
     /// regardless of which entry point (`result` / `result_addr`) is hit first.
     pub workers_announced: std::sync::atomic::AtomicBool,
@@ -689,6 +707,25 @@ impl RequestState {
         self.data.hash_only
     }
 
+    /// True when this run verifies the codegen tree instead of writing it
+    /// (`--frozen`). See [`RequestStateData::frozen`].
+    pub fn frozen(&self) -> bool {
+        // Acquire/Release, not Relaxed: the top-level frame stores this before
+        // spawning the dependency work that reads it, and on a weakly-ordered
+        // target (aarch64) a relaxed pair does not order that store against the
+        // dependency's load — a dep could observe `false` on a frozen run and
+        // write the tree.
+        self.data.frozen.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record the run's `--frozen` mode. Called by the top-level frame only, from
+    /// the options the user's command built.
+    pub(crate) fn set_frozen(&self, frozen: bool) {
+        self.data
+            .frozen
+            .store(frozen, std::sync::atomic::Ordering::Release);
+    }
+
     /// Records a genuinely-failing target's rich diagnostic. First-writer-wins:
     /// if `addr` already has an entry (e.g. shared via the memoizer to multiple
     /// waiters), the existing one is kept.
@@ -1040,6 +1077,7 @@ impl Engine {
             speculative_live: std::sync::atomic::AtomicUsize::new(0),
             mem_execute_cache: Memoizer::with_tag_task("execute_cache", self.runtime.clone()),
             mem_locked_result: Memoizer::with_tag_task("locked_result", self.runtime.clone()),
+            mem_codegen_tree: Memoizer::with_tag_task("codegen_tree", self.runtime.clone()),
             mem_remote_blob: Memoizer::with_tag_task("remote_blob", self.runtime.clone()),
             mem_result: Memoizer::with_tag_task("result", self.runtime.clone()),
             mem_meta: Memoizer::with_tag_task("meta", self.runtime.clone()),
@@ -1054,6 +1092,7 @@ impl Engine {
             log_tail_lines,
             events,
             hooks: self.hooks(),
+            frozen: std::sync::atomic::AtomicBool::new(false),
             workers_announced: std::sync::atomic::AtomicBool::new(false),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending: Arc::clone(&bg_pending),
