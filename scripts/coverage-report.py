@@ -13,6 +13,17 @@ and reads as well tested. Neither Codecov's `ignore:` nor grcov's `--ignore`
 can reach these lines: both match on paths, and these live inside production
 source files.
 
+Why not `#[coverage(off)]`, which is what the ecosystem points at: it is still
+unstable on this repo's toolchain (rustc 1.96 gives `error[E0658]: the
+`#[coverage]` attribute is an experimental feature`; tracking issue #84605, open
+since 2021). Adopting it would mean a nightly toolchain for the coverage legs,
+`#![feature(coverage_attribute)]` in 42 crate roots, and an annotation on all
+184 `#[cfg(test)] mod tests` blocks that a new module can silently forget —
+which is the same failure this exists to close, moved somewhere with 184 chances
+to happen. When it stabilises the attribute becomes the better answer, because
+the regions are then excluded at instrumentation time rather than after the
+fact, and this file can go.
+
 The exclusion is computed from the source rather than by regex-matching line
 markers, because the obvious grcov spelling (`--excl-start '^#\\[cfg\\(test\\)\\]$'`
 with `--excl-stop '^\\}$'`) is wrong on this tree in a direction that fails

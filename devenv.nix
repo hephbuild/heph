@@ -351,7 +351,11 @@ in
   # for something CI never reads.
   #
   # `#[cfg(test)]` modules are stripped from the report by
-  # `scripts/coverage-report.py`. 39% of this tree's Rust lines are inside one,
+  # `scripts/coverage-report.py`. Upstream's answer for this is
+  # `#[coverage(off)]`, which is still unstable (E0658 on this repo's rustc
+  # 1.96, tracking issue #84605) and would cost a nightly toolchain for the
+  # coverage legs, `#![feature(coverage_attribute)]` in 42 crate roots, and an
+  # annotation on all 184 test modules that a new one can silently forget. 39% of this tree's Rust lines are inside one,
   # source-based coverage instruments them along with the code they test, and no
   # path-based exclusion can reach them because they live inside production
   # files. Left in they do not merely inflate the headline: `.claude/testing.md`
@@ -375,6 +379,33 @@ in
   #     its own `.profraw` and is counted with everything else. `llvm-tools` is
   #     already a toolchain component here (for `rust-objcopy`) and carries the
   #     `llvm-profdata` grcov needs.
+  #
+  # AND WHY NOT cargo-llvm-cov, which is the obvious fourth answer and drives
+  # the same rustc mechanism. On paper it replaces most of this script: it
+  # composes RUSTFLAGS with `.cargo/config.toml` instead of replacing them
+  # (`show-env` emits `--cfg tokio_unstable -Cforce-frame-pointers=yes -C
+  # instrument-coverage`), splits host from target units, manages the profiles,
+  # and reads them with the toolchain's own llvm-profdata so the format cannot
+  # skew. It was built that way and reverted, because it does not survive
+  # contact with kache — and the failure is silent, which is the one kind this
+  # feature cannot have:
+  #
+  #   - kache is this repo's `RUSTC_WRAPPER`, and cargo-llvm-cov installs its
+  #     own by default. `--no-rustc-wrapper` keeps kache, but that is also how
+  #     cargo-llvm-cov normally avoids instrumenting build scripts and
+  #     proc-macros, so `--target` has to do that job instead.
+  #   - `cargo llvm-cov report` then resolves objects and sources by the path
+  #     the compiler recorded, and kache normalises those (`/kache/.cargo/…`).
+  #     Measured on `-p core --lib`, same tree, same profiles: grcov reported
+  #     2,625 lines across `crates/core`; `cargo llvm-cov report` reported two
+  #     registry files and exited 0. A report of almost nothing, with no error.
+  #
+  # grcov is immune because it is told `--binary-path` and `--source-dir`
+  # explicitly and relativises with `--ignore-not-existing`, so it never depends
+  # on a recorded absolute path matching this machine. That is what the
+  # hand-rolled plumbing below buys, and why it is not merely reinvention.
+  # Revisit if kache gains a no-remap mode or cargo-llvm-cov gains an explicit
+  # binary/source path.
   #
   # Not measured, and deliberately: doctests still *run* under `cov` but are not
   # instrumented on stable, so they contribute nothing to the report; and `bin-e2e` is excluded for the
