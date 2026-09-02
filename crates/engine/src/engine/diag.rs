@@ -53,15 +53,26 @@ pub enum Op {
     RemoteCacheRead,
     RemoteCacheWrite,
     LocalCacheWrite,
+    /// Preparing a scratch directory — seeding a lineage from a fallback scope
+    /// or pulling a snapshot from the remote store.
+    ///
+    /// Tracked here for the same reason the cache-write spans are: it happens
+    /// *before* `ExecuteStart`, so without it a build spending four minutes
+    /// pulling a multi-GB cache touches nothing on the quiet clock and
+    /// [`no_work_in_flight`](StallReport::no_work_in_flight) reports that the
+    /// process has nothing to do — a stall paragraph for a build that is working
+    /// exactly as designed.
+    ScratchPrepare,
 }
 
 impl Op {
-    pub const ALL: [Op; 5] = [
+    pub const ALL: [Op; 6] = [
         Op::Result,
         Op::Execute,
         Op::RemoteCacheRead,
         Op::RemoteCacheWrite,
         Op::LocalCacheWrite,
+        Op::ScratchPrepare,
     ];
 
     const fn idx(self) -> usize {
@@ -71,6 +82,7 @@ impl Op {
             Op::RemoteCacheRead => 2,
             Op::RemoteCacheWrite => 3,
             Op::LocalCacheWrite => 4,
+            Op::ScratchPrepare => 5,
         }
     }
 
@@ -82,6 +94,7 @@ impl Op {
             Op::RemoteCacheRead => "remote-cache-read",
             Op::RemoteCacheWrite => "remote-cache-write",
             Op::LocalCacheWrite => "local-cache-write",
+            Op::ScratchPrepare => "scratch-prepare",
         }
     }
 
@@ -260,7 +273,11 @@ pub struct DiagState {
     /// How many interactive holds are open on the terminal. See
     /// [`DiagState::suppress_stall`].
     interactive_holds: AtomicU64,
-    ops: [OpState; 5],
+    /// One slot per [`Op`], indexed by [`Op::idx`]. Sized off [`Op::ALL`]:
+    /// `op_state` degrades an out-of-range index to "not tracked" rather than
+    /// panicking inside a diagnostic, so a hardcoded length would silently
+    /// un-track a newly added op instead of failing loudly.
+    ops: [OpState; Op::ALL.len()],
     limiters: Vec<Limiter>,
     /// Completed / failed targets, for the progress line.
     done: AtomicU64,
@@ -371,13 +388,7 @@ impl DiagState {
             base: Instant::now(),
             last_transition_ms: AtomicU64::new(0),
             interactive_holds: AtomicU64::new(0),
-            ops: [
-                OpState::new(),
-                OpState::new(),
-                OpState::new(),
-                OpState::new(),
-                OpState::new(),
-            ],
+            ops: std::array::from_fn(|_| OpState::new()),
             limiters,
             done: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -973,6 +984,12 @@ impl hplugin::hook::Hook for DiagHook {
                 ..
             } => s.scratch_wait_start(addr, scratch, *holder_pid, now),
             BuildEventKind::ScratchLockWaitEnd { addr, .. } => s.scratch_wait_end(addr, now),
+            BuildEventKind::ScratchPrepareStart { addr, .. } => {
+                s.op_start(Op::ScratchPrepare, addr, now);
+            }
+            BuildEventKind::ScratchPrepareEnd { addr, .. } => {
+                s.op_end(Op::ScratchPrepare, addr, now);
+            }
             // Cache hit/miss carry no span but are unambiguous progress.
             BuildEventKind::LocalCacheHit { .. }
             | BuildEventKind::LocalCacheMiss { .. }
@@ -1748,6 +1765,87 @@ mod tests {
         }));
         let r = s.evaluate(61_000, T).expect("reported");
         assert!(r.scratch_waits.is_none(), "the wait ended");
+    }
+
+    /// A scratch prepare in flight is work, not silence.
+    ///
+    /// The failing case this locks down: a cold CI runner pulling a multi-GB Go
+    /// build cache spends minutes inside `acquire_scratch`, which runs *before*
+    /// `ExecuteStart`. With no span open for it, the only thing the watchdog
+    /// sees is a `Result` span — which it correctly treats as bookkeeping — and
+    /// so it reports that the process has nothing to do, for a build that is
+    /// doing exactly what it was asked to.
+    #[test]
+    fn an_open_scratch_prepare_is_not_an_idle_process() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        s.op_start(Op::ScratchPrepare, "//a:b", 0);
+        let r = s
+            .evaluate(61_000, T)
+            .expect("a quiet run with an open span is still reported");
+        assert!(
+            !r.no_work_in_flight(),
+            "a scratch pull is heph's own work, not an idle process",
+        );
+    }
+
+    /// And once it closes the process really is idle — otherwise the arm above
+    /// would just be pinning the report open forever.
+    #[test]
+    fn a_closed_scratch_prepare_leaves_the_process_idle() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        s.op_start(Op::ScratchPrepare, "//a:b", 0);
+        s.op_end(Op::ScratchPrepare, "//a:b", 10);
+        let r = s.evaluate(61_000, T).expect("still reported");
+        assert!(r.no_work_in_flight(), "nothing is in flight any more");
+    }
+
+    /// The prepare *events* map to the op in both directions.
+    ///
+    /// The state-level tests above prove an open prepare counts as work; this
+    /// proves the events reach it, which a missing or mistyped arm would break
+    /// while leaving those green.
+    #[test]
+    fn the_prepare_events_open_and_close_the_scratch_op() {
+        use hplugin::hook::Hook as _;
+        let s = state();
+        let hook = DiagHook::new(std::sync::Arc::clone(&s));
+        hook.on_event(&ev(BuildEventKind::ScratchPrepareStart {
+            addr: "//a:b".into(),
+            scratch: "//build:gocache".into(),
+        }));
+        assert!(
+            !s.evaluate(61_000, T).expect("reported").no_work_in_flight(),
+            "an open prepare is work",
+        );
+
+        hook.on_event(&ev(BuildEventKind::ScratchPrepareEnd {
+            addr: "//a:b".into(),
+            scratch: "//build:gocache".into(),
+            outcome: "pulled".into(),
+            bytes: 1024,
+            path_mismatch: false,
+            error: None,
+        }));
+        assert!(
+            s.evaluate(61_000, T).expect("reported").no_work_in_flight(),
+            "the prepare closed",
+        );
+    }
+
+    /// Every [`Op`] has a distinct tracking slot. `op_state` degrades an
+    /// out-of-range index to "not tracked", so a variant added without
+    /// extending `ALL` would silently stop being counted — exactly the failure
+    /// the array's sizing is meant to prevent.
+    #[test]
+    fn every_op_has_its_own_slot() {
+        let idxs: std::collections::HashSet<usize> = Op::ALL.iter().map(|o| o.idx()).collect();
+        assert_eq!(idxs.len(), Op::ALL.len(), "two ops share an index");
+        assert!(
+            idxs.iter().all(|i| *i < Op::ALL.len()),
+            "an index is out of range"
+        );
     }
 
     /// A wedged cache write alongside a quiet exec fires at the ordinary

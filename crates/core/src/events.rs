@@ -214,6 +214,48 @@ pub enum BuildEventKind {
         addr: String,
         scratch: String,
     },
+    /// Start of preparing a scratch directory for a consumer: everything done
+    /// under the slot guard — resolving the lineage, seeding a new scope from a
+    /// fallback, creating the directory, and pulling from the remote when the
+    /// lineage is cold.
+    ///
+    /// One span rather than one per step: they share a guard, run in fixed
+    /// order, and a user cannot act on them separately. What they *can* act on
+    /// is the outcome, which is why the detail rides on the `End`.
+    ///
+    /// Only ever emitted on an execute (i.e. after a cache miss), so a fully
+    /// cached run emits none of these.
+    ScratchPrepareStart {
+        addr: String,
+        scratch: String,
+    },
+    ScratchPrepareEnd {
+        addr: String,
+        scratch: String,
+        /// What preparing the directory actually did — `"warm"`, `"seeded"`,
+        /// `"pulled"`, `"cold"`, `"audit"`, or `"interrupted"`.
+        ///
+        /// A string, not an enum, and for a wire reason: an enum variant a
+        /// skewed plugin has never heard of fails to deserialize, and the SDK
+        /// treats a decode failure as end-of-stream. An unrecognised string just
+        /// prints. Same call, for the same reason, as `ResultEnd::exit_status`.
+        #[serde(default)]
+        outcome: String,
+        /// Bytes pulled from the remote, when the outcome was `"pulled"`.
+        #[serde(default)]
+        bytes: u64,
+        /// The snapshot was restored at a different path than it was produced
+        /// at.
+        ///
+        /// Worth its own field rather than a log line: a cache whose entries
+        /// embed absolute paths restores perfectly and is then *inert* — the
+        /// pull reports success, the bytes are spent, and every future build
+        /// still runs cold. It looks exactly like a hit, so nothing else in the
+        /// stream can distinguish it.
+        #[serde(default)]
+        path_mismatch: bool,
+        error: Option<String>,
+    },
     RemoteCacheHit {
         addr: String,
     },
@@ -347,6 +389,28 @@ mod tests {
                 !scratch_disabled,
                 "a host with no such field had scratch enabled",
             ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The scratch spans decode with their detail fields absent — the shape an
+    /// older host, or one that emits only the `Start` half, produces.
+    #[test]
+    fn scratch_prepare_end_decodes_without_its_detail_fields() {
+        let frame = r#"{"at_unix_ms":1,"kind":{"type":"ScratchPrepareEnd",
+            "addr":"//a:x","scratch":"//b:cache","error":null}}"#;
+        let ev: BuildEvent = serde_json::from_str(frame).expect("must decode");
+        match ev.kind {
+            BuildEventKind::ScratchPrepareEnd {
+                outcome,
+                bytes,
+                path_mismatch,
+                ..
+            } => {
+                assert_eq!(outcome, "");
+                assert_eq!(bytes, 0);
+                assert!(!path_mismatch);
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }
