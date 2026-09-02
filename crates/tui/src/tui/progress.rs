@@ -3072,6 +3072,7 @@ mod tests {
         BuildEventKind::RequestConfig {
             max_workers: count,
             fail_fast: false,
+            scratch_disabled: false,
         }
     }
 

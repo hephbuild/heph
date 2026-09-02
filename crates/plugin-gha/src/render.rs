@@ -590,7 +590,7 @@ pub(crate) fn render_final(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Str
     }
 
     push_summary_table(&mut b, t, &c);
-    push_zero_hit_diagnosis(&mut b, &c);
+    push_zero_hit_diagnosis(&mut b, t, &c);
     // On the final summary as well as the live comment: the job summary is what
     // people actually read after the fact, and "why was this slow?" is a
     // question asked at the end, not during.
@@ -645,8 +645,19 @@ fn push_summary_table(b: &mut Budgeted, t: &Tally, c: &Counters) {
 /// sends someone to Slack. The precise reason needs `MissReason` on the miss
 /// events (`docs/GHA_REPORTING.md` §7.2); until then this says what *is* known
 /// and points at the command that answers the rest.
-fn push_zero_hit_diagnosis(b: &mut Budgeted, c: &Counters) {
+fn push_zero_hit_diagnosis(b: &mut Budgeted, t: &Tally, c: &Counters) {
     if c.cached() > 0 || c.misses() == 0 {
+        return;
+    }
+    // Under `--no-scratch` a total miss is the *requested* outcome, not a
+    // symptom. Sending someone to `inspect hashin` for it would be a wild goose
+    // chase — the flag implies a rebuild, so nothing consulted the cache.
+    if t.scratch_disabled() {
+        b.push(&format!(
+            "\n> [!NOTE]\n> **0 of {} targets hit cache** — this run used \
+             `--no-scratch`, which rebuilds every target it touches. Expected.\n\n",
+            fmt_count(c.misses())
+        ));
         return;
     }
     b.push(&format!(
@@ -786,6 +797,7 @@ mod tests {
             BuildEventKind::RequestConfig {
                 max_workers: 64,
                 fail_fast: false,
+                scratch_disabled: false,
             },
         ));
         t.apply(&ev(
@@ -1189,6 +1201,7 @@ mod tests {
             BuildEventKind::RequestConfig {
                 max_workers: 64,
                 fail_fast: true,
+                scratch_disabled: false,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
@@ -1242,6 +1255,7 @@ mod tests {
             BuildEventKind::RequestConfig {
                 max_workers: 64,
                 fail_fast: false,
+                scratch_disabled: false,
             },
         ));
         println!("\n===== LIVE, healthy =====\n");

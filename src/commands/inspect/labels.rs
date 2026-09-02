@@ -71,7 +71,7 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         Some(s) => htpkg::parse(s.as_str(), &crate::engine::get_cwp()?)?,
         None => Matcher::PackagePrefix(PkgBuf::from("")),
     };
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
     let app = LabelsApp {
         engine,
         matcher,

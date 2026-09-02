@@ -219,6 +219,7 @@ pub(crate) struct Tally {
     /// Whether this invocation stops at the first failure. Reported by the
     /// engine, never inferred here — see `BuildEventKind::RequestConfig`.
     fail_fast: bool,
+    scratch_disabled: bool,
     /// Open scratch waits: consumer -> (cache, started at). Drained into
     /// `scratch_waits` when the wait ends.
     scratch_wait_since: FxHashMap<Box<str>, (Box<str>, u64)>,
@@ -277,9 +278,11 @@ impl Tally {
             BuildEventKind::RequestConfig {
                 max_workers,
                 fail_fast,
+                scratch_disabled,
             } => {
                 self.max_workers = *max_workers;
                 self.fail_fast = *fail_fast;
+                self.scratch_disabled = *scratch_disabled;
             }
 
             BuildEventKind::Matched { addrs, complete } => {
@@ -609,6 +612,10 @@ impl Tally {
 
     pub(crate) fn fail_fast(&self) -> bool {
         self.fail_fast
+    }
+
+    pub(crate) fn scratch_disabled(&self) -> bool {
+        self.scratch_disabled
     }
 
     /// Caches that serialized targets this run, as `(cache, waiters, total ms)`,
@@ -1301,6 +1308,7 @@ mod tests {
             BuildEventKind::RequestConfig {
                 max_workers: 16,
                 fail_fast: false,
+                scratch_disabled: false,
             },
         ));
         t.apply(&ev(

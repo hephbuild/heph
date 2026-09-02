@@ -8,7 +8,6 @@
 //! keeps working when the targets that produced a slot have been deleted or
 //! renamed — the same property `heph tool clean` has for addr-only selections.
 
-use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::engine::scratch_store::{SlotEntry, store_root};
 use crate::tui::LogSink;
@@ -99,27 +98,19 @@ pub enum ScratchCommands {
 }
 
 impl ScratchArgs {
-    pub fn execute(&self, _sink: LogSink, _global: &GlobalOptions) -> anyhow::Result<()> {
+    pub fn execute(&self, _sink: LogSink) -> anyhow::Result<()> {
         match &self.command {
-            ScratchCommands::Ls => bootstrap::block_on(ls(_global))?,
-            ScratchCommands::Path { addr } => bootstrap::block_on(path(addr, _global))?,
-            ScratchCommands::Rm { addr, all } => {
-                bootstrap::block_on(rm(addr.as_deref(), *all, _global))?
-            }
+            ScratchCommands::Ls => bootstrap::block_on(ls())?,
+            ScratchCommands::Path { addr } => bootstrap::block_on(path(addr))?,
+            ScratchCommands::Rm { addr, all } => bootstrap::block_on(rm(addr.as_deref(), *all))?,
             ScratchCommands::Push {
                 addr,
                 all,
                 force,
                 producer,
-            } => bootstrap::block_on(push(
-                addr.as_deref(),
-                *all,
-                *force,
-                producer.clone(),
-                _global,
-            ))?,
+            } => bootstrap::block_on(push(addr.as_deref(), *all, *force, producer.clone()))?,
             ScratchCommands::Pull { addr, all } => {
-                bootstrap::block_on(pull(addr.as_deref(), *all, _global))?
+                bootstrap::block_on(pull(addr.as_deref(), *all))?
             }
         }
     }
@@ -152,8 +143,8 @@ fn describe(slot: &SlotEntry) -> (String, String) {
     }
 }
 
-async fn ls(global: &GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+async fn ls() -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine()?;
     let mut slots = engine.scratch_slots()?;
     if slots.is_empty() {
         println!("No scratch caches in this workspace.");
@@ -195,8 +186,8 @@ async fn ls(global: &GlobalOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn path(addr: &str, global: &GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+async fn path(addr: &str) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine()?;
     let slots = engine.scratch_slots()?;
     let found = slots
         .iter()
@@ -215,11 +206,11 @@ async fn path(addr: &str, global: &GlobalOptions) -> anyhow::Result<()> {
     }
 }
 
-async fn rm(addr: Option<&str>, all: bool, global: &GlobalOptions) -> anyhow::Result<()> {
+async fn rm(addr: Option<&str>, all: bool) -> anyhow::Result<()> {
     if all == addr.is_some() {
         anyhow::bail!("pass either an address or --all, not both or neither");
     }
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+    let (engine, _shutdown) = bootstrap::new_engine()?;
     let (removed, freed) = engine.scratch_remove(addr)?;
     if removed == 0 {
         println!("Nothing to remove.");
@@ -256,14 +247,8 @@ fn select(
         .collect())
 }
 
-async fn push(
-    addr: Option<&str>,
-    all: bool,
-    force: bool,
-    producer: String,
-    global: &GlobalOptions,
-) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+async fn push(addr: Option<&str>, all: bool, force: bool, producer: String) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine()?;
     let selected = select(engine.scratch_slots()?, addr, all)?;
     if selected.is_empty() {
         println!("Nothing to publish.");
@@ -308,8 +293,8 @@ async fn push(
     Ok(())
 }
 
-async fn pull(addr: Option<&str>, all: bool, global: &GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+async fn pull(addr: Option<&str>, all: bool) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine()?;
     let selected = select(engine.scratch_slots()?, addr, all)?;
     if selected.is_empty() {
         println!(

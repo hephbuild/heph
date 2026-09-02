@@ -93,7 +93,7 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let a = resolve_addr(args.a.as_ref())?;
     let b = resolve_addr(args.b.as_ref())?;
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
     let app = PathApp {
         engine,
         a,

@@ -63,19 +63,21 @@ pub fn sanitize_scope(scope: &str) -> String {
         .collect()
 }
 
-fn resolve_scratch(c: &ScratchConfig, root: &Path) -> ScratchOptions {
+/// `c` is `None` when the config file has no `scratch:` section at all — the
+/// common case, and still worth resolving here rather than through a separate
+/// `unwrap_or(defaults)` branch that would be one place for the two paths to
+/// drift apart.
+fn resolve_scratch(c: Option<&ScratchConfig>, root: &Path) -> ScratchOptions {
     let defaults = ScratchOptions::default();
     ScratchOptions {
-        // Not configurable from the file: turning scratch off is something you do
-        // to one run to check a target, not a state a workspace sits in.
-        enabled: defaults.enabled,
         scope: c
-            .scope
-            .as_deref()
+            .and_then(|c| c.scope.as_deref())
             .map(|s| expand_scope(s, root))
             .unwrap_or(defaults.scope),
-        restore_scopes: c.restore_scopes.clone(),
-        seed_on_fork: c.seed_on_fork.unwrap_or(defaults.seed_on_fork),
+        restore_scopes: c.map(|c| c.restore_scopes.clone()).unwrap_or_default(),
+        seed_on_fork: c
+            .and_then(|c| c.seed_on_fork)
+            .unwrap_or(defaults.seed_on_fork),
     }
 }
 
@@ -121,27 +123,6 @@ pub struct Config {
 /// expanded here, so nothing downstream knows about git.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScratchOptions {
-    /// Whether a declared scratch cache carries its contents between runs.
-    ///
-    /// `false` is `--no-scratch`, the audit mode. **It deletes nothing** — the
-    /// stored cache is left untouched and the run is pointed at a throwaway
-    /// directory instead. Everything else is still set up:
-    /// the declaration resolves, the slot is locked, a directory is created and
-    /// mounted, the environment variable is announced. What is withheld is the
-    /// **carried-over state** — the directory starts empty, and nothing is
-    /// pulled from the remote or published to it. The throwaway directory is
-    /// discarded afterwards, so a later ordinary build finds its cache exactly
-    /// as it left it.
-    ///
-    /// That is deliberately not "as if nothing were declared". Withholding the
-    /// directory too would audit the target's shell rather than the contract: a
-    /// target reading `$MYCACHE` unguarded would fail under `set -u` instead of
-    /// running cold, and every driver would need a fallback for a case that only
-    /// the audit produces. The contract says outputs must not depend on what is
-    /// *in* the cache; this checks exactly that.
-    ///
-    /// A run-time switch, deliberately not a config-file one.
-    pub enabled: bool,
     /// Lineage this run writes to. Empty means one shared lineage.
     pub scope: String,
     /// Lineages to fall back to on read, in order. Never written to.
@@ -153,7 +134,6 @@ pub struct ScratchOptions {
 impl Default for ScratchOptions {
     fn default() -> Self {
         Self {
-            enabled: true,
             scope: String::new(),
             restore_scopes: Vec::new(),
             // On, because branch scoping without it makes every switch cold,
@@ -267,11 +247,7 @@ impl ConfigYamlExt for ConfigYaml {
                 .map(mem_cache_opts)
                 .unwrap_or(defaults.tmp_cache),
             fuse: self.fuse.unwrap_or(defaults.fuse),
-            scratch: self
-                .scratch
-                .as_ref()
-                .map(|s| resolve_scratch(s, root))
-                .unwrap_or(defaults.scratch),
+            scratch: resolve_scratch(self.scratch.as_ref(), root),
             lock_backend: self
                 .lock
                 .and_then(|l| l.backend)
@@ -423,5 +399,34 @@ mod tests {
             serde_yaml::from_str("caches:\n  r:\n    write: false\n").expect("parse");
         let err = yaml.resolve(Path::new("/repo")).expect_err("must error");
         assert!(format!("{err:#}").contains("uri"), "{err}");
+    }
+
+    /// A config file with no `scratch:` section still resolves a usable lineage
+    /// policy. This used to take a separate `unwrap_or(defaults)` branch that
+    /// skipped `resolve_scratch` entirely — one place for the two paths to
+    /// drift apart.
+    #[test]
+    fn an_absent_scratch_section_still_resolves_a_lineage_policy() {
+        let bare = ConfigYaml::default()
+            .resolve(Path::new("/repo"))
+            .expect("resolve");
+        assert_eq!(bare.scratch, ScratchOptions::default());
+
+        let configured = ConfigYaml {
+            scratch: Some(ScratchConfig {
+                scope: Some("main".into()),
+                restore_scopes: vec!["master".into()],
+                seed_on_fork: Some(false),
+            }),
+            ..Default::default()
+        }
+        .resolve(Path::new("/repo"))
+        .expect("resolve");
+        assert_eq!(configured.scratch.scope, "main");
+        assert_eq!(
+            configured.scratch.restore_scopes,
+            vec!["master".to_string()]
+        );
+        assert!(!configured.scratch.seed_on_fork);
     }
 }

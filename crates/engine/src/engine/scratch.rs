@@ -382,7 +382,16 @@ impl Engine {
             .scratch_audit_ready
             .get_or_try_init(|| {
                 let root = crate::engine::scratch_store::audit_root(&self.home);
-                let mine = root.join(std::process::id().to_string());
+                // One directory per engine, not per process: see
+                // `audit_run_dir`. The counter is process-wide and only ever
+                // increments, so two engines never collide.
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mine = crate::engine::scratch_store::audit_run_dir(
+                    &self.home,
+                    std::process::id(),
+                    seq,
+                );
                 async move {
                     let m = mine.clone();
                     hcore::blocking::run(move || {
@@ -430,6 +439,7 @@ impl Engine {
         rs: &Arc<RequestState>,
         consumer: &Addr,
         resolved: &[ResolvedScratch],
+        no_scratch: bool,
     ) -> anyhow::Result<(Vec<ScratchMount>, Vec<ScratchGuard>)> {
         if resolved.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -460,7 +470,7 @@ impl Engine {
             // is withheld. That is what makes it an audit of the contract rather
             // than of the target's shell: "the same outputs from a cold cache",
             // not "survives having its cache ripped out".
-            let dir = if self.cfg.scratch.enabled {
+            let dir = if !no_scratch {
                 resolve_scope_dir(&self.home, &slot, &self.cfg.scratch, &r.addr)
                     .await
                     .with_context(|| format!("resolve scratch lineage for {}", r.addr))?
@@ -483,7 +493,7 @@ impl Engine {
             // cold build. Publishing is the opposite on all three counts and is
             // therefore a command (`heph tool scratch push`), never a side effect
             // of building.
-            if r.def.remote && self.cfg.scratch.enabled {
+            if r.def.remote && !no_scratch {
                 self.pull_if_cold(&slot, &dir, &r.addr).await;
             }
 
@@ -700,7 +710,6 @@ mod scope_tests {
 
     fn opts(scope: &str, fallbacks: &[&str], seed: bool) -> ScratchOptions {
         ScratchOptions {
-            enabled: true,
             scope: scope.to_string(),
             restore_scopes: fallbacks.iter().map(|s| s.to_string()).collect(),
             seed_on_fork: seed,

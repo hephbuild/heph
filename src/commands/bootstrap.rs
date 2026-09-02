@@ -94,13 +94,12 @@ pub fn telemetry_enabled_from_config() -> bool {
 
 /// Build the engine for this invocation.
 ///
-/// Takes the CLI's global options rather than reading them from a static: a
-/// process-global switch makes `scratch.enabled` arrive from nowhere as far as
-/// this function's signature is concerned, and every caller here already holds
-/// `global` — it is threaded into `execute` for exactly this reason.
-pub fn new_engine(
-    global: &crate::commands::global::GlobalOptions,
-) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
+/// Takes nothing from the CLI. Everything a *run* can switch — `--force`,
+/// `--shell`, `--frozen`, `--no-scratch` — rides on `ResultOptions` rather than
+/// on the engine, so one engine serves an ordinary request and an audit request
+/// without being rebuilt, and each switch has exactly one source of truth. Only
+/// workspace-level policy reaches `Config`.
+pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
         Err(inner) => anyhow::bail!("Error: {}", inner),
@@ -109,8 +108,7 @@ pub fn new_engine(
     // The config file is the all-optional, profile-layered YAML; `resolve`
     // applies every default in one place and yields the engine's runtime config.
     let file = config_yaml::load_from_root(&root)?;
-    let mut config = file.resolve(&root)?;
-    config.scratch.enabled = !global.no_scratch;
+    let config = file.resolve(&root)?;
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend

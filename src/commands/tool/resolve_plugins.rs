@@ -14,7 +14,7 @@ pub fn execute(args: &Args, _sink: LogSink, global: &GlobalOptions) -> anyhow::R
     bootstrap::block_on(execute_async(args.clone(), global.clone()))?
 }
 
-async fn execute_async(args: Args, global: GlobalOptions) -> anyhow::Result<()> {
+async fn execute_async(args: Args, _global: GlobalOptions) -> anyhow::Result<()> {
     if args.force {
         crate::engine::clear_plugin_cache()?;
     }
@@ -24,7 +24,7 @@ async fn execute_async(args: Args, global: GlobalOptions) -> anyhow::Result<()> 
     // `url:` is downloaded to ~/.heph/plugins), the host dylib resolved, and the
     // cdylib load-checked over the stable ABI (`create` runs). Reaching `Ok`
     // here therefore means every configured plugin is present and loadable.
-    let (engine, _shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, _shutdown) = bootstrap::new_engine()?;
 
     let mut providers: Vec<String> = engine.providers_by_name.keys().cloned().collect();
     let mut drivers: Vec<String> = engine.drivers_by_name.keys().cloned().collect();

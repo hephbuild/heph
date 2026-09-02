@@ -130,7 +130,7 @@ impl ToolCommands {
             ToolCommands::Gc(args) => gc::execute(args, sink, global),
             ToolCommands::Clean(args) => clean::execute(args, sink, global),
             ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
-            ToolCommands::Scratch(args) => args.execute(sink, global),
+            ToolCommands::Scratch(args) => args.execute(sink),
             ToolCommands::Cache(args) => args.execute(sink, global),
             ToolCommands::Completions(args) => completions::execute(args),
             ToolCommands::BuildFmt(args) => build_fmt::execute(args, sink, global),

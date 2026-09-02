@@ -39,8 +39,7 @@ fn candidates(partial: &str) -> anyhow::Result<Vec<String>> {
     let base = get_cwp()?;
     bootstrap::block_on(async move {
         // `new_engine` spawns tokio tasks, so it must run inside the runtime.
-        let (engine, _shutdown) =
-            bootstrap::new_engine(&crate::commands::global::GlobalOptions::default())?;
+        let (engine, _shutdown) = bootstrap::new_engine()?;
         addr_candidates(&engine, &base, partial).await
     })?
 }

@@ -667,7 +667,6 @@ async fn a_branch_switch_seeds_from_the_fallback_and_writes_stay_put() -> anyhow
     };
 
     let on = |scope: &str| heph::engine::ScratchOptions {
-        enabled: true,
         scope: scope.to_string(),
         restore_scopes: vec!["master".to_string()],
         seed_on_fork: true,
@@ -723,7 +722,6 @@ async fn seed_on_fork_off_starts_a_new_branch_cold() -> anyhow::Result<()> {
         Ok(out)
     };
     let on = |scope: &str, seed: bool| heph::engine::ScratchOptions {
-        enabled: true,
         scope: scope.to_string(),
         restore_scopes: vec!["master".to_string()],
         seed_on_fork: seed,
@@ -765,18 +763,14 @@ async fn no_scratch_withholds_carried_over_state_not_the_directory() -> anyhow::
        ])"#,
     );
 
-    let on = |enabled: bool| heph::engine::ScratchOptions {
-        enabled,
-        ..Default::default()
-    };
-    // `force`, because that is what the CLI does for `--scratch=off` and why it
-    // has to: scratch never reaches `hashin`, so without it the second run is a
-    // cache hit that replays the result built *with* a warm cache — the audit
-    // would pass by reading exactly the answer it is meant to re-derive.
-    let run = async |engine: &Arc<heph::engine::Engine>, force: bool| -> anyhow::Result<String> {
+    let run = async |engine: &Arc<heph::engine::Engine>,
+                     force: bool,
+                     no_scratch: bool|
+           -> anyhow::Result<String> {
         let addr = heph::htaddr::parse_addr("//app:a")?;
         let opts = ResultOptions {
             force,
+            no_scratch,
             ..Default::default()
         };
         let r = Arc::clone(engine)
@@ -788,35 +782,39 @@ async fn no_scratch_withholds_carried_over_state_not_the_directory() -> anyhow::
     };
 
     // First run: nothing carried over yet, and it leaves a marker behind.
-    assert_eq!(run(&ws.reopen_scoped(on(true))?, false).await?, "cold");
+    assert_eq!(run(&ws.reopen()?, false, false).await?, "cold");
     // Second, forced: the marker is there, so state does carry between runs.
-    assert_eq!(run(&ws.reopen_scoped(on(true))?, true).await?, "warm");
+    assert_eq!(run(&ws.reopen()?, true, false).await?, "warm");
 
-    // The trap this test originally fell into, asserted *before* the forced run
-    // so nobody "simplifies" the implication away later: scratch never reaches
-    // `hashin`, so an unforced audit run is a plain cache hit and replays the
-    // result built with a warm cache. The audit would pass by reading exactly the
-    // answer it is meant to re-derive.
+    // The trap this test originally fell into, and the reason the implication
+    // now lives in the engine rather than at each call site: scratch never
+    // reaches `hashin`, so without a rebuild an audit run is a plain cache hit
+    // that replays the result built *with* a warm cache. It would pass by
+    // reading exactly the answer it is meant to re-derive.
+    //
+    // Asserted with `force: false` on purpose. Every command that runs targets
+    // — `run`, `inspect hashout`, `inspect outputs` — gets the rebuild from
+    // `no_scratch` alone, so none of them can produce a vacuous audit by
+    // forgetting to pair the two.
     assert_eq!(
-        run(&ws.reopen_scoped(on(false))?, false).await?,
-        "warm",
-        "a cached result is served regardless of scratch — which is why \
-         `--no-scratch` must imply a rebuild"
+        run(&ws.reopen()?, false, true).await?,
+        "cold",
+        "`--no-scratch` must imply a rebuild without the caller asking for one"
     );
 
-    // With the rebuild the CLI forces: the cache is set up as normal — variable
-    // set, directory mounted — and only its *contents* are withheld. The target
-    // reads `$C` unguarded and still runs, which is the whole point of auditing
-    // the contract rather than the target's shell.
+    // The cache is still set up as normal — variable set, directory mounted —
+    // and only its *contents* are withheld. The target reads `$C` unguarded and
+    // still runs, which is the whole point of auditing the contract rather than
+    // the target's shell.
     assert_eq!(
-        run(&ws.reopen_scoped(on(false))?, true).await?,
+        run(&ws.reopen()?, true, true).await?,
         "cold",
         "--no-scratch must withhold carried-over state, not the directory"
     );
 
     // And it must not have disturbed the real lineage: the next ordinary run
     // still finds what the first one left.
-    assert_eq!(run(&ws.reopen_scoped(on(true))?, true).await?, "warm");
+    assert_eq!(run(&ws.reopen()?, true, false).await?, "warm");
     Ok(())
 }
 
@@ -848,10 +846,7 @@ async fn an_audit_leaves_the_stored_cache_untouched() -> anyhow::Result<()> {
 
     // Audit, forced so it genuinely re-executes.
     ws.write_build_file("app", &build("second"));
-    let audit = ws.reopen_scoped(heph::engine::ScratchOptions {
-        enabled: false,
-        ..Default::default()
-    })?;
+    let audit = ws.reopen()?;
     let addr = heph::htaddr::parse_addr("//app:a")?;
     let r = Arc::clone(&audit)
         .result_addr(
@@ -860,6 +855,7 @@ async fn an_audit_leaves_the_stored_cache_untouched() -> anyhow::Result<()> {
             OutputMatcher::All,
             &ResultOptions {
                 force: true,
+                no_scratch: true,
                 ..Default::default()
             },
         )
@@ -943,7 +939,6 @@ fn remote_engine(
             region: None,
         }],
         scratch: ScratchOptions {
-            enabled: true,
             scope: scope.to_string(),
             restore_scopes: fallbacks.iter().map(|s| s.to_string()).collect(),
             seed_on_fork: true,

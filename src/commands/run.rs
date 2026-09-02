@@ -197,20 +197,13 @@ impl App for RunApp {
         };
 
         let opts = ResultOptions {
-            // `--no-scratch` implies `--force`, and must: the whole point is to
-            // check that a target produces the same outputs without its carried
-            // -over state, and a cached result was produced *with* it. Serving
-            // one back would make the audit vacuous — it would pass by reading
-            // exactly the answer it is supposed to be re-deriving.
-            //
-            // Note this does not change any cache key: scratch never reaches
-            // `hashin`, so the audit run writes its revision under the same key
-            // and a divergence surfaces as a rebuilt-hashout mismatch rather
-            // than as two unrelated entries.
-            force: self.args.force || self.scratch_off,
+            // `--no-scratch` implies `--force`; the engine applies that from
+            // `no_scratch` below, so it is not repeated here.
+            force: self.args.force,
             shell: self.args.shell.is_some(),
             interactive,
             frozen: self.args.frozen,
+            no_scratch: self.scratch_off,
         };
         // In the interactive TUI the prompt renders on the live view and `y`/`n`
         // resolve it; otherwise the notice prints to stderr and the decision is
@@ -319,7 +312,7 @@ pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow:
 async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
     let app = RunApp {
         args,
         engine: std::sync::Arc::clone(&engine),

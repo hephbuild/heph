@@ -32,8 +32,8 @@ impl CacheArgs {
     }
 }
 
-async fn measure_latency(global: &GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+async fn measure_latency(_global: &GlobalOptions) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine()?;
     let set = engine.remote_caches();
     if set.is_empty() {
         println!("No remote caches configured.");

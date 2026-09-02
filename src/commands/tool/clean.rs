@@ -152,14 +152,14 @@ async fn execute_async(
     // selection to make — so it must not be forced through `selection`, which
     // deliberately refuses an empty one rather than wiping the target cache.
     if args.scratch && args.arg1.is_none() && args.expr.is_none() {
-        let (engine, _shutdown) = bootstrap::new_engine(&global)?;
+        let (engine, _shutdown) = bootstrap::new_engine()?;
         let (n, freed) = engine.scratch_remove(None)?;
         println!("Removed {n} scratch cache(s), freed {freed} bytes.");
         return Ok(());
     }
 
     let matcher = selection(&args, &cwp)?;
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
     if args.scratch
         && let Some(addr) = args.arg1.as_deref()
     {

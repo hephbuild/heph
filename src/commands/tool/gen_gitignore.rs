@@ -110,7 +110,7 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         Some(s) => (htpkg::parse(&s, &get_cwp()?)?, true),
         None => (Matcher::TreeOutputTo(PkgBuf::from("")), false),
     };
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
     let app = GenGitignoreApp {
         engine,
         matcher,

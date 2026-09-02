@@ -123,12 +123,16 @@ pub fn audit_root(home: &Path) -> PathBuf {
     home.join("scratch-audit")
 }
 
-/// A throwaway stand-in for one slot's head, for the duration of one run.
-pub fn audit_head_dir(home: &Path, pid: u32, slot: &str) -> PathBuf {
-    audit_root(home)
-        .join(pid.to_string())
-        .join(slot)
-        .join("head")
+/// The directory one run's throwaway audit slots live under.
+///
+/// Named `<pid>-<seq>`, not just `<pid>`. The pid is what
+/// [`sweep_dead_audit_dirs`] probes for liveness; `seq` distinguishes engines
+/// within one process, so two audits sharing a process do not share a
+/// directory. That is invisible to the CLI (one run per process) and load-
+/// bearing anywhere an engine is reused — an audit that inherited the previous
+/// audit's writes would not be a cold cache at all.
+pub fn audit_run_dir(home: &Path, pid: u32, seq: u64) -> PathBuf {
+    audit_root(home).join(format!("{pid}-{seq}"))
 }
 
 /// Remove audit directories belonging to processes that are gone, reporting
@@ -147,7 +151,11 @@ pub(crate) fn sweep_dead_audit_dirs(root: &Path) -> (usize, u64) {
         return (removed, freed);
     };
     for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+        // `<pid>-<seq>`; the pid is the part that answers "is that run still
+        // alive?". A name that does not start with one is not ours — leave it.
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Ok(pid) = name.split('-').next().unwrap_or_default().parse::<i32>() else {
             continue;
         };
         // SAFETY: `kill` with signal 0 performs the permission check and
@@ -385,7 +393,7 @@ mod tests {
         // `kill(_, 0)` is what decides — not this number.
         let dead = 4_000_000;
         for pid in [1u32, dead] {
-            let d = root.join(pid.to_string()).join("slot").join("head");
+            let d = audit_run_dir(tmp.path(), pid, 0).join("slot").join("head");
             std::fs::create_dir_all(&d).expect("mkdir");
             std::fs::write(d.join("f"), b"0123456789").expect("write");
         }
@@ -393,12 +401,35 @@ mod tests {
         let (removed, freed) = sweep_dead_audit_dirs(&root);
         assert_eq!(removed, 1, "only the dead one goes");
         assert!(freed >= 10, "it reports what it reclaimed: {freed}");
-        assert!(!root.join(dead.to_string()).exists());
+        assert!(!audit_run_dir(tmp.path(), dead, 0).exists());
         assert!(
-            root.join("1").exists(),
+            audit_run_dir(tmp.path(), 1, 0).exists(),
             "a live pid is another audit in progress; taking its directory would \
              break a running build"
         );
+    }
+
+    /// Two runs in one process get two directories, so the second audit is a
+    /// genuinely cold cache rather than an inheritance of the first one's
+    /// writes. Both still sweep on the same pid.
+    #[test]
+    fn two_runs_in_one_process_do_not_share_an_audit_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pid = std::process::id();
+        assert_ne!(
+            audit_run_dir(tmp.path(), pid, 0),
+            audit_run_dir(tmp.path(), pid, 1),
+        );
+
+        // …and a dead process's directories still sweep, whatever the sequence.
+        for d in [
+            audit_run_dir(tmp.path(), 4_000_000, 0),
+            audit_run_dir(tmp.path(), 4_000_000, 7),
+        ] {
+            std::fs::create_dir_all(&d).expect("mkdir");
+        }
+        let (removed, _) = sweep_dead_audit_dirs(&audit_root(tmp.path()));
+        assert_eq!(removed, 2, "the pid is parsed out of `<pid>-<seq>`");
     }
 
     /// The layout, stated once so a change to it is a change to this test.

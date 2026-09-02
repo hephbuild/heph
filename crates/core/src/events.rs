@@ -79,6 +79,23 @@ pub enum BuildEventKind {
         /// It matters to a report because a one-failure summary under fail-fast
         /// reads as "one thing is broken" when the truth is "we stopped looking".
         fail_fast: bool,
+        /// Whether this run was asked to ignore carried-over scratch state
+        /// (`--no-scratch`). Scratch caches are still resolved, locked, created
+        /// and announced through their environment variables — only the stored
+        /// contents are withheld, so every target that uses one runs cold.
+        ///
+        /// On the stream because it explains *two* anomalies a consumer would
+        /// otherwise have to guess at: a build that is inexplicably slow, and a
+        /// report showing no cache reuse. A summary saying "0 cached" with no
+        /// cause reads like a cache outage rather than a deliberate audit.
+        ///
+        /// Phrased negatively on purpose. `#[serde(default)]` fills a missing
+        /// key with `false`, and for a frame from a host older than this field
+        /// the true answer *is* "not disabled" — scratch was on. The positive
+        /// spelling (`scratch_enabled`) would default those same frames to
+        /// "scratch was off", which is both wrong and alarming.
+        #[serde(default)]
+        scratch_disabled: bool,
     },
     /// Incremental notice of matched top-level targets. `addrs` are newly
     /// matched addresses to add to the set; `complete` is false while the
@@ -308,6 +325,28 @@ mod tests {
                 assert_eq!(exit_status, None);
                 assert_eq!(log_tail, None);
             }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `RequestConfig` from a host predating `scratch_disabled`.
+    ///
+    /// The default must read as "scratch was on", which is the truth for every
+    /// frame emitted before the field existed. The positive spelling would
+    /// default these to "scratch was off" and have consumers report a
+    /// deliberate-looking audit on runs that never asked for one.
+    #[test]
+    fn an_old_request_config_defaults_to_scratch_enabled() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"RequestConfig","max_workers":8,
+            "fail_fast":false}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
+        match ev.kind {
+            BuildEventKind::RequestConfig {
+                scratch_disabled, ..
+            } => assert!(
+                !scratch_disabled,
+                "a host with no such field had scratch enabled",
+            ),
             other => panic!("wrong variant: {other:?}"),
         }
     }

@@ -11,7 +11,7 @@ use crate::tui::LogSink;
 #[derive(ClapArgs, Clone)]
 pub struct Args {}
 
-pub fn execute(_args: &Args, _sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+pub fn execute(_args: &Args, _sink: LogSink, _global: &GlobalOptions) -> anyhow::Result<()> {
     // Engine construction spawns background tasks (signal/shutdown handlers), so
     // it must run inside a runtime context. The LSP itself is a blocking stdio
     // loop that owns its own lifecycle via the LSP shutdown/exit handshake, so we
@@ -21,6 +21,6 @@ pub fn execute(_args: &Args, _sink: LogSink, global: &GlobalOptions) -> anyhow::
         .build()
         .context("building tokio runtime for build-lsp")?;
     let _guard = runtime.enter();
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+    let (engine, _shutdown) = bootstrap::new_engine()?;
     crate::pluginbuildfile::serve_stdio(engine)
 }
