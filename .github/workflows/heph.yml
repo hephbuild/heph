@@ -14,7 +14,7 @@ on:
   # spelled out and two more are added. Both additions exist for the gate:
   #
   #   - `labeled`, so adding `ci/force-ci` starts a run by itself rather than
-  #     needing a push to notice the label. (It also makes `perf-test`
+  #     needing a push to notice the label. (It also makes `ci/perf-test`
   #     self-triggering, which it previously was not.)
   #   - `edited`, so the base-branch change GitHub performs *itself* when a
   #     stack's base merges — retargeting the child at master — starts a run.
@@ -128,7 +128,7 @@ jobs:
             why="this PR carries the 'ci/force-ci' label."
           else
             run=false
-            why="this PR targets '$BASE', not '$DEFAULT_BRANCH' — it is stacked on another branch, so it cannot merge until the layer below it does, and it will get a full run as soon as it is rebased onto '$DEFAULT_BRANCH'. Add the 'ci/force-ci' label to build it anyway; 'perf-test' alone will not, because perfbench needs the build this gate skipped."
+            why="this PR targets '$BASE', not '$DEFAULT_BRANCH' — it is stacked on another branch, so it cannot merge until the layer below it does, and it will get a full run as soon as it is rebased onto '$DEFAULT_BRANCH'. Add the 'ci/force-ci' label to build it anyway; 'ci/perf-test' alone will not, because perfbench needs the build this gate skipped."
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
           echo "reason=$why" >> "$GITHUB_OUTPUT"
@@ -1232,7 +1232,7 @@ jobs:
   # Perf-regression check (own workflow: .github/workflows/perf.yml) —
   # generates one synthetic corpus, times a fixed scenario set against N and
   # N-1, and reports a regression verdict. Two triggers, two roles:
-  #   - `pull_request`, labeled `perf-test`: this is the GATE — a real
+  #   - `pull_request`, labeled `ci/perf-test`: this is the GATE — a real
   #     regression fails the check for real. Opt-in while the harness and its
   #     thresholds are still being proven out; an unlabeled PR skips this job
   #     entirely rather than running it just to fail on the missing label —
@@ -1241,7 +1241,7 @@ jobs:
   #     run on its own — `labeled` is in this workflow's `pull_request` types
   #     (added for the gate's `ci/force-ci`), so no push or manual re-run is
   #     needed. On a *stacked* PR it still gets nothing: this job needs
-  #     `build`, which the gate skipped, so `perf-test` there wants
+  #     `build`, which the gate skipped, so `ci/perf-test` there wants
   #     `ci/force-ci` alongside it.
   #   - `push` to `master`: nothing is blocked at this point (the merge
   #     already happened) — this is continuous monitoring, and a regression
@@ -1258,7 +1258,7 @@ jobs:
   perfbench:
     name: Perf
     if: |
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf-test')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/perf-test')) ||
       (github.event_name == 'push' && github.ref == 'refs/heads/master')
     needs: [build]
     uses: ./.github/workflows/perf.yml
