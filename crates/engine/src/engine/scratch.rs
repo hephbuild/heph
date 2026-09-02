@@ -212,6 +212,33 @@ pub fn scope_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
     crate::engine::scratch_store::head_dir(home, slot, scope)
 }
 
+/// Remove audit directories belonging to processes that are gone.
+///
+/// Best-effort and never fatal: a leftover directory costs disk, and failing a
+/// build over one would be worse than the disk. A live pid is left alone, which
+/// is what lets two concurrent audits coexist.
+fn sweep_dead_audit_dirs(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        // `kill(pid, 0)` asks "may I signal this?" without signalling. ESRCH
+        // means no such process; EPERM means it exists and is someone else's,
+        // which still counts as alive.
+        // SAFETY: `kill` with signal 0 performs the permission check and
+        // returns, sending nothing. It takes a plain `pid_t` and touches no
+        // memory we own, so there is no pointer or lifetime obligation.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !alive {
+            drop(std::fs::remove_dir_all(entry.path()));
+        }
+    }
+}
+
 /// Resolve which lineage to use, and seed it if it is new.
 ///
 /// The behaviour is *try this branch, then fall back* — the current scope first,
@@ -329,13 +356,6 @@ impl Engine {
         consumer: &Addr,
         inputs: &[Input],
     ) -> anyhow::Result<Vec<ResolvedScratch>> {
-        // `--scratch=off`: behave as though nothing were declared. Done here
-        // rather than at the mount so the *whole* path is skipped — no spec
-        // resolution, no lock, no directory — which is what makes it a faithful
-        // "as if absent" and not merely "mounted somewhere empty".
-        if !self.cfg.scratch.enabled {
-            return Ok(Vec::new());
-        }
         let refs: Vec<&Input> = inputs.iter().filter(|i| is_scratch_input(i)).collect();
         if refs.is_empty() {
             return Ok(Vec::new());
@@ -372,6 +392,41 @@ impl Engine {
         check_env_collisions(consumer, &resolved)?;
         check_mount_overlaps(consumer, &resolved)?;
         Ok(resolved)
+    }
+
+    /// A throwaway directory standing in for a slot's head, for this run only.
+    ///
+    /// `--no-scratch` withholds *carried-over state*, not the cache itself: the
+    /// target still gets a directory at the usual mount point, announced through
+    /// the usual variable, locked the usual way. Only its contents start empty.
+    ///
+    /// Per **process**, not per target, so targets sharing a declaration still
+    /// share a directory within the run and `access` still means what it says.
+    /// Per process rather than per slot-lineage so a concurrent ordinary build
+    /// cannot see it, and an audit cannot see that build's state.
+    async fn scratch_audit_dir(self: &Arc<Self>, slot: &str) -> anyhow::Result<PathBuf> {
+        let root = self
+            .scratch_audit_ready
+            .get_or_try_init(|| {
+                let root = crate::engine::scratch_store::audit_root(&self.home);
+                let mine = root.join(std::process::id().to_string());
+                async move {
+                    let m = mine.clone();
+                    hcore::blocking::run(move || {
+                        // A killed run cannot clean up after itself, so sweep
+                        // any pid directory that is not a live process before
+                        // creating ours.
+                        sweep_dead_audit_dirs(&root);
+                        std::fs::create_dir_all(&m)
+                            .with_context(|| format!("create audit dir {}", m.display()))?;
+                        anyhow::Ok(())
+                    })
+                    .await?;
+                    anyhow::Ok(mine)
+                }
+            })
+            .await?;
+        Ok(root.join(slot).join("head"))
     }
 
     /// Take every slot lock this target needs, create the directories, and return
@@ -425,9 +480,22 @@ impl Engine {
             // cold lineage cannot both decide it is absent and seed it twice.
             // Both creation and seeding are idempotent, which is what makes the
             // shared-access case safe.
-            let dir = resolve_scope_dir(&self.home, &slot, &self.cfg.scratch, &r.addr)
-                .await
-                .with_context(|| format!("resolve scratch lineage for {}", r.addr))?;
+            //
+            // The audit (`--no-scratch`) takes the other branch: everything is
+            // set up exactly as normal — resolved, locked, created, mounted,
+            // announced through the env var — and only the *carried-over state*
+            // is withheld. That is what makes it an audit of the contract rather
+            // than of the target's shell: "the same outputs from a cold cache",
+            // not "survives having its cache ripped out".
+            let dir = if self.cfg.scratch.enabled {
+                resolve_scope_dir(&self.home, &slot, &self.cfg.scratch, &r.addr)
+                    .await
+                    .with_context(|| format!("resolve scratch lineage for {}", r.addr))?
+            } else {
+                self.scratch_audit_dir(&slot)
+                    .await
+                    .with_context(|| format!("audit scratch dir for {}", r.addr))?
+            };
             let d = dir.clone();
             hcore::blocking::run(move || std::fs::create_dir_all(&d))
                 .await
@@ -442,7 +510,7 @@ impl Engine {
             // cold build. Publishing is the opposite on all three counts and is
             // therefore a command (`heph tool scratch push`), never a side effect
             // of building.
-            if r.def.remote {
+            if r.def.remote && self.cfg.scratch.enabled {
                 self.pull_if_cold(&slot, &dir, &r.addr).await;
             }
 

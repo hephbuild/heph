@@ -109,6 +109,28 @@ pub fn head_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
     lineage_dir(home, slot, scope).join("head")
 }
 
+/// Root of the **audit** store: where `--no-scratch` puts its throwaway
+/// directories.
+///
+/// Deliberately a sibling of [`store_root`], never inside it. The store walk
+/// treats every child of `store_root` as a slot, so an audit directory living
+/// there would list as an orphan slot, be swept by the GC, and be reported by
+/// `heph tool scratch ls` as if it were real state.
+///
+/// Keyed by pid so two concurrent audits do not share a directory, and swept of
+/// abandoned pids on first use — a killed run cannot clean up after itself.
+pub fn audit_root(home: &Path) -> PathBuf {
+    home.join("scratch-audit")
+}
+
+/// A throwaway stand-in for one slot's head, for the duration of one run.
+pub fn audit_head_dir(home: &Path, pid: u32, slot: &str) -> PathBuf {
+    audit_root(home)
+        .join(pid.to_string())
+        .join(slot)
+        .join("head")
+}
+
 fn meta_path(home: &Path, slot: &str) -> PathBuf {
     slot_dir(home, slot).join(SLOT_META_FILE)
 }

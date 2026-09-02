@@ -121,12 +121,22 @@ pub struct Config {
 /// expanded here, so nothing downstream knows about git.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScratchOptions {
-    /// Whether declared scratch caches are used at all.
+    /// Whether a declared scratch cache carries its contents between runs.
     ///
-    /// `false` is `--scratch=off`: every target runs with its caches absent. It
-    /// is the audit mode for the scratch contract — outputs must be identical
-    /// warm, cold or absent — so it is a run-time switch and deliberately not a
-    /// config-file one.
+    /// `false` is `--no-scratch`, the audit mode. Everything is still set up:
+    /// the declaration resolves, the slot is locked, a directory is created and
+    /// mounted, the environment variable is announced. What is withheld is the
+    /// **carried-over state** — the directory starts empty, and nothing is
+    /// pulled from the remote or published to it.
+    ///
+    /// That is deliberately not "as if nothing were declared". Withholding the
+    /// directory too would audit the target's shell rather than the contract: a
+    /// target reading `$MYCACHE` unguarded would fail under `set -u` instead of
+    /// running cold, and every driver would need a fallback for a case that only
+    /// the audit produces. The contract says outputs must not depend on what is
+    /// *in* the cache; this checks exactly that.
+    ///
+    /// A run-time switch, deliberately not a config-file one.
     pub enabled: bool,
     /// Lineage this run writes to. Empty means one shared lineage.
     pub scope: String,

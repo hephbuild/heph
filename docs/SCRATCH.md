@@ -275,20 +275,31 @@ holding anything, which is right for resolving and useless for explaining — so
 winner. "Why did my branch start cold?" is answerable only by seeing what was
 *not* found.
 
-**`--no-scratch`** is a global build flag: every scratch absent — no directory
-and no environment variable, not merely an empty one. It implies `--force`,
+**`--no-scratch`** is a global build flag: every scratch **empty**. Everything is
+still set up — the declaration resolves, the slot is locked, the directory is
+created and mounted, the variable is announced — and only the carried-over
+contents are withheld, along with any remote pull or push. It implies `--force`,
 because a scratch never reaches `hashin`, so without a rebuild the run would
 replay the result built *with* a warm cache and the audit would pass by reading
 back the answer it exists to re-derive.
+
+Empty rather than absent, deliberately. The contract says outputs must not depend
+on what is *in* the cache, so that is what the audit withholds. Taking the
+directory away too would audit the target's shell instead: a target reading
+`$MYCACHE` would fail on an unset variable rather than running cold, and every
+driver would need a fallback for a case only the audit produces.
+
+The audit writes into `<home>/scratch-audit/<pid>/`, a sibling of the store and
+never inside it — the store walk treats every child of `store_root` as a slot, so
+an audit directory there would list as an orphan and be swept as if it were real
+state. Directories are per process, so two audits cannot collide and neither can
+see an ordinary build's cache; dead ones are swept on next use, because a killed
+run cannot clean up after itself.
 
 It is a bool rather than `--scratch=on|off` for a second reason: a valued flag
 named `scratch` collides on clap's argument *id* with any subcommand wanting a
 `--scratch` of its own, which is a runtime panic on access rather than a build
 error.
-
-Its sharp edge: "absent" includes the environment variable, so a target reading
-`$MYCACHE` unguarded fails under `set -u` rather than running cold. Drivers that
-own a cache handle this; a hand-written `bash` target should write `${MYCACHE:-}`.
 
 `example/scratch/` is a worked package covering the three shapes.
 
