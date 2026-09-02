@@ -199,7 +199,7 @@ async fn def_hash(engine: &Arc<heph::engine::Engine>, addr: &str) -> anyhow::Res
     Ok(def.target_def.hash.clone())
 }
 
-/// The central property (`docs/SCRATCH.md` §6.3): **nothing about a scratch
+/// The central property (`docs/SCRATCH.md`, "The contract"): **nothing about a scratch
 /// reaches a consumer's `hashin`**. Not the reference, and not the declaration.
 ///
 /// The tempting design is the opposite — fold the declaration in, so bumping

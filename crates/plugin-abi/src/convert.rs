@@ -707,7 +707,7 @@ pub fn scratch_mount_to_pb(m: &hplugin::driver::ScratchMount) -> pb::ScratchMoun
 /// A mount whose `addr` did not survive the wire is dropped rather than
 /// defaulted: the addr is only a diagnostic, but a mount with a wrong one would
 /// misattribute a failure to some other target, and a scratch that silently does
-/// not mount costs a cold cache — never a wrong build (`docs/SCRATCH.md` §4).
+/// not mount costs a cold cache — never a wrong build (`docs/SCRATCH.md`, "The contract").
 pub fn scratch_mount_from_pb(m: pb::ScratchMount) -> Option<hplugin::driver::ScratchMount> {
     Some(hplugin::driver::ScratchMount {
         addr: addr_from_pb(m.addr?),

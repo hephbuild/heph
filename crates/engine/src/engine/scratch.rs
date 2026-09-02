@@ -47,7 +47,7 @@ impl ResolvedScratch {
     /// Stable id for this cache's storage slot.
     ///
     /// The identity is `(addr, version)` — see
-    /// `docs/SCRATCH.md` §6.1 for what is deliberately *absent*: `path`, `env`,
+    /// `docs/SCRATCH.md`, "Identity", for what is deliberately *absent*: `path`, `env`,
     /// `access`, `remote` and `max_size` are all policy about how a cache is used
     /// rather than what is in it, and changing one must not throw the contents
     /// away.
