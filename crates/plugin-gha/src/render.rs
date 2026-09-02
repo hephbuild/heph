@@ -476,6 +476,13 @@ fn push_scratch(b: &mut Budgeted, t: &Tally) {
         ));
     }
 
+    for scratch in t.scratch_dropped().into_iter().take(SCRATCH_ROWS) {
+        b.push(&format!(
+            "\n> [!WARNING]\n> Scratch `{scratch}` exceeded its `max_size` and was dropped \
+             whole; targets using it ran cold.\n",
+        ));
+    }
+
     let waits = t.scratch_waits();
     if waits.is_empty() {
         return;
@@ -1348,10 +1355,25 @@ mod tests {
                 error: None,
             },
         ));
+        t.apply(&ev(
+            0,
+            BuildEventKind::ScratchPrepareEnd {
+                addr: "//a:y".into(),
+                scratch: "//build:gomodcache".into(),
+                outcome: "dropped_over_max".into(),
+                bytes: 0,
+                path_mismatch: false,
+                error: None,
+            },
+        ));
         let out = render_final(&t, &ctx("Build", 60_000), 100_000);
         assert!(
             out.contains("heph tool scratch head //build:gocache"),
             "an inert cache must name the command that explains it: {out}",
+        );
+        assert!(
+            out.contains("//build:gomodcache") && out.contains("max_size"),
+            "a dropped cache must be reported: {out}",
         );
     }
 

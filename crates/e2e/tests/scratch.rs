@@ -1212,6 +1212,70 @@ async fn a_published_snapshot_warms_a_cold_machine() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A cache dropped for exceeding its cap must not be immediately re-pulled from
+/// the remote.
+///
+/// The loop this prevents: `enforce_max_size` drops the oversized directory,
+/// `create_dir_all` recreates it empty, and a pull that ran next would see a
+/// cold lineage and fetch back the very snapshot just judged too big — so every
+/// run would drop, re-pull and drop again, paying the egress forever while
+/// reporting `pulled` and never once surfacing the drop the user needs to see.
+#[tokio::test]
+async fn a_cache_dropped_over_its_cap_is_not_re_pulled() -> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+
+    // Publish a snapshot comfortably over the cap we will impose.
+    let a = tempfile::tempdir()?;
+    std::fs::create_dir_all(a.path().join("build"))?;
+    std::fs::create_dir_all(a.path().join("app"))?;
+    std::fs::write(a.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    std::fs::write(
+        a.path().join("app").join("BUILD"),
+        remote_target("published"),
+    )?;
+
+    let e1 = remote_engine(a.path(), &uri, "master", &[]);
+    assert_eq!(build(&e1).await?, "cold");
+    let slot = e1.scratch_slots()?[0].slot.clone();
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.home, &slot, "master");
+    std::fs::write(dir.join("bulk"), vec![0u8; 64 * 1024])?;
+    e1.scratch_push(&slot, "master", &dir, None, "run-1")
+        .await?;
+    drop(e1);
+
+    // A second machine with a cap far below the published snapshot. Its first
+    // build pulls — nothing local yet, so nothing is over the cap.
+    let b = tempfile::tempdir()?;
+    std::fs::create_dir_all(b.path().join("build"))?;
+    std::fs::create_dir_all(b.path().join("app"))?;
+    std::fs::write(
+        b.path().join("build").join("BUILD"),
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C",
+       remote = True, max_size = "1KB")"#,
+    )?;
+    std::fs::write(b.path().join("app").join("BUILD"), remote_target("local"))?;
+
+    let e2 = remote_engine(b.path(), &uri, "master", &[]);
+    assert_eq!(
+        build(&e2).await?,
+        "published",
+        "the first build restores it"
+    );
+    drop(e2);
+
+    // Now it is local and over the cap. The next build must drop it and start
+    // cold — not fetch the same oversized snapshot straight back.
+    std::fs::write(b.path().join("app").join("BUILD"), remote_target("second"))?;
+    let e3 = remote_engine(b.path(), &uri, "master", &[]);
+    assert_eq!(
+        build(&e3).await?,
+        "cold",
+        "an over-cap cache is dropped and stays dropped for this run",
+    );
+    Ok(())
+}
+
 /// Generations advance at publish time and are `parent + 1` within a lineage, so
 /// a later publish wins — and republishing identical contents adds nothing.
 #[tokio::test]

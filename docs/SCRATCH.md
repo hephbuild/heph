@@ -337,8 +337,8 @@ collapsing is a rendering decision.
 | `ScratchLockWaitStart/End` | a slot stays contended past 5s | consumer, cache, `access`, holder pid when nameable |
 | `ScratchPrepareStart/End` | every prepare under the guard | consumer, cache, `outcome`, `bytes`, `path_mismatch` |
 
-`outcome` is one of `warm`, `seeded`, `pulled`, `cold`, `audit`, or
-`interrupted` — a string rather than an enum, because an unknown enum variant is
+`outcome` is one of `warm`, `seeded`, `pulled`, `cold`, `dropped_over_max`,
+`audit`, or `interrupted` — a string rather than an enum, because an unknown enum variant is
 a decode failure on a version-skewed plugin and the SDK reads that as
 end-of-stream. An unrecognised string just prints. `interrupted` exists because
 the end of a span also fires when its future is *dropped*: a Ctrl-C during a
@@ -406,7 +406,7 @@ Every one degrades to a cold build:
 |---|---|
 | no remote entry, remote unreachable, corrupt meta | cold |
 | a seed copy that fails | cold, with no partial tree left behind |
-| a slot over its cap | dropped, then cold |
+| a slot over its cap | dropped, then cold; reported as `dropped_over_max`, and not re-pulled this run |
 | a poisoned cache | survives until evicted; `rm` is the remedy |
 
 The last is the one that is not self-healing, and it is why the caches this

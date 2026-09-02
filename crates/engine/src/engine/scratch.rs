@@ -815,8 +815,8 @@ impl Engine {
                 //
                 // Skipped for an audit: that directory is fresh by construction,
                 // so there is nothing over a cap and nothing to drop.
-                let dropped = !no_scratch
-                    && enforce_max_size(&dir, r.def.max_size.as_deref(), &r.addr).await;
+                let dropped =
+                    !no_scratch && enforce_max_size(&dir, r.def.max_size.as_deref(), &r.addr).await;
                 if dropped {
                     cell.lock().prepared = Some(Prepared::DroppedOverMax);
                 }
@@ -1303,6 +1303,52 @@ mod tests {
             .await
             .expect("second prepare");
         assert_eq!(prepared, Prepared::Warm);
+    }
+
+    /// Dropping a cache for exceeding its cap is reported as an outcome, not
+    /// only as a log line. It is the most consequential thing this module does —
+    /// the next build runs cold — and a report that cannot see it cannot explain
+    /// why.
+    #[tokio::test]
+    async fn dropping_an_oversized_cache_is_reported_as_an_outcome() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let (engine, _rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let mut r = resolved(Access::Shared);
+        r.def.max_size = Some("1B".into());
+
+        let (dir, _) = engine
+            .prepare_scratch_dir(&rs, "//app:a", &r.slot(), &r, false)
+            .await
+            .expect("first prepare");
+        std::fs::write(dir.join("f"), vec![0u8; 4096]).expect("write");
+
+        let (dir, prepared) = engine
+            .prepare_scratch_dir(&rs, "//app:a", &r.slot(), &r, false)
+            .await
+            .expect("second prepare");
+        assert_eq!(prepared, Prepared::DroppedOverMax);
+        assert!(dir.is_dir(), "the directory is recreated, just empty");
+        assert!(!dir.join("f").exists(), "the oversized contents are gone");
+    }
+
+    /// An audit is exempt from the cap: its directory is fresh by construction,
+    /// so there is nothing over a cap and nothing to drop.
+    #[tokio::test]
+    async fn an_audit_is_not_subject_to_the_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let (engine, _rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let mut r = resolved(Access::Shared);
+        r.def.max_size = Some("1B".into());
+
+        let (_, prepared) = engine
+            .prepare_scratch_dir(&rs, "//app:a", &r.slot(), &r, true)
+            .await
+            .expect("prepare");
+        assert_eq!(prepared, Prepared::Audit);
     }
 
     /// `--no-scratch` is an audit, and says so on the stream. Without the

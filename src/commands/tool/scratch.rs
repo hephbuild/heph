@@ -115,9 +115,7 @@ impl ScratchArgs {
             ScratchCommands::Ls => bootstrap::block_on(ls())?,
             ScratchCommands::Head { addr } => bootstrap::block_on(head(addr))?,
             ScratchCommands::Path { addr } => bootstrap::block_on(path(addr))?,
-            ScratchCommands::Rm { addr, all } => {
-                bootstrap::block_on(rm(addr.as_deref(), *all))?
-            }
+            ScratchCommands::Rm { addr, all } => bootstrap::block_on(rm(addr.as_deref(), *all))?,
             ScratchCommands::Push {
                 addr,
                 all,
