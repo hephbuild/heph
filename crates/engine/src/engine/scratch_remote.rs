@@ -44,7 +44,6 @@
 
 use crate::engine::Engine;
 use crate::engine::remote_cache::RemoteCacheBackend;
-use crate::engine::scratch_store::store_root;
 use anyhow::Context as _;
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::path::{Path, PathBuf};
@@ -409,10 +408,7 @@ pub fn scope_head_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
 
 /// Where a slot's local lineage state is recorded.
 pub fn local_meta_path(home: &Path, slot: &str, scope: &str) -> PathBuf {
-    store_root(home)
-        .join(slot)
-        .join(crate::engine::config::sanitize_scope(scope))
-        .join("head.meta")
+    crate::engine::scratch_store::lineage_dir(home, slot, scope).join("head.meta")
 }
 
 /// Read the snapshot a local lineage was last seeded from or published as.

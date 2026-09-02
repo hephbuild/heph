@@ -70,13 +70,47 @@ pub struct SlotEntry {
     pub last_used: Option<SystemTime>,
 }
 
+// ── on-disk layout ──────────────────────────────────────────────────────────
+//
+// One place derives it, because a layout spelled out at several call sites is a
+// layout that drifts: a scope sanitized here and not there puts a branch's cache
+// in two directories, and neither the store nor the sweeper would notice.
+//
+//     <home>/scratch/                     store_root
+//                   /<slot>/              slot_dir
+//                          /slot.meta     meta_path
+//                          /<scope>/      lineage_dir   (scope sanitized here)
+//                                  /head  head_dir      (the directory mounted)
+//                                  /head.meta           (lineage bookkeeping)
+
 /// Root of the scratch store.
 pub fn store_root(home: &Path) -> PathBuf {
     home.join("scratch")
 }
 
+/// Everything belonging to one slot, across every lineage.
+pub fn slot_dir(home: &Path, slot: &str) -> PathBuf {
+    store_root(home).join(slot)
+}
+
+/// One slot's lineage. **The only place a scope is sanitized** — a branch name
+/// like `feature/x` would otherwise nest an extra directory level, and a caller
+/// that forgot would address a different lineage than one that remembered.
+pub fn lineage_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
+    slot_dir(home, slot).join(crate::engine::config::sanitize_scope(scope))
+}
+
+/// The directory actually mounted into a sandbox.
+///
+/// A level below the lineage so bookkeeping can sit beside it without ever
+/// appearing inside the cache — anything written next to `head` is heph's, and
+/// anything inside it is the tool's.
+pub fn head_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
+    lineage_dir(home, slot, scope).join("head")
+}
+
 fn meta_path(home: &Path, slot: &str) -> PathBuf {
-    store_root(home).join(slot).join(SLOT_META_FILE)
+    slot_dir(home, slot).join(SLOT_META_FILE)
 }
 
 /// Record what a slot came from, if it is not already recorded.
@@ -270,6 +304,50 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The layout, stated once so a change to it is a change to this test.
+    ///
+    /// It used to be spelled out at three call sites, two of which applied
+    /// `sanitize_scope` and one of which re-derived `<home>/scratch` on its own.
+    /// A layout duplicated like that drifts silently: a scope sanitized here and
+    /// not there puts one branch's cache in two directories, and neither the
+    /// store listing nor the sweeper would see anything wrong.
+    #[test]
+    fn the_layout_nests_the_way_the_store_expects() {
+        let home = Path::new("/h");
+        assert_eq!(store_root(home), Path::new("/h/scratch"));
+        assert_eq!(slot_dir(home, "s1"), Path::new("/h/scratch/s1"));
+        assert_eq!(
+            lineage_dir(home, "s1", "main"),
+            Path::new("/h/scratch/s1/main")
+        );
+        assert_eq!(
+            head_dir(home, "s1", "main"),
+            Path::new("/h/scratch/s1/main/head")
+        );
+        // Bookkeeping sits *beside* the mounted directory, never inside it:
+        // everything under `head` belongs to the tool.
+        assert_eq!(meta_path(home, "s1"), Path::new("/h/scratch/s1/slot.meta"));
+        assert!(!meta_path(home, "s1").starts_with(head_dir(home, "s1", "main")));
+    }
+
+    /// A branch name with a `/` must not nest an extra level, and the sanitizing
+    /// must happen in exactly one place — otherwise two callers address two
+    /// different directories for one lineage.
+    #[test]
+    fn a_slash_in_a_scope_stays_one_component() {
+        let home = Path::new("/h");
+        assert_eq!(
+            lineage_dir(home, "s1", "feature/x"),
+            Path::new("/h/scratch/s1/feature_x")
+        );
+        // And every deeper path inherits it, because they are all built from it.
+        assert!(head_dir(home, "s1", "feature/x").starts_with(lineage_dir(
+            home,
+            "s1",
+            "feature/x"
+        )));
+    }
 
     fn meta(addr: &str) -> SlotMeta {
         SlotMeta {

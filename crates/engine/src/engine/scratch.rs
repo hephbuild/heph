@@ -209,10 +209,7 @@ fn stamp_pid(guard: &hlock::hlock::FWriteGuard) {
 /// `master` builds from. `sanitize_scope` is what keeps a branch name like
 /// `feature/x` from silently nesting an extra level.
 pub fn scope_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
-    home.join("scratch")
-        .join(slot)
-        .join(crate::engine::config::sanitize_scope(scope))
-        .join("head")
+    crate::engine::scratch_store::head_dir(home, slot, scope)
 }
 
 /// Resolve which lineage to use, and seed it if it is new.
