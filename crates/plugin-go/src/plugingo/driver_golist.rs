@@ -468,26 +468,23 @@ impl ManagedDriver for GoGolistDriver {
         // is materialized and torn down inside each sandbox. The host GOCACHE is
         // still never touched.
         //
-        // No mount means `--no-scratch`: the audit mode runs every target with
-        // its caches absent, so the host resolves none and sends none. It is
-        // *not* an old-host compatibility path — the plugin and the host are
-        // locked to one `ABI_SEMVER` and a mismatch fails at `dlopen`, so that
-        // case cannot reach here.
-        //
-        // A sandbox-local directory rather than no `GOCACHE` at all, because Go
-        // does not treat an unset `GOCACHE` as "no cache": it falls back to the
-        // developer's `~/.cache/go-build`, which would make the audit read the
-        // host's cache and write to it. Per-sandbox and empty is what "cold"
-        // has to mean here.
-        let gocache = match req.request.scratch.iter().find(|m| m.env == "GOCACHE") {
-            Some(mount) => mount.dir.clone(),
-            None => {
-                let local = req.sandbox_pkg_dir.join(".heph-gocache");
-                std::fs::create_dir_all(&local)
-                    .with_context(|| format!("create gocache dir {local:?}"))?;
-                local
-            }
-        };
+        // Always present, so there is no fallback: the host resolves and locks a
+        // mount for every target that references the cache, and `--no-scratch`
+        // supplies an *empty* one rather than none. There is no correct fallback
+        // to write anyway — Go reads `~/.cache/go-build` when `GOCACHE` is unset,
+        // so inventing a sandbox-local directory would be guessing at what the
+        // host already decided.
+        let gocache = req
+            .request
+            .scratch
+            .iter()
+            .find(|m| m.env == "GOCACHE")
+            .map(|m| m.dir.clone())
+            .context(
+                "no GOCACHE scratch mount: the host resolves and locks one for every \
+                 target that references the shared cache, and `--no-scratch` supplies an \
+                 empty one rather than none",
+            )?;
 
         let env = golist_env(def, &goroot, &gocache, |n| std::env::var(n).ok());
 

@@ -486,23 +486,20 @@ impl ManagedDriver for GoCompileDriver {
         )
         .await?;
 
-        // Resolved and locked by the host from this target's scratch reference.
-        //
-        // No mount means `--no-scratch`, not an old host: the plugin and the
-        // host share one `ABI_SEMVER` and a mismatch fails at `dlopen`. A
-        // sandbox-local directory rather than no `GOCACHE`, because Go reads
-        // `~/.cache/go-build` when the variable is unset — the audit would then
-        // consult and pollute the developer's real cache instead of running
-        // cold.
-        let gocache = match req.request.scratch.iter().find(|m| m.env == "GOCACHE") {
-            Some(mount) => mount.dir.clone(),
-            None => {
-                let local = pkg_dir.join(".heph-gocache");
-                std::fs::create_dir_all(&local)
-                    .with_context(|| format!("create gocache dir {local:?}"))?;
-                local
-            }
-        };
+        // Resolved and locked by the host from this target's scratch reference,
+        // always — `--no-scratch` supplies an empty mount rather than none, so
+        // there is nothing to fall back to and nothing to guess.
+        let gocache = req
+            .request
+            .scratch
+            .iter()
+            .find(|m| m.env == "GOCACHE")
+            .map(|m| m.dir.clone())
+            .context(
+                "no GOCACHE scratch mount: the host resolves and locks one for every \
+                 target that references the shared cache, and `--no-scratch` supplies an \
+                 empty one rather than none",
+            )?;
 
         let mut env: HashMap<String, String> = HashMap::new();
         env.insert("GOOS".to_string(), def.goos.clone());
