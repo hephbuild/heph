@@ -112,9 +112,9 @@ pub fn build_modcache_spec(addr: Addr) -> TargetSpec {
         // concurrent `go mod download` is ordinary — the same trust heph already
         // extended to the host modcache passthrough this replaces.
         ("access".to_string(), Value::String("shared".to_string())),
-        // Module source, not objects. The showcase for `any`: one cache serves a
-        // Linux CI runner and a macOS laptop alike.
-        ("platform".to_string(), Value::String("any".to_string())),
+        // Module *source*, not objects, so nothing here depends on the host or
+        // the target: no `version`, which is what declares a slot portable, and
+        // one cache serves a Linux CI runner and a macOS laptop alike.
         ("remote".to_string(), Value::Bool(false)),
     ]);
 
@@ -426,7 +426,10 @@ mod tests {
         assert!(!spec.config.contains_key("version"));
     }
 
-    /// The spec must survive the driver that will actually parse it.
+    /// **Every** spec this module builds must survive the driver that will parse
+    /// it. A new one goes in the table below — the first version of this test
+    /// covered only `build_spec`, and `build_modcache_spec` then shipped setting
+    /// a `platform` field the declaration had already dropped.
     ///
     /// Asserting individual config keys, as the test above does, cannot catch a
     /// key the driver does not accept — and a `scratch` declaration rejects
@@ -435,9 +438,13 @@ mod tests {
     /// that: it kept setting `platform` after the field was removed from the
     /// declaration, and no unit test noticed because none of them parsed.
     #[test]
-    fn the_spec_parses_as_a_declaration() {
-        let spec = build_spec(key().addr());
-        hbuiltins::pluginscratch::parse_declaration(&spec)
-            .unwrap_or_else(|e| panic!("the gocache spec must parse as a declaration: {e:#}"));
+    fn every_spec_parses_as_a_declaration() {
+        for (what, spec) in [
+            ("gocache", build_spec(key().addr())),
+            ("modcache", build_modcache_spec(modcache_addr())),
+        ] {
+            hbuiltins::pluginscratch::parse_declaration(&spec)
+                .unwrap_or_else(|e| panic!("the {what} spec must parse as a declaration: {e:#}"));
+        }
     }
 }

@@ -487,9 +487,13 @@ impl ManagedDriver for GoCompileDriver {
         .await?;
 
         // Resolved and locked by the host from this target's scratch reference.
-        // Falls back to a sandbox-local directory when the mount is absent — an
-        // older host that does not carry scratch mounts on `RunRequest` must
-        // still run this driver, and a cold cache is slow, never wrong.
+        //
+        // No mount means `--no-scratch`, not an old host: the plugin and the
+        // host share one `ABI_SEMVER` and a mismatch fails at `dlopen`. A
+        // sandbox-local directory rather than no `GOCACHE`, because Go reads
+        // `~/.cache/go-build` when the variable is unset — the audit would then
+        // consult and pollute the developer's real cache instead of running
+        // cold.
         let gocache = match req.request.scratch.iter().find(|m| m.env == "GOCACHE") {
             Some(mount) => mount.dir.clone(),
             None => {
