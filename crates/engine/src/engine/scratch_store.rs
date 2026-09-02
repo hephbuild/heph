@@ -131,6 +131,45 @@ pub fn audit_head_dir(home: &Path, pid: u32, slot: &str) -> PathBuf {
         .join("head")
 }
 
+/// Remove audit directories belonging to processes that are gone, reporting
+/// what was reclaimed.
+///
+/// An audit directory is pure garbage the moment its process ends: nothing reads
+/// it, and `--no-scratch` never reuses one. So this is unconditional — it is not
+/// eviction under a budget, it is picking up litter. A *live* pid is left alone,
+/// which is what lets two concurrent audits coexist.
+///
+/// Best-effort and never fatal: a leftover directory costs disk, and failing a
+/// build or a `gc` over one would be worse than the disk.
+pub(crate) fn sweep_dead_audit_dirs(root: &Path) -> (usize, u64) {
+    let (mut removed, mut freed) = (0usize, 0u64);
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return (removed, freed);
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        // SAFETY: `kill` with signal 0 performs the permission check and
+        // returns, sending nothing. It takes a plain `pid_t` and touches no
+        // memory we own, so there is no pointer or lifetime obligation.
+        //
+        // ESRCH means no such process; EPERM means it exists and belongs to
+        // someone else, which still counts as alive.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if alive {
+            continue;
+        }
+        let (bytes, _) = measure(&entry.path());
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+            freed += bytes;
+        }
+    }
+    (removed, freed)
+}
+
 fn meta_path(home: &Path, slot: &str) -> PathBuf {
     slot_dir(home, slot).join(SLOT_META_FILE)
 }
@@ -285,7 +324,11 @@ impl Engine {
         max_age: Option<std::time::Duration>,
     ) -> anyhow::Result<(usize, u64)> {
         let mut slots = self.scratch_slots()?;
-        let (mut removed, mut freed) = (0usize, 0u64);
+        // Audit leftovers first, and regardless of the budgets: a directory
+        // whose process is gone is litter, not a cache competing for space.
+        // Swept here as well as on the next audit's first use, because a machine
+        // that never audits again would otherwise keep them forever.
+        let (mut removed, mut freed) = sweep_dead_audit_dirs(&audit_root(&self.home));
         let now = SystemTime::now();
 
         if let Some(max_age) = max_age {
@@ -326,6 +369,37 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `gc` reclaims a dead audit directory, and leaves a live one alone.
+    ///
+    /// Unconditionally, and regardless of the size and age budgets: an audit
+    /// directory whose process is gone is litter. It is also why the audit root
+    /// is a *sibling* of the store — if it lived inside, this sweep and the slot
+    /// sweep would be fighting over the same tree.
+    #[test]
+    fn the_sweep_reclaims_dead_audit_dirs_and_spares_live_ones() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = audit_root(tmp.path());
+
+        // pid 1 always exists; a very high pid almost certainly does not, and
+        // `kill(_, 0)` is what decides — not this number.
+        let dead = 4_000_000;
+        for pid in [1u32, dead] {
+            let d = root.join(pid.to_string()).join("slot").join("head");
+            std::fs::create_dir_all(&d).expect("mkdir");
+            std::fs::write(d.join("f"), b"0123456789").expect("write");
+        }
+
+        let (removed, freed) = sweep_dead_audit_dirs(&root);
+        assert_eq!(removed, 1, "only the dead one goes");
+        assert!(freed >= 10, "it reports what it reclaimed: {freed}");
+        assert!(!root.join(dead.to_string()).exists());
+        assert!(
+            root.join("1").exists(),
+            "a live pid is another audit in progress; taking its directory would \
+             break a running build"
+        );
+    }
 
     /// The layout, stated once so a change to it is a change to this test.
     ///

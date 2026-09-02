@@ -123,11 +123,15 @@ pub struct Config {
 pub struct ScratchOptions {
     /// Whether a declared scratch cache carries its contents between runs.
     ///
-    /// `false` is `--no-scratch`, the audit mode. Everything is still set up:
+    /// `false` is `--no-scratch`, the audit mode. **It deletes nothing** — the
+    /// stored cache is left untouched and the run is pointed at a throwaway
+    /// directory instead. Everything else is still set up:
     /// the declaration resolves, the slot is locked, a directory is created and
     /// mounted, the environment variable is announced. What is withheld is the
     /// **carried-over state** — the directory starts empty, and nothing is
-    /// pulled from the remote or published to it.
+    /// pulled from the remote or published to it. The throwaway directory is
+    /// discarded afterwards, so a later ordinary build finds its cache exactly
+    /// as it left it.
     ///
     /// That is deliberately not "as if nothing were declared". Withholding the
     /// directory too would audit the target's shell rather than the contract: a

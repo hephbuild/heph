@@ -820,6 +820,70 @@ async fn no_scratch_withholds_carried_over_state_not_the_directory() -> anyhow::
     Ok(())
 }
 
+/// The audit must not disturb the stored cache — not its contents, not its
+/// bookkeeping, not its existence. `--no-scratch` is a diagnostic, and a
+/// diagnostic that mutates what it inspects is not one.
+#[tokio::test]
+async fn an_audit_leaves_the_stored_cache_untouched() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    let build = |marker: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["echo hi > $OUT", "echo {marker} > \"$C/marker\""])"#
+        )
+    };
+    ws.write_build_file("app", &build("first"));
+    ws.run("//app:a").await?;
+
+    let engine = ws.reopen()?;
+    let slot = engine.scratch_slots()?[0].slot.clone();
+    let head = heph::engine::scratch_remote::scope_head_dir(&engine.home, &slot, "");
+    let before = std::fs::read_to_string(head.join("marker"))?;
+    assert_eq!(before.trim(), "first");
+    drop(engine);
+
+    // Audit, forced so it genuinely re-executes.
+    ws.write_build_file("app", &build("second"));
+    let audit = ws.reopen_scoped(heph::engine::ScratchOptions {
+        enabled: false,
+        ..Default::default()
+    })?;
+    let addr = heph::htaddr::parse_addr("//app:a")?;
+    let r = Arc::clone(&audit)
+        .result_addr(
+            audit.new_state(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions {
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    drop(r);
+
+    // The stored head still holds what the *first* run wrote. The audit wrote
+    // "second" somewhere, and that somewhere was not here.
+    assert_eq!(
+        std::fs::read_to_string(head.join("marker"))?.trim(),
+        "first",
+        "the audit must not write into the stored cache"
+    );
+    assert!(
+        !engine_slots_empty(&audit)?,
+        "and must not remove the slot either"
+    );
+    Ok(())
+}
+
+fn engine_slots_empty(engine: &Arc<heph::engine::Engine>) -> anyhow::Result<bool> {
+    Ok(engine.scratch_slots()?.is_empty())
+}
+
 /// The store describes itself, so it can be listed and reclaimed without reading
 /// a single BUILD file — the property that keeps a cache manageable after the
 /// target that made it is gone.

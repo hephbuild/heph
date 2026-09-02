@@ -212,33 +212,6 @@ pub fn scope_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
     crate::engine::scratch_store::head_dir(home, slot, scope)
 }
 
-/// Remove audit directories belonging to processes that are gone.
-///
-/// Best-effort and never fatal: a leftover directory costs disk, and failing a
-/// build over one would be worse than the disk. A live pid is left alone, which
-/// is what lets two concurrent audits coexist.
-fn sweep_dead_audit_dirs(root: &Path) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        // `kill(pid, 0)` asks "may I signal this?" without signalling. ESRCH
-        // means no such process; EPERM means it exists and is someone else's,
-        // which still counts as alive.
-        // SAFETY: `kill` with signal 0 performs the permission check and
-        // returns, sending nothing. It takes a plain `pid_t` and touches no
-        // memory we own, so there is no pointer or lifetime obligation.
-        let alive = unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        if !alive {
-            drop(std::fs::remove_dir_all(entry.path()));
-        }
-    }
-}
-
 /// Resolve which lineage to use, and seed it if it is new.
 ///
 /// The behaviour is *try this branch, then fall back* — the current scope first,
@@ -416,7 +389,7 @@ impl Engine {
                         // A killed run cannot clean up after itself, so sweep
                         // any pid directory that is not a live process before
                         // creating ours.
-                        sweep_dead_audit_dirs(&root);
+                        crate::engine::scratch_store::sweep_dead_audit_dirs(&root);
                         std::fs::create_dir_all(&m)
                             .with_context(|| format!("create audit dir {}", m.display()))?;
                         anyhow::Ok(())

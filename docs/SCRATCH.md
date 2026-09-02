@@ -254,7 +254,9 @@ path collides with nothing, because empty means *no path*, not the root.
   a foreign tool's entries are hot, and evicting a guess would degrade the cache
   while claiming to manage it. Unset by default.
 - **Sweep** — `heph tool gc --scratch-max-size` / `--scratch-max-age-days`, LRU
-  per (slot, scope). Branch scoping means a laptop accumulates a head per branch
+  per (slot, scope). It also reclaims abandoned `--no-scratch` directories
+  unconditionally: one whose process is gone is litter, not a cache competing for
+  space. Branch scoping means a laptop accumulates a head per branch
   ever built; the sweep collects the merged and abandoned ones.
 - **`heph tool scratch rm`** — always safe, by the contract.
 
@@ -275,26 +277,32 @@ holding anything, which is right for resolving and useless for explaining — so
 winner. "Why did my branch start cold?" is answerable only by seeing what was
 *not* found.
 
-**`--no-scratch`** is a global build flag: every scratch **empty**. Everything is
-still set up — the declaration resolves, the slot is locked, the directory is
-created and mounted, the variable is announced — and only the carried-over
-contents are withheld, along with any remote pull or push. It implies `--force`,
-because a scratch never reaches `hashin`, so without a rebuild the run would
-replay the result built *with* a warm cache and the audit would pass by reading
-back the answer it exists to re-derive.
+**`--no-scratch`** is a global build flag: run against a fresh, empty cache
+instead of the stored one. **It deletes nothing.** The stored cache is not
+touched, read or emptied — the run is pointed at a throwaway directory, which is
+discarded afterwards, and a later ordinary build finds its cache exactly as it
+left it.
 
-Empty rather than absent, deliberately. The contract says outputs must not depend
-on what is *in* the cache, so that is what the audit withholds. Taking the
-directory away too would audit the target's shell instead: a target reading
-`$MYCACHE` would fail on an unset variable rather than running cold, and every
-driver would need a fallback for a case only the audit produces.
+Everything else is set up as normal: the declaration resolves, the slot is
+locked, the directory is created and mounted, the variable is announced. Only the
+carried-over contents are withheld, along with any remote pull or push. It
+implies `--force`, because a scratch never reaches `hashin`, so without a rebuild
+the run would replay the result built *with* a warm cache and the audit would
+pass by reading back the answer it exists to re-derive.
 
-The audit writes into `<home>/scratch-audit/<pid>/`, a sibling of the store and
-never inside it — the store walk treats every child of `store_root` as a slot, so
-an audit directory there would list as an orphan and be swept as if it were real
-state. Directories are per process, so two audits cannot collide and neither can
-see an ordinary build's cache; dead ones are swept on next use, because a killed
-run cannot clean up after itself.
+A throwaway directory rather than no directory, deliberately. The contract says
+outputs must not depend on what is *in* the cache, so that is what the audit
+withholds. Taking the directory away as well would audit the target's shell
+instead: a target reading `$MYCACHE` would fail on an unset variable rather than
+running cold, and every driver would need a fallback for a case only the audit
+produces.
+
+Those directories live in `<home>/scratch-audit/<pid>/`, a sibling of the store
+and never inside it — the store walk treats every child of `store_root` as a
+slot, so one there would list as an orphan and be swept as if it were real state.
+Per process, so two audits cannot collide and neither can see an ordinary build's
+cache. Dead ones are reclaimed by `heph tool gc` and on the next audit's first
+use, because a killed run cannot clean up after itself.
 
 It is a bool rather than `--scratch=on|off` for a second reason: a valued flag
 named `scratch` collides on clap's argument *id* with any subcommand wanting a
