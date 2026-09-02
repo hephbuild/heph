@@ -741,6 +741,48 @@ pub struct BuildState {
     /// holder's pid (`None` if unknown). Added on `ResultLockWaitStart`, removed
     /// on `ResultLockWaitEnd`, so it reflects only currently-blocked waits.
     lock_waits: HashMap<String, Option<u32>>,
+    /// Consumers blocked on a scratch slot, keyed by the *consumer* addr so a
+    /// wait can be removed when its own `ScratchLockWaitEnd` lands.
+    ///
+    /// Rendered collapsed by scratch declaration — see [`scratch_wait_lines`].
+    /// One `exclusive` cache shared by hundreds of targets produces that many
+    /// simultaneous waiters, and that many identical rows is a flooded terminal,
+    /// not a diagnostic.
+    ///
+    /// [`scratch_wait_lines`]: BuildState::scratch_wait_lines
+    scratch_waits: HashMap<String, ScratchWait>,
+    /// Finished scratch waits, aggregated per cache as `(waiters, total ms)`.
+    ///
+    /// Kept after the wait ends because the *total* is the number worth
+    /// reporting: one target blocked for two seconds is noise, but 47 targets
+    /// blocked for three minutes between them is the whole reason the build was
+    /// slow, and by the time anyone reads the summary every wait has ended.
+    scratch_wait_totals: HashMap<String, (u64, u64)>,
+}
+
+/// Every blocked wait on one cache, collapsed for a single row.
+#[derive(Debug, Clone, Copy)]
+struct ScratchWaitGroup<'a> {
+    waiters: usize,
+    /// The *oldest* wait on this cache — how long the contention has run, not
+    /// how long the most recent arrival has been queued.
+    since_ms: u64,
+    holder_pid: Option<u32>,
+    access: &'a str,
+}
+
+/// One consumer's blocked wait on a scratch slot.
+#[derive(Debug, Clone)]
+struct ScratchWait {
+    /// The scratch declaration's addr — the subject of the rendered row, since
+    /// the cache is what the user would change, not the target that wanted it.
+    scratch: String,
+    /// `"exclusive"` or `"shared"`, echoed from the declaration.
+    access: String,
+    /// A process holding the slot, when one could be named.
+    holder_pid: Option<u32>,
+    /// When this consumer started waiting, for the row's elapsed clock.
+    since_ms: u64,
 }
 
 /// The header's count fields for one frame, as rendered strings.
@@ -944,6 +986,29 @@ impl BuildState {
             }
             BuildEventKind::ResultLockWaitEnd { addr } => {
                 self.lock_waits.remove(addr);
+            }
+            BuildEventKind::ScratchLockWaitStart {
+                addr,
+                scratch,
+                access,
+                holder_pid,
+            } => {
+                self.scratch_waits.insert(
+                    addr.clone(),
+                    ScratchWait {
+                        scratch: scratch.clone(),
+                        access: access.clone(),
+                        holder_pid: *holder_pid,
+                        since_ms: ev.at_unix_ms,
+                    },
+                );
+            }
+            BuildEventKind::ScratchLockWaitEnd { addr, .. } => {
+                if let Some(w) = self.scratch_waits.remove(addr) {
+                    let e = self.scratch_wait_totals.entry(w.scratch).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += ev.at_unix_ms.saturating_sub(w.since_ms);
+                }
             }
             // Read/Write markers are not aggregated into counters. The local
             // cache-write span is folded into the op timeline above, so the
@@ -1330,12 +1395,82 @@ impl BuildState {
             .collect()
     }
 
-    /// The full body: lock-wait notices first (they take priority), then every
+    /// The full body: wait notices first (they take priority), then every
     /// slow-target row. Uncollapsed — the caller windows it to the available rows.
     pub fn body_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
         let mut body = self.lock_wait_lines();
+        body.extend(self.scratch_wait_lines(now_ms));
         body.extend(self.slow_rows(now_ms));
         body
+    }
+
+    /// Every cache that serialized somebody this run, as
+    /// `(scratch, waiters, total wait ms)`, ordered by total wait descending so
+    /// the worst offender is first. Empty when nothing ever blocked.
+    pub fn scratch_wait_totals(&self) -> Vec<(&str, u64, u64)> {
+        let mut v: Vec<(&str, u64, u64)> = self
+            .scratch_wait_totals
+            .iter()
+            .map(|(k, (n, ms))| (k.as_str(), *n, *ms))
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+        v
+    }
+
+    /// Rows for scratch slots that are currently blocking somebody, one row per
+    /// *cache* rather than per waiting target:
+    /// `⧗ //build:gocache — 47 waiting (exclusive, 1m12s)`.
+    ///
+    /// Deliberately not shaped like the result-lock rows above, because the two
+    /// name different problems. A blocked result lock means another process is
+    /// building this exact target: wait, or kill it. A blocked scratch slot
+    /// means the build is serialized on a shared cache — a declaration-level
+    /// choice (`access = "exclusive"`) with a declaration-level fix. Rendering
+    /// them identically would send a user looking for a rogue process when what
+    /// they need to change is a line in a BUILD file.
+    ///
+    /// The subject is the scratch addr, and the count is the point: "47 waiting"
+    /// is what tells someone their cache is the bottleneck. Sorted by addr so
+    /// the order is stable across frames.
+    pub fn scratch_wait_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
+        if self.scratch_waits.is_empty() {
+            return Vec::new();
+        }
+        // Collapse by cache: waiters, the oldest wait, and any named holder.
+        let mut by_scratch: HashMap<&str, ScratchWaitGroup<'_>> = HashMap::new();
+        for w in self.scratch_waits.values() {
+            let e = by_scratch
+                .entry(w.scratch.as_str())
+                .or_insert(ScratchWaitGroup {
+                    waiters: 0,
+                    since_ms: w.since_ms,
+                    holder_pid: w.holder_pid,
+                    access: w.access.as_str(),
+                });
+            e.waiters += 1;
+            e.since_ms = e.since_ms.min(w.since_ms);
+            // Any waiter that managed to name a holder speaks for the rest.
+            e.holder_pid = e.holder_pid.or(w.holder_pid);
+        }
+
+        let mut rows: Vec<(&str, ScratchWaitGroup<'_>)> = by_scratch.into_iter().collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+        rows.into_iter()
+            .map(|(scratch, g)| {
+                let waited = human_elapsed(now_ms.saturating_sub(g.since_ms));
+                // A named holder outranks the access mode: "another process has
+                // it" and "you declared this exclusive" are different fixes, and
+                // only the first can be pinned on a pid.
+                let detail = match g.holder_pid {
+                    Some(pid) => format!("held by pid {pid}, {waited}"),
+                    None => format!("{}, {waited}", g.access),
+                };
+                Line::from(Span::styled(
+                    format!("  ⧗ {scratch} — {} waiting ({detail})", g.waiters),
+                    Style::default().fg(Color::Yellow),
+                ))
+            })
+            .collect()
     }
 
     /// Rows for addrs currently blocked on the result lock past the notice
@@ -2200,12 +2335,20 @@ impl TUIAppView for TuiProgressView {
 /// log sink. Used by every command's `ci_view`.
 pub struct CiProgressView {
     core: ProgressCore,
+    /// Caches whose contention has already been announced.
+    ///
+    /// One `exclusive` cache shared by hundreds of targets produces that many
+    /// waits; without this, a GitHub log gets that many identical lines. The
+    /// first names the problem, and [`finish`](CIAppView::finish) reports the
+    /// total it cost.
+    scratch_wait_announced: HashSet<String>,
 }
 
 impl CiProgressView {
     pub fn new(label: impl Into<String>) -> Self {
         Self {
             core: ProgressCore::new(label),
+            scratch_wait_announced: HashSet::new(),
         }
     }
 }
@@ -2234,6 +2377,19 @@ impl CIAppView for CiProgressView {
                 };
                 tracing::info!("waiting on result lock for {addr} ({holder})");
             }
+            // First waiter per cache only — see `scratch_wait_announced`.
+            BuildEventKind::ScratchLockWaitStart {
+                scratch,
+                access,
+                holder_pid,
+                ..
+            } if self.scratch_wait_announced.insert(scratch.clone()) => match holder_pid {
+                Some(pid) => tracing::info!("waiting on scratch {scratch}, held by pid {pid}"),
+                None => tracing::info!(
+                    "waiting on scratch {scratch} ({access}); \
+                     targets sharing it run one at a time"
+                ),
+            },
             _ => {}
         }
         self.core.fold(ev);
@@ -2242,6 +2398,12 @@ impl CIAppView for CiProgressView {
     fn finish(&self) {
         if let Some(n) = self.core.state.matched_total() {
             tracing::info!("matched {n} targets");
+        }
+        // The one number that tells someone their `exclusive` default is what
+        // made the build slow. Reported per cache, worst first.
+        for (scratch, waiters, total_ms) in self.core.state.scratch_wait_totals() {
+            let total = human_elapsed(total_ms);
+            tracing::info!("scratch {scratch} serialized {waiters} targets, {total} of total wait");
         }
         tracing::info!("{}", self.core.state.summary());
     }
@@ -2767,6 +2929,156 @@ mod tests {
         assert!(
             line.contains(&format!("({} ", Op::LocalCacheWrite.icon())),
             "{line}"
+        );
+    }
+
+    fn scratch_wait(addr: &str, scratch: &str, access: &str, pid: Option<u32>) -> BuildEventKind {
+        BuildEventKind::ScratchLockWaitStart {
+            addr: addr.into(),
+            scratch: scratch.into(),
+            access: access.into(),
+            holder_pid: pid,
+        }
+    }
+
+    fn scratch_wait_end(addr: &str, scratch: &str) -> BuildEventKind {
+        BuildEventKind::ScratchLockWaitEnd {
+            addr: addr.into(),
+            scratch: scratch.into(),
+        }
+    }
+
+    /// The row is about the *cache*, and many blocked targets collapse into one
+    /// line. A shared `exclusive` cache with hundreds of consumers produces that
+    /// many simultaneous waits; a row each would bury every other diagnostic.
+    #[test]
+    fn scratch_waits_collapse_to_one_row_per_cache() {
+        let mut st = BuildState::new();
+        for i in 0..40 {
+            st.apply(&ev(
+                1_000,
+                scratch_wait(
+                    &format!("//go/pkg{i}:build"),
+                    "//build:gocache",
+                    "exclusive",
+                    None,
+                ),
+            ));
+        }
+        st.apply(&ev(
+            1_000,
+            scratch_wait("//other:x", "//build:gomodcache", "shared", Some(88214)),
+        ));
+
+        let lines = st.scratch_wait_lines(61_000);
+        assert_eq!(lines.len(), 2, "one row per cache, not per waiter");
+
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(
+            text[0].contains("//build:gocache") && text[0].contains("40 waiting"),
+            "the cache and the count are the diagnostic: {:?}",
+            text[0],
+        );
+        assert!(
+            text[0].contains("exclusive"),
+            "an unheld slot names the access mode that caused it: {:?}",
+            text[0],
+        );
+        assert!(
+            text[1].contains("held by pid 88214"),
+            "a named holder outranks the access mode: {:?}",
+            text[1],
+        );
+    }
+
+    /// A scratch wait must not render as a result-lock wait. They are different
+    /// problems: one is "another process holds this target", the other is "your
+    /// own build is serialized on a cache you declared `exclusive`".
+    #[test]
+    fn a_scratch_wait_is_not_rendered_as_a_result_lock_wait() {
+        let mut st = BuildState::new();
+        st.apply(&ev(
+            0,
+            scratch_wait("//a:x", "//build:gocache", "exclusive", None),
+        ));
+        assert!(
+            st.lock_wait_lines().is_empty(),
+            "a scratch wait must not appear among the result-lock rows",
+        );
+        assert_eq!(st.scratch_wait_lines(1_000).len(), 1);
+    }
+
+    /// The row disappears the moment the slot is acquired — it reflects only
+    /// currently-blocked waits, and a stale row would send someone chasing a
+    /// bottleneck that has already cleared.
+    #[test]
+    fn a_scratch_wait_row_clears_when_the_slot_is_acquired() {
+        let mut st = BuildState::new();
+        st.apply(&ev(
+            1_000,
+            scratch_wait("//a:x", "//build:gocache", "exclusive", None),
+        ));
+        assert_eq!(st.scratch_wait_lines(5_000).len(), 1);
+        st.apply(&ev(9_000, scratch_wait_end("//a:x", "//build:gocache")));
+        assert!(st.scratch_wait_lines(9_000).is_empty());
+
+        // …and is remembered as a total, which is what the summary reports.
+        assert_eq!(
+            st.scratch_wait_totals(),
+            vec![("//build:gocache", 1, 8_000)]
+        );
+    }
+
+    /// Totals accumulate across every consumer, so the summary can say what the
+    /// contention actually cost rather than what one target saw.
+    #[test]
+    fn scratch_wait_totals_sum_every_waiter() {
+        let mut st = BuildState::new();
+        for (i, since) in [1_000u64, 2_000, 3_000].iter().enumerate() {
+            let addr = format!("//a:x{i}");
+            st.apply(&ev(
+                *since,
+                scratch_wait(&addr, "//build:gocache", "exclusive", None),
+            ));
+            st.apply(&ev(
+                since + 10_000,
+                scratch_wait_end(&addr, "//build:gocache"),
+            ));
+        }
+        assert_eq!(
+            st.scratch_wait_totals(),
+            vec![("//build:gocache", 3, 30_000)]
+        );
+    }
+
+    /// One line per contended cache, however many targets are queued behind it.
+    /// Without the dedup a large build writes one identical line per target.
+    #[test]
+    fn the_ci_view_announces_each_contended_cache_once() {
+        let mut v = CiProgressView::new("Running");
+        for i in 0..50 {
+            v.apply(&ev(
+                0,
+                scratch_wait(&format!("//a:x{i}"), "//build:gocache", "exclusive", None),
+            ));
+        }
+        assert_eq!(
+            v.scratch_wait_announced.len(),
+            1,
+            "one cache, one announcement",
+        );
+
+        v.apply(&ev(
+            0,
+            scratch_wait("//a:y", "//build:gomodcache", "shared", None),
+        ));
+        assert_eq!(
+            v.scratch_wait_announced.len(),
+            2,
+            "a second cache is its own problem and gets its own line",
         );
     }
 

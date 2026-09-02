@@ -57,7 +57,7 @@ impl Engine {
             .await
             .with_context(|| format!("resolve scratch for {addr}"))?;
         let (scratch_mounts, _scratch_guards) = self
-            .acquire_scratch(&rs, &resolved_scratch)
+            .acquire_scratch(&rs, addr, &resolved_scratch)
             .await
             .with_context(|| format!("acquire scratch for {addr}"))?;
 

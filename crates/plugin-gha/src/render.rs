@@ -311,6 +311,7 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
         );
     }
 
+    push_scratch(&mut b, t);
     push_lock_waits(&mut b, t, ctx);
     push_running_longest(&mut b, t, ctx);
 
@@ -447,6 +448,33 @@ fn pkg_rollup(r: &crate::tally::RootFailure, limit: usize) -> String {
     s
 }
 
+/// Most scratch caches named in any one report section. A workspace with more
+/// than a handful of distinct caches is unusual; the worst offenders sort first.
+const SCRATCH_ROWS: usize = 5;
+
+/// Which caches cost this run time.
+///
+/// Otherwise invisible in a report: a per-cache wait total is what tells someone
+/// their `access = "exclusive"` is the bottleneck, and it is not derivable from
+/// anything else in the summary.
+///
+/// Capped like every other list here — `Budgeted` is a fixed budget shared with
+/// the failure and lock-wait sections.
+fn push_scratch(b: &mut Budgeted, t: &Tally) {
+    let waits = t.scratch_waits();
+    if waits.is_empty() {
+        return;
+    }
+    b.push("\n### Scratch contention\n\n");
+    b.push("| cache | targets waiting | total wait |\n|---|--:|--:|\n");
+    for (scratch, waiters, total_ms) in waits.into_iter().take(SCRATCH_ROWS) {
+        b.push(&format!(
+            "| `{scratch}` | {waiters} | {} |\n",
+            fmt_duration(total_ms)
+        ));
+    }
+}
+
 fn push_lock_waits(b: &mut Budgeted, t: &Tally, ctx: &RenderCtx<'_>) {
     let (waits, total) = t.lock_waits(ctx.now_ms, ctx.slow_after_ms, LIVE_LOCK_ROWS);
     if waits.is_empty() {
@@ -563,6 +591,10 @@ pub(crate) fn render_final(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Str
 
     push_summary_table(&mut b, t, &c);
     push_zero_hit_diagnosis(&mut b, &c);
+    // On the final summary as well as the live comment: the job summary is what
+    // people actually read after the fact, and "why was this slow?" is a
+    // question asked at the end, not during.
+    push_scratch(&mut b, t);
     push_slowest(&mut b, t);
     push_miss_rollup(&mut b, t, &c);
 
@@ -1232,5 +1264,43 @@ mod tests {
             "{}",
             render_final(&t3, &ctx("run //...", 468_000), SUMMARY_BUDGET)
         );
+    }
+
+    /// The contention table reaches the **final** summary, not just the live
+    /// comment. The job summary is what people read after the job is over, and
+    /// "why was this slow?" is an after-the-fact question.
+    #[test]
+    fn the_final_summary_reports_scratch_contention() {
+        let mut t = build(2, 0, 0);
+        t.apply(&ev(
+            0,
+            BuildEventKind::ScratchLockWaitStart {
+                addr: "//a:z".into(),
+                scratch: "//build:gocache".into(),
+                access: "exclusive".into(),
+                holder_pid: None,
+            },
+        ));
+        t.apply(&ev(
+            9_000,
+            BuildEventKind::ScratchLockWaitEnd {
+                addr: "//a:z".into(),
+                scratch: "//build:gocache".into(),
+            },
+        ));
+
+        let out = render_final(&t, &ctx("Build", 60_000), 100_000);
+        assert!(
+            out.contains("Scratch contention") && out.contains("| `//build:gocache` | 1 |"),
+            "the contention table must render: {out}",
+        );
+    }
+
+    /// A run with no contention says nothing about scratch at all.
+    #[test]
+    fn an_uncontended_run_reports_no_scratch_section() {
+        let t = build(2, 0, 0);
+        let out = render_final(&t, &ctx("Build", 60_000), 100_000);
+        assert!(!out.contains("Scratch contention"), "{out}");
     }
 }

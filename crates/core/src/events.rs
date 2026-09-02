@@ -159,6 +159,44 @@ pub enum BuildEventKind {
     ResultLockWaitEnd {
         addr: String,
     },
+    /// Acquiring a scratch slot has been blocked past the notice threshold.
+    ///
+    /// Deliberately *not* folded into `ResultLockWait*`, because the two name
+    /// different problems with different fixes. A blocked result lock means
+    /// another process is building this exact target — wait for it, or kill it.
+    /// A blocked scratch slot means targets are serialized on a shared cache,
+    /// which is a declaration-level choice (`access`) the user can change.
+    ///
+    /// Emitted per *consumer*, so nothing is lost for a machine reader. A
+    /// renderer must collapse them by `scratch` before display: one `exclusive`
+    /// cache with hundreds of consumers produces that many simultaneous
+    /// waiters, and that many identical rows is not a diagnostic.
+    ///
+    /// Paired one-to-one with `ScratchLockWaitEnd` (which fires on acquire
+    /// **or** cancellation).
+    ScratchLockWaitStart {
+        /// The consumer waiting for the slot.
+        addr: String,
+        /// The scratch *declaration* being waited on (`//build:gocache`). The
+        /// subject of the diagnostic — the slot hash stays off the wire, being
+        /// internal and already resolvable via `heph tool scratch path`.
+        scratch: String,
+        /// `"exclusive"` or `"shared"`, echoing the word used in the BUILD file
+        /// rather than a bool the user would have to translate back.
+        access: String,
+        /// A process holding the slot when it was probed, when one can be named.
+        ///
+        /// Only an *exclusive* holder in **another** process stamps a nameable
+        /// pid, so this is `None` whenever the wait is on shared readers
+        /// draining, or on this build serializing against itself — the same
+        /// limitation, for the same reason, as `ResultLockWaitStart::holder_pid`.
+        holder_pid: Option<u32>,
+    },
+    /// The scratch-slot wait ended (slot acquired or the wait was cancelled).
+    ScratchLockWaitEnd {
+        addr: String,
+        scratch: String,
+    },
     RemoteCacheHit {
         addr: String,
     },

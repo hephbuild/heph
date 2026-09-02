@@ -87,9 +87,21 @@ pub enum ScratchLock {
     /// `flock(2)` files under `<home>/lock/scratch/`. Mutually exclusive across
     /// processes on the same machine — which is the point, since two `heph`
     /// invocations share one slot directory.
-    Fs(KeyedRWLock<String, FRWLock>),
+    Fs {
+        lock: KeyedRWLock<String, FRWLock>,
+        /// The directory the per-slot lock files live in. Kept so
+        /// [`holder_pid`](ScratchLock::holder_pid) can find a slot's file by
+        /// path, the same way `ResultLock::Fs` keeps its own.
+        dir: PathBuf,
+    },
     /// In-process only. Tests, and anything that has opted out of file locking.
     Mem(KeyedRWLock<String, MemRWLock>),
+}
+
+/// Path of a slot's lock file. One definition, so the file `new` locks and the
+/// file [`holder_pid`](ScratchLock::holder_pid) probes cannot drift apart.
+fn slot_lock_path(dir: &Path, slot: &str) -> PathBuf {
+    dir.join(format!("{slot}.scratch.lock"))
 }
 
 /// An opaque RAII guard on a slot. Held for the target's execute and dropped
@@ -100,9 +112,13 @@ pub type ScratchGuard = Box<dyn std::any::Any + Send>;
 impl ScratchLock {
     pub fn new(backend: LockBackend, dir: PathBuf) -> Self {
         match backend {
-            LockBackend::Fs => Self::Fs(KeyedRWLock::new(move |slot: &String| {
-                FRWLock::new(dir.join(format!("{slot}.scratch.lock")))
-            })),
+            LockBackend::Fs => Self::Fs {
+                lock: KeyedRWLock::new({
+                    let dir = dir.clone();
+                    move |slot: &String| FRWLock::new(slot_lock_path(&dir, slot))
+                }),
+                dir,
+            },
             LockBackend::Mem => Self::Mem(KeyedRWLock::new(|_| MemRWLock::default())),
         }
     }
@@ -115,15 +131,74 @@ impl ScratchLock {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ScratchGuard> {
         Ok(match (self, access) {
-            (Self::Fs(l), Access::Shared) => Box::new(l.read(slot, ctoken).await?) as ScratchGuard,
-            (Self::Fs(l), Access::Exclusive) => {
-                Box::new(l.write(slot, ctoken).await?) as ScratchGuard
+            (Self::Fs { lock, .. }, Access::Shared) => {
+                Box::new(lock.read(slot, ctoken).await?) as ScratchGuard
+            }
+            (Self::Fs { lock, .. }, Access::Exclusive) => {
+                let guard = lock.write(slot, ctoken).await?;
+                stamp_pid(guard.get());
+                Box::new(guard) as ScratchGuard
             }
             (Self::Mem(l), Access::Shared) => Box::new(l.read(slot, ctoken).await?) as ScratchGuard,
             (Self::Mem(l), Access::Exclusive) => {
                 Box::new(l.write(slot, ctoken).await?) as ScratchGuard
             }
         })
+    }
+
+    /// A process holding `slot` exclusively right now, when one can be named.
+    ///
+    /// Best-effort by nature, and in exactly the two ways the result lock's
+    /// probe is: it is a snapshot (the holder may release the instant after),
+    /// and a pid is a hint for a human, never something the engine acts on.
+    ///
+    /// `None` for a slot held by *readers*: `flock(2)` shared holders are not
+    /// stamped and `FLock::is_path_held` reports them as unheld. That leaves the
+    /// case worth naming — one `exclusive` consumer, very often in another
+    /// `heph` process, blocking everyone else — which is the whole reason a
+    /// waiter cannot answer this question by looking inward.
+    fn holder_pid(&self, slot: &str) -> Option<u32> {
+        match self {
+            Self::Fs { dir, .. } => {
+                let path = slot_lock_path(dir, slot);
+                match hlock::hlock::FLock::is_path_held(&path) {
+                    // Our own pid means this build is serialized against itself
+                    // — many targets sharing one `exclusive` cache is the
+                    // dominant shape. Reporting "held by pid <us>" would send
+                    // the reader hunting a rogue process when the fix is the
+                    // `access` on the declaration, so say nothing and let the
+                    // renderer fall back to naming the access mode.
+                    Ok(true) => crate::engine::result_lock::read_pid(&path)
+                        .filter(|pid| *pid != std::process::id()),
+                    Ok(false) => None,
+                    Err(err) => {
+                        // Without this the diagnostic path is itself
+                        // undiagnosable — same reasoning as the result lock's.
+                        tracing::debug!(error = %err, slot, "probing scratch lock liveness");
+                        None
+                    }
+                }
+            }
+            // In-process only, so the holder is always this process and naming
+            // it would tell a reader nothing they did not already know.
+            Self::Mem(_) => None,
+        }
+    }
+}
+
+/// Stamp this process's pid into a slot's lock file, so a blocked waiter in
+/// another process can name the holder.
+///
+/// Written through the held guard's already-open file description, and
+/// newline-framed for the same reason the result lock frames its own: a shorter
+/// pid written over a longer stale one would otherwise leave `<new><stale tail>`
+/// — all digits, perfectly parseable, naming a process that is nobody. See
+/// `result_lock::read_pid`, which is the reader for both.
+///
+/// Best-effort: a failed stamp costs a waiter the holder's name and nothing else.
+fn stamp_pid(guard: &hlock::hlock::FWriteGuard) {
+    if let Err(err) = guard.write_contents(format!("{}\n", std::process::id()).as_bytes()) {
+        tracing::debug!(error = %err, "could not stamp pid into scratch lock");
     }
 }
 
@@ -218,6 +293,7 @@ impl Engine {
     pub(crate) async fn acquire_scratch(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
+        consumer: &Addr,
         resolved: &[ResolvedScratch],
     ) -> anyhow::Result<(Vec<ScratchMount>, Vec<ScratchGuard>)> {
         if resolved.is_empty() {
@@ -228,12 +304,12 @@ impl Engine {
             resolved.iter().map(|r| (r.slot(), r)).collect();
         ordered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
+        let consumer_str = consumer.format();
         let mut guards = Vec::with_capacity(ordered.len());
         let mut mounts = Vec::with_capacity(ordered.len());
         for (slot, r) in ordered {
             let guard = self
-                .scratch_lock
-                .acquire(slot.clone(), r.def.access, rs.ctoken())
+                .acquire_slot_with_notice(rs, &consumer_str, &slot, r)
                 .await
                 .with_context(|| format!("acquire scratch lock for {}", r.addr))?;
             guards.push(guard);
@@ -255,6 +331,70 @@ impl Engine {
             });
         }
         Ok((mounts, guards))
+    }
+}
+
+/// How long a scratch slot may be contended before the wait is announced.
+///
+/// The same five seconds the result lock uses, and for the same reason: below
+/// it, contention is normal scheduling and a notice would be noise; above it,
+/// the user is waiting and deserves to know what for.
+#[cfg(not(test))]
+const SCRATCH_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shortened under `cfg(test)` so the contended path can be exercised without
+/// putting a five-second sleep in a suite that runs on every push. The gate
+/// itself — that an immediate acquire stays silent and a blocked one does not —
+/// is what the tests assert; the threshold is a product decision, fixed above.
+#[cfg(test)]
+const SCRATCH_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl Engine {
+    /// Acquire one slot, announcing the wait if it outlasts
+    /// [`SCRATCH_LOCK_NOTICE`]. The notice is informational; the wait continues
+    /// until the slot is acquired or the request is cancelled.
+    ///
+    /// Gated on the threshold rather than emitted unconditionally because an
+    /// uncontended acquire is the overwhelmingly common case and must stay
+    /// silent — hundreds of targets sharing one cache would otherwise emit two
+    /// events each saying only "nothing was wrong".
+    async fn acquire_slot_with_notice(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        consumer: &str,
+        slot: &str,
+        r: &ResolvedScratch,
+    ) -> anyhow::Result<ScratchGuard> {
+        let lock_fut = self
+            .scratch_lock
+            .acquire(slot.to_string(), r.def.access, rs.ctoken());
+        tokio::pin!(lock_fut);
+
+        match tokio::time::timeout(SCRATCH_LOCK_NOTICE, &mut lock_fut).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                // Probed only once the wait is already known to be long, so the
+                // common path never pays for the filesystem check.
+                let holder_pid = self.scratch_lock.holder_pid(slot);
+                let (addr, scratch) = (consumer.to_string(), r.addr.format());
+                let end = (addr.clone(), scratch.clone());
+                crate::engine::event::emit_scope(
+                    rs,
+                    crate::engine::event::BuildEventKind::ScratchLockWaitStart {
+                        addr,
+                        scratch,
+                        access: r.def.access.as_str().to_string(),
+                        holder_pid,
+                    },
+                    move |_| crate::engine::event::BuildEventKind::ScratchLockWaitEnd {
+                        addr: end.0,
+                        scratch: end.1,
+                    },
+                    async { (&mut lock_fut).await },
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -391,5 +531,154 @@ mod tests {
         assert!(!hcore::paths::paths_overlap("a/b", "a/c"));
         assert!(hcore::paths::paths_overlap("a", "a/b"));
         assert!(hcore::paths::paths_overlap("a/b", "a"));
+    }
+
+    /// Records every event a run emits, so a test can assert on the stream the
+    /// TUI, the GHA hook and the stall watchdog all actually consume.
+    #[derive(Default)]
+    struct Rec {
+        seen: parking_lot::Mutex<Vec<crate::engine::event::BuildEventKind>>,
+    }
+
+    impl crate::engine::hook::Hook for Rec {
+        fn name(&self) -> String {
+            "rec".into()
+        }
+        fn on_event(&self, ev: &hcore::events::BuildEvent) {
+            self.seen.lock().push(ev.kind.clone());
+        }
+        fn on_close(&self) {}
+    }
+
+    /// An engine over `root` with a recording hook attached.
+    fn recording_engine(root: &Path) -> (Arc<Engine>, Arc<Rec>) {
+        let mut e = Engine::new(crate::engine::Config {
+            root: root.to_path_buf(),
+            home_dir: PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })
+        .expect("engine");
+        let rec = Arc::new(Rec::default());
+        e.register_hook(Arc::clone(&rec) as Arc<dyn crate::engine::hook::Hook>)
+            .expect("register hook");
+        (Arc::new(e), rec)
+    }
+
+    /// An uncontended acquire emits nothing.
+    ///
+    /// The notice is threshold-gated because the quiet case is overwhelmingly
+    /// the common one: hundreds of targets sharing a cache would otherwise emit
+    /// two events each saying "nothing was wrong".
+    #[tokio::test]
+    async fn an_uncontended_slot_emits_no_wait_notice() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let (engine, rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let r = res("c", "C", ".cache/x");
+
+        let guard = engine
+            .acquire_slot_with_notice(&rs, "//app:a", &r.slot(), &r)
+            .await
+            .expect("acquire");
+        drop(guard);
+
+        assert!(
+            !rec.seen.lock().iter().any(|k| matches!(
+                k,
+                crate::engine::event::BuildEventKind::ScratchLockWaitStart { .. }
+            )),
+            "an immediate acquire must stay silent",
+        );
+    }
+
+    /// A slot that is genuinely held announces the wait, names the cache, and
+    /// closes the span on acquire.
+    ///
+    /// This is the whole point: before it, a build serialized on a shared cache
+    /// showed only an open `result` span — indistinguishable from a target
+    /// queued for a worker — and neither the TUI nor the stall report could say
+    /// what it was waiting for.
+    #[tokio::test]
+    async fn a_contended_slot_announces_the_wait_and_names_the_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let (engine, rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let r = res("c", "C", ".cache/x");
+        let slot = r.slot();
+
+        // Hold the slot, then race a second acquire past the notice threshold.
+        let held = engine
+            .acquire_slot_with_notice(&rs, "//app:holder", &slot, &r)
+            .await
+            .expect("first acquire");
+
+        let waiter = {
+            let (engine, rs, r, slot) = (
+                Arc::clone(&engine),
+                Arc::clone(&rs),
+                r.clone(),
+                slot.clone(),
+            );
+            tokio::spawn(async move {
+                engine
+                    .acquire_slot_with_notice(&rs, "//app:waiter", &slot, &r)
+                    .await
+                    .map(drop)
+            })
+        };
+
+        tokio::time::sleep(SCRATCH_LOCK_NOTICE * 4).await;
+        drop(held);
+        waiter.await.expect("join").expect("second acquire");
+
+        let seen = rec.seen.lock();
+        assert!(
+            seen.iter().any(|k| matches!(
+                k,
+                crate::engine::event::BuildEventKind::ScratchLockWaitStart {
+                    addr, scratch, access, ..
+                } if addr == "//app:waiter"
+                    && scratch == &r.addr.format()
+                    && access == "exclusive"
+            )),
+            "the blocked waiter must announce itself: {seen:?}",
+        );
+        assert!(
+            seen.iter().any(|k| matches!(
+                k,
+                crate::engine::event::BuildEventKind::ScratchLockWaitEnd { addr, .. }
+                    if addr == "//app:waiter"
+            )),
+            "the span must close on acquire, or the row never clears: {seen:?}",
+        );
+    }
+
+    /// Contention *within* one process reports no holder pid.
+    ///
+    /// The stamp is this process's own, so naming it would point the reader at a
+    /// rogue process when the fix is the `access` on the declaration. The
+    /// renderer falls back to naming the access mode instead.
+    #[tokio::test]
+    async fn self_contention_names_no_holder_process() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let (engine, _rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let r = res("c", "C", ".cache/x");
+        let slot = r.slot();
+
+        let held = engine
+            .acquire_slot_with_notice(&rs, "//app:holder", &slot, &r)
+            .await
+            .expect("acquire");
+        assert_eq!(
+            engine.scratch_lock.holder_pid(&slot),
+            None,
+            "our own pid is not a useful holder to report",
+        );
+        drop(held);
     }
 }

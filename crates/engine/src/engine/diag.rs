@@ -277,9 +277,24 @@ pub struct DiagState {
     /// on the same machine, and no amount of introspection into this process
     /// would ever find it.
     lock_wait: OpState,
+    /// Blocked scratch-slot acquisitions, tracked apart from `lock_wait`.
+    ///
+    /// Deliberately not folded in: a blocked result lock means another process
+    /// is building this exact target — wait, or kill it — while a blocked
+    /// scratch slot means the build is serialized on a cache the author
+    /// declared `exclusive`, which is a BUILD-file fix. Reporting them under one
+    /// label sends an operator hunting a rogue process for a configuration
+    /// problem.
+    scratch_wait: OpState,
     /// Pid believed to hold the lock at the most recent blocked acquisition;
     /// `0` for none/unknown. Last-writer-wins — a diagnostic hint, not a census.
     lock_holder_pid: AtomicU64,
+    scratch_holder_pid: AtomicU64,
+    /// The cache most recently reported as contended — the subject of the stall
+    /// paragraph's scratch line. A `Mutex` rather than an atomic because it is a
+    /// name, and it is only ever written past the notice threshold, which is
+    /// rare by construction.
+    scratch_wait_cache: parking_lot::Mutex<Option<String>>,
     /// Worker permits currently held by a target that is actually running —
     /// incremented once `acquire()` has *returned*, decremented when the permit
     /// drops.
@@ -367,7 +382,10 @@ impl DiagState {
             done: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             lock_wait: OpState::new(),
+            scratch_wait: OpState::new(),
             lock_holder_pid: AtomicU64::new(0),
+            scratch_holder_pid: AtomicU64::new(0),
+            scratch_wait_cache: parking_lot::Mutex::new(None),
             workers_running: AtomicI64::new(0),
             workers_capacity: AtomicU64::new(0),
             workers_free: std::sync::OnceLock::new(),
@@ -424,6 +442,52 @@ impl DiagState {
     /// cancelled — `ResultLockWaitEnd` fires for both).
     pub fn lock_wait_end(&self, addr: &str, now_ms: u64) {
         self.span_end(&self.lock_wait, addr, now_ms);
+    }
+
+    /// Record the start of a blocked scratch-slot acquisition.
+    pub fn scratch_wait_start(
+        &self,
+        addr: &str,
+        scratch: &str,
+        holder_pid: Option<u32>,
+        now_ms: u64,
+    ) {
+        if let Some(pid) = holder_pid {
+            self.scratch_holder_pid
+                .store(u64::from(pid), Ordering::Relaxed);
+        }
+        *self.scratch_wait_cache.lock() = Some(scratch.to_string());
+        self.span_start(&self.scratch_wait, addr, now_ms);
+    }
+
+    /// Record the end of a blocked scratch-slot acquisition (acquired or
+    /// cancelled — `ScratchLockWaitEnd` fires for both).
+    pub fn scratch_wait_end(&self, addr: &str, now_ms: u64) {
+        self.span_end(&self.scratch_wait, addr, now_ms);
+    }
+
+    /// Blocked scratch slots right now, or `None` when nothing is blocked.
+    pub fn scratch_waits(&self, now_ms: u64) -> Option<ScratchWaitSummary> {
+        if !self.any_scratch_wait() {
+            return None;
+        }
+        let pid = self.scratch_holder_pid.load(Ordering::Relaxed);
+        Some(ScratchWaitSummary {
+            waiters: u64::try_from(self.scratch_wait.open.load(Ordering::Relaxed).max(0))
+                .unwrap_or(0),
+            oldest: oldest_of(&self.scratch_wait, now_ms),
+            holder_pid: (pid != 0).then(|| u32::try_from(pid).unwrap_or(0)),
+            cache: self.scratch_wait_cache.lock().clone(),
+        })
+    }
+
+    /// Whether any scratch slot is blocked, without building a summary.
+    ///
+    /// The predicates that only need the yes/no answer use this rather than
+    /// `scratch_waits(..).is_none()`, which would take the mutex and clone a
+    /// cache name purely to throw it away.
+    fn any_scratch_wait(&self) -> bool {
+        self.scratch_wait.open.load(Ordering::Relaxed) > 0
     }
 
     /// `(open waits, oldest age, holder pid)` — `None` when nothing is blocked.
@@ -680,6 +744,7 @@ impl DiagState {
         // another process (the holder pid) that nothing else could surface —
         // so its report must not wait on the subprocess clock.
         let only_subprocesses = self.lock_waits(now_ms).is_none()
+            && !self.any_scratch_wait()
             && open.iter().any(|(op, _, _)| matches!(op, Op::Execute))
             && open
                 .iter()
@@ -703,6 +768,7 @@ impl DiagState {
             done: self.done(),
             failed: self.failed(),
             lock_waits: self.lock_waits(now_ms),
+            scratch_waits: self.scratch_waits(now_ms),
             workers: self.worker_permits(),
             delta: None,
             stuck: Vec::new(),
@@ -754,6 +820,8 @@ pub struct StallReport {
     pub failed: u64,
     /// `(open waits, oldest age, holder pid)` when the result lock is blocking.
     pub lock_waits: Option<(u64, Option<Duration>, Option<u32>)>,
+    /// Blocked scratch slots, when any.
+    pub scratch_waits: Option<ScratchWaitSummary>,
     /// Change since the previous fire; `None` on the first.
     pub delta: Option<StallDelta>,
     /// Worker-permit accounting, when the pool has been registered.
@@ -808,6 +876,7 @@ impl StallReport {
     /// "only result spans are open" means the process has nothing to do.
     pub fn no_work_in_flight(&self) -> bool {
         self.lock_waits.is_none()
+            && self.scratch_waits.is_none()
             && self
                 .open
                 .iter()
@@ -892,6 +961,18 @@ impl hplugin::hook::Hook for DiagHook {
                 s.lock_wait_start(addr, *holder_pid, now);
             }
             BuildEventKind::ResultLockWaitEnd { addr } => s.lock_wait_end(addr, now),
+            // A blocked scratch slot is a blocked build, exactly like a blocked
+            // result lock, and disqualifies the "only subprocesses" exemption
+            // for the same reason: heph can see this wait completely and often
+            // name the process holding it, so the report must not sit on the
+            // slower subprocess clock waiting to say so.
+            BuildEventKind::ScratchLockWaitStart {
+                addr,
+                scratch,
+                holder_pid,
+                ..
+            } => s.scratch_wait_start(addr, scratch, *holder_pid, now),
+            BuildEventKind::ScratchLockWaitEnd { addr, .. } => s.scratch_wait_end(addr, now),
             // Cache hit/miss carry no span but are unambiguous progress.
             BuildEventKind::LocalCacheHit { .. }
             | BuildEventKind::LocalCacheMiss { .. }
@@ -903,6 +984,24 @@ impl hplugin::hook::Hook for DiagHook {
     }
 
     fn on_close(&self) {}
+}
+
+/// Blocked scratch slots as the stall paragraph reports them.
+///
+/// Named rather than a 4-tuple because the render site reads every field and a
+/// positional destructuring there is one reordering away from labelling the
+/// waiter count as a pid.
+#[derive(Debug, Clone)]
+pub struct ScratchWaitSummary {
+    /// Consumers currently blocked.
+    pub waiters: u64,
+    /// How long the oldest of them has waited.
+    pub oldest: Option<Duration>,
+    /// A process holding the slot, when one could be named. `None` means the
+    /// contention is this build against itself — see `ScratchLock::holder_pid`.
+    pub holder_pid: Option<u32>,
+    /// The cache being waited on — the subject of the line.
+    pub cache: Option<String>,
 }
 
 /// Cells listed individually in a stall paragraph. The paragraph repeats on
@@ -1010,6 +1109,25 @@ pub fn render_stall(r: &StallReport) -> String {
         };
         out.push_str(&format!(
             "  lock waits   {n} on the result lock{age}{holder}\n"
+        ));
+    }
+
+    if let Some(w) = &r.scratch_waits {
+        let (n, pid) = (w.waiters, w.holder_pid);
+        let age = w
+            .oldest
+            .map(|d| format!(" for {}", secs(d)))
+            .unwrap_or_default();
+        // A pid means another process holds the cache; without one the cause is
+        // this build's own `access = "exclusive"`. Different fixes, so the line
+        // must not read the same.
+        let holder = match pid {
+            Some(p) => format!(", holder pid {p}"),
+            None => String::new(),
+        };
+        let cache = w.cache.as_deref().unwrap_or("a scratch cache");
+        out.push_str(&format!(
+            "  scratch      {n} waiting on {cache}{age}{holder}\n"
         ));
     }
 
@@ -1553,6 +1671,93 @@ mod tests {
             .evaluate(61_000, T)
             .expect("a visible lock wait must be reported at the ordinary threshold");
         assert!(r.lock_waits.is_some());
+    }
+
+    /// A blocked scratch slot fires at the ordinary threshold, exactly as a
+    /// blocked result lock does — heph sees the whole wait and can often name
+    /// the holder, so there is nothing to defer to the subprocess clock for.
+    ///
+    /// Driven through `DiagHook::on_event` rather than by poking the state, so
+    /// the event→state mapping this module owns is what is under test.
+    #[test]
+    fn a_blocked_scratch_slot_alongside_a_quiet_exec_still_fires() {
+        use hplugin::hook::Hook as _;
+        let s = state();
+        let hook = DiagHook::new(std::sync::Arc::clone(&s));
+        hook.on_event(&ev(BuildEventKind::ExecuteStart {
+            addr: "//a:b".into(),
+            driver: "bash".into(),
+            cache: true,
+        }));
+        hook.on_event(&ev(BuildEventKind::ScratchLockWaitStart {
+            addr: "//c:d".into(),
+            scratch: "//build:gocache".into(),
+            access: "exclusive".into(),
+            holder_pid: Some(4412),
+        }));
+
+        let r = s
+            .evaluate(61_000, T)
+            .expect("a blocked scratch slot must be reported at the ordinary threshold");
+        let w = r.scratch_waits.clone().expect("a scratch wait is open");
+        assert_eq!((w.waiters, w.holder_pid), (1, Some(4412)));
+        assert_eq!(w.cache.as_deref(), Some("//build:gocache"));
+        assert!(
+            r.lock_waits.is_none(),
+            "a scratch wait must not be counted as a result-lock wait",
+        );
+    }
+
+    /// The rendered paragraph names the cache and never says "result lock".
+    ///
+    /// The two waits have different fixes — "another process is building this
+    /// target" versus "you declared this cache `exclusive`" — so a shared label
+    /// sends an operator hunting a rogue process for a BUILD-file problem. That
+    /// is the misattribution the split exists to prevent, and only a
+    /// render-level assertion catches it.
+    #[test]
+    fn a_scratch_wait_is_not_reported_as_a_result_lock_wait() {
+        use hplugin::hook::Hook as _;
+        let s = state();
+        let hook = DiagHook::new(std::sync::Arc::clone(&s));
+        hook.on_event(&ev(BuildEventKind::ScratchLockWaitStart {
+            addr: "//c:d".into(),
+            scratch: "//build:gocache".into(),
+            access: "exclusive".into(),
+            holder_pid: None,
+        }));
+
+        let r = s.evaluate(61_000, T).expect("reported");
+        let text = render_stall(&r);
+        assert!(
+            text.contains("//build:gocache"),
+            "the paragraph must name the contended cache: {text}",
+        );
+        assert!(
+            !text.contains("result lock"),
+            "a scratch wait must not be attributed to the result lock: {text}",
+        );
+    }
+
+    /// The wait closes on `ScratchLockWaitEnd`, so a run that acquired its slot
+    /// stops reporting contention.
+    #[test]
+    fn a_scratch_wait_clears_when_the_slot_is_acquired() {
+        use hplugin::hook::Hook as _;
+        let s = state();
+        let hook = DiagHook::new(std::sync::Arc::clone(&s));
+        hook.on_event(&ev(BuildEventKind::ScratchLockWaitStart {
+            addr: "//c:d".into(),
+            scratch: "//build:gocache".into(),
+            access: "exclusive".into(),
+            holder_pid: None,
+        }));
+        hook.on_event(&ev(BuildEventKind::ScratchLockWaitEnd {
+            addr: "//c:d".into(),
+            scratch: "//build:gocache".into(),
+        }));
+        let r = s.evaluate(61_000, T).expect("reported");
+        assert!(r.scratch_waits.is_none(), "the wait ended");
     }
 
     /// A wedged cache write alongside a quiet exec fires at the ordinary

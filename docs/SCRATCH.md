@@ -292,6 +292,37 @@ own a cache handle this; a hand-written `bash` target should write `${MYCACHE:-}
 
 `example/scratch/` is a worked package covering the three shapes.
 
+## Observability
+
+Scratch work happens between dependency resolution and the worker permit —
+*before* `ExecuteStart`. Uninstrumented, a target blocked on a contended slot is
+indistinguishable from one queued for a worker: one open `result` span and
+nothing else.
+
+`ScratchLockWaitStart/End` closes that, emitted once a slot stays contended past
+five seconds. It carries the consumer, the cache, the `access` word from the
+declaration, and a holder pid when one can be named. The wait is threshold-gated
+because an uncontended acquire must stay silent — hundreds of targets sharing
+one cache would otherwise emit two events each saying nothing was wrong.
+
+The event is per *consumer*, so a machine reader loses nothing, but **renderers
+collapse by cache**: one `exclusive` cache with hundreds of consumers produces
+that many simultaneous waiters. The TUI shows
+`⧗ //build:gocache — 47 waiting (exclusive, 1m12s)`; the CI view logs the first
+waiter per cache and a per-cache total at the end; the GHA report renders a
+contention table. The subject is the cache because that is what the user would
+change.
+
+This is deliberately **not** the result lock's `🔒` row. "Another process is
+building this target" and "your build is serialized on a cache you declared
+`exclusive`" are different problems with different fixes, and the stall
+paragraph keeps them on separate lines for the same reason.
+
+A holder pid appears only when the holder is *another process*. Contention
+within one build reports none — the stamp would be our own pid, and naming it
+would send the reader hunting a rogue process when the fix is one line in a
+BUILD file.
+
 ## Who uses it
 
 - **`plugin-go`** — one `GOCACHE` per Go module per variant, plus one shared,
@@ -331,8 +362,6 @@ Designed, and deliberately absent:
   base and gets steadily colder. Strict precedence ships instead. The data the
   guard needs (`parent_scope`, `parent_generation`) is already recorded, so
   enabling it later is a resolution change, not a format change.
-- **Scratch events** — nothing appears in the TUI or `--json`; `tracing` at
-  `debug` is what exists.
 - **`heph tool scratch verify`** — the cold/warm `hashout` pair is a CI script.
 - **A per-run clone** — deferred, not rejected.
 - **A local BuildKit layer cache** for `docker_build`.
