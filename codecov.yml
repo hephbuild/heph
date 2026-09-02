@@ -1,0 +1,103 @@
+# Codecov configuration.
+#
+# The reports are produced by `cov` (see devenv.nix) — LLVM source-based
+# instrumentation collected with grcov — and uploaded by the `coverage` job in
+# .github/workflows/heph.yml, one upload per platform leg.
+#
+# ADVISORY, NEVER A GATE. `informational: true` on every status means Codecov
+# reports the delta on the PR and never sets a failing check, and the `coverage`
+# job is deliberately absent from `release`'s `needs:`. A percentage that blocks
+# a merge buys tests that move the percentage, not tests that catch bugs; the
+# gates in this repo are `lint`, `test` and `bin_e2e`, plus the standing rule in
+# .claude/testing.md that every feature and bug fix ships with a test. Revisit
+# with two months of real data, not before.
+#
+# Because nothing here can fail, nothing here is a safety net either: every
+# check that can tell a broken measurement from a real drop lives in `cov`
+# itself, which exits non-zero rather than publishing an empty report.
+
+codecov:
+  # This is a report, not a verdict. Waiting for the rest of CI would hold the
+  # comment behind a 45-minute test matrix that has nothing to say about it.
+  require_ci_to_pass: false
+  notify:
+    # Two legs upload (linux/amd64, darwin/arm64) and the merged number is only
+    # meaningful once both have. `tests/coverage_gate.rs` keeps this equal to
+    # the matrix leg count — too high and the comment never arrives, too low
+    # and it is posted on a partial merge.
+    #
+    # Two cases produce no comment at all rather than a half one, which is the
+    # right outcome but reads as "coverage is not configured": a fork PR (no
+    # token, so neither leg uploads) and a leg that fails outright. The red job
+    # is the signal in the second case.
+    after_n_builds: 2
+
+coverage:
+  precision: 2
+  round: down
+  range: "50...90"
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# One flag per platform leg, so the OS axis stays visible after the merge.
+# Coverage is per-line, and this tree has whole files behind `cfg(target_os)` —
+# `crates/proc/src/proc_exec/imp_macos.rs` is ~790 lines that a Linux run does
+# not compile, so it emits no mapping and would read as "nothing to cover", a
+# green patch check over entirely unmeasured code. Two legs, merged, is what
+# makes that honest.
+#
+# `carryforward: true` keeps the last known value for a leg that did not upload
+# (a fork PR, a re-run of one leg) instead of reporting it as a cliff.
+flag_management:
+  default_rules:
+    carryforward: true
+    statuses:
+      - type: project
+        informational: true
+      - type: patch
+        informational: true
+  individual_flags:
+    - name: linux-amd64
+    - name: darwin-arm64
+
+comment:
+  layout: "condensed_header, diff, flags, condensed_files, condensed_footer"
+  require_changes: true
+
+# Excluded because it is not code anyone is expected to cover, not because it is
+# inconvenient. `cov`'s own table still shows most of these locally — knowing the
+# e2e harness is itself half dead code is useful there and noise on a PR.
+#
+# Generated code (`gen/` is written by buf) is excluded in grcov instead, so it
+# never reaches the report at all; each exclusion has exactly one home.
+ignore:
+  # Test scaffolding: these crates *are* the tests.
+  - "crates/e2e/**"
+  - "crates/bin-e2e/**"
+  - "crates/plugingo-e2e/**"
+  - "crates/testkit/**"
+  # `**/tests/**`, not `tests/**`: the latter matches only the root
+  # package's, leaving `crates/execrunner/tests` and `crates/xstarlark-fmt/tests`
+  # — self-covering integration-test code — in the denominator.
+  - "**/tests/**"
+  # Perf harness — run by the perf workflow, not by `tst`.
+  - "crates/bench/**"
+  - "crates/bench-corpus/**"
+  # The cdylib shims exist to be `dlopen`ed, and the only real `dlopen` lives in
+  # `bin-e2e`, which `cov` excludes for the same reason `tst` does. They would
+  # sit at a permanent ~0% and set a floor of noise a real regression could hide
+  # under. If `cov` ever grows a leg that loads them, delete these four lines.
+  - "crates/plugin-go-cdylib/**"
+  - "crates/plugin-gha-cdylib/**"
+  - "crates/plugin-oci-cdylib/**"
+  - "crates/plugin-devenv-cdylib/**"
+  # Not shipped code.
+  - "example/**"
+  - "tools/**"
+  - "scripts/**"
+  - "**/build.rs"

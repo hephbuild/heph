@@ -17,6 +17,9 @@ target/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Coverage reports written by `cov` (the .profraw live under target/)
+/coverage/
+
 # Devenv
 .devenv*
 devenv.local.nix
