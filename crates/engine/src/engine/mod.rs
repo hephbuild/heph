@@ -94,6 +94,7 @@ pub mod sandbox_cleaner;
 pub mod scratch;
 pub mod scratch_remote;
 pub mod scratch_store;
+mod secrets;
 pub mod validate;
 pub mod worker_pool;
 

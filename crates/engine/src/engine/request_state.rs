@@ -293,6 +293,18 @@ pub struct RequestStateData {
     /// key.
     pub(crate) mem_remote_blob: Memoizer<(AddrKey, String, String), Result<bool, ArcErr>>,
     pub mem_meta: Memoizer<AddrKey, Result<ResultMeta, ArcErr>>,
+    /// The credential broker for this request.
+    ///
+    /// Per-request rather than per-engine, so a value never outlives the run
+    /// that minted it. Built lazily: the overwhelming majority of requests
+    /// declare no credentials, and constructing a provider registry for them
+    /// would be pure cost.
+    ///
+    /// Deliberately *not* the engine's `Memoizer`, which is compute-once for
+    /// the life of a `RequestState` and has no expiry — a credential has a
+    /// clock on it, so the broker keeps a cache of its own with real TTL
+    /// semantics.
+    pub(crate) broker: std::sync::OnceLock<Arc<hsecrets::broker::Broker>>,
     pub mem_spec: Memoizer<AddrKey, Result<Arc<EngineTargetSpec>, ArcErr>>,
     pub mem_def: Memoizer<AddrKey, Result<Arc<ExtendedTargetDef>, ArcErr>>,
     pub mem_expanded_inputs:
@@ -619,6 +631,22 @@ pub struct RequestState {
 impl RequestState {
     pub fn request_id(&self) -> &String {
         &self.data.request_id
+    }
+
+    /// The credential broker for this request, built on first use.
+    ///
+    /// One per run, so every target naming `//infra/creds:ecr` shares a single
+    /// mint — which is the difference between one STS call and one per target.
+    pub(crate) fn broker(&self) -> Arc<hsecrets::broker::Broker> {
+        Arc::clone(self.data.broker.get_or_init(|| {
+            let registry = hsecrets::provider::ProviderRegistry::with_builtins()
+                // The builtins are two `register` calls on an empty registry;
+                // the only way this fails is a duplicate, which cannot happen
+                // for a set this code owns. An empty registry still reports a
+                // useful "no provider registered" per descriptor.
+                .unwrap_or_default();
+            Arc::new(hsecrets::broker::Broker::new(Arc::new(registry)))
+        }))
     }
 
     pub fn ctoken(&self) -> &StdCancellationToken {
@@ -1044,6 +1072,7 @@ impl Engine {
             mem_remote_blob: Memoizer::with_tag_task("remote_blob", self.runtime.clone()),
             mem_result: Memoizer::with_tag_task("result", self.runtime.clone()),
             mem_meta: Memoizer::with_tag_task("meta", self.runtime.clone()),
+            broker: std::sync::OnceLock::new(),
             mem_spec: Memoizer::with_tag_task("spec", self.runtime.clone()),
             mem_def: Memoizer::with_tag_task("def", self.runtime.clone()),
             mem_expanded_inputs: Memoizer::with_tag_task("expanded_inputs", self.runtime.clone()),

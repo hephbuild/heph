@@ -47,6 +47,8 @@
 //! - [`expiry`] — where an expiry comes from, in precedence order.
 //! - [`jwt`] — a best-effort claim reader that reads but does not verify.
 //! - [`protocol`] — the four helper wire formats, encode and decode.
+//! - [`render`] — writing a minted value where a tool will find it, and
+//!   scrubbing it off a sandbox that is kept for diagnostics.
 //! - [`provider`] — the code that obtains a value: `static_env` and `exec`.
 //! - [`redact`] — the multi-pattern redacting tee.
 //! - [`value`] — a minted value, and the one type allowed to hold one.
@@ -64,6 +66,7 @@ pub mod jwt;
 pub mod protocol;
 pub mod provider;
 pub mod redact;
+pub mod render;
 pub mod shape;
 pub mod value;
 
@@ -75,5 +78,6 @@ pub use descriptor::{
 pub use expiry::{Expiry, ExpirySource};
 pub use provider::{MintCtx, ProviderRegistry, SecretProvider};
 pub use redact::{Entry as RedactEntry, RedactStream, Redactor};
+pub use render::{Rendered, Rendering, render_all, scrub};
 pub use shape::{Claim, Shape, Slot, check_collisions};
 pub use value::{Credential, SecretValue};

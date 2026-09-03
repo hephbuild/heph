@@ -1534,6 +1534,8 @@ mod tests {
             stderr: None,
             sandbox_dir: root,
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         }
     }
 

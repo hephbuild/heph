@@ -1051,6 +1051,41 @@ pub struct RunRequest<'a, 'io> {
     /// Scratch caches to mount for this run, already locked and created by the
     /// host. Empty for the overwhelming majority of targets.
     pub scratch: Vec<ScratchMount>,
+    /// Environment the host rendered from this target's credentials.
+    ///
+    /// The driver's whole job is to merge these into the command's environment.
+    /// Everything else — reading the declarations, checking the slots, minting,
+    /// writing the files, scrubbing them off a failed sandbox — is the host's
+    /// and deliberately not visible here.
+    ///
+    /// Mostly *paths*: `$SECRET_<NAME>`, `HOME`, `AWS_SHARED_CREDENTIALS_FILE`,
+    /// `DOCKER_CONFIG`. A value appears only for a credential whose declaration
+    /// asked for the `env` shape, which is an explicit per-secret opt-in to that
+    /// exposure.
+    ///
+    /// These take precedence over an exec runner's `env`, following the
+    /// precedence `docs/EXEC_RUNNERS.md` already sets: a target that declares
+    /// something gets what it declared.
+    pub secret_env: Vec<(String, String)>,
+    /// `(name, value)` for every credential this target holds, **for redaction
+    /// only**.
+    ///
+    /// The driver's obligation is to mask these out of anything it writes to
+    /// `log.txt`, a sink, or the event stream, and to do nothing else with
+    /// them. They are here because redaction has to happen where the output is
+    /// produced: a driver that spawns its own process is the only thing that
+    /// sees that process's bytes.
+    ///
+    /// Plain data rather than a compiled matcher because this struct lives in
+    /// the plugin contract, which cannot depend on the credential crate without
+    /// a cycle — the credential crate already depends on it for its config
+    /// schema.
+    ///
+    /// A value appears here whatever shape delivered it, including one written
+    /// only to a file the driver never reads. That is deliberate: a tool that
+    /// reads a credential out of a file and then echoes it is exactly the
+    /// accident redaction exists for.
+    pub secret_values: Vec<(String, String)>,
 }
 /// Cleanup closure a driver returns for the engine to run after `cache_locally`.
 /// The FUSE/OS sandbox layers each supply their own teardown; the engine's

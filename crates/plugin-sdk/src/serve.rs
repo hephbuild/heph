@@ -1259,6 +1259,8 @@ async fn run_once(
     let mut stdout_sink = FrameSink::new(out, false);
     let mut stderr_sink = FrameSink::new(out, true);
     let rr = RunRequest {
+        secret_env: Vec::new(),
+        secret_values: Vec::new(),
         request_id: &request_id,
         target: &target,
         tree_root_path: PathBuf::from(req.tree_root_path),

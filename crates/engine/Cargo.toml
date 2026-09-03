@@ -19,6 +19,7 @@ hplugin = { package = "plugin", path = "../plugin" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
 hdriver-bridge = { package = "driver-bridge", path = "../driver-bridge" }
 hbuiltins = { package = "builtins", path = "../builtins" }
+hsecrets = { package = "secrets", path = "../secrets" }
 hplugin-exec = { package = "plugin-exec", path = "../plugin-exec" }
 hplugin-query = { package = "plugin-query", path = "../plugin-query" }
 hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", features = ["host"] }

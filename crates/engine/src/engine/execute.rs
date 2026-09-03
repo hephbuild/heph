@@ -62,6 +62,16 @@ impl Engine {
             .await
             .with_context(|| format!("acquire scratch for {addr}"))?;
 
+        // Declarations only: read the referenced `secret()` targets and reject a
+        // set that would fight over one file or variable. Nothing is minted
+        // here — that waits until there is a sandbox to render into, which is
+        // also what keeps a cache hit from touching an IdP at all.
+        hcore::hmemoizer::set_phase("execute:secrets_resolve");
+        let resolved_secrets = self
+            .resolve_secrets(&rs, addr, &def.target.inputs)
+            .await
+            .with_context(|| format!("resolve secrets for {addr}"))?;
+
         // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
         // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
         // waiting for a leaf that also needs a permit.
@@ -173,10 +183,25 @@ impl Engine {
 
                     let (tx, rx) = tokio::sync::oneshot::channel::<RunResponse>();
 
+                    // Mint and render now that there is a sandbox to write into.
+                    // Deliberately *after* the cache decision: a hit never gets
+                    // here, so a fully warm build touches no IdP at all.
+                    hcore::hmemoizer::set_phase("execute:secrets_deliver");
+                    let secret_delivery = self
+                        .deliver_secrets(&rs, addr, &resolved_secrets, &sandbox_dir)
+                        .await
+                        .with_context(|| format!("deliver secrets for {addr}"))?;
+                    let secret_env: Vec<(String, String)> = secret_delivery
+                        .env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let secret_values = secret_delivery.values.clone();
+
                     let hashin = hashin.to_owned();
 
                     let inner: InteractiveInner = Box::new(enclose!(
-                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts)
+                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts, secret_env, secret_values)
                         move |stdin, stdout, stderr| {
                             Box::pin(async move {
                                 let req = RunRequest {
@@ -190,6 +215,8 @@ impl Engine {
                                     stderr,
                                     sandbox_dir,
                                     scratch: scratch_mounts,
+                                    secret_env,
+                                    secret_values,
                                 };
                                 let res = if shell {
                                     driver.driver.run_shell(req, rs.ctoken()).await?
@@ -211,6 +238,21 @@ impl Engine {
                 }
                 .await;
 
+                // Credentials come off the sandbox the moment the process is
+                // done with them, on **both** paths.
+                //
+                // Doing it only on failure was a real leak, caught by a test:
+                // on success the rendered file simply stayed in the sandbox,
+                // where it survives until that target's next run — and the
+                // sandbox teardown is no answer, because it is queued rather
+                // than immediate and the whole claim is that nothing durable is
+                // written. Nothing needs them any more either: credentials are
+                // rendered outside `ws/`, so no output glob can collect one and
+                // `cache_locally` never reads them.
+                if !resolved_secrets.is_empty() {
+                    crate::engine::secrets::SecretDelivery::scrub(&sandbox_dir);
+                }
+
                 let res = match run {
                     Ok(res) => res,
                     Err(err) => {
@@ -221,6 +263,9 @@ impl Engine {
                         // cleanup and a failing target reports an exit status
                         // with no output. The tree survives until this target's
                         // next run, whose `remove_stale` reclaims it.
+                        // Already scrubbed above, which matters most here: this
+                        // tree is deliberately kept as the diagnostic and
+                        // survives until the target's next run.
                         sandbox_teardown.leave_for_diagnostics();
                         return Err(err);
                     }
