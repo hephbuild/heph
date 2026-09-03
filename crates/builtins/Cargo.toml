@@ -20,7 +20,6 @@ wax = "0.7"
 parking_lot = "0.12"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 rustc-hash = "2"
-xattr = "1"
 which = "8.0.3"
 tracing = "0.1"
 itertools = "0.15.0"

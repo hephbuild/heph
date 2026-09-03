@@ -22,7 +22,7 @@ use hplugin::provider::{
     ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider as EProvider, ProviderFn,
     ProviderFunctionDef, TargetSpec,
 };
-use hwalk::{CachedWalker, Ignore};
+use hwalk::{CachedWalker, ClaimSet, CodegenClaims, Ignore};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
@@ -31,21 +31,6 @@ use xxhash_rust::xxh3::Xxh3;
 
 const PKG: &str = "@heph/fs";
 pub const DRIVER_NAME: &str = "fs";
-
-/// Extended-attribute name stamped on net-new codegen files written back to the
-/// tree (value = the generator's addr). Raw source reads must skip these so a
-/// generated file is never double-sourced.
-pub const CODEGEN_XATTR: &str = "user.heph.codegen";
-
-/// True if the file at `path` carries the codegen provenance xattr — i.e. it is
-/// a tree file owned by a `codegen = "copy"` target. `in_place` outputs are never
-/// stamped, so any stamped file belongs to some *other* codegen target.
-///
-/// A filesystem that does not support xattrs (or any IO error) is treated as
-/// "not stamped" so globbing/file reads never break on such trees.
-pub fn has_codegen_xattr(path: &std::path::Path) -> bool {
-    matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
-}
 
 /// True if `path` resolves inside a `.heph*` directory (e.g. `.heph3/cache/...`),
 /// pointing at an engine-internal artifact — a materialized cache output, not raw
@@ -144,13 +129,20 @@ pub fn is_fs_addr(addr: &Addr) -> bool {
 pub struct Provider {
     /// Dirs the `glob` provider function must prune, shared with the driver.
     skip: Arc<Ignore>,
+    /// Tree paths owned by a `codegen = "copy"` target, shared with the driver.
+    /// A glob must never source one — see [`CodegenClaims`].
+    claims: Arc<CodegenClaims>,
     /// Shared cross-run filesystem-walk cache, used by the `glob` function.
     walker: Arc<CachedWalker>,
 }
 
 impl Provider {
-    pub fn new(skip: Arc<Ignore>, walker: Arc<CachedWalker>) -> Self {
-        Self { skip, walker }
+    pub fn new(skip: Arc<Ignore>, claims: Arc<CodegenClaims>, walker: Arc<CachedWalker>) -> Self {
+        Self {
+            skip,
+            claims,
+            walker,
+        }
     }
 }
 
@@ -259,6 +251,7 @@ impl EProvider for Provider {
                     .to_string(),
                 func: Arc::new(GlobFn {
                     skip: self.skip.clone(),
+                    claims: self.claims.clone(),
                     walker: self.walker.clone(),
                 }),
             },
@@ -325,6 +318,7 @@ impl EProvider for Provider {
 /// the engine's skip dirs/globs. Result is sorted.
 struct GlobFn {
     skip: Arc<Ignore>,
+    claims: Arc<CodegenClaims>,
     walker: Arc<CachedWalker>,
 }
 
@@ -339,7 +333,7 @@ impl ProviderFn for GlobFn {
 
         // No user excludes, so `request_id` is irrelevant (the built-in exclude
         // path is taken). Reuses the driver's compiled glob + walk verbatim.
-        let compiled = compile_glob(&self.skip, "heph.fs.glob", &resolved, &[])?;
+        let compiled = compile_glob(&self.skip, &self.claims, "heph.fs.glob", &resolved, &[])?;
         let artifacts = walk_glob(&self.walker, ctx.root, &compiled)?;
 
         let pkg_prefix = (!ctx.pkg.is_empty()).then(|| std::path::Path::new(ctx.pkg));
@@ -599,6 +593,8 @@ struct CompiledGlob {
     prefix: String,
     /// Engine-provided dirs/globs to prune during the walk.
     skip: Arc<Ignore>,
+    /// Tree paths a `codegen = "copy"` target owns, excluded from the walk.
+    claims: Arc<CodegenClaims>,
 }
 
 /// Process-global cache of compiled globs keyed by pattern string.
@@ -711,6 +707,7 @@ enum FsDef {
 
 fn compile_glob(
     skip: &Arc<Ignore>,
+    claims: &Arc<CodegenClaims>,
     request_id: &str,
     pattern: &str,
     exclude: &[String],
@@ -729,6 +726,7 @@ fn compile_glob(
         not,
         prefix: literal_prefix(pattern).to_owned(),
         skip: skip.clone(),
+        claims: claims.clone(),
     })
 }
 
@@ -736,7 +734,7 @@ fn compile_glob(
 ///
 /// Recursion runs through the shared [`CachedWalker`]: every `readdir` and every
 /// file content hash is served from the cross-run fswalk cache when the tree is
-/// unchanged. Filtering (glob match, excludes, skip-dir pruning, codegen xattr)
+/// unchanged. Filtering (glob match, excludes, skip-dir pruning, codegen claims)
 /// is applied here — the walker itself is consumer-agnostic. Starts at the
 /// pattern's literal prefix so a rooted pattern (`a/b/**/*`) scans only
 /// `<root>/a/b`, not the whole tree.
@@ -745,6 +743,15 @@ fn walk_glob(
     root: &std::path::Path,
     compiled: &CompiledGlob,
 ) -> anyhow::Result<Vec<OutputArtifact>> {
+    // One claim snapshot for the whole walk: the freshness check behind it is a
+    // `stat`, which is fine once per glob and far too much once per file. A walk
+    // wants a fixed answer for its duration in any case.
+    let ctx = WalkCtx {
+        claims: compiled.claims.snapshot(),
+        walker,
+        root,
+        compiled,
+    };
     let walk_root = if compiled.prefix.is_empty() {
         root.to_path_buf()
     } else {
@@ -787,9 +794,7 @@ fn walk_glob(
                         // A symlink-to-dir is rejected by `file_hash` (which follows
                         // and errors on a dir), matching the old walk.
                         emit_glob_file(
-                            walker,
-                            root,
-                            compiled,
+                            &ctx,
                             &abs,
                             entry.kind == hwalk::EntryKind::Symlink,
                             dir_in_heph,
@@ -801,33 +806,39 @@ fn walk_glob(
         }
         // A fully-literal pattern names one path with no walk above it, so there
         // is no parent answer to carry: resolve it in full.
-        Ok(_) => emit_glob_file(
-            walker,
-            root,
-            compiled,
-            &walk_root,
-            true,
-            false,
-            &mut artifacts,
-        )?,
+        Ok(_) => emit_glob_file(&ctx, &walk_root, true, false, &mut artifacts)?,
         Err(_) => {} // missing walk root ⇒ empty match
     }
 
     Ok(artifacts)
 }
 
+/// Everything a glob walk holds fixed for its whole duration.
+struct WalkCtx<'a> {
+    /// The claim snapshot taken once for this walk.
+    claims: Arc<ClaimSet>,
+    walker: &'a CachedWalker,
+    root: &'a std::path::Path,
+    compiled: &'a CompiledGlob,
+}
+
 /// If `abs` matches the glob (and isn't excluded or a codegen output), hash it
 /// via the walker and push its artifact onto `out`.
 fn emit_glob_file(
-    walker: &CachedWalker,
-    root: &std::path::Path,
-    compiled: &CompiledGlob,
+    ctx: &WalkCtx<'_>,
     abs: &std::path::Path,
     is_symlink: bool,
     parent_in_heph: bool,
     out: &mut Vec<OutputArtifact>,
 ) -> anyhow::Result<()> {
     use wax::Program as _;
+
+    let WalkCtx {
+        claims,
+        walker,
+        root,
+        compiled,
+    } = ctx;
 
     let Ok(rel) = abs.strip_prefix(root) else {
         return Ok(());
@@ -836,12 +847,13 @@ fn emit_glob_file(
     if !compiled.glob.is_match(rel) || compiled.not.is_match(rel) {
         return Ok(());
     }
-    // Skip net-new codegen outputs stamped back into the tree — sourcing them
-    // here would double-source the generated content. Same for paths resolving
-    // into a `.heph*` dir: they are engine-internal artifacts, not raw source.
+    // Skip net-new codegen outputs written back into the tree — sourcing them
+    // here would double-source the generated content. The claim is a path
+    // *declaration* rather than a mark on the file, so a formatter or a
+    // `git checkout` that rewrites the file cannot erase it. Same for paths
+    // resolving into a `.heph*` dir: engine-internal artifacts, not raw source.
     let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    if has_codegen_xattr(abs) || entry_resolves_into_heph_dir(abs, name, is_symlink, parent_in_heph)
-    {
+    if claims.claims(rel) || entry_resolves_into_heph_dir(abs, name, is_symlink, parent_in_heph) {
         return Ok(());
     }
     let Some(rel_str) = rel.to_str() else {
@@ -913,6 +925,9 @@ fn cached_glob_walk(
 pub struct Driver {
     /// Engine-owned + built-in dirs pruned during glob walks.
     skip: Arc<Ignore>,
+    /// Tree paths owned by a `codegen = "copy"` target. Neither a `glob()` nor a
+    /// `file()` may source one — see [`CodegenClaims`].
+    claims: Arc<CodegenClaims>,
     /// Shared cross-run filesystem-walk cache (readdir + file hashes).
     walker: Arc<CachedWalker>,
 }
@@ -921,14 +936,19 @@ impl Default for Driver {
     fn default() -> Self {
         Self {
             skip: Arc::default(),
+            claims: Arc::default(),
             walker: Arc::new(CachedWalker::disabled()),
         }
     }
 }
 
 impl Driver {
-    pub fn new(skip: Arc<Ignore>, walker: Arc<CachedWalker>) -> Self {
-        Self { skip, walker }
+    pub fn new(skip: Arc<Ignore>, claims: Arc<CodegenClaims>, walker: Arc<CachedWalker>) -> Self {
+        Self {
+            skip,
+            claims,
+            walker,
+        }
     }
 }
 
@@ -1015,6 +1035,7 @@ impl hplugin::driver::Driver for Driver {
 
                 let compiled = Arc::new(compile_glob(
                     &self.skip,
+                    &self.claims,
                     &req.request_id,
                     &pattern,
                     &exclude,
@@ -1077,12 +1098,35 @@ impl hplugin::driver::Driver for Driver {
             FsDef::File { path } => {
                 let abs = root.join(path);
 
-                // A file() over a net-new codegen output (stamped back into the
-                // tree) resolves to nothing — the generated content must only be
-                // sourced from its generator, never re-read as raw source. A path
-                // resolving into a `.heph*` dir (engine-internal artifact) is
-                // skipped the same way.
-                if has_codegen_xattr(&abs) || resolves_into_heph_dir(&abs) {
+                // A file() over a net-new codegen output resolves to nothing —
+                // the generated content must only be sourced from its generator,
+                // never re-read as raw source. A path resolving into a `.heph*`
+                // dir (engine-internal artifact) is skipped the same way.
+                //
+                // Resolving to nothing is silent by construction, and a BUILD file
+                // that names a generated path is a real mistake, so say which
+                // target owns it — that is the whole answer to "why is my file()
+                // empty?", and the claim knows it.
+                let rel = std::path::Path::new(path.as_str());
+                let claims = self.claims.snapshot();
+                if claims.claims(rel) {
+                    match claims.owner(rel) {
+                        Some(owner) => tracing::warn!(
+                            path = %path,
+                            owner = %owner,
+                            "file() names a generated path; depend on the target that emits it"
+                        ),
+                        None => tracing::warn!(
+                            path = %path,
+                            "file() names a generated path; depend on the target that emits it"
+                        ),
+                    }
+                    return Ok(RunResponse {
+                        artifacts: vec![],
+                        ..Default::default()
+                    });
+                }
+                if resolves_into_heph_dir(&abs) {
                     return Ok(RunResponse {
                         artifacts: vec![],
                         ..Default::default()
@@ -1226,6 +1270,7 @@ mod tests {
         let v = futures::executor::block_on(
             GlobFn {
                 skip,
+                claims: Arc::default(),
                 walker: Arc::new(CachedWalker::disabled()),
             }
             .call(&ctx, args),
@@ -1763,9 +1808,33 @@ mod tests {
         );
     }
 
+    /// A claim set holding `paths`, as if a codegen target had generated them.
+    fn claims_for(paths: &[&str]) -> (tempfile::TempDir, Arc<CodegenClaims>) {
+        let dir = tempdir().expect("tempdir");
+        let claims = Arc::new(
+            CodegenClaims::open(dir.path().join("codegen-claims.db")).expect("claim store"),
+        );
+        let declared: Vec<hwalk::Claim> = paths
+            .iter()
+            .map(|p| {
+                if p.ends_with("/**") || !p.contains('.') {
+                    hwalk::Claim::dir(p.trim_end_matches("/**"))
+                } else {
+                    hwalk::Claim::file(*p)
+                }
+            })
+            .collect();
+        claims.record("//pkg:gen", &declared).expect("record");
+        (dir, claims)
+    }
+
     /// `walk_glob` matches the right files (recursively), hashes them, and skips a
-    /// codegen-stamped file. Cross-run cache mechanics are tested in
+    /// claimed codegen file. Cross-run cache mechanics are tested in
     /// `htwalk::cached_walker`.
+    ///
+    /// The claim is a declaration, not a mark on the file, so this asserts
+    /// unconditionally — the old xattr version could only assert on a filesystem
+    /// that persisted xattrs, and silently passed everywhere else.
     #[test]
     fn test_walk_glob_matches_and_skips_codegen() {
         let tmp = tempdir().unwrap();
@@ -1776,21 +1845,73 @@ mod tests {
         fs::write(root.join("c.txt"), b"ignored").unwrap();
 
         let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
-        let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
         let walker = CachedWalker::disabled();
 
+        let compiled = compile_glob(&skip, &Arc::default(), "t", "**/*.rs", &[]).unwrap();
         let arts = walk_glob(&walker, root, &compiled).unwrap();
         let mut names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["a.rs".to_string(), "sub_b.rs".to_string()]);
         assert!(arts.iter().all(|a| !a.hashout.is_empty()));
 
-        // A codegen-stamped file drops out of a re-walk.
-        #[cfg(unix)]
-        if xattr::set(root.join("a.rs"), CODEGEN_XATTR, b"//gen:it").is_ok() {
-            let arts = walk_glob(&walker, root, &compiled).unwrap();
-            assert_eq!(arts.len(), 1, "codegen-stamped a.rs is excluded");
-        }
+        // A claimed file drops out of the walk; its unclaimed sibling stays.
+        let (_cd, claims) = claims_for(&["/a.rs"]);
+        let compiled = compile_glob(&skip, &claims, "t", "**/*.rs", &[]).unwrap();
+        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["sub_b.rs".to_string()],
+            "claimed a.rs is excluded"
+        );
+    }
+
+    /// A claimed *directory* excludes its whole subtree, not just the entry that
+    /// names it — a `codegen = "copy"` dir output is one claim covering many files.
+    #[test]
+    fn test_walk_glob_skips_a_claimed_subtree() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("gen").join("deep")).unwrap();
+        fs::write(root.join("keep.rs"), b"keep").unwrap();
+        fs::write(root.join("gen").join("a.rs"), b"gen").unwrap();
+        fs::write(root.join("gen").join("deep").join("b.rs"), b"gen").unwrap();
+
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let walker = CachedWalker::disabled();
+        let (_cd, claims) = claims_for(&["/gen"]);
+        let compiled = compile_glob(&skip, &claims, "t", "**/*.rs", &[]).unwrap();
+
+        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(names, vec!["keep.rs".to_string()]);
+    }
+
+    /// Rewriting a claimed file the way a formatter does — write a temp file and
+    /// rename over it, which replaces the inode — must not turn it back into
+    /// source. This is the exact failure the xattr had: the stamp lived on the
+    /// inode, so `gofmt -w` erased it and the next glob sourced the output.
+    #[test]
+    fn test_claim_survives_a_rewrite_that_replaces_the_inode() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("gen.rs"), b"generated").unwrap();
+
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let walker = CachedWalker::disabled();
+        let (_cd, claims) = claims_for(&["/gen.rs"]);
+        let compiled = compile_glob(&skip, &claims, "t", "**/*.rs", &[]).unwrap();
+        assert!(walk_glob(&walker, root, &compiled).unwrap().is_empty());
+
+        // What every formatter and editor does: new file, rename over the target.
+        fs::write(root.join("gen.rs.tmp"), b"GENERATED").unwrap();
+        fs::rename(root.join("gen.rs.tmp"), root.join("gen.rs")).unwrap();
+
+        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        assert!(
+            arts.is_empty(),
+            "a rewritten generated file is still generated"
+        );
     }
 
     /// The walk carries "resolves into a `.heph*` dir" down from each directory
@@ -1820,7 +1941,7 @@ mod tests {
         .unwrap();
 
         let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
-        let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
+        let compiled = compile_glob(&skip, &Arc::default(), "t", "**/*.rs", &[]).unwrap();
         let walker = CachedWalker::disabled();
 
         let arts = walk_glob(&walker, root, &compiled).unwrap();
@@ -1847,7 +1968,7 @@ mod tests {
         fs::write(root.join("sub").join(".heph3").join("drop.rs"), b"drop").unwrap();
 
         let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
-        let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
+        let compiled = compile_glob(&skip, &Arc::default(), "t", "**/*.rs", &[]).unwrap();
         let walker = CachedWalker::disabled();
 
         let arts = walk_glob(&walker, root, &compiled).unwrap();
@@ -1880,7 +2001,11 @@ mod tests {
         let (id1, id2, id3) = ("r1".to_string(), "r2".to_string(), "r3".to_string());
 
         let parse_res = {
-            let driver = Driver::new(skip.clone(), Arc::new(CachedWalker::open(&db)));
+            let driver = Driver::new(
+                skip.clone(),
+                Arc::default(),
+                Arc::new(CachedWalker::open(&db)),
+            );
             let pr = driver
                 .parse(make_parse_req(config), &ctoken())
                 .await
@@ -1897,7 +2022,11 @@ mod tests {
         };
 
         // A fresh walker reads the populated db (unchanged tree).
-        let driver2 = Driver::new(skip.clone(), Arc::new(CachedWalker::open(&db)));
+        let driver2 = Driver::new(
+            skip.clone(),
+            Arc::default(),
+            Arc::new(CachedWalker::open(&db)),
+        );
         let second = driver2
             .run(
                 make_run_req(&parse_res.target_def, &id2, root.to_path_buf(), &hashin),
@@ -2024,7 +2153,7 @@ mod tests {
         // The engine hands the fs plugin its skip dirs (the heph home); the walk
         // must prune that subtree.
         let skip = Arc::new(Ignore::new(&[home], &[]).unwrap());
-        let driver = Driver::new(skip, Arc::new(CachedWalker::disabled()));
+        let driver = Driver::new(skip, Arc::default(), Arc::new(CachedWalker::disabled()));
 
         let config =
             std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
@@ -2061,7 +2190,7 @@ mod tests {
         // A `fs.skip` dir from the config file (resolved to an absolute path) is
         // pruned just like the engine home.
         let skip = Arc::new(Ignore::new(&[tmp.path().join("vendor")], &[]).unwrap());
-        let driver = Driver::new(skip, Arc::new(CachedWalker::disabled()));
+        let driver = Driver::new(skip, Arc::default(), Arc::new(CachedWalker::disabled()));
 
         let config =
             std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
@@ -2098,7 +2227,7 @@ mod tests {
         // A `fs.skip` glob (`**/node_modules/**`) excludes the whole subtree at
         // any depth — and prunes the dir so the walk never descends into it.
         let skip = Arc::new(Ignore::new(&[], &["**/node_modules/**".to_string()]).unwrap());
-        let driver = Driver::new(skip, Arc::new(CachedWalker::disabled()));
+        let driver = Driver::new(skip, Arc::default(), Arc::new(CachedWalker::disabled()));
 
         let config =
             std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
@@ -2567,7 +2696,7 @@ mod tests {
     #[test]
     fn test_compile_glob_no_exclude_reuses_builtin() {
         let skip = Arc::new(Ignore::default());
-        let compiled = compile_glob(&skip, "req-test", "**/*.rs", &[]).unwrap();
+        let compiled = compile_glob(&skip, &Arc::default(), "req-test", "**/*.rs", &[]).unwrap();
         assert!(
             Arc::ptr_eq(&compiled.not, skip.file_matcher()),
             "empty-exclude path must reuse the ignore's prebuilt file matcher"
@@ -2582,6 +2711,7 @@ mod tests {
         let req = "req-share";
         let a = compile_glob(
             &skip,
+            &Arc::default(),
             req,
             "**/*.go",
             &["vendor/**".into(), "out/**".into()],
@@ -2589,6 +2719,7 @@ mod tests {
         .unwrap();
         let b = compile_glob(
             &skip,
+            &Arc::default(),
             req,
             "src/**/*.go",
             &["out/**".into(), "vendor/**".into()],
@@ -2599,7 +2730,7 @@ mod tests {
             "identical exclude sets must share one Any regardless of order"
         );
 
-        let c = compile_glob(&skip, req, "**/*.go", &["other/**".into()]).unwrap();
+        let c = compile_glob(&skip, &Arc::default(), req, "**/*.go", &["other/**".into()]).unwrap();
         assert!(
             !Arc::ptr_eq(&a.not, &c.not),
             "distinct exclude sets must not share an Any"
@@ -2612,8 +2743,8 @@ mod tests {
         // set — buckets are keyed by request.
         let skip = Arc::new(Ignore::default());
         let exclude = ["vendor/**".to_string()];
-        let a = compile_glob(&skip, "req-iso-a", "**/*.go", &exclude).unwrap();
-        let b = compile_glob(&skip, "req-iso-b", "**/*.go", &exclude).unwrap();
+        let a = compile_glob(&skip, &Arc::default(), "req-iso-a", "**/*.go", &exclude).unwrap();
+        let b = compile_glob(&skip, &Arc::default(), "req-iso-b", "**/*.go", &exclude).unwrap();
         assert!(
             !Arc::ptr_eq(&a.not, &b.not),
             "distinct requests must not share an exclude Any"
@@ -2796,32 +2927,26 @@ mod tests {
         assert_eq!(result.target_spec.driver, DRIVER_NAME);
     }
 
-    // ─── Codegen-xattr exclusion ───────────────────────────────────────────
+    // ─── Codegen-claim exclusion ───────────────────────────────────────────
 
-    /// Stamps the codegen xattr on `path` and returns whether the platform/FS
-    /// actually persisted it. Tests skip their assertions when this is `false`
-    /// so a tmpfs without xattr support can't make them flake.
-    fn stamp_codegen(path: &std::path::Path) -> bool {
-        if xattr::set(path, CODEGEN_XATTR, b"//pkg:gen").is_err() {
-            return false;
-        }
-        has_codegen_xattr(path)
+    /// A driver whose claim set covers `patterns` — the shape the engine builds
+    /// from the heph-managed `.gitignore` section.
+    fn driver_claiming(patterns: &[&str]) -> (tempfile::TempDir, Driver) {
+        let (dir, claims) = claims_for(patterns);
+        (
+            dir,
+            Driver::new(Arc::default(), claims, Arc::new(CachedWalker::disabled())),
+        )
     }
 
     #[tokio::test]
-    async fn test_driver_run_glob_excludes_stamped_codegen() {
-        let driver = Driver::default();
+    async fn test_driver_run_glob_excludes_claimed_codegen() {
+        let (_cd, driver) = driver_claiming(&["/generated.rs"]);
         let tmp = tempdir().unwrap();
         let plain = tmp.path().join("plain.rs");
         let generated = tmp.path().join("generated.rs");
         fs::write(&plain, b"plain").unwrap();
         fs::write(&generated, b"generated").unwrap();
-
-        if !stamp_codegen(&generated) {
-            // Filesystem here doesn't support the codegen xattr; the exclusion
-            // can't be exercised, so don't assert anything misleading.
-            return;
-        }
 
         let config =
             std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
@@ -2841,19 +2966,15 @@ mod tests {
         let res = driver.run(req, &ctoken()).await.unwrap();
 
         let names: Vec<_> = res.artifacts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["plain.rs"], "stamped file must be excluded");
+        assert_eq!(names, vec!["plain.rs"], "claimed file must be excluded");
     }
 
     #[tokio::test]
-    async fn test_driver_run_file_stamped_codegen_yields_nothing() {
-        let driver = Driver::default();
+    async fn test_driver_run_file_claimed_codegen_yields_nothing() {
+        let (_cd, driver) = driver_claiming(&["/generated.rs"]);
         let tmp = tempdir().unwrap();
         let generated = tmp.path().join("generated.rs");
         fs::write(&generated, b"generated").unwrap();
-
-        if !stamp_codegen(&generated) {
-            return;
-        }
 
         let config = std::collections::HashMap::from([(
             "f".to_string(),
@@ -2876,8 +2997,39 @@ mod tests {
 
         assert!(
             res.artifacts.is_empty(),
-            "file() over a stamped codegen file must yield no artifacts"
+            "file() over a claimed codegen file must yield no artifacts"
         );
+    }
+
+    /// The claim decides, not the file: a `file()` over a claimed path yields
+    /// nothing even when the path does not exist on disk at all (the generator
+    /// has not run yet). The xattr could not express this — an absent file
+    /// carries no stamp, so it read as plain missing source.
+    #[tokio::test]
+    async fn test_driver_run_file_claimed_but_not_yet_generated_yields_nothing() {
+        let (_cd, driver) = driver_claiming(&["/generated.rs"]);
+        let tmp = tempdir().unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "f".to_string(),
+            Value::String("generated.rs".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        assert!(res.artifacts.is_empty());
     }
 
     #[tokio::test]

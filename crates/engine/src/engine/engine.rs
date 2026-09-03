@@ -36,6 +36,11 @@ pub struct PluginInit {
     pub skip_globs: Vec<String>,
     /// Shared cross-run filesystem-walk cache for tree-walking plugins.
     pub walker: Arc<hwalk::CachedWalker>,
+    /// Workspace paths a `codegen = "copy"` target owns. Every plugin that
+    /// discovers source files must skip them: their content already enters the
+    /// graph through its generator, so sourcing them again double-sources it.
+    /// Handed to the plugin rather than discovered, like the skip set beside it.
+    pub codegen_claims: Arc<hwalk::CodegenClaims>,
     /// The engine's runtime — what an in-process plugin's memoizers spawn
     /// their computations on. Handed to the plugin, never discovered by it
     /// (a cdylib plugin uses its own runtime instead; this field serves the
@@ -75,6 +80,11 @@ pub struct Engine {
     /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
     /// tree-walking plugins via [`PluginInit`].
     pub(crate) walker: Arc<hwalk::CachedWalker>,
+    /// Tree paths owned by a `codegen = "copy"` target. Handed to every plugin
+    /// via [`PluginInit`], and written by the codegen write-back — which both
+    /// registers each `copy` target's outputs and reads the set, so an `in_place`
+    /// target never clobbers a file a `copy` target owns.
+    pub(crate) codegen_claims: Arc<hwalk::CodegenClaims>,
 
     pub(crate) providers: Vec<Arc<Provider>>,
     pub providers_by_name: HashMap<String, Arc<Provider>>,
@@ -464,6 +474,17 @@ impl Engine {
             &home.join("cache").join("fswalk.db"),
         ));
 
+        // Which tree paths are generated rather than source: the ledger the codegen
+        // write-back maintains, registered in the same operation that puts a file
+        // on disk, so a generated file is never on disk unclaimed. Heph's own
+        // state, and not attached to the file — so no tool that rewrites the file
+        // can erase the claim, which is the failure that sank the extended
+        // attribute this replaced.
+        let codegen_claims = Arc::new(
+            hwalk::CodegenClaims::open(home.join("cache").join("codegen-claims.db"))
+                .context("opening the codegen claim store")?,
+        );
+
         let max_workers = 2 * parallelism;
 
         // Fails loudly here rather than at first request: every request's
@@ -480,6 +501,7 @@ impl Engine {
             local_cache,
             local_cache_tmp,
             walker,
+            codegen_claims,
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],
@@ -533,12 +555,15 @@ impl Engine {
 
         // The `fs` provider + driver are always-on built-ins. Each builds its
         // `Ignore` from the same `PluginInit` (home + `fs.skip` dirs/globs) the
-        // engine hands every plugin, so every fs glob walk prunes the same paths.
+        // engine hands every plugin, so every fs glob walk prunes the same paths,
+        // and takes the same codegen claim set so a generated file is never
+        // sourced as raw input.
         // The fallible variant lets a bad `fs.skip` glob surface as an error here.
         engine.try_register_provider(|init| {
             let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             Ok(Box::new(hbuiltins::pluginfs::Provider::new(
                 ignore,
+                init.codegen_claims.clone(),
                 init.walker.clone(),
             )))
         })?;
@@ -546,6 +571,7 @@ impl Engine {
             let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             Ok(Box::new(hbuiltins::pluginfs::Driver::new(
                 ignore,
+                init.codegen_claims.clone(),
                 init.walker.clone(),
             )))
         })?;
@@ -664,6 +690,14 @@ impl Engine {
         });
     }
 
+    /// The workspace's codegen claim set — which tree paths a `codegen = "copy"`
+    /// target owns. Exposed so the commands that resolve every target can
+    /// reconcile the ledger against them (see
+    /// [`gitignore::reconcile_claims`](crate::engine::gitignore::reconcile_claims)).
+    pub fn codegen_claims(&self) -> &Arc<hwalk::CodegenClaims> {
+        &self.codegen_claims
+    }
+
     /// The [`PluginInit`] context handed to every plugin constructor (direct
     /// registration or factory): workspace root + the engine's skip dirs/globs.
     fn plugin_init_payload(&self) -> PluginInit {
@@ -672,6 +706,7 @@ impl Engine {
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
             walker: self.walker.clone(),
+            codegen_claims: self.codegen_claims.clone(),
             runtime: self.runtime.clone(),
         }
     }
