@@ -689,6 +689,34 @@ fn cache_config_from_pb(c: pb::CacheConfig) -> CacheConfig {
     }
 }
 
+/// Scratch mounts, host -> plugin.
+///
+/// One-way by nature: the host resolves, locks and creates a slot, and the plugin
+/// only places it. Nothing about a mount travels back.
+pub fn scratch_mount_to_pb(m: &hplugin::driver::ScratchMount) -> pb::ScratchMount {
+    pb::ScratchMount {
+        addr: Some(addr_to_pb(&m.addr)),
+        path: m.path.clone(),
+        env: m.env.clone(),
+        dir: m.dir.to_string_lossy().into_owned(),
+    }
+}
+
+/// Scratch mounts, as seen by a plugin.
+///
+/// A mount whose `addr` did not survive the wire is dropped rather than
+/// defaulted: the addr is only a diagnostic, but a mount with a wrong one would
+/// misattribute a failure to some other target, and a scratch that silently does
+/// not mount costs a cold cache — never a wrong build (`docs/SCRATCH.md`, "The contract").
+pub fn scratch_mount_from_pb(m: pb::ScratchMount) -> Option<hplugin::driver::ScratchMount> {
+    Some(hplugin::driver::ScratchMount {
+        addr: addr_from_pb(m.addr?),
+        path: m.path,
+        env: m.env,
+        dir: std::path::PathBuf::from(m.dir),
+    })
+}
+
 pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
     Ok(pb::TargetDef {
         addr: Some(addr_to_pb(&td.addr)),

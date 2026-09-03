@@ -347,6 +347,7 @@ mod shell_fallback_tests {
             stdout: None,
             stderr: None,
             sandbox_dir: sandbox.clone(),
+            scratch: vec![],
         };
 
         bridge.run_shell(req, &ctoken).await?;

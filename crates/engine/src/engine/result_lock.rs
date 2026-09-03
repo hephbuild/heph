@@ -419,7 +419,7 @@ fn stamp_pid(gateway: Option<&FWriteGuard>) {
 ///
 /// The read is capped: the payload is a pid and a newline, while the directory
 /// it sits in could hold a stray or corrupted file of any size.
-fn read_pid(path: &Path) -> Option<u32> {
+pub(crate) fn read_pid(path: &Path) -> Option<u32> {
     const MAX_STAMP: u64 = 64;
     let mut s = String::new();
     std::fs::File::open(path)

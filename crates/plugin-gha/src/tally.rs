@@ -219,6 +219,13 @@ pub(crate) struct Tally {
     /// Whether this invocation stops at the first failure. Reported by the
     /// engine, never inferred here — see `BuildEventKind::RequestConfig`.
     fail_fast: bool,
+    /// Open scratch waits: consumer -> (cache, started at). Drained into
+    /// `scratch_waits` when the wait ends.
+    scratch_wait_since: FxHashMap<Box<str>, (Box<str>, u64)>,
+    /// Finished scratch waits per cache: `(waiters, total ms)`. The total is the
+    /// number worth reporting — one target blocked briefly is noise, dozens
+    /// blocked between them is why the job was slow.
+    scratch_waits: FxHashMap<Box<str>, (u64, u64)>,
     first_event_ms: Option<u64>,
     last_event_ms: u64,
 
@@ -393,6 +400,20 @@ impl Tally {
             }
             BuildEventKind::ResultLockWaitEnd { addr } => {
                 self.lock_waits.remove(addr.as_str());
+            }
+
+            BuildEventKind::ScratchLockWaitStart { addr, scratch, .. } => {
+                self.scratch_wait_since.insert(
+                    addr.as_str().into(),
+                    (scratch.as_str().into(), ev.at_unix_ms),
+                );
+            }
+            BuildEventKind::ScratchLockWaitEnd { addr, .. } => {
+                if let Some((scratch, since)) = self.scratch_wait_since.remove(addr.as_str()) {
+                    let e = self.scratch_waits.entry(scratch).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += ev.at_unix_ms.saturating_sub(since);
+                }
             }
 
             // Emitted only by `heph tool gc` / `clean`, which this hook does not
@@ -588,6 +609,18 @@ impl Tally {
 
     pub(crate) fn fail_fast(&self) -> bool {
         self.fail_fast
+    }
+
+    /// Caches that serialized targets this run, as `(cache, waiters, total ms)`,
+    /// worst total first.
+    pub(crate) fn scratch_waits(&self) -> Vec<(&str, u64, u64)> {
+        let mut v: Vec<(&str, u64, u64)> = self
+            .scratch_waits
+            .iter()
+            .map(|(k, (n, ms))| (&**k, *n, *ms))
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+        v
     }
 
     /// Targets currently inside a *foreground* phase — the denominator for
@@ -1013,6 +1046,59 @@ mod tests {
         assert_eq!((done, total, complete), (0, 2, true));
         exec(&mut t, "//a:x", 0, 5);
         assert_eq!(t.progress().0, 1);
+    }
+
+    fn wait(t: &mut Tally, addr: &str, scratch: &str, start: u64, end: u64) {
+        t.apply(&ev(
+            start,
+            BuildEventKind::ScratchLockWaitStart {
+                addr: addr.into(),
+                scratch: scratch.into(),
+                access: "exclusive".into(),
+                holder_pid: None,
+            },
+        ));
+        t.apply(&ev(
+            end,
+            BuildEventKind::ScratchLockWaitEnd {
+                addr: addr.into(),
+                scratch: scratch.into(),
+            },
+        ));
+    }
+
+    /// Waits aggregate per cache, and the report orders by what the contention
+    /// actually cost rather than by who waited most recently.
+    #[test]
+    fn scratch_waits_aggregate_per_cache_worst_first() {
+        let mut t = Tally::default();
+        wait(&mut t, "//a:x", "//build:gocache", 0, 1_000);
+        wait(&mut t, "//a:y", "//build:gocache", 0, 2_000);
+        wait(&mut t, "//a:z", "//build:gomodcache", 0, 10_000);
+
+        assert_eq!(
+            t.scratch_waits(),
+            vec![
+                ("//build:gomodcache", 1, 10_000),
+                ("//build:gocache", 2, 3_000),
+            ],
+        );
+    }
+
+    /// An `End` with no `Start` is ignored rather than counted as a zero-length
+    /// wait. Reachable two ways: a host older than these events, and a budgeted
+    /// stream that dropped the `Start`.
+    #[test]
+    fn an_unmatched_scratch_wait_end_is_ignored() {
+        let mut t = Tally::default();
+        t.apply(&ev(
+            5_000,
+            BuildEventKind::ScratchLockWaitEnd {
+                addr: "//a:x".into(),
+                scratch: "//build:gocache".into(),
+            },
+        ));
+        assert!(t.scratch_waits().is_empty(), "no wait was ever announced");
     }
 
     #[test]

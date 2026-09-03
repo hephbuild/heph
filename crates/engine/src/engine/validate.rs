@@ -50,22 +50,6 @@ fn path_components(p: &str) -> std::str::Split<'_, char> {
     p.trim_end_matches('/').split('/')
 }
 
-/// True when `ancestor` is a strict parent directory of `descendant` — both
-/// already trailing-slash-trimmed. `descendant` must continue past `ancestor`
-/// at a `/` boundary, so `/a` is an ancestor of `/a/b` but not of `/ab`.
-fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
-    descendant.starts_with(ancestor) && descendant.as_bytes().get(ancestor.len()) == Some(&b'/')
-}
-
-/// True when two normalized output paths collide in the tree: the same path
-/// (trailing slash ignored, so a file and a same-named directory still clash),
-/// or one is an ancestor directory of the other (`/gen/` vs `/gen/a.go`).
-fn paths_overlap(a: &str, b: &str) -> bool {
-    let a = a.trim_end_matches('/');
-    let b = b.trim_end_matches('/');
-    a == b || is_ancestor(a, b) || is_ancestor(b, a)
-}
-
 /// An overlap between two outputs that is *not* a codegen clobber, so it must not
 /// be flagged. Two fs-provider inputs (e.g. a broad `glob` and a specific `file`,
 /// or two globs) may legitimately cover the same path — the fs provider only
@@ -156,7 +140,7 @@ impl Engine {
         let mut overlaps: Vec<CodegenOverlap> = Vec::new();
         for (i, a) in outs.iter().enumerate() {
             for b in outs.iter().skip(i + 1) {
-                if !paths_overlap(&a.path, &b.path) {
+                if !hcore::paths::paths_overlap(&a.path, &b.path) {
                     break;
                 }
                 if a.addr != b.addr && !overlap_exempt(&a.addr, &b.addr) {

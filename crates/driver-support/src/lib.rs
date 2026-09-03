@@ -7,4 +7,5 @@
 //! `heph-driver-bridge`, which the engine wires via `Engine::new_managed_driver`.
 pub mod driver_managed;
 pub mod driver_managed_os;
+pub mod scratch;
 pub mod stage;

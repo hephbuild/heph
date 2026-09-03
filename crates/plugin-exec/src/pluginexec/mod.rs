@@ -851,6 +851,43 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 .push(input.clone());
         }
 
+        // Scratch references. `hashed: false, runtime: false` is the one
+        // combination nothing else uses, and it is exactly right: a scratch
+        // materializes no artifacts (its declaration has none) and must not touch
+        // this target's cache key, because a target's outputs are required to be
+        // identical whether its scratch is warm, cold, or absent. The edge exists
+        // so the graph knows about it — which is what makes `heph query revdeps`
+        // answer "who shares this cache?" and what turns a bad addr into an
+        // ordinary `TargetNotFoundError`.
+        //
+        // Order is the declared order, deduped: a repeated reference would mount
+        // one directory twice and set one env var twice, which is a BUILD-file
+        // mistake worth naming rather than quietly collapsing.
+        let mut seen_scratch: BTreeMap<String, usize> = BTreeMap::new();
+        let mut scratch_inputs: Vec<Input> = Vec::with_capacity(spec.scratch.len());
+        for (i, raw) in spec.scratch.iter().enumerate() {
+            let r#ref = TargetAddr::parse(raw, &pkg)?;
+            let key = r#ref.to_string();
+            if let Some(first) = seen_scratch.insert(key.clone(), i) {
+                anyhow::bail!(
+                    "scratch {key} is referenced twice (positions {first} and {i}) — a scratch \
+                     mounts at one path and sets one environment variable, so referencing it \
+                     again does nothing; drop the duplicate"
+                );
+            }
+            scratch_inputs.push(Input {
+                r#ref,
+                mode: InputMode::Standard,
+                origin_id: format!("{}|{}", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX, i),
+                annotations: BTreeMap::from([(
+                    hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
+                    "true".to_string(),
+                )]),
+                hashed: false,
+                runtime: false,
+            });
+        }
+
         let tool_inputs = sorted_by_group(spec.tools)
             .into_iter()
             .flat_map(|(k, v)| {
@@ -1014,6 +1051,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .chain(runtime_dep_inputs.into_iter().map(|(_, v)| v))
                     .chain(tool_inputs.into_iter().map(|(_, v)| v))
                     .chain(runner_input)
+                    .chain(scratch_inputs)
                     .collect(),
                 outputs,
                 support_files,
@@ -1437,6 +1475,39 @@ impl Driver {
         }
 
         env.extend(def.runtime_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+        // Scratch caches: each declaration names the variable its tool reads the
+        // directory from, so a consumer needs no wiring of its own — declaring
+        // `env = "GOCACHE"` is what makes `scratch = [...]` sufficient.
+        //
+        // The value is the *canonical* slot path the host resolved, not the
+        // in-sandbox symlink: tools bake absolute paths into their cache entries,
+        // so every consumer must see one stable string or the cache restores and
+        // is inert. Set after `runtime_env` and before PATH, and never hashed —
+        // the path contains the engine home, so hashing it would make every cache
+        // key machine-specific.
+        //
+        // A collision with the target's own env is rejected rather than resolved:
+        // silently winning either way leaves one of the two settings inoperative
+        // with nothing to see.
+        for m in &rreq.scratch {
+            let dir = m.dir.to_str().ok_or_else(|| {
+                anyhow::anyhow!("scratch dir for {} is not valid UTF-8: {:?}", m.addr, m.dir)
+            })?;
+            if let Some(existing) = env.get(&m.env)
+                && existing != dir
+            {
+                anyhow::bail!(
+                    "scratch {} sets `{}`, but this target already sets it to {:?}. One would \
+                     shadow the other — rename the variable on the scratch declaration, or drop \
+                     it from this target's env",
+                    m.addr,
+                    m.env,
+                    existing
+                );
+            }
+            env.insert(m.env.clone(), dir.to_string());
+        }
 
         // The target's own tools lead, wherever it ends up running — composed by
         // `hexecrunner` rather than spliced into the string here, because under
@@ -2125,6 +2196,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let res = tokio::time::timeout(
@@ -2449,6 +2521,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let _res = driver.run(make_req(req), &ctoken).await?;
@@ -2507,6 +2580,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let res = driver.run(make_req(req), &ctoken).await;
@@ -2578,6 +2652,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         // Use a timeout to detect the hang
@@ -2639,6 +2714,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2707,6 +2783,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2774,6 +2851,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         let res = tokio::time::timeout(
@@ -2950,6 +3028,7 @@ mod tests {
             stdout: Some(&mut out_handle),
             stderr: Some(&mut err_handle),
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
@@ -3031,6 +3110,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         driver.run(make_req(req), &ctoken).await?;
@@ -3105,6 +3185,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: Some(&mut stderr),
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         tokio::time::timeout(
@@ -3261,6 +3342,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         tokio::time::timeout(
@@ -3359,6 +3441,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
@@ -3571,6 +3654,83 @@ mod tests {
             .expect("hash_dep input present");
         assert!(hash_dep_input.hashed);
         assert!(!hash_dep_input.runtime);
+        Ok(())
+    }
+
+    /// A scratch reference is the one input with `hashed: false, runtime: false`.
+    /// Both halves matter: it materializes no artifacts (its declaration has
+    /// none), and it must not touch the consumer's cache key, because a target's
+    /// outputs are required to be identical whether its scratch is warm, cold, or
+    /// absent.
+    #[tokio::test]
+    async fn test_parse_scratch_routes_a_non_hashed_non_runtime_input() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let extra = HashMap::from([(
+            "scratch".to_string(),
+            Value::List(vec![Value::String("//build:gocache".to_string())]),
+        )]);
+        let td = parse_with(extra).await?;
+        let def = td.def::<TargetDef>();
+
+        // Not wired into any runtime routing map: a scratch is not a dep, and
+        // must never appear in SRC_*/LIST_*.
+        assert!(def.dep_group_inputs.is_empty());
+        assert!(def.runtime_dep_group_inputs.is_empty());
+        assert!(def.tool_group_inputs.is_empty());
+
+        let input = td
+            .inputs
+            .iter()
+            .find(|i| i.origin_id.starts_with("scratch|"))
+            .expect("scratch input present");
+        assert!(
+            !input.hashed,
+            "a scratch must not feed the consumer's hashin"
+        );
+        assert!(!input.runtime, "a scratch materializes no artifacts");
+        assert!(
+            hdriver_support::scratch::is_scratch(&input.annotations),
+            "the host recognizes a scratch by its annotation"
+        );
+        assert_eq!(input.r#ref.r#ref.format(), "//build:gocache");
+        Ok(())
+    }
+
+    /// The property the whole design rests on: adding a scratch reference leaves
+    /// the def hash untouched, so it cannot reach any consumer's `hashin`.
+    #[tokio::test]
+    async fn test_parse_scratch_excluded_from_def_hash() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let bare = parse_with(HashMap::new()).await?;
+        let with = parse_with(HashMap::from([(
+            "scratch".to_string(),
+            Value::List(vec![Value::String("//build:gocache".to_string())]),
+        )]))
+        .await?;
+        assert_eq!(
+            bare.hash, with.hash,
+            "a scratch reference must not change the def hash"
+        );
+        Ok(())
+    }
+
+    /// A repeated reference would mount one directory twice and set one variable
+    /// twice. Collapsing it silently would hide a BUILD-file mistake.
+    #[tokio::test]
+    async fn test_parse_scratch_rejects_a_duplicate_reference() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let extra = HashMap::from([(
+            "scratch".to_string(),
+            Value::List(vec![
+                Value::String("//build:c".to_string()),
+                Value::String("//build:c".to_string()),
+            ]),
+        )]);
+        let err = match parse_with(extra).await {
+            Ok(_) => panic!("a duplicate scratch reference must fail"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("twice"));
         Ok(())
     }
 
@@ -4313,6 +4473,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -4359,6 +4520,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -4438,6 +4600,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -4594,6 +4757,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: sandbox.clone(),
+            scratch: vec![],
         };
 
         os.run_inner(req, &ctoken, false).await?;
@@ -4690,6 +4854,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -4764,6 +4929,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver.run(make_req(req), &ctoken).await?;
 
@@ -4850,6 +5016,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -4952,6 +5119,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
         driver
             .run(
@@ -5041,6 +5209,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
         };
 
         driver.run(make_req(req), &ctoken).await?;

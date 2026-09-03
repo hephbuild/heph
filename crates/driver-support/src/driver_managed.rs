@@ -135,6 +135,12 @@ pub async fn invoke_inner<'a, 'io>(
     // `req.request.sandbox_dir` for filesystem ops. Keep both consistent
     // with the (maybe-redirected) sandbox_dir we just built.
     req.sandbox_dir = sandbox_dir.clone();
+    // Scratch mounts go in after every input is materialized and before the
+    // driver runs. Here rather than in the engine because *this* layer owns
+    // sandbox creation — the FUSE path may redirect `sandbox_pkg_dir` into a
+    // mount, so there is no earlier moment at which the directory reliably
+    // exists — and because putting it here covers both sandbox modes at once.
+    mount_scratch(&sandbox_pkg_dir, &req.scratch)?;
     let mreq = ManagedRunRequest {
         sandbox_dir,
         sandbox_ws_dir: ws_dir,
@@ -160,6 +166,47 @@ pub async fn invoke_inner<'a, 'io>(
             .with_context(|| "driver run")?
     };
     Ok(res)
+}
+
+/// Symlink each resolved scratch cache into the sandbox at its declared path.
+///
+/// One `symlink(2)` per mount, pointing *out* of the sandbox at the canonical
+/// slot directory. That is the whole mechanism, and it is why a scratch costs an
+/// inode per target rather than a copy: teardown removes the link, not the tree
+/// (`remove_dir_all` does not follow symlinks), exactly as read-only input
+/// staging already does for the Go SDK.
+///
+/// The link target is the canonical path rather than something sandbox-local
+/// deliberately — tools bake absolute paths into their cache entries, so if every
+/// consumer saw its own path the cache would be present and inert.
+fn mount_scratch(pkg_dir: &Path, mounts: &[hplugin::driver::ScratchMount]) -> anyhow::Result<()> {
+    for m in mounts {
+        let at = pkg_dir.join(&m.path);
+
+        // A scratch must not land where an input already did. Silently replacing
+        // it would mean the target reads cache bytes where it believes it reads a
+        // declared dependency — bytes no `hashin` describes, which is the one way
+        // a scratch can cause a *wrong build* rather than a slow one. Refuse.
+        if let Ok(md) = fs::symlink_metadata(&at) {
+            anyhow::bail!(
+                "scratch {} cannot mount at {:?}: something is already there ({}). A scratch \
+                 must not overlap a dependency or an output — mounting over it would let the \
+                 target read cache contents where it expects declared inputs",
+                m.addr,
+                m.path,
+                if md.is_dir() { "a directory" } else { "a file" }
+            );
+        }
+
+        if let Some(parent) = at.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("create parent of scratch mount {:?} for {}", m.path, m.addr)
+            })?;
+        }
+        std::os::unix::fs::symlink(&m.dir, &at)
+            .with_context(|| format!("symlink scratch {} at {:?} -> {:?}", m.addr, at, m.dir))?;
+    }
+    Ok(())
 }
 
 /// Run an interactive shell on `shell_fallback` inside the
@@ -189,6 +236,7 @@ async fn run_shell_fallback<'a, 'io>(
         stdout,
         stderr,
         sandbox_dir: req_sandbox_dir,
+        scratch,
     } = request;
 
     let mut synthetic = (*shell_fallback.spec_template).clone();
@@ -223,6 +271,7 @@ async fn run_shell_fallback<'a, 'io>(
         stdout,
         stderr,
         sandbox_dir: req_sandbox_dir,
+        scratch,
     };
     let new_mreq = ManagedRunRequest {
         request: new_req,

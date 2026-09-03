@@ -44,6 +44,23 @@ impl Engine {
             .inputs_result_exec(rs.clone(), &def.inputs)
             .await?;
 
+        // Scratch slots, between dep resolution and the worker permit — see
+        // `acquire_scratch` for why both sides of that sandwich are load-bearing.
+        // In short: after deps, or a dep needing the same slot could never get it;
+        // before the permit, so a target queued on a contended slot holds no
+        // worker, which also makes the wait provably bounded.
+        //
+        // The guards ride to the end of the run and drop with `_scratch_guards`.
+        hcore::hmemoizer::set_phase("execute:scratch_acquire");
+        let resolved_scratch = self
+            .resolve_scratch(&rs, addr, &def.target.inputs)
+            .await
+            .with_context(|| format!("resolve scratch for {addr}"))?;
+        let (scratch_mounts, _scratch_guards) = self
+            .acquire_scratch(&rs, addr, &resolved_scratch)
+            .await
+            .with_context(|| format!("acquire scratch for {addr}"))?;
+
         // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
         // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
         // waiting for a leaf that also needs a permit.
@@ -158,7 +175,7 @@ impl Engine {
                     let hashin = hashin.to_owned();
 
                     let inner: InteractiveInner = Box::new(enclose!(
-                        (driver, def, rs, self => engine, sandbox_dir)
+                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts)
                         move |stdin, stdout, stderr| {
                             Box::pin(async move {
                                 let req = RunRequest {
@@ -171,6 +188,7 @@ impl Engine {
                                     stdout,
                                     stderr,
                                     sandbox_dir,
+                                    scratch: scratch_mounts,
                                 };
                                 let res = if shell {
                                     driver.driver.run_shell(req, rs.ctoken()).await?

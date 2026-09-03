@@ -89,6 +89,7 @@ mod matcher_spec;
 pub mod matcher_target;
 mod meta;
 pub mod sandbox_cleaner;
+pub mod scratch;
 pub mod validate;
 pub mod worker_pool;
 
