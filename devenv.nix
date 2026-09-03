@@ -53,7 +53,7 @@ let
   };
 
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p execrunner -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-devenv -p plugin-devenv-cdylib -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
+  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p coreutils -p walk -p proc -p execrunner -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-devenv -p plugin-devenv-cdylib -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
 in
 {
   # https://devenv.sh/basics/

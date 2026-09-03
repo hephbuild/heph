@@ -92,6 +92,21 @@ pub fn telemetry_enabled_from_config() -> bool {
         .unwrap_or(true)
 }
 
+/// How the exec/bash drivers get the builtin-utility shim directory.
+///
+/// The heph home is the host's knowledge, and materializing the shims is the
+/// `coreutils` crate's — so the driver is handed a closure and needs neither.
+/// Deferred rather than eager so a command that never runs a target (`query`,
+/// `inspect`) never touches the filesystem for it.
+fn coreutils_shims(home_dir: &std::path::Path) -> pluginexec::CoreutilsShims {
+    let home = home_dir.to_path_buf();
+    Arc::new(move || {
+        let exe = std::env::current_exe()
+            .context("locate the heph binary the builtin-utility shims point at")?;
+        hcoreutils::shim_dir(&home, &exe)
+    })
+}
+
 /// Build the engine for this invocation.
 ///
 /// Takes nothing from the CLI. Everything a *run* can switch — `--force`,
@@ -142,6 +157,12 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // a separate cdylib loaded from a `path:`/`url:` manifest entry
     // (`heph-oci-plugin.json`), under their own `docker_build` / `oci_pull` /
     // `oci_push` / `oci_load` names.
+    // Built before `home_dir` is moved into the nix driver's factory. The exec
+    // and bash drivers take a closure rather than the path itself, so
+    // `plugin-exec` — which most of the workspace links — does not have to
+    // depend on the forty utility crates to know it has a directory to put on
+    // PATH. Resolved lazily, so a `heph query` never touches the filesystem.
+    let (coreutils_exec, coreutils_bash) = (coreutils_shims(&home_dir), coreutils_shims(&home_dir));
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
     // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
@@ -160,11 +181,17 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
             .with_walker(init.walker.clone()),
         ))
     })?;
-    e.register_managed_driver_factory("exec", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
+    e.register_managed_driver_factory("exec", move |_init, opts| {
+        Ok(Box::new(
+            pluginexec::Driver::from_options_exec(opts)?
+                .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_exec.clone()),
+        ))
     })?;
-    e.register_managed_driver_factory("bash", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
+    e.register_managed_driver_factory("bash", move |_init, opts| {
+        Ok(Box::new(
+            pluginexec::Driver::from_options_bash(opts)?
+                .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_bash.clone()),
+        ))
     })?;
 
     // Apply every `plugins:` entry: a `builtin:` instantiates the matching
@@ -319,11 +346,18 @@ mod tests {
                 .with_walker(init.walker.clone()),
             ))
         })?;
-        e.register_managed_driver_factory("exec", |_init, opts| {
-            Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
+        let (cu_exec, cu_bash) = (coreutils_shims(&home_dir), coreutils_shims(&home_dir));
+        e.register_managed_driver_factory("exec", move |_init, opts| {
+            Ok(Box::new(
+                pluginexec::Driver::from_options_exec(opts)?
+                    .with_coreutils(hcoreutils::COREUTILS_VERSION, cu_exec.clone()),
+            ))
         })?;
-        e.register_managed_driver_factory("bash", |_init, opts| {
-            Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
+        e.register_managed_driver_factory("bash", move |_init, opts| {
+            Ok(Box::new(
+                pluginexec::Driver::from_options_bash(opts)?
+                    .with_coreutils(hcoreutils::COREUTILS_VERSION, cu_bash.clone()),
+            ))
         })?;
 
         // The helper exercises built-in plugins only (no cdylib loading).

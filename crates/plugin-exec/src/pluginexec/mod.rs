@@ -29,6 +29,15 @@ const SHELL_INIT_SH: &str = include_str!("./init.sh");
 
 const EXEC_DEF_FORMAT_VERSION: u32 = 1;
 
+/// Supplies the builtin-utility shim directory, on demand.
+///
+/// A closure rather than a path so the directory is materialized only when a
+/// target actually runs — and a closure rather than a dependency on the
+/// `coreutils` crate so that *this* crate, which most of the workspace links,
+/// does not drag forty utility crates into every build and test binary that
+/// merely wants the exec driver.
+pub type CoreutilsShims = Arc<dyn Fn() -> anyhow::Result<PathBuf> + Send + Sync>;
+
 pub struct Driver {
     name: String,
     /// PATH the driver injects into target processes. Empty falls back to a hardcoded default.
@@ -42,6 +51,16 @@ pub struct Driver {
     /// reaching the cache key would serve every previously-cached artifact
     /// unchanged when it was switched on.
     default_runner: Option<String>,
+    /// Whether this driver puts heph's builtin utilities on its targets' PATH,
+    /// from the `coreutils:` option. Off by default: turning it on changes what
+    /// every recipe's `cp` resolves to, and it moves every exec cache key.
+    coreutils_enabled: bool,
+    /// The toolbox version to hash, and how to get its shim directory —
+    /// supplied by the host, which is the thing that knows the heph home.
+    /// `None` while the toolbox is off.
+    coreutils: Option<(u32, CoreutilsShims)>,
+    /// Resolved on first use and reused: the steady-state cost is one `stat`.
+    coreutils_dir: std::sync::OnceLock<PathBuf>,
     wrap_run: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
     wrap_run_shell: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
 }
@@ -257,6 +276,9 @@ impl Driver {
         Self {
             default_runner: None,
             name: "exec".to_string(),
+            coreutils_enabled: false,
+            coreutils: None,
+            coreutils_dir: std::sync::OnceLock::new(),
             search_path: vec![],
             wrap_run: |_, run| Ok(run.to_vec()),
             wrap_run_shell: |sandbox_dir, run| {
@@ -294,6 +316,9 @@ impl Driver {
         Self {
             default_runner: None,
             name: "bash".to_string(),
+            coreutils_enabled: false,
+            coreutils: None,
+            coreutils_dir: std::sync::OnceLock::new(),
             search_path: vec![],
             wrap_run: |sandbox_dir, run| {
                 bash_args_public(sandbox_dir, run.join("\n").as_str(), vec![])
@@ -306,6 +331,7 @@ impl Driver {
         Ok(Self {
             search_path: decode_path(opts)?,
             default_runner: decode_runner(opts)?,
+            coreutils_enabled: decode_coreutils(opts)?,
             ..Self::new_exec()
         })
     }
@@ -314,8 +340,64 @@ impl Driver {
         Ok(Self {
             search_path: decode_path(opts)?,
             default_runner: decode_runner(opts)?,
+            coreutils_enabled: decode_coreutils(opts)?,
             ..Self::new_bash()
         })
+    }
+
+    /// Turn the toolbox on for a driver built directly rather than from
+    /// options — the constructors used by tests and by the shell fallback.
+    #[cfg(test)]
+    #[must_use]
+    fn with_coreutils_enabled_for_test(mut self) -> Self {
+        self.coreutils_enabled = true;
+        self
+    }
+
+    /// Hand the driver the toolbox: the version that reaches the cache key, and
+    /// a way to get the shim directory when a target runs.
+    ///
+    /// A no-op unless `coreutils:` turned the toolbox on, so a host can call
+    /// this unconditionally without deciding policy.
+    #[must_use]
+    pub fn with_coreutils(mut self, version: u32, shims: CoreutilsShims) -> Self {
+        if self.coreutils_enabled {
+            self.coreutils = Some((version, shims));
+        }
+        self
+    }
+
+    /// The shim directory to put on a target's PATH, materialized on first use,
+    /// or `None` when the toolbox is off for this driver.
+    ///
+    /// Fallible on purpose. Degrading to `None` would run the target against the
+    /// host's utilities while its cache key claims heph's — a silently wrong
+    /// build, and the exact failure the version in that key exists to prevent.
+    fn coreutils_dir(&self) -> anyhow::Result<Option<&std::path::Path>> {
+        let Some((_, shims)) = self.coreutils.as_ref() else {
+            // Configured on but never supplied is a host wiring bug, and the
+            // wrong thing to shrug off: the target would run against the host's
+            // utilities while nothing put heph's on its PATH.
+            anyhow::ensure!(
+                !self.coreutils_enabled,
+                "`coreutils: true` is set but no shim directory was supplied to the \
+                 {} driver — the host must call `with_coreutils`",
+                self.name,
+            );
+            return Ok(None);
+        };
+        if let Some(dir) = self.coreutils_dir.get() {
+            return Ok(Some(dir.as_path()));
+        }
+        let dir = shims().context("materialize the builtin-utility shim directory")?;
+        Ok(Some(self.coreutils_dir.get_or_init(|| dir).as_path()))
+    }
+
+    /// The toolbox identity that reaches a target's cache key, or `None` when it
+    /// is off — in which case nothing is hashed at all, so a workspace that
+    /// never turns this on keeps the keys it has today.
+    fn coreutils_version(&self) -> Option<u32> {
+        self.coreutils.as_ref().map(|(version, _)| *version)
     }
 }
 
@@ -341,8 +423,21 @@ fn spec_path_to_target_path(
 }
 
 fn decode_path(opts: &hplugin::config::Options) -> anyhow::Result<Vec<String>> {
-    hplugin::config::deny_unknown("exec/bash/sh driver", opts, &["path", "runner"])?;
+    hplugin::config::deny_unknown(
+        "exec/bash/sh driver",
+        opts,
+        &["path", "runner", "coreutils"],
+    )?;
     Ok(hplugin::config::decode_opt(opts, "exec/bash/sh driver", "path")?.unwrap_or_default())
+}
+
+/// `coreutils: true` puts heph's builtin utilities on every target's PATH.
+///
+/// Off by default. Turning it on is a behaviour change to every recipe — the
+/// `cp` a target runs stops being the host's — and it moves every exec target's
+/// cache key, so it stays opt-in until a release makes it the default.
+fn decode_coreutils(opts: &hplugin::config::Options) -> anyhow::Result<bool> {
+    Ok(hplugin::config::decode_opt(opts, "exec/bash/sh driver", "coreutils")?.unwrap_or(false))
 }
 
 /// The workspace-wide default runner, from `options.runner`.
@@ -1026,6 +1121,16 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 format!("exec_def_{}", req.target_spec.addr.format())
             });
             def.hash(&mut h);
+            // The builtin utilities sit on this target's PATH without being
+            // declared, and nothing can tell which of them a shell command will
+            // invoke without parsing it — so the whole toolbox's identity goes
+            // in, or a heph upgrade that changes `cp` would keep serving
+            // artifacts the old one built. Hashed only when the toolbox is on,
+            // so a workspace that leaves it off keeps every key it has today.
+            if let Some(version) = self.coreutils_version() {
+                "coreutils".hash(&mut h);
+                version.hash(&mut h);
+            }
 
             format!("{:x}", h.finish()).into_bytes()
         };
@@ -1513,6 +1618,20 @@ impl Driver {
         // `hexecrunner` rather than spliced into the string here, because under
         // a runner the rest of `PATH` is not known until the runner (or its
         // agent) has had its say.
+        //
+        // The builtins go in the *suffix*, behind everything the environment
+        // provides. They are what heph supplies rather than what the target
+        // declared, so they fill a gap rather than win an argument: a workspace
+        // that names a devenv or nix runner pinned that environment's `sed` on
+        // purpose, and heph's arriving in front of it would be a silent
+        // downgrade inside a cache key that claims the environment. A target
+        // that declares its own tool still beats both — that is `prefix`.
+        //
+        // It also means the builtins do not reach a runner carrying the
+        // environment out of band, which is what we want: the shim directory is
+        // a host path holding symlinks into a host-platform binary, and a
+        // container's filesystem is not this one.
+        let coreutils_dir = self.coreutils_dir()?;
         let path_policy = hexecrunner::PathPolicy {
             prefix: tool_bin_dir
                 .as_ref()
@@ -1520,9 +1639,10 @@ impl Driver {
                 .into_iter()
                 .collect(),
             fallback: Some(std::ffi::OsString::from(self.sandbox_path_display())),
-            // Nothing heph supplies behind the environment yet; the builtin
-            // toolbox is what this tier exists for.
-            suffix: vec![],
+            suffix: coreutils_dir
+                .map(|d| d.as_os_str().to_os_string())
+                .into_iter()
+                .collect(),
         };
 
         let output_log_path = req.sandbox_dir.join("log.txt");
@@ -5229,6 +5349,232 @@ mod tests {
         assert!(
             !tmp.path().join("never").exists(),
             "Glob must not trigger dir creation",
+        );
+        Ok(())
+    }
+
+    // ---- builtin coreutils ----
+
+    /// A shim directory that looks like the real one, without depending on the
+    /// crate that builds it — the point of the closure this crate takes.
+    fn fake_shims(root: &std::path::Path) -> CoreutilsShims {
+        let root = root.to_path_buf();
+        Arc::new(move || {
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin)?;
+            for name in ["cp", "install", "sha256sum"] {
+                let link = bin.join(name);
+                if !link.exists() {
+                    std::fs::write(&link, b"shim")?;
+                }
+            }
+            Ok(bin)
+        })
+    }
+
+    fn coreutils_opts(on: bool) -> hplugin::config::Options {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "coreutils".to_string(),
+            serde_yaml::from_str(if on { "true" } else { "false" }).expect("yaml"),
+        );
+        opts
+    }
+
+    #[test]
+    fn coreutils_is_off_unless_asked_for() {
+        // The default must stay off: turning it on changes what every recipe's
+        // `cp` resolves to and moves every exec cache key.
+        let d = Driver::from_options_exec(&hplugin::config::Options::new()).expect("from_options");
+        assert!(!d.coreutils_enabled);
+        assert!(d.coreutils_version().is_none());
+    }
+
+    #[test]
+    fn coreutils_is_ignored_while_the_toolbox_is_off() {
+        // A host supplies the toolbox unconditionally; policy lives in the
+        // option, so an off driver must not resolve anything.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let d = Driver::from_options_exec(&coreutils_opts(false))
+            .expect("from_options")
+            .with_coreutils(7, fake_shims(tmp.path()));
+        assert!(d.coreutils.is_none());
+        assert!(d.coreutils_dir().expect("no work to do").is_none());
+        assert!(
+            !tmp.path().join("bin").exists(),
+            "nothing may be materialized"
+        );
+    }
+
+    #[test]
+    fn coreutils_on_without_a_supply_is_an_error_not_a_shrug() {
+        // Running against the host's utilities while the config says otherwise
+        // is the silently-wrong-build case; it has to be loud.
+        let d = Driver::from_options_exec(&coreutils_opts(true)).expect("from_options");
+        let err = d.coreutils_dir().expect_err("must not degrade quietly");
+        assert!(
+            err.to_string().contains("no shim directory was supplied"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn coreutils_on_materializes_the_shims_once() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let d = Driver::from_options_exec(&coreutils_opts(true))
+            .expect("from_options")
+            .with_coreutils(1, fake_shims(home.path()));
+
+        let first = d.coreutils_dir().expect("shim dir").expect("enabled");
+        assert!(first.join("cp").exists(), "cp shim is missing");
+        assert!(first.join("install").exists(), "install shim is missing");
+        // Resolved once and reused — the steady-state cost is a cache read, not
+        // a directory walk per target.
+        let second = d.coreutils_dir().expect("shim dir").expect("enabled");
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn coreutils_moves_the_def_hash_and_only_when_on() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let off = Driver::new_exec();
+        let on = Driver::from_options_exec(&coreutils_opts(true))?
+            .with_coreutils(1, fake_shims(home.path()));
+
+        let base = parse_with_driver(&off, HashMap::new()).await?;
+        let with_toolbox = parse_with_driver(&on, HashMap::new()).await?;
+
+        // The utilities are on the target's PATH without being declared, so
+        // their identity has to reach the key: otherwise an upgrade that
+        // changes `cp` keeps serving artifacts the old one built.
+        assert_ne!(
+            base.hash, with_toolbox.hash,
+            "turning the toolbox on must move the def hash"
+        );
+
+        // And the off path must be byte-identical to what it hashes today, or
+        // shipping this would invalidate every exec target in every workspace
+        // that never asked for it.
+        let off_again = parse_with_driver(
+            &Driver::from_options_exec(&coreutils_opts(false))?,
+            HashMap::new(),
+        )
+        .await?;
+        assert_eq!(base.hash, off_again.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coreutils_sits_behind_everything_the_environment_provides() -> anyhow::Result<()> {
+        // The precedence the whole design rests on. A target that declares a
+        // tool gets that one — `prefix` leads. The builtins are what *heph*
+        // supplies rather than what the target asked for, so they go last: they
+        // fill a gap the environment leaves and never shadow a binary it
+        // deliberately ships.
+        let home = tempfile::tempdir()?;
+        let driver = Driver::new_bash()
+            .with_coreutils_enabled_for_test()
+            .with_coreutils(1, fake_shims(home.path()));
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let tool_path = make_tool_binary(tmp.path(), "mytool", "echo ok")?;
+        let origin_id = "tool||0";
+        let managed_input = make_tool_managed_input(origin_id, &tool_path, tmp.path())?;
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                runner: None,
+                run: vec!["echo $PATH".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::from([(
+                    "".to_string(),
+                    vec![Input {
+                        r#ref: hplugin::driver::TargetAddr::default(),
+                        mode: InputMode::Tool,
+                        origin_id: origin_id.to_string(),
+                        annotations: BTreeMap::from([(
+                            "unpack_root".to_string(),
+                            "tools".to_string(),
+                        )]),
+                        hashed: true,
+                        runtime: true,
+                    }],
+                )]),
+                pass_env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            pty: true,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let mut stdout = Vec::new();
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: Some(&mut stdout),
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+            scratch: vec![],
+        };
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![managed_input],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        let path_out = String::from_utf8(stdout)?;
+        let path_out = path_out.trim();
+        let entries: Vec<&str> = path_out.split(':').collect();
+        let bin_dir = tmp.path().join("bin").to_string_lossy().into_owned();
+        let shim_dir = driver
+            .coreutils_dir()?
+            .expect("enabled")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            entries.first().copied(),
+            Some(bin_dir.as_str()),
+            "the target's own tools must lead; got: {path_out}"
+        );
+        assert_eq!(
+            entries.last().copied(),
+            Some(shim_dir.as_str()),
+            "the builtins must come last, behind everything the environment \
+             provides; got: {path_out}"
+        );
+        let declared = entries
+            .iter()
+            .position(|e| *e == "/usr/bin")
+            .expect("what the target declared must still be on PATH");
+        assert!(
+            declared < entries.len() - 1,
+            "what the target declared must come before the builtins; got: {path_out}"
         );
         Ok(())
     }
