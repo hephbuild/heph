@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 use crate::engine::config::ConfigYamlExt;
 use crate::engine::config_yaml;
 use crate::{
-    engine, pluginbuildfile, pluginexec, pluginhostbin, pluginhttp, pluginnix, plugintextfile,
+    engine, pluginbuildfile, pluginexec, pluginhostbin, pluginhttp, pluginnix, plugintemplate,
+    plugintextfile,
 };
 
 /// Builds the multi-thread runtime used by every command entry point.
@@ -131,6 +132,9 @@ pub fn register_builtin_plugins(
     })?;
     e.register_plugin(plugintextfile::DRIVER_NAME, |_| {
         Ok(PluginParts::default().with_driver(Box::new(plugintextfile::Driver)))
+    })?;
+    e.register_plugin(plugintemplate::DRIVER_NAME, |_| {
+        Ok(PluginParts::default().with_driver(Box::new(plugintemplate::Driver)))
     })?;
     // `http_fetch`: downloads a URL (templated over the target's addr args) into a
     // cacheable file output — how tool binaries are provisioned off the internet.
@@ -461,6 +465,7 @@ plugins:
                 "http_fetch",
                 "nix",
                 "scratch",
+                "template",
                 "textfile",
             ]
         );
