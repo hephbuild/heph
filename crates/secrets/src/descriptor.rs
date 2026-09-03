@@ -310,8 +310,14 @@ pub enum Exchange {
     /// The standard way to trade an assertion for a scoped credential, and what
     /// GCP's own STS endpoint speaks.
     TokenExchange {
-        #[spec(required)]
-        endpoint: String,
+        /// The authorization server, discovered rather than hard-coded.
+        ///
+        /// Preferred over [`Self::TokenExchange::endpoint`] — see
+        /// [`Endpoint`].
+        issuer: Option<String>,
+        /// The token endpoint, for a server that publishes no discovery
+        /// document.
+        endpoint: Option<String>,
         audience: Option<String>,
         resource: Option<String>,
         scope: Vec<String>,
@@ -323,14 +329,14 @@ pub enum Exchange {
     /// What a service-account key actually is: a signed assertion traded for an
     /// access token.
     JwtBearer {
-        #[spec(required)]
-        endpoint: String,
+        issuer: Option<String>,
+        endpoint: Option<String>,
         scope: Vec<String>,
     },
     /// RFC 6749 §4.4 client credentials.
     ClientCredentials {
-        #[spec(required)]
-        endpoint: String,
+        issuer: Option<String>,
+        endpoint: Option<String>,
         scope: Vec<String>,
     },
     /// AWS STS `AssumeRoleWithWebIdentity`.
@@ -358,6 +364,115 @@ pub enum Exchange {
         /// shapes downstream see named fields rather than a blob.
         fields: BTreeMap<String, String>,
     },
+}
+
+/// Where an OAuth grant is sent: an issuer to discover, or a literal endpoint.
+///
+/// **Discovery is the standard, so `issuer` is the spelling to reach for.**
+/// OpenID Connect Discovery 1.0 (and RFC 8414 for plain OAuth) put the token
+/// endpoint in `{issuer}/.well-known/openid-configuration`, which is why every
+/// IdP publishes one and why an issuer is the thing an administrator can
+/// actually tell you. Requiring a hand-written `token_endpoint` was an
+/// inconsistency in this design's own terms: `heph auth login` already
+/// discovers its endpoints from an issuer, and an exchange had no reason to
+/// work differently.
+///
+/// Discovery also gets a diagnostic for free. The metadata document lists
+/// `grant_types_supported`, so asking a server for a grant it does not
+/// implement can fail by name, before the request, instead of arriving as a
+/// bare `400 unsupported_grant_type`.
+///
+/// `endpoint` stays as the escape hatch, because not every server publishes
+/// metadata — an internal minting service, or an endpoint reached through a
+/// gateway on a different host than its issuer claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint<'a> {
+    /// Resolve `{issuer}/.well-known/openid-configuration` and read
+    /// `token_endpoint` from it.
+    Discover(&'a str),
+    /// Use this URL directly.
+    Literal(&'a str),
+}
+
+/// The well-known path appended to an issuer, per OpenID Connect Discovery 1.0.
+pub const OIDC_DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
+
+impl Endpoint<'_> {
+    /// The URL to fetch metadata from, for the discovery form.
+    ///
+    /// The issuer's trailing slash is dropped first: OIDC Discovery specifies
+    /// concatenation, so an issuer written with one yields a double slash that
+    /// some servers 404 on and others do not — a difference nobody should have
+    /// to debug from a BUILD file.
+    pub fn discovery_url(&self) -> Option<String> {
+        match self {
+            Endpoint::Discover(issuer) => Some(format!(
+                "{}{OIDC_DISCOVERY_PATH}",
+                issuer.trim_end_matches('/')
+            )),
+            Endpoint::Literal(_) => None,
+        }
+    }
+}
+
+/// Resolve the `issuer`/`endpoint` pair for one grant.
+///
+/// Exactly one, and saying so is the whole rule: silently preferring one when
+/// both are given would make which server was contacted depend on a precedence
+/// nobody can see at the call site.
+fn endpoint_of<'a>(
+    issuer: &'a Option<String>,
+    endpoint: &'a Option<String>,
+    kind: &str,
+) -> anyhow::Result<Endpoint<'a>> {
+    match (issuer.as_deref(), endpoint.as_deref()) {
+        (Some(i), None) => Ok(Endpoint::Discover(i)),
+        (None, Some(e)) => Ok(Endpoint::Literal(e)),
+        (Some(_), Some(_)) => anyhow::bail!(
+            "`{kind}` names both an `issuer` and an `endpoint`; set one. `issuer` discovers the \
+             token endpoint from {OIDC_DISCOVERY_PATH}, which is what an IdP publishes and what \
+             an administrator can tell you; `endpoint` is for a server that publishes no \
+             discovery document."
+        ),
+        (None, None) => anyhow::bail!(
+            "`{kind}` needs an `issuer` (preferred — the token endpoint is discovered from \
+             {OIDC_DISCOVERY_PATH}) or an explicit `endpoint`."
+        ),
+    }
+}
+
+impl Exchange {
+    /// Where this step sends its request, for the grants that have one.
+    ///
+    /// `None` for [`Exchange::AwsSts`] and [`Exchange::Http`], which name their
+    /// own destinations and speak no OAuth metadata.
+    pub fn endpoint(&self) -> anyhow::Result<Option<Endpoint<'_>>> {
+        Ok(match self {
+            Exchange::TokenExchange {
+                issuer, endpoint, ..
+            } => Some(endpoint_of(issuer, endpoint, "token_exchange")?),
+            Exchange::JwtBearer {
+                issuer, endpoint, ..
+            } => Some(endpoint_of(issuer, endpoint, "jwt_bearer")?),
+            Exchange::ClientCredentials {
+                issuer, endpoint, ..
+            } => Some(endpoint_of(issuer, endpoint, "client_credentials")?),
+            Exchange::AwsSts { .. } | Exchange::Http { .. } => None,
+        })
+    }
+
+    /// The grant type this step requests, for the metadata check that
+    /// discovery makes possible.
+    pub fn grant_type(&self) -> Option<&'static str> {
+        match self {
+            Exchange::TokenExchange { .. } => {
+                Some("urn:ietf:params:oauth:grant-type:token-exchange")
+            }
+            Exchange::JwtBearer { .. } => Some("urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            Exchange::ClientCredentials { .. } => Some("client_credentials"),
+            Exchange::AwsSts { .. } | Exchange::Http { .. } => None,
+        }
+    }
 }
 
 /// Accept `var = "TOKEN"` as well as `vars = {…}`.
@@ -666,6 +781,13 @@ impl Acquire {
                     );
                 }
             }
+        }
+        // Each step's destination resolves at declaration time, so a grant
+        // naming neither an issuer nor an endpoint — or both — fails here
+        // rather than on the first mint of a build that got that far.
+        for (i, step) in self.exchange.iter().enumerate() {
+            step.endpoint()
+                .map_err(|e| anyhow::anyhow!("{}: exchange[{i}]: {e}", at()))?;
         }
         if self.ttl.is_some() {
             self.ttl_duration()
@@ -1146,6 +1268,132 @@ mod tests {
             acq(static_env("TOK")).helper_timeout().expect("default"),
             DEFAULT_HELPER_TIMEOUT
         );
+    }
+
+    // ---- discovery ----
+
+    fn token_exchange(issuer: Option<&str>, endpoint: Option<&str>) -> Exchange {
+        Exchange::TokenExchange {
+            issuer: issuer.map(str::to_string),
+            endpoint: endpoint.map(str::to_string),
+            audience: None,
+            resource: None,
+            scope: Vec::new(),
+            requested_token_type: None,
+        }
+    }
+
+    /// An issuer is the thing an administrator can actually tell you, so it is
+    /// the spelling to reach for — and the endpoint comes from the metadata
+    /// document every IdP publishes.
+    #[test]
+    fn an_issuer_resolves_to_its_discovery_document() {
+        let e = token_exchange(Some("https://sts.googleapis.com"), None);
+        let at = e.endpoint().expect("resolves").expect("has one");
+        assert_eq!(
+            at.discovery_url().as_deref(),
+            Some("https://sts.googleapis.com/.well-known/openid-configuration")
+        );
+    }
+
+    /// OIDC Discovery specifies concatenation, so an issuer written with a
+    /// trailing slash would otherwise produce a double slash that some servers
+    /// 404 on and others do not — a difference nobody should debug from a
+    /// BUILD file.
+    #[test]
+    fn a_trailing_slash_on_the_issuer_does_not_double_up() {
+        let e = token_exchange(Some("https://org.okta.com/oauth2/default/"), None);
+        let at = e.endpoint().expect("resolves").expect("has one");
+        assert_eq!(
+            at.discovery_url().as_deref(),
+            Some("https://org.okta.com/oauth2/default/.well-known/openid-configuration")
+        );
+    }
+
+    /// The escape hatch: a server that publishes no metadata.
+    #[test]
+    fn a_literal_endpoint_is_used_as_written_and_discovers_nothing() {
+        let e = token_exchange(None, Some("https://internal.example/mint"));
+        let at = e.endpoint().expect("resolves").expect("has one");
+        assert_eq!(at, Endpoint::Literal("https://internal.example/mint"));
+        assert!(at.discovery_url().is_none());
+    }
+
+    /// Neither, or both, is a declaration-time failure — silently preferring
+    /// one would make which server was contacted depend on an invisible
+    /// precedence.
+    #[test]
+    fn a_grant_needs_exactly_one_of_issuer_and_endpoint() {
+        let err = token_exchange(None, None).endpoint().expect_err("neither");
+        let msg = err.to_string();
+        assert!(msg.contains("issuer"), "{msg}");
+        assert!(msg.contains(OIDC_DISCOVERY_PATH), "{msg}");
+
+        let err = token_exchange(Some("https://a"), Some("https://b"))
+            .endpoint()
+            .expect_err("both");
+        assert!(err.to_string().contains("set one"), "{err}");
+    }
+
+    /// The two steps that name their own destination speak no OAuth metadata.
+    #[test]
+    fn vendor_steps_have_no_oauth_endpoint_or_grant() {
+        for e in [
+            Exchange::AwsSts { endpoint: None },
+            Exchange::Http {
+                url: "https://api.github.com/x".into(),
+                method: None,
+                headers: BTreeMap::new(),
+                body: None,
+                fields: BTreeMap::new(),
+            },
+        ] {
+            assert!(e.endpoint().expect("no error").is_none(), "{e:?}");
+            assert!(e.grant_type().is_none(), "{e:?}");
+        }
+    }
+
+    /// Discovery buys a diagnostic: the metadata lists `grant_types_supported`,
+    /// so a server that does not implement the grant can be named before the
+    /// request rather than arriving as a bare `400 unsupported_grant_type`.
+    #[test]
+    fn each_oauth_grant_names_its_urn() {
+        assert_eq!(
+            token_exchange(Some("https://x"), None).grant_type(),
+            Some("urn:ietf:params:oauth:grant-type:token-exchange")
+        );
+        assert_eq!(
+            Exchange::JwtBearer {
+                issuer: Some("https://x".into()),
+                endpoint: None,
+                scope: Vec::new(),
+            }
+            .grant_type(),
+            Some("urn:ietf:params:oauth:grant-type:jwt-bearer")
+        );
+        assert_eq!(
+            Exchange::ClientCredentials {
+                issuer: Some("https://x".into()),
+                endpoint: None,
+                scope: Vec::new(),
+            }
+            .grant_type(),
+            Some("client_credentials")
+        );
+    }
+
+    /// A malformed grant fails at the declaration, not on the first mint of a
+    /// build that already got that far.
+    #[test]
+    fn a_grant_with_no_destination_fails_when_the_route_is_validated() {
+        let a = Acquire {
+            exchange: vec![token_exchange(None, None)],
+            ..acq(Source::Oidc {})
+        };
+        let err = a.validate("//x:y", 0).expect_err("no destination");
+        let msg = err.to_string();
+        assert!(msg.contains("exchange[0]"), "{msg}");
+        assert!(msg.contains("issuer"), "{msg}");
     }
 
     #[test]

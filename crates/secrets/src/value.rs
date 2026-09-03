@@ -133,6 +133,7 @@ mod tests {
         Expiry {
             at: SystemTime::UNIX_EPOCH,
             source: ExpirySource::Default,
+            issued_at: SystemTime::UNIX_EPOCH,
         }
     }
 

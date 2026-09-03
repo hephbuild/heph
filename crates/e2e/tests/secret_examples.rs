@@ -290,7 +290,7 @@ target(
     shape = ["gcloud_adc", "docker_config"],
     provider = "oidc",
     exchange = [
-        {"kind": "token_exchange", "endpoint": "https://sts.googleapis.com/v1/token"},
+        {"kind": "token_exchange", "issuer": "https://sts.googleapis.com"},
         {"kind": "http",
          "url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/x:generateAccessToken"},
     ],
@@ -300,6 +300,59 @@ target(
     .await?;
 
     assert_eq!(desc.acquire.first().map(|a| a.exchange.len()), Some(2));
+    Ok(())
+}
+
+/// An OAuth grant names an **issuer**, and the token endpoint is discovered
+/// from the metadata document every IdP publishes. That is the standard, and
+/// it is what `heph auth login` already does for its own endpoints — an
+/// exchange had no reason to work differently.
+#[tokio::test]
+async fn a_grant_discovers_its_endpoint_from_the_issuer() -> anyhow::Result<()> {
+    let desc = declare(
+        r#"
+target(
+    name = "c",
+    driver = "secret",
+    audience = "heph.org.example",
+    provider = "oidc",
+    exchange = {"kind": "token_exchange", "issuer": "https://org.okta.com/oauth2/default"},
+)
+"#,
+    )
+    .await?;
+
+    let step = desc
+        .acquire
+        .first()
+        .and_then(|a| a.exchange.first())
+        .expect("one step");
+    assert_eq!(
+        step.endpoint()?.and_then(|e| e.discovery_url()).as_deref(),
+        Some("https://org.okta.com/oauth2/default/.well-known/openid-configuration")
+    );
+    Ok(())
+}
+
+/// A grant naming neither an issuer nor an endpoint — or both — fails at the
+/// declaration, where a BUILD author sees it.
+#[tokio::test]
+async fn a_grant_with_no_destination_is_refused_at_the_declaration() -> anyhow::Result<()> {
+    let err = declare(
+        r#"
+target(
+    name = "c",
+    driver = "secret",
+    provider = "oidc",
+    exchange = {"kind": "token_exchange"},
+)
+"#,
+    )
+    .await
+    .expect_err("no destination");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("issuer"), "{msg}");
+    assert!(msg.contains(".well-known/openid-configuration"), "{msg}");
     Ok(())
 }
 

@@ -812,16 +812,64 @@ mod tests {
         assert!(matches!(steps.get(1), Some(Exchange::Http { .. })));
     }
 
+    /// An OAuth grant names an `issuer` and discovers the rest; a literal
+    /// `endpoint` is the escape hatch. Naming neither is a declaration-time
+    /// failure that says which to reach for.
     #[test]
-    fn an_exchange_missing_its_endpoint_fails_at_parse() {
+    fn a_grant_naming_neither_issuer_nor_endpoint_fails_at_the_declaration() {
         let err = parse_declaration(&spec_of(&[
             ("provider", s("oidc")),
             ("exchange", map(&[("kind", s("token_exchange"))])),
         ]))
-        .expect_err("no endpoint");
-        assert!(
-            format!("{err:#}").contains("missing required `endpoint`"),
-            "{err:#}"
+        .expect_err("no destination");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`issuer`"), "{msg}");
+        assert!(msg.contains(".well-known/openid-configuration"), "{msg}");
+    }
+
+    /// Both is refused too: silently preferring one would make which server was
+    /// contacted depend on a precedence nobody can see at the call site.
+    #[test]
+    fn a_grant_naming_both_issuer_and_endpoint_is_refused() {
+        let err = parse_declaration(&spec_of(&[
+            ("provider", s("oidc")),
+            (
+                "exchange",
+                map(&[
+                    ("kind", s("token_exchange")),
+                    ("issuer", s("https://org.okta.com/oauth2/default")),
+                    ("endpoint", s("https://internal.example/mint")),
+                ]),
+            ),
+        ]))
+        .expect_err("both");
+        assert!(format!("{err:#}").contains("set one"), "{err:#}");
+    }
+
+    #[test]
+    fn an_issuer_resolves_to_its_discovery_document() {
+        let d = parse_declaration(&spec_of(&[
+            ("provider", s("oidc")),
+            (
+                "exchange",
+                map(&[
+                    ("kind", s("token_exchange")),
+                    ("issuer", s("https://org.okta.com/oauth2/default")),
+                ]),
+            ),
+        ]))
+        .expect("issuer");
+        let step = d
+            .acquire
+            .first()
+            .and_then(|a| a.exchange.first())
+            .expect("one step");
+        assert_eq!(
+            step.endpoint()
+                .expect("resolves")
+                .and_then(|e| e.discovery_url())
+                .as_deref(),
+            Some("https://org.okta.com/oauth2/default/.well-known/openid-configuration")
         );
     }
 

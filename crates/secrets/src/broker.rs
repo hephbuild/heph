@@ -31,14 +31,14 @@
 //! fails at once instead of blocking on a human who is not watching.
 
 use crate::descriptor::Descriptor;
-use crate::provider::{EnvLookup, MintCtx, ProviderRegistry};
+use crate::provider::{EnvLookup, MintCtx, ProviderRegistry, SharedEnvLookup};
 use crate::redact::{Entry, Redactor};
 use crate::value::{Credential, SecretValue};
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 
 /// What the caller must supply for a mint that this crate cannot discover.
@@ -77,6 +77,42 @@ pub struct Grant {
     pub expiry_source: crate::expiry::ExpirySource,
 }
 
+/// How often the background sweep looks for credentials to renew.
+///
+/// Well under [`crate::expiry::MIN_HANDOUT_LIFETIME`], so a credential crossing
+/// the headroom line is picked up long before a consumer could be handed it.
+/// One wakeup a minute for a whole run is not a cost worth tuning.
+pub const REFRESH_TICK: Duration = Duration::from_secs(60);
+
+/// Everything the background sweep needs, owned rather than borrowed.
+///
+/// [`BrokerCtx`] borrows, which is right for a call made on a consumer's
+/// behalf and impossible for a task that outlives every individual call. The
+/// environment lookup is the process environment either way, so an owned handle
+/// to it means the same thing.
+#[derive(Clone)]
+pub struct RefreshConfig {
+    pub env: SharedEnvLookup,
+    pub ctoken: Arc<dyn Cancellable + Send + Sync>,
+    pub request_id: String,
+    pub cwd: std::path::PathBuf,
+}
+
+/// Stops the background sweep when dropped.
+///
+/// The task holds a weak reference to the broker, so it never keeps a run
+/// alive on its own; this guard is what stops it promptly rather than at the
+/// next tick after everything else has gone.
+pub struct RefreshGuard {
+    stop: hcore::hasync::StdCancellationToken,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
 /// Per-run credential broker.
 pub struct Broker {
     registry: Arc<ProviderRegistry>,
@@ -84,7 +120,7 @@ pub struct Broker {
     /// is held only long enough to clone an `Arc`; the mint itself happens
     /// under the *slot's* lock, so two different descriptors never serialize
     /// against each other.
-    slots: Mutex<BTreeMap<String, Arc<Mutex<Option<Credential>>>>>,
+    slots: Mutex<BTreeMap<String, Arc<Mutex<Option<Cached>>>>>,
     /// Every value minted so far, for the redactor. Separate from `slots`
     /// because the redactor must be buildable without touching a slot that is
     /// mid-mint — which would deadlock the very error path that needs it.
@@ -105,6 +141,21 @@ pub struct Broker {
 /// A few generations is enough: a superseded value can still be sitting in a
 /// stream's carry buffer or an in-flight log line, but not four re-mints later.
 const MAX_LIVE_PER_SECRET: usize = 4;
+
+/// A minted credential, plus everything needed to mint it again without a
+/// caller.
+///
+/// The background sweep has no `BrokerCtx` of its own and no consumer asking,
+/// so the descriptor, the consumer's name and the resolved runner are kept from
+/// the first mint. Storing them is what makes a refresh possible at all.
+struct Cached {
+    cred: Credential,
+    desc: Arc<Descriptor>,
+    /// The consumer's name for it, which is what `«redacted:NAME»` shows.
+    name: String,
+    /// The already-resolved runner from the first mint.
+    runner: Option<Addr>,
+}
 
 #[derive(Default)]
 struct LiveValues {
@@ -200,12 +251,61 @@ impl Broker {
         // driver minting for itself.
         let mut guard = slot.lock().await;
 
-        if let Some(existing) = guard.as_ref()
-            && !existing.expiry.stale_at(ctx.now)
-        {
-            return Ok(existing.clone());
+        // Reuse only a credential a target can actually *do something with*.
+        //
+        // `stale_at` alone was the bug: it answers "is this still valid?", and
+        // a value one second inside the skew margin passes that and then fails
+        // every target that runs for longer than a second. A handout wants
+        // headroom, so a still-valid credential with too little life left is
+        // re-minted now rather than handed over to fail later.
+        //
+        // Unless re-minting cannot help — a credential whose whole lifetime is
+        // shorter than the headroom would be re-minted on every single handout,
+        // paying a mint per target to buy nothing. That is worth saying once,
+        // not fixing silently.
+        if let Some(existing) = guard.as_ref() {
+            let e = &existing.cred.expiry;
+            if !e.stale_at(ctx.now)
+                && (e.has_handout_headroom(ctx.now) || !e.refresh_would_help(ctx.now))
+            {
+                if !e.has_handout_headroom(ctx.now) {
+                    tracing::warn!(
+                        secret = %desc.addr,
+                        usable_lifetime_s = e.usable_lifetime().as_secs(),
+                        min_s = crate::expiry::MIN_HANDOUT_LIFETIME.as_secs(),
+                        "credential's whole lifetime is shorter than the headroom a target \
+                         wants; re-minting cannot help, so a long target may outlive it. Raise \
+                         the ttl, or give the target a process credential."
+                    );
+                }
+                return Ok(existing.cred.clone());
+            }
         }
 
+        let cred = self.mint_into(desc, name, ctx.runner, ctx).await?;
+
+        *guard = Some(Cached {
+            cred: cred.clone(),
+            desc: Arc::new(desc.clone()),
+            name: name.to_string(),
+            runner: ctx.runner.cloned(),
+        });
+        Ok(cred)
+    }
+
+    /// Select a route, call its provider, and record the grant.
+    ///
+    /// Shared by the on-demand path and the background sweep, so a refreshed
+    /// credential is registered with the redactor and recorded as a grant on
+    /// exactly the same terms as a freshly minted one. Deliberately does *not*
+    /// touch the slot: its caller owns the lock and decides what to store.
+    async fn mint_into(
+        &self,
+        desc: &Descriptor,
+        name: &str,
+        runner: Option<&Addr>,
+        ctx: &BrokerCtx<'_>,
+    ) -> anyhow::Result<Credential> {
         let selection = desc.select(ctx.env)?;
         let provider = self.registry.get(selection.entry.source.kind())?;
 
@@ -216,7 +316,7 @@ impl Broker {
             env: ctx.env,
             ctoken: ctx.ctoken,
             request_id: ctx.request_id,
-            runner: ctx.runner,
+            runner,
             cwd: ctx.cwd,
             redactor: &redactor,
         };
@@ -245,9 +345,131 @@ impl Broker {
             expiry_source = cred.expiry.source.as_str(),
             "minted a credential"
         );
-
-        *guard = Some(cred.clone());
         Ok(cred)
+    }
+
+    /// Start refreshing credentials in the background for the life of the run.
+    ///
+    /// A build that runs for hours would otherwise refresh only when a consumer
+    /// asks, which puts the mint latency on whichever target happens to be
+    /// unlucky and leaves a window where a target starting just then is handed
+    /// the short end of a credential's life. The sweep moves that work off the
+    /// critical path entirely: by the time a target asks, the value is warm.
+    ///
+    /// This is *not* the answer to a credential expiring **inside** a single
+    /// long-running target. Nothing outside that process can replace a value it
+    /// has already read; that case needs a process credential the tool re-reads
+    /// (`credential_process`, `GOAUTH=command`, a git `credential.helper`),
+    /// which is a separate piece of work.
+    pub fn spawn_refresher(self: &Arc<Self>, cfg: RefreshConfig) -> RefreshGuard {
+        self.spawn_refresher_every(cfg, REFRESH_TICK)
+    }
+
+    /// [`Self::spawn_refresher`] with the tick chosen by the caller, for tests.
+    pub fn spawn_refresher_every(
+        self: &Arc<Self>,
+        cfg: RefreshConfig,
+        tick: Duration,
+    ) -> RefreshGuard {
+        let stop = hcore::hasync::StdCancellationToken::new();
+        // `Weak`, so a forgotten guard leaks a sleeping task rather than
+        // pinning the whole broker — and every live credential in it — for the
+        // life of the process.
+        let weak = Arc::downgrade(self);
+        let stop_for_task = stop.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = stop_for_task.cancelled() => return,
+                    () = cfg.ctoken.cancelled() => return,
+                    () = tokio::time::sleep(tick) => {}
+                }
+                let Some(broker) = weak.upgrade() else { return };
+                let ctx = BrokerCtx {
+                    now: SystemTime::now(),
+                    env: cfg.env.as_ref(),
+                    ctoken: cfg.ctoken.as_ref(),
+                    request_id: &cfg.request_id,
+                    runner: None,
+                    cwd: &cfg.cwd,
+                };
+                let n = broker.refresh_due(&ctx).await;
+                if n > 0 {
+                    tracing::debug!(count = n, "refreshed credentials ahead of demand");
+                }
+            }
+        });
+
+        RefreshGuard { stop }
+    }
+
+    /// Re-mint every credential that a handout would now refuse.
+    ///
+    /// This is the background half. A run that lasts hours would otherwise
+    /// leave every credential to be refreshed by the next consumer that asks —
+    /// which makes some unlucky target pay the mint latency, and leaves a gap
+    /// where a target starting just then gets the short end of a credential's
+    /// life. Sweeping ahead of demand keeps values warm, so a handout is a
+    /// clone rather than a network round trip.
+    ///
+    /// Separate from the loop that calls it so the *logic* is testable without
+    /// spawning anything or waiting on a clock.
+    ///
+    /// Returns the number re-minted. Failures are logged and left in place: the
+    /// old value may still be usable, and a background sweep is the wrong place
+    /// to fail a build — the consumer that actually needs it will surface the
+    /// error with its own target's name attached.
+    pub async fn refresh_due(&self, ctx: &BrokerCtx<'_>) -> usize {
+        let slots: Vec<(String, Arc<Mutex<Option<Cached>>>)> = {
+            let slots = self.slots.lock().await;
+            slots
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
+
+        let mut refreshed = 0usize;
+        for (addr, slot) in slots {
+            // `try_lock`: a slot mid-mint is already being refreshed by whoever
+            // holds it, and a sweep must never queue behind a helper
+            // subprocess — that would stall every later slot behind one slow
+            // one.
+            let Ok(mut guard) = slot.try_lock() else {
+                continue;
+            };
+            let Some(cached) = guard.as_ref() else {
+                continue;
+            };
+            let e = &cached.cred.expiry;
+            if e.has_handout_headroom(ctx.now) || !e.refresh_would_help(ctx.now) {
+                continue;
+            }
+
+            let (desc, name, runner) = (
+                Arc::clone(&cached.desc),
+                cached.name.clone(),
+                cached.runner.clone(),
+            );
+            match self.mint_into(&desc, &name, runner.as_ref(), ctx).await {
+                Ok(cred) => {
+                    *guard = Some(Cached {
+                        cred,
+                        desc,
+                        name,
+                        runner,
+                    });
+                    refreshed = refreshed.saturating_add(1);
+                }
+                Err(e) => tracing::warn!(
+                    secret = %addr,
+                    error = %e,
+                    "background credential refresh failed; the existing value is kept and the \
+                     next consumer will report this with its own target attached"
+                ),
+            }
+        }
+        refreshed
     }
 
     async fn register_live(&self, name: &str, cred: &Credential) {
@@ -341,6 +563,7 @@ mod tests {
                 Expiry {
                     at: ctx.now + self.ttl,
                     source: ExpirySource::DeclaredTtl,
+                    issued_at: ctx.now,
                 },
             ))
         }
@@ -443,6 +666,7 @@ mod tests {
                 Expiry {
                     at: ctx.now + Duration::from_secs(3600),
                     source: ExpirySource::DeclaredTtl,
+                    issued_at: ctx.now,
                 },
             ))
         }
@@ -566,6 +790,7 @@ mod tests {
                     Expiry {
                         at: ctx.now + Duration::from_secs(3600),
                         source: ExpirySource::DeclaredTtl,
+                        issued_at: ctx.now,
                     },
                 ))
             }
@@ -605,6 +830,236 @@ mod tests {
         b.mint(&d, "x", &ctx).await.expect("second succeeds");
         assert_eq!(p.calls.load(Ordering::SeqCst), 2);
         assert_eq!(b.grants().await.len(), 1);
+    }
+
+    // ---- preemptive refresh ----
+
+    /// The bug this pins, in the user's words: a target must not start with a
+    /// token that is valid for one second.
+    ///
+    /// `stale_at` alone answers "is this still valid?", and a credential just
+    /// inside the skew margin passes that while being useless to anything that
+    /// runs for longer than a moment. A handout wants *headroom*, so a
+    /// still-valid credential with too little life left is re-minted before it
+    /// is given away.
+    #[tokio::test]
+    async fn a_handout_refreshes_a_still_valid_but_nearly_dead_credential() {
+        // 1h credentials, so a refresh genuinely buys more life.
+        let (b, p) = broker(Duration::from_secs(3600));
+        let token = StdCancellationToken::new();
+        let env = env_of(&[]);
+        let d = descriptor("//c:x");
+        let mk = |now| BrokerCtx {
+            now,
+            env: &env,
+            ctoken: &token,
+            request_id: "req",
+            runner: None,
+            cwd: std::path::Path::new("."),
+        };
+
+        b.mint(&d, "x", &mk(t(0))).await.expect("first");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+
+        // Still valid — well inside the 60s skew margin of a 3600s expiry — but
+        // with under five minutes of usable life. The old rule reused it.
+        let nearly_dead = t(3600 - 60 - 30);
+        b.mint(&d, "x", &mk(nearly_dead)).await.expect("handout");
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            2,
+            "a credential with 30s of usable life was handed to a target"
+        );
+    }
+
+    /// …but not when re-minting cannot help. A credential whose whole lifetime
+    /// is shorter than the headroom would otherwise be re-minted on every
+    /// single handout, paying a mint per target to buy nothing.
+    #[tokio::test]
+    async fn a_short_lived_credential_is_not_re_minted_on_every_handout() {
+        // 90s credentials: 30s usable after the margin, always under the
+        // handout headroom, and a refresh would land in exactly the same place.
+        let (b, p) = broker(Duration::from_secs(90));
+        let token = StdCancellationToken::new();
+        let env = env_of(&[]);
+        let d = descriptor("//c:x");
+        let mk = |now| BrokerCtx {
+            now,
+            env: &env,
+            ctoken: &token,
+            request_id: "req",
+            runner: None,
+            cwd: std::path::Path::new("."),
+        };
+
+        b.mint(&d, "x", &mk(t(0))).await.expect("first");
+        for at in [1, 2, 3, 4, 5] {
+            b.mint(&d, "x", &mk(t(at))).await.expect("handout");
+        }
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            1,
+            "a credential too short-lived to refresh was re-minted anyway"
+        );
+    }
+
+    /// The background half: a long run keeps its credentials warm without any
+    /// consumer paying the mint latency.
+    #[tokio::test]
+    async fn the_sweep_renews_ahead_of_demand() {
+        let (b, p) = broker(Duration::from_secs(3600));
+        let token = StdCancellationToken::new();
+        let env = env_of(&[]);
+        let d = descriptor("//c:x");
+        let mk = |now| BrokerCtx {
+            now,
+            env: &env,
+            ctoken: &token,
+            request_id: "req",
+            runner: None,
+            cwd: std::path::Path::new("."),
+        };
+
+        b.mint(&d, "x", &mk(t(0))).await.expect("first");
+
+        // Nothing due yet.
+        assert_eq!(b.refresh_due(&mk(t(60))).await, 0);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+
+        // Inside the headroom window: the sweep renews it before anyone asks.
+        assert_eq!(b.refresh_due(&mk(t(3600 - 60 - 30))).await, 1);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+
+        // And the consumer that arrives next is served without a mint.
+        b.mint(&d, "x", &mk(t(3600 - 60 - 29))).await.expect("warm");
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            2,
+            "the consumer paid a mint the sweep had already done"
+        );
+    }
+
+    /// A background failure must not fail a build: the old value is kept, and
+    /// the consumer that actually needs it reports the error with its own
+    /// target attached.
+    #[tokio::test]
+    async fn a_failed_sweep_keeps_the_existing_value() {
+        struct FailAfterFirst {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl SecretProvider for FailAfterFirst {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::StaticEnv
+            }
+            async fn mint(
+                &self,
+                ctx: &MintCtx<'_>,
+                _identity: &Identity,
+                _acquire: &Acquire,
+            ) -> anyhow::Result<Credential> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    anyhow::bail!("idp unreachable");
+                }
+                Ok(Credential::single(
+                    "the_first_token_value",
+                    Expiry {
+                        at: ctx.now + Duration::from_secs(3600),
+                        source: ExpirySource::DeclaredTtl,
+                        issued_at: ctx.now,
+                    },
+                ))
+            }
+        }
+
+        let p = Arc::new(FailAfterFirst {
+            calls: AtomicUsize::new(0),
+        });
+        let mut reg = ProviderRegistry::default();
+        reg.register(p.clone()).expect("register");
+        let b = Broker::new(Arc::new(reg));
+        let token = StdCancellationToken::new();
+        let env = env_of(&[]);
+        let d = descriptor("//c:x");
+        let mk = |now| BrokerCtx {
+            now,
+            env: &env,
+            ctoken: &token,
+            request_id: "req",
+            runner: None,
+            cwd: std::path::Path::new("."),
+        };
+
+        b.mint(&d, "x", &mk(t(0))).await.expect("first");
+        assert_eq!(b.refresh_due(&mk(t(3600 - 60 - 30))).await, 0, "it failed");
+        // The value is still there, and still masked.
+        assert_eq!(
+            b.redactor().await.redact_str("saw the_first_token_value"),
+            "saw «redacted:x»"
+        );
+    }
+
+    /// The loop itself, not just the sweep it calls: a spawned refresher must
+    /// actually renew on its own, and must stop when its guard is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_spawned_refresher_renews_and_then_stops() {
+        // Short-lived enough that the very first tick finds work to do.
+        let (b, p) = broker(Duration::from_secs(3600));
+        let b = Arc::new(b);
+        let token = StdCancellationToken::new();
+        let env = env_of(&[]);
+        let d = descriptor("//c:x");
+
+        b.mint(
+            &d,
+            "x",
+            &BrokerCtx {
+                // Minted far enough in the past that it is already inside the
+                // headroom window by the time the sweep runs against `now()`.
+                now: SystemTime::now() - Duration::from_secs(3600 - 60 - 10),
+                env: &env,
+                ctoken: &token,
+                request_id: "req",
+                runner: None,
+                cwd: std::path::Path::new("."),
+            },
+        )
+        .await
+        .expect("first");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+
+        let guard = b.spawn_refresher_every(
+            RefreshConfig {
+                env: Arc::new(|_: &str| None),
+                ctoken: Arc::new(StdCancellationToken::new()),
+                request_id: "req".to_string(),
+                cwd: std::path::PathBuf::from("."),
+            },
+            Duration::from_millis(20),
+        );
+
+        // Wait for the sweep to do its work rather than assuming a duration.
+        for _ in 0..100 {
+            if p.calls.load(Ordering::SeqCst) > 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            p.calls.load(Ordering::SeqCst) > 1,
+            "the background refresher never renewed anything"
+        );
+
+        // Dropping the guard stops it: the count settles.
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let settled = p.calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            settled,
+            "the refresher kept running after its guard was dropped"
+        );
     }
 
     /// A superseded value stays maskable for a few generations and then stops,

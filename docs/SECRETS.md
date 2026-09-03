@@ -239,6 +239,28 @@ actually uses. It is named for the **grant**, and the grants have RFC numbers:
 | `token_exchange` | RFC 8693 OAuth 2.0 Token Exchange. What GCP's own STS endpoint speaks. |
 | `jwt_bearer` | RFC 7523 §2.1. What a service-account key actually is. |
 | `client_credentials` | RFC 6749 §4.4. |
+
+The three OAuth grants take an **`issuer`**, not a hand-written endpoint:
+
+```python
+exchange = {"kind": "token_exchange", "issuer": "https://org.okta.com/oauth2/default"}
+```
+
+The token endpoint comes from `{issuer}/.well-known/openid-configuration` —
+OpenID Connect Discovery 1.0, and RFC 8414 for plain OAuth. That is what every
+IdP publishes and what an administrator can actually tell you, and it is what
+`heph auth login` already does for its own endpoints; requiring a literal
+`token_endpoint` here was an inconsistency in this design's own terms.
+
+Discovery also buys a diagnostic. The metadata lists `grant_types_supported`, so
+asking a server for a grant it does not implement can fail by name, before the
+request, rather than arriving as a bare `400 unsupported_grant_type`.
+
+`endpoint` remains as the escape hatch for a server that publishes no metadata —
+an internal minting service, or an endpoint behind a gateway on a different host
+than its issuer claims. **Exactly one of the two**, because silently preferring
+one would make which server was contacted depend on a precedence nobody can see
+at the call site.
 | `aws_sts` | AWS `AssumeRoleWithWebIdentity`. Not an IETF grant, kept because it is how one of the three clouds federates and it predates RFC 8693. |
 | `http` | A vendor REST call: a URL, headers, a body, and JSON pointers naming the fields to keep. |
 
@@ -266,7 +288,7 @@ impersonation call:
 
 ```python
 exchange = [
-    {"kind": "token_exchange", "endpoint": "https://sts.googleapis.com/v1/token"},
+    {"kind": "token_exchange", "issuer": "https://sts.googleapis.com"},
     {"kind": "http", "url": "https://iamcredentials.googleapis.com/…:generateAccessToken"},
 ]
 ```
@@ -413,8 +435,44 @@ direction is a `ttl` longer than the truth**. Too short merely re-mints more
 than it needs to; too long means holding a dead credential and discovering it
 mid-target.
 
-Re-minting happens at a margin *before* the stated expiry, because `exp` is
-absolute and the host's clock may not agree with the issuer's.
+### Two margins, not one
+
+An expiry gets asked two different questions, and answering both with one number
+was a bug:
+
+- **Is this token still valid?** A 60-second margin before the stated expiry,
+  because `exp` is absolute and the host's clock may not agree with the
+  issuer's.
+- **Is it worth giving to a target that is about to start?** A separate,
+  larger floor — five minutes of usable life. A credential one second inside the
+  skew margin passes the first test and fails every target that runs for longer
+  than a second, which is most of them.
+
+So **a handout re-mints a still-valid credential that has too little life left**
+rather than passing the problem on. The cost is an occasional early mint; the
+failure it prevents is a target dying partway through with an authentication
+error, losing whatever it had already done.
+
+The exception is a credential whose *whole* lifetime is shorter than that floor:
+refreshing a 90-second token cannot produce a five-minute one, so heph warns
+once instead of minting on every single handout for no gain.
+
+### Long runs refresh in the background
+
+A build that runs for hours would otherwise refresh only when a consumer asks —
+which puts the mint latency on whichever target is unlucky, and leaves a window
+where a target starting just then is handed the short end of a credential's
+life. A background sweep renews ahead of demand, so by the time a target asks,
+the value is warm and the handout is a clone rather than a network round trip.
+
+A sweep that fails changes nothing: the existing value is kept, and the consumer
+that actually needs it reports the error with its own target's name attached. A
+background task is the wrong place to fail a build.
+
+None of this helps a credential expiring **inside** one long-running target.
+Nothing outside that process can replace a value it has already read — that is
+what a process credential is for (`credential_process`, `GOAUTH=command`, a git
+`credential.helper`), and it is separate work.
 
 ### The JWT reader reads claims; it does not verify them
 

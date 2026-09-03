@@ -44,6 +44,9 @@ use std::time::SystemTime;
 /// them parallel-safe.
 pub type EnvLookup<'a> = &'a (dyn Fn(&str) -> Option<String> + Send + Sync);
 
+/// The owned counterpart, for a background task that outlives any one call.
+pub type SharedEnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// Everything a provider is told. Nothing is discovered.
 pub struct MintCtx<'a> {
     /// The descriptor target's address, for every diagnostic.
