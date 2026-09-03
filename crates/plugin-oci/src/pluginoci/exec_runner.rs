@@ -40,7 +40,8 @@ use hexecrunner::SpecRewrite;
 use hexecrunner::registry::{ExecRunner, RunnerCtx};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// The name a `runner.json` selects this by.
@@ -120,6 +121,13 @@ fn resolve_docker(bin: &str) -> anyhow::Result<std::path::PathBuf> {
 struct Live {
     id: String,
     docker: String,
+    /// The image's own `PATH`, read once from the container's config.
+    ///
+    /// A target's `PATH` reaches the container as an explicit `-e PATH=…`,
+    /// which *replaces* the image's rather than extending it. Without the
+    /// image's own value behind it, entering a container would strip `/usr/bin`
+    /// from every target that declares a tool.
+    path: Option<OsString>,
 }
 
 pub struct OciRunner {
@@ -149,14 +157,18 @@ impl OciRunner {
     /// container is a *place to exec into*, so its own entrypoint is irrelevant
     /// and must not be whatever the image happens to declare — an image whose
     /// entrypoint exits immediately would otherwise leave nothing to exec into.
-    fn container(&self, ctx: &RunnerCtx<'_>, cfg: &OciConfig) -> anyhow::Result<String> {
+    fn container(
+        &self,
+        ctx: &RunnerCtx<'_>,
+        cfg: &OciConfig,
+    ) -> anyhow::Result<(String, Option<OsString>)> {
         let key = (ctx.addr.to_string(), ctx.fingerprint.to_string());
         let mut live = self
             .live
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("oci runner container table poisoned"))?;
         if let Some(c) = live.get(&key) {
-            return Ok(c.id.clone());
+            return Ok((c.id.clone(), c.path.clone()));
         }
 
         let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--rm".into()];
@@ -195,15 +207,106 @@ impl OciRunner {
                 cfg.docker
             );
         }
+        let path = image_path(&cfg.docker, &id);
         live.insert(
             key,
             Live {
                 id: id.clone(),
                 docker: cfg.docker.clone(),
+                path: path.clone(),
             },
         );
-        Ok(id)
+        Ok((id, path))
     }
+}
+
+/// The `docker exec` argv for one target.
+///
+/// Separate from [`OciRunner::prepare`] so the argv can be asserted without a
+/// daemon: everything above it needs a running container, and this is the part
+/// that decides what the target actually sees.
+fn exec_args(id: &str, image_path: Option<&OsStr>, rewrite: SpecRewrite) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["exec".into()];
+    args.push("-w".into());
+    args.push(rewrite.cwd.into_os_string());
+    for (k, v) in &rewrite.env {
+        args.push("-e".into());
+        // `-e KEY=VALUE` as one argument, so a value containing `=` or
+        // whitespace survives — docker splits on the first `=` only.
+        let mut kv = k.clone();
+        kv.push("=");
+        if k == "PATH" {
+            // `-e PATH` replaces the image's rather than extending it, so the
+            // image's own value has to be restored *behind* what the target
+            // carries: its declared tools and heph's builtins lead, the image's
+            // directories follow. Without this, entering a container would
+            // strip `/usr/bin` from every target that declares a tool.
+            kv.push(join_path_values(v, image_path));
+        } else {
+            kv.push(v);
+        }
+        args.push(kv);
+    }
+    args.push(OsString::from(id));
+    args.push(rewrite.program.into_os_string());
+    args.extend(rewrite.args);
+    args
+}
+
+/// `carried`, then whatever of `image` is not already in it.
+///
+/// Deduplicated because the two genuinely overlap — a target whose tools live
+/// under a mounted host path and an image that ships the same directory — and a
+/// `PATH` that grows a duplicate per exec is a real cost on every `execvp` the
+/// target makes.
+fn join_path_values(carried: &OsStr, image: Option<&OsStr>) -> OsString {
+    let Some(image) = image else {
+        return carried.to_os_string();
+    };
+    let mut seen: Vec<PathBuf> = std::env::split_paths(carried).collect();
+    let mut out = carried.to_os_string();
+    for entry in std::env::split_paths(image) {
+        if entry.as_os_str().is_empty() || seen.contains(&entry) {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(":");
+        }
+        out.push(&entry);
+        seen.push(entry);
+    }
+    out
+}
+
+/// The image's `PATH`, read from the running container's config.
+///
+/// Asked of the daemon rather than of the image, because `docker run` arguments
+/// (`--env`) can override it. Best-effort: an unreadable value costs the image's
+/// own directories on the target's `PATH`, which is a degraded environment but
+/// not a wrong one, and failing the build over it would be worse.
+fn image_path(docker: &str, id: &str) -> Option<OsString> {
+    let out = std::process::Command::new(docker)
+        .args([
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
+            id,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        tracing::debug!(
+            container = id,
+            "could not inspect the container for its PATH; the image's own \
+             directories will not be on the target's PATH"
+        );
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("PATH="))
+        .filter(|v| !v.is_empty())
+        .map(OsString::from)
 }
 
 #[async_trait::async_trait]
@@ -225,26 +328,12 @@ impl ExecRunner for OciRunner {
     ) -> anyhow::Result<SpecRewrite> {
         let cfg: OciConfig = serde_json::from_value(ctx.config.clone())
             .map_err(|e| anyhow::anyhow!("oci runner {}: parse config: {e}", ctx.addr))?;
-        let id = self.container(ctx, &cfg)?;
+        let (id, image_path) = self.container(ctx, &cfg)?;
 
         // `docker exec` rather than a fresh `docker run`: the cwd and the
         // environment are per-exec, and a container that is already up costs
         // nothing to enter.
-        let mut args: Vec<OsString> = vec!["exec".into()];
-        args.push("-w".into());
-        args.push(rewrite.cwd.clone().into_os_string());
-        for (k, v) in &rewrite.env {
-            args.push("-e".into());
-            // `-e KEY=VALUE` as one argument, so a value containing `=` or
-            // whitespace survives — docker splits on the first `=` only.
-            let mut kv = k.clone();
-            kv.push("=");
-            kv.push(v);
-            args.push(kv);
-        }
-        args.push(OsString::from(&id));
-        args.push(rewrite.program.into_os_string());
-        args.extend(rewrite.args);
+        let args = exec_args(&id, image_path.as_deref(), rewrite);
 
         Ok(SpecRewrite {
             program: resolve_docker(&cfg.docker)?,
@@ -281,6 +370,70 @@ mod tests {
 
     fn ctx_config(json: serde_json::Value) -> OciConfig {
         serde_json::from_value(json).expect("parse")
+    }
+
+    /// The end of the whole chain: what the target inside the container is
+    /// actually handed. Its declared tools and heph's builtins lead, and the
+    /// image's own directories are still there behind them.
+    #[test]
+    fn the_exec_argv_carries_the_targets_path_ahead_of_the_images() {
+        let args = exec_args(
+            "deadbeef",
+            Some(OsStr::new("/usr/bin:/bin")),
+            SpecRewrite {
+                program: PathBuf::from("bash"),
+                args: vec![OsString::from("-c"), OsString::from("make")],
+                env: vec![(
+                    OsString::from("PATH"),
+                    OsString::from("/sandbox/bin:/heph/coreutils/bin"),
+                )],
+                cwd: PathBuf::from("/ws/pkg"),
+            },
+        );
+        let path = args
+            .iter()
+            .find_map(|a| a.to_str()?.strip_prefix("PATH="))
+            .expect("the target's PATH must reach the container");
+        assert_eq!(path, "/sandbox/bin:/heph/coreutils/bin:/usr/bin:/bin");
+        // The container id must still separate the docker flags from the
+        // target's own command.
+        let id_at = args.iter().position(|a| a == "deadbeef").expect("id");
+        assert_eq!(args[id_at + 1], OsString::from("bash"));
+    }
+
+    /// `-e PATH` replaces the image's, so the image's own directories have to be
+    /// restored behind what the target carries — otherwise entering a container
+    /// strips `/usr/bin` from every target that declares a tool.
+    #[test]
+    fn the_image_path_follows_what_the_target_carries() {
+        let joined = join_path_values(
+            OsStr::new("/sandbox/bin:/heph/coreutils/bin"),
+            Some(OsStr::new("/usr/local/bin:/usr/bin:/bin")),
+        );
+        assert_eq!(
+            joined,
+            OsString::from("/sandbox/bin:/heph/coreutils/bin:/usr/local/bin:/usr/bin:/bin")
+        );
+    }
+
+    /// The two overlap in practice — the workspace is mounted at the same path
+    /// inside, so a tool directory can appear in both — and a duplicate costs a
+    /// wasted `stat` on every `execvp` the target makes.
+    #[test]
+    fn a_directory_in_both_is_not_repeated() {
+        let joined = join_path_values(
+            OsStr::new("/sandbox/bin:/usr/bin"),
+            Some(OsStr::new("/usr/bin:/bin")),
+        );
+        assert_eq!(joined, OsString::from("/sandbox/bin:/usr/bin:/bin"));
+    }
+
+    /// An image whose `PATH` could not be read leaves the target with exactly
+    /// what it carried, rather than failing the build.
+    #[test]
+    fn an_unreadable_image_path_leaves_the_carried_one_alone() {
+        let joined = join_path_values(OsStr::new("/sandbox/bin"), None);
+        assert_eq!(joined, OsString::from("/sandbox/bin"));
     }
 
     #[test]
