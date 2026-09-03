@@ -285,3 +285,172 @@ async fn a_cache_hit_mints_nothing() -> anyhow::Result<()> {
     assert_eq!(second.trim(), "once_only_value");
     Ok(())
 }
+
+// ---------------------------------------------------------------- transitive
+
+/// A credential is usually a property of a *dependency*. Whatever pulls a
+/// private module needs the credential because of what it depends on — and for
+/// generated targets, which nobody authors, a transitive contribution is the
+/// only way it can arrive at all.
+#[tokio::test]
+async fn a_dependency_contributes_a_credential_to_its_consumers() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        r#"target(name = "tok", driver = "secret", provider = "exec", protocol = "raw",
+       helper = ["/bin/echo", "inherited_token_value"])"#,
+    );
+    ws.write_build_file(
+        "lib",
+        r#"target(name = "lib", driver = "bash", out = "l.txt", run = ["echo lib > l.txt"],
+       transitive = {"secrets": {"tok": "//creds:tok"}})"#,
+    );
+    // Declares no secret of its own; gets one because of what it depends on.
+    ws.write_build_file(
+        "app",
+        r#"target(name = "use", driver = "bash", out = "o.txt",
+       deps = ["//lib:lib"],
+       run = ["cat $SECRET_TOK > o.txt"])"#,
+    );
+
+    let out = common::artifact_string(&*ws.run("//app:use").await?);
+    assert!(out.contains("inherited_token_value"), "{out}");
+    Ok(())
+}
+
+/// An inherited credential reaches the consumer's cache key, exactly like a
+/// declared one — otherwise the identity a target built under is not in its key.
+#[tokio::test]
+async fn an_inherited_credential_reaches_the_consumers_hashin() -> anyhow::Result<()> {
+    let hashin_of = async |role: &str| -> anyhow::Result<String> {
+        let ws = Workspace::new();
+        ws.write_build_file(
+            "creds",
+            &format!(
+                r#"target(name = "tok", driver = "secret", role = "{role}",
+       provider = "static_env", var = "TOKEN")"#
+            ),
+        );
+        ws.write_build_file(
+            "lib",
+            r#"target(name = "lib", driver = "bash", out = "l.txt", run = ["echo lib > l.txt"],
+       transitive = {"secrets": {"tok": "//creds:tok"}})"#,
+        );
+        ws.write_build_file(
+            "app",
+            r#"target(name = "use", driver = "bash", out = "o.txt",
+       deps = ["//lib:lib"], run = ["echo hi > o.txt"])"#,
+        );
+        ws.hashin("//app:use").await
+    };
+
+    assert_ne!(
+        hashin_of("arn:aws:iam::4711:role/read").await?,
+        hashin_of("arn:aws:iam::4711:role/write").await?,
+        "an inherited identity did not reach the consumer's cache key"
+    );
+    Ok(())
+}
+
+/// The consumer's own declaration wins. That is the escape hatch when a
+/// dependency's choice is wrong for one consumer — and unlike a slot collision,
+/// one of the two parties is written in the target itself.
+#[tokio::test]
+async fn a_targets_own_declaration_overrides_an_inherited_one() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        r#"
+target(name = "inherited", driver = "secret", provider = "exec", protocol = "raw",
+       helper = ["/bin/echo", "from_the_dependency"])
+target(name = "own", driver = "secret", provider = "exec", protocol = "raw",
+       helper = ["/bin/echo", "from_the_target_itself"])
+"#,
+    );
+    ws.write_build_file(
+        "lib",
+        r#"target(name = "lib", driver = "bash", out = "l.txt", run = ["echo lib > l.txt"],
+       transitive = {"secrets": {"tok": "//creds:inherited"}})"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "use", driver = "bash", out = "o.txt",
+       deps = ["//lib:lib"],
+       secrets = {"tok": "//creds:own"},
+       run = ["cat $SECRET_TOK > o.txt"])"#,
+    );
+
+    let out = common::artifact_string(&*ws.run("//app:use").await?);
+    assert!(out.contains("from_the_target_itself"), "{out}");
+    assert!(!out.contains("from_the_dependency"), "{out}");
+    Ok(())
+}
+
+/// Two dependencies supplying one name from different declarations is worse
+/// than a slot collision: the name is what the command references, and neither
+/// party appears at the failing target's call site. The chains are what make
+/// the message actionable.
+#[tokio::test]
+async fn two_dependencies_supplying_one_name_fail_with_both_chains() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        r#"
+target(name = "a", driver = "secret", provider = "static_env", var = "A")
+target(name = "b", driver = "secret", provider = "static_env", var = "B")
+"#,
+    );
+    ws.write_build_file(
+        "l1",
+        r#"target(name = "l", driver = "bash", out = "l.txt", run = ["echo l > l.txt"],
+       transitive = {"secrets": {"tok": "//creds:a"}})"#,
+    );
+    ws.write_build_file(
+        "l2",
+        r#"target(name = "l", driver = "bash", out = "l.txt", run = ["echo l > l.txt"],
+       transitive = {"secrets": {"tok": "//creds:b"}})"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "use", driver = "bash", out = "o.txt",
+       deps = ["//l1:l", "//l2:l"], run = ["echo hi > o.txt"])"#,
+    );
+
+    let err = match ws.run("//app:use").await {
+        Ok(_) => panic!("two declarations under one name must fail"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("//creds:a"), "{err}");
+    assert!(err.contains("//creds:b"), "{err}");
+    assert!(err.contains("$SECRET_<NAME>"), "{err}");
+    Ok(())
+}
+
+/// Two dependencies needing *the same* credential is the common case, not a
+/// conflict.
+#[tokio::test]
+async fn two_dependencies_needing_the_same_credential_dedupe() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        r#"target(name = "tok", driver = "secret", provider = "exec", protocol = "raw",
+       helper = ["/bin/echo", "shared_token_value"])"#,
+    );
+    for pkg in ["l1", "l2"] {
+        ws.write_build_file(
+            pkg,
+            r#"target(name = "l", driver = "bash", out = "l.txt", run = ["echo l > l.txt"],
+       transitive = {"secrets": {"tok": "//creds:tok"}})"#,
+        );
+    }
+    ws.write_build_file(
+        "app",
+        r#"target(name = "use", driver = "bash", out = "o.txt",
+       deps = ["//l1:l", "//l2:l"],
+       run = ["cat $SECRET_TOK > o.txt"])"#,
+    );
+
+    let out = common::artifact_string(&*ws.run("//app:use").await?);
+    assert!(out.contains("shared_token_value"), "{out}");
+    Ok(())
+}

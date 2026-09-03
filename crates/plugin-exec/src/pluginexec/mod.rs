@@ -1156,6 +1156,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
     ) -> anyhow::Result<ApplyTransitiveResponse> {
         let mut def = req.target_def.clone();
         let mut xdef = def.def::<TargetDef>().clone();
+        // Taken before the loops below consume the rest of the sandbox.
+        let secret_conflicts = req.sandbox.secret_conflicts().to_vec();
         for tool in req.sandbox.tools {
             let input = Input {
                 r#ref: tool.r#ref.clone(),
@@ -1232,6 +1234,61 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     }
                 }
             }
+        }
+
+        // Two deps that supplied one name from two different descriptors. Worse
+        // than a shape collision, because the name is what the command
+        // references: picking one silently changes what `$SECRET_<NAME>`
+        // resolves to, and neither party appears at this target's call site.
+        // The merged ids carry the chains, which is the only thing that makes
+        // the message actionable.
+        if let Some((name, a, b)) = secret_conflicts.first() {
+            anyhow::bail!(
+                "two dependencies supply a secret named {name:?} from different declarations:\n                   {} (via {})\n  {} (via {})\n\nThe name is what the command references as \
+                 `$SECRET_<NAME>`, so one would silently win. Rename one, or declare \
+                 `secrets = {{\"{name}\": …}}` on this target to choose.",
+                a.r#ref,
+                a.id,
+                b.r#ref,
+                b.id,
+            );
+        }
+
+        // A credential a dependency contributed. `hashed: true, runtime: false`,
+        // the same shape a directly declared one produces — the identity has to
+        // reach this target's key whether the author wrote it or inherited it.
+        //
+        // **The target's own declaration wins.** That resembles the silent
+        // overwrite the slot rule refuses and is not: there, neither colliding
+        // party appears at the call site; here one is written in the target
+        // itself. It is also the escape hatch when a dependency's choice is
+        // wrong for one consumer, and it follows the precedence
+        // `docs/EXEC_RUNNERS.md` already sets.
+        let declared: std::collections::BTreeSet<String> = def
+            .inputs
+            .iter()
+            .filter_map(|i| hdriver_support::secret::secret_name(&i.annotations))
+            .map(str::to_string)
+            .collect();
+        let mut inherited: Vec<(String, hplugin::driver::sandbox::Secret)> =
+            req.sandbox.secrets.into_iter().collect();
+        // Sorted: this reaches a def hash, and a `HashMap` iterates arbitrarily.
+        inherited.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, secret) in inherited {
+            if declared.contains(&name) {
+                continue;
+            }
+            def.inputs.push(Input {
+                r#ref: secret.r#ref.clone(),
+                mode: InputMode::Standard,
+                origin_id: secret.id.clone(),
+                annotations: BTreeMap::from([(
+                    hdriver_support::secret::SECRET_ANNOTATION.to_string(),
+                    name,
+                )]),
+                hashed: true,
+                runtime: false,
+            });
         }
 
         def.hash = {
