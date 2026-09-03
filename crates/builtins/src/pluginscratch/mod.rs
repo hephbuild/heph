@@ -82,7 +82,13 @@ struct ScratchSpec {
     /// Where the directory is mounted in a consuming target's sandbox, relative to
     /// that target's cwd. The same for every consumer: a cache's location is part
     /// of what it is, because tools bake absolute paths into their entries.
-    #[spec(required)]
+    ///
+    /// **Optional.** Omit it when the tool finds the cache through `env` alone —
+    /// which is most of them. Without a mount the directory is never placed in
+    /// the tree at all, so no output can collect it and no dependency can be
+    /// shadowed by it; the two failure modes a mount has to be guarded against
+    /// simply cannot arise. Declare a `path` only when a tool insists on a
+    /// conventional location in its working directory.
     path: String,
     /// Environment variable a consumer reads the directory's path from. Defaults
     /// to `SCRATCH_<NAME>`. Set it to the tool's own variable (`GOCACHE`,
@@ -132,6 +138,7 @@ struct ScratchSpec {
 /// validated view, and the single place the parsing/validation rules live.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ScratchDef {
+    /// Mount point, or empty for an env-var-only cache. See [`ScratchSpec::path`].
     pub path: String,
     pub env: String,
     pub access: Access,
@@ -167,9 +174,6 @@ pub fn default_env_name(name: &str) -> String {
 /// letting it be absolute or `..`-relative would put that symlink anywhere on the
 /// machine, and letting it be `.` would replace the target's whole workspace.
 fn validate_path(path: &str) -> anyhow::Result<()> {
-    if path.is_empty() {
-        anyhow::bail!("scratch `path` must not be empty");
-    }
     if std::path::Path::new(path).is_absolute() {
         anyhow::bail!(
             "scratch `path` must be relative to the consuming target's cwd, got {path:?} — a \
@@ -220,7 +224,10 @@ pub fn parse_declaration(spec: &hplugin::provider::TargetSpec) -> anyhow::Result
 impl ScratchDef {
     /// Parse and validate a declaration from its spec config.
     fn from_spec(spec: ScratchSpec, target_name: &str) -> anyhow::Result<Self> {
-        validate_path(&spec.path)?;
+        // An absent path is the env-var-only form, not a malformed mount.
+        if !spec.path.is_empty() {
+            validate_path(&spec.path)?;
+        }
         let access = spec
             .access
             .as_deref()
@@ -234,6 +241,14 @@ impl ScratchDef {
             Some(e) => e,
             None => default_env_name(target_name),
         };
+        // Rejected here rather than ignored at acquisition: a cap that silently
+        // does nothing is worse than no cap, because the author believes the
+        // cache is bounded.
+        if let Some(max) = &spec.max_size {
+            hcore::units::parse_size(max).with_context(|| {
+                format!("scratch `max_size` on {target_name}: {max:?} is not a size")
+            })?;
+        }
         Ok(Self {
             path: spec.path,
             env,
@@ -393,6 +408,24 @@ mod tests {
     }
 
     #[test]
+    fn a_max_size_that_is_not_a_size_is_rejected_at_the_declaration() {
+        let err = parse(&[("max_size", s("plenty"))], "c").expect_err("must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("max_size"), "{msg}");
+        // The author needs to see what they typed, not just that it was wrong.
+        assert!(msg.contains("plenty"), "{msg}");
+    }
+
+    #[test]
+    fn a_max_size_in_the_units_people_type_is_accepted() {
+        for v in ["1024", "5GiB", "500MB", " 8 MiB "] {
+            let d = parse(&[("max_size", s(v))], "c")
+                .unwrap_or_else(|e| panic!("{v:?} must parse: {e:#}"));
+            assert_eq!(d.max_size.as_deref(), Some(v));
+        }
+    }
+
+    #[test]
     fn default_env_name_sanitizes_like_the_exec_group_convention() {
         assert_eq!(default_env_name("gocache"), "SCRATCH_GOCACHE");
         assert_eq!(default_env_name("go-cache"), "SCRATCH_GO_CACHE");
@@ -435,10 +468,25 @@ mod tests {
         assert!(msg.contains("exclusive") && msg.contains("shared"), "{msg}");
     }
 
+    /// The env-var-only form: no mount, so nothing is placed in the tree and the
+    /// two failure modes a mount must be guarded against cannot arise.
     #[test]
-    fn path_is_required() {
-        let err = ScratchSpec::from(&cfg(&[("version", s("1"))])).expect_err("path is required");
-        assert!(format!("{err:#}").contains("path"));
+    fn a_scratch_without_a_path_is_the_env_var_only_form() {
+        let d = parse(&[("env", s("GOMODCACHE"))], "modcache").expect("parse");
+        assert_eq!(d.path, "");
+        assert_eq!(d.env, "GOMODCACHE");
+    }
+
+    /// A path that *is* given is still validated — omitting one is a choice, a
+    /// malformed one is a mistake.
+    #[test]
+    fn a_given_path_is_still_validated() {
+        for bad in ["/abs", "../escape", "."] {
+            assert!(
+                parse(&[("path", s(bad))], "n").is_err(),
+                "{bad:?} must still be rejected"
+            );
+        }
     }
 
     /// The mount is a symlink out of the sandbox. An absolute path would let a

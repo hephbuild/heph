@@ -39,6 +39,10 @@ const SLOT_META_FILE: &str = "slot.meta";
 /// describe itself.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SlotMeta {
+    /// On-disk format. Set by [`SlotMeta::new`] — never write it by hand: both
+    /// production call sites once hardcoded it, so bumping the constant would
+    /// make them write a meta nothing can read back, and the slot would list as
+    /// an orphan. A constructor is the only place this number belongs.
     pub format: u32,
     /// The declaring target, formatted (`//build:gocache`).
     pub addr: String,
@@ -52,6 +56,28 @@ pub struct SlotMeta {
     pub version: String,
     /// Whether the declaration opted into the remote lineage.
     pub remote: bool,
+}
+
+impl SlotMeta {
+    /// A meta stamped with the current format.
+    pub fn new(
+        addr: String,
+        path: String,
+        env: String,
+        access: String,
+        version: String,
+        remote: bool,
+    ) -> Self {
+        Self {
+            format: SLOT_META_FORMAT,
+            addr,
+            path,
+            env,
+            access,
+            version,
+            remote,
+        }
+    }
 }
 
 /// One slot as the store sees it.
@@ -219,7 +245,7 @@ fn read_slot_meta(home: &Path, slot: &str) -> Option<SlotMeta> {
 /// Walks rather than caching: a size is only ever asked for by `ls`, `gc` and
 /// the per-slot cap, none of which is on a build's hot path, and a cached total
 /// would be wrong the moment a target wrote into the slot — which is constantly.
-fn measure(dir: &Path) -> (u64, Option<SystemTime>) {
+pub(crate) fn measure(dir: &Path) -> (u64, Option<SystemTime>) {
     let (mut bytes, mut newest) = (0u64, None::<SystemTime>);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (bytes, newest);

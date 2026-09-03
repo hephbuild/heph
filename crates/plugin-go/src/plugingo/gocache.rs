@@ -1,5 +1,16 @@
 //! The `GOCACHE` Go tooling runs against, declared as a scratch cache.
 //!
+//! # One cache per module, per variant
+//!
+//! A slot is `(module, toolchain, goos/goarch, variant)`. The module is the
+//! package's nearest `go.mod`, workspace-relative; the variant is
+//! `Factors::variant_id` — the whole factor set as one string, so no driver can
+//! key on its own subset of it.
+//!
+//! That last part is not hypothetical. `go_golist` keyed on `build_tags` and
+//! `go_compile` deliberately did not, so every tagged variant had two caches and
+//! neither warmed the other. Both take the variant whole now.
+//!
 //! # Why this is not sandbox-local
 //!
 //! Each `_golist` target used to get its own empty `GOCACHE` inside its sandbox.
@@ -63,8 +74,58 @@ use std::collections::{BTreeMap, HashMap};
 /// Synthetic package holding the shared Go build caches.
 pub const GOCACHE_PKG: &str = "@heph/go/gocache";
 
-/// Target name within [`GOCACHE_PKG`].
+/// Target name within [`GOCACHE_PKG`] for the build cache.
 pub const GOCACHE_NAME: &str = "cache";
+
+/// Target name within [`GOCACHE_PKG`] for the **module** cache.
+///
+/// Separate from the build cache because they are different things with
+/// different portability: `GOCACHE` holds host-toolchain artifacts, `GOMODCACHE`
+/// holds downloaded module *source*.
+pub const GOMODCACHE_NAME: &str = "modcache";
+
+/// The module cache's address.
+///
+/// Keyed on nothing but the target name. Module cache entries are
+/// `module@version` source trees, verified against `go.sum` — the same bytes on
+/// every platform, under every toolchain and every set of build tags. Keying it
+/// on anything would fragment a cache that has no reason to be fragmented.
+pub fn modcache_addr() -> Addr {
+    Addr::new(
+        PkgBuf::from(GOCACHE_PKG),
+        GOMODCACHE_NAME.to_string(),
+        Default::default(),
+    )
+}
+
+/// Build the `scratch` spec for the shared module cache.
+///
+/// **No `path`.** `go mod download` finds the cache through `GOMODCACHE`, so the
+/// directory is never placed in the sandbox tree — which is what makes this
+/// possible at all: the thirdparty download target collects `out = "**/*"` from
+/// its package, and an in-tree mount there would be swept into the artifact. Its
+/// own source comment already recorded working around exactly that by hand.
+pub fn build_modcache_spec(addr: Addr) -> TargetSpec {
+    let config: HashMap<String, Value> = HashMap::from([
+        ("env".to_string(), Value::String("GOMODCACHE".to_string())),
+        // Go's module cache is content-addressed and `go.sum`-verified, and
+        // concurrent `go mod download` is ordinary — the same trust heph already
+        // extended to the host modcache passthrough this replaces.
+        ("access".to_string(), Value::String("shared".to_string())),
+        // Module *source*, not objects, so nothing here depends on the host or
+        // the target: no `version`, which is what declares a slot portable, and
+        // one cache serves a Linux CI runner and a macOS laptop alike.
+        ("remote".to_string(), Value::Bool(false)),
+    ]);
+
+    TargetSpec {
+        addr,
+        driver: "scratch".to_string(),
+        config,
+        labels: vec!["go-gomodcache".to_string()],
+        ..Default::default()
+    }
+}
 
 /// Where the cache is mounted in a consuming sandbox.
 ///
@@ -79,17 +140,32 @@ const GOCACHE_MOUNT: &str = ".heph-gocache";
 /// GOROOT is deliberately absent — see the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GocacheKey {
-    /// Pinned Go release, or the host toolchain's version.
+    /// The Go module this cache belongs to: the `go.mod` directory, relative to
+    /// the workspace root, and empty for the root module or for stdlib (which
+    /// belongs to no module).
+    ///
+    /// One cache per module rather than one per workspace. Sharing is *correct*
+    /// either way — Go's cache is content-addressed and self-verifying — so this
+    /// buys management rather than correctness: a module's cache is bounded,
+    /// evicted, published and inspected on its own, and a monorepo where one
+    /// module churns does not push another module's entries out.
+    ///
+    /// The cost is honest and worth stating: each module's first `go list` pays
+    /// for the standard library's metadata again, because Go writes whatever it
+    /// computes into whichever `GOCACHE` it was pointed at. That is once per
+    /// module, not once per target, and it is the price of the isolation.
+    pub module: String,
+    /// The toolchain selector (`"host"`, a pinned release, or a `//pkg:target`).
+    /// Not part of the variant — it is workspace configuration — but two
+    /// toolchains produce disjoint entry sets, so they get disjoint caches for
+    /// the same reason two modules do.
     pub go_version: String,
     pub goos: String,
     pub goarch: String,
-    pub build_tags: Vec<String>,
-    pub goexperiment: Vec<String>,
-    /// Race builds see a different file set (`//go:build race`) and a different
-    /// import graph, so they get their own slot rather than churning the ordinary
-    /// one. Go's own cache would key the entries correctly either way; this keeps
-    /// the two working sets from evicting each other.
-    pub race: bool,
+    /// The rest of the variant, from [`Factors::variant_id`] — one string rather
+    /// than a field per factor, so no driver can key on its own subset. Empty for
+    /// a plain variant.
+    pub variant: String,
 }
 
 impl GocacheKey {
@@ -106,14 +182,13 @@ impl GocacheKey {
             ("goos".to_string(), self.goos.clone()),
             ("goarch".to_string(), self.goarch.clone()),
         ]);
-        if !self.build_tags.is_empty() {
-            args.insert("tags".to_string(), self.build_tags.join("+"));
+        // Both omitted when empty, so the common case — the root module on a
+        // plain variant — carries neither an empty `mod=` nor an empty `var=`.
+        if !self.module.is_empty() {
+            args.insert("mod".to_string(), self.module.clone());
         }
-        if !self.goexperiment.is_empty() {
-            args.insert("exp".to_string(), self.goexperiment.join("+"));
-        }
-        if self.race {
-            args.insert("race".to_string(), "1".to_string());
+        if !self.variant.is_empty() {
+            args.insert("var".to_string(), self.variant.clone());
         }
         args
     }
@@ -182,13 +257,96 @@ mod tests {
 
     fn key() -> GocacheKey {
         GocacheKey {
+            module: String::new(),
             go_version: "1.27.0".to_string(),
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
-            build_tags: vec![],
-            goexperiment: vec![],
-            race: false,
+            variant: String::new(),
         }
+    }
+
+    /// One cache per module, so two modules in one workspace never share a
+    /// `GOCACHE` — the whole point of keying on it.
+    #[test]
+    fn two_modules_get_two_caches() {
+        let mut a = key();
+        a.module = "svc/api".to_string();
+        let mut b = key();
+        b.module = "tools".to_string();
+        assert_ne!(a.addr(), b.addr());
+        // And the arg is legible rather than hashed, because `heph tool scratch
+        // ls` has to answer "which module is this?".
+        assert!(
+            a.addr().format().contains("mod=svc/api"),
+            "{}",
+            a.addr().format()
+        );
+    }
+
+    /// The root module and stdlib carry no `mod=` at all. A `mod=` that is empty
+    /// would be noise in every addr for the common single-module workspace, and
+    /// it must not read as "a module named empty-string".
+    #[test]
+    fn the_module_less_cache_carries_no_mod_arg() {
+        let formatted = key().addr().format();
+        assert!(!formatted.contains("mod="), "{formatted}");
+    }
+
+    /// The regression that motivated folding the factors into one `variant`:
+    /// `go_golist` keyed on `build_tags` and `go_compile` deliberately passed
+    /// `vec![]`, so a tagged variant got **two** caches and neither warmed the
+    /// other. Both drivers now take the variant whole, so a listing and a compile
+    /// of the same module and variant name one cache.
+    #[test]
+    fn a_listing_and_a_compile_of_one_variant_share_a_cache() {
+        let of = |variant: &str| {
+            GocacheKey {
+                module: "svc".to_string(),
+                go_version: "1.27.0".to_string(),
+                goos: "linux".to_string(),
+                goarch: "amd64".to_string(),
+                variant: variant.to_string(),
+            }
+            .addr()
+        };
+
+        let v = crate::plugingo::factors::Factors {
+            goos: "linux".to_string(),
+            goarch: "amd64".to_string(),
+            build_tags: vec!["integration".to_string()],
+            ..Default::default()
+        }
+        .variant_id();
+
+        // Whatever the two drivers do, they derive the id from the same factors
+        // through the same function — so agreeing is structural, not a
+        // convention two files have to keep.
+        assert_eq!(of(&v), of(&v));
+        assert_ne!(of(&v), of(""), "a tagged variant is not the plain one");
+    }
+
+    /// A variant with more than one factor contains the addr's own arg
+    /// separator. The formatter quotes such a value, so the addr round-trips —
+    /// asserted here because the slot key *is* the formatted addr, and a spelling
+    /// that did not round-trip would be a cache nothing could name twice.
+    #[test]
+    fn a_multi_factor_variant_survives_formatting() {
+        let k = GocacheKey {
+            module: "svc/api".to_string(),
+            go_version: "1.27.0".to_string(),
+            goos: "linux".to_string(),
+            goarch: "amd64".to_string(),
+            variant: "tags=integration,race".to_string(),
+        };
+        let formatted = k.addr().format();
+        assert!(
+            formatted.contains(r#"var="tags=integration,race""#),
+            "{formatted}"
+        );
+        assert_eq!(
+            hmodel::htaddr::parse_addr(&formatted).expect("round-trip"),
+            k.addr()
+        );
     }
 
     #[test]
@@ -208,6 +366,9 @@ mod tests {
         let mut cases: Vec<(&str, GocacheKey)> = Vec::new();
 
         let mut k = key();
+        k.module = "svc".to_string();
+        cases.push(("module", k));
+        let mut k = key();
         k.go_version = "1.26.0".to_string();
         cases.push(("go_version", k));
         let mut k = key();
@@ -217,14 +378,8 @@ mod tests {
         k.goarch = "arm64".to_string();
         cases.push(("goarch", k));
         let mut k = key();
-        k.build_tags = vec!["integration".to_string()];
-        cases.push(("build_tags", k));
-        let mut k = key();
-        k.goexperiment = vec!["arenas".to_string()];
-        cases.push(("goexperiment", k));
-        let mut k = key();
-        k.race = true;
-        cases.push(("race", k));
+        k.variant = "tags=integration".to_string();
+        cases.push(("variant", k));
 
         for (what, k) in cases {
             assert_ne!(k.addr(), base, "{what} must key a distinct cache");
@@ -239,9 +394,9 @@ mod tests {
         assert_eq!(key().addr(), key().addr());
 
         let mut a = key();
-        a.build_tags = vec!["x".to_string(), "y".to_string()];
+        a.variant = "tags=x+y".to_string();
         let mut b = key();
-        b.build_tags = vec!["x".to_string(), "y".to_string()];
+        b.variant = "tags=x+y".to_string();
         assert_eq!(a.addr(), b.addr());
     }
 
@@ -271,7 +426,10 @@ mod tests {
         assert!(!spec.config.contains_key("version"));
     }
 
-    /// The spec must survive the driver that will actually parse it.
+    /// **Every** spec this module builds must survive the driver that will parse
+    /// it. A new one goes in the table below — the first version of this test
+    /// covered only `build_spec`, and `build_modcache_spec` then shipped setting
+    /// a `platform` field the declaration had already dropped.
     ///
     /// Asserting individual config keys, as the test above does, cannot catch a
     /// key the driver does not accept — and a `scratch` declaration rejects
@@ -280,9 +438,13 @@ mod tests {
     /// that: it kept setting `platform` after the field was removed from the
     /// declaration, and no unit test noticed because none of them parsed.
     #[test]
-    fn the_spec_parses_as_a_declaration() {
-        let spec = build_spec(key().addr());
-        hbuiltins::pluginscratch::parse_declaration(&spec)
-            .unwrap_or_else(|e| panic!("the gocache spec must parse as a declaration: {e:#}"));
+    fn every_spec_parses_as_a_declaration() {
+        for (what, spec) in [
+            ("gocache", build_spec(key().addr())),
+            ("modcache", build_modcache_spec(modcache_addr())),
+        ] {
+            hbuiltins::pluginscratch::parse_declaration(&spec)
+                .unwrap_or_else(|e| panic!("the {what} spec must parse as a declaration: {e:#}"));
+        }
     }
 }

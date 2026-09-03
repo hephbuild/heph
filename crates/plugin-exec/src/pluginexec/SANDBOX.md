@@ -45,6 +45,29 @@ For each dependency group after inputs are unpacked:
 
 The `.list` files are written to the sandbox root as `dep_<group>.list` before the process starts. They are useful when the number of inputs would overflow command-line limits.
 
+### Auto-injected scratch-cache variables
+
+For each address in the target's `scratch` attribute:
+
+| Variable            | Value                                                            |
+|---------------------|------------------------------------------------------------------|
+| `SCRATCH_<NAME>`    | Absolute path to the resolved scratch directory, where `<NAME>` is the declaration's target name uppercased with non-alphanumerics as `_` |
+| *(declared `env`)*  | The same path, under the name the declaration chose — e.g. `env = "GOCACHE"` |
+
+A `scratch` declaration names its own variable with `env`; without one the
+`SCRATCH_<NAME>` form applies. The path is absolute and stable across runs for a
+given cache, so a tool may record it.
+
+Unlike every other variable here, a scratch directory is **writable, carried
+between runs, and not hashed**. It is a cache and nothing more: the target's
+outputs must be identical whether it is warm, cold, or absent, which is what
+`heph --scratch=off` audits. Never write anything there that the target's outputs
+depend on.
+
+A scratch collides loudly rather than silently: a declaration whose variable name
+is already set by the target's own `env`, or two declarations claiming one name,
+is an error at execution time, not a silent overwrite.
+
 ## Working Directory and Filesystem Layout
 
 ```

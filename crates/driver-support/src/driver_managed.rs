@@ -181,6 +181,12 @@ pub async fn invoke_inner<'a, 'io>(
 /// consumer saw its own path the cache would be present and inert.
 fn mount_scratch(pkg_dir: &Path, mounts: &[hplugin::driver::ScratchMount]) -> anyhow::Result<()> {
     for m in mounts {
+        // Env-var-only: the directory is announced through the environment and
+        // never placed in the tree. Nothing to link, and by construction nothing
+        // an output glob can collect or a dependency can be shadowed by.
+        if m.path.is_empty() {
+            continue;
+        }
         let at = pkg_dir.join(&m.path);
 
         // A scratch must not land where an input already did. Silently replacing

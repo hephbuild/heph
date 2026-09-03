@@ -236,6 +236,8 @@ pub(crate) struct Tally {
     /// Caches restored at a path they were not produced at, so they are present
     /// and inert. Named because nothing else distinguishes this from a hit.
     scratch_inert: FxHashSet<Box<str>>,
+    /// Caches dropped for exceeding `max_size` — the targets using them ran cold.
+    scratch_dropped: FxHashSet<Box<str>>,
     first_event_ms: Option<u64>,
     last_event_ms: u64,
 
@@ -373,11 +375,15 @@ impl Tally {
             BuildEventKind::ScratchPrepareEnd {
                 addr,
                 scratch,
+                outcome,
                 path_mismatch,
                 ..
             } => {
                 if *path_mismatch {
                     self.scratch_inert.insert(scratch.as_str().into());
+                }
+                if outcome == "dropped_over_max" {
+                    self.scratch_dropped.insert(scratch.as_str().into());
                 }
                 self.clear_phase(addr);
             }
@@ -645,6 +651,14 @@ impl Tally {
     /// indistinguishable from a hit anywhere else in the report.
     pub(crate) fn scratch_inert(&self) -> Vec<&str> {
         let mut v: Vec<&str> = self.scratch_inert.iter().map(|s| &**s).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Caches dropped for exceeding their cap. Every target using one ran cold,
+    /// which is otherwise indistinguishable from a first build.
+    pub(crate) fn scratch_dropped(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.scratch_dropped.iter().map(|s| &**s).collect();
         v.sort_unstable();
         v
     }
@@ -1177,6 +1191,26 @@ mod tests {
         assert_eq!(t.scratch_inert(), vec!["//build:gocache"]);
     }
 
+    /// A dropped cache is reported once per cache, however many targets used it.
+    #[test]
+    fn a_dropped_cache_is_reported_once_per_cache() {
+        let mut t = Tally::default();
+        for i in 0..50 {
+            prepared(
+                &mut t,
+                &format!("//a:y{i}"),
+                "//build:gomodcache",
+                "dropped_over_max",
+                false,
+            );
+        }
+        assert_eq!(t.scratch_dropped(), vec!["//build:gomodcache"]);
+        assert!(
+            t.scratch_inert().is_empty(),
+            "a drop is not an inert restore"
+        );
+    }
+
     /// An ordinary outcome is not a problem — otherwise every cold CI run would
     /// raise a warning.
     #[test]
@@ -1184,7 +1218,7 @@ mod tests {
         let mut t = Tally::default();
         prepared(&mut t, "//a:x", "//build:gocache", "warm", false);
         prepared(&mut t, "//a:y", "//build:gocache", "pulled", false);
-        assert!(t.scratch_inert().is_empty());
+        assert!(t.scratch_inert().is_empty() && t.scratch_dropped().is_empty());
     }
 
     /// A target warming its cache shows as in-flight under its own phase label.

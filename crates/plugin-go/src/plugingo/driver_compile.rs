@@ -117,6 +117,15 @@ struct GoCompileSpec {
     /// Go release whose staged hermetic SDK provides GOROOT + the `go` binary.
     #[spec(required)]
     go_version: String,
+    /// Workspace-relative `go.mod` directory of this package's module, selecting
+    /// which module's shared `GOCACHE` the compile runs against. Empty for the
+    /// root module and for stdlib.
+    go_module: String,
+    /// The variant this compile belongs to, from `Factors::variant_id` — the
+    /// other half of the cache's `(module, variant)` identity. Absent from
+    /// `Hash` for the same reason as `go_module`: it selects a cache, it does
+    /// not change the archive.
+    go_variant: String,
     /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
     goexperiment: Vec<String>,
     /// Extra flags passed verbatim to `go tool compile` (the variant's gcflags).
@@ -157,6 +166,17 @@ struct GoCompileDef {
     goos: String,
     goarch: String,
     go_version: String,
+    /// Which module's shared `GOCACHE` to use. Deliberately absent from `Hash`,
+    /// for the same reason the scratch input is `hashed: false`: a compile
+    /// produces the same archive whether its cache is warm, cold or absent, so
+    /// folding this in would make moving a package between modules rebuild the
+    /// world for no change in output.
+    go_module: String,
+    /// The variant this compile belongs to, from `Factors::variant_id` — the
+    /// other half of the cache's `(module, variant)` identity. Absent from
+    /// `Hash` for the same reason as `go_module`: it selects a cache, it does
+    /// not change the archive.
+    go_variant: String,
     goexperiment: Vec<String>,
     gcflags: Vec<String>,
     buildmode: BuildMode,
@@ -329,6 +349,8 @@ impl ManagedDriver for GoCompileDriver {
             goos: spec.goos,
             goarch: spec.goarch,
             go_version: spec.go_version,
+            go_module: spec.go_module,
+            go_variant: spec.go_variant,
             goexperiment: spec.goexperiment,
             gcflags: spec.gcflags,
             buildmode,
@@ -375,12 +397,51 @@ impl ManagedDriver for GoCompileDriver {
             format!("{:x}", h.finish()).into_bytes()
         };
 
+        // The shared `GOCACHE`, as a scratch reference — one cache per Go module
+        // per variant, the same slot the golist targets of that module and
+        // variant use (see `plugingo::gocache`). Until recently every compile
+        // target created and tore down an *empty* cache inside its own sandbox:
+        // the exact pattern the golist sharing was written to remove, left in
+        // place here because that fix was driver-local.
+        //
+        // This used to drop `build_tags` from the key, reasoning that a compile's
+        // entries cannot depend on a file set that `go list` already fixed. True
+        // in itself, and still the wrong call: `go_golist` *did* key on them, so
+        // a tagged variant got two caches and neither warmed the other. The
+        // variant now travels whole, from `Factors::variant_id`, so the two
+        // drivers cannot key on different subsets. The cost is a cold start on a
+        // variant that differs only in a factor its entries ignore; the thing it
+        // buys is that "one cache per module per variant" is true rather than
+        // approximately true.
+        let gocache_key = crate::plugingo::gocache::GocacheKey {
+            module: def.go_module.clone(),
+            go_version: def.go_version.clone(),
+            goos: def.goos.clone(),
+            goarch: def.goarch.clone(),
+            variant: def.go_variant.clone(),
+        };
+        let gocache_input = Input {
+            r#ref: TargetAddr {
+                r#ref: gocache_key.addr(),
+                output: None,
+                filters: vec![],
+            },
+            mode: InputMode::Standard,
+            origin_id: format!("{}|0", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX),
+            annotations: std::collections::BTreeMap::from([(
+                hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
+                "true".to_string(),
+            )]),
+            hashed: false,
+            runtime: false,
+        };
+
         Ok(ParseResponse {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                inputs,
+                inputs: inputs.into_iter().chain([gocache_input]).collect(),
                 outputs,
                 support_files: vec![],
                 cache: CacheConfig::on(true),
@@ -425,9 +486,20 @@ impl ManagedDriver for GoCompileDriver {
         )
         .await?;
 
-        let gocache = pkg_dir.join(".heph-gocache");
-        std::fs::create_dir_all(&gocache)
-            .with_context(|| format!("create gocache dir {gocache:?}"))?;
+        // Resolved and locked by the host from this target's scratch reference,
+        // always — `--no-scratch` supplies an empty mount rather than none, so
+        // there is nothing to fall back to and nothing to guess.
+        let gocache = req
+            .request
+            .scratch
+            .iter()
+            .find(|m| m.env == "GOCACHE")
+            .map(|m| m.dir.clone())
+            .context(
+                "no GOCACHE scratch mount: the host resolves and locks one for every \
+                 target that references the shared cache, and `--no-scratch` supplies an \
+                 empty one rather than none",
+            )?;
 
         let mut env: HashMap<String, String> = HashMap::new();
         env.insert("GOOS".to_string(), def.goos.clone());
@@ -859,6 +931,8 @@ pub struct CompileParams<'a> {
     pub out_file: String,
     pub factors: &'a Factors,
     pub go_version: &'a str,
+    /// Workspace-relative `go.mod` directory selecting the module's `GOCACHE`.
+    pub go_module: &'a str,
     /// `(import_path, lib archive addr)` — importcfg entries + `lib_*` dep groups.
     pub transitive_libs: &'a [(String, Addr)],
     /// Compile sources (`.go`) → the default (`""`) dep group.
@@ -941,6 +1015,16 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
     config.insert(
         "go_version".to_string(),
         Value::String(p.go_version.to_string()),
+    );
+    config.insert(
+        "go_module".to_string(),
+        Value::String(p.go_module.to_string()),
+    );
+    // Computed here rather than passed in: `build_compile_spec` already holds the
+    // variant, so there is no call site that could hand it a different one.
+    config.insert(
+        "go_variant".to_string(),
+        Value::String(p.factors.variant_id()),
     );
     config.insert(
         "goexperiment".to_string(),
@@ -1092,6 +1176,7 @@ mod driver_tests {
             out_file: "x.a".to_string(),
             factors: &factors(),
             go_version: V,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1138,6 +1223,7 @@ mod driver_tests {
             out_file: "x.a".to_string(),
             factors: &factors(),
             go_version: V,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1166,6 +1252,7 @@ mod driver_tests {
             out_file: "x.a".to_string(),
             factors: &factors(),
             go_version: V,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1205,6 +1292,7 @@ mod driver_tests {
                 ..factors()
             },
             go_version: V,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1277,6 +1365,7 @@ mod driver_tests {
             out_file: "x.a".to_string(),
             factors: &factors(),
             go_version: V,
+            go_module: "",
             transitive_libs: libs,
             src_addrs: &["//mylib:a.go".to_string()],
             s_files: &[],
@@ -1360,6 +1449,7 @@ mod driver_tests {
             out_file: "mylib.a".to_string(),
             factors: f,
             go_version: crate::plugingo::toolchain::DEFAULT_GO_VERSION,
+            go_module: "",
             transitive_libs: &[],
             src_addrs: &[],
             s_files: &[],
@@ -1407,6 +1497,8 @@ mod driver_tests {
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
             go_version: crate::plugingo::toolchain::HASH_GOLDEN_GO_VERSION.to_string(),
+            go_module: String::new(),
+            go_variant: String::new(),
             goexperiment: vec![],
             gcflags: vec![],
             buildmode: BuildMode::default(),
@@ -1428,6 +1520,8 @@ mod driver_tests {
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
             go_version: crate::plugingo::toolchain::HASH_GOLDEN_GO_VERSION.to_string(),
+            go_module: String::new(),
+            go_variant: String::new(),
             goexperiment: vec![],
             gcflags: vec![],
             buildmode: BuildMode::default(),

@@ -577,6 +577,11 @@ impl Engine {
         &self.cfg.scratch.restore_scopes
     }
 
+    /// Whether a cold lineage seeds itself from the first warm fallback.
+    pub fn scratch_seeds_on_fork(&self) -> bool {
+        self.cfg.scratch.seed_on_fork
+    }
+
     pub fn result_lock(&self) -> &ResultLock {
         &self.result_lock
     }

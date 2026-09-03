@@ -2384,6 +2384,10 @@ pub(crate) fn prepare_note(
             format!("scratch {scratch}: seeded from a fallback scope"),
             false,
         ),
+        (None, "dropped_over_max") => (
+            format!("scratch {scratch}: over its max_size — dropped whole, this build runs cold"),
+            true,
+        ),
         (None, "cold") => (
             format!("scratch {scratch}: cold, nothing to restore from"),
             false,
@@ -3200,6 +3204,11 @@ mod tests {
         assert!(note("seeded").text.contains("seeded"));
         assert!(note("cold").text.contains("cold"));
         assert!(note("audit").text.contains("--no-scratch"));
+        assert!(
+            note("dropped_over_max").warn,
+            "a dropped cache is a problem"
+        );
+        assert!(note("dropped_over_max").text.contains("runs cold"));
     }
 
     /// An outcome this build has never heard of is printed, not dropped. This is

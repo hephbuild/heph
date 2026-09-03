@@ -266,8 +266,10 @@ impl ManagedDriver for Driver {
                 addr: addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                // No inputs: the bytes come from the registry, not other targets.
-                inputs: vec![],
+                // The bytes come from the registry, not from other targets — the
+                // one edge here is the shared blob store, which materializes
+                // nothing and never reaches this target's cache key.
+                inputs: vec![super::platform::blobs_input()],
                 outputs: vec![Output {
                     group: String::new(),
                     paths: vec![OutPath {
@@ -310,10 +312,22 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("out {:?} has no file name", def.out))?;
         let out_path = req.sandbox_pkg_dir.join(out_name);
 
-        // Blobs land here on their way out of the registry, outside the
-        // workspace dir so they are not collected as outputs. The sandbox is
-        // torn down after the run, so there is nothing to clean up.
-        let blob_dir = req.sandbox_dir.join("heph-oci-blobs");
+        // Blobs land in the shared store, so two images sharing a base layer
+        // download it once rather than once per pull target. It lives outside the
+        // package dir either way, so it is never collected as an output.
+        let blob_dir = match req
+            .request
+            .scratch
+            .iter()
+            .find(|m| m.env == super::platform::BLOBS_ENV)
+        {
+            Some(mount) => mount.dir.clone(),
+            // No mount: an older host that does not carry scratch mounts on
+            // `RunRequest`. Fall back to the per-sandbox directory this used to
+            // always use — re-downloading a shared base layer is slow, never
+            // wrong.
+            None => req.sandbox_dir.join("heph-oci-blobs"),
+        };
         let pulled = super::registry::pull_layout(&def.src, &def.platform, def.insecure, &blob_dir)
             .await
             .with_context(|| format!("pull image {}", def.src))?;
@@ -403,13 +417,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_declares_no_inputs_one_output_and_cached() {
+    async fn parse_declares_one_output_the_blob_store_and_is_cached() {
         let resp = parse(
             "//base:alpine",
             cfg(&[("ref", Value::String(PINNED.to_string()))]),
         )
         .await;
-        assert!(resp.target_def.inputs.is_empty());
+        // The only edge is the shared blob store, and it must stay invisible to
+        // the cache key: a pull returns the same image whether the store was warm
+        // or empty.
+        assert_eq!(resp.target_def.inputs.len(), 1);
+        let blobs = &resp.target_def.inputs[0];
+        assert_eq!(
+            blobs.r#ref.r#ref.format(),
+            super::super::platform::blobs_addr()
+        );
+        assert!(!blobs.hashed, "the blob store must not reach the cache key");
+        assert!(!blobs.runtime, "the blob store materializes no artifacts");
         assert_eq!(resp.target_def.outputs.len(), 1);
         // Named for the target, so two pulls in one package do not collide.
         assert!(matches!(

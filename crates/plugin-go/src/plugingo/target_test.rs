@@ -49,6 +49,7 @@ fn compile_lib(
     embed_file_addrs: &[String],
     embed_src_addrs: &[String],
     go_version: &str,
+    go_module: &str,
 ) -> TargetSpec {
     build_compile_spec(CompileParams {
         addr,
@@ -56,6 +57,7 @@ fn compile_lib(
         out_file,
         factors,
         go_version,
+        go_module,
         transitive_libs,
         src_addrs: &src_addrs,
         s_files: &[],
@@ -87,6 +89,7 @@ pub fn build_test_lib_spec(
     embed_file_addrs: &[String],
     embed_src_addrs: &[String],
     go_version: &str,
+    go_module: &str,
 ) -> TargetSpec {
     let src: Vec<String> = src_addrs
         .iter()
@@ -105,6 +108,7 @@ pub fn build_test_lib_spec(
         embed_file_addrs,
         embed_src_addrs,
         go_version,
+        go_module,
     )
 }
 
@@ -121,6 +125,7 @@ pub fn build_xtest_lib_spec(
     embed_file_addrs: &[String],
     embed_src_addrs: &[String],
     go_version: &str,
+    go_module: &str,
 ) -> TargetSpec {
     compile_lib(
         addr,
@@ -134,6 +139,7 @@ pub fn build_xtest_lib_spec(
         embed_file_addrs,
         embed_src_addrs,
         go_version,
+        go_module,
     )
 }
 
@@ -144,6 +150,7 @@ pub fn build_testmain_lib_spec(
     testmain_src_addr: &Addr,
     testmain_libs: &[(String, Addr)],
     go_version: &str,
+    go_module: &str,
 ) -> TargetSpec {
     compile_lib(
         addr,
@@ -157,6 +164,7 @@ pub fn build_testmain_lib_spec(
         &[],
         &[],
         go_version,
+        go_module,
     )
 }
 
@@ -426,6 +434,7 @@ mod tests {
             &[],
             &[],
             V,
+            "",
         );
         assert_eq!(spec.driver, "go_compile");
     }
@@ -444,6 +453,7 @@ mod tests {
             &[],
             &[],
             V,
+            "",
         );
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
@@ -478,6 +488,7 @@ mod tests {
             &[],
             &[],
             V,
+            "",
         );
         assert_eq!(spec.driver, "go_compile");
         assert_eq!(
@@ -501,6 +512,7 @@ mod tests {
             &[],
             &[],
             V,
+            "",
         );
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
@@ -534,6 +546,7 @@ mod tests {
             &[],
             &[],
             V,
+            "",
         );
         assert_eq!(
             crate::plugingo::driver_compile::test_support::cfg_str(&spec, "p_flag"),
@@ -552,6 +565,7 @@ mod tests {
             &testmain_src,
             &[],
             V,
+            "",
         );
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
@@ -577,6 +591,7 @@ mod tests {
             &testmain_src,
             &[],
             V,
+            "",
         );
         assert_eq!(
             crate::plugingo::driver_compile::test_support::cfg_str(&spec, "p_flag"),
@@ -705,6 +720,7 @@ mod tests {
             &[],
             &[],
             V,
+            "",
         );
         assert_eq!(spec.driver, "go_compile");
         assert_eq!(
@@ -895,6 +911,7 @@ mod tests {
             &[],
             &[],
             V,
+            "",
         );
         assert!(
             spec.labels.contains(&"go-build".to_string()),
@@ -916,6 +933,7 @@ mod tests {
             &[],
             &[],
             V,
+            "",
         );
         assert!(
             spec.labels.contains(&"go-build".to_string()),
@@ -932,6 +950,7 @@ mod tests {
             &mk_addr("pkg", "_testmain_src"),
             &[],
             V,
+            "",
         );
         assert!(
             spec.labels.contains(&"go-build".to_string()),

@@ -83,6 +83,17 @@ pub fn build_download_spec(
     if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
         config.insert(ro_k, ro_v);
     }
+    // The shared module cache. Env-var-only — no mount — which is what makes it
+    // possible here at all: this target collects `out = "**/*"` from its package,
+    // and an in-tree mount would be swept straight into the artifact. `go mod
+    // download` reads `GOMODCACHE` from the environment and does not care where
+    // the directory is.
+    config.insert(
+        "scratch".to_string(),
+        Value::List(vec![Value::String(
+            crate::plugingo::gocache::modcache_addr().format(),
+        )]),
+    );
     // Glob form (contains `*`) — pluginexec packs every matching file under
     // the target's pkg into the artifact, preserving relative paths.
     config.insert(
@@ -95,15 +106,21 @@ pub fn build_download_spec(
     // CGO/toolchain pins live in `env` (hashed; pluginexec/mod.rs:70 excludes
     // runtime_env from the def hash).
     config.insert("env".to_string(), go_build_env());
-    // GOPROXY/GOMODCACHE/etc must be inherited at runtime so network fetches
-    // and modcache placement match the user's host config. (Modules are
-    // content-addressed and go.sum-verified, so this stays reproducible.) For a
+    // The module cache is heph's now, not the host's — a scratch declared at
+    // `//@heph/go/gocache:modcache` and announced through `GOMODCACHE` (see the
+    // `scratch` config below). So `GOMODCACHE` is deliberately *absent* from the
+    // passthrough list: leaving it would let a host value reach the sandbox and
+    // collide with the one the scratch sets, which pluginexec rejects rather
+    // than silently picking a winner.
+    //
+    // The rest still come from the host. `GOPROXY` and friends are network
+    // configuration, not cache placement — how to reach a registry is the user's
+    // to decide, and heph owning where the bytes land does not change that. For a
     // host/target toolchain, `go` itself is non-hermetic and must be resolvable
     // from the sandbox — merge in `go_host_runtime_pass_env` (PATH, HOME, …)
     // rather than clobbering it with a second `runtime_pass_env` insert.
     let mut pass_env: Vec<String> = [
         "HOME",
-        "GOMODCACHE",
         "GOPATH",
         "GOCACHE",
         "GOPROXY",
@@ -156,6 +173,7 @@ pub fn build_lib_spec(
     golist_addr: Option<&Addr>,
     embed_file_addrs: &[String],
     go_version: &str,
+    go_module: &str,
 ) -> TargetSpec {
     let import_path = &pkg.import_path;
     let package_name = pkg.name.as_deref().unwrap_or("");
@@ -180,6 +198,7 @@ pub fn build_lib_spec(
         out_file,
         factors,
         go_version,
+        go_module,
         transitive_libs,
         src_addrs,
         s_files: &pkg.s_files,
@@ -424,9 +443,36 @@ mod tests {
             !env.contains(&"PATH".to_string()),
             "hermetic must not leak host PATH: {env:?}"
         );
+        // The module cache is heph's, declared as a scratch and announced through
+        // `GOMODCACHE`. Passing the host's through as well would collide with it,
+        // which pluginexec rejects rather than silently picking a winner.
         assert!(
-            env.contains(&"GOMODCACHE".to_string()),
-            "must keep module env: {env:?}"
+            !env.contains(&"GOMODCACHE".to_string()),
+            "GOMODCACHE is set by the scratch, not inherited: {env:?}"
+        );
+        // Network configuration is still the user's: how to reach a registry is a
+        // different question from where the bytes land.
+        assert!(
+            env.contains(&"GOPROXY".to_string()),
+            "must keep the network env: {env:?}"
+        );
+    }
+
+    /// The download target references the shared module cache, and does so
+    /// without a mount — its `out = "**/*"` would otherwise sweep the cache into
+    /// the artifact.
+    #[test]
+    fn test_download_references_the_shared_modcache() {
+        let spec = build_download_spec(download_addr(), "github.com/go-logr/logr", "v1.4.2", V);
+        let scratch = match spec.config.get("scratch").expect("scratch config") {
+            Value::List(v) => v.clone(),
+            other => panic!("expected a list, got {other:?}"),
+        };
+        assert_eq!(
+            scratch,
+            vec![Value::String(
+                crate::plugingo::gocache::modcache_addr().format()
+            )]
         );
     }
 
@@ -474,6 +520,7 @@ mod tests {
             golist,
             embed_files,
             V,
+            "",
         )
     }
 
@@ -568,6 +615,7 @@ mod tests {
             None,
             &[],
             V,
+            "",
         );
         assert_eq!(cfg_list(&s, "s_files"), vec!["asm_amd64.s".to_string()]);
         assert!(deps_map(&s).contains_key("asm"));
@@ -595,6 +643,7 @@ mod tests {
             None,
             &[],
             V,
+            "",
         );
         let hdr = deps_map(&s).get("hdr").cloned().unwrap_or_default();
         assert!(

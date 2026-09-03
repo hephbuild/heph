@@ -28,6 +28,18 @@ pub enum ScratchCommands {
     ///
     /// Example: `heph tool scratch ls`
     Ls,
+    /// Explain which lineage a cache would be restored from
+    ///
+    /// Prints the resolution walk: every candidate lineage in the order it is
+    /// consulted, what each holds, and which one wins. This is the answer to
+    /// "why did my branch build start cold?" — a question the local directory
+    /// alone cannot answer, because the interesting part is what was *not* found.
+    ///
+    /// Example: `heph tool scratch head //build:gocache`
+    Head {
+        /// Address of the `scratch` target.
+        addr: String,
+    },
     /// Print the on-disk path of a scratch cache
     ///
     /// For pointing another tool at it, or `du`-ing it by hand.
@@ -101,6 +113,7 @@ impl ScratchArgs {
     pub fn execute(&self, _sink: LogSink) -> anyhow::Result<()> {
         match &self.command {
             ScratchCommands::Ls => bootstrap::block_on(ls())?,
+            ScratchCommands::Head { addr } => bootstrap::block_on(head(addr))?,
             ScratchCommands::Path { addr } => bootstrap::block_on(path(addr))?,
             ScratchCommands::Rm { addr, all } => bootstrap::block_on(rm(addr.as_deref(), *all))?,
             ScratchCommands::Push {
@@ -113,6 +126,16 @@ impl ScratchArgs {
                 bootstrap::block_on(pull(addr.as_deref(), *all))?
             }
         }
+    }
+}
+
+/// Name a lineage for a human. The default lineage has an empty name, and
+/// printing `` for it reads like something went wrong.
+fn describe_scope(scope: &str) -> String {
+    if scope.is_empty() {
+        "the default lineage".to_string()
+    } else {
+        format!("`{scope}`")
     }
 }
 
@@ -183,6 +206,176 @@ async fn ls() -> anyhow::Result<()> {
         slots.len(),
         hcore::units::human_bytes(total)
     );
+    Ok(())
+}
+
+/// The local lineages a build would consult, in order, each with whether it is
+/// warm. Stops at the first warm one, exactly as
+/// `engine::scratch::resolve_scope_dir` does — this walk is an explanation of
+/// that one, so any divergence is a lie rather than a cosmetic difference.
+fn local_trace(
+    home: &std::path::Path,
+    slot: &str,
+    scope: &str,
+    fallbacks: &[String],
+    seed_on_fork: bool,
+) -> Vec<(String, bool)> {
+    let has = |sc: &str| {
+        let p = crate::engine::scratch_remote::scope_head_dir(home, slot, sc);
+        std::fs::read_dir(&p).is_ok_and(|mut d| d.next().is_some())
+    };
+
+    let own = has(scope);
+    let mut out = vec![(scope.to_string(), own)];
+    if own || !seed_on_fork {
+        return out;
+    }
+    for fb in fallbacks {
+        // The own scope is already reported; a fallback repeating it is not a
+        // second chance.
+        if fb == scope {
+            continue;
+        }
+        let warm = has(fb);
+        out.push((fb.clone(), warm));
+        if warm {
+            break;
+        }
+    }
+    out
+}
+
+async fn head(addr: &str) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine()?;
+    let (found_addr, def) = declared_scratches(&engine)
+        .await?
+        .into_iter()
+        .find(|(a, _)| a.format() == addr)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no `scratch` target named {addr}. `heph query -e '//...'` lists what the \
+                 workspace declares"
+            )
+        })?;
+
+    let slot = crate::engine::scratch::ResolvedScratch {
+        addr: found_addr.clone(),
+        def: def.clone(),
+    }
+    .slot();
+    let scope = engine.scratch_scope().to_string();
+    let fallbacks = engine.scratch_restore_scopes().to_vec();
+
+    println!("{found_addr}  (slot {slot})");
+
+    // Local first, and with its *own* fallbacks — a build seeds a cold lineage
+    // from a warm sibling before it ever looks at the remote, so a trace that
+    // skipped straight to the network would name the wrong winner in exactly the
+    // case this command exists for: a fresh branch on a machine that has built
+    // its base.
+    let local = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, &scope);
+    let head_of = |sc: &str| crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, sc);
+
+    let trace = local_trace(
+        &engine.home,
+        &slot,
+        &scope,
+        &fallbacks,
+        engine.scratch_seeds_on_fork(),
+    );
+    let warm = trace.last().is_some_and(|(_, w)| *w);
+    for (sc, is_warm) in &trace {
+        let dir = head_of(sc);
+        if !is_warm {
+            println!("    local {}: cold", describe_scope(sc));
+        } else if *sc == scope {
+            println!("  * local {}: warm — {}", describe_scope(sc), dir.display());
+        } else {
+            println!(
+                "  * local {}: warm — seeds {} from {}",
+                describe_scope(sc),
+                describe_scope(&scope),
+                dir.display()
+            );
+        }
+    }
+    if warm {
+        // Resolution stops here; everything below is printed for context, not as
+        // a prediction. Saying so beats letting the remote section imply a fetch
+        // that will not happen.
+        println!("  (warm locally — a build here does not consult the remote)");
+    }
+
+    if !def.remote {
+        println!("  remote: not consulted (this cache declares `remote = False`)");
+        return Ok(());
+    }
+    if engine.remote_caches().is_empty() {
+        println!("  remote: no remote cache is configured");
+        return Ok(());
+    }
+
+    let trace = engine.scratch_remote_trace(&slot, &scope, &fallbacks).await;
+    let mut winner_shown = false;
+    for (scope, head) in &trace {
+        match head {
+            Some(h) => {
+                // The first scope with anything is the one a build takes; the
+                // rest are printed so the ordering is visible rather than
+                // implied.
+                let wins = !winner_shown && !warm;
+                winner_shown = true;
+                // `bytes` is the unpacked size; `push` reports what it
+                // uploaded. Saying which this is stops the two commands from
+                // looking like they disagree about one snapshot.
+                let mut line = format!(
+                    "  {} remote {}: generation {} ({} unpacked, from `{}`",
+                    if wins { "*" } else { " " },
+                    describe_scope(scope),
+                    h.meta.generation,
+                    hcore::units::human_bytes(h.meta.bytes),
+                    h.cache,
+                );
+                if !h.meta.producer.is_empty() {
+                    line.push_str(&format!(", producer {}", h.meta.producer));
+                }
+                line.push(')');
+                println!("{line}");
+                // Only for the entry that would actually be restored — the
+                // others are never unpacked, so where they were produced says
+                // nothing about this machine.
+                // Compare against where *its own* lineage lives here: the tail
+                // differs by scope on every cross-branch restore, which is
+                // ordinary, so comparing full paths would warn constantly. A
+                // difference against its own scope's path means a different
+                // workspace or home — the case that actually breaks a cache
+                // whose contents embed absolute paths.
+                let native = head_of(&h.meta.scope);
+                if wins && h.meta.produced_at != native.to_string_lossy() {
+                    println!(
+                        "      produced under {}, restores under {} — a cache whose \
+                         contents embed absolute paths will restore but be inert",
+                        h.meta.produced_at,
+                        local.display()
+                    );
+                }
+            }
+            None => println!("    remote {}: nothing published", describe_scope(scope)),
+        }
+    }
+    if !winner_shown && !warm {
+        // Only cold if the local head is cold too — resolution consults the
+        // remote *because* local missed, so an empty remote with a warm local is
+        // a perfectly good build.
+        if warm {
+            println!(
+                "  nothing published in any candidate lineage; the local head is warm, so a \
+                 build here uses it"
+            );
+        } else {
+            println!("  nothing published in any candidate lineage — a build here starts cold");
+        }
+    }
     Ok(())
 }
 
@@ -293,46 +486,117 @@ async fn push(addr: Option<&str>, all: bool, force: bool, producer: String) -> a
     Ok(())
 }
 
+/// Every `scratch` declaration in the workspace, resolved from the graph.
+///
+/// **Not from the local store.** A machine that has never built has no slots, and
+/// warming exactly that machine is what `pull` exists for — reading the store
+/// would make the command useless in its only real use case. Costs a spec
+/// resolution per target, which is why this is a rare explicit command and not
+/// something a build does.
+async fn declared_scratches(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+) -> anyhow::Result<Vec<(crate::htaddr::Addr, hbuiltins::pluginscratch::ScratchDef)>> {
+    use futures::StreamExt as _;
+
+    // Every package: the workspace-wide selector `clean` and the gitignore walk
+    // already use.
+    let matcher = crate::htmatcher::Matcher::PackagePrefix(crate::htpkg::PkgBuf::from(""));
+    let rs = engine.new_state();
+    let mut stream = Box::pin(std::sync::Arc::clone(engine).query_spec(rs, &matcher));
+
+    let mut out = Vec::new();
+    while let Some(spec) = stream.next().await {
+        // A target whose spec will not resolve is not this command's problem — it
+        // is reported by anything that actually builds it. Skipping keeps one
+        // broken package from making the whole workspace unwarmable.
+        let Ok(spec) = spec else { continue };
+        if spec.driver != hbuiltins::pluginscratch::DRIVER_NAME {
+            continue;
+        }
+        match hbuiltins::pluginscratch::parse_declaration(&spec) {
+            Ok(def) => out.push((spec.addr.clone(), def)),
+            Err(err) => println!("{}: skipped — {err:#}", spec.addr),
+        }
+    }
+    Ok(out)
+}
+
 async fn pull(addr: Option<&str>, all: bool) -> anyhow::Result<()> {
+    if all == addr.is_some() {
+        anyhow::bail!("pass either an address or --all, not both or neither");
+    }
     let (engine, _shutdown) = bootstrap::new_engine()?;
-    let selected = select(engine.scratch_slots()?, addr, all)?;
+
+    let selected: Vec<_> = declared_scratches(&engine)
+        .await?
+        .into_iter()
+        .filter(|(a, def)| match addr {
+            // Naming one is an explicit instruction; honour it whatever the
+            // declaration says about travelling.
+            Some(want) => a.format() == want,
+            // `--all` means every cache that opted in, not every cache: a
+            // local-only one has nowhere to fetch from.
+            None => def.remote,
+        })
+        .collect();
+
     if selected.is_empty() {
-        println!(
-            "Nothing to fetch. A cache must have been built at least once, and declared `remote = True`."
-        );
+        match addr {
+            Some(want) => anyhow::bail!(
+                "no `scratch` target named {want}. `heph query -e '//...'` lists what the \
+                 workspace declares"
+            ),
+            None => println!("No scratch cache declares `remote = True`; nothing to fetch."),
+        }
         return Ok(());
     }
 
     let scope = engine.scratch_scope().to_string();
     let fallbacks = engine.scratch_restore_scopes().to_vec();
-    for slot in &selected {
-        let name = slot
-            .meta
-            .as_ref()
-            .map(|m| m.addr.clone())
-            .unwrap_or_else(|| slot.slot.clone());
-        let Some(head) = engine
-            .scratch_remote_head(&slot.slot, &scope, &fallbacks)
-            .await
-        else {
-            println!("{name}: nothing published for this branch");
+    for (addr, def) in &selected {
+        let slot = crate::engine::scratch::ResolvedScratch {
+            addr: addr.clone(),
+            def: def.clone(),
+        }
+        .slot();
+        let Some(head) = engine.scratch_remote_head(&slot, &scope, &fallbacks).await else {
+            println!("{addr}: nothing published for this branch");
             continue;
         };
-        let dir = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot.slot, &scope);
+        let dir = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, &scope);
         match engine.scratch_pull(&head, &dir).await {
             Ok(bytes) => {
                 crate::engine::scratch_remote::write_local_meta(
                     &engine.home,
-                    &slot.slot,
+                    &slot,
                     &scope,
                     &head.meta,
                 );
+                // Record what the slot came from, exactly as a build would. A
+                // machine warmed purely by `pull` would otherwise hold a cache
+                // that `ls` cannot name and `rm <addr>` cannot find — the store
+                // stops describing itself the moment it is populated any way but
+                // by building.
+                crate::engine::scratch_store::write_slot_meta(
+                    &engine.home,
+                    &slot,
+                    &crate::engine::scratch_store::SlotMeta {
+                        format: 1,
+                        addr: addr.format(),
+                        path: def.path.clone(),
+                        env: def.env.clone(),
+                        access: def.access.as_str().to_string(),
+                        version: def.version.clone(),
+                        remote: def.remote,
+                    },
+                );
                 println!(
-                    "{name}: fetched generation {} from `{}` ({bytes} bytes)",
-                    head.meta.generation, head.meta.scope
+                    "{addr}: fetched generation {} from {} ({bytes} bytes)",
+                    head.meta.generation,
+                    describe_scope(&head.meta.scope),
                 );
             }
-            Err(err) => println!("{name}: FAILED — {err:#}"),
+            Err(err) => println!("{addr}: FAILED — {err:#}"),
         }
     }
     Ok(())
@@ -344,16 +608,11 @@ mod tests {
     use crate::engine::scratch_store::SlotMeta;
 
     #[test]
-    fn human_bytes_reads_like_a_person_wrote_it() {
-        assert_eq!(hcore::units::human_bytes(0), "0 B");
-        assert_eq!(hcore::units::human_bytes(999), "999 B");
-        // Exact powers stay exact rather than becoming "1024.0 B".
-        assert_eq!(hcore::units::human_bytes(1024), "1.0 KiB");
-        assert_eq!(hcore::units::human_bytes(1536), "1.5 KiB");
-        assert_eq!(
-            hcore::units::human_bytes(10 * 1024 * 1024 * 1024),
-            "10.0 GiB"
-        );
+    fn a_lineage_is_named_for_a_human() {
+        assert_eq!(describe_scope("main"), "`main`");
+        // The default lineage has an empty name; printing `` for it reads like
+        // something went wrong.
+        assert_eq!(describe_scope(""), "the default lineage");
     }
 
     fn entry(meta: Option<SlotMeta>) -> SlotEntry {
@@ -412,6 +671,84 @@ mod tests {
         let (_, detail) = describe(&entry(Some(m)));
         assert!(detail.contains("v=go1.23"), "{detail}");
         assert!(detail.contains("remote"), "{detail}");
+    }
+
+    /// The local walk must stop where resolution stops. Reporting a scope past
+    /// the winner would say a build consults something it never reaches.
+    #[test]
+    fn the_local_walk_stops_at_the_first_warm_lineage() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let warm = |sc: &str| {
+            let d = crate::engine::scratch_remote::scope_head_dir(home.path(), "s1", sc);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            std::fs::write(d.join("f"), b"x").expect("write");
+        };
+        let fbs = ["release".to_string(), "master".to_string()];
+
+        // Nothing anywhere: every candidate is reported, all cold.
+        assert_eq!(
+            local_trace(home.path(), "s1", "pr-1", &fbs, true),
+            [
+                ("pr-1".to_string(), false),
+                ("release".to_string(), false),
+                ("master".to_string(), false)
+            ]
+        );
+
+        // `master` warm: `release` is still consulted (it is ahead in order),
+        // `master` wins, and the walk ends there.
+        warm("master");
+        assert_eq!(
+            local_trace(home.path(), "s1", "pr-1", &fbs, true),
+            [
+                ("pr-1".to_string(), false),
+                ("release".to_string(), false),
+                ("master".to_string(), true)
+            ]
+        );
+
+        // Own scope warm: no fallback is consulted at all.
+        warm("pr-1");
+        assert_eq!(
+            local_trace(home.path(), "s1", "pr-1", &fbs, true),
+            [("pr-1".to_string(), true)]
+        );
+    }
+
+    /// Without `seedOnFork` a cold lineage stays cold — the fallbacks are not
+    /// consulted, so reporting them would invent a restore that cannot happen.
+    #[test]
+    fn seeding_off_means_the_walk_never_leaves_its_own_lineage() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let d = crate::engine::scratch_remote::scope_head_dir(home.path(), "s1", "master");
+        std::fs::create_dir_all(&d).expect("mkdir");
+        std::fs::write(d.join("f"), b"x").expect("write");
+
+        assert_eq!(
+            local_trace(home.path(), "s1", "pr-1", &["master".to_string()], false),
+            [("pr-1".to_string(), false)]
+        );
+    }
+
+    /// A fallback list that names the current scope must not report it twice —
+    /// it would read as a second, separate chance at the same directory.
+    #[test]
+    fn a_fallback_repeating_the_current_scope_is_not_a_second_chance() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let trace = local_trace(
+            home.path(),
+            "s1",
+            "master",
+            &["master".to_string(), "release".to_string()],
+            true,
+        );
+        assert_eq!(
+            trace,
+            [
+                ("master".to_string(), false),
+                ("release".to_string(), false)
+            ]
+        );
     }
 
     fn slot(addr: &str, remote: bool) -> crate::engine::scratch_store::SlotEntry {

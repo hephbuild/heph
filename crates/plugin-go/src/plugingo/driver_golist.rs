@@ -56,6 +56,15 @@ struct GoGolistSpec {
     /// Go release whose staged hermetic SDK provides GOROOT + the `go` binary.
     #[spec(required)]
     go_version: String,
+    /// Workspace-relative `go.mod` directory of this package's module, selecting
+    /// which module's shared `GOCACHE` the listing runs against. Empty for the
+    /// root module and for stdlib.
+    go_module: String,
+    /// The variant this listing belongs to, from `Factors::variant_id` — the
+    /// other half of the cache's `(module, variant)` identity. Carried whole so
+    /// this driver cannot key on a different subset of the factors than
+    /// `go_compile` does.
+    go_variant: String,
     /// Go build tags.
     build_tags: Vec<String>,
     /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
@@ -337,12 +346,11 @@ impl ManagedDriver for GoGolistDriver {
         // must not touch this target's cache key, because a `go list` produces
         // the same package metadata warm or cold.
         let gocache_key = crate::plugingo::gocache::GocacheKey {
+            module: spec.go_module.clone(),
             go_version: spec.go_version.clone(),
             goos: spec.goos.clone(),
             goarch: spec.goarch.clone(),
-            build_tags: spec.build_tags.clone(),
-            goexperiment: spec.goexperiment.clone(),
-            race: spec.race,
+            variant: spec.go_variant.clone(),
         };
         let gocache_input = Input {
             r#ref: TargetAddr {
@@ -460,19 +468,23 @@ impl ManagedDriver for GoGolistDriver {
         // is materialized and torn down inside each sandbox. The host GOCACHE is
         // still never touched.
         //
-        // A missing mount falls back to a sandbox-local directory rather than
-        // failing: an older host that does not carry scratch mounts on
-        // `RunRequest` still has to be able to run this driver, and a cold cache
-        // is slow, never wrong.
-        let gocache = match req.request.scratch.iter().find(|m| m.env == "GOCACHE") {
-            Some(mount) => mount.dir.clone(),
-            None => {
-                let local = req.sandbox_pkg_dir.join(".heph-gocache");
-                std::fs::create_dir_all(&local)
-                    .with_context(|| format!("create gocache dir {local:?}"))?;
-                local
-            }
-        };
+        // Always present, so there is no fallback: the host resolves and locks a
+        // mount for every target that references the cache, and `--no-scratch`
+        // supplies an *empty* one rather than none. There is no correct fallback
+        // to write anyway — Go reads `~/.cache/go-build` when `GOCACHE` is unset,
+        // so inventing a sandbox-local directory would be guessing at what the
+        // host already decided.
+        let gocache = req
+            .request
+            .scratch
+            .iter()
+            .find(|m| m.env == "GOCACHE")
+            .map(|m| m.dir.clone())
+            .context(
+                "no GOCACHE scratch mount: the host resolves and locks one for every \
+                 target that references the shared cache, and `--no-scratch` supplies an \
+                 empty one rather than none",
+            )?;
 
         let env = golist_env(def, &goroot, &gocache, |n| std::env::var(n).ok());
 

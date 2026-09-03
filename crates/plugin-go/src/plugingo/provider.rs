@@ -508,18 +508,19 @@ impl ProviderTrait for Provider {
     }
 
     fn functions(&self) -> Vec<ProviderFunctionDef> {
-        vec![ProviderFunctionDef {
-            name: "build_addr".to_string(),
-            signature: FnSignature {
-                positional: vec![
-                    Param::required("pkg", ParamType::String),
-                    Param::optional("variant", ParamType::String, Value::String(String::new())),
-                ],
-                named: vec![],
-                variadic: None,
-                returns: ParamType::String,
-            },
-            doc: "Build the address of a Go package's user-facing `build` target, as \
+        vec![
+            ProviderFunctionDef {
+                name: "build_addr".to_string(),
+                signature: FnSignature {
+                    positional: vec![
+                        Param::required("pkg", ParamType::String),
+                        Param::optional("variant", ParamType::String, Value::String(String::new())),
+                    ],
+                    named: vec![],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: "Build the address of a Go package's user-facing `build` target, as \
                   used in `deps`. `pkg` is a heph package path (e.g. \"mylib\", \
                   \"@heph/go/std/fmt\") or, starting with `./` or `../`, a path \
                   relative to the calling BUILD file's package. With a variant name, \
@@ -528,9 +529,63 @@ impl ProviderTrait for Provider {
                   that forwards to the first variant matching this machine's \
                   os/arch. The provider resolves the variant (and pins the defining \
                   package) when built."
-                .to_string(),
-            func: Arc::new(BuildAddrFn),
-        }]
+                    .to_string(),
+                func: Arc::new(BuildAddrFn),
+            },
+            ProviderFunctionDef {
+                name: "gocache_addr".to_string(),
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![
+                        Param::optional("goos", ParamType::String, Value::String(String::new())),
+                        Param::optional("goarch", ParamType::String, Value::String(String::new())),
+                        Param::optional(
+                            "gotool",
+                            ParamType::String,
+                            Value::String("host".to_string()),
+                        ),
+                        Param::optional(
+                            "tags",
+                            ParamType::list(ParamType::String),
+                            Value::List(vec![]),
+                        ),
+                        Param::optional(
+                            "goexperiment",
+                            ParamType::list(ParamType::String),
+                            Value::List(vec![]),
+                        ),
+                        Param::optional(
+                            "gcflags",
+                            ParamType::list(ParamType::String),
+                            Value::List(vec![]),
+                        ),
+                        Param::optional(
+                            "ldflags",
+                            ParamType::list(ParamType::String),
+                            Value::List(vec![]),
+                        ),
+                        Param::optional("race", ParamType::Bool, Value::Bool(false)),
+                    ],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: "Address of the shared Go build cache (`GOCACHE`) for the calling \
+                  BUILD file's module and the given variant factors — a `scratch` \
+                  target, for use in a target's `scratch = [...]`. The module is \
+                  taken from the nearest `go.mod` above the calling package, so a \
+                  target gets the same cache the Go driver targets in that module \
+                  already use. `goos`/`goarch` default to this machine's; `gotool` \
+                  selects the toolchain (`\"host\"`, a pinned release like \
+                  `\"1.27.0\"`, or a `//pkg:target`). Pass the same factors the \
+                  variant uses, or the target will warm a different cache than the \
+                  one it meant to share."
+                    .to_string(),
+                func: Arc::new(GocacheAddrFn {
+                    workspace_root: self.inner.workspace_root.clone(),
+                    default_gotool: self.inner.go_version.clone(),
+                }),
+            },
+        ]
     }
 
     fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
@@ -690,6 +745,89 @@ impl BuildAddrFn {
                 anyhow::bail!("heph.go.build_addr: `{name}` must be a string, got {other:?}")
             }
         }
+    }
+}
+
+/// `heph.go.gocache_addr(...)` — the module's shared `GOCACHE` address.
+///
+/// Carries the workspace root and the configured default toolchain because a
+/// [`FnCallContext`] gives only the calling package and root, and the module a
+/// package belongs to is a filesystem question.
+struct GocacheAddrFn {
+    workspace_root: std::path::PathBuf,
+    /// The plugin's configured `gotool`, so an unqualified call agrees with what
+    /// the generated Go targets in this workspace actually use.
+    default_gotool: String,
+}
+
+impl GocacheAddrFn {
+    fn str_named(args: &FnArgs, name: &str, default: &str) -> anyhow::Result<String> {
+        match args.named.get(name) {
+            None | Some(Value::String(_)) => match args.named.get(name) {
+                Some(Value::String(s)) if !s.is_empty() => Ok(s.clone()),
+                _ => Ok(default.to_string()),
+            },
+            Some(other) => {
+                anyhow::bail!("heph.go.gocache_addr: `{name}` must be a string, got {other:?}")
+            }
+        }
+    }
+
+    fn list_named(args: &FnArgs, name: &str) -> anyhow::Result<Vec<String>> {
+        match args.named.get(name) {
+            None => Ok(vec![]),
+            Some(Value::List(items)) => items
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => Ok(s.clone()),
+                    other => anyhow::bail!(
+                        "heph.go.gocache_addr: `{name}` must be a list of strings, got {other:?}"
+                    ),
+                })
+                .collect(),
+            Some(other) => {
+                anyhow::bail!("heph.go.gocache_addr: `{name}` must be a list, got {other:?}")
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderFn for GocacheAddrFn {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let goos = Self::str_named(&args, "goos", hcore::htplatform::os())?;
+        let goarch = Self::str_named(&args, "goarch", hcore::htplatform::arch())?;
+        let gotool = Self::str_named(&args, "gotool", &self.default_gotool)?;
+        let race = match args.named.get("race") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(other) => {
+                anyhow::bail!("heph.go.gocache_addr: `race` must be a bool, got {other:?}")
+            }
+        };
+        // The workspace root from the call context, not `self`: a BUILD file is
+        // evaluated against the root that loaded it.
+        let _ = ctx.root;
+        // Built through `Factors` rather than by hand, so this function and the
+        // drivers cannot disagree about what a variant is.
+        let factors = crate::plugingo::factors::Factors {
+            goos: goos.clone(),
+            goarch: goarch.clone(),
+            build_tags: Self::list_named(&args, "tags")?,
+            goexperiment: Self::list_named(&args, "goexperiment")?,
+            gcflags: Self::list_named(&args, "gcflags")?,
+            ldflags: Self::list_named(&args, "ldflags")?,
+            buildmode: Default::default(),
+            race,
+        };
+        let key = crate::plugingo::gocache::GocacheKey {
+            module: module_of_pkg(&hmodel::htpkg::PkgBuf::from(ctx.pkg), &self.workspace_root),
+            go_version: gotool,
+            goos,
+            goarch,
+            variant: factors.variant_id(),
+        };
+        Ok(Value::String(key.addr().format()))
     }
 }
 
@@ -1117,6 +1255,20 @@ fn module_root_rel(kind: &GoPackageKind, workspace_root: &Path) -> String {
             .into_owned(),
         GoPackageKind::Stdlib { .. } => String::new(),
     }
+}
+
+/// The Go module a package belongs to, workspace-relative, for selecting that
+/// module's shared `GOCACHE` (`plugingo::gocache`). `""` for the root module,
+/// for stdlib, and for anything that does not decode as a Go package — all of
+/// which land in the module-less cache rather than being attributed to whichever
+/// module asked first.
+///
+/// `decode_package` is memoized, so this is a map lookup on the hot spec-
+/// generation path rather than a `go.mod` walk per target.
+fn module_of_pkg(pkg: &hmodel::htpkg::PkgBuf, workspace_root: &Path) -> String {
+    decode_package(pkg, workspace_root)
+        .map(|k| module_root_rel(&k, workspace_root))
+        .unwrap_or_default()
 }
 
 /// Whether `pkg` (a Go import package) belongs to the module rooted at
@@ -1681,10 +1833,17 @@ impl ProviderInner {
         // package decoding, exactly like the toolchain above — because there is
         // no such directory on disk and asking the filesystem about it would only
         // produce a confusing "not found".
-        if addr.name == gocache::GOCACHE_NAME && gocache::is_gocache_pkg(addr.package.as_str()) {
-            return Ok(GetResponse {
-                target_spec: gocache::build_spec(addr.clone()),
-            });
+        if gocache::is_gocache_pkg(addr.package.as_str()) {
+            if addr.name == gocache::GOCACHE_NAME {
+                return Ok(GetResponse {
+                    target_spec: gocache::build_spec(addr.clone()),
+                });
+            }
+            if addr.name == gocache::GOMODCACHE_NAME {
+                return Ok(GetResponse {
+                    target_spec: gocache::build_modcache_spec(addr.clone()),
+                });
+            }
         }
 
         // `heph-govet`, the analysis/format binary the lint and format targets
@@ -2078,6 +2237,7 @@ impl ProviderInner {
                         embed_golist,
                         &pkg_addrs.embed_files,
                         &self.go_version,
+                        &module_of_pkg(&addr.package, &self.workspace_root),
                     ),
                     _ => {
                         // `go_embed_src` assets (kept out of `_golist`) are staged
@@ -2103,6 +2263,7 @@ impl ProviderInner {
                             &transitive.libs,
                             &pkg_addrs.go_files,
                             &self.go_version,
+                            &module_of_pkg(&addr.package, &self.workspace_root),
                             embed_golist,
                             &pkg_addrs.embed_files,
                             &embed_src_addrs,
@@ -2325,6 +2486,7 @@ impl ProviderInner {
                     &test_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
+                    &module_of_pkg(&addr.package, &self.workspace_root),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2424,6 +2586,7 @@ impl ProviderInner {
                     &pkg_addrs.xtest_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
+                    &module_of_pkg(&addr.package, &self.workspace_root),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2458,6 +2621,7 @@ impl ProviderInner {
                     &testmain_src_addr,
                     &transitive.libs,
                     &self.go_version,
+                    &module_of_pkg(&addr.package, &self.workspace_root),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2497,6 +2661,7 @@ impl ProviderInner {
                     &testmain_src_addr,
                     &transitive.libs,
                     &self.go_version,
+                    &module_of_pkg(&addr.package, &self.workspace_root),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2749,6 +2914,7 @@ impl ProviderInner {
                     import_path,
                     factors,
                     &self.go_version,
+                    &module_root_rel.to_string_lossy(),
                     &go_mod_addr,
                     &go_src_glob_addr,
                     None,
@@ -2782,6 +2948,7 @@ impl ProviderInner {
                     &import_path,
                     factors,
                     &self.go_version,
+                    &module_root_rel.to_string_lossy(),
                     &go_mod_addr,
                     &download_addr,
                 )?
@@ -3906,6 +4073,95 @@ mod tests {
             pkg: "",
             root: std::path::Path::new("/"),
         }
+    }
+
+    /// A workspace with a nested module: `svc/go.mod` alongside the root one.
+    fn two_module_workspace() -> tempfile::TempDir {
+        let d = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            d.path().join("go.mod"),
+            "module example.com/root\ngo 1.22\n",
+        )
+        .expect("root go.mod");
+        std::fs::create_dir_all(d.path().join("svc")).expect("mkdir svc");
+        std::fs::write(
+            d.path().join("svc").join("go.mod"),
+            "module example.com/svc\ngo 1.22\n",
+        )
+        .expect("svc go.mod");
+        std::fs::create_dir_all(d.path().join("lib")).expect("mkdir lib");
+        d
+    }
+
+    fn gocache_fn(root: &std::path::Path) -> GocacheAddrFn {
+        GocacheAddrFn {
+            workspace_root: root.to_path_buf(),
+            default_gotool: "1.27.0".to_string(),
+        }
+    }
+
+    async fn gocache_addr_at(root: &std::path::Path, pkg: &str) -> String {
+        let ctx = FnCallContext { pkg, root };
+        let mut named = HashMap::new();
+        named.insert("goos".to_string(), Value::String("linux".into()));
+        named.insert("goarch".to_string(), Value::String("amd64".into()));
+        match gocache_fn(root)
+            .call(
+                &ctx,
+                FnArgs {
+                    positional: vec![],
+                    named,
+                },
+            )
+            .await
+            .expect("gocache_addr")
+        {
+            Value::String(s) => s,
+            other => panic!("expected a string, got {other:?}"),
+        }
+    }
+
+    /// The function's whole job: the cache follows the *calling BUILD file's*
+    /// module, so a target in a nested module gets that module's cache rather
+    /// than the root's.
+    #[tokio::test]
+    async fn test_gocache_addr_follows_the_callers_module() {
+        let d = two_module_workspace();
+        let root_pkg = gocache_addr_at(d.path(), "lib").await;
+        let nested = gocache_addr_at(d.path(), "svc").await;
+
+        assert_ne!(root_pkg, nested, "two modules must not share a GOCACHE");
+        assert!(nested.contains("mod=svc"), "{nested}");
+        // The root module carries no `mod=` at all.
+        assert!(!root_pkg.contains("mod="), "{root_pkg}");
+        assert!(
+            root_pkg.starts_with("//@heph/go/gocache:cache@"),
+            "{root_pkg}"
+        );
+    }
+
+    /// Two packages *in the same module* must land on one cache — otherwise the
+    /// sharing that makes this worth having is gone.
+    #[tokio::test]
+    async fn test_gocache_addr_is_one_cache_per_module_not_per_package() {
+        let d = two_module_workspace();
+        std::fs::create_dir_all(d.path().join("svc").join("inner")).expect("mkdir");
+        assert_eq!(
+            gocache_addr_at(d.path(), "svc").await,
+            gocache_addr_at(d.path(), "svc/inner").await,
+        );
+    }
+
+    /// `gotool` defaults to the plugin's configured toolchain, so an unqualified
+    /// call names the same cache the generated Go targets already use. A default
+    /// that disagreed would hand out an addr for a cache nothing else writes.
+    #[tokio::test]
+    async fn test_gocache_addr_defaults_to_the_configured_toolchain() {
+        let d = two_module_workspace();
+        assert!(
+            gocache_addr_at(d.path(), "lib").await.contains("go=1.27.0"),
+            "must default to the plugin's `gotool`"
+        );
     }
 
     #[tokio::test]

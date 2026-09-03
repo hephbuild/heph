@@ -118,23 +118,31 @@ async fn two_packages_can_declare_the_same_name() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `path` is what a consumer mounts, so a missing one is not a defaultable
-/// omission — it is an incomplete declaration, and the error must land at parse
-/// time in the package that wrote it.
+/// A declaration without a `path` is the env-var-only form, not an incomplete
+/// one: the cache is announced through its variable and never placed in the tree.
+/// That is what lets a target whose output is a broad glob use one at all —
+/// nothing is in the tree for the glob to collect.
 #[tokio::test]
-async fn a_declaration_without_a_path_fails_at_parse() -> anyhow::Result<()> {
+async fn a_declaration_without_a_path_is_env_var_only() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "build",
-        r#"target(name = "c", driver = "scratch", version = "1")"#,
+        r#"target(name = "c", driver = "scratch", env = "MYCACHE")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "**/*", scratch = ["//build:c"],
+       run = ["echo \"$MYCACHE\" > o.txt"])"#,
     );
 
-    let err = expect_err(
-        ws.run("//build:c").await,
-        "a scratch without `path` must not resolve",
-    );
-    let msg = format!("{err:#}");
-    assert!(msg.contains("path"), "error must name the field: {msg}");
+    // The `**/*` glob would be rejected against a mounted scratch; with no mount
+    // there is nothing in the tree to collect.
+    let out = common::artifact_string(&*ws.run("//app:a").await?);
+    let path = out.trim();
+    assert!(path.starts_with('/'), "the variable must be set: {path:?}");
+    assert!(path.contains("/scratch/"), "{path:?}");
+    // And the directory really is absent from the sandbox tree.
+    assert!(!out.contains("MYCACHE="), "{out:?}");
     Ok(())
 }
 
@@ -412,6 +420,80 @@ target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt",
     Ok(())
 }
 
+/// Serialization is the reason `access` exists: two targets sharing one cache
+/// must not be inside it at the same time, or a tool that assumes sole ownership
+/// of its cache directory corrupts it. Nothing else in this file asserts it —
+/// every other test runs one target at a time, where a lock that was never taken
+/// looks identical to one that was.
+///
+/// Each target refuses to proceed if it finds the other's in-progress marker, so
+/// the assertion is on the targets' own observation rather than on timing.
+#[tokio::test]
+async fn exclusive_targets_never_share_the_directory() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C",
+       access = "exclusive")"#,
+    );
+    // Claim, linger, release. `mkdir` is the atomic test-and-set every shell
+    // has: it fails if the directory is already there, so a target that finds
+    // the marker knows another one is inside the cache right now.
+    let t = |name: &str| {
+        format!(
+            r#"target(name = "{name}", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = [
+         "if ! mkdir \"$C/busy\" 2>/dev/null; then echo OVERLAP > $OUT; exit 0; fi",
+         "sleep 0.3",
+         "rmdir \"$C/busy\"",
+         "echo alone > $OUT",
+       ])"#
+        )
+    };
+    ws.write_build_file("app", &format!("{}\n{}", t("a"), t("b")));
+
+    let (a, b) = tokio::join!(ws.run("//app:a"), ws.run("//app:b"));
+    let (a, b) = (a?, b?);
+    let (sa, sb) = (
+        common::artifact_string(&a).trim().to_string(),
+        common::artifact_string(&b).trim().to_string(),
+    );
+    drop((a, b));
+    assert_eq!(
+        (sa.as_str(), sb.as_str()),
+        ("alone", "alone"),
+        "two `exclusive` consumers of one cache overlapped"
+    );
+    Ok(())
+}
+
+/// `shared` is the "trust the tool" escape hatch — Go's build cache is safe under
+/// concurrent use, and forcing those targets through one lock would serialize a
+/// whole build for nothing. Both must complete; the point is that neither is
+/// blocked, not that they overlap (asserting overlap would be a race).
+#[tokio::test]
+async fn shared_targets_are_not_serialized_against_each_other() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C",
+       access = "shared")"#,
+    );
+    let t = |name: &str| {
+        format!(
+            r#"target(name = "{name}", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = ["echo {name} > \"$C/{name}\"", "echo ok > $OUT"])"#
+        )
+    };
+    ws.write_build_file("app", &format!("{}\n{}", t("a"), t("b")));
+
+    let (a, b) = tokio::join!(ws.run("//app:a"), ws.run("//app:b"));
+    let (a, b) = (a?, b?);
+    assert_eq!(common::artifact_string(&a).trim(), "ok");
+    assert_eq!(common::artifact_string(&b).trim(), "ok");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Mounting: the point of the whole thing.
 // ---------------------------------------------------------------------------
@@ -468,6 +550,103 @@ async fn a_scratch_carries_state_between_runs() -> anyhow::Result<()> {
         common::artifact_string(&second).trim(),
         "first",
         "the second run must see what the first wrote into the scratch"
+    );
+    Ok(())
+}
+
+/// `max_size` was accepted on the declaration and enforced nowhere — an author
+/// could bound a cache, believe it bounded, and watch it grow without limit. The
+/// cap drops the lineage **whole** rather than trimming it: heph cannot tell
+/// which of a foreign tool's entries are hot, so evicting a guess would quietly
+/// degrade the cache while claiming to manage it.
+#[tokio::test]
+async fn a_scratch_over_its_max_size_is_dropped_whole() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "MYCACHE",
+       max_size = "4KiB")"#,
+    );
+    // Writes ~64KiB, well past the cap, and reports whether anything survived
+    // from the run before it.
+    let build = |marker: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = [
+         "if [ -f \"$MYCACHE/marker\" ]; then cat \"$MYCACHE/marker\" > $OUT; else echo cold > $OUT; fi",
+         "echo {marker} > \"$MYCACHE/marker\"",
+         "printf '%*s' 65536 '' > \"$MYCACHE/bulk\"",
+       ])"#
+        )
+    };
+
+    ws.write_build_file("app", &build("first"));
+    let first = ws.run("//app:a").await?;
+    let first_out = common::artifact_string(&first).trim().to_string();
+    drop(first);
+    assert_eq!(first_out, "cold");
+
+    ws.write_build_file("app", &build("second"));
+    let engine = ws.reopen()?;
+    let addr = heph::htaddr::parse_addr("//app:a")?;
+    let second = engine
+        .clone()
+        .result_addr(
+            engine.new_state(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        common::artifact_string(&second).trim(),
+        "cold",
+        "a cache past its cap must be dropped, so the next run starts cold"
+    );
+    Ok(())
+}
+
+/// The cap must not fire on a cache that is merely non-empty — a cap that drops
+/// everything is indistinguishable from no cache at all, and would make the
+/// feature silently useless rather than loudly broken.
+#[tokio::test]
+async fn a_scratch_under_its_max_size_is_kept() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "MYCACHE",
+       max_size = "1GiB")"#,
+    );
+    let build = |marker: &str| {
+        format!(
+            r#"target(name = "a", driver = "bash", out = "o.txt", scratch = ["//build:c"],
+       run = [
+         "if [ -f \"$MYCACHE/marker\" ]; then cat \"$MYCACHE/marker\" > $OUT; else echo cold > $OUT; fi",
+         "echo {marker} > \"$MYCACHE/marker\"",
+       ])"#
+        )
+    };
+
+    ws.write_build_file("app", &build("first"));
+    let first = ws.run("//app:a").await?;
+    drop(first);
+
+    ws.write_build_file("app", &build("second"));
+    let engine = ws.reopen()?;
+    let addr = heph::htaddr::parse_addr("//app:a")?;
+    let second = engine
+        .clone()
+        .result_addr(
+            engine.new_state(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        common::artifact_string(&second).trim(),
+        "first",
+        "a cache inside its cap must survive"
     );
     Ok(())
 }
@@ -1033,6 +1212,70 @@ async fn a_published_snapshot_warms_a_cold_machine() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A cache dropped for exceeding its cap must not be immediately re-pulled from
+/// the remote.
+///
+/// The loop this prevents: `enforce_max_size` drops the oversized directory,
+/// `create_dir_all` recreates it empty, and a pull that ran next would see a
+/// cold lineage and fetch back the very snapshot just judged too big — so every
+/// run would drop, re-pull and drop again, paying the egress forever while
+/// reporting `pulled` and never once surfacing the drop the user needs to see.
+#[tokio::test]
+async fn a_cache_dropped_over_its_cap_is_not_re_pulled() -> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+
+    // Publish a snapshot comfortably over the cap we will impose.
+    let a = tempfile::tempdir()?;
+    std::fs::create_dir_all(a.path().join("build"))?;
+    std::fs::create_dir_all(a.path().join("app"))?;
+    std::fs::write(a.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    std::fs::write(
+        a.path().join("app").join("BUILD"),
+        remote_target("published"),
+    )?;
+
+    let e1 = remote_engine(a.path(), &uri, "master", &[]);
+    assert_eq!(build(&e1).await?, "cold");
+    let slot = e1.scratch_slots()?[0].slot.clone();
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.home, &slot, "master");
+    std::fs::write(dir.join("bulk"), vec![0u8; 64 * 1024])?;
+    e1.scratch_push(&slot, "master", &dir, None, "run-1")
+        .await?;
+    drop(e1);
+
+    // A second machine with a cap far below the published snapshot. Its first
+    // build pulls — nothing local yet, so nothing is over the cap.
+    let b = tempfile::tempdir()?;
+    std::fs::create_dir_all(b.path().join("build"))?;
+    std::fs::create_dir_all(b.path().join("app"))?;
+    std::fs::write(
+        b.path().join("build").join("BUILD"),
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C",
+       remote = True, max_size = "1KB")"#,
+    )?;
+    std::fs::write(b.path().join("app").join("BUILD"), remote_target("local"))?;
+
+    let e2 = remote_engine(b.path(), &uri, "master", &[]);
+    assert_eq!(
+        build(&e2).await?,
+        "published",
+        "the first build restores it"
+    );
+    drop(e2);
+
+    // Now it is local and over the cap. The next build must drop it and start
+    // cold — not fetch the same oversized snapshot straight back.
+    std::fs::write(b.path().join("app").join("BUILD"), remote_target("second"))?;
+    let e3 = remote_engine(b.path(), &uri, "master", &[]);
+    assert_eq!(
+        build(&e3).await?,
+        "cold",
+        "an over-cap cache is dropped and stays dropped for this run",
+    );
+    Ok(())
+}
+
 /// Generations advance at publish time and are `parent + 1` within a lineage, so
 /// a later publish wins — and republishing identical contents adds nothing.
 #[tokio::test]
@@ -1140,6 +1383,71 @@ async fn a_branch_reads_from_master_and_publishes_to_itself() -> anyhow::Result<
     Ok(())
 }
 
+/// `heph tool scratch head` is the "why did my branch start cold?" answer, and the
+/// question is only answerable if the trace shows the scopes that held *nothing*.
+/// Resolution itself stops at the first hit, so a trace that reported only the
+/// winner would be no better than the resolution it explains.
+#[tokio::test]
+async fn the_resolution_trace_reports_every_candidate_including_the_empty_ones()
+-> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+    let mk = || -> anyhow::Result<tempfile::TempDir> {
+        let d = tempfile::tempdir()?;
+        std::fs::create_dir_all(d.path().join("build"))?;
+        std::fs::create_dir_all(d.path().join("app"))?;
+        std::fs::write(d.path().join("build").join("BUILD"), REMOTE_DECL)?;
+        std::fs::write(d.path().join("app").join("BUILD"), remote_target("x"))?;
+        Ok(d)
+    };
+
+    // Only `master` ever publishes. `release` never does.
+    let m = mk()?;
+    let em = remote_engine(m.path(), &uri, "master", &[]);
+    build(&em).await?;
+    let slot = em.scratch_slots()?[0].slot.clone();
+    let mdir = heph::engine::scratch_remote::scope_head_dir(&em.home, &slot, "master");
+    em.scratch_push(&slot, "master", &mdir, None, "ci-42")
+        .await?;
+
+    // Asked from `pr-1`, falling back to `release` then `master`.
+    let trace = em
+        .scratch_remote_trace(
+            &slot,
+            "pr-1",
+            &["release".to_string(), "master".to_string()],
+        )
+        .await;
+
+    assert_eq!(
+        trace.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+        ["pr-1", "release", "master"],
+        "the trace must be the consult order, own scope first"
+    );
+    assert!(
+        trace[0].1.is_none() && trace[1].1.is_none(),
+        "a scope nobody published to holds nothing: {trace:?}"
+    );
+    let winner = trace[2].1.as_ref().expect("master holds the snapshot");
+    assert_eq!(winner.meta.scope, "master");
+    // The producer is the field that turns "it came from master" into "it came
+    // from *that* run", which is the whole point of recording it.
+    assert_eq!(winner.meta.producer, "ci-42");
+
+    // And the trace agrees with the resolution it explains — the first scope with
+    // anything is what a cold build here would restore.
+    let resolved = em
+        .scratch_remote_head(
+            &slot,
+            "pr-1",
+            &["release".to_string(), "master".to_string()],
+        )
+        .await
+        .expect("resolves to master");
+    assert_eq!(resolved.stem, winner.stem);
+    Ok(())
+}
+
 /// A remote that is unreachable is a cold build, never a failed one — the scratch
 /// contract in its most load-bearing form.
 #[tokio::test]
@@ -1162,5 +1470,100 @@ async fn an_unreachable_remote_degrades_to_a_cold_build() -> anyhow::Result<()> 
         "cold",
         "a dead remote must not fail a build"
     );
+    Ok(())
+}
+
+/// What a broad glob beside a mounted scratch actually does.
+///
+/// It used to be rejected at *parse* time, on the reasoning that the glob would
+/// sweep the cache into the artifact. That reasoning was wrong: collection uses
+/// `symlink_metadata` and takes `is_file() || is_symlink()`, and `walkdir` does
+/// not follow symlinks — so a glob reaching a mount collects the *symlink*, never
+/// what is behind it. The parse-time guard was also redundant, because the packer
+/// already refuses an absolute symlink, and says so precisely.
+///
+/// So this is the behaviour today: the build runs, and packing fails naming the
+/// mount. **Still not right** — heph created that symlink, the author did not, so
+/// collection ought to skip it rather than hand the author an error about it.
+/// Fixing that means threading the mount paths into `collect_outputs`; until
+/// then this test pins what actually happens rather than what should.
+///
+/// The overlap that is genuinely invalid is a mount landing on a materialized
+/// input — that destroys a real file, and is covered by
+/// `a_scratch_cannot_mount_over_a_materialized_input`.
+#[tokio::test]
+async fn a_broad_glob_beside_a_mount_fails_in_the_packer_not_the_parser() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "build",
+        r#"target(name = "c", driver = "scratch", path = ".cache/x", env = "C")"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "**/*", scratch = ["//build:c"],
+       run = ["echo hi > o.txt", "echo cached > \"$C/entry\""])"#,
+    );
+
+    let err = expect_err(
+        ws.run("//app:a").await,
+        "packing must refuse the mount symlink",
+    );
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("absolute symlink not allowed"),
+        "the packer's own check is what rejects it now: {msg}"
+    );
+    // And it names the mount, which is the part a person needs.
+    assert!(msg.contains(".cache/x"), "must name the mount: {msg}");
+    Ok(())
+}
+
+/// `pull` must work on a machine that has never built — warming exactly that
+/// machine is what it is for. Selecting from the local store instead of the graph
+/// made it a no-op in its only real use case.
+///
+/// And a pull-warmed slot must still describe itself, or the store stops being
+/// listable and removable the moment it is populated any way but by building.
+#[tokio::test]
+async fn a_cold_machine_can_pull_what_it_has_never_built() -> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+
+    // Machine one publishes.
+    let a = tempfile::tempdir()?;
+    std::fs::create_dir_all(a.path().join("build"))?;
+    std::fs::create_dir_all(a.path().join("app"))?;
+    std::fs::write(a.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    std::fs::write(
+        a.path().join("app").join("BUILD"),
+        remote_target("published"),
+    )?;
+    let e1 = remote_engine(a.path(), &uri, "master", &[]);
+    build(&e1).await?;
+    let slot = e1.scratch_slots()?[0].slot.clone();
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.home, &slot, "master");
+    e1.scratch_push(&slot, "master", &dir, None, "run-1")
+        .await?;
+
+    // Machine two has built nothing at all, so it has no slots to enumerate.
+    let b = tempfile::tempdir()?;
+    std::fs::create_dir_all(b.path().join("build"))?;
+    std::fs::write(b.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    let e2 = remote_engine(b.path(), &uri, "master", &[]);
+    assert!(
+        e2.scratch_slots()?.is_empty(),
+        "precondition: the second machine is genuinely cold"
+    );
+
+    // The head is discoverable without any local state — which is what makes a
+    // graph-driven `pull` possible.
+    let head = e2
+        .scratch_remote_head(&slot, "master", &[])
+        .await
+        .expect("a cold machine must still find the published head");
+    let dir2 = heph::engine::scratch_remote::scope_head_dir(&e2.home, &slot, "master");
+    let bytes = e2.scratch_pull(&head, &dir2).await?;
+    assert!(bytes > 0);
+    assert!(dir2.join("marker").exists(), "the payload must have landed");
     Ok(())
 }
