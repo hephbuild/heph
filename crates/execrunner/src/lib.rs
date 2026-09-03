@@ -392,6 +392,23 @@ async fn prepare(
     // side could equally be either.
     let declared = get_env(&spec.env, "PATH");
 
+    // The prefix has to be on the environment the runner *carries*, not only on
+    // the one this process ends up spawning. A runner may move the target's
+    // environment out of band — `oci` turns it into `docker exec -e KEY=VALUE`
+    // arguments and hands back the *client's* environment — and anything
+    // composed after `prepare` then decorates the docker client while the
+    // target inside the container gets neither its declared tools nor heph's
+    // builtins. Silently: the container falls back to the image's own tools, so
+    // the recipe keeps working with a different binary than its cache key names.
+    //
+    // Composing here puts the prefix on the wire the runner already carries.
+    // The composition after `prepare` still runs, and still orders the runner's
+    // own `PATH` behind the prefix for every runner that leaves the environment
+    // in place; `join_path` dedupes, so doing both is idempotent.
+    if let Some(carried) = carried_path(path, declared.as_ref()) {
+        set_path(&mut spec.env, carried);
+    }
+
     let outcome = host
         .prepare(runner.request_id, addr, SpecRewrite::split(spec), ctoken)
         .await?;
@@ -440,6 +457,16 @@ fn compose_path(
     if let Some(p) = composed {
         set_path(env, p);
     }
+}
+
+/// The `PATH` handed to the runner: the target's prefix ahead of what it
+/// declared.
+///
+/// Separate from the composition that follows `prepare` because a runner may
+/// carry the environment out of band, and then this is the only copy the target
+/// ever sees. See [`PathPolicy`].
+fn carried_path(path: &PathPolicy, declared: Option<&OsString>) -> Option<OsString> {
+    join_path(path.prefix.iter().cloned().chain(declared.cloned()))
 }
 
 fn set_path(env: &mut Vec<(OsString, OsString)>, value: OsString) {
@@ -652,6 +679,40 @@ mod tests {
             path_of(&spec.env).as_deref(),
             Some("/sandbox/bin:/usr/local/bin:/usr/bin")
         );
+    }
+
+    /// A runner may carry the target's environment **out of band**: `oci` turns
+    /// it into `docker exec -e KEY=VALUE` arguments and hands back the *docker
+    /// client's* environment. So the prefix — the target's declared tools, and
+    /// heph's builtin utilities — has to be on the environment handed *to* the
+    /// runner, because for such a runner that is the only copy the target ever
+    /// sees.
+    ///
+    /// Composing only after `prepare` decorated the docker client instead, and
+    /// the target inside the container got neither. Silently: the container
+    /// falls back to the image's own tools, so the recipe keeps working with a
+    /// different binary than its cache key names.
+    #[test]
+    fn the_path_handed_to_a_runner_leads_with_the_targets_prefix() {
+        let carried = carried_path(
+            &policy(&["/sandbox/bin", "/heph/coreutils/bin"], Some("/fallback")),
+            Some(&os("/declared")),
+        );
+        assert_eq!(
+            carried.as_deref(),
+            Some(std::ffi::OsStr::new(
+                "/sandbox/bin:/heph/coreutils/bin:/declared"
+            )),
+            "the target's tools and heph's builtins must lead the PATH the runner carries"
+        );
+    }
+
+    /// The fallback is the driver's sandbox `PATH`, and it is not part of what a
+    /// runner carries: reinstating it out of band would put `/usr/bin` inside
+    /// the environment the target asked to run in.
+    #[test]
+    fn nothing_is_carried_to_a_runner_when_there_is_no_prefix_and_no_declaration() {
+        assert_eq!(carried_path(&policy(&[], Some("/usr/bin")), None), None);
     }
 
     #[test]
