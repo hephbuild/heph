@@ -1,6 +1,6 @@
 # Builtin coreutils
 
-heph ships 40 POSIX utilities inside its own binary and can put them on every
+heph ships 48 POSIX utilities inside its own binary and can put them on every
 target's `PATH`, so a recipe that runs `cp`, `install` or `sha256sum` behaves
 identically on Linux and macOS.
 
@@ -131,7 +131,8 @@ exists to prevent.
 ## The applets
 
 Forty MIT-licensed [uutils/coreutils] crates, tested upstream against the GNU
-test suite. Adding one is a line in the `applets!` table in
+test suite; `find` and `xargs` from [uutils/findutils]; and a `grep` built on
+ripgrep's search engine. Adding one is a line in the `applets!` table in
 `crates/coreutils/src/lib.rs` plus its crate in `Cargo.toml` — and a
 `COREUTILS_VERSION` bump.
 
@@ -147,8 +148,89 @@ fetching, hermetically and cacheably), `git`, `uname` (normalising `arm64` vs
 `aarch64` would change recipes that already switch on it), `du`/`df` (they
 answer questions about the machine, not the build), and anything interactive.
 
-`sed`, `grep`, `find`, `xargs`, `tar`, `gzip` and a template renderer are not in
-yet; they are the next slices.
+The applet set is complete. `diff`/`cmp`
+are not planned: the `diffutils` crate exposes its algorithms but keeps its CLI
+in a private `main`, so wiring it up would mean reimplementing its argument
+parsing for the lowest-value pair in the set.
+
+### `sed`, and the BRE translation
+
+The sharpest divergence in the set: GNU's `-i` takes an *optional* attached
+suffix and BSD's requires a separate one, so `sed -i 's/a/b/' f` edits the file
+on Linux and eats the next argument as a filename on macOS. heph takes GNU's
+form, and refuses BSD's (`sed -i '' …`) with the fix spelled out rather than
+silently treating `''` as the script and doing nothing.
+
+No embeddable POSIX sed exists in Rust, so this one is written here, over the
+`regex` crate — which has **no backreferences and no lookaround, by design**.
+The rule for that gap is *reject loudly, never approximate*: an unsupported
+construct is an error naming the construct, never a silently different match.
+
+Basic regular expressions are supported by translating them to the extended
+syntax the engine speaks: `\(` becomes `(`, a bare `+` becomes `\+`, and
+bracket expressions are passed through untouched because nothing inside them
+follows either set of rules. Without that translation the single most common
+idiom in real scripts — `s/\(a\)\(b\)/\2\1/` — would not compile, and
+"reject loudly" would mean rejecting almost everything.
+
+Supported: `s` (with `g`, `p`, `i`, and a numeric flag), `y`, `d`, `p`, `q`,
+`=`, `a`, `i`, `c`; addresses by line, `$`, `/re/`, ranges and `!`; `-n`, `-e`,
+`-f`, `-i[SUFFIX]`, `-E`/`-r`. Command groups (`{ … }`) are refused rather than
+half-supported. Both `a text` (GNU) and `a\` + newline (BSD) are accepted, since
+the point is that one script runs on both hosts.
+
+In-place editing writes through a temporary in the same directory and renames.
+A truncate-then-write loses the file if anything fails halfway, and this is
+editing someone's source.
+
+### `grep`, and where it departs from GNU
+
+Built on `grep-searcher`/`grep-regex` — the engine ripgrep uses — with a POSIX
+flag surface of our own (`-EFivnclLqwxrhHs`, `-m`, `-e`, `-f`, `--`). Two
+departures, both deliberate:
+
+* **No `-P`.** The `regex` crate has no backreferences or lookaround, by
+  design. `-P` fails with that explanation rather than with "invalid option",
+  because a pattern needing it has to be rewritten, not retried.
+* **Never colourised.** Output goes into build logs and gets parsed; a
+  `--color=auto` that guessed from a tty would make a recipe's behaviour depend
+  on how it was invoked.
+
+The argument parser is hand-rolled rather than clap, because `grep -e -v file`
+must treat `-v` as the *pattern*. Line numbers are always counted and only
+printed under `-n`: the `UTF8` sink asks every match for its line number and
+fails if the searcher was not tracking them.
+
+### `tar`, `gzip`/`gunzip` and `zstd` — reproducible by default
+
+The applets where the divergence is not a flag but the *bytes*. GNU tar and
+bsdtar disagree about whether `--transform`, `--sort`, `--owner` and `--mtime`
+exist at all; `gzip` writes the source filename and its mtime into the header
+unless told not to; `zstd` is installed by default on neither host.
+
+Archiving the same tree twice, on two machines, should produce the same bytes.
+With the host tools it does not — gzipping identical content a second later
+gives a different file. So the reproducible settings are the **defaults**, not
+flags anyone has to remember:
+
+* entries sorted by path, so the archive does not inherit directory order;
+* uid/gid 0 and empty owner *names*, so it does not inherit whoever built it;
+* mode normalised to the executable bit, since the rest is umask;
+* mtime from `SOURCE_DATE_EPOCH` when set, otherwise 0;
+* no gzip header name or timestamp.
+
+There is deliberately no flag to turn any of that off. A recipe that wants a
+non-reproducible archive is a recipe with a bug.
+
+Compression is detected from the magic bytes rather than the file name, so a
+`.tar` that is actually gzipped still extracts instead of failing confusingly.
+
+### `find` and `xargs`
+
+Straight adapters over findutils. Its entry points take `&[&str]`, so a
+non-UTF-8 argument is refused by name rather than lossily converted — GNU `find`
+accepts arbitrary bytes in a path and this cannot, and searching a *different*
+path than the one asked for is worse than saying so.
 
 ## One process per invocation
 
@@ -162,3 +244,4 @@ self-update check, and before any runtime exists. A build may invoke `cp`
 thousands of times, and each one is a fresh `heph` process.
 
 [uutils/coreutils]: https://github.com/uutils/coreutils
+[uutils/findutils]: https://github.com/uutils/findutils
