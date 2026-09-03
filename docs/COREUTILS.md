@@ -34,18 +34,26 @@ those outputs undeclared and host-defined.
 
 ## Using it
 
-Off by default. Turning it on changes what every recipe's `cp` resolves to, and
-it moves every exec target's cache key.
+**On by default.** There is nothing to configure: a recipe that runs `cp`
+behaves the same on Linux and macOS because the toolbox is already on its
+`PATH`. A toolbox nobody enables fixes nothing.
+
+The escape hatch is per driver, for a workspace that genuinely wants the host's
+tools:
 
 ```yaml
 plugins:
   - builtin: exec
     options:
-      coreutils: true
+      coreutils: false
   - builtin: bash
     options:
-      coreutils: true
+      coreutils: false
 ```
+
+Opting out is folded into the def hash too, so it is a cache-visible decision
+rather than a silent one — turning it off invalidates the targets it affects,
+which is what you want, because their outputs may change.
 
 `heph tool coreutils list` prints the set. `heph tool coreutils which cp` says
 whether heph ships that name and what the host would supply instead — the two
@@ -120,8 +128,8 @@ deliberate:
 
 Bump it on any observable behaviour change: an applet added or removed, an
 upstream upgrade that changes output, a fix to a hand-written part. Nothing is
-hashed at all while the toolbox is off, so a workspace that never turns it on
-keeps the keys it has today.
+hashed at all while the toolbox is off, so a workspace that opts out keeps the
+keys it would have had without this feature.
 
 Resolving the shim directory is fallible on purpose. Degrading to "no builtins"
 would run the target against the host's utilities while its cache key claims

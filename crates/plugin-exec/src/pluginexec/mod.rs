@@ -52,8 +52,10 @@ pub struct Driver {
     /// unchanged when it was switched on.
     default_runner: Option<String>,
     /// Whether this driver puts heph's builtin utilities on its targets' PATH,
-    /// from the `coreutils:` option. Off by default: turning it on changes what
-    /// every recipe's `cp` resolves to, and it moves every exec cache key.
+    /// from the `coreutils:` option. On by default — the whole point is that a
+    /// recipe behaves the same on both hosts without opting in. A driver built
+    /// directly rather than from options starts off, because only a host that
+    /// knows the heph home can supply the shims.
     coreutils_enabled: bool,
     /// The toolbox version to hash, and how to get its shim directory —
     /// supplied by the host, which is the thing that knows the heph home.
@@ -431,13 +433,15 @@ fn decode_path(opts: &hplugin::config::Options) -> anyhow::Result<Vec<String>> {
     Ok(hplugin::config::decode_opt(opts, "exec/bash/sh driver", "path")?.unwrap_or_default())
 }
 
-/// `coreutils: true` puts heph's builtin utilities on every target's PATH.
+/// `coreutils:` puts heph's builtin utilities on every target's PATH.
 ///
-/// Off by default. Turning it on is a behaviour change to every recipe — the
-/// `cp` a target runs stops being the host's — and it moves every exec target's
-/// cache key, so it stays opt-in until a release makes it the default.
+/// **On by default.** The point of shipping them is that a recipe behaves the
+/// same on Linux and macOS without anyone opting in; a toolbox nobody enables
+/// fixes nothing. `coreutils: false` is the escape hatch for a workspace that
+/// genuinely wants the host's tools, and opting out is itself folded into the
+/// def hash, so it is a cache-visible decision rather than a silent one.
 fn decode_coreutils(opts: &hplugin::config::Options) -> anyhow::Result<bool> {
-    Ok(hplugin::config::decode_opt(opts, "exec/bash/sh driver", "coreutils")?.unwrap_or(false))
+    Ok(hplugin::config::decode_opt(opts, "exec/bash/sh driver", "coreutils")?.unwrap_or(true))
 }
 
 /// The workspace-wide default runner, from `options.runner`.
@@ -2661,6 +2665,13 @@ mod tests {
         opts.insert(
             "path".to_string(),
             serde_yaml::from_str("[/nonexistent-test-search-dir]").expect("yaml"),
+        );
+        // The toolbox is on by default, and this test is about the spawn
+        // diagnostic rather than about `PATH` composition — so it opts out
+        // rather than standing up a shim directory it would never look at.
+        opts.insert(
+            "coreutils".to_string(),
+            serde_yaml::from_str("false").expect("yaml"),
         );
         let driver = Driver::from_options_exec(&opts)?;
         let ctoken = StdCancellationToken::new();
@@ -5382,10 +5393,24 @@ mod tests {
     }
 
     #[test]
-    fn coreutils_is_off_unless_asked_for() {
-        // The default must stay off: turning it on changes what every recipe's
-        // `cp` resolves to and moves every exec cache key.
-        let d = Driver::from_options_exec(&hplugin::config::Options::new()).expect("from_options");
+    fn coreutils_is_on_unless_turned_off() {
+        // The default is on: a toolbox nobody enables fixes nothing.
+        let on = Driver::from_options_exec(&hplugin::config::Options::new()).expect("from_options");
+        assert!(on.coreutils_enabled, "the toolbox must be on by default");
+
+        // And `coreutils: false` must still turn it off, since that is the
+        // escape hatch for a workspace that wants the host's tools.
+        let off = Driver::from_options_exec(&coreutils_opts(false)).expect("from_options");
+        assert!(!off.coreutils_enabled);
+        assert!(off.coreutils_version().is_none());
+    }
+
+    #[test]
+    fn a_driver_built_without_options_starts_off() {
+        // `new_exec` is what test harnesses and the shell fallback use. They
+        // have no heph home to materialize shims under, so the toolbox must not
+        // switch itself on there and then assert about missing shims.
+        let d = Driver::new_exec();
         assert!(!d.coreutils_enabled);
         assert!(d.coreutils_version().is_none());
     }

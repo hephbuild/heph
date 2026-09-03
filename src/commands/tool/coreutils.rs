@@ -148,8 +148,9 @@ fn which(args: &WhichArgs) -> anyhow::Result<()> {
     if builtin {
         writeln!(
             out,
-            "A target gets the builtin when the exec/bash driver has `coreutils: true`,\n\
-             unless it declares a tool of the same name — a target's own tools always win."
+            "A target gets the builtin unless it declares a tool of the same name — a\n\
+             target's own tools always win — or the exec/bash driver is configured with\n\
+             `coreutils: false`."
         )?;
     } else {
         writeln!(
