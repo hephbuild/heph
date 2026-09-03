@@ -3,7 +3,8 @@ use heph::engine::driver::Driver as SDKDriver;
 use heph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use heph::engine::provider::Provider as SDKProvider;
 use heph::engine::{
-    Config, EResult, Engine, EngineTargetSpec, OutputMatcher, PluginInit, ResultOptions,
+    Config, EResult, Engine, EngineTargetSpec, ExtendedTargetDef, OutputMatcher, PluginInit,
+    ResultOptions,
 };
 use heph::htaddr::{Addr, parse_addr};
 use std::path::{Path, PathBuf};
@@ -211,6 +212,26 @@ impl Workspace {
         let addr = parse_addr(addr_str)?;
         let rs = self.engine.new_state();
         self.engine.clone().get_spec(rs, &addr).await
+    }
+
+    /// The parsed def, for asserting on what a driver produced — inputs, output
+    /// groups, cache settings — without running the target.
+    pub async fn get_def(&self, addr_str: &str) -> anyhow::Result<Arc<ExtendedTargetDef>> {
+        let addr = parse_addr(addr_str)?;
+        let rs = self.engine.new_state();
+        self.engine.clone().get_def(rs, &addr).await
+    }
+
+    /// A target's input hash: the cache key itself.
+    ///
+    /// The right assertion for anything claiming to change, or not change, what
+    /// a target is keyed by. Comparing artifacts instead proves only that two
+    /// builds agreed on an answer, not that they would have shared an entry —
+    /// which is the property a cache-key change actually breaks.
+    pub async fn hashin(&self, addr_str: &str) -> anyhow::Result<String> {
+        let addr = parse_addr(addr_str)?;
+        let rs = self.engine.new_state();
+        Ok(self.engine.clone().meta(rs, &addr).await?.hashin)
     }
 }
 

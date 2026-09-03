@@ -20,7 +20,8 @@ extern crate core;
 // module paths so `crate::hasync::…` etc. keep resolving unchanged across the
 // monolith.
 pub use hbuiltins::{
-    pluginfs, plugingroup, pluginhostbin, pluginscratch, pluginstatictarget, plugintextfile,
+    pluginfs, plugingroup, pluginhostbin, pluginscratch, pluginsecret, pluginstatictarget,
+    plugintextfile,
 };
 pub use hcore::{
     debug_hash, defer, hartifactcontent, hasync, hmemoizer, htplatform, htvalue, version,

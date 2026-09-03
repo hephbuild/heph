@@ -11,6 +11,7 @@ hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hwalk = { package = "walk", path = "../walk" }
 hplugin = { package = "plugin", path = "../plugin" }
+hsecrets = { package = "secrets", path = "../secrets" }
 anyhow = "1.0.102"
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1.89"
@@ -26,7 +27,9 @@ tracing = "0.1"
 itertools = "0.15.0"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "macros", "sync", "fs", "process"] }
 
+[dependencies.serde_json]
+version = "1.0"
+
 [dev-dependencies]
-serde_json = "1.0"
 serde_yaml = "0.9"
 tempfile = "3"

@@ -529,6 +529,11 @@ impl Engine {
         };
         engine.register_driver(|_| Box::new(hbuiltins::plugingroup::Driver))?;
         engine.register_driver(|_| Box::new(hbuiltins::pluginscratch::Driver))?;
+        // `secret`, like `scratch`, is a declaration driver: the engine reads
+        // its spec directly (see `hbuiltins::pluginsecret::parse_declaration`)
+        // so the shape-collision and policy checks run without building or
+        // minting anything, which is what keeps them alive on a warm build.
+        engine.register_driver(|_| Box::new(hbuiltins::pluginsecret::Driver))?;
         engine.register_provider(|_| Box::new(hplugin_query::pluginquery::Provider))?;
 
         // The `fs` provider + driver are always-on built-ins. Each builds its

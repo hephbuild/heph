@@ -60,6 +60,7 @@ pub mod spec;
 pub use result::ArtifactMeta;
 pub use result::BatchResult;
 pub use result::EResult;
+pub use result::ExtendedTargetDef;
 pub use result::OutputMatcher;
 pub use result::ResultOptions;
 pub use result::{InteractiveInner, InteractiveWrapper};
