@@ -92,7 +92,8 @@ in one direction and a permanent full-miss in the other.
 heph ships 40 POSIX utilities inside the binary (`crates/coreutils`) and can put
 them on every target's `PATH`, so `cp`/`install`/`sha256sum` behave the same on
 Linux and macOS. On by default; `coreutils: false` on the `exec`/`bash` driver
-opts out.
+opts out. The host's directories are **not** on a target's `PATH` — it sees its
+own tools plus the builtins, and nothing else.
 
 Read `docs/COREUTILS.md` before touching it. The one thing to know going in:
 `COREUTILS_VERSION` is folded into every exec target's def hash when the toolbox

@@ -74,7 +74,14 @@ async fn runner_json_never_enters_the_sandbox() -> anyhow::Result<()> {
     let ws = Workspace::new();
     let mut build = runner_target(
         "runner",
-        r#"{"version": 1, "fingerprint": "fp-1", "runner": "wrap", "config": {}}"#,
+        // The runner supplies the environment its targets run in, `PATH`
+        // included. The driver's own search path is deliberately not injected
+        // under a runner — putting the host's directories in front of the
+        // environment would let a host tool shadow the one the target asked to
+        // run beside — so a runner that names no `PATH` gives its targets only
+        // their declared tools.
+        r#"{"version": 1, "fingerprint": "fp-1", "runner": "wrap",
+ "config": {"env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}}}"#,
     );
     build.push_str(
         r#"

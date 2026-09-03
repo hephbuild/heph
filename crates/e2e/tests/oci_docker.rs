@@ -196,7 +196,9 @@ fn workspace() -> htestkit::Workspace {
                 init.runtime.clone(),
             ))
         })
-        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         .with_managed_driver(Box::new(pluginoci::docker_build::Driver::new()))
         .with_provider(|_| Box::new(pluginoci::platform::Provider))
         .with_managed_driver(Box::new(pluginoci::platform::Driver::new()))

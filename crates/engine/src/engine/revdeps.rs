@@ -116,8 +116,9 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine
-            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))

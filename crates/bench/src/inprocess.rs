@@ -63,9 +63,9 @@ fn build_engine(root: &Path) -> Result<Arc<Engine>> {
         ))
     })
     .context("register pluginbuildfile provider")?;
-    e.register_managed_driver(|_| Box::new(heph::pluginexec::Driver::new_exec()))
+    e.register_managed_driver(|_| Box::new(heph::pluginexec::Driver::new_exec().with_host_path()))
         .context("register exec driver")?;
-    e.register_managed_driver(|_| Box::new(heph::pluginexec::Driver::new_bash()))
+    e.register_managed_driver(|_| Box::new(heph::pluginexec::Driver::new_bash().with_host_path()))
         .context("register bash driver")?;
     Ok(Arc::new(e))
 }

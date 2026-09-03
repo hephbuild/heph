@@ -175,12 +175,12 @@ composed into the environment this process spawns, and therefore deliberately
 does not reach a runner carrying the environment out of band: those are host
 paths, and a container's filesystem is not this one.
 
-What is **not** in there is the exec driver's own sandbox `PATH`
-(`/usr/local/bin:/usr/bin:/bin`, or its `path:` option). Under a runner the
-driver does not inject it at all: it is a fallback for a local spawn, and
-putting it in front of the environment would let a host-installed tool silently
-shadow the one the target asked to run beside — inside a cache key that claims
-the runner's environment.
+What is **not** in there is the host's directories. They are not injected under
+a runner — putting them in front of the environment would let a host-installed
+tool silently shadow the one the target asked to run beside, inside a cache key
+that claims the runner's environment — and, since heph ships its own utilities,
+they are not injected for a local spawn either. See `COREUTILS.md`. The driver's
+`path:` option names directories back for a workspace that needs them.
 
 ## The fingerprint, and why it exists
 

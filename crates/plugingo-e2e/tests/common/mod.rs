@@ -470,8 +470,8 @@ fn make_workspace_ordered_runner(
     }
 
     let r = || runner.clone();
-    b.with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
+    b.with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
+        .with_managed_driver(Box::new(pluginexec::Driver::new_exec().with_host_path()))
         .with_managed_driver(Box::new(hplugin_devenv::plugindevenv::Driver::new()))
         .with_managed_driver(Box::new(
             plugingo::GoGolistDriver::new().with_default_runner(r()),

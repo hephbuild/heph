@@ -46,7 +46,7 @@ fn build_engine(root: &Path, remote_uri: &str) -> Arc<Engine> {
         ))
     })
     .expect("register buildfile provider");
-    e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash()))
+    e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))
         .expect("register bash driver");
     Arc::new(e)
 }
@@ -277,7 +277,7 @@ async fn output_is_nondeterministic_without_cache() {
             ))
         })
         .expect("provider");
-        e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash()))
+        e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))
             .expect("driver");
         Arc::new(e)
     };
