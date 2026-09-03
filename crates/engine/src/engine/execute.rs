@@ -27,6 +27,7 @@ impl Engine {
         hashin: &str,
         exec_wrapper: Option<InteractiveWrapper>,
         shell: bool,
+        no_scratch: bool,
     ) -> anyhow::Result<(
         Vec<OutputArtifact>,
         crate::engine::sandbox_cleaner::SandboxTeardown,
@@ -57,7 +58,7 @@ impl Engine {
             .await
             .with_context(|| format!("resolve scratch for {addr}"))?;
         let (scratch_mounts, _scratch_guards) = self
-            .acquire_scratch(&rs, addr, &resolved_scratch)
+            .acquire_scratch(&rs, addr, &resolved_scratch, no_scratch)
             .await
             .with_context(|| format!("acquire scratch for {addr}"))?;
 

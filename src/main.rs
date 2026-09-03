@@ -137,6 +137,8 @@ fn main() -> ExitCode {
     // did not anticipate — you would have to have passed a flag on the run that
     // is already stuck. Costs one `signal(2)` at startup; the file is opened
     // lazily inside the handler.
+    // Applied before any engine is constructed, since it decides whether the
+    // engine resolves scratch caches at all.
     diag::install(cli.global.diag_backtrace);
 
     // When `--pprof-cpu` is set, start the sampler + `SIGUSR2` dump watcher.

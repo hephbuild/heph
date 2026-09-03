@@ -752,7 +752,7 @@ impl RequestState {
     /// Emit the `RequestConfig` announcement at most once per request. Safe to
     /// call from every top-level entry point (`result`, `result_addr`); only the
     /// first call emits, so dep recursion never re-announces.
-    pub fn announce_request_config(&self, count: usize) {
+    pub fn announce_request_config(&self, count: usize, scratch_disabled: bool) {
         if !self
             .data
             .workers_announced
@@ -761,6 +761,7 @@ impl RequestState {
             self.emit(crate::engine::event::BuildEventKind::RequestConfig {
                 max_workers: count,
                 fail_fast: self.data.fail_fast,
+                scratch_disabled,
             });
         }
     }

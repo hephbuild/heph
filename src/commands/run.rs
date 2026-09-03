@@ -111,6 +111,9 @@ struct RunApp {
     matcher: Matcher,
     fail_fast: bool,
     auto_approve: bool,
+    /// `--no-scratch`: run with every declared scratch cache absent. Implies a
+    /// forced rebuild — see where `force` is set.
+    scratch_off: bool,
     /// Shared approval queue: attached to the TUI view (so prompts render) and to
     /// the TUI approval handler (so keypresses resolve them). Unused in non-TUI
     /// mode, which prompts on the terminal instead.
@@ -194,10 +197,13 @@ impl App for RunApp {
         };
 
         let opts = ResultOptions {
+            // `--no-scratch` implies `--force`; the engine applies that from
+            // `no_scratch` below, so it is not repeated here.
             force: self.args.force,
             shell: self.args.shell.is_some(),
             interactive,
             frozen: self.args.frozen,
+            no_scratch: self.scratch_off,
         };
         // In the interactive TUI the prompt renders on the live view and `y`/`n`
         // resolve it; otherwise the notice prints to stderr and the decision is
@@ -313,6 +319,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         matcher: m,
         fail_fast: global.fail_fast,
         auto_approve: global.auto_approve,
+        scratch_off: global.no_scratch,
         approval: tui::ApprovalCenter::new(),
     };
     let interactive = tui::should_use_tui(global.no_tui);

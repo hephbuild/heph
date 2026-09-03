@@ -29,7 +29,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use hcore::events::{BuildEvent, BuildEventKind, LogTailData};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// How many completed targets to retain for the "slowest" table. The heap is
 /// capped at this, so the memory is constant regardless of graph size.
@@ -45,6 +45,11 @@ pub(crate) const ROOTS_KEPT: usize = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     Execute,
+    /// Warming a scratch cache before the target can run — seeding a lineage or
+    /// pulling a snapshot from the remote. On the critical path (it holds the
+    /// slot guard and precedes the worker permit), so unlike a background upload
+    /// it belongs in "running longest".
+    ScratchPrepare,
     CachePull,
     LocalCacheWrite,
     RemoteCacheWrite,
@@ -54,6 +59,7 @@ impl Phase {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Phase::Execute => "execute",
+            Phase::ScratchPrepare => "scratch prepare",
             Phase::CachePull => "cache pull",
             Phase::LocalCacheWrite => "cache write",
             Phase::RemoteCacheWrite => "remote cache write",
@@ -219,6 +225,7 @@ pub(crate) struct Tally {
     /// Whether this invocation stops at the first failure. Reported by the
     /// engine, never inferred here — see `BuildEventKind::RequestConfig`.
     fail_fast: bool,
+    scratch_disabled: bool,
     /// Open scratch waits: consumer -> (cache, started at). Drained into
     /// `scratch_waits` when the wait ends.
     scratch_wait_since: FxHashMap<Box<str>, (Box<str>, u64)>,
@@ -226,6 +233,9 @@ pub(crate) struct Tally {
     /// number worth reporting — one target blocked briefly is noise, dozens
     /// blocked between them is why the job was slow.
     scratch_waits: FxHashMap<Box<str>, (u64, u64)>,
+    /// Caches restored at a path they were not produced at, so they are present
+    /// and inert. Named because nothing else distinguishes this from a hit.
+    scratch_inert: FxHashSet<Box<str>>,
     first_event_ms: Option<u64>,
     last_event_ms: u64,
 
@@ -277,9 +287,11 @@ impl Tally {
             BuildEventKind::RequestConfig {
                 max_workers,
                 fail_fast,
+                scratch_disabled,
             } => {
                 self.max_workers = *max_workers;
                 self.fail_fast = *fail_fast;
+                self.scratch_disabled = *scratch_disabled;
             }
 
             BuildEventKind::Matched { addrs, complete } => {
@@ -355,6 +367,20 @@ impl Tally {
                 }
             }
 
+            BuildEventKind::ScratchPrepareStart { addr, .. } => {
+                self.start_phase(addr, Phase::ScratchPrepare, ev.at_unix_ms);
+            }
+            BuildEventKind::ScratchPrepareEnd {
+                addr,
+                scratch,
+                path_mismatch,
+                ..
+            } => {
+                if *path_mismatch {
+                    self.scratch_inert.insert(scratch.as_str().into());
+                }
+                self.clear_phase(addr);
+            }
             BuildEventKind::RemoteCacheReadStart { addr } => {
                 self.start_phase(addr, Phase::CachePull, ev.at_unix_ms);
             }
@@ -609,6 +635,18 @@ impl Tally {
 
     pub(crate) fn fail_fast(&self) -> bool {
         self.fail_fast
+    }
+
+    pub(crate) fn scratch_disabled(&self) -> bool {
+        self.scratch_disabled
+    }
+
+    /// Caches that were restored but are inert — present, unused, and
+    /// indistinguishable from a hit anywhere else in the report.
+    pub(crate) fn scratch_inert(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.scratch_inert.iter().map(|s| &**s).collect();
+        v.sort_unstable();
+        v
     }
 
     /// Caches that serialized targets this run, as `(cache, waiters, total ms)`,
@@ -1101,6 +1139,89 @@ mod tests {
         assert!(t.scratch_waits().is_empty(), "no wait was ever announced");
     }
 
+    fn prepared(t: &mut Tally, addr: &str, scratch: &str, outcome: &str, mismatch: bool) {
+        t.apply(&ev(
+            0,
+            BuildEventKind::ScratchPrepareStart {
+                addr: addr.into(),
+                scratch: scratch.into(),
+            },
+        ));
+        t.apply(&ev(
+            1,
+            BuildEventKind::ScratchPrepareEnd {
+                addr: addr.into(),
+                scratch: scratch.into(),
+                outcome: outcome.into(),
+                bytes: 0,
+                path_mismatch: mismatch,
+                error: None,
+            },
+        ));
+    }
+
+    /// An inert restore is collected and deduped by cache — 50 consumers of one
+    /// inert cache is one problem, not 50 identical warnings.
+    #[test]
+    fn an_inert_restore_is_reported_once_per_cache() {
+        let mut t = Tally::default();
+        for i in 0..50 {
+            prepared(
+                &mut t,
+                &format!("//a:x{i}"),
+                "//build:gocache",
+                "pulled",
+                true,
+            );
+        }
+        assert_eq!(t.scratch_inert(), vec!["//build:gocache"]);
+    }
+
+    /// An ordinary outcome is not a problem — otherwise every cold CI run would
+    /// raise a warning.
+    #[test]
+    fn a_normal_prepare_reports_no_problem() {
+        let mut t = Tally::default();
+        prepared(&mut t, "//a:x", "//build:gocache", "warm", false);
+        prepared(&mut t, "//a:y", "//build:gocache", "pulled", false);
+        assert!(t.scratch_inert().is_empty());
+    }
+
+    /// A target warming its cache shows as in-flight under its own phase label.
+    /// It is on the critical path — it holds the slot guard and runs before the
+    /// worker permit — so unlike a background upload it belongs in "running
+    /// longest".
+    #[test]
+    fn a_scratch_prepare_is_a_foreground_phase() {
+        let mut t = Tally::default();
+        t.apply(&ev(
+            0,
+            BuildEventKind::ScratchPrepareStart {
+                addr: "//a:x".into(),
+                scratch: "//build:gocache".into(),
+            },
+        ));
+        let (running, _) = t.running_longest(60_000, 1_000, 5);
+        assert_eq!(running.len(), 1, "the target is in flight");
+        assert_eq!(running[0].1, "scratch prepare", "under its own phase label");
+
+        t.apply(&ev(
+            1_000,
+            BuildEventKind::ScratchPrepareEnd {
+                addr: "//a:x".into(),
+                scratch: "//build:gocache".into(),
+                outcome: "warm".into(),
+                bytes: 0,
+                path_mismatch: false,
+                error: None,
+            },
+        ));
+        assert!(
+            t.running_longest(60_000, 1_000, 5).0.is_empty(),
+            "the phase cleared",
+        );
+    }
+
     #[test]
     fn counters_are_graph_wide() {
         // Decision recorded in docs/GHA_REPORTING.md §13.4: `executed` and
@@ -1301,6 +1422,7 @@ mod tests {
             BuildEventKind::RequestConfig {
                 max_workers: 16,
                 fail_fast: false,
+                scratch_disabled: false,
             },
         ));
         t.apply(&ev(

@@ -92,6 +92,13 @@ pub fn telemetry_enabled_from_config() -> bool {
         .unwrap_or(true)
 }
 
+/// Build the engine for this invocation.
+///
+/// Takes nothing from the CLI. Everything a *run* can switch — `--force`,
+/// `--shell`, `--frozen`, `--no-scratch` — rides on `ResultOptions` rather than
+/// on the engine, so one engine serves an ordinary request and an audit request
+/// without being rebuilt, and each switch has exactly one source of truth. Only
+/// workspace-level policy reaches `Config`.
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,

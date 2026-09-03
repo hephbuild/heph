@@ -967,6 +967,31 @@ impl RemoteCacheSet {
         })
     }
 
+    /// Readable caches, fastest-first, as `(name, backend)`.
+    ///
+    /// Exposed for the scratch lineage, which lives in its own key namespace
+    /// (`scratch/v1/…`) and cannot go through the revision/manifest paths above —
+    /// a scratch is keyed by a declaration and a branch, not by an input hash, so
+    /// none of the addr/hashin plumbing applies to it.
+    pub async fn readable_backends(&self) -> Vec<(String, Arc<dyn RemoteCacheBackend>)> {
+        let order = self.read_order().await;
+        order
+            .iter()
+            .filter_map(|&i| self.caches.get(i))
+            .map(|c| (c.def.name.clone(), Arc::clone(&c.backend)))
+            .collect()
+    }
+
+    /// Writable caches, as `(name, backend)`. Same rationale as
+    /// [`readable_backends`](Self::readable_backends).
+    pub fn writable_backends(&self) -> Vec<(String, Arc<dyn RemoteCacheBackend>)> {
+        self.caches
+            .iter()
+            .filter(|c| c.def.write)
+            .map(|c| (c.def.name.clone(), Arc::clone(&c.backend)))
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.caches.is_empty()
     }

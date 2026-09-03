@@ -19,6 +19,33 @@ fn parse_stall_notice(s: &str) -> Result<std::time::Duration, String> {
 /// subcommand, then plumbed to each command's `execute`.
 #[derive(Args, Clone, Debug, Default)]
 pub struct GlobalOptions {
+    /// Run against a fresh, empty scratch cache instead of the stored one.
+    ///
+    /// **Deletes nothing.** The stored cache is not touched, read, or emptied —
+    /// the run is simply pointed at a throwaway directory instead, and that
+    /// directory is discarded afterwards. A later ordinary build finds its cache
+    /// exactly as it left it.
+    ///
+    /// This is how the scratch contract gets audited: a target's outputs must be
+    /// identical whether its scratch is warm or cold, so a build with
+    /// `--no-scratch` should produce the same `hashout`s as one without. If it
+    /// does not, the target depends on carried-over state and is already broken.
+    /// It implies `--force`: a scratch never reaches `hashin`, so without a
+    /// rebuild the run would just replay the result built *with* a warm cache.
+    ///
+    /// Everything else is set up as normal — the directory is created and
+    /// mounted, the environment variable is announced, the slot is locked — so a
+    /// target reading `$MYCACHE` runs cold rather than failing on an unset
+    /// variable. The audit is of your build, not of your shell.
+    ///
+    /// A build flag rather than a `heph tool scratch` subcommand — it modifies a
+    /// build rather than being one, so it belongs next to `--force`. And a bool
+    /// rather than `--scratch=on|off`: there are exactly two states, `off` is the
+    /// only one anyone types, and a valued flag named `scratch` collides with
+    /// every subcommand that wants a `--scratch` of its own (see
+    /// `tool::clean`'s test).
+    #[arg(long = "no-scratch", global = true)]
+    pub no_scratch: bool,
     /// Sample CPU and write a pprof profile to PATH. `kill -USR2 <pid>`
     /// snapshots the profile so far without stopping the run — this is the point
     /// of the flag, since a hung build never reaches exit. A filtered final

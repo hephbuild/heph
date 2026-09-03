@@ -25,14 +25,14 @@ pub enum CacheCommands {
 }
 
 impl CacheArgs {
-    pub fn execute(&self, _sink: LogSink, _global: &GlobalOptions) -> anyhow::Result<()> {
+    pub fn execute(&self, _sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match &self.command {
-            CacheCommands::MeasureLatency => bootstrap::block_on(measure_latency())?,
+            CacheCommands::MeasureLatency => bootstrap::block_on(measure_latency(global))?,
         }
     }
 }
 
-async fn measure_latency() -> anyhow::Result<()> {
+async fn measure_latency(_global: &GlobalOptions) -> anyhow::Result<()> {
     let (engine, _shutdown) = bootstrap::new_engine()?;
     let set = engine.remote_caches();
     if set.is_empty() {

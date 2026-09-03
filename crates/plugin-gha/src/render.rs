@@ -461,6 +461,21 @@ const SCRATCH_ROWS: usize = 5;
 /// Capped like every other list here — `Budgeted` is a fixed budget shared with
 /// the failure and lock-wait sections.
 fn push_scratch(b: &mut Budgeted, t: &Tally) {
+    if t.scratch_disabled() {
+        b.push(
+            "\n> [!NOTE]\n> Ran with `--no-scratch`: scratch caches were wired up but \
+             started empty, so targets using one built cold. Nothing was deleted.\n",
+        );
+    }
+
+    for scratch in t.scratch_inert().into_iter().take(SCRATCH_ROWS) {
+        b.push(&format!(
+            "\n> [!WARNING]\n> Scratch `{scratch}` was restored at a different path than \
+             it was produced at, so a path-sensitive cache is inert — present, and unused. \
+             Run `heph tool scratch head {scratch}` to see what was restored.\n",
+        ));
+    }
+
     let waits = t.scratch_waits();
     if waits.is_empty() {
         return;
@@ -590,7 +605,7 @@ pub(crate) fn render_final(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Str
     }
 
     push_summary_table(&mut b, t, &c);
-    push_zero_hit_diagnosis(&mut b, &c);
+    push_zero_hit_diagnosis(&mut b, t, &c);
     // On the final summary as well as the live comment: the job summary is what
     // people actually read after the fact, and "why was this slow?" is a
     // question asked at the end, not during.
@@ -645,8 +660,19 @@ fn push_summary_table(b: &mut Budgeted, t: &Tally, c: &Counters) {
 /// sends someone to Slack. The precise reason needs `MissReason` on the miss
 /// events (`docs/GHA_REPORTING.md` §7.2); until then this says what *is* known
 /// and points at the command that answers the rest.
-fn push_zero_hit_diagnosis(b: &mut Budgeted, c: &Counters) {
+fn push_zero_hit_diagnosis(b: &mut Budgeted, t: &Tally, c: &Counters) {
     if c.cached() > 0 || c.misses() == 0 {
+        return;
+    }
+    // Under `--no-scratch` a total miss is the *requested* outcome, not a
+    // symptom. Sending someone to `inspect hashin` for it would be a wild goose
+    // chase — the flag implies a rebuild, so nothing consulted the cache.
+    if t.scratch_disabled() {
+        b.push(&format!(
+            "\n> [!NOTE]\n> **0 of {} targets hit cache** — this run used \
+             `--no-scratch`, which rebuilds every target it touches. Expected.\n\n",
+            fmt_count(c.misses())
+        ));
         return;
     }
     b.push(&format!(
@@ -786,6 +812,7 @@ mod tests {
             BuildEventKind::RequestConfig {
                 max_workers: 64,
                 fail_fast: false,
+                scratch_disabled: false,
             },
         ));
         t.apply(&ev(
@@ -1189,6 +1216,7 @@ mod tests {
             BuildEventKind::RequestConfig {
                 max_workers: 64,
                 fail_fast: true,
+                scratch_disabled: false,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
@@ -1242,6 +1270,7 @@ mod tests {
             BuildEventKind::RequestConfig {
                 max_workers: 64,
                 fail_fast: false,
+                scratch_disabled: false,
             },
         ));
         println!("\n===== LIVE, healthy =====\n");
@@ -1302,5 +1331,74 @@ mod tests {
         let t = build(2, 0, 0);
         let out = render_final(&t, &ctx("Build", 60_000), 100_000);
         assert!(!out.contains("Scratch contention"), "{out}");
+    }
+
+    /// The scratch notes reach the **final** summary, not just the live comment.
+    #[test]
+    fn the_final_summary_reports_an_inert_cache() {
+        let mut t = build(2, 0, 0);
+        t.apply(&ev(
+            0,
+            BuildEventKind::ScratchPrepareEnd {
+                addr: "//a:x".into(),
+                scratch: "//build:gocache".into(),
+                outcome: "pulled".into(),
+                bytes: 10,
+                path_mismatch: true,
+                error: None,
+            },
+        ));
+        let out = render_final(&t, &ctx("Build", 60_000), 100_000);
+        assert!(
+            out.contains("heph tool scratch head //build:gocache"),
+            "an inert cache must name the command that explains it: {out}",
+        );
+    }
+
+    /// A total cache miss under `--no-scratch` is the requested outcome, not a
+    /// symptom. Sending someone to `inspect hashin` for it is a wild goose
+    /// chase: the flag implies a rebuild, so nothing consulted the cache.
+    #[test]
+    fn a_zero_hit_audit_run_is_explained_rather_than_flagged() {
+        let mut t = build(1, 0, 0);
+        t.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 64,
+                fail_fast: false,
+                scratch_disabled: true,
+            },
+        ));
+        t.apply(&ev(
+            0,
+            BuildEventKind::LocalCacheMiss {
+                addr: "//a:x".into(),
+            },
+        ));
+
+        let out = render_final(&t, &ctx("Build", 60_000), 100_000);
+        assert!(
+            out.contains("--no-scratch"),
+            "the run must explain itself: {out}"
+        );
+        assert!(
+            !out.contains("inspect hashin"),
+            "and must not send the reader chasing a cache never consulted: {out}",
+        );
+    }
+
+    /// Without the flag the ordinary zero-hit warning still fires — the arm
+    /// above must not swallow a genuine total miss.
+    #[test]
+    fn a_zero_hit_ordinary_run_still_warns() {
+        let mut t = build(1, 0, 0);
+        t.apply(&ev(
+            0,
+            BuildEventKind::LocalCacheMiss {
+                addr: "//a:x".into(),
+            },
+        ));
+        let out = render_final(&t, &ctx("Build", 60_000), 100_000);
+        assert!(out.contains("inspect hashin"), "{out}");
     }
 }

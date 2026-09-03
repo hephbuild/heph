@@ -10,11 +10,11 @@ pub struct Args {
     pub force: bool,
 }
 
-pub fn execute(args: &Args, _sink: LogSink, _global: &GlobalOptions) -> anyhow::Result<()> {
-    bootstrap::block_on(execute_async(args.clone()))?
+pub fn execute(args: &Args, _sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    bootstrap::block_on(execute_async(args.clone(), global.clone()))?
 }
 
-async fn execute_async(args: Args) -> anyhow::Result<()> {
+async fn execute_async(args: Args, _global: GlobalOptions) -> anyhow::Result<()> {
     if args.force {
         crate::engine::clear_plugin_cache()?;
     }

@@ -908,6 +908,25 @@ pub struct ResultOptions {
     /// `--frozen`: verify codegen targets' generated output matches the tree
     /// without writing. A mismatch surfaces a [`FrozenCheckError`].
     pub frozen: bool,
+    /// `--no-scratch`: run every scratch cache against a fresh, empty directory
+    /// instead of its stored contents. **Deletes nothing** — the stored cache is
+    /// not touched, read or emptied, and a later ordinary build finds it exactly
+    /// as it left it.
+    ///
+    /// A request option and not engine config, for the same reason `force` is:
+    /// it is something you do to *one run* to check a target, never a state a
+    /// workspace sits in. One engine can serve an audit request and an ordinary
+    /// one, and the flag has a single source of truth.
+    ///
+    /// **Implies `force`**, and the implication is applied in the engine rather
+    /// than at each call site so no command can forget it. It has to hold: the
+    /// point is to check that a target produces the same outputs without its
+    /// carried-over state, and a cached result was produced *with* it. Serving
+    /// one back would make the audit vacuous — it would pass by reading exactly
+    /// the answer it is supposed to be re-deriving. Note this changes no cache
+    /// key: scratch never reaches `hashin`, so a divergence surfaces as a
+    /// rebuilt-`hashout` mismatch rather than as two unrelated entries.
+    pub no_scratch: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -925,6 +944,10 @@ struct ExecuteOptions<'a> {
     interactive: Option<InteractiveWrapper>,
     shell: bool,
     frozen: bool,
+    /// See [`ResultOptions::no_scratch`]. Unlike `is_top`/`frozen` this is *not*
+    /// inert on the shared cell: it decides whether the execute below gets the
+    /// stored cache or a throwaway directory.
+    no_scratch: bool,
     /// True only for the directly-requested (top-level) target. Gates codegen
     /// tree write-back so a codegen target pulled in as a *dependency* doesn't
     /// materialize its output into the workspace.
@@ -1317,7 +1340,7 @@ impl Engine {
         // Announce worker capacity once per request. Covers the single-target
         // entry (`run` of one addr) that bypasses `Engine::result`; the once-guard
         // makes the dep recursion below a no-op.
-        rs.announce_request_config(self.max_workers);
+        rs.announce_request_config(self.max_workers, opts.no_scratch);
 
         // Single-target entry (`run` of one addr, which bypasses `Engine::result`):
         // claim the matched stream and emit the set-of-one as already-complete
@@ -1643,7 +1666,7 @@ impl Engine {
 
         // Announce worker capacity up front so the client can paint a fixed
         // worker-slot indicator before any execute lands.
-        rs.announce_request_config(self.max_workers);
+        rs.announce_request_config(self.max_workers, opts.no_scratch);
 
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
@@ -1970,6 +1993,7 @@ impl Engine {
                             interactive: opts.interactive.clone(),
                             shell: opts.shell,
                             frozen: opts.frozen,
+                            no_scratch: opts.no_scratch,
                             is_top,
                         },
                     )
@@ -2244,7 +2268,8 @@ impl Engine {
         // key and early-return. Skip it and save a full input re-hash on the
         // steady-state path (an already-formatted tree), where it is the common
         // case.
-        let can_cache = !opts.force && opts.def.target.cache.enabled && !opts.shell;
+        let can_cache =
+            !opts.force && !opts.no_scratch && opts.def.target.cache.enabled && !opts.shell;
         if can_cache && wrote {
             self.clone().maybe_store_fixpoint(&rs, opts).await?;
         }
@@ -2432,6 +2457,7 @@ impl Engine {
         let force = opts.force;
         let shell = opts.shell;
         let interactive = opts.interactive.clone();
+        let no_scratch = opts.no_scratch;
 
         rs.data
             .mem_locked_result
@@ -2451,6 +2477,7 @@ impl Engine {
                         interactive,
                         shell,
                         frozen: false,
+                        no_scratch,
                         is_top: false,
                     };
                     engine.resolve_locked_inner(rs, &opts).await
@@ -2498,7 +2525,7 @@ impl Engine {
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<Arc<LockedResolution>> {
         let def = opts.def;
-        let can_cache = !opts.force && def.target.cache.enabled && !opts.shell;
+        let can_cache = !opts.force && !opts.no_scratch && def.target.cache.enabled && !opts.shell;
         let addr = &def.target.addr;
         let ctoken = rs.ctoken();
 
@@ -3034,6 +3061,7 @@ impl Engine {
         let use_tmp_cache = !opts.def.target.cache.enabled || opts.shell;
         let interactive = opts.interactive.clone();
         let shell = opts.shell;
+        let no_scratch = opts.no_scratch;
         let key = (AddrKey(addr.clone()), hashin.clone());
 
         rs.data
@@ -3054,7 +3082,7 @@ impl Engine {
                     hcore::hmemoizer::set_phase("execute_cache:engine_execute");
                     let (artifacts, sandbox_teardown, sandbox_guards) = engine
                         .clone()
-                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell)
+                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch)
                         .await
                         .with_context(|| format!("execute {addr}"))?;
 

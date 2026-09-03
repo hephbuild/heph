@@ -254,7 +254,9 @@ path collides with nothing, because empty means *no path*, not the root.
   a foreign tool's entries are hot, and evicting a guess would degrade the cache
   while claiming to manage it. Unset by default.
 - **Sweep** — `heph tool gc --scratch-max-size` / `--scratch-max-age-days`, LRU
-  per (slot, scope). Branch scoping means a laptop accumulates a head per branch
+  per (slot, scope). It also reclaims abandoned `--no-scratch` directories
+  unconditionally: one whose process is gone is litter, not a cache competing for
+  space. Branch scoping means a laptop accumulates a head per branch
   ever built; the sweep collects the merged and abandoned ones.
 - **`heph tool scratch rm`** — always safe, by the contract.
 
@@ -275,38 +277,94 @@ holding anything, which is right for resolving and useless for explaining — so
 winner. "Why did my branch start cold?" is answerable only by seeing what was
 *not* found.
 
-**`--no-scratch`** is a global build flag: every scratch absent — no directory
-and no environment variable, not merely an empty one. It implies `--force`,
-because a scratch never reaches `hashin`, so without a rebuild the run would
-replay the result built *with* a warm cache and the audit would pass by reading
-back the answer it exists to re-derive.
+**`--no-scratch`** is a global build flag: run against a fresh, empty cache
+instead of the stored one. **It deletes nothing.**
+
+It is a *request* option (`ResultOptions::no_scratch`), not engine
+configuration — it is something you do to one run to check a target, never a
+state a workspace sits in, so one engine can serve an audit request and an
+ordinary one. It **implies a rebuild**, and the engine applies that implication
+from the flag itself rather than each command pairing it with `--force`: a
+command that forgot would produce a vacuous audit that passes by replaying the
+answer it was supposed to re-derive. The throwaway directory is per run, so two
+audits in one process do not inherit each other's writes. The stored cache is not
+touched, read or emptied — the run is pointed at a throwaway directory, which is
+discarded afterwards, and a later ordinary build finds its cache exactly as it
+left it.
+
+Everything else is set up as normal: the declaration resolves, the slot is
+locked, the directory is created and mounted, the variable is announced. Only the
+carried-over contents are withheld, along with any remote pull or push. It
+implies `--force`, because a scratch never reaches `hashin`, so without a rebuild
+the run would replay the result built *with* a warm cache and the audit would
+pass by reading back the answer it exists to re-derive.
+
+A throwaway directory rather than no directory, deliberately. The contract says
+outputs must not depend on what is *in* the cache, so that is what the audit
+withholds. Taking the directory away as well would audit the target's shell
+instead: a target reading `$MYCACHE` would fail on an unset variable rather than
+running cold, and every driver would need a fallback for a case only the audit
+produces.
+
+Those directories live in `<home>/scratch-audit/<pid>/`, a sibling of the store
+and never inside it — the store walk treats every child of `store_root` as a
+slot, so one there would list as an orphan and be swept as if it were real state.
+Per process, so two audits cannot collide and neither can see an ordinary build's
+cache. Dead ones are reclaimed by `heph tool gc` and on the next audit's first
+use, because a killed run cannot clean up after itself.
 
 It is a bool rather than `--scratch=on|off` for a second reason: a valued flag
 named `scratch` collides on clap's argument *id* with any subcommand wanting a
 `--scratch` of its own, which is a runtime panic on access rather than a build
 error.
 
-Its sharp edge: "absent" includes the environment variable, so a target reading
-`$MYCACHE` unguarded fails under `set -u` rather than running cold. Drivers that
-own a cache handle this; a hand-written `bash` target should write `${MYCACHE:-}`.
-
 `example/scratch/` is a worked package covering the three shapes.
 
 ## Observability
 
 Scratch work happens between dependency resolution and the worker permit —
-*before* `ExecuteStart`. Uninstrumented, a target blocked on a contended slot is
-indistinguishable from one queued for a worker: one open `result` span and
-nothing else.
+*before* `ExecuteStart`. Uninstrumented, a target blocked on a contended slot or
+pulling a multi-GB snapshot is indistinguishable from one queued for a worker:
+one open `result` span and nothing else. Worse, the stall watchdog treats "only
+result spans open" as an idle process, so a long pull produced a "no progress"
+report for a build that was working exactly as designed.
 
-`ScratchLockWaitStart/End` closes that, emitted once a slot stays contended past
-five seconds. It carries the consumer, the cache, the `access` word from the
-declaration, and a holder pid when one can be named. The wait is threshold-gated
-because an uncontended acquire must stay silent — hundreds of targets sharing
-one cache would otherwise emit two events each saying nothing was wrong.
+Two spans close that. Both are per-consumer, so a machine reader loses nothing;
+collapsing is a rendering decision.
 
-The event is per *consumer*, so a machine reader loses nothing, but **renderers
-collapse by cache**: one `exclusive` cache with hundreds of consumers produces
+| event | when | carries |
+|---|---|---|
+| `ScratchLockWaitStart/End` | a slot stays contended past 5s | consumer, cache, `access`, holder pid when nameable |
+| `ScratchPrepareStart/End` | every prepare under the guard | consumer, cache, `outcome`, `bytes`, `path_mismatch` |
+
+`outcome` is one of `warm`, `seeded`, `pulled`, `cold`, `audit`, or
+`interrupted` — a string rather than an enum, because an unknown enum variant is
+a decode failure on a version-skewed plugin and the SDK reads that as
+end-of-stream. An unrecognised string just prints. `interrupted` exists because
+the end of a span also fires when its future is *dropped*: a Ctrl-C during a
+multi-GB pull would otherwise report `cold`, which says the remote had nothing —
+false, and reassuring.
+
+`path_mismatch` is the expensive one. A cache whose entries embed absolute paths
+restores perfectly at a different path and is then inert — present, unused, and
+indistinguishable from a hit, while every build stays cold and the bytes are
+already spent. It is a field, a `warn`, and a report block naming
+`heph tool scratch head`.
+
+`RequestConfig` carries `scratch_disabled`, so a consumer can explain a run that
+reused nothing rather than reporting it as a cache outage. It is phrased
+negatively on purpose: `#[serde(default)]` fills a missing key with `false`, and
+for every frame emitted before the field existed the true answer is "scratch was
+on". The GHA report uses it to suppress the "0 of N hit cache — inspect one to
+see what changed" warning, which under an audit would send a reader chasing a
+cache that was never consulted.
+
+The wait notice is gated on the threshold; the prepare span is not. An uncontended acquire must stay silent — hundreds of targets sharing one cache
+would otherwise emit two events each saying nothing was wrong — while a prepare
+only ever runs on an execute, and sub-second spans are dropped by the renderer
+anyway.
+
+**Renderers collapse waits by cache, never by consumer**: one `exclusive` cache with hundreds of consumers produces
 that many simultaneous waiters. The TUI shows
 `⧗ //build:gocache — 47 waiting (exclusive, 1m12s)`; the CI view logs the first
 waiter per cache and a per-cache total at the end; the GHA report renders a

@@ -34,6 +34,8 @@ struct OutputsApp {
     addr: Addr,
     json: bool,
     fail_fast: bool,
+    /// `--no-scratch`: run against empty scratch caches. Implies a rebuild.
+    no_scratch: bool,
 }
 
 #[async_trait]
@@ -63,7 +65,10 @@ impl App for OutputsApp {
                 rs.clone(),
                 &self.addr,
                 OutputMatcher::All,
-                &ResultOptions::default(),
+                &ResultOptions {
+                    no_scratch: self.no_scratch,
+                    ..Default::default()
+                },
             )
             .await;
         let addr = self.addr.format();
@@ -115,6 +120,7 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         addr,
         json: args.json,
         fail_fast: global.fail_fast,
+        no_scratch: global.no_scratch,
     };
     let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await

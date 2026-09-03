@@ -566,6 +566,9 @@ impl HeaderItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Op {
     RemoteCacheRead,
+    /// Warming a scratch directory — seeding a lineage from a fallback scope, or
+    /// pulling a snapshot from the remote.
+    ScratchPrepare,
     Execute,
     LocalCacheWrite,
     RemoteCacheWrite,
@@ -578,6 +581,7 @@ impl Op {
     fn icon(self) -> char {
         match self {
             Op::RemoteCacheRead => '↓',
+            Op::ScratchPrepare => '↺',
             Op::Execute => '▶',
             Op::LocalCacheWrite => '⊕',
             Op::RemoteCacheWrite => '↑',
@@ -585,13 +589,16 @@ impl Op {
     }
 
     /// Pipeline ordinal for stable left-to-right ordering of the breakdown:
-    /// remote download → execute → local-cache write → remote upload.
+    /// remote download → scratch warm → execute → local-cache write → remote
+    /// upload. This is the order the engine runs them in, so a row reads
+    /// left-to-right as the target's own history.
     fn order(self) -> u8 {
         match self {
             Op::RemoteCacheRead => 0,
-            Op::Execute => 1,
-            Op::LocalCacheWrite => 2,
-            Op::RemoteCacheWrite => 3,
+            Op::ScratchPrepare => 1,
+            Op::Execute => 2,
+            Op::LocalCacheWrite => 3,
+            Op::RemoteCacheWrite => 4,
         }
     }
 }
@@ -638,6 +645,12 @@ fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
         }
         BuildEventKind::RemoteCacheWriteEnd { addr, .. } => {
             Some((addr, Op::RemoteCacheWrite, Boundary::End))
+        }
+        BuildEventKind::ScratchPrepareStart { addr, .. } => {
+            Some((addr, Op::ScratchPrepare, Boundary::Start))
+        }
+        BuildEventKind::ScratchPrepareEnd { addr, .. } => {
+            Some((addr, Op::ScratchPrepare, Boundary::End))
         }
         BuildEventKind::RemoteCacheReadStart { addr } => {
             Some((addr, Op::RemoteCacheRead, Boundary::Start))
@@ -1003,6 +1016,12 @@ impl BuildState {
                     },
                 );
             }
+            // The prepare span is folded into the op timeline above, and its
+            // outcome is reported by the CI view rather than counted here — a
+            // seeded or pulled cache is not a cache *hit*, and putting it on the
+            // hit counters would overstate reuse.
+            BuildEventKind::ScratchPrepareStart { .. }
+            | BuildEventKind::ScratchPrepareEnd { .. } => {}
             BuildEventKind::ScratchLockWaitEnd { addr, .. } => {
                 if let Some(w) = self.scratch_waits.remove(addr) {
                     let e = self.scratch_wait_totals.entry(w.scratch).or_insert((0, 0));
@@ -1521,21 +1540,7 @@ impl ProgressCore {
     }
 }
 
-/// Format a byte count as a compact human-readable size (`512 B`, `3.4 KiB`,
-/// `1.2 GiB`). Binary units; one decimal past the bytes band.
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut v = bytes as f64;
-    let mut unit = 0;
-    while v >= 1024.0 && unit < UNITS.len() - 1 {
-        v /= 1024.0;
-        unit += 1;
-    }
-    format!("{v:.1} {}", UNITS.get(unit).copied().unwrap_or("B"))
-}
+pub use hcore::units::human_bytes;
 
 /// Per-command header content for [`TuiProgressView`]. The view owns the box
 /// chrome, the elapsed clock, and the body (slow rows / lock waits / idle art);
@@ -2330,6 +2335,71 @@ impl TUIAppView for TuiProgressView {
     }
 }
 
+/// One line the CI view would log, and whether it is a warning.
+///
+/// Built as a value rather than logged inline so the "stay quiet" contract — no
+/// line at all for a warm cache — is testable without capturing a subscriber. A
+/// regression there is not cosmetic: it puts one line per target into a CI log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Note {
+    pub(crate) text: String,
+    pub(crate) warn: bool,
+}
+
+/// The line for a snapshot restored somewhere other than where it was produced.
+///
+/// Names the command that explains it, because an operator — or an agent — must
+/// be able to act on this without first working out what to run.
+pub(crate) fn path_mismatch_note(scratch: &str) -> String {
+    format!(
+        "scratch {scratch}: restored at a different path than it was produced at \
+         — a path-sensitive cache will be inert. \
+         See `heph tool scratch head {scratch}`"
+    )
+}
+
+/// The line for one finished prepare, or `None` when there is nothing worth
+/// saying — which is the overwhelmingly common case.
+pub(crate) fn prepare_note(
+    scratch: &str,
+    outcome: &str,
+    bytes: u64,
+    error: Option<&str>,
+) -> Option<Note> {
+    let (text, warn) = match (error, outcome) {
+        (Some(err), _) => (
+            format!("scratch {scratch}: could not prepare ({err})"),
+            true,
+        ),
+        // The common case, and the whole point of staying quiet.
+        (None, "" | "warm") => return None,
+        (None, "pulled") => (
+            format!(
+                "scratch {scratch}: pulled {} from the remote",
+                human_bytes(bytes)
+            ),
+            false,
+        ),
+        (None, "seeded") => (
+            format!("scratch {scratch}: seeded from a fallback scope"),
+            false,
+        ),
+        (None, "cold") => (
+            format!("scratch {scratch}: cold, nothing to restore from"),
+            false,
+        ),
+        (None, "audit") => (
+            format!("scratch {scratch}: --no-scratch, running against an empty cache"),
+            false,
+        ),
+        // An outcome from a host newer than this build. Printing it verbatim
+        // beats dropping it: the word is meant to be readable, and this is
+        // exactly why `outcome` is a string and not an enum.
+        (None, other) => (format!("scratch {scratch}: {other}"), false),
+    };
+    Some(Note { text, warn })
+}
+
 /// The paved-road [`CIAppView`]: a one-line label header, a concise per-execute
 /// line, and a final one-line summary plus per-error lines — all through the
 /// log sink. Used by every command's `ci_view`.
@@ -2390,6 +2460,27 @@ impl CIAppView for CiProgressView {
                      targets sharing it run one at a time"
                 ),
             },
+            // The cold-runner case this view exists for: no tty, and a pull that
+            // can run for minutes. Silent for `warm`, which is every other run.
+            BuildEventKind::ScratchPrepareEnd {
+                scratch,
+                outcome,
+                bytes,
+                path_mismatch,
+                error,
+                ..
+            } => {
+                if *path_mismatch {
+                    tracing::warn!("{}", path_mismatch_note(scratch));
+                }
+                if let Some(note) = prepare_note(scratch, outcome, *bytes, error.as_deref()) {
+                    if note.warn {
+                        tracing::warn!("{}", note.text);
+                    } else {
+                        tracing::info!("{}", note.text);
+                    }
+                }
+            }
             _ => {}
         }
         self.core.fold(ev);
@@ -3082,10 +3173,118 @@ mod tests {
         );
     }
 
+    /// The contract that keeps a CI log readable: a warm cache says nothing.
+    ///
+    /// Every target that uses a cache emits a prepare span, so a regression here
+    /// puts one line per target into a GitHub log — thousands on a real build.
+    #[test]
+    fn a_warm_prepare_logs_nothing() {
+        assert_eq!(prepare_note("//build:c", "warm", 0, None), None);
+        assert_eq!(
+            prepare_note("//build:c", "", 0, None),
+            None,
+            "an absent outcome from an older host is also silence",
+        );
+    }
+
+    /// Every outcome that cost the build something says so.
+    #[test]
+    fn each_non_warm_outcome_reports_itself() {
+        let note = |o: &str| prepare_note("//build:c", o, 2048, None).expect("a line");
+        assert!(
+            note("pulled").text.contains("pulled 2.0 KiB"),
+            "{}",
+            note("pulled").text
+        );
+        assert!(!note("pulled").warn);
+        assert!(note("seeded").text.contains("seeded"));
+        assert!(note("cold").text.contains("cold"));
+        assert!(note("audit").text.contains("--no-scratch"));
+    }
+
+    /// An outcome this build has never heard of is printed, not dropped. This is
+    /// why `outcome` is a string: a newer host can add one without a decode
+    /// failure, and the word is written to be readable.
+    #[test]
+    fn an_unknown_outcome_is_printed_verbatim() {
+        let note = prepare_note("//build:c", "reflinked", 0, None).expect("a line");
+        assert!(note.text.contains("reflinked"), "{}", note.text);
+    }
+
+    /// A failure outranks any outcome.
+    #[test]
+    fn a_failed_prepare_warns_with_its_error() {
+        let note = prepare_note("//build:c", "pulled", 9, Some("disk full")).expect("a line");
+        assert!(
+            note.warn && note.text.contains("disk full"),
+            "{}",
+            note.text
+        );
+    }
+
+    /// The inert-restore line names the command that explains it — the failure
+    /// is invisible otherwise, and an operator cannot act on "it will be inert".
+    #[test]
+    fn the_path_mismatch_note_names_the_command_to_run() {
+        let text = path_mismatch_note("//build:gocache");
+        assert!(
+            text.contains("heph tool scratch head //build:gocache"),
+            "{text}"
+        );
+    }
+
+    /// The prepare span joins the per-target timeline, so a target sitting in a
+    /// multi-GB pull is visibly *doing* something rather than looking queued.
+    #[test]
+    fn a_slow_scratch_prepare_shows_in_the_target_breakdown() {
+        let mut st = BuildState::new();
+        st.apply(&ev(
+            0,
+            BuildEventKind::ScratchPrepareStart {
+                addr: "//a:x".into(),
+                scratch: "//build:gocache".into(),
+            },
+        ));
+        let rows = st.slow_rows(42_000);
+        let text: String = rows[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            text.contains("//a:x")
+                && text.contains(&format!("({} 42s)", Op::ScratchPrepare.icon())),
+            "{text}",
+        );
+    }
+
+    /// Ordering is the pipeline order, so a row reads left-to-right as the
+    /// target's own history rather than in event-arrival order.
+    #[test]
+    fn scratch_prepare_sorts_between_remote_read_and_execute() {
+        let mut ops = [
+            Op::Execute,
+            Op::RemoteCacheWrite,
+            Op::ScratchPrepare,
+            Op::RemoteCacheRead,
+        ];
+        ops.sort_by_key(|o| o.order());
+        assert_eq!(
+            ops,
+            [
+                Op::RemoteCacheRead,
+                Op::ScratchPrepare,
+                Op::Execute,
+                Op::RemoteCacheWrite
+            ],
+        );
+    }
+
     fn max_workers(count: usize) -> BuildEventKind {
         BuildEventKind::RequestConfig {
             max_workers: count,
             fail_fast: false,
+            scratch_disabled: false,
         }
     }
 

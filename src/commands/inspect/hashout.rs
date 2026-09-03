@@ -22,6 +22,8 @@ struct HashoutApp {
     engine: Arc<Engine>,
     addr: Addr,
     fail_fast: bool,
+    /// `--no-scratch`: run against empty scratch caches. Implies a rebuild.
+    no_scratch: bool,
 }
 
 #[async_trait]
@@ -51,7 +53,10 @@ impl App for HashoutApp {
                 rs.clone(),
                 &self.addr,
                 OutputMatcher::None,
-                &ResultOptions::default(),
+                &ResultOptions {
+                    no_scratch: self.no_scratch,
+                    ..Default::default()
+                },
             )
             .await;
         crate::commands::errors::finalize!(ctx, rs, res, result => {
@@ -76,6 +81,7 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         engine,
         addr,
         fail_fast: global.fail_fast,
+        no_scratch: global.no_scratch,
     };
     let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await

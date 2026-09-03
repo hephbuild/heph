@@ -202,9 +202,160 @@ fn stamp_pid(guard: &hlock::hlock::FWriteGuard) {
     }
 }
 
-/// The directory a slot's contents live in.
-pub fn slot_dir(home: &Path, slot: &str) -> PathBuf {
-    home.join("scratch").join(slot)
+/// The directory a slot's contents live in, for one lineage.
+///
+/// Scope-structured, so a branch's work stays on that branch: two scopes of one
+/// slot are two directories, and nothing a feature branch does can reach the one
+/// `master` builds from. `sanitize_scope` is what keeps a branch name like
+/// `feature/x` from silently nesting an extra level.
+pub fn scope_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
+    crate::engine::scratch_store::head_dir(home, slot, scope)
+}
+
+/// What preparing a scratch directory actually did, as it rides to
+/// `ScratchPrepareEnd`.
+///
+/// Ordered by how it reads to a user rather than by how the code reaches it:
+/// [`Warm`](Prepared::Warm) is the happy path and everything else is a reason
+/// this target is about to do more work than it did last time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Prepared {
+    /// The lineage was already there. Nothing was copied or fetched.
+    Warm,
+    /// Cold in this scope, so it was copied from a fallback scope.
+    Seeded,
+    /// Cold, and nothing local or remote to warm it from.
+    Cold,
+    /// Cold locally, restored from the remote store.
+    Pulled,
+    /// `--no-scratch`: a throwaway directory, deliberately empty.
+    Audit,
+}
+
+impl Prepared {
+    /// The wire spelling. Kept next to the variants so a new outcome cannot
+    /// reach the event stream without being given a name a reader can act on.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Prepared::Warm => "warm",
+            Prepared::Seeded => "seeded",
+            Prepared::Cold => "cold",
+            Prepared::Pulled => "pulled",
+            Prepared::Audit => "audit",
+        }
+    }
+}
+
+/// The outcome of one prepare, as it rides to `ScratchPrepareEnd`.
+///
+/// `prepared` is `None` until some step commits to an answer, which is what lets
+/// a cancelled span be reported as interrupted rather than as a finished prepare.
+#[derive(Debug, Clone, Default)]
+struct PrepareOutcome {
+    prepared: Option<Prepared>,
+    /// Bytes pulled from the remote, when the outcome was `Pulled`.
+    bytes: u64,
+    /// The snapshot was restored somewhere other than where it was produced.
+    path_mismatch: bool,
+}
+
+/// Wire spelling for a prepare that never reached an outcome — the span was
+/// cancelled, almost always by a Ctrl-C during a long transfer.
+const INTERRUPTED: &str = "interrupted";
+
+/// Resolve which lineage to use, and seed it if it is new.
+///
+/// The behaviour is *try this branch, then fall back* — the current scope first,
+/// then each configured `restore_scopes` entry in order. Returns the directory to
+/// mount, always inside the **current** scope: a fallback is a place to copy
+/// *from*, never a place to write to, and that asymmetry is the whole of the
+/// isolation. A PR build cannot advance `master`'s cache, and a broken experiment
+/// on a branch cannot corrupt the one you go back to.
+///
+/// Seeding is the only copy in this design. It happens once per (slot, scope) —
+/// on the first build after a branch switch — and is measured against a cold
+/// rebuild, not against nothing. `scratch.seedOnFork: false` turns it off for a
+/// large slot on a filesystem without reflink, at the cost of every new branch
+/// starting cold.
+async fn resolve_scope_dir(
+    home: &Path,
+    slot: &str,
+    opts: &crate::engine::config::ScratchOptions,
+    addr: &Addr,
+) -> anyhow::Result<(PathBuf, Prepared)> {
+    let own = scope_dir(home, slot, &opts.scope);
+    let exists = |p: PathBuf| async move {
+        hcore::blocking::run(move || Ok::<bool, std::io::Error>(p.is_dir()))
+            .await
+            .unwrap_or(false)
+    };
+
+    if exists(own.clone()).await {
+        return Ok((own, Prepared::Warm));
+    }
+
+    // Cold in this lineage. Seed from the first fallback that has anything, so a
+    // branch switch costs a copy rather than a rebuild.
+    if opts.seed_on_fork {
+        for fallback in &opts.restore_scopes {
+            if *fallback == opts.scope {
+                continue;
+            }
+            let from = scope_dir(home, slot, fallback);
+            if !exists(from.clone()).await {
+                continue;
+            }
+            let (src, dst) = (from.clone(), own.clone());
+            let seeded = hcore::blocking::run(move || copy_tree(&src, &dst)).await;
+            match seeded {
+                Ok(()) => {
+                    tracing::debug!(
+                        %addr, slot, from = %from.display(), to = %own.display(),
+                        "seeded scratch from fallback scope",
+                    );
+                    return Ok((own, Prepared::Seeded));
+                }
+                // A failed seed is a cold cache, never a failed build: by the
+                // scratch contract, losing one is a slowdown and nothing more.
+                // Leave no partial tree behind for the next run to mistake for a
+                // warm one.
+                Err(err) => {
+                    tracing::debug!(
+                        %addr, slot, error = %err,
+                        "could not seed scratch from fallback scope; starting cold",
+                    );
+                    let dead = own.clone();
+                    drop(hcore::blocking::run(move || std::fs::remove_dir_all(&dead)).await);
+                }
+            }
+        }
+    }
+    Ok((own, Prepared::Cold))
+}
+
+/// Recursively copy `src` to `dst`, following no symlinks out of the tree.
+///
+/// Deliberately plain: a reflink would make this near-free on APFS/btrfs and is
+/// the obvious next step, but it is a per-platform optimization and this has to
+/// be correct on every filesystem first. Symlinks are recreated as symlinks
+/// rather than followed, so a slot that has acquired a link to somewhere else
+/// does not silently duplicate that somewhere else into the new scope.
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            std::os::unix::fs::symlink(target, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// True when this input is a scratch reference rather than an ordinary dep.
@@ -267,6 +418,50 @@ impl Engine {
         Ok(resolved)
     }
 
+    /// A throwaway directory standing in for a slot's head, for this run only.
+    ///
+    /// `--no-scratch` withholds *carried-over state*, not the cache itself: the
+    /// target still gets a directory at the usual mount point, announced through
+    /// the usual variable, locked the usual way. Only its contents start empty.
+    ///
+    /// Per **process**, not per target, so targets sharing a declaration still
+    /// share a directory within the run and `access` still means what it says.
+    /// Per process rather than per slot-lineage so a concurrent ordinary build
+    /// cannot see it, and an audit cannot see that build's state.
+    async fn scratch_audit_dir(self: &Arc<Self>, slot: &str) -> anyhow::Result<PathBuf> {
+        let root = self
+            .scratch_audit_ready
+            .get_or_try_init(|| {
+                let root = crate::engine::scratch_store::audit_root(&self.home);
+                // One directory per engine, not per process: see
+                // `audit_run_dir`. The counter is process-wide and only ever
+                // increments, so two engines never collide.
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mine = crate::engine::scratch_store::audit_run_dir(
+                    &self.home,
+                    std::process::id(),
+                    seq,
+                );
+                async move {
+                    let m = mine.clone();
+                    hcore::blocking::run(move || {
+                        // A killed run cannot clean up after itself, so sweep
+                        // any pid directory that is not a live process before
+                        // creating ours.
+                        crate::engine::scratch_store::sweep_dead_audit_dirs(&root);
+                        std::fs::create_dir_all(&m)
+                            .with_context(|| format!("create audit dir {}", m.display()))?;
+                        anyhow::Ok(())
+                    })
+                    .await?;
+                    anyhow::Ok(mine)
+                }
+            })
+            .await?;
+        Ok(root.join(slot).join("head"))
+    }
+
     /// Take every slot lock this target needs, create the directories, and return
     /// the mounts to hand the driver.
     ///
@@ -295,6 +490,7 @@ impl Engine {
         rs: &Arc<RequestState>,
         consumer: &Addr,
         resolved: &[ResolvedScratch],
+        no_scratch: bool,
     ) -> anyhow::Result<(Vec<ScratchMount>, Vec<ScratchGuard>)> {
         if resolved.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -314,14 +510,42 @@ impl Engine {
                 .with_context(|| format!("acquire scratch lock for {}", r.addr))?;
             guards.push(guard);
 
-            // Created under the guard, so two processes racing a cold slot cannot
-            // both decide it is absent and clobber each other's setup. Creation
-            // is idempotent, which is what makes the shared-access case safe.
-            let dir = slot_dir(&self.home, &slot);
-            let d = dir.clone();
-            hcore::blocking::run(move || std::fs::create_dir_all(&d))
+            // Resolved, created and warmed under the guard, so two processes
+            // racing a cold lineage cannot both decide it is absent and seed it
+            // twice. Every step in there is idempotent, which is what makes the
+            // shared-access case safe.
+            //
+            // Wrapped in one span rather than instrumented step by step: the
+            // steps share a guard, run in a fixed order, and a user cannot act
+            // on them separately. What they *can* act on is the outcome, which
+            // is why the detail rides on the end of the span.
+            let (dir, prepared) = self
+                .prepare_scratch_dir(rs, &consumer_str, &slot, r, no_scratch)
                 .await
-                .with_context(|| format!("create scratch dir {dir:?} for {}", r.addr))?;
+                .with_context(|| format!("prepare scratch dir for {}", r.addr))?;
+
+            tracing::debug!(
+                addr = %consumer_str, scratch = %r.addr, slot,
+                outcome = prepared.as_str(), dir = %dir.display(),
+                "prepared scratch directory",
+            );
+
+            // Record what this slot came from, so the store can describe itself
+            // without resolving the graph (see `scratch_store`). Idempotent and
+            // best-effort: it is a diagnostic, not part of the build.
+            crate::engine::scratch_store::write_slot_meta(
+                &self.home,
+                &slot,
+                &crate::engine::scratch_store::SlotMeta {
+                    format: 1,
+                    addr: r.addr.format(),
+                    path: r.def.path.clone(),
+                    env: r.def.env.clone(),
+                    access: r.def.access.as_str().to_string(),
+                    version: r.def.version.clone(),
+                    remote: r.def.remote,
+                },
+            );
 
             mounts.push(ScratchMount {
                 addr: r.addr.clone(),
@@ -398,6 +622,178 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// Seed a locally-cold lineage from the remote, if there is anything to seed
+    /// from.
+    ///
+    /// Never fails a build. A remote that is down, a head that will not decode, a
+    /// transfer that dies halfway — every one of them means "cold", which by the
+    /// scratch contract is a slowdown and nothing more. A partial unpack is
+    /// cleared rather than left for the next run to mistake for a warm cache.
+    /// `Some((bytes, path_mismatch))` when a snapshot was actually restored;
+    /// `None` when the lineage was already warm, there was nothing to pull, or
+    /// the pull failed — all three of which mean "cold", which by the scratch
+    /// contract is a slowdown and nothing more.
+    async fn pull_if_cold(&self, slot: &str, dir: &Path, addr: &Addr) -> Option<(u64, bool)> {
+        // Unreadable counts as cold: if the directory cannot be listed, nothing
+        // useful is in it either way.
+        let cold = std::fs::read_dir(dir).map_or(true, |mut d| d.next().is_none());
+        if !cold {
+            return None;
+        }
+        let opts = &self.cfg.scratch;
+        let head = self
+            .scratch_remote_head(slot, &opts.scope, &opts.restore_scopes)
+            .await?;
+
+        match self.scratch_pull(&head, dir).await {
+            Ok(bytes) => {
+                // A cache whose entries embed absolute paths restores fine at a
+                // different path and is then inert — present, and useless, which
+                // looks exactly like a hit. Naming both paths is what makes that
+                // diagnosable rather than mysterious.
+                //
+                // At `warn`, not `debug`: this is the most expensive failure in
+                // the module. The transfer reported success, the bytes are
+                // already spent, and every future run still builds cold — with
+                // nothing anywhere else in the stream to distinguish it from a
+                // hit. It also rides out on `ScratchPrepareEnd::path_mismatch`,
+                // so a machine reader does not have to scrape this line.
+                let path_mismatch = head.meta.produced_at != dir.to_string_lossy();
+                if path_mismatch {
+                    tracing::warn!(
+                        %addr, produced_at = %head.meta.produced_at, restored_at = %dir.display(),
+                        "scratch snapshot restored at a different path than it was produced at; \
+                         a path-sensitive cache will be inert. \
+                         See `heph tool scratch head` for what was restored",
+                    );
+                }
+                tracing::debug!(
+                    %addr, slot, scope = %head.meta.scope, generation = head.meta.generation, bytes,
+                    "pulled scratch snapshot",
+                );
+                crate::engine::scratch_remote::write_local_meta(
+                    &self.home,
+                    slot,
+                    &opts.scope,
+                    &head.meta,
+                );
+                Some((bytes, path_mismatch))
+            }
+            Err(err) => {
+                tracing::debug!(%addr, slot, error = %err, "could not pull scratch snapshot");
+                let dead = dir.to_path_buf();
+                drop(hcore::blocking::run(move || std::fs::remove_dir_all(&dead)).await);
+                drop(std::fs::create_dir_all(dir));
+                None
+            }
+        }
+    }
+}
+
+impl Engine {
+    /// Everything done under a held slot guard: resolve the lineage, seed it,
+    /// create the directory, and pull from the remote when it is still cold.
+    /// Returns the directory and what preparing it did.
+    ///
+    /// Emitted as a span unconditionally rather than past a threshold, unlike
+    /// the lock wait. It runs only on an execute — a fully cached run emits
+    /// none of these — and the renderer already drops sub-second spans, so the
+    /// warm case costs two events and shows nothing.
+    async fn prepare_scratch_dir(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        consumer: &str,
+        slot: &str,
+        r: &ResolvedScratch,
+        no_scratch: bool,
+    ) -> anyhow::Result<(PathBuf, Prepared)> {
+        // The outcome, shared between the span body and the closure that builds
+        // the end event: `emit_scope`'s `make_end` is `'static` and cannot borrow
+        // anything the body computed, so the two meet here.
+        //
+        // Seeded `None`, not `Cold`. `make_end` also fires when the body future
+        // is *dropped* — a Ctrl-C mid-pull — and a seed of `Cold` would report
+        // that interrupted transfer as a completed prepare that found nothing to
+        // restore, which is a different and reassuring claim.
+        let cell = Arc::new(parking_lot::Mutex::new(PrepareOutcome::default()));
+
+        let (addr, scratch) = (consumer.to_string(), r.addr.format());
+        let end = (addr.clone(), scratch.clone(), Arc::clone(&cell));
+        crate::engine::event::emit_scope(
+            rs,
+            crate::engine::event::BuildEventKind::ScratchPrepareStart { addr, scratch },
+            move |error| {
+                let out = end.2.lock().clone();
+                crate::engine::event::BuildEventKind::ScratchPrepareEnd {
+                    addr: end.0,
+                    scratch: end.1,
+                    outcome: out
+                        .prepared
+                        .map_or(INTERRUPTED, Prepared::as_str)
+                        .to_string(),
+                    bytes: out.bytes,
+                    path_mismatch: out.path_mismatch,
+                    error: error.map(crate::engine::event::ErrorDetail::into_message),
+                }
+            },
+            async {
+                // The audit (`--no-scratch`) takes the other branch: everything
+                // is set up exactly as normal — resolved, locked, created,
+                // mounted, announced through the env var — and only the
+                // *carried-over state* is withheld. That is what makes it an
+                // audit of the contract rather than of the target's shell: "the
+                // same outputs from a cold cache", not "survives having its
+                // cache ripped out".
+                let dir = if !no_scratch {
+                    let (dir, prepared) =
+                        resolve_scope_dir(&self.home, slot, &self.cfg.scratch, &r.addr)
+                            .await
+                            .with_context(|| format!("resolve scratch lineage for {}", r.addr))?;
+                    cell.lock().prepared = Some(prepared);
+                    dir
+                } else {
+                    cell.lock().prepared = Some(Prepared::Audit);
+                    self.scratch_audit_dir(slot)
+                        .await
+                        .with_context(|| format!("audit scratch dir for {}", r.addr))?
+                };
+
+                let d = dir.clone();
+                hcore::blocking::run(move || std::fs::create_dir_all(&d))
+                    .await
+                    .with_context(|| format!("create scratch dir {dir:?} for {}", r.addr))?;
+
+                // Still cold after the local fallbacks? Try the remote lineage.
+                // This is the CI case and the reason `remote` exists: a fresh
+                // runner is cold in every lineage, so without it every job
+                // starts from nothing.
+                //
+                // Pull is automatic — and safe to be, because it is read-only,
+                // costs one list plus one fetch, and every way it can fail
+                // degrades to a cold build. Publishing is the opposite on all
+                // three counts and is therefore a command
+                // (`heph tool scratch push`), never a side effect of building.
+                if r.def.remote
+                    && !no_scratch
+                    && let Some((bytes, path_mismatch)) =
+                        self.pull_if_cold(slot, &dir, &r.addr).await
+                {
+                    *cell.lock() = PrepareOutcome {
+                        prepared: Some(Prepared::Pulled),
+                        bytes,
+                        path_mismatch,
+                    };
+                }
+
+                let prepared = cell.lock().prepared.unwrap_or(Prepared::Cold);
+                anyhow::Ok((dir, prepared))
+            },
+        )
+        .await
+    }
+}
+
 /// Reject two references that would claim the same environment variable.
 ///
 /// The default name is derived from the target *name* alone (so packages do not
@@ -448,6 +844,201 @@ fn check_mount_overlaps(consumer: &Addr, resolved: &[ResolvedScratch]) -> anyhow
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use crate::engine::config::ScratchOptions;
+    use hmodel::htpkg::PkgBuf;
+
+    fn addr() -> Addr {
+        Addr::new(PkgBuf::from("build"), "c".to_string(), Default::default())
+    }
+
+    fn opts(scope: &str, fallbacks: &[&str], seed: bool) -> ScratchOptions {
+        ScratchOptions {
+            scope: scope.to_string(),
+            restore_scopes: fallbacks.iter().map(|s| s.to_string()).collect(),
+            seed_on_fork: seed,
+        }
+    }
+
+    /// Two lineages of one slot are two directories. Without this, "branch
+    /// isolation" is a word rather than a behaviour.
+    #[test]
+    fn scopes_are_separate_directories() {
+        let home = Path::new("/h");
+        assert_ne!(
+            scope_dir(home, "abc", "master"),
+            scope_dir(home, "abc", "feat")
+        );
+        assert_eq!(
+            scope_dir(home, "abc", "master"),
+            scope_dir(home, "abc", "master")
+        );
+    }
+
+    /// A branch name with a `/` must not nest an extra level, or two branches
+    /// collide the moment one is a path prefix of another.
+    #[test]
+    fn a_slash_in_a_branch_name_stays_one_component() {
+        let d = scope_dir(Path::new("/h"), "abc", "feature/x");
+        let comps: Vec<_> = d.components().collect();
+        assert_eq!(
+            comps.len(),
+            6,
+            "/h + scratch + abc + <scope> + head is 5 components plus root, got {d:?}"
+        );
+        assert!(!d.to_string_lossy().contains("feature/x"), "{d:?}");
+    }
+
+    /// The empty scope is still a directory name — it is the default (one shared
+    /// lineage), so it cannot resolve to the slot dir itself.
+    #[test]
+    fn the_empty_scope_has_a_directory_of_its_own() {
+        let d = scope_dir(Path::new("/h"), "abc", "");
+        assert!(d.ends_with("head"));
+        assert!(d.to_string_lossy().contains("/abc/_/"), "{d:?}");
+    }
+
+    #[tokio::test]
+    async fn a_cold_lineage_with_no_fallback_resolves_to_its_own_empty_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (got, prepared) = resolve_scope_dir(tmp.path(), "s", &opts("feat", &[], true), &addr())
+            .await
+            .expect("resolve");
+        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(prepared, Prepared::Cold);
+    }
+
+    /// The branch-switch story: `master` is warm, `feat` has never been built, so
+    /// `feat` starts from a copy of `master` rather than from nothing.
+    #[tokio::test]
+    async fn a_new_scope_seeds_from_its_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let master = scope_dir(tmp.path(), "s", "master");
+        std::fs::create_dir_all(master.join("sub")).expect("mkdir");
+        std::fs::write(master.join("sub").join("f"), b"warm").expect("write");
+
+        let (got, prepared) =
+            resolve_scope_dir(tmp.path(), "s", &opts("feat", &["master"], true), &addr())
+                .await
+                .expect("resolve");
+
+        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(
+            std::fs::read(got.join("sub").join("f")).expect("read seeded"),
+            b"warm"
+        );
+        // The copy is the reason this build is slower than the last one, so it
+        // has to be reportable and not merely correct.
+        assert_eq!(prepared, Prepared::Seeded);
+    }
+
+    /// Writes land in the branch's own lineage. A PR build must not be able to
+    /// advance the cache its base builds from.
+    #[tokio::test]
+    async fn seeding_leaves_the_fallback_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let master = scope_dir(tmp.path(), "s", "master");
+        std::fs::create_dir_all(&master).expect("mkdir");
+        std::fs::write(master.join("f"), b"base").expect("write");
+
+        let (got, _) =
+            resolve_scope_dir(tmp.path(), "s", &opts("feat", &["master"], true), &addr())
+                .await
+                .expect("resolve");
+        std::fs::write(got.join("f"), b"branch work").expect("write");
+
+        assert_eq!(std::fs::read(master.join("f")).expect("read"), b"base");
+    }
+
+    #[tokio::test]
+    async fn seed_on_fork_off_starts_cold() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let master = scope_dir(tmp.path(), "s", "master");
+        std::fs::create_dir_all(&master).expect("mkdir");
+        std::fs::write(master.join("f"), b"warm").expect("write");
+
+        let (got, prepared) =
+            resolve_scope_dir(tmp.path(), "s", &opts("feat", &["master"], false), &addr())
+                .await
+                .expect("resolve");
+        assert!(!got.join("f").exists(), "must not have seeded");
+        assert_eq!(prepared, Prepared::Cold);
+    }
+
+    /// An already-warm lineage is used as-is; nothing re-seeds over live work.
+    #[tokio::test]
+    async fn a_warm_scope_is_never_reseeded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (scope, body) in [("master", b"base".as_slice()), ("feat", b"mine".as_slice())] {
+            let d = scope_dir(tmp.path(), "s", scope);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            std::fs::write(d.join("f"), body).expect("write");
+        }
+        let (got, prepared) =
+            resolve_scope_dir(tmp.path(), "s", &opts("feat", &["master"], true), &addr())
+                .await
+                .expect("resolve");
+        assert_eq!(std::fs::read(got.join("f")).expect("read"), b"mine");
+        assert_eq!(prepared, Prepared::Warm);
+    }
+
+    /// Fallbacks are ordered, so a three-level convention works without
+    /// special-casing — and an entry naming a lineage that never existed is
+    /// skipped rather than erroring.
+    #[tokio::test]
+    async fn fallbacks_are_tried_in_order_and_missing_ones_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let develop = scope_dir(tmp.path(), "s", "develop");
+        std::fs::create_dir_all(&develop).expect("mkdir");
+        std::fs::write(develop.join("f"), b"develop").expect("write");
+
+        let (got, prepared) = resolve_scope_dir(
+            tmp.path(),
+            "s",
+            &opts("feat", &["nonexistent", "develop", "master"], true),
+            &addr(),
+        )
+        .await
+        .expect("resolve");
+        assert_eq!(std::fs::read(got.join("f")).expect("read"), b"develop");
+        assert_eq!(prepared, Prepared::Seeded);
+    }
+
+    /// A slot listing its own scope as a fallback must not try to seed from
+    /// itself — that is a no-op at best and a self-copy at worst.
+    #[tokio::test]
+    async fn a_scope_does_not_seed_from_itself() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (got, prepared) =
+            resolve_scope_dir(tmp.path(), "s", &opts("feat", &["feat"], true), &addr())
+                .await
+                .expect("resolve");
+        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(prepared, Prepared::Cold, "a self-seed is not a seed");
+    }
+
+    #[test]
+    fn copy_tree_recreates_symlinks_rather_than_following_them() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (src, dst) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir_all(src.join("d")).expect("mkdir");
+        std::fs::write(src.join("d").join("f"), b"x").expect("write");
+        std::os::unix::fs::symlink("/somewhere/else", src.join("link")).expect("symlink");
+
+        copy_tree(&src, &dst).expect("copy");
+
+        assert_eq!(std::fs::read(dst.join("d").join("f")).expect("read"), b"x");
+        let md = std::fs::symlink_metadata(dst.join("link")).expect("stat");
+        assert!(md.file_type().is_symlink(), "must stay a symlink");
+        assert_eq!(
+            std::fs::read_link(dst.join("link")).expect("readlink"),
+            Path::new("/somewhere/else")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +1154,147 @@ mod tests {
         e.register_hook(Arc::clone(&rec) as Arc<dyn crate::engine::hook::Hook>)
             .expect("register hook");
         (Arc::new(e), rec)
+    }
+
+    fn resolved(access: Access) -> ResolvedScratch {
+        ResolvedScratch {
+            addr: addr("c"),
+            def: ScratchDef {
+                path: ".cache/x".into(),
+                env: "C".into(),
+                access,
+                version: String::new(),
+                remote: false,
+                max_size: None,
+            },
+        }
+    }
+
+    /// The prepare span reaches the event stream with an outcome on it.
+    ///
+    /// This is what the stall watchdog counts as work and what the CI view turns
+    /// into its one line; without the pair, a build warming a multi-GB cache
+    /// looks idle to both.
+    #[tokio::test]
+    async fn preparing_a_scratch_emits_a_span_carrying_its_outcome() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let (engine, rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let r = resolved(Access::Shared);
+
+        let (_dir, prepared) = engine
+            .prepare_scratch_dir(&rs, "//app:a", &r.slot(), &r, false)
+            .await
+            .expect("prepare");
+        assert_eq!(prepared, Prepared::Cold, "nothing to warm from");
+
+        let seen = rec.seen.lock();
+        assert!(
+            seen.iter().any(|k| matches!(
+                k,
+                crate::engine::event::BuildEventKind::ScratchPrepareStart { addr, scratch }
+                    if addr == "//app:a" && scratch == &r.addr.format()
+            )),
+            "the start names both the consumer and the cache: {seen:?}",
+        );
+        let end = seen
+            .iter()
+            .find_map(|k| match k {
+                crate::engine::event::BuildEventKind::ScratchPrepareEnd {
+                    outcome, error, ..
+                } => Some((outcome.clone(), error.clone())),
+                _ => None,
+            })
+            .expect("an end event must close the span");
+        assert_eq!(end, ("cold".to_string(), None));
+    }
+
+    /// A second run over a warm directory reports `warm`, so a consumer can tell
+    /// "this build paid nothing" from "this build refilled the cache".
+    #[tokio::test]
+    async fn a_warm_lineage_reports_warm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let (engine, _rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let r = resolved(Access::Shared);
+
+        let (dir, _) = engine
+            .prepare_scratch_dir(&rs, "//app:a", &r.slot(), &r, false)
+            .await
+            .expect("first prepare");
+        std::fs::write(dir.join("f"), b"warm").expect("write");
+
+        let (_, prepared) = engine
+            .prepare_scratch_dir(&rs, "//app:a", &r.slot(), &r, false)
+            .await
+            .expect("second prepare");
+        assert_eq!(prepared, Prepared::Warm);
+    }
+
+    /// `--no-scratch` is an audit, and says so on the stream. Without the
+    /// outcome, a run with no cache reuse is indistinguishable from a broken
+    /// cache — the report would read as an outage rather than a deliberate run.
+    #[tokio::test]
+    async fn the_audit_reports_itself_rather_than_looking_like_a_cold_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let (engine, _rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let r = resolved(Access::Shared);
+
+        let (dir, prepared) = engine
+            .prepare_scratch_dir(&rs, "//app:a", &r.slot(), &r, true)
+            .await
+            .expect("prepare");
+        assert_eq!(prepared, Prepared::Audit);
+        assert!(dir.is_dir(), "the audit still gets a real, empty directory");
+    }
+
+    /// A prepare cancelled mid-flight reports that it was interrupted, not that
+    /// it completed and found nothing.
+    ///
+    /// `emit_scope`'s guard fires when the body future is *dropped* — Ctrl-C
+    /// during a multi-GB pull — so the end event carries whatever the body had
+    /// committed to. Reporting `cold` there would tell an operator the remote
+    /// had nothing for them, which is both false and reassuring.
+    #[tokio::test]
+    async fn a_cancelled_prepare_is_not_reported_as_a_finished_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let (engine, rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let r = resolved(Access::Shared);
+
+        // Poll once so the span opens and the end-guard arms, then drop the
+        // future mid-flight — the shape a Ctrl-C produces. The first poll parks
+        // on the lineage probe (a `blocking::run`), so nothing has committed to
+        // an outcome yet.
+        let slot = r.slot();
+        {
+            let mut fut =
+                std::pin::pin!(engine.prepare_scratch_dir(&rs, "//app:a", &slot, &r, false));
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(
+                std::future::Future::poll(fut.as_mut(), &mut cx).is_pending(),
+                "the prepare must still be in flight for this to be a cancellation",
+            );
+        }
+
+        let outcome = rec
+            .seen
+            .lock()
+            .iter()
+            .find_map(|k| match k {
+                crate::engine::event::BuildEventKind::ScratchPrepareEnd { outcome, .. } => {
+                    Some(outcome.clone())
+                }
+                _ => None,
+            })
+            .expect("the span still closes when cancelled");
+        assert_eq!(outcome, INTERRUPTED);
     }
 
     /// An uncontended acquire emits nothing.

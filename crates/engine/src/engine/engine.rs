@@ -138,6 +138,11 @@ pub struct Engine {
     /// on first use (`Engine::remote_tmp_dir`). Lazy, so a build with no
     /// `caches:` configured never touches the directory at all.
     pub(crate) remote_tmp_ready: tokio::sync::OnceCell<PathBuf>,
+
+    /// This process's `--no-scratch` audit directory, created (and older,
+    /// dead-process ones swept) on first use. Lazy, so an ordinary build never
+    /// creates it.
+    pub(crate) scratch_audit_ready: tokio::sync::OnceCell<PathBuf>,
 }
 
 /// Per-process FUSE sandbox state. Owns the `<home>/sandboxfuse<pid>/`
@@ -520,6 +525,7 @@ impl Engine {
             remote_caches,
             provider_functions_wired: std::sync::Once::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
+            scratch_audit_ready: tokio::sync::OnceCell::new(),
         };
         engine.register_driver(|_| Box::new(hbuiltins::plugingroup::Driver))?;
         engine.register_driver(|_| Box::new(hbuiltins::pluginscratch::Driver))?;
@@ -561,6 +567,16 @@ impl Engine {
     }
 
     /// The per-addr execute-phase lock.
+    /// The scratch lineage this run writes to.
+    pub fn scratch_scope(&self) -> &str {
+        &self.cfg.scratch.scope
+    }
+
+    /// Lineages this run may read from when its own has nothing.
+    pub fn scratch_restore_scopes(&self) -> &[String] {
+        &self.cfg.scratch.restore_scopes
+    }
+
     pub fn result_lock(&self) -> &ResultLock {
         &self.result_lock
     }

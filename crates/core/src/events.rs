@@ -79,6 +79,23 @@ pub enum BuildEventKind {
         /// It matters to a report because a one-failure summary under fail-fast
         /// reads as "one thing is broken" when the truth is "we stopped looking".
         fail_fast: bool,
+        /// Whether this run was asked to ignore carried-over scratch state
+        /// (`--no-scratch`). Scratch caches are still resolved, locked, created
+        /// and announced through their environment variables — only the stored
+        /// contents are withheld, so every target that uses one runs cold.
+        ///
+        /// On the stream because it explains *two* anomalies a consumer would
+        /// otherwise have to guess at: a build that is inexplicably slow, and a
+        /// report showing no cache reuse. A summary saying "0 cached" with no
+        /// cause reads like a cache outage rather than a deliberate audit.
+        ///
+        /// Phrased negatively on purpose. `#[serde(default)]` fills a missing
+        /// key with `false`, and for a frame from a host older than this field
+        /// the true answer *is* "not disabled" — scratch was on. The positive
+        /// spelling (`scratch_enabled`) would default those same frames to
+        /// "scratch was off", which is both wrong and alarming.
+        #[serde(default)]
+        scratch_disabled: bool,
     },
     /// Incremental notice of matched top-level targets. `addrs` are newly
     /// matched addresses to add to the set; `complete` is false while the
@@ -197,6 +214,48 @@ pub enum BuildEventKind {
         addr: String,
         scratch: String,
     },
+    /// Start of preparing a scratch directory for a consumer: everything done
+    /// under the slot guard — resolving the lineage, seeding a new scope from a
+    /// fallback, creating the directory, and pulling from the remote when the
+    /// lineage is cold.
+    ///
+    /// One span rather than one per step: they share a guard, run in fixed
+    /// order, and a user cannot act on them separately. What they *can* act on
+    /// is the outcome, which is why the detail rides on the `End`.
+    ///
+    /// Only ever emitted on an execute (i.e. after a cache miss), so a fully
+    /// cached run emits none of these.
+    ScratchPrepareStart {
+        addr: String,
+        scratch: String,
+    },
+    ScratchPrepareEnd {
+        addr: String,
+        scratch: String,
+        /// What preparing the directory actually did — `"warm"`, `"seeded"`,
+        /// `"pulled"`, `"cold"`, `"audit"`, or `"interrupted"`.
+        ///
+        /// A string, not an enum, and for a wire reason: an enum variant a
+        /// skewed plugin has never heard of fails to deserialize, and the SDK
+        /// treats a decode failure as end-of-stream. An unrecognised string just
+        /// prints. Same call, for the same reason, as `ResultEnd::exit_status`.
+        #[serde(default)]
+        outcome: String,
+        /// Bytes pulled from the remote, when the outcome was `"pulled"`.
+        #[serde(default)]
+        bytes: u64,
+        /// The snapshot was restored at a different path than it was produced
+        /// at.
+        ///
+        /// Worth its own field rather than a log line: a cache whose entries
+        /// embed absolute paths restores perfectly and is then *inert* — the
+        /// pull reports success, the bytes are spent, and every future build
+        /// still runs cold. It looks exactly like a hit, so nothing else in the
+        /// stream can distinguish it.
+        #[serde(default)]
+        path_mismatch: bool,
+        error: Option<String>,
+    },
     RemoteCacheHit {
         addr: String,
     },
@@ -307,6 +366,50 @@ mod tests {
                 assert_eq!(upstream_of, None);
                 assert_eq!(exit_status, None);
                 assert_eq!(log_tail, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `RequestConfig` from a host predating `scratch_disabled`.
+    ///
+    /// The default must read as "scratch was on", which is the truth for every
+    /// frame emitted before the field existed. The positive spelling would
+    /// default these to "scratch was off" and have consumers report a
+    /// deliberate-looking audit on runs that never asked for one.
+    #[test]
+    fn an_old_request_config_defaults_to_scratch_enabled() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"RequestConfig","max_workers":8,
+            "fail_fast":false}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
+        match ev.kind {
+            BuildEventKind::RequestConfig {
+                scratch_disabled, ..
+            } => assert!(
+                !scratch_disabled,
+                "a host with no such field had scratch enabled",
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The scratch spans decode with their detail fields absent — the shape an
+    /// older host, or one that emits only the `Start` half, produces.
+    #[test]
+    fn scratch_prepare_end_decodes_without_its_detail_fields() {
+        let frame = r#"{"at_unix_ms":1,"kind":{"type":"ScratchPrepareEnd",
+            "addr":"//a:x","scratch":"//b:cache","error":null}}"#;
+        let ev: BuildEvent = serde_json::from_str(frame).expect("must decode");
+        match ev.kind {
+            BuildEventKind::ScratchPrepareEnd {
+                outcome,
+                bytes,
+                path_mismatch,
+                ..
+            } => {
+                assert_eq!(outcome, "");
+                assert_eq!(bytes, 0);
+                assert!(!path_mismatch);
             }
             other => panic!("wrong variant: {other:?}"),
         }
