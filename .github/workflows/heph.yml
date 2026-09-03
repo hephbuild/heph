@@ -1024,6 +1024,183 @@ jobs:
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
 
+  # Line coverage, uploaded to Codecov. Runs `cov` (devenv.nix) — the same
+  # command a human runs locally — and uploads the lcov it writes. LLVM
+  # source-based instrumentation via grcov; `cov`'s header explains why, over
+  # kcov and tarpaulin.
+  #
+  # Two legs, and they are not decoration. Coverage is per-line, so a report
+  # describes whichever OS ran the suite: `crates/proc/src/proc_exec/imp_macos.rs`
+  # is ~790 lines of the most delicate code in the tree, a Linux run does not
+  # compile it, so it emits no coverage mapping, never appears in the lcov, and
+  # Codecov's patch status on a PR that touches only that file reports "nothing
+  # to cover" — a green check over entirely unmeasured code. Both legs upload
+  # under their own Codecov `flag`, and Codecov merges them (see codecov.yml).
+  # The arch axis is deliberately not covered: x86_64-vs-aarch64 differences
+  # here are memory ordering and codegen, which line coverage cannot see anyway.
+  #
+  # ADVISORY. Absent from `release`'s `needs:` on purpose — see codecov.yml, and
+  # `tests/coverage_gate.rs` keeps it that way. It *is* in `cleanup`'s, because
+  # `cleanup` deletes the `repo` artifact these legs download; the cost of that
+  # is that a red coverage leg leaks the artifact for the retention window, the
+  # same way a red `lint` or `test` already does. `cleanup` gains an
+  # `if: always()` the day that becomes annoying — it is left alone here because
+  # flipping it also changes what a red *lint* enforces, which
+  # `tests/lint_gate.rs` documents as deliberate.
+  #
+  # Fork PRs run this too, and get no R2 credentials, so both legs pay a full
+  # cold instrumented compile for a report that is never uploaded (only written
+  # to the step summary). That is the same deal `build`, `lint` and `test`
+  # already give a fork, so it is consistent rather than new — but it is the
+  # first place to look if fork CI starts timing out.
+  #
+  # Its own job rather than a step in `test`: `-Cinstrument-coverage` changes
+  # RUSTFLAGS, so this shares no kache key with the uninstrumented build, and
+  # sharing a runner would mean compiling the workspace twice in series on one
+  # disk. Run #1 after any RUSTFLAGS change is therefore a full cold compile of
+  # the whole locked graph; after that its own keys stay warm in R2 — which is
+  # exactly why the drain step at the bottom is not optional here.
+  coverage:
+    name: Coverage ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    # `Test linux/amd64` sits near 24min at a 45min timeout. Instrumented
+    # execution adds to that (diluted, since much of this suite's wall time is
+    # uninstrumented `go` and `sh` subprocesses), grcov's ingest adds minutes on
+    # top, and run #1 — plus every fork PR, which gets no R2 credentials —
+    # starts from a cold instrumented compile.
+    timeout-minutes: 90
+    needs: gen
+    strategy:
+      # Both legs always report. With fail-fast the second is cancelled the
+      # moment the first goes red, and a `cancelled` leg tells you nothing about
+      # the platform you did not see — which for a two-OS report is the point.
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            flag: linux-amd64
+          - os: darwin
+            arch: arm64
+            runs-on: ${{ vars.MACOS_RUNNER }}
+            target: aarch64-apple-darwin
+            flag: darwin-arm64
+    env:
+      # Job-level so the upload steps can branch on it: a fork PR is given no
+      # secrets, and this expands to the empty string there.
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v7
+        with:
+          name: repo
+          path: .
+
+      # The same reclaim `test` needs, for the same ~14 GB root disk, with more
+      # riding on it: instrumented artifacts carry `__llvm_covmap`/`__llvm_covfun`
+      # on top of the dev profile, and the run leaves a `.profraw` per test
+      # process. `cov` drops `-Cdebuginfo=0` into RUSTFLAGS to claw most of that
+      # back — source-based coverage reads no DWARF — and deletes the profiles as
+      # soon as grcov has read them. Linux only; the macOS runner is not
+      # disk-constrained here.
+      - name: Free disk space (linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+        with:
+          cargo-target: ${{ matrix.target }}
+          # Distinct from the test/build/lint jobs on the same triples:
+          # actions/cache skips the save when the exact key already exists, so
+          # two jobs sharing a key means whichever saves first freezes the entry
+          # and the other's crate downloads never persist.
+          cache-suffix: "-coverage"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
+
+      # No `continue-on-error:` and no `if:` here, for the same reason the Lint
+      # step carries neither. This script is the only thing in the pipeline that
+      # can tell a broken measurement from a real drop — Codecov is configured
+      # informational and this job gates nothing — so a skipped or shrugged-off
+      # `cov` is how an empty report gets published as a number.
+      - name: Coverage
+        shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
+        run: cov
+
+      # Fork PRs get no secrets. Codecov's tokenless path exists for public
+      # repos but is rate-limited, and with `fail_ci_if_error: true` a rate
+      # limit would turn an external contributor's PR red over something they
+      # cannot fix. Skip it there instead — loudly, in the step below — and note
+      # that the whole report is still in the job log and the step summary that
+      # `cov` wrote.
+      - name: Upload to Codecov
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # Named, not searched for. Left to auto-discovery the action can pick
+          # up an unrelated report, or none, and "none" is only an error by
+          # default — a *valid but empty* one is not.
+          files: coverage/lcov.info
+          disable_search: true
+          flags: ${{ matrix.flag }}
+          # The report is the deliverable. An upload that 404s or times out and
+          # is shrugged off leaves the PR comment showing the previous commit's
+          # number, which reads exactly like "coverage did not move".
+          fail_ci_if_error: true
+
+      - name: Note skipped upload
+        if: env.CODECOV_TOKEN == ''
+        run: |
+          echo "::warning title=Codecov::no CODECOV_TOKEN (fork PR?) — coverage was measured but not uploaded; the report is in this job's summary"
+
+      # Also the upload barrier, which is why it is `always()` and why every
+      # compiling job needs one. The daemon uploads to R2 in the background so
+      # no rustc invocation waits on the network — but an ephemeral runner is
+      # torn down the moment the job ends, taking any queued upload with it.
+      # `daemon stop` drains the queue (up to 30s) before returning, so what
+      # this job compiled is actually published. Without it the cache still
+      # reads correctly, it just never fills — and for this job that means every
+      # run pays the full cold instrumented compile.
+      #
+      # `|| true`: fork PRs run with no remote and therefore no daemon (see
+      # setup-nix), and this must not turn a green build red on the way out.
+      - name: kache stats + drain uploads
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: |
+          kache stats
+
+          # Resolve the log path from the daemon itself rather than hardcoding
+          # it. Both OSes run this same step and they do not agree: Linux puts
+          # it at `~/.cache/kache/kache.log`, macOS at
+          # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
+          # directory the upstream docs name, which is where hardcoding it
+          # would have silently produced nothing on the darwin legs.
+          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+
+          kache daemon stop || true
+
+          # Upload outcomes exist *only* in this log. `kache stats` reports what
+          # was read, never what was published, so without this the difference
+          # between "uploaded" and "still queued when the 30s drain cap fired"
+          # is invisible — which is precisely the question a low hit rate on a
+          # re-run raises, and which cost a round trip to answer once already.
+          if [ -n "${log:-}" ] && [ -f "$log" ]; then
+            echo "::group::kache daemon log (tail)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          else
+            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
+
   # Compile `bin_e2e`'s test binaries ahead of the job that runs them. `tst`
   # excludes the crate (it needs staged artifacts to run) and nothing else in
   # the workspace depends on it, so its private dependencies — portable-pty,
@@ -1357,7 +1534,14 @@ jobs:
 
   cleanup:
     name: Cleanup
-    needs: [gen, build, lint, test, bin_e2e, upload_artifacts]
+    # `coverage` is here purely so the `repo` artifact outlives it. Every
+    # compiling job downloads that artifact as its first step and this job
+    # deletes it; `coverage` is the longest job in the graph, so without this
+    # entry `cleanup` can fire while a coverage leg is still queued, and
+    # `download-artifact` hard-fails with an error that points at artifacts
+    # rather than at coverage. It is not a gate — nothing downstream of
+    # `cleanup` exists.
+    needs: [gen, build, lint, test, bin_e2e, coverage, upload_artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

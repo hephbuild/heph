@@ -42,6 +42,7 @@ cargo test <test_name>               # run a single test by name
 
 tst                                  # run all tests (excludes bin-e2e)
 e2e                                  # binary end-to-end suite (see below)
+cov                                  # line coverage (see below) — CI runs it, don't run it reflexively
 lint                                 # lint
 fix                                  # format & apply lint fixes
 gen                                  # regenerate protobuf bindings (runs buf generate)
@@ -73,6 +74,47 @@ There is no `CARGO_TARGET_DIR` override anywhere — every workspace uses cargo'
 It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run it reflexively: the `bin_e2e` CI job runs it on all three platforms on every push, and it gates `release`. Run it locally only when changing something it covers (the loader, the TUI, CLI exit codes, the `e2e` script itself) — and expect a full release build the first time.
 
 `tst` excludes `bin-e2e` deliberately: those tests need staged artifacts and hard-fail without `HEPH_E2E_DIST`, so a suite that never ran can't read as a suite that passed. See `.claude/testing.md` for what belongs there versus `crates/e2e`.
+
+### `cov` — line coverage
+
+`cov` runs the `tst` suite under LLVM source-based instrumentation
+(`-Cinstrument-coverage`) and turns the resulting `.profraw` into lcov with
+grcov. The `coverage` job in CI runs exactly this — on `linux/amd64` and
+`darwin/arm64`, each uploading under its own Codecov flag — and then uploads
+the file. Reads out of `coverage/`: `lcov.info` (filtered — what Codecov
+reads), `lcov.raw.info`, `summary.json` (sorted keys, no timestamps — the agent
+surface), `test.log`, and a worst-covered-first per-crate table on stdout.
+
+`#[cfg(test)]` modules are stripped from the report by
+`scripts/coverage-report.py`. 39% of this tree's Rust lines live inside one and
+source-based coverage instruments them along with the code they test — no
+path-based exclusion can reach them. Left in, they do more than inflate the
+headline: since every change here ships with a test, patch coverage on a PR
+would rise in proportion to how much test code it added. (Measured on
+`crates/core`: 86.4% with them, 73.2% without.)
+
+```bash
+cov                          # the whole gate suite
+cov -p engine                # narrow local loop; args go straight to cargo test
+```
+
+**Coverage gates nothing, and that is the point.** Every Codecov status is
+`informational` and the job is absent from `release`'s `needs:` — a percentage
+that blocks a merge buys tests that move the percentage. The corollary is that
+nothing downstream can tell a broken measurement from a real drop, so `cov`
+itself exits non-zero on every way it knows of measuring nothing: no profiles,
+zero tests, a profile written outside `$LLVM_PROFILE_FILE`, a profile grcov
+skipped, a report under the size floors, or the named canary file unhit.
+`tests/coverage_gate.rs` guards the rest — that the instrumented build keeps
+`.cargo/config.toml`'s rustflags (an env `RUSTFLAGS` *replaces* them), that it
+names a target so proc-macros are not instrumented, that it measures the same
+selection `tst` does, and that both platform legs still exist.
+
+Slow and disk-hungry: `-Cinstrument-coverage` shares no kache key with the
+normal build, so the first run after any RUSTFLAGS change is a full cold
+compile. CI runs it on every push — don't run it locally unless you are
+changing coverage itself, or you want the per-crate table for a crate you are
+working on (`cov -p <crate>`, which skips the floors).
 
 ### Exec runners
 
