@@ -128,7 +128,7 @@ jobs:
             arch: arm64
             runs-on: macos-latest
     steps:
-      # The `perf-test` label opt-in for `pull_request` runs is enforced by
+      # The `ci/perf-test` label opt-in for `pull_request` runs is enforced by
       # the caller (`heph.yml`'s `perfbench` job `if:`) — an unlabeled PR
       # never invokes this workflow at all, so there is no in-job gate step
       # here to fail past.

@@ -3,17 +3,41 @@ name: CI
 on:
   push:
     branches: ["master"]
-  # Every pull request, whatever it targets. Deliberately unfiltered: a
-  # `branches:` filter here matches the PR's *base*, so restricting it to
-  # master silently gives zero CI to any PR stacked on another branch — no
-  # runs queued, no failed checks, nothing to notice. The upper layers of a
-  # stack are exactly the changes that most want testing before the layer
-  # below them merges.
+  # Every pull request, whatever it targets. Deliberately unfiltered *here*: a
+  # `branches:` filter matches the PR's *base*, and a workflow that never
+  # triggers publishes no checks at all — a stacked PR would show an empty
+  # check list, which reads like a pass and cannot be overridden with a label.
+  # The stacked-PR decision is made by the `gate` job below instead, where it
+  # is visible, explainable, and opt-outable.
+  #
+  # Naming `types:` replaces the default set, so the three default events are
+  # spelled out and two more are added. Both additions exist for the gate:
+  #
+  #   - `labeled`, so adding `ci/force-ci` starts a run by itself rather than
+  #     needing a push to notice the label. (It also makes `ci/perf-test`
+  #     self-triggering, which it previously was not.)
+  #   - `edited`, so the base-branch change GitHub performs *itself* when a
+  #     stack's base merges — retargeting the child at master — starts a run.
+  #     Nothing else reports that: a retarget fires no `synchronize`, so
+  #     without this the child would sit at `master` still carrying the
+  #     `skipped` checks from its stacked days, which branch protection reads
+  #     as success. That is code reaching master with nothing ever built.
+  #
+  # Both fire on things that are not code changes — any label, any title or
+  # body edit — and the gate cannot suppress those without concluding "skip"
+  # on a master-targeting PR, which would replace its green required checks
+  # with skipped ones. Re-running is the safe direction, so the cost is real
+  # and taken deliberately: **a label or a body edit on a master-targeting PR
+  # runs CI again, and because this workflow cancels in-progress PR runs, doing
+  # either mid-run kills that run and restarts it from zero.** In practice the
+  # dominant case is `gh stack submit`, which pushes and rewrites PR bodies
+  # seconds apart — same concurrency group, so those collapse into one run.
   #
   # The ABI guard diffs against `github.base_ref` rather than a hardcoded
-  # master, so it keeps working here and reports the ABI delta for that layer
-  # alone.
+  # master, so it keeps working on a stacked PR and reports the ABI delta for
+  # that layer alone.
   pull_request:
+    types: [opened, synchronize, reopened, labeled, edited]
 
 # PR: cancel superseded runs so a new push doesn't leave the old run burning
 # runners (and showing up as a noisy "cancelled"). master: every commit gets
@@ -42,10 +66,97 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Which pull requests get a build.
+  #
+  # A stacked PR — one whose base is another PR's branch rather than master —
+  # is not the change that is about to land. Everything under it has to merge
+  # first, and `master` is squash-only, so the layer above always gets rebased
+  # (`gh stack sync`) once its base lands; that force-push is a `synchronize`
+  # event on a PR whose base is now master, and *that* run is the one whose
+  # result anyone acts on. Building every layer on every push multiplied a
+  # deep stack's CI cost by its depth to produce results that were, at best,
+  # about a tree nobody would ever merge.
+  #
+  # So: a push, or a PR targeting the default branch, builds. Anything else
+  # builds only when the PR carries the `ci/force-ci` label — for the times a
+  # mid-stack change is worth testing on its own (a big refactor low in the
+  # stack, a platform-specific change, a flake hunt).
+  #
+  # This does not let untested code reach master. Required status checks live
+  # in the `master` repository ruleset, whose condition is `~DEFAULT_BRANCH` —
+  # it applies to exactly the PRs whose base is master, which is exactly the
+  # set this gate lets through. A stacked PR merges with skipped checks
+  # because GitHub asks nothing of a PR that does not target a protected
+  # branch. The stack stays mergeable bottom-up with no manual override and no
+  # ruleset change.
+  #
+  # That argument has one seam, and it is the reason `edited` is in the
+  # trigger list above. A skipped job's check run concludes `skipped`, which
+  # branch protection treats as a pass — so a child PR that *became*
+  # master-targeting without a new run would be mergeable carrying skipped
+  # checks over content nothing ever built. Two independent things close it:
+  # GitHub's own retarget is an `edited` event with `changes.base`, which
+  # triggers a run whose base is now master; and `gh stack sync` — required
+  # anyway, since `master` is squash-only and the child still carries its
+  # base's commits — force-pushes, which is a `synchronize`. Either one alone
+  # is sufficient; neither is trusted alone.
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          FORCED: ${{ contains(github.event.pull_request.labels.*.name, 'ci/force-ci') }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            run=true
+            why="event is '$EVENT', not a pull request."
+          elif [ "$BASE" = "$DEFAULT_BRANCH" ]; then
+            run=true
+            why="this PR targets '$DEFAULT_BRANCH'."
+          elif [ "$FORCED" = "true" ]; then
+            run=true
+            why="this PR carries the 'ci/force-ci' label."
+          else
+            run=false
+            why="this PR targets '$BASE', not '$DEFAULT_BRANCH' — it is stacked on another branch, so it cannot merge until the layer below it does, and it will get a full run as soon as it is rebased onto '$DEFAULT_BRANCH'. Add the 'ci/force-ci' label to build it anyway; 'ci/perf-test' alone will not, because perfbench needs the build this gate skipped."
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "reason=$why" >> "$GITHUB_OUTPUT"
+
+          # Stdout and an annotation, deliberately not a step summary. The
+          # run-page summary belongs to the `summary` job, which already
+          # reports the verdict there and would otherwise be preceded by a
+          # near-duplicate of itself. These two surfaces are the ones a
+          # non-browser reader can reach: stdout lands in `gh run view --log`,
+          # and the annotation is in the check-run API, so it survives into
+          # `gh run view` and the PR's checks page. That matters because
+          # someone — or something — reading `gh pr checks` sees eleven
+          # `skipping` rows and an exit code of 0, and needs the reason to be
+          # reachable without opening a tab.
+          if [ "$run" = "true" ]; then
+            echo "Running CI: $why"
+            echo "::notice title=CI running::$why"
+          else
+            echo "Skipping CI: $why"
+            echo "::notice title=CI skipped::$why"
+          fi
+
   gen:
     name: Codegen
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     outputs:
       version: ${{ steps.version.outputs.version }}
       repo_artifact_id: ${{ steps.upload_repo.outputs.artifact-id }}
@@ -91,12 +202,15 @@ jobs:
   # into the plugin (`HEPH_GOVET_SHA256_*`), which then verifies the asset it
   # downloads — no checksum for a user to configure, and a tampered asset fails
   # the build closed. That baking is the only reason `build` needs this job; it
-  # deliberately depends on nothing itself (no codegen, no devenv — just the Go
-  # sources), so it runs concurrently with `gen` and adds no critical path.
+  # needs no codegen and no devenv of its own (just the Go sources), so it runs
+  # concurrently with `gen` and adds no critical path. `gate` is the sole
+  # exception, and it is seconds.
   govet:
     name: Build heph-govet
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     outputs:
       sha256_linux_amd64: ${{ steps.build.outputs.sha256_linux_amd64 }}
       sha256_linux_arm64: ${{ steps.build.outputs.sha256_linux_arm64 }}
@@ -631,8 +745,11 @@ jobs:
   abi:
     name: ABI guard
     # PR-only: it diffs the branch against the PR base. Pure git + bash, so it
-    # skips the devenv toolchain and runs in seconds.
-    if: github.event_name == 'pull_request'
+    # skips the devenv toolchain and runs in seconds — but it still reports on
+    # a layer nobody can merge yet, so it rides the same gate as everything
+    # else rather than being a lone check on a skipped stacked PR.
+    needs: gate
+    if: github.event_name == 'pull_request' && needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1115,15 +1232,17 @@ jobs:
   # Perf-regression check (own workflow: .github/workflows/perf.yml) —
   # generates one synthetic corpus, times a fixed scenario set against N and
   # N-1, and reports a regression verdict. Two triggers, two roles:
-  #   - `pull_request`, labeled `perf-test`: this is the GATE — a real
+  #   - `pull_request`, labeled `ci/perf-test`: this is the GATE — a real
   #     regression fails the check for real. Opt-in while the harness and its
   #     thresholds are still being proven out; an unlabeled PR skips this job
   #     entirely rather than running it just to fail on the missing label —
   #     cheaper, and the `if:` below is the single source of truth for
-  #     whether perf runs at all. Adding the label to an already-open PR does
-  #     NOT retrigger this job on its own (`pull_request` only fires on
-  #     `opened`/`synchronize`/`reopened`, not `labeled`) — push a commit or
-  #     re-run the job after labeling.
+  #     whether perf runs at all. Labelling an already-open PR does start a
+  #     run on its own — `labeled` is in this workflow's `pull_request` types
+  #     (added for the gate's `ci/force-ci`), so no push or manual re-run is
+  #     needed. On a *stacked* PR it still gets nothing: this job needs
+  #     `build`, which the gate skipped, so `ci/perf-test` there wants
+  #     `ci/force-ci` alongside it.
   #   - `push` to `master`: nothing is blocked at this point (the merge
   #     already happened) — this is continuous monitoring, and a regression
   #     instead files a GitHub issue.
@@ -1139,7 +1258,7 @@ jobs:
   perfbench:
     name: Perf
     if: |
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf-test')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci/perf-test')) ||
       (github.event_name == 'push' && github.ref == 'refs/heads/master')
     needs: [build]
     uses: ./.github/workflows/perf.yml
@@ -1184,15 +1303,46 @@ jobs:
               },
             });
 
+  # `always()`, so this is the one job that still speaks when the gate skipped
+  # everything — a run whose every check is "skipped" and whose summary is
+  # empty is indistinguishable from a broken workflow. It restates the gate's
+  # reason instead.
   summary:
     name: Summary
-    needs: [gen, upload_artifacts]
+    needs: [gate, gen, upload_artifacts]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Generate summary
+        # The gate's reason carries a branch name, so it arrives through `env:`
+        # rather than a `${{ }}` spliced into the script. Ref names may contain
+        # `$`, `"` and backticks, and this one is only trusted because a PR's
+        # base is always a branch of *this* repo — one `env:` is cheaper than
+        # relying on that staying true.
+        env:
+          GATE_RUN: ${{ needs.gate.outputs.run }}
+          GATE_REASON: ${{ needs.gate.outputs.reason }}
+          GATE_RESULT: ${{ needs.gate.result }}
         run: |
+          # `needs.gate.result` first, and only then its outputs. `always()`
+          # means this job also runs when `gate` was cancelled or failed, and
+          # a cancelled gate has empty outputs — so branching on `run` alone
+          # would explain a broken workflow as "this PR is stacked", which is
+          # a confident, wrong, and unfalsifiable answer from the one job that
+          # exists to answer the question.
+          if [ "$GATE_RESULT" != "success" ]; then
+            echo "# Build Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**CI did not run** — the \`Gate\` job concluded \`$GATE_RESULT\`, so nothing downstream of it started. This is not the stacked-PR skip; see the \`Gate\` job." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          if [ "$GATE_RUN" != "true" ]; then
+            echo "# Build Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**CI skipped** — $GATE_REASON" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
           echo "# Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** \`${{needs.gen.outputs.version}}\`" >> $GITHUB_STEP_SUMMARY
