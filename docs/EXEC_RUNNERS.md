@@ -150,6 +150,7 @@ contribute:
 
 ```text
 PATH = the target's tools  ++  what the target declared  ++  the runner's PATH
+                                                          ++  what heph supplies
 ```
 
 Tools lead, so a target that declares a tool gets that one even when the
@@ -165,6 +166,14 @@ to the image's own tools: the recipe keeps working, with a different binary than
 its cache key names. A runner that replaces `PATH` outright is then responsible
 for putting its own environment's back *behind* what it was handed — which is
 why the oci runner reads the image's `PATH` from the container config.
+
+The last tier is the opposite of the first. `prefix` is what the *target*
+declared, so it leads and wins over everything; `suffix` is what *heph* supplies
+— the builtin utilities — so it trails, filling a gap the environment leaves
+without ever shadowing a binary that environment deliberately ships. It is
+composed into the environment this process spawns, and therefore deliberately
+does not reach a runner carrying the environment out of band: those are host
+paths, and a container's filesystem is not this one.
 
 What is **not** in there is the exec driver's own sandbox `PATH`
 (`/usr/local/bin:/usr/bin:/bin`, or its `path:` option). Under a runner the

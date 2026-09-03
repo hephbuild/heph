@@ -140,6 +140,20 @@ pub struct PathPolicy {
     /// Used only when nothing else provides a `PATH`, and never under a runner
     /// that supplies an environment of its own.
     pub fallback: Option<OsString>,
+    /// Entries that come **last**, behind everything the environment provides.
+    ///
+    /// For tools heph supplies rather than the target: they should fill a gap
+    /// the environment leaves, and never shadow a binary that environment
+    /// deliberately ships. `prefix` is the opposite — what the target declared,
+    /// which wins over everything.
+    ///
+    /// It is composed into the environment *this process* spawns, and so it
+    /// deliberately does not reach a runner that carries the environment out of
+    /// band: those entries are host paths, and a container's filesystem is not
+    /// this one. A runner that relocates the environment gets the prefix (which
+    /// is the target's own, and lives on paths the runner is responsible for
+    /// making visible) and not the suffix.
+    pub suffix: Vec<OsString>,
 }
 
 /// The `PATH` key, as an `OsStr` comparison target.
@@ -362,6 +376,7 @@ async fn prepare(
         // local spawn, unchanged.
         let declared = get_env(&spec.env, "PATH");
         compose_path(&mut spec.env, path, declared, true);
+        append_path(&mut spec.env, path.suffix.iter().cloned());
         return Ok(());
     };
 
@@ -429,11 +444,13 @@ async fn prepare(
         !supplies_environment,
     );
     if let Some(provided) = provided {
-        let so_far = get_env(&spec.env, "PATH");
-        if let Some(joined) = join_path(so_far.into_iter().chain(std::iter::once(provided))) {
-            set_path(&mut spec.env, joined);
-        }
+        append_path(&mut spec.env, std::iter::once(provided));
     }
+    // Last, behind the environment the target asked to run in. Only for a
+    // runner that left the environment in `spec.env`: one that carried it out
+    // of band is holding a copy this never touches, which is the intended
+    // outcome — see [`PathPolicy::suffix`].
+    append_path(&mut spec.env, path.suffix.iter().cloned());
     Ok(())
 }
 
@@ -467,6 +484,14 @@ fn compose_path(
 /// ever sees. See [`PathPolicy`].
 fn carried_path(path: &PathPolicy, declared: Option<&OsString>) -> Option<OsString> {
     join_path(path.prefix.iter().cloned().chain(declared.cloned()))
+}
+
+/// Append `items` behind whatever `PATH` the environment already has.
+fn append_path(env: &mut Vec<(OsString, OsString)>, items: impl IntoIterator<Item = OsString>) {
+    let so_far = get_env(env, "PATH");
+    if let Some(joined) = join_path(so_far.into_iter().chain(items)) {
+        set_path(env, joined);
+    }
 }
 
 fn set_path(env: &mut Vec<(OsString, OsString)>, value: OsString) {
@@ -613,6 +638,15 @@ mod tests {
         PathPolicy {
             prefix: prefix.iter().map(|p| os(p)).collect(),
             fallback: fallback.map(os),
+            suffix: vec![],
+        }
+    }
+
+    fn policy_with_suffix(prefix: &[&str], suffix: &[&str]) -> PathPolicy {
+        PathPolicy {
+            prefix: prefix.iter().map(|p| os(p)).collect(),
+            fallback: None,
+            suffix: suffix.iter().map(|p| os(p)).collect(),
         }
     }
 
@@ -704,6 +738,45 @@ mod tests {
                 "/sandbox/bin:/heph/coreutils/bin:/declared"
             )),
             "the target's tools and heph's builtins must lead the PATH the runner carries"
+        );
+    }
+
+    /// The suffix is for tools *heph* supplies rather than the target: they fill
+    /// a gap the environment leaves and never shadow what it deliberately
+    /// ships. So it composes behind everything — the target's tools lead, what
+    /// the target declared follows, then the environment, then these.
+    #[tokio::test]
+    async fn what_heph_supplies_composes_behind_the_environment() {
+        let mut spec = spec("/bin/true");
+        spec.env.push((os("PATH"), os("/declared")));
+        let ctoken = StdCancellationToken::new();
+        let policy = policy_with_suffix(&["/sandbox/bin"], &["/heph/coreutils/bin"]);
+        prepare(RunnerRef::local(), &mut spec, &policy, &ctoken)
+            .await
+            .expect("local prepare");
+        assert_eq!(
+            path_of(&spec.env).as_deref(),
+            Some("/sandbox/bin:/declared:/heph/coreutils/bin")
+        );
+    }
+
+    /// The suffix is not part of what a runner carries. Those entries are host
+    /// paths, and the whole point of naming a runner is that the filesystem may
+    /// not be this one — a container would get a directory of symlinks into a
+    /// binary built for the wrong platform.
+    ///
+    /// The prefix still is carried: it is the target's own, on paths the runner
+    /// is responsible for making visible.
+    #[test]
+    fn what_heph_supplies_is_not_carried_to_a_runner() {
+        let carried = carried_path(
+            &policy_with_suffix(&["/sandbox/bin"], &["/heph/coreutils/bin"]),
+            Some(&os("/declared")),
+        );
+        assert_eq!(
+            carried.as_deref(),
+            Some(std::ffi::OsStr::new("/sandbox/bin:/declared")),
+            "a runner carries the target's own PATH, not heph's host-path builtins"
         );
     }
 
