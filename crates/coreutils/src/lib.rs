@@ -19,6 +19,7 @@ mod archive;
 mod find;
 mod grep;
 mod sed;
+mod tmpl;
 
 use anyhow::Context as _;
 use std::ffi::OsString;
@@ -34,7 +35,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Bump it on any observable behaviour change — an applet added or removed, an
 /// upstream upgrade that changes output, a fix to one of the hand-written parts.
-pub const COREUTILS_VERSION: u32 = 4;
+pub const COREUTILS_VERSION: u32 = 5;
 
 /// Where the applets come from, for `heph tool coreutils list`.
 pub const UPSTREAM: &str =
@@ -115,6 +116,7 @@ applets! {
     "tar" => crate::archive::tar,
     "tee" => uu!(uu_tee),
     "timeout" => uu!(uu_timeout),
+    "tmpl" => crate::tmpl::main,
     "touch" => uu!(uu_touch),
     "tr" => uu!(uu_tr),
     "true" => uu!(uu_true),

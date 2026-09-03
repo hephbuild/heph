@@ -7,6 +7,7 @@
 //! - `pluginscratch` — the `scratch` driver (persistent cache-directory declarations).
 //! - `pluginstatictarget` — in-memory static target provider (tests/wiring).
 //! - `plugintextfile` — the `textfile` driver.
+//! - `plugintemplate` — the `template` driver (minijinja rendering).
 //! - `pluginhostbin` — the host-binary provider + driver.
 
 pub mod pluginfs;
@@ -14,6 +15,7 @@ pub mod plugingroup;
 pub mod pluginhostbin;
 pub mod pluginscratch;
 pub mod pluginstatictarget;
+pub mod plugintemplate;
 pub mod plugintextfile;
 
 // The `htspec` derive macros expand to code referencing `crate::htvalue` and

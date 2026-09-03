@@ -98,6 +98,16 @@ Read `docs/COREUTILS.md` before touching it. The one thing to know going in:
 is on, so bumping it invalidates every exec target in every workspace — a
 release-gated decision, not a routine one.
 
+### The `template` driver
+
+`template(name, src, out, vars)` renders a declared template with declared
+variables, in-process (`crates/builtins/src/plugintemplate`). It exists so
+filling in a config file does not have to go through `sed` and a shell.
+
+Read `docs/TEMPLATE.md` before touching it. The one thing to know going in:
+`vars` is hashed from a `BTreeMap` because it arrives as a `HashMap`, and
+hashing it in iteration order would move the def hash on every run.
+
 ### `heph-bench` — perf-regression harness
 
 `crates/bench-corpus` (deterministic synthetic corpus generator) + `crates/bench` (`heph-bench` binary: `corpus`/`run inprocess`/`run dist`/`compare`). Times `heph` scenarios in-process (Tier A, no process spawn, no plugin cdylib) or against the real prebuilt binary + plugin cdylib (Tier B, the seam only a real `dlopen` can exercise), then decides regression from a baseline-vs-candidate comparison.
