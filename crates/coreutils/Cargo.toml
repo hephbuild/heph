@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
+htemplate = { package = "template", path = "../template" }
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 uu_basename = "0.10"
 uu_base64 = "0.10"
