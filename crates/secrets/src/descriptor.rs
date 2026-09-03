@@ -37,6 +37,7 @@
 //! an identity that does not — but only once the machinery for obtaining it has
 //! been separated out.
 
+use crate::htspec::{SpecEnum, SpecOneOf, SpecStruct};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -75,17 +76,25 @@ pub struct Identity {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<String>,
 
-    /// GCP service account to impersonate after the STS hop.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub impersonate: Option<String>,
-
-    /// GitHub App id, for the installation-token exchange.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_id: Option<String>,
-
-    /// GitHub App installation, as `org` or `org/repo`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub install: Option<String>,
+    /// Identity parameters that only one provider or exchange understands.
+    ///
+    /// **The open half of the identity, and deliberately so.** The named fields
+    /// above are the ones with a meaning across vendors — a principal, an
+    /// audience, a scope, a region, an object store, a slot key. Everything
+    /// vendor-shaped lives here instead: a GitHub App id and installation, a
+    /// service account to impersonate, an Azure tenant.
+    ///
+    /// Naming those as first-class fields was the earlier design and it was
+    /// wrong twice over. It put vendor names in a format that is frozen into
+    /// every consumer's cache key, and it made supporting the next vendor a
+    /// schema change — so an organization with an internal IdP had no way to
+    /// say what its identity was at all. A map costs a little checkability and
+    /// buys forward compatibility: a new vendor adds no field and re-keys
+    /// nothing.
+    ///
+    /// Hashed, like the rest of the identity half.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
 
     /// Cloud account id (AWS account, Cloudflare account).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,13 +243,17 @@ pub enum ProviderKind {
 /// Implementing only the Bazel-derived spec would have covered none of the
 /// laptop paths this feature exists for, so the protocol is an explicit closed
 /// field rather than something guessed from output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(SpecEnum, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
-    /// The Bazel `--credential_helper` / EngFlow spec. Takes `{"uri": …}` on
-    /// stdin, returns `{"headers": {…}, "expires": …}`. The only protocol that
-    /// carries expiry natively, which is why the broker's TTL cache prefers it.
-    Engflow,
+    /// The Bazel `--credential_helper` protocol. Takes `{"uri": …}` on stdin,
+    /// returns `{"headers": {…}, "expires": …}`. The only protocol that carries
+    /// expiry natively, which is why the broker's TTL cache prefers it.
+    ///
+    /// Named for what it is rather than for EngFlow, who authored the spec: the
+    /// helpers that speak it are not theirs, and a vendor's name on a protocol
+    /// several tools implement misleads the reader about what is required.
+    CredentialHelper,
     /// The AWS `credential_process` schema. No stdin; returns
     /// `{"Version":1,"AccessKeyId":…,"SessionToken":…,"Expiration":…}`. The one
     /// protocol heph both reads and *writes* — the same shape it accepts from
@@ -262,24 +275,192 @@ impl Protocol {
     /// Two of four cannot, which is why `ttl` exists on [`Acquire`] and why the
     /// JWT reader in [`crate::jwt`] is worth having.
     pub fn carries_expiry(self) -> bool {
-        matches!(self, Protocol::Engflow | Protocol::CredentialProcess)
+        matches!(
+            self,
+            Protocol::CredentialHelper | Protocol::CredentialProcess
+        )
     }
 }
 
-/// Which token exchange turns an assertion into a cloud credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// One step that turns what a [`Source`] produced into a usable credential.
+///
+/// **Standards first; vendors are configuration.** The earlier design was a
+/// closed enum of vendor names — `aws`, `gcp`, `github_app`, `r2_temp` — which
+/// was wrong twice over. It privileged whichever vendors happened to be in
+/// front of the author, so a GitHub App token was a first-class concept while
+/// an internal IdP was inexpressible; and adding the next vendor meant changing
+/// a schema that other heph versions read back.
+///
+/// What is actually general is the *grant*, and there are three of them, each
+/// with an RFC. AWS STS keeps a variant because `AssumeRoleWithWebIdentity` is
+/// the federation entry point for one of the three clouds and speaks none of
+/// them. Everything else — a GitHub App installation token, a Cloudflare R2
+/// temporary credential, a bespoke internal minting endpoint — is
+/// [`Exchange::Http`], described in the BUILD file rather than named in heph.
+///
+/// A pipeline rather than a single step, because more than one hop is normal:
+/// GCP federation is RFC 8693 against its STS endpoint followed by a
+/// service-account impersonation call. Two steps, not a special case.
+#[derive(SpecOneOf, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[spec(tag = "kind")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Exchange {
-    /// `sts:AssumeRoleWithWebIdentity`.
-    Aws,
-    /// GCP STS + service-account impersonation.
-    Gcp,
-    /// GCP JWT-bearer grant from a service-account key.
-    GcpSaKey,
-    /// GitHub App installation token.
-    GithubApp,
-    /// Cloudflare `POST /accounts/{id}/r2/temp-access-credentials`.
-    R2Temp,
+    /// RFC 8693 OAuth 2.0 Token Exchange.
+    ///
+    /// The standard way to trade an assertion for a scoped credential, and what
+    /// GCP's own STS endpoint speaks.
+    TokenExchange {
+        #[spec(required)]
+        endpoint: String,
+        audience: Option<String>,
+        resource: Option<String>,
+        scope: Vec<String>,
+        /// `urn:ietf:params:oauth:token-type:…`, where the default is not wanted.
+        requested_token_type: Option<String>,
+    },
+    /// RFC 7523 §2.1 JWT bearer grant.
+    ///
+    /// What a service-account key actually is: a signed assertion traded for an
+    /// access token.
+    JwtBearer {
+        #[spec(required)]
+        endpoint: String,
+        scope: Vec<String>,
+    },
+    /// RFC 6749 §4.4 client credentials.
+    ClientCredentials {
+        #[spec(required)]
+        endpoint: String,
+        scope: Vec<String>,
+    },
+    /// AWS STS `AssumeRoleWithWebIdentity`.
+    ///
+    /// Not an IETF grant, and kept as a variant anyway: it is how one of the
+    /// three clouds federates, it predates RFC 8693, and expressing it as a raw
+    /// HTTP call would put XML parsing in a BUILD file. The role comes from the
+    /// identity half, not from here.
+    AwsSts { endpoint: Option<String> },
+    /// A vendor REST call that trades the previous step's value for a credential.
+    ///
+    /// The escape hatch that keeps heph out of the business of knowing vendors.
+    /// A GitHub App installation token and a Cloudflare R2 temporary credential
+    /// are each one POST and a couple of JSON pointers; neither needs a name in
+    /// this enum, a release to add, or a schema change to remove.
+    Http {
+        #[spec(required)]
+        url: String,
+        /// Defaults to `POST`.
+        method: Option<String>,
+        headers: BTreeMap<String, String>,
+        /// Request body. `{token}` interpolates the previous step's value.
+        body: Option<String>,
+        /// Credential field name → JSON pointer into the response, so the
+        /// shapes downstream see named fields rather than a blob.
+        fields: BTreeMap<String, String>,
+    },
+}
+
+/// Accept `var = "TOKEN"` as well as `vars = {…}`.
+///
+/// A bare string is the single-variable case and lands on the primary field, so
+/// `$SECRET_<NAME>` and a `"$."` pointer both resolve to it.
+fn parse_vars(v: &crate::htvalue::Value) -> anyhow::Result<BTreeMap<String, String>> {
+    use crate::htspec::FromSpecValue as _;
+    match v {
+        crate::htvalue::Value::String(one) => Ok(BTreeMap::from([(
+            crate::value::Credential::PRIMARY.to_string(),
+            one.clone(),
+        )])),
+        other => <BTreeMap<String, String>>::from_spec_value(other),
+    }
+}
+
+fn vars_param_type() -> crate::htvalue::signature::ParamType {
+    use crate::htvalue::signature::ParamType;
+    ParamType::union(vec![ParamType::String, ParamType::map(ParamType::String)])
+}
+
+/// Accept either one exchange or a pipeline of them.
+///
+/// A single hop is the common case and should not have to be spelled as a
+/// one-element list; two hops must be expressible, because GCP needs them.
+pub fn parse_exchange_value(v: &crate::htvalue::Value) -> anyhow::Result<Vec<Exchange>> {
+    use crate::htspec::FromSpecValue as _;
+    match v {
+        crate::htvalue::Value::Null() => Ok(Vec::new()),
+        crate::htvalue::Value::List(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                Exchange::from_spec_value(item).map_err(|e| anyhow::anyhow!("exchange[{i}]: {e}"))
+            })
+            .collect(),
+        other => Exchange::from_spec_value(other).map(|e| vec![e]),
+    }
+}
+
+/// How the raw material for a credential is obtained.
+///
+/// A tagged union rather than a bag of options: the tag says which shape this
+/// is, so a field belonging to another provider is an unknown key rather than a
+/// silently ignored one, and a field the provider requires is missing at parse
+/// time rather than in hand-written cross-field validation. `protocol` on an
+/// `exec` is required *by construction*; `helper` on a `static_env` cannot be
+/// written at all.
+#[derive(SpecOneOf, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[spec(tag = "provider")]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum Source {
+    /// Read named host environment variables.
+    ///
+    /// The honest escape hatch and the migration path off `pass_env`. Names a
+    /// variable, never a literal — the schema has no free-form value field at
+    /// all, so a token cannot be written into a target and pushed to a shared
+    /// cache.
+    StaticEnv {
+        /// Credential field name → host variable name.
+        ///
+        /// Written as `vars = {"aws_access_key_id": "AWS_…"}`, or as
+        /// `var = "TOKEN"` for the single-variable case — one field with two
+        /// spellings, so there is no `var`/`vars` pair left to get wrong and no
+        /// mutual-exclusion rule to enforce downstream.
+        #[spec(alias = "var", parse = parse_vars, ty = vars_param_type())]
+        vars: BTreeMap<String, String>,
+    },
+    /// Run a helper subprocess speaking one of the four wire protocols.
+    Exec {
+        /// The helper argv. Its head is the program.
+        helper: Vec<String>,
+        /// Required, and never guessed: the four protocols differ in stdin
+        /// encoding as well as in response shape.
+        #[spec(required)]
+        protocol: Protocol,
+        /// An exec runner for the helper: a target address, or `"local"`.
+        ///
+        /// A helper inherits **no** workspace-wide `runner:` default, unlike a
+        /// target — it usually needs the real `$HOME` a hermetic runner exists
+        /// to hide.
+        runner: Option<String>,
+        /// How long the helper may run, e.g. `"120s"`. Defaults to
+        /// [`DEFAULT_HELPER_TIMEOUT`].
+        timeout: Option<String>,
+    },
+    /// Present the ambient workload identity token, or the stored session.
+    ///
+    /// It has no configuration of its own: what it asserts is the identity
+    /// half's `audience`, and what it becomes is the `exchange` pipeline.
+    Oidc {},
+}
+
+impl Source {
+    /// Which provider implementation handles this source.
+    pub fn kind(&self) -> ProviderKind {
+        match self {
+            Source::StaticEnv { .. } => ProviderKind::StaticEnv,
+            Source::Exec { .. } => ProviderKind::Exec,
+            Source::Oidc {} => ProviderKind::Oidc,
+        }
+    }
 }
 
 /// The guard that selects an [`Acquire`] entry.
@@ -335,74 +516,35 @@ impl WhenEnv {
 }
 
 /// One route to the value. The unhashed half.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Three fields, where there were ten. Everything provider-specific moved into
+/// [`Source`], which means the combinations that used to need hand-written
+/// cross-field validation — a `helper` on a `static_env`, a `runner` on an
+/// `oidc`, an `exec` with no `protocol` — are now unwritable rather than
+/// merely rejected.
+#[derive(SpecStruct, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Acquire {
     /// The guard. `None` always matches, so an unguarded entry is the catch-all
     /// and must come last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[spec(parse = parse_when_env, ty = when_env_param_type())]
     pub when_env: Option<WhenEnv>,
 
-    pub provider: ProviderKind,
+    /// How the raw material is obtained. Flattened, so a route is written as
+    /// one map — `{"provider": "exec", "helper": [...], "protocol": "raw"}` —
+    /// rather than nesting the provider's own fields a level deeper.
+    #[serde(flatten)]
+    #[spec(flatten)]
+    pub source: Source,
 
-    /// `static_env`: the single host variable holding the value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub var: Option<String>,
-
-    /// `static_env`: several host variables, as field name → variable name.
+    /// Steps that turn what the source produced into the final credential.
     ///
-    /// Names a variable, never a literal. The schema deliberately has no
-    /// free-form value field: otherwise someone writes a token into a
-    /// `text_file` target and it is pushed to the shared remote cache.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub vars: BTreeMap<String, String>,
-
-    /// `exec`: the helper argv. Its head is the program.
+    /// Empty for a source that already yields one, which is the common case for
+    /// `static_env` and `exec`. A pipeline, because GCP federation is two hops.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub helper: Vec<String>,
-
-    /// `exec`: which wire protocol the helper speaks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<Protocol>,
-
-    /// `exec`: the exec runner the helper runs under, as a target address, or
-    /// the literal `"local"`.
-    ///
-    /// **The default is `local`, and a helper inherits no workspace default.**
-    /// This is the one place in heph where the workspace-wide `runner:` option
-    /// deliberately does not apply. That option exists to move *targets* into a
-    /// described environment, and the environments people put targets in are
-    /// precisely the ones a helper cannot work in: `aws configure
-    /// export-credentials` needs `~/.aws/sso/cache`, `gh auth token` needs the
-    /// login keychain, `op` needs a desktop-app session — all of it in the real
-    /// `$HOME` that a hermetic runner exists to hide. Inheriting the default
-    /// would mean that the day someone sets a workspace runner, every laptop
-    /// credential stops resolving.
-    ///
-    /// Unlike a target's runner this is **unhashed**, and the inversion is
-    /// worth stating: on a target the runner is part of what produced the
-    /// output, so its fingerprint belongs in the key; here it only affects how
-    /// a value was fetched, and the value is not in the key at all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runner: Option<String>,
-
-    /// Which exchange, if any, turns the acquired assertion into a credential.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exchange: Option<Exchange>,
-
-    /// How long the helper may run before the mint fails, e.g. `"120s"`.
-    ///
-    /// Defaults to [`DEFAULT_HELPER_TIMEOUT`]. A helper cannot be interactive
-    /// during a build, and stdin being closed only enforces half of that: it
-    /// stops a *stdin* prompt, but not a macOS keychain dialog, a Touch ID
-    /// prompt from `op`, or a helper blocked on an unreachable endpoint. None
-    /// of those read stdin, and all of them hang a build that has nobody to
-    /// answer them.
-    ///
-    /// Raise it for a helper that is legitimately slow. Note that the deadline
-    /// is in the *unhashed* half, so changing it moves no cache key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<String>,
+    #[spec(parse = parse_exchange_value, ty = exchange_param_type())]
+    pub exchange: Vec<Exchange>,
 
     /// Declared lifetime, used only when nothing better is known.
     ///
@@ -411,6 +553,46 @@ pub struct Acquire {
     /// dangerous direction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>,
+}
+
+/// The schema type for a single-or-list `exchange`.
+fn exchange_param_type() -> crate::htvalue::signature::ParamType {
+    use crate::htspec::FromSpecValue as _;
+    let one = Exchange::spec_param_type();
+    crate::htvalue::signature::ParamType::union(vec![
+        one.clone(),
+        crate::htvalue::signature::ParamType::list(one),
+    ])
+}
+
+/// The schema type for a `when_env` guard: a variable name, or a map of exact
+/// values.
+fn when_env_param_type() -> crate::htvalue::signature::ParamType {
+    use crate::htvalue::signature::ParamType;
+    ParamType::union(vec![
+        ParamType::String,
+        ParamType::map(ParamType::String),
+        ParamType::Null,
+    ])
+}
+
+fn parse_when_env(v: &crate::htvalue::Value) -> anyhow::Result<Option<WhenEnv>> {
+    use crate::htvalue::Value;
+    Ok(match v {
+        Value::Null() => None,
+        Value::String(name) => Some(WhenEnv::Set(name.clone())),
+        Value::Map(m) => Some(WhenEnv::Equals(
+            m.iter()
+                .map(|(k, val)| match val {
+                    Value::String(s) => Ok((k.clone(), s.clone())),
+                    other => anyhow::bail!("`when_env` values must be strings, got {other:?}"),
+                })
+                .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
+        )),
+        other => anyhow::bail!(
+            "`when_env` must be a variable name or a map of name → exact value, got {other:?}"
+        ),
+    })
 }
 
 /// How long an `exec` helper may run before the mint fails.
@@ -422,8 +604,15 @@ pub const DEFAULT_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 impl Acquire {
     /// The helper deadline: the declared one, or [`DEFAULT_HELPER_TIMEOUT`].
+    ///
+    /// Meaningful only for [`Source::Exec`]; a deadline on any other source is
+    /// now unwritable rather than something to reject.
     pub fn helper_timeout(&self) -> anyhow::Result<std::time::Duration> {
-        match &self.timeout {
+        let declared = match &self.source {
+            Source::Exec { timeout, .. } => timeout.as_deref(),
+            _ => None,
+        };
+        match declared {
             None => Ok(DEFAULT_HELPER_TIMEOUT),
             Some(s) => humantime::parse_duration(s)
                 .map_err(|e| anyhow::anyhow!("invalid timeout {s:?}: {e}")),
@@ -440,56 +629,46 @@ impl Acquire {
         }
     }
 
-    /// Validate the combination of fields for this provider.
+    /// What remains to check once the shape is a tagged union.
     ///
-    /// Done once at spec time, so a descriptor that cannot possibly work fails
-    /// before any network call and identically on every machine — rather than
-    /// as a missing-credential error three layers down at target 400.
+    /// Three rules, where there were eight. The five that went away did not
+    /// move somewhere else — they became unwritable: `helper` on a
+    /// `static_env`, `var` on an `exec`, a `runner` or `timeout` on an `oidc`,
+    /// an `exec` with no `protocol`, and the `var`/`vars` pair, which collapsed
+    /// into one map. What is left is the genuinely cross-field part: a
+    /// non-empty argv, an `oidc` that has something to exchange its assertion
+    /// for, and durations that parse.
     pub fn validate(&self, addr: &str, index: usize) -> anyhow::Result<()> {
         let at = || format!("secret {addr}: acquire[{index}]");
-        match self.provider {
-            ProviderKind::StaticEnv => {
-                if self.var.is_none() && self.vars.is_empty() {
-                    anyhow::bail!("{}: static_env needs `var` or `vars`", at());
-                }
-                if self.var.is_some() && !self.vars.is_empty() {
-                    anyhow::bail!("{}: `var` and `vars` are mutually exclusive", at());
-                }
-                if !self.helper.is_empty() {
-                    anyhow::bail!("{}: `helper` has no meaning for static_env", at());
-                }
-            }
-            ProviderKind::Exec => {
-                if self.helper.is_empty() {
-                    anyhow::bail!("{}: exec needs a `helper` argv", at());
-                }
-                if self.protocol.is_none() {
+        match &self.source {
+            Source::StaticEnv { vars } => {
+                if vars.is_empty() {
                     anyhow::bail!(
-                        "{}: exec needs an explicit `protocol` (engflow, credential_process, \
-                         docker_credential or raw). It is not guessed from output: the four \
-                         differ in stdin encoding as well as response shape.",
+                        "{}: static_env needs `var` (one variable) or `vars` (several)",
                         at()
                     );
                 }
             }
-            ProviderKind::Oidc => {
-                if self.exchange.is_none() {
-                    anyhow::bail!("{}: oidc needs an `exchange`", at());
+            Source::Exec { helper, .. } => {
+                if helper.is_empty() {
+                    anyhow::bail!("{}: exec needs a `helper` argv", at());
                 }
-                if !self.helper.is_empty() {
-                    anyhow::bail!("{}: `helper` has no meaning for oidc", at());
+                self.helper_timeout()
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", at()))?;
+            }
+            Source::Oidc {} => {
+                if self.exchange.is_empty() {
+                    anyhow::bail!(
+                        "{}: oidc needs an `exchange`. An assertion is not a credential: say \
+                         what to trade it for — a `token_exchange`, a `jwt_bearer`, an `aws_sts`, \
+                         or an `http` call.",
+                        at()
+                    );
                 }
             }
         }
         if self.ttl.is_some() {
             self.ttl_duration()
-                .map_err(|e| anyhow::anyhow!("{}: {e}", at()))?;
-        }
-        if self.timeout.is_some() {
-            if self.provider != ProviderKind::Exec {
-                anyhow::bail!("{}: `timeout` only applies to an exec helper", at());
-            }
-            self.helper_timeout()
                 .map_err(|e| anyhow::anyhow!("{}: {e}", at()))?;
         }
         Ok(())
@@ -621,27 +800,35 @@ mod tests {
         }
     }
 
-    fn acq(provider: ProviderKind) -> Acquire {
+    fn acq(source: Source) -> Acquire {
         Acquire {
             when_env: None,
-            provider,
-            var: None,
-            vars: BTreeMap::new(),
-            helper: Vec::new(),
-            protocol: None,
-            runner: None,
-            exchange: None,
-            timeout: None,
+            source,
+            exchange: Vec::new(),
             ttl: None,
         }
     }
 
-    fn exec_acq() -> Acquire {
-        Acquire {
-            helper: vec!["gh".into(), "auth".into(), "token".into()],
-            protocol: Some(Protocol::Raw),
-            ..acq(ProviderKind::Exec)
+    fn static_env(var: &str) -> Source {
+        Source::StaticEnv {
+            vars: BTreeMap::from([(
+                crate::value::Credential::PRIMARY.to_string(),
+                var.to_string(),
+            )]),
         }
+    }
+
+    fn exec_source() -> Source {
+        Source::Exec {
+            helper: vec!["gh".into(), "auth".into(), "token".into()],
+            protocol: Protocol::Raw,
+            runner: None,
+            timeout: None,
+        }
+    }
+
+    fn exec_acq() -> Acquire {
+        acq(exec_source())
     }
 
     /// A golden freeze of the emitted bytes.
@@ -815,8 +1002,8 @@ mod tests {
             acquire: vec![
                 Acquire {
                     when_env: Some(WhenEnv::Set("GITHUB_ACTIONS".into())),
-                    exchange: Some(Exchange::Aws),
-                    ..acq(ProviderKind::Oidc)
+                    exchange: vec![Exchange::AwsSts { endpoint: None }],
+                    ..acq(Source::Oidc {})
                 },
                 exec_acq(),
             ],
@@ -827,11 +1014,11 @@ mod tests {
             .select(&env_of(&[("GITHUB_ACTIONS", "true")]))
             .expect("ci");
         assert_eq!(ci.index, 0);
-        assert_eq!(ci.entry.provider, ProviderKind::Oidc);
+        assert_eq!(ci.entry.source.kind(), ProviderKind::Oidc);
 
         let laptop = d.select(&env_of(&[])).expect("laptop");
         assert_eq!(laptop.index, 1);
-        assert_eq!(laptop.entry.provider, ProviderKind::Exec);
+        assert_eq!(laptop.entry.source.kind(), ProviderKind::Exec);
         assert!(laptop.matched.is_none());
     }
 
@@ -875,29 +1062,46 @@ mod tests {
         assert!(err.to_string().contains("must come last"), "{err}");
     }
 
+    /// `protocol` on an `exec` is now required *by construction* — there is no
+    /// `Acquire` value that omits it — so the check that used to enforce it is
+    /// gone rather than moved. What the tagged union cannot express is an empty
+    /// argv, and that is still checked.
     #[test]
-    fn exec_without_protocol_is_rejected_at_spec_time() {
-        let a = Acquire {
-            protocol: None,
-            ..exec_acq()
-        };
-        let err = a.validate("//x:y", 0).expect_err("needs protocol");
-        assert!(err.to_string().contains("explicit `protocol`"), "{err}");
+    fn exec_with_an_empty_helper_is_rejected_at_spec_time() {
+        let a = acq(Source::Exec {
+            helper: Vec::new(),
+            protocol: Protocol::Raw,
+            runner: None,
+            timeout: None,
+        });
+        let err = a.validate("//x:y", 0).expect_err("needs an argv");
+        assert!(err.to_string().contains("`helper` argv"), "{err}");
+    }
+
+    /// An assertion is not a credential: an `oidc` source with nothing to trade
+    /// it for cannot work, and says so at the declaration.
+    #[test]
+    fn oidc_without_an_exchange_is_rejected_at_spec_time() {
+        let err = acq(Source::Oidc {})
+            .validate("//x:y", 0)
+            .expect_err("needs an exchange");
+        let msg = err.to_string();
+        assert!(msg.contains("needs an `exchange`"), "{msg}");
+        assert!(msg.contains("token_exchange"), "{msg}");
     }
 
     #[test]
-    fn static_env_needs_a_variable_name_and_rejects_both_forms() {
-        let err = acq(ProviderKind::StaticEnv)
-            .validate("//x:y", 0)
-            .expect_err("needs var");
-        assert!(err.to_string().contains("`var` or `vars`"), "{err}");
+    fn static_env_needs_a_variable_name() {
+        let err = acq(Source::StaticEnv {
+            vars: BTreeMap::new(),
+        })
+        .validate("//x:y", 0)
+        .expect_err("needs var");
+        assert!(err.to_string().contains("`var`"), "{err}");
 
-        let both = Acquire {
-            var: Some("A".into()),
-            vars: BTreeMap::from([("k".to_string(), "B".to_string())]),
-            ..acq(ProviderKind::StaticEnv)
-        };
-        assert!(both.validate("//x:y", 0).is_err());
+        acq(static_env("TOKEN"))
+            .validate("//x:y", 0)
+            .expect("one variable is enough");
     }
 
     #[test]
@@ -915,12 +1119,38 @@ mod tests {
             ttl: Some("one hour".into()),
             ..exec_acq()
         };
-        assert!(bad.validate("//x:y", 0).is_err());
+        bad.validate("//x:y", 0).expect_err("unparseable ttl");
+    }
+
+    /// A deadline is a property of running a helper, so it exists only on the
+    /// variant that runs one. There is no `Acquire` that puts one on a
+    /// `static_env`, which is why no check needs to reject that any more.
+    #[test]
+    fn a_deadline_belongs_to_the_exec_variant_alone() {
+        assert_eq!(
+            exec_acq().helper_timeout().expect("default"),
+            DEFAULT_HELPER_TIMEOUT
+        );
+        let slow = acq(Source::Exec {
+            helper: vec!["op".into()],
+            protocol: Protocol::Raw,
+            runner: None,
+            timeout: Some("5m".into()),
+        });
+        assert_eq!(
+            slow.helper_timeout().expect("override"),
+            std::time::Duration::from_secs(300)
+        );
+        // A non-exec source simply has nowhere to put one.
+        assert_eq!(
+            acq(static_env("TOK")).helper_timeout().expect("default"),
+            DEFAULT_HELPER_TIMEOUT
+        );
     }
 
     #[test]
     fn only_two_protocols_carry_expiry() {
-        assert!(Protocol::Engflow.carries_expiry());
+        assert!(Protocol::CredentialHelper.carries_expiry());
         assert!(Protocol::CredentialProcess.carries_expiry());
         assert!(!Protocol::Raw.carries_expiry());
         assert!(!Protocol::DockerCredential.carries_expiry());

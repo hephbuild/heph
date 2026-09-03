@@ -7,7 +7,7 @@
 //!
 //! | protocol | stdin | stdout | expiry | speakers |
 //! |---|---|---|---|---|
-//! | `engflow` | `{"uri": …}` | `{"headers": {…}, "expires": …}` | native, RFC 3339 | Bazel `--credential_helper` helpers |
+//! | `credential_helper` | `{"uri": …}` | `{"headers": {…}, "expires": …}` | native, RFC 3339 | Bazel `--credential_helper` helpers |
 //! | `credential_process` | — | `{"Version":1,"AccessKeyId":…}` | `Expiration`, optional | `aws configure export-credentials`, aws-vault, Granted |
 //! | `docker_credential` | bare URL, not JSON | `{"ServerURL","Username","Secret"}` | none | `docker-credential-osxkeychain`, `-ecr-login`, `-gcr` |
 //! | `raw` | — | the value, verbatim | none | `gh auth token`, `gcloud auth print-access-token`, `op read` |
@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime};
 /// the request has already been sent in some encoding.
 pub fn stdin_for(protocol: Protocol, uri: Option<&str>) -> Option<Vec<u8>> {
     match protocol {
-        Protocol::Engflow => {
+        Protocol::CredentialHelper => {
             let uri = uri.unwrap_or_default();
             Some(format!("{{\"uri\":{}}}", json_string(uri)).into_bytes())
         }
@@ -59,7 +59,7 @@ pub fn parse_response(
 ) -> anyhow::Result<Credential> {
     match protocol {
         Protocol::Raw => parse_raw(stdout, now, declared_ttl),
-        Protocol::Engflow => parse_engflow(stdout, now, declared_ttl),
+        Protocol::CredentialHelper => parse_engflow(stdout, now, declared_ttl),
         Protocol::CredentialProcess => parse_credential_process(stdout, now, declared_ttl),
         Protocol::DockerCredential => parse_docker_credential(stdout, now, declared_ttl),
     }
@@ -113,9 +113,9 @@ fn parse_engflow(
     declared_ttl: Option<Duration>,
 ) -> anyhow::Result<Credential> {
     let r: EngflowResponse = serde_json::from_slice(stdout)
-        .map_err(|e| anyhow::anyhow!("engflow helper: parse response: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("credential_helper helper: parse response: {e}"))?;
     if r.headers.is_empty() {
-        anyhow::bail!("engflow helper returned no `headers`");
+        anyhow::bail!("credential_helper helper returned no `headers`");
     }
 
     let expires = r.expires.as_deref().and_then(parse_rfc3339);
@@ -125,7 +125,7 @@ fn parse_engflow(
         // usually longer than the truth and that is the dangerous direction.
         tracing::warn!(
             expires = ?r.expires,
-            "engflow helper returned an `expires` that is not RFC 3339; falling back to the \
+            "credential_helper helper returned an `expires` that is not RFC 3339; falling back to the \
              declared ttl"
         );
     }
@@ -157,7 +157,7 @@ fn parse_engflow(
     if fields.is_empty() {
         let names = r.headers.keys().cloned().collect::<Vec<_>>().join(", ");
         anyhow::bail!(
-            "engflow helper returned headers with no values: [{names}]. A credential with no \
+            "credential_helper helper returned headers with no values: [{names}]. A credential with no \
              fields would be registered as unmaskable and fail far downstream, so it is rejected \
              here."
         );
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn each_protocol_encodes_its_request_differently() {
         assert_eq!(
-            stdin_for(Protocol::Engflow, Some("https://host/p")).as_deref(),
+            stdin_for(Protocol::CredentialHelper, Some("https://host/p")).as_deref(),
             Some(&br#"{"uri":"https://host/p"}"#[..])
         );
         // A bare URL, not JSON — the detail most often got wrong.
@@ -396,7 +396,7 @@ mod tests {
     fn engflow_recovers_a_bare_token_from_the_authorization_header() {
         let body = br#"{"headers":{"Authorization":["Bearer abc123"]},
                         "expires":"2026-01-01T00:00:00Z"}"#;
-        let c = parse_response(Protocol::Engflow, body, t(0), None).expect("parse");
+        let c = parse_response(Protocol::CredentialHelper, body, t(0), None).expect("parse");
         assert_eq!(c.resolve_pointer("$.").expect("v").expose(), "abc123");
         assert_eq!(
             c.get("header.Authorization").expect("h").expose(),
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn engflow_header_names_are_matched_case_insensitively() {
         let body = br#"{"headers":{"authorization":["Bearer xyz"]}}"#;
-        let c = parse_response(Protocol::Engflow, body, t(0), None).expect("parse");
+        let c = parse_response(Protocol::CredentialHelper, body, t(0), None).expect("parse");
         assert_eq!(c.resolve_pointer("$.").expect("v").expose(), "xyz");
     }
 
@@ -418,8 +418,13 @@ mod tests {
     #[test]
     fn an_unparseable_expiry_falls_back_rather_than_failing() {
         let body = br#"{"headers":{"Authorization":["Bearer a1b2c3"]},"expires":"next tuesday"}"#;
-        let c = parse_response(Protocol::Engflow, body, t(0), Some(Duration::from_secs(60)))
-            .expect("parse");
+        let c = parse_response(
+            Protocol::CredentialHelper,
+            body,
+            t(0),
+            Some(Duration::from_secs(60)),
+        )
+        .expect("parse");
         assert_eq!(c.expiry.source, ExpirySource::DeclaredTtl);
     }
 

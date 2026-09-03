@@ -22,7 +22,7 @@
 //! prefer an absolute path, and name an [`Acquire::runner`] so the helper comes
 //! from a described environment instead of an ambient lookup.
 
-use crate::descriptor::{Acquire, Identity, Protocol, ProviderKind};
+use crate::descriptor::{Acquire, Identity, Protocol, ProviderKind, Source};
 use crate::protocol;
 use crate::redact::Redactor;
 use crate::value::Credential;
@@ -195,22 +195,30 @@ impl SecretProvider for StaticEnvProvider {
             }
         };
 
-        if let Some(var) = &acquire.var {
-            let value = read(var)?;
-            let expiry = crate::expiry::Expiry::resolve(ctx.now, None, Some(&value), ttl);
-            return Ok(Credential::single(value, expiry));
-        }
+        let Source::StaticEnv { vars } = &acquire.source else {
+            anyhow::bail!(
+                "secret {}: static_env provider given a {:?} source",
+                ctx.addr,
+                acquire.source.kind()
+            );
+        };
 
         let mut fields = BTreeMap::new();
-        for (field, var) in &acquire.vars {
+        for (field, var) in vars {
             fields.insert(field.clone(), crate::value::SecretValue::new(read(var)?));
         }
         if fields.is_empty() {
             anyhow::bail!("secret {}: static_env named no variables", ctx.addr);
         }
+        // A single-variable descriptor lands on the primary field, so the JWT
+        // reader still gets a look: `var = "TOK"` is sugar for
+        // `vars = {"token": "TOK"}` and must behave identically.
+        let primary = fields
+            .get(Credential::PRIMARY)
+            .map(|v| v.expose().to_string());
         Ok(Credential {
             fields,
-            expiry: crate::expiry::Expiry::resolve(ctx.now, None, None, ttl),
+            expiry: crate::expiry::Expiry::resolve(ctx.now, None, primary.as_deref(), ttl),
         })
     }
 }
@@ -261,7 +269,7 @@ impl ExecProvider {
     fn uri_for(protocol: Protocol, identity: &Identity) -> Option<String> {
         match protocol {
             Protocol::DockerCredential => identity.registry.clone(),
-            Protocol::Engflow => identity
+            Protocol::CredentialHelper => identity
                 .endpoint
                 .clone()
                 .or_else(|| identity.machine.clone().map(|m| format!("https://{m}"))),
@@ -293,10 +301,18 @@ impl SecretProvider for ExecProvider {
         identity: &Identity,
         acquire: &Acquire,
     ) -> anyhow::Result<Credential> {
-        let protocol = acquire.protocol.ok_or_else(|| {
-            anyhow::anyhow!("secret {}: exec acquisition has no `protocol`", ctx.addr)
-        })?;
-        let (program, args) = acquire.helper.split_first().ok_or_else(|| {
+        let Source::Exec {
+            helper, protocol, ..
+        } = &acquire.source
+        else {
+            anyhow::bail!(
+                "secret {}: exec provider given a {:?} source",
+                ctx.addr,
+                acquire.source.kind()
+            );
+        };
+        let protocol = *protocol;
+        let (program, args) = helper.split_first().ok_or_else(|| {
             anyhow::anyhow!(
                 "secret {}: exec acquisition has an empty `helper`",
                 ctx.addr
@@ -383,7 +399,7 @@ impl SecretProvider for ExecProvider {
                      answer. Run it once by hand to prime the session, or raise `timeout` on the \
                      acquire entry if it is legitimately slow.",
                     ctx.addr,
-                    acquire.helper.join(" "),
+                    helper.join(" "),
                     humantime::format_duration(deadline),
                 ))
             );
@@ -398,7 +414,7 @@ impl SecretProvider for ExecProvider {
                      host at mint time. Prefer an absolute path, or name a `runner` on the \
                      acquire entry so it comes from a described environment.",
                     ctx.addr,
-                    acquire.helper.join(" "),
+                    helper.join(" "),
                 ))
             })?;
 
@@ -416,7 +432,7 @@ impl SecretProvider for ExecProvider {
                 ctx.redactor.redact_str(&format!(
                     "secret {}: credential helper {:?} exited {}\n{}",
                     ctx.addr,
-                    acquire.helper.join(" "),
+                    helper.join(" "),
                     out.status
                         .code()
                         .map(|c| c.to_string())
@@ -447,7 +463,6 @@ impl SecretProvider for ExecProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor::Protocol;
     use crate::expiry::ExpirySource;
     use hcore::hasync::StdCancellationToken;
 
@@ -490,27 +505,34 @@ mod tests {
         }
     }
 
-    fn exec_acquire() -> Acquire {
+    fn acquire(source: Source) -> Acquire {
         Acquire {
-            helper: vec!["/bin/true".into()],
-            protocol: Some(Protocol::Raw),
-            ..acquire(ProviderKind::Exec)
+            when_env: None,
+            source,
+            exchange: Vec::new(),
+            ttl: None,
         }
     }
 
-    fn acquire(provider: ProviderKind) -> Acquire {
-        Acquire {
-            when_env: None,
-            provider,
-            var: None,
-            vars: BTreeMap::new(),
-            helper: Vec::new(),
-            protocol: None,
+    /// An `exec` route running `argv`.
+    fn exec(argv: &[&str], protocol: Protocol) -> Acquire {
+        acquire(Source::Exec {
+            helper: argv.iter().map(|a| (*a).to_string()).collect(),
+            protocol,
             runner: None,
-            exchange: None,
             timeout: None,
-            ttl: None,
-        }
+        })
+    }
+
+    /// A `static_env` route reading one variable into the primary field.
+    fn static_env(var: &str) -> Acquire {
+        acquire(Source::StaticEnv {
+            vars: BTreeMap::from([(Credential::PRIMARY.to_string(), var.to_string())]),
+        })
+    }
+
+    fn exec_acquire() -> Acquire {
+        exec(&["/bin/true"], Protocol::Raw)
     }
 
     #[tokio::test]
@@ -521,10 +543,7 @@ mod tests {
             .mint(
                 &ctx.mint_ctx(&env),
                 &Identity::default(),
-                &Acquire {
-                    var: Some("GITHUB_TOKEN".into()),
-                    ..acquire(ProviderKind::StaticEnv)
-                },
+                &static_env("GITHUB_TOKEN"),
             )
             .await
             .expect("mint");
@@ -544,10 +563,7 @@ mod tests {
             .mint(
                 &ctx.mint_ctx(&env),
                 &Identity::default(),
-                &Acquire {
-                    var: Some("TOK".into()),
-                    ..acquire(ProviderKind::StaticEnv)
-                },
+                &static_env("TOK"),
             )
             .await
             .expect_err("empty");
@@ -563,10 +579,7 @@ mod tests {
             .mint(
                 &ctx.mint_ctx(&env),
                 &Identity::default(),
-                &Acquire {
-                    var: Some("NOPE".into()),
-                    ..acquire(ProviderKind::StaticEnv)
-                },
+                &static_env("NOPE"),
             )
             .await
             .expect_err("unset");
@@ -583,13 +596,12 @@ mod tests {
             .mint(
                 &ctx.mint_ctx(&env),
                 &Identity::default(),
-                &Acquire {
+                &acquire(Source::StaticEnv {
                     vars: BTreeMap::from([
                         ("aws_access_key_id".to_string(), "AK".to_string()),
                         ("aws_secret_access_key".to_string(), "SK".to_string()),
                     ]),
-                    ..acquire(ProviderKind::StaticEnv)
-                },
+                }),
             )
             .await
             .expect("mint");
@@ -612,14 +624,11 @@ mod tests {
                 &ctx.mint_ctx(&env),
                 &Identity::default(),
                 &Acquire {
-                    helper: vec![
-                        "/bin/sh".into(),
-                        "-c".into(),
-                        "echo ghs_from_a_real_helper".into(),
-                    ],
-                    protocol: Some(Protocol::Raw),
                     ttl: Some("1h".into()),
-                    ..acquire(ProviderKind::Exec)
+                    ..exec(
+                        &["/bin/sh", "-c", "echo ghs_from_a_real_helper"],
+                        Protocol::Raw,
+                    )
                 },
             )
             .await
@@ -644,17 +653,16 @@ mod tests {
                     registry: Some("ghcr.io".into()),
                     ..Identity::default()
                 },
-                &Acquire {
-                    // Echo back what arrived on stdin as the Secret, so the
-                    // assertion proves the payload crossed.
-                    helper: vec![
-                        "/bin/sh".into(),
-                        "-c".into(),
-                        r#"printf '{"Username":"<token>","Secret":"%s-ok"}' "$(cat)""#.into(),
+                // Echo back what arrived on stdin as the Secret, so the
+                // assertion proves the payload crossed.
+                &exec(
+                    &[
+                        "/bin/sh",
+                        "-c",
+                        r#"printf '{"Username":"<token>","Secret":"%s-ok"}' "$(cat)""#,
                     ],
-                    protocol: Some(Protocol::DockerCredential),
-                    ..acquire(ProviderKind::Exec)
-                },
+                    Protocol::DockerCredential,
+                ),
             )
             .await
             .expect("mint");
@@ -672,15 +680,14 @@ mod tests {
             .mint(
                 &ctx.mint_ctx(&env),
                 &Identity::default(),
-                &Acquire {
-                    helper: vec![
-                        "/bin/sh".into(),
-                        "-c".into(),
-                        "echo 'not logged in: run gh auth login' >&2; exit 4".into(),
+                &exec(
+                    &[
+                        "/bin/sh",
+                        "-c",
+                        "echo 'not logged in: run gh auth login' >&2; exit 4",
                     ],
-                    protocol: Some(Protocol::Raw),
-                    ..acquire(ProviderKind::Exec)
-                },
+                    Protocol::Raw,
+                ),
             )
             .await
             .expect_err("exit 4");
@@ -713,16 +720,14 @@ mod tests {
             .mint(
                 &ctx,
                 &Identity::default(),
-                &Acquire {
-                    helper: vec![
-                        "/bin/sh".into(),
-                        "-c".into(),
-                        "echo 'failed with ghs_16C7e42F292c6912E7710c838347Ae178B4a' >&2; exit 1"
-                            .into(),
+                &exec(
+                    &[
+                        "/bin/sh",
+                        "-c",
+                        "echo 'failed with ghs_16C7e42F292c6912E7710c838347Ae178B4a' >&2; exit 1",
                     ],
-                    protocol: Some(Protocol::Raw),
-                    ..acquire(ProviderKind::Exec)
-                },
+                    Protocol::Raw,
+                ),
             )
             .await
             .expect_err("exit 1");
@@ -745,14 +750,14 @@ mod tests {
             .mint(
                 &ctx.mint_ctx(&env),
                 &Identity::default(),
-                &Acquire {
-                    // Reads no stdin and never exits — the shape of a helper
-                    // waiting on a desktop approval.
+                // Reads no stdin and never exits — the shape of a helper
+                // waiting on a desktop approval.
+                &acquire(Source::Exec {
                     helper: vec!["/bin/sh".into(), "-c".into(), "sleep 3600".into()],
-                    protocol: Some(Protocol::Raw),
+                    protocol: Protocol::Raw,
+                    runner: None,
                     timeout: Some("2s".into()),
-                    ..acquire(ProviderKind::Exec)
-                },
+                }),
             )
             .await
             .expect_err("deadline");
@@ -764,30 +769,21 @@ mod tests {
 
     #[test]
     fn the_helper_deadline_defaults_and_is_overridable() {
-        let default = exec_acquire();
         assert_eq!(
-            default.helper_timeout().expect("default"),
+            exec_acquire().helper_timeout().expect("default"),
             crate::descriptor::DEFAULT_HELPER_TIMEOUT
         );
 
-        let slow = Acquire {
+        let slow = acquire(Source::Exec {
+            helper: vec!["/bin/true".into()],
+            protocol: Protocol::Raw,
+            runner: None,
             timeout: Some("5m".into()),
-            ..exec_acquire()
-        };
+        });
         assert_eq!(
             slow.helper_timeout().expect("override"),
             std::time::Duration::from_secs(300)
         );
-
-        // A deadline on a provider that runs no subprocess is a mistake worth
-        // naming rather than silently ignoring.
-        let wrong = Acquire {
-            timeout: Some("5m".into()),
-            var: Some("TOK".into()),
-            ..acquire(ProviderKind::StaticEnv)
-        };
-        let err = wrong.validate("//x:y", 0).expect_err("not an exec");
-        assert!(err.to_string().contains("only applies to an exec"), "{err}");
     }
 
     /// The advice a reader needs is "prefer an absolute path or a runner", not
@@ -800,11 +796,7 @@ mod tests {
             .mint(
                 &ctx.mint_ctx(&env),
                 &Identity::default(),
-                &Acquire {
-                    helper: vec!["/nonexistent/definitely-not-here".into()],
-                    protocol: Some(Protocol::Raw),
-                    ..acquire(ProviderKind::Exec)
-                },
+                &exec(&["/nonexistent/definitely-not-here"], Protocol::Raw),
             )
             .await
             .expect_err("no such binary");
@@ -843,7 +835,7 @@ mod tests {
             Some("ghcr.io")
         );
         assert_eq!(
-            ExecProvider::uri_for(Protocol::Engflow, &id).as_deref(),
+            ExecProvider::uri_for(Protocol::CredentialHelper, &id).as_deref(),
             Some("https://github.com")
         );
         assert!(ExecProvider::uri_for(Protocol::Raw, &id).is_none());

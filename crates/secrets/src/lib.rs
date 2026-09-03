@@ -51,6 +51,12 @@
 //! - [`redact`] — the multi-pattern redacting tee.
 //! - [`value`] — a minted value, and the one type allowed to hold one.
 
+// The `htspec` derives expand to code referencing `crate::htvalue` and
+// `crate::htspec`; alias them so those expansions resolve here, the same way
+// `builtins` does.
+pub(crate) use hcore::htvalue;
+pub(crate) use hplugin::htspec;
+
 pub mod broker;
 pub mod descriptor;
 pub mod expiry;
@@ -64,7 +70,7 @@ pub mod value;
 pub use broker::{Broker, BrokerCtx, Grant};
 pub use descriptor::{
     Acquire, Descriptor, Exchange, Identity, Protocol, ProviderKind, SECRET_JSON,
-    SECRET_JSON_VERSION, SecretJson, Selection, WhenEnv,
+    SECRET_JSON_VERSION, SecretJson, Selection, Source, WhenEnv,
 };
 pub use expiry::{Expiry, ExpirySource};
 pub use provider::{MintCtx, ProviderRegistry, SecretProvider};

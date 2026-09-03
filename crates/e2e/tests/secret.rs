@@ -23,6 +23,16 @@
 mod common;
 
 use common::Workspace;
+use hsecrets::descriptor::{Descriptor, Source};
+
+/// The resolved `runner` of an acquire entry, which now lives inside the
+/// `exec` variant rather than beside it.
+fn runner_of(d: &Descriptor, index: usize) -> Option<String> {
+    match d.acquire.get(index).map(|a| &a.source) {
+        Some(Source::Exec { runner, .. }) => runner.clone(),
+        _ => None,
+    }
+}
 
 /// The driver is registered and a declaration resolves. Without this, everything
 /// downstream fails with "driver not found" and no test says why.
@@ -40,7 +50,7 @@ target(
     shape = ["aws_profile"],
     profile = "ecr",
     provider = "oidc",
-    exchange = "aws",
+    exchange = {"kind": "aws_sts"},
 )
 "#,
     );
@@ -109,7 +119,7 @@ target(
     shape = ["aws_profile"],
     profile = "artifacts",
     provider = "oidc",
-    exchange = "aws",
+    exchange = {"kind": "aws_sts"},
 )
 "#;
     let laptop = r#"
@@ -316,17 +326,14 @@ target(name = "rel", driver = "secret", provider = "exec", protocol = "raw",
     let local = ws.get_spec("//creds:local").await?;
     let desc = heph::pluginsecret::parse_declaration(&local)?;
     assert!(
-        desc.acquire.first().is_some_and(|a| a.runner.is_none()),
+        runner_of(&desc, 0).is_none(),
         "`local` must resolve to no runner, not to the literal string"
     );
 
     // A relative address resolves against the declaring package.
     let rel = ws.get_spec("//creds:rel").await?;
     let desc = heph::pluginsecret::parse_declaration(&rel)?;
-    assert_eq!(
-        desc.acquire.first().and_then(|a| a.runner.as_deref()),
-        Some("//creds:devenv")
-    );
+    assert_eq!(runner_of(&desc, 0).as_deref(), Some("//creds:devenv"));
     Ok(())
 }
 
@@ -386,7 +393,8 @@ target(
     driver = "secret",
     role = "arn:aws:iam::4711:role/heph-read",
     acquire = [
-        {"when_env": "GITHUB_ACTIONS", "provider": "oidc", "exchange": "aws"},
+        {"when_env": "GITHUB_ACTIONS", "provider": "oidc",
+         "exchange": {"kind": "aws_sts"}},
         {"when_env": {"CI": "true"}, "provider": "static_env", "var": "TOK"},
         {"provider": "exec", "protocol": "credential_process",
          "helper": ["aws", "configure", "export-credentials"],
@@ -407,7 +415,7 @@ target(
     let laptop = desc.select(&|_: &str| None)?;
     assert_eq!(laptop.index, 2);
     assert_eq!(
-        laptop.entry.runner.as_deref(),
+        runner_of(&desc, laptop.index).as_deref(),
         Some("//tools/devenv:runner"),
         "the acquire entry's runner must survive the round trip"
     );

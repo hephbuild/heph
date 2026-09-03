@@ -1,5 +1,5 @@
 //! Runtime support for the spec derives (`Spec`, `SpecStruct`, `SpecEnum`,
-//! `SpecUnion`).
+//! `SpecUnion`, `SpecOneOf`).
 //!
 //! A target config spec is a struct whose fields are parsed out of a raw
 //! BUILD-file config map (`HashMap<String, Value>`). [`FromSpecValue`] is the
@@ -14,6 +14,9 @@
 //!   * `#[derive(SpecStruct)]` — a nested object with well-known keys
 //!     (`map[...]`);
 //!   * `#[derive(SpecEnum)]` — a string-valued enum;
+//!   * `#[derive(SpecOneOf)]` — a *tagged* union: a map whose discriminant key
+//!     picks the variant, so a field belonging to another variant is an unknown
+//!     key rather than a silent mismatch;
 //!   * `#[derive(SpecUnion)]` — a value accepting one of several shapes; or a
 //!     hand-written impl for a bespoke shape (see [`TargetSpecCache`], the
 //!     shared `cache` attribute).
@@ -24,7 +27,51 @@ use hcore::htvalue::{
     parse_map_string_strings, parse_string, parse_strings,
 };
 
-pub use htspec_derive::{Spec, SpecEnum, SpecStruct, SpecUnion};
+pub use htspec_derive::{Spec, SpecEnum, SpecOneOf, SpecStruct, SpecUnion};
+
+/// A config shape that reads its keys out of an enclosing map, rather than out
+/// of a value of its own.
+///
+/// Implemented by `#[derive(SpecOneOf)]`, and consumed by `#[spec(flatten)]`.
+/// It exists so one parser can serve both spellings of the same thing: a tagged
+/// map nested in a list, and the same keys written inline on the target. A
+/// second, hand-maintained key list for the inline form is exactly the drift
+/// these derives exist to prevent.
+///
+/// An implementation removes only the keys it owns, leaving the rest for
+/// whoever called it to account for.
+pub trait FromSpecMap: Sized {
+    fn from_spec_map(m: &mut std::collections::HashMap<&str, &Value>) -> anyhow::Result<Self>;
+
+    /// The discriminant key. Presence of this key is what tells an optional
+    /// flattened field whether it is there at all.
+    fn spec_tag() -> &'static str;
+
+    /// The keys this shape accepts, for the enclosing schema.
+    fn spec_schema_fields() -> Vec<DriverField>;
+}
+
+/// An optional flattened shape: absent exactly when its tag key is.
+///
+/// This is what lets one struct accept both spellings — a target that writes
+/// `provider = "exec"` inline, and one that gives an `acquire` list instead and
+/// writes no provider at top level at all.
+impl<T: FromSpecMap> FromSpecMap for Option<T> {
+    fn from_spec_map(m: &mut std::collections::HashMap<&str, &Value>) -> anyhow::Result<Self> {
+        if !m.contains_key(T::spec_tag()) {
+            return Ok(None);
+        }
+        T::from_spec_map(m).map(Some)
+    }
+
+    fn spec_tag() -> &'static str {
+        T::spec_tag()
+    }
+
+    fn spec_schema_fields() -> Vec<DriverField> {
+        T::spec_schema_fields()
+    }
+}
 
 mod cache;
 pub use cache::TargetSpecCache;
@@ -167,6 +214,22 @@ impl FromSpecValue
 impl FromSpecValue for std::collections::HashMap<String, String> {
     fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
         parse_map_string_string(v)
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::union(vec![ParamType::String, ParamType::map(ParamType::String)])
+    }
+}
+
+/// The ordered counterpart, for a field whose iteration order is observable.
+///
+/// A `HashMap` is fine wherever the parsed value is only ever looked up by key.
+/// It is not fine where the map is later serialized into something hashed — a
+/// def hash, a cache key — because its iteration order varies per process, so
+/// the same declaration would digest differently on consecutive runs.
+impl FromSpecValue for std::collections::BTreeMap<String, String> {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        Ok(parse_map_string_string(v)?.into_iter().collect())
     }
 
     fn spec_param_type() -> ParamType {
@@ -344,6 +407,203 @@ mod tests {
         assert_eq!(f["count"].ty, ParamType::Int);
         // `with` module supplies the schema type.
         assert_eq!(f["mode"].ty, ParamType::String);
+    }
+
+    // --- SpecOneOf ---
+
+    #[derive(SpecOneOf, Debug, PartialEq)]
+    #[spec(tag = "provider")]
+    enum Source {
+        StaticEnv {
+            vars: std::collections::BTreeMap<String, String>,
+        },
+        Exec {
+            helper: Vec<String>,
+            #[spec(required)]
+            protocol: String,
+            timeout: Option<String>,
+        },
+        #[spec(rename = "oidc")]
+        Federated {},
+    }
+
+    fn map(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn one_of_dispatches_on_its_tag() {
+        let exec = Source::from_spec_value(&map(&[
+            ("provider", Value::String("exec".into())),
+            (
+                "helper",
+                Value::List(vec![
+                    Value::String("gh".into()),
+                    Value::String("auth".into()),
+                ]),
+            ),
+            ("protocol", Value::String("raw".into())),
+        ]))
+        .expect("exec");
+        assert_eq!(
+            exec,
+            Source::Exec {
+                helper: vec!["gh".to_string(), "auth".to_string()],
+                protocol: "raw".to_string(),
+                timeout: None,
+            }
+        );
+
+        // A variant with no fields of its own still needs its braces.
+        assert_eq!(
+            Source::from_spec_value(&map(&[("provider", Value::String("oidc".into()))]))
+                .expect("oidc"),
+            Source::Federated {}
+        );
+    }
+
+    /// The whole reason for tagging: a field belonging to another variant is an
+    /// unknown key on *this* one, reported against the provider the author
+    /// actually named — not a silent mismatch, and not "nothing matched".
+    #[test]
+    fn a_field_from_another_variant_is_an_unknown_key() {
+        let err = Source::from_spec_value(&map(&[
+            ("provider", Value::String("static_env".into())),
+            ("helper", Value::List(vec![Value::String("gh".into())])),
+        ]))
+        .expect_err("helper is not a static_env field");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown entries"), "{msg}");
+        assert!(msg.contains("helper"), "{msg}");
+    }
+
+    /// A field the variant requires is missing at parse time rather than in a
+    /// hand-written cross-field check further downstream.
+    #[test]
+    fn a_required_field_of_the_selected_variant_is_enforced() {
+        let err = Source::from_spec_value(&map(&[
+            ("provider", Value::String("exec".into())),
+            ("helper", Value::List(vec![Value::String("gh".into())])),
+        ]))
+        .expect_err("protocol is required for exec");
+        assert!(format!("{err:#}").contains("protocol"), "{err:#}");
+    }
+
+    #[test]
+    fn an_unknown_or_missing_tag_lists_the_legal_ones() {
+        let err = Source::from_spec_value(&map(&[("provider", Value::String("vault".into()))]))
+            .expect_err("unknown provider");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("vault"), "{msg}");
+        assert!(msg.contains("static_env"), "{msg}");
+        assert!(msg.contains("oidc"), "{msg}");
+
+        let err = Source::from_spec_value(&map(&[])).expect_err("no provider");
+        assert!(format!("{err:#}").contains("missing `provider`"), "{err:#}");
+    }
+
+    /// The schema is a union of one struct per variant, each carrying the tag,
+    /// so an editor can offer the keys that variant actually accepts.
+    #[test]
+    fn the_schema_is_a_struct_per_variant() {
+        let ParamType::Union(members) = Source::spec_param_type() else {
+            panic!("expected a union, got {:?}", Source::spec_param_type());
+        };
+        assert_eq!(members.len(), 3);
+        for m in &members {
+            let ParamType::Struct(fields) = m else {
+                panic!("expected a struct member, got {m:?}");
+            };
+            assert!(
+                fields.iter().any(|f| f.name == "provider"),
+                "a variant's struct type omitted the tag: {fields:?}"
+            );
+        }
+    }
+
+    /// A `BTreeMap` field parses like its `HashMap` counterpart, and exists so
+    /// a map that reaches a hash has a stable iteration order.
+    #[test]
+    fn btree_map_fields_parse_and_order() {
+        let parsed = <std::collections::BTreeMap<String, String>>::from_spec_value(&map(&[
+            ("b", Value::String("2".into())),
+            ("a", Value::String("1".into())),
+        ]))
+        .expect("parses");
+        assert_eq!(
+            parsed.keys().collect::<Vec<_>>(),
+            vec![&"a".to_string(), &"b".to_string()]
+        );
+    }
+
+    /// The flat form and the nested form must be one parser. A `#[spec(flatten)]`
+    /// oneof consumes its own keys and leaves the rest to the outer struct, so
+    /// there is no second key list to fall out of step.
+    #[derive(Spec, Debug, PartialEq)]
+    struct Outer {
+        name: String,
+        #[spec(flatten)]
+        source: Source,
+    }
+
+    #[test]
+    fn a_flattened_one_of_reads_its_keys_inline() {
+        let cfg: std::collections::HashMap<String, Value> = [
+            ("name".to_string(), Value::String("ecr".into())),
+            ("provider".to_string(), Value::String("exec".into())),
+            (
+                "helper".to_string(),
+                Value::List(vec![Value::String("gh".into())]),
+            ),
+            ("protocol".to_string(), Value::String("raw".into())),
+        ]
+        .into_iter()
+        .collect();
+
+        let outer = Outer::from(&cfg).expect("flat form");
+        assert_eq!(outer.name, "ecr");
+        assert_eq!(
+            outer.source,
+            Source::Exec {
+                helper: vec!["gh".to_string()],
+                protocol: "raw".to_string(),
+                timeout: None,
+            }
+        );
+    }
+
+    /// The outer struct still accounts for what the flattened field did not
+    /// take, so a stray key is reported rather than ignored.
+    #[test]
+    fn a_flattened_one_of_leaves_unknown_keys_to_the_outer_struct() {
+        let cfg: std::collections::HashMap<String, Value> = [
+            ("name".to_string(), Value::String("x".into())),
+            ("provider".to_string(), Value::String("static_env".into())),
+            ("nonsense".to_string(), Value::String("y".into())),
+        ]
+        .into_iter()
+        .collect();
+        let err = Outer::from(&cfg).expect_err("stray key");
+        assert!(format!("{err:#}").contains("nonsense"), "{err:#}");
+    }
+
+    /// The inline spelling is advertised in the schema, tag included, or an
+    /// editor cannot offer the keys the flat form accepts.
+    #[test]
+    fn a_flattened_one_of_contributes_its_keys_to_the_schema() {
+        let schema = Outer::schema();
+        let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        for expected in ["name", "provider", "vars", "helper", "protocol", "timeout"] {
+            assert!(
+                names.contains(&expected),
+                "schema missing {expected}: {names:?}"
+            );
+        }
     }
 
     // --- SpecUnion ---

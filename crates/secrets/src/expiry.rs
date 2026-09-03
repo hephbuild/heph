@@ -3,7 +3,7 @@
 //! A credential's real lifetime and its declared one are different things, and
 //! only one of them is load-bearing. Four sources, in precedence order:
 //!
-//! 1. **The protocol's own field** — `expires` from `engflow`, `Expiration`
+//! 1. **The protocol's own field** — `expires` from `credential_helper`, `Expiration`
 //!    from `credential_process`. Authoritative when present.
 //! 2. **A parsed `exp` claim**, when the value turns out to be a JWT.
 //! 3. **The descriptor's `ttl`** — a declaration, not an observation.

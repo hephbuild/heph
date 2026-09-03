@@ -44,10 +44,8 @@ use hplugin::driver::{
 };
 use hplugin::htspec::Spec;
 use hsecrets::descriptor::{
-    Acquire, Descriptor, Exchange, Identity, Protocol, ProviderKind, SECRET_JSON, SecretJson,
-    WhenEnv,
+    Acquire, Descriptor, Exchange, Identity, SECRET_JSON, SecretJson, Source,
 };
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -55,9 +53,15 @@ pub const DRIVER_NAME: &str = "secret";
 
 /// Config for a `secret` target.
 ///
-/// The field list is split in two by comment, and the split is the whole design:
-/// everything above `provider` reaches every consumer's cache key, and nothing
-/// below it does.
+/// The field list is split in two, and the split is the whole design:
+/// everything before `acquire` reaches every consumer's cache key, and nothing
+/// after it does.
+///
+/// The acquisition half is a **tagged union** ([`Source`]) rather than a bag of
+/// options. That is what makes the combinations illegal-by-construction:
+/// `helper` on a `static_env` is an unknown key, an `exec` without a `protocol`
+/// fails at parse, and a `timeout` on an `oidc` cannot be written. The five
+/// cross-field rules that used to enforce those by hand are gone, not moved.
 #[derive(Spec, Debug)]
 struct SecretSpec {
     // ---- identity: hashed, written to secret.json ----
@@ -70,15 +74,6 @@ struct SecretSpec {
     /// OAuth scopes requested. Sorted before hashing, so declaration order is
     /// not a cache-key component.
     scope: Vec<String>,
-    /// GCP service account to impersonate after the STS hop.
-    #[spec(ty = ParamType::String)]
-    impersonate: Option<String>,
-    /// GitHub App id, for the installation-token exchange.
-    #[spec(ty = ParamType::String)]
-    app_id: Option<String>,
-    /// GitHub App installation, as `org` or `org/repo`.
-    #[spec(ty = ParamType::String)]
-    install: Option<String>,
     /// Cloud account id (an AWS account, a Cloudflare account).
     #[spec(ty = ParamType::String)]
     account: Option<String>,
@@ -104,13 +99,20 @@ struct SecretSpec {
     /// collide rather than silently overwriting each other.
     #[spec(ty = ParamType::String)]
     profile: Option<String>,
+    /// Identity parameters only one provider or exchange understands — a
+    /// GitHub App id and installation, a service account to impersonate, an
+    /// Azure tenant.
+    ///
+    /// The open half of the identity. Naming those as first-class fields put
+    /// vendor names into a format frozen into every consumer's cache key, and
+    /// made the next vendor a schema change; a map re-keys nothing and needs no
+    /// release.
+    params: std::collections::HashMap<String, String>,
     /// Which shapes this credential renders: `file` (the default), `env`,
     /// `netrc`, `docker_config`, `git_credential`, `aws_profile`, `gcloud_adc`.
     ///
     /// Identity, deliberately: a shape decides which files and variables exist
-    /// in the sandbox, and that is part of what the target reads. It costs
-    /// nothing in cache sharing, because a shape's paths and variable *names*
-    /// are fixed while only the contents vary.
+    /// in the sandbox, and that is part of what the target reads.
     shape: Vec<String>,
     /// For the `env` shape: variable name → pointer into the acquired value.
     /// `"$."` is the whole value, `"$.<field>"` one field.
@@ -121,55 +123,24 @@ struct SecretSpec {
     /// `when_env` guard matches is used, and an entry with no guard is the
     /// catch-all and must come last.
     ///
-    /// The flat form below is sugar for a single-entry list. Reach for this
-    /// only when one identity genuinely has two routes — ambient in CI, a
-    /// stored session on a laptop.
+    /// The inline form below is the same shape spelled without the list. Reach
+    /// for this only when one identity genuinely has two routes — ambient in
+    /// CI, a stored session on a laptop.
     #[spec(ty = ParamType::list(acquire_param_type()), parse = parse_acquire)]
     acquire: Vec<Acquire>,
 
-    /// Flat form: which provider obtains the value (`static_env`, `exec`, `oidc`).
-    #[spec(ty = ParamType::String)]
-    provider: Option<String>,
-    /// Flat form, `static_env`: the host variable holding the value.
-    #[spec(ty = ParamType::String)]
-    var: Option<String>,
-    /// Flat form, `static_env`: field name → host variable name. Names a
-    /// variable, never a literal — the schema has no free-form value field, so
-    /// a token cannot be written into a target and pushed to a shared cache.
-    vars: std::collections::HashMap<String, String>,
-    /// Flat form, `exec`: the helper argv. Its head is the program.
-    helper: Vec<String>,
-    /// Flat form, `exec`: which wire protocol the helper speaks — `engflow`,
-    /// `credential_process`, `docker_credential` or `raw`. Required for `exec`
-    /// and never guessed: the four differ in stdin encoding as well as
-    /// response shape.
-    #[spec(ty = ParamType::String)]
-    protocol: Option<String>,
-    /// Flat form, `exec`: an exec runner for the helper, as a target address or
-    /// the literal `"local"` (the default).
+    /// The single-route form, written inline on the target.
     ///
-    /// A helper inherits **no** workspace-wide `runner:` default, unlike a
-    /// target — a helper usually needs the real `$HOME` a hermetic runner
-    /// exists to hide (`~/.aws/sso/cache`, the login keychain, a desktop-app
-    /// session), so inheriting would break every laptop credential the day
-    /// someone set one.
-    #[spec(ty = ParamType::String)]
-    runner: Option<String>,
-    /// Flat form: which token exchange turns an assertion into a credential —
-    /// `aws`, `gcp`, `gcp_sa_key`, `github_app`, `r2_temp`.
-    #[spec(ty = ParamType::String)]
-    exchange: Option<String>,
-    /// Flat form, `exec`: how long the helper may run (`"120s"`) before the
-    /// mint fails. Defaults to 60s.
-    ///
-    /// Closing stdin stops a helper prompting on stdin, but not a macOS
-    /// keychain dialog, a Touch ID prompt, or a helper blocked on an
-    /// unreachable endpoint — none of which read stdin, and all of which would
-    /// otherwise hang a build nobody is watching.
-    #[spec(ty = ParamType::String)]
-    timeout: Option<String>,
-    /// Flat form: declared lifetime (`"1h"`), used only when nothing better is
-    /// known. A `ttl` *longer* than the truth is the dangerous direction.
+    /// Flattened rather than restated: the same [`Source`] parser serves both
+    /// spellings, so there is no second key list to fall out of step with the
+    /// first. Absent exactly when no `provider` is written at top level.
+    #[spec(flatten)]
+    source: Option<Source>,
+    /// Inline form: what to trade the source's value for. One step or a list.
+    #[spec(ty = exchange_param_type(), parse = parse_exchanges_spec)]
+    exchange: Vec<Exchange>,
+    /// Inline form: declared lifetime (`"1h"`), used only when nothing better
+    /// is known. A `ttl` *longer* than the truth is the dangerous direction.
     #[spec(ty = ParamType::String)]
     ttl: Option<String>,
 }
@@ -188,38 +159,22 @@ struct SecretDef {
 }
 
 /// The LSP schema for one `acquire` entry.
-///
-/// A real struct rather than "any dict": the whole reason `acquire` keys are
-/// rejected when unknown is that a silently-dropped `when-env` turns a guarded
-/// entry into the catch-all, and an editor that can say so before the build is
-/// strictly better than an error that can.
 fn acquire_param_type() -> ParamType {
-    ParamType::strukt(vec![
-        (
-            "when_env",
-            ParamType::union(vec![ParamType::String, ParamType::map(ParamType::String)]),
-        ),
-        ("provider", ParamType::String),
-        ("var", ParamType::String),
-        ("vars", ParamType::map(ParamType::String)),
-        ("helper", ParamType::list(ParamType::String)),
-        ("protocol", ParamType::String),
-        ("runner", ParamType::String),
-        ("exchange", ParamType::String),
-        ("timeout", ParamType::String),
-        ("ttl", ParamType::String),
-    ])
+    <Acquire as hplugin::htspec::FromSpecValue>::spec_param_type()
 }
 
-fn str_of(v: &Value, field: &str) -> anyhow::Result<String> {
-    match v {
-        Value::String(s) => Ok(s.clone()),
-        other => anyhow::bail!("`{field}` must be a string, got {other:?}"),
-    }
+fn exchange_param_type() -> ParamType {
+    let one = <Exchange as hplugin::htspec::FromSpecValue>::spec_param_type();
+    ParamType::union(vec![one.clone(), ParamType::list(one)])
 }
 
-/// Parse the `acquire` list: a list of dicts, each one route.
+fn parse_exchanges_spec(v: &Value) -> anyhow::Result<Vec<Exchange>> {
+    hsecrets::descriptor::parse_exchange_value(v)
+}
+
+/// Parse the `acquire` list: a list of routes, each a tagged map.
 fn parse_acquire(v: &Value) -> anyhow::Result<Vec<Acquire>> {
+    use hplugin::htspec::FromSpecValue as _;
     let items = match v {
         Value::List(items) => items,
         Value::Null() => return Ok(Vec::new()),
@@ -228,146 +183,19 @@ fn parse_acquire(v: &Value) -> anyhow::Result<Vec<Acquire>> {
     items
         .iter()
         .enumerate()
-        .map(|(i, item)| acquire_from_map(item).with_context(|| format!("`acquire` entry {i}")))
+        .map(|(i, item)| {
+            Acquire::from_spec_value(item).with_context(|| format!("`acquire` entry {i}"))
+        })
         .collect()
-}
-
-fn acquire_from_map(v: &Value) -> anyhow::Result<Acquire> {
-    let m = match v {
-        Value::Map(m) => m,
-        other => anyhow::bail!("expected a dict, got {other:?}"),
-    };
-
-    // Reject unknown keys rather than ignoring them: a typo'd `when-env` that
-    // is silently dropped turns a guarded entry into the catch-all, which
-    // selects the wrong identity without saying anything.
-    const KNOWN: &[&str] = &[
-        "when_env", "provider", "var", "vars", "helper", "protocol", "runner", "exchange", "ttl",
-    ];
-    for k in m.keys() {
-        if !KNOWN.contains(&k.as_str()) {
-            anyhow::bail!("unknown key {k:?}; expected one of {}", KNOWN.join(", "));
-        }
-    }
-
-    let get = |k: &str| m.get(k).filter(|v| !matches!(v, Value::Null()));
-    let opt_str =
-        |k: &str| -> anyhow::Result<Option<String>> { get(k).map(|v| str_of(v, k)).transpose() };
-
-    let when_env = match get("when_env") {
-        None => None,
-        Some(Value::String(s)) => Some(WhenEnv::Set(s.clone())),
-        Some(Value::Map(m)) => Some(WhenEnv::Equals(
-            m.iter()
-                .map(|(k, v)| Ok((k.clone(), str_of(v, "when_env")?)))
-                .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
-        )),
-        Some(other) => anyhow::bail!(
-            "`when_env` must be a variable name or a dict of name → exact value, got {other:?}"
-        ),
-    };
-
-    let provider = provider_of(
-        opt_str("provider")?
-            .as_deref()
-            .context("`provider` is required on an acquire entry")?,
-    )?;
-
-    Ok(Acquire {
-        when_env,
-        provider,
-        var: opt_str("var")?,
-        vars: match get("vars") {
-            None => BTreeMap::new(),
-            Some(Value::Map(m)) => m
-                .iter()
-                .map(|(k, v)| Ok((k.clone(), str_of(v, "vars")?)))
-                .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
-            Some(other) => anyhow::bail!("`vars` must be a dict, got {other:?}"),
-        },
-        helper: match get("helper") {
-            None => Vec::new(),
-            Some(v) => hcore::htvalue::parse_strings(v).context("`helper`")?,
-        },
-        protocol: opt_str("protocol")?
-            .as_deref()
-            .map(protocol_of)
-            .transpose()?,
-        runner: opt_str("runner")?,
-        exchange: opt_str("exchange")?
-            .as_deref()
-            .map(exchange_of)
-            .transpose()?,
-        timeout: opt_str("timeout")?,
-        ttl: opt_str("ttl")?,
-    })
-}
-
-fn provider_of(s: &str) -> anyhow::Result<ProviderKind> {
-    Ok(match s {
-        "static_env" => ProviderKind::StaticEnv,
-        "exec" => ProviderKind::Exec,
-        "oidc" => ProviderKind::Oidc,
-        other => anyhow::bail!(
-            "unknown `provider` {other:?} — expected \"static_env\", \"exec\" or \"oidc\""
-        ),
-    })
-}
-
-fn protocol_of(s: &str) -> anyhow::Result<Protocol> {
-    Ok(match s {
-        "engflow" => Protocol::Engflow,
-        "credential_process" => Protocol::CredentialProcess,
-        "docker_credential" => Protocol::DockerCredential,
-        "raw" => Protocol::Raw,
-        other => anyhow::bail!(
-            "unknown `protocol` {other:?} — expected \"engflow\", \"credential_process\", \
-             \"docker_credential\" or \"raw\". It is never guessed from output: the four differ \
-             in stdin encoding as well as response shape."
-        ),
-    })
-}
-
-fn exchange_of(s: &str) -> anyhow::Result<Exchange> {
-    Ok(match s {
-        "aws" => Exchange::Aws,
-        "gcp" => Exchange::Gcp,
-        "gcp_sa_key" => Exchange::GcpSaKey,
-        "github_app" => Exchange::GithubApp,
-        "r2_temp" => Exchange::R2Temp,
-        other => anyhow::bail!(
-            "unknown `exchange` {other:?} — expected \"aws\", \"gcp\", \"gcp_sa_key\", \
-             \"github_app\" or \"r2_temp\""
-        ),
-    })
-}
-
-/// Parse and validate a `secret()` declaration straight from a target spec.
-///
-/// The broker and the collision check both call this, for the same reason the
-/// engine calls `pluginscratch::parse_declaration`: a `raw_def` is opaque to
-/// the host by contract, and a spec is readable **without building or minting
-/// anything**. That is what keeps the `allow` and collision checks running on a
-/// fully warm build, where every consumer is a cache hit and no descriptor is
-/// ever executed.
-pub fn parse_declaration(spec: &hplugin::provider::TargetSpec) -> anyhow::Result<Descriptor> {
-    let parsed = SecretSpec::from(&spec.config).context("parse secret config")?;
-    let d = from_spec(parsed, &spec.addr.format(), &spec.addr.package)?;
-    d.validate()?;
-    Ok(d)
 }
 
 /// Normalize an acquire entry's `runner`.
 ///
 /// `"local"` — the documented explicit opt-out — becomes `None`, and everything
 /// else is resolved to a canonical absolute address against the descriptor's own
-/// package. Both were previously unimplemented: `runner = "not an addr!!"`
-/// parsed, validated and survived all the way to the broker, and `"local"` was
-/// promised by two doc comments and understood by no code.
-///
-/// Resolving here rather than in `Acquire::validate` is deliberate — this is the
-/// only layer that knows the declaring package, so `runner = ":devenv"` can mean
-/// what it says.
+/// package. Resolving here rather than in the domain crate is deliberate: this
+/// is the only layer that knows the declaring package, so `runner = ":devenv"`
+/// can mean what it says.
 fn normalize_runner(
     raw: Option<String>,
     pkg: &hmodel::htpkg::PkgBuf,
@@ -385,6 +213,34 @@ fn normalize_runner(
         )
     })?;
     Ok(Some(parsed.to_string()))
+}
+
+/// Resolve every runner address in a route, in place.
+fn resolve_runners(
+    mut a: Acquire,
+    pkg: &hmodel::htpkg::PkgBuf,
+    addr: &str,
+    index: usize,
+) -> anyhow::Result<Acquire> {
+    if let Source::Exec { runner, .. } = &mut a.source {
+        *runner = normalize_runner(runner.take(), pkg, addr, index)?;
+    }
+    Ok(a)
+}
+
+/// Parse and validate a `secret()` declaration straight from a target spec.
+///
+/// The broker and the collision check both call this, for the same reason the
+/// engine calls `pluginscratch::parse_declaration`: a `raw_def` is opaque to
+/// the host by contract, and a spec is readable **without building or minting
+/// anything**. That is what keeps the `allow` and collision checks running on a
+/// fully warm build, where every consumer is a cache hit and no descriptor is
+/// ever executed.
+pub fn parse_declaration(spec: &hplugin::provider::TargetSpec) -> anyhow::Result<Descriptor> {
+    let parsed = SecretSpec::from(&spec.config).context("parse secret config")?;
+    let d = from_spec(parsed, &spec.addr.format(), &spec.addr.package)?;
+    d.validate()?;
+    Ok(d)
 }
 
 fn from_spec(
@@ -411,9 +267,6 @@ fn from_spec(
         role: spec.role,
         audience: spec.audience,
         scope,
-        impersonate: spec.impersonate,
-        app_id: spec.app_id,
-        install: spec.install,
         account: spec.account,
         region: spec.region,
         bucket: spec.bucket,
@@ -421,6 +274,7 @@ fn from_spec(
         registry: spec.registry,
         machine: spec.machine,
         profile: spec.profile,
+        params: spec.params.into_iter().collect(),
         shape,
         // Normalized before it can reach a cache key, the same way `scope` and
         // `shape` are sorted: `"$."`, `"$"` and `"$.token"` name one field, so
@@ -436,54 +290,40 @@ fn from_spec(
             .collect::<anyhow::Result<_>>()?,
     };
 
-    // The flat form is sugar for a single-entry list. Mixing the two is a
-    // mistake worth naming: it reads as "these compose" and they do not.
-    let flat_used = spec.provider.is_some()
-        || spec.var.is_some()
-        || !spec.vars.is_empty()
-        || !spec.helper.is_empty()
-        || spec.protocol.is_some()
-        || spec.runner.is_some()
-        || spec.exchange.is_some()
-        || spec.timeout.is_some()
-        || spec.ttl.is_some();
+    // The inline form is the same route written without the list. Mixing the
+    // two is a mistake worth naming: it reads as if they compose.
+    let inline_used = spec.source.is_some() || !spec.exchange.is_empty() || spec.ttl.is_some();
 
-    let acquire = match (spec.acquire.is_empty(), flat_used) {
+    let acquire = match (spec.acquire.is_empty(), inline_used) {
         (false, true) => anyhow::bail!(
-            "secret {addr}: the flat form (`provider`, `helper`, …) and `acquire` are two \
+            "secret {addr}: the inline form (`provider`, `helper`, …) and `acquire` are two \
              spellings of the same thing, not two things that compose. Put every route in \
-             `acquire`, or use the flat form for the single-route case."
+             `acquire`, or use the inline form for the single-route case."
         ),
         (false, false) => spec
             .acquire
             .into_iter()
             .enumerate()
-            .map(|(i, a)| {
-                Ok(Acquire {
-                    runner: normalize_runner(a.runner, pkg, addr, i)?,
-                    ..a
-                })
-            })
+            .map(|(i, a)| resolve_runners(a, pkg, addr, i))
             .collect::<anyhow::Result<Vec<_>>>()?,
         (true, _) => {
-            let provider = spec.provider.as_deref().ok_or_else(|| {
+            let source = spec.source.ok_or_else(|| {
                 anyhow::anyhow!(
                     "secret {addr}: no way to acquire a value. Give it a `provider` \
                      (static_env, exec or oidc), or an `acquire` list."
                 )
             })?;
-            vec![Acquire {
-                when_env: None,
-                provider: provider_of(provider)?,
-                var: spec.var,
-                vars: spec.vars.into_iter().collect(),
-                helper: spec.helper,
-                protocol: spec.protocol.as_deref().map(protocol_of).transpose()?,
-                runner: normalize_runner(spec.runner, pkg, addr, 0)?,
-                exchange: spec.exchange.as_deref().map(exchange_of).transpose()?,
-                timeout: spec.timeout,
-                ttl: spec.ttl,
-            }]
+            vec![resolve_runners(
+                Acquire {
+                    when_env: None,
+                    source,
+                    exchange: spec.exchange,
+                    ttl: spec.ttl,
+                },
+                pkg,
+                addr,
+                0,
+            )?]
         }
     };
 
@@ -640,6 +480,7 @@ mod tests {
     use hmodel::htaddr::parse_addr;
     use hplugin::driver::Driver as EDriver;
     use hplugin::provider::TargetSpec;
+    use hsecrets::descriptor::WhenEnv;
     use std::collections::HashMap;
 
     fn spec_of(pairs: &[(&str, Value)]) -> TargetSpec {
@@ -669,6 +510,14 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), v.clone()))
                 .collect(),
         )
+    }
+
+    /// The resolved `runner` of the nth acquire entry, if it has one.
+    fn runner_of(d: &Descriptor, index: usize) -> Option<String> {
+        match d.acquire.get(index).map(|a| &a.source) {
+            Some(Source::Exec { runner, .. }) => runner.clone(),
+            _ => None,
+        }
     }
 
     async fn parse_def(spec: TargetSpec) -> anyhow::Result<ParseResponse> {
@@ -713,15 +562,17 @@ mod tests {
         (parsed.target_def.hash.clone(), a.hashout.clone(), a)
     }
 
+    // ---- the tagged union ----
+
     #[test]
-    fn the_flat_form_is_sugar_for_a_single_entry_acquire_list() {
-        let flat = parse_declaration(&spec_of(&[
+    fn the_inline_form_is_the_same_route_as_a_one_entry_acquire_list() {
+        let inline = parse_declaration(&spec_of(&[
             ("role", s("arn:aws:iam::4711:role/heph-read")),
             ("provider", s("exec")),
             ("protocol", s("credential_process")),
             ("helper", list(&["aws", "configure", "export-credentials"])),
         ]))
-        .expect("flat");
+        .expect("inline");
 
         let listed = parse_declaration(&spec_of(&[
             ("role", s("arn:aws:iam::4711:role/heph-read")),
@@ -736,21 +587,109 @@ mod tests {
         ]))
         .expect("listed");
 
-        assert_eq!(flat, listed);
+        assert_eq!(inline, listed);
     }
 
-    /// Mixing the two reads as "these compose", and they do not.
+    /// The point of the tag: a field belonging to another provider is an
+    /// unknown key on the one the author named, rejected at parse rather than
+    /// by a hand-written rule further down — or, worse, ignored.
     #[test]
-    fn mixing_the_flat_form_with_acquire_is_refused() {
+    fn a_field_from_another_provider_is_rejected() {
+        for (provider, stray, value) in [
+            ("static_env", "helper", list(&["gh", "auth", "token"])),
+            ("static_env", "protocol", s("raw")),
+            ("oidc", "helper", list(&["gh"])),
+            ("oidc", "timeout", s("30s")),
+        ] {
+            let err = parse_declaration(&spec_of(&[(
+                "acquire",
+                Value::List(vec![map(&[
+                    ("provider", s(provider)),
+                    ("var", s("TOK")),
+                    (stray, value),
+                ])]),
+            )]))
+            .expect_err("{provider} has no {stray}");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(stray), "{provider}/{stray}: {msg}");
+        }
+    }
+
+    /// `protocol` on an `exec` is required by construction — the failure is a
+    /// missing required field at parse time, not a cross-field check.
+    #[test]
+    fn exec_without_a_protocol_fails_at_parse() {
         let err = parse_declaration(&spec_of(&[
             ("provider", s("exec")),
+            ("helper", list(&["gh", "auth", "token"])),
+        ]))
+        .expect_err("no protocol");
+        assert!(
+            format!("{err:#}").contains("missing required `protocol`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_provider_lists_the_legal_ones() {
+        let err = parse_declaration(&spec_of(&[("provider", s("vault"))])).expect_err("unknown");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("vault"), "{msg}");
+        assert!(msg.contains("static_env"), "{msg}");
+        assert!(msg.contains("exec"), "{msg}");
+        assert!(msg.contains("oidc"), "{msg}");
+    }
+
+    #[test]
+    fn an_unknown_protocol_lists_the_legal_ones() {
+        let err = parse_declaration(&spec_of(&[
+            ("provider", s("exec")),
+            ("helper", list(&["x"])),
+            ("protocol", s("netrc")),
+        ]))
+        .expect_err("unknown protocol");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("netrc"), "{msg}");
+        assert!(msg.contains("credential_helper"), "{msg}");
+    }
+
+    /// `var` and `vars` are one field with two spellings, so there is no
+    /// mutual-exclusion rule left — and writing both is caught by the derive.
+    #[test]
+    fn var_is_sugar_for_a_single_entry_vars_map() {
+        let one = parse_declaration(&spec_of(&[
+            ("provider", s("static_env")),
+            ("var", s("TOK")),
+        ]))
+        .expect("var");
+        let many = parse_declaration(&spec_of(&[
+            ("provider", s("static_env")),
+            ("vars", map(&[("token", s("TOK"))])),
+        ]))
+        .expect("vars");
+        assert_eq!(one, many);
+
+        let err = parse_declaration(&spec_of(&[
+            ("provider", s("static_env")),
+            ("var", s("A")),
+            ("vars", map(&[("token", s("B"))])),
+        ]))
+        .expect_err("both spellings");
+        assert!(format!("{err:#}").contains("two spellings"), "{err:#}");
+    }
+
+    #[test]
+    fn mixing_the_inline_form_with_acquire_is_refused() {
+        let err = parse_declaration(&spec_of(&[
+            ("provider", s("static_env")),
+            ("var", s("A")),
             (
                 "acquire",
-                Value::List(vec![map(&[("provider", s("static_env")), ("var", s("X"))])]),
+                Value::List(vec![map(&[("provider", s("static_env")), ("var", s("B"))])]),
             ),
         ]))
         .expect_err("mixed");
-        assert!(err.to_string().contains("two spellings"), "{err}");
+        assert!(format!("{err:#}").contains("two spellings"), "{err:#}");
     }
 
     /// A typo'd guard key silently dropped would turn a guarded entry into the
@@ -766,9 +705,7 @@ mod tests {
             ])]),
         )]))
         .expect_err("typo");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("when-env"), "{msg}");
-        assert!(msg.contains("when_env"), "{msg}");
+        assert!(format!("{err:#}").contains("when-env"), "{err:#}");
     }
 
     #[test]
@@ -779,7 +716,7 @@ mod tests {
                 map(&[
                     ("when_env", s("GITHUB_ACTIONS")),
                     ("provider", s("oidc")),
-                    ("exchange", s("aws")),
+                    ("exchange", map(&[("kind", s("aws_sts"))])),
                 ]),
                 map(&[
                     ("when_env", map(&[("CI", s("true"))])),
@@ -802,6 +739,117 @@ mod tests {
         assert!(d.acquire.get(2).is_some_and(|a| a.when_env.is_none()));
     }
 
+    // ---- standards-first exchanges ----
+
+    /// An exchange is a *grant*, not a vendor. What used to be `exchange =
+    /// "github_app"` is an ordinary HTTP call described in the BUILD file, and
+    /// heph needs to know nothing about GitHub to run it.
+    #[test]
+    fn a_vendor_rest_exchange_needs_no_vendor_support() {
+        let d = parse_declaration(&spec_of(&[
+            ("machine", s("github.com")),
+            (
+                "params",
+                map(&[("app_id", s("1180022")), ("install", s("org/heph"))]),
+            ),
+            ("provider", s("oidc")),
+            (
+                "exchange",
+                map(&[
+                    ("kind", s("http")),
+                    (
+                        "url",
+                        s("https://api.github.com/app/installations/42/access_tokens"),
+                    ),
+                    ("fields", map(&[("token", s("/token"))])),
+                ]),
+            ),
+        ]))
+        .expect("http exchange");
+        assert!(matches!(
+            d.acquire.first().and_then(|a| a.exchange.first()),
+            Some(Exchange::Http { .. })
+        ));
+        // The GitHub-shaped identity lives in the open map, not in named fields.
+        assert_eq!(
+            d.identity.params.get("app_id").map(String::as_str),
+            Some("1180022")
+        );
+    }
+
+    /// GCP federation is RFC 8693 followed by an impersonation call: two hops,
+    /// which is why an exchange is a pipeline rather than a single step.
+    #[test]
+    fn an_exchange_pipeline_parses_in_order() {
+        let d = parse_declaration(&spec_of(&[
+            ("audience", s("//iam.googleapis.com/projects/8801/…")),
+            ("provider", s("oidc")),
+            (
+                "exchange",
+                Value::List(vec![
+                    map(&[
+                        ("kind", s("token_exchange")),
+                        ("endpoint", s("https://sts.googleapis.com/v1/token")),
+                    ]),
+                    map(&[
+                        ("kind", s("http")),
+                        ("url", s("https://iamcredentials.googleapis.com/…")),
+                    ]),
+                ]),
+            ),
+        ]))
+        .expect("pipeline");
+        let steps = d
+            .acquire
+            .first()
+            .map(|a| a.exchange.as_slice())
+            .unwrap_or(&[]);
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(
+            steps.first(),
+            Some(Exchange::TokenExchange { .. })
+        ));
+        assert!(matches!(steps.get(1), Some(Exchange::Http { .. })));
+    }
+
+    #[test]
+    fn an_exchange_missing_its_endpoint_fails_at_parse() {
+        let err = parse_declaration(&spec_of(&[
+            ("provider", s("oidc")),
+            ("exchange", map(&[("kind", s("token_exchange"))])),
+        ]))
+        .expect_err("no endpoint");
+        assert!(
+            format!("{err:#}").contains("missing required `endpoint`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_exchange_kind_lists_the_legal_ones() {
+        let err = parse_declaration(&spec_of(&[
+            ("provider", s("oidc")),
+            ("exchange", map(&[("kind", s("github_app"))])),
+        ]))
+        .expect_err("vendor name");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("github_app"), "{msg}");
+        assert!(msg.contains("token_exchange"), "{msg}");
+        assert!(msg.contains("http"), "{msg}");
+    }
+
+    /// An assertion is not a credential.
+    #[test]
+    fn oidc_without_an_exchange_is_refused() {
+        let err = parse_declaration(&spec_of(&[("provider", s("oidc"))])).expect_err("no exchange");
+        assert!(
+            format!("{err:#}").contains("needs an `exchange`"),
+            "{err:#}"
+        );
+    }
+
+    // ---- runner ----
+
     #[test]
     fn a_runner_on_an_acquire_entry_parses_and_defaults_to_none() {
         let d = parse_declaration(&spec_of(&[(
@@ -822,15 +870,14 @@ mod tests {
             ]),
         )]))
         .expect("runner");
-        assert_eq!(
-            d.acquire.first().and_then(|a| a.runner.as_deref()),
-            Some("//tools/awscli:oci")
-        );
+        assert_eq!(runner_of(&d, 0).as_deref(), Some("//tools/awscli:oci"));
         assert!(
-            d.acquire.get(1).is_some_and(|a| a.runner.is_none()),
+            runner_of(&d, 1).is_none(),
             "a helper must inherit no workspace runner default"
         );
     }
+
+    // ---- the cache-key contract ----
 
     /// The load-bearing property: swapping the acquisition half leaves the
     /// emitted artifact byte-identical, so no consumer's `hashin` moves.
@@ -844,7 +891,10 @@ mod tests {
         ];
 
         let mut ci = identity.to_vec();
-        ci.extend_from_slice(&[("provider", s("oidc")), ("exchange", s("aws"))]);
+        ci.extend_from_slice(&[
+            ("provider", s("oidc")),
+            ("exchange", map(&[("kind", s("aws_sts"))])),
+        ]);
 
         let mut laptop = identity.to_vec();
         laptop.extend_from_slice(&[
@@ -871,7 +921,7 @@ mod tests {
         };
         let text = String::from_utf8(raw.data.clone()).expect("utf8");
         for leaked in [
-            "provider", "helper", "oidc", "exec", "ttl", "runner", "aws\":",
+            "provider", "helper", "oidc", "exec", "ttl", "runner", "kind",
         ] {
             assert!(
                 !text.contains(leaked),
@@ -882,8 +932,6 @@ mod tests {
         assert!(text.contains("aws_profile"), "{text}");
     }
 
-    /// Changing the identity half *must* move the hashout — the other half of
-    /// the same contract.
     #[tokio::test]
     async fn changing_the_identity_moves_the_hashout() {
         let base: Vec<(&str, Value)> = vec![
@@ -897,6 +945,24 @@ mod tests {
         let (_, base_hashout, _) = parse_and_run(&base).await;
         let (_, other_hashout, _) = parse_and_run(&other).await;
         assert_ne!(base_hashout, other_hashout);
+    }
+
+    /// `params` is hashed like the rest of the identity: it is where the
+    /// vendor-shaped half of an identity lives, and it still decides what a
+    /// consumer keys on.
+    #[tokio::test]
+    async fn params_are_part_of_the_identity() {
+        let base: Vec<(&str, Value)> = vec![
+            ("provider", s("static_env")),
+            ("var", s("TOK")),
+            ("params", map(&[("app_id", s("1"))])),
+        ];
+        let mut other = base.clone();
+        other[2] = ("params", map(&[("app_id", s("2"))]));
+
+        let (_, a, _) = parse_and_run(&base).await;
+        let (_, b, _) = parse_and_run(&other).await;
+        assert_ne!(a, b, "params must reach the cache key");
     }
 
     #[test]
@@ -914,19 +980,6 @@ mod tests {
     fn a_descriptor_with_no_acquisition_at_all_is_refused() {
         let err = parse_declaration(&spec_of(&[("role", s("arn:x"))])).expect_err("no provider");
         assert!(format!("{err:#}").contains("no way to acquire"), "{err:#}");
-    }
-
-    #[test]
-    fn exec_without_a_protocol_is_refused_at_declaration_time() {
-        let err = parse_declaration(&spec_of(&[
-            ("provider", s("exec")),
-            ("helper", list(&["gh", "auth", "token"])),
-        ]))
-        .expect_err("no protocol");
-        assert!(
-            format!("{err:#}").contains("explicit `protocol`"),
-            "{err:#}"
-        );
     }
 
     /// Declaration order must not be a cache-key component.
@@ -959,29 +1012,6 @@ mod tests {
         let d = parse_declaration(&spec_of(&[("provider", s("static_env")), ("var", s("X"))]))
             .expect("defaults");
         assert_eq!(d.identity.shape, vec!["file".to_string()]);
-    }
-
-    #[test]
-    fn unknown_provider_protocol_and_exchange_names_list_the_legal_ones() {
-        for (field, value, expect) in [
-            ("provider", "vault", "static_env"),
-            ("protocol", "netrc", "engflow"),
-            ("exchange", "azure", "github_app"),
-        ] {
-            let mut cfg = vec![("provider", s("exec")), ("helper", list(&["x"]))];
-            if field == "provider" {
-                cfg = vec![("provider", s(value))];
-            } else {
-                cfg.push((field, s(value)));
-                if field != "protocol" {
-                    cfg.push(("protocol", s("raw")));
-                }
-            }
-            let err = parse_declaration(&spec_of(&cfg)).expect_err(field);
-            let msg = format!("{err:#}");
-            assert!(msg.contains(value), "{field}: {msg}");
-            assert!(msg.contains(expect), "{field}: {msg}");
-        }
     }
 
     #[tokio::test]

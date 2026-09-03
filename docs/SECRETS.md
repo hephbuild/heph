@@ -34,7 +34,7 @@ target(
 
     # acquisition — NOT hashed. Swap freely per environment.
     provider = "oidc",
-    exchange = "aws",
+    exchange = {"kind": "aws_sts"},
 )
 ```
 
@@ -48,8 +48,8 @@ A descriptor has two halves that behave completely differently.
 
 | | Fields | In the cache key? |
 |---|---|---|
-| **Identity** | `role`, `audience`, `scope`, `impersonate`, `app_id`, `install`, `account`, `region`, `bucket`, `endpoint`, `registry`, `machine`, `profile`, `shape`, `env` | **Yes** |
-| **Acquisition** | `provider`, `var`, `vars`, `helper`, `protocol`, `runner`, `exchange`, `timeout`, `ttl`, `acquire` | **No** |
+| **Identity** | `role`, `audience`, `scope`, `account`, `region`, `bucket`, `endpoint`, `registry`, `machine`, `profile`, `params`, `shape`, `env` | **Yes** |
+| **Acquisition** | `provider`, `var`/`vars`, `helper`, `protocol`, `runner`, `timeout`, `exchange`, `ttl`, `acquire` | **No** |
 
 Getting this wrong costs the feature its main promise. If `provider` were
 hashed, CI saying `oidc` and a laptop saying `exec` would produce different
@@ -119,7 +119,8 @@ target(
     role = "arn:aws:iam::4711:role/heph-read",   # identity — one for all entries
 
     acquire = [
-        {"when_env": "GITHUB_ACTIONS", "provider": "oidc", "exchange": "aws"},
+        {"when_env": "GITHUB_ACTIONS", "provider": "oidc",
+         "exchange": {"kind": "aws_sts"}},
         {"provider": "exec", "protocol": "credential_process",   # no guard: the catch-all
          "helper": ["aws", "configure", "export-credentials", "--format", "process"],
          "runner": "//tools/devenv:runner"},
@@ -176,17 +177,31 @@ account and you get artifacts from two identities sharing one key. Prefer a
 route that *derives* its credential from the declared identity over one that is
 merely believed to match it.
 
-## Providers
+## Providers are a tagged union
 
-| `provider` | What it does |
-|---|---|
-| `static_env` | Reads a named host variable. The honest escape hatch and the migration path off `pass_env`. |
-| `exec` | Runs a helper subprocess speaking one of four protocols. |
-| `oidc` | Acquires a workload identity token and exchanges it for a scoped short-lived credential. |
+`provider` is a discriminant, not one field among many. Each provider's own
+fields belong to it and to nothing else:
+
+| `provider` | Its fields | What it does |
+|---|---|---|
+| `static_env` | `var` / `vars` | Reads named host variables. The honest escape hatch and the migration path off `pass_env`. |
+| `exec` | `helper`, `protocol`, `runner`, `timeout` | Runs a helper subprocess speaking one of four protocols. |
+| `oidc` | — | Presents the ambient workload identity token, or the stored session. |
+
+That is what makes the wrong combinations **unwritable rather than merely
+rejected**. A `helper` on a `static_env` is an unknown key. An `exec` with no
+`protocol` is a missing required field, caught at parse. A `timeout` on an
+`oidc` cannot be spelled at all. Five hand-written cross-field rules went away
+when this became a union, and they did not move somewhere else.
+
+What is left is the part a union genuinely cannot express: a non-empty argv, an
+`oidc` with something to exchange its assertion for, and durations that parse.
 
 `static_env` names a **variable, never a literal**, and the descriptor schema has
 no free-form value field at all — otherwise someone writes a token into a
-`text_file` target and it is pushed to the shared remote cache.
+`text_file` target and it is pushed to the shared remote cache. `var = "TOKEN"`
+and `vars = {"token": "TOKEN"}` are one field with two spellings; writing both
+is an error rather than a precedence question.
 
 ### The four helper protocols
 
@@ -196,12 +211,14 @@ response exists the request has already been sent in some encoding.
 
 | `protocol` | stdin | stdout | Expiry | Speakers |
 |---|---|---|---|---|
-| `engflow` | `{"uri": …}` | `{"headers": {…}, "expires": …}` | Native, RFC 3339 | Bazel `--credential_helper` helpers |
+| `credential_helper` | `{"uri": …}` | `{"headers": {…}, "expires": …}` | Native, RFC 3339 | Bazel `--credential_helper` helpers |
 | `credential_process` | — | `{"Version":1,"AccessKeyId":…}` | `Expiration`, optional | `aws configure export-credentials`, aws-vault, Granted |
 | `docker_credential` | bare URL, **not JSON** | `{"ServerURL","Username","Secret"}` | None | `docker-credential-osxkeychain`, `-ecr-login`, `-gcr` |
 | `raw` | — | the value, verbatim | None | `gh auth token`, `gcloud auth print-access-token`, `op read` |
 
-- `engflow` is the only one carrying expiry natively. It returns *headers*
+- `credential_helper` is the only one carrying expiry natively. Named for the
+  protocol rather than for EngFlow, who authored the spec: the helpers that
+  speak it are not theirs. It returns *headers*
   rather than a credential, so a bare token is recovered from `Authorization`.
 - `credential_process` is the one heph both reads and writes. `Version` must be
   `1`; an absent `Expiration` means "treat as static", not "expired".
@@ -211,6 +228,66 @@ response exists the request has already been sent in some encoding.
 - `raw` is a concession rather than a protocol. **A helper that prints a warning
   to stdout has just made it part of your credential.** Helpers here must be
   silent, or wrapped until they are.
+
+## Exchanges are standards, not vendors
+
+An exchange turns what the provider produced into the credential a target
+actually uses. It is named for the **grant**, and the grants have RFC numbers:
+
+| `kind` | What it is |
+|---|---|
+| `token_exchange` | RFC 8693 OAuth 2.0 Token Exchange. What GCP's own STS endpoint speaks. |
+| `jwt_bearer` | RFC 7523 §2.1. What a service-account key actually is. |
+| `client_credentials` | RFC 6749 §4.4. |
+| `aws_sts` | AWS `AssumeRoleWithWebIdentity`. Not an IETF grant, kept because it is how one of the three clouds federates and it predates RFC 8693. |
+| `http` | A vendor REST call: a URL, headers, a body, and JSON pointers naming the fields to keep. |
+
+The earlier design was a closed enum of vendor names — `aws`, `gcp`,
+`github_app`, `r2_temp` — and it was wrong twice over. It privileged whichever
+vendors happened to be in front of the author, so a GitHub App token was a
+first-class concept while an internal IdP was inexpressible; and adding the next
+vendor meant changing a schema that other heph versions read back.
+
+So **a GitHub App installation token and a Cloudflare R2 temporary credential
+are both `http`**, described in the BUILD file. Neither needs a name in heph, a
+release to add, or a schema change to remove:
+
+```python
+exchange = {
+    "kind": "http",
+    "url": "https://api.github.com/app/installations/42/access_tokens",
+    "fields": {"token": "/token"},
+}
+```
+
+`exchange` is a **pipeline**, because more than one hop is normal — GCP
+federation is RFC 8693 against its STS endpoint followed by a service-account
+impersonation call:
+
+```python
+exchange = [
+    {"kind": "token_exchange", "endpoint": "https://sts.googleapis.com/v1/token"},
+    {"kind": "http", "url": "https://iamcredentials.googleapis.com/…:generateAccessToken"},
+]
+```
+
+A single hop may be written as one dict rather than a one-element list.
+
+### Vendor-shaped identity goes in `params`
+
+The named identity fields are the ones with a meaning across vendors. Anything
+vendor-specific — a GitHub App id and installation, a service account to
+impersonate, an Azure tenant — goes in `params`, which is hashed like the rest
+of the identity:
+
+```python
+params = {"app_id": "1180022", "install": "org/heph"}
+```
+
+Naming those as first-class fields was the earlier design, and it put vendor
+names into a format frozen into every consumer's cache key while making the next
+vendor a schema change. A map costs a little checkability and buys forward
+compatibility: a new vendor adds no field and re-keys nothing.
 
 ### A helper has a deadline
 

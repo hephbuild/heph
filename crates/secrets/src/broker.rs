@@ -207,7 +207,7 @@ impl Broker {
         }
 
         let selection = desc.select(ctx.env)?;
-        let provider = self.registry.get(selection.entry.provider)?;
+        let provider = self.registry.get(selection.entry.source.kind())?;
 
         let redactor = self.redactor().await;
         let mint_ctx = MintCtx {
@@ -233,14 +233,14 @@ impl Broker {
             addr: desc.addr.clone(),
             acquire_index: selection.index,
             selected_by: selection.matched.clone(),
-            provider: selection.entry.provider,
+            provider: selection.entry.source.kind(),
             expires_at: cred.expiry.at,
             expiry_source: cred.expiry.source,
         });
 
         tracing::debug!(
             secret = %desc.addr,
-            provider = ?selection.entry.provider,
+            provider = ?selection.entry.source.kind(),
             acquire_index = selection.index,
             expiry_source = cred.expiry.source.as_str(),
             "minted a credential"
@@ -311,7 +311,7 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor::{Acquire, Identity, Protocol, ProviderKind, WhenEnv};
+    use crate::descriptor::{Acquire, Identity, ProviderKind, Source, WhenEnv};
     use crate::expiry::{Expiry, ExpirySource};
     use crate::provider::SecretProvider;
     use hcore::hasync::StdCancellationToken;
@@ -365,14 +365,10 @@ mod tests {
             identity: Identity::default(),
             acquire: vec![Acquire {
                 when_env: None,
-                provider: ProviderKind::StaticEnv,
-                var: Some("X".into()),
-                vars: BTreeMap::new(),
-                helper: Vec::new(),
-                protocol: None,
-                runner: None,
-                exchange: None,
-                timeout: None,
+                source: Source::StaticEnv {
+                    vars: BTreeMap::from([("token".to_string(), "X".to_string())]),
+                },
+                exchange: Vec::new(),
                 ttl: None,
             }],
         }
@@ -784,7 +780,6 @@ mod tests {
         let mut d = descriptor("//c:x");
         d.acquire = vec![Acquire {
             when_env: Some(WhenEnv::Set("NEVER_SET".into())),
-            protocol: Some(Protocol::Raw),
             ..d.acquire.first().cloned().expect("one")
         }];
 

@@ -13,6 +13,33 @@
 //!   to `snake_case` by default). `spec_param_type` is `string`.
 //! * `#[derive(SpecUnion)]` — on a newtype-variant enum, a union: parsing tries
 //!   each variant's inner type in declared order; schema renders `a | b | c`.
+//! * `#[derive(SpecOneOf)]` — on a struct-variant enum, a *tagged* union: one
+//!   map whose discriminant key selects the variant, and whose remaining keys
+//!   are that variant's fields. Unlike `SpecUnion` it does not guess — the tag
+//!   says which shape this is, so a wrong field is reported against the variant
+//!   the author named rather than as "nothing matched".
+//!
+//!   ```ignore
+//!   #[derive(SpecOneOf)]
+//!   #[spec(tag = "provider")]
+//!   enum Source {
+//!       StaticEnv { vars: HashMap<String, String> },
+//!       Exec { helper: Vec<String>, #[spec(required)] protocol: Protocol },
+//!   }
+//!   // {"provider": "exec", "helper": ["gh", "auth", "token"], "protocol": "raw"}
+//!   ```
+//!
+//!   This is what makes illegal states unrepresentable: a field belonging to
+//!   another variant is an unknown key, and a field the variant requires is
+//!   missing at parse time rather than in hand-written cross-field validation.
+//!
+//! Per-variant overrides (`SpecOneOf`), under `#[spec(...)]`:
+//!   * `rename = "name"`  — tag spelling differs from the `snake_case` ident
+//!
+//! Two more field overrides:
+//!   * `alias = "key"`    — a second accepted spelling; both at once is an error
+//!   * `flatten`          — the field reads its keys from the enclosing map
+//!     (see [`FromSpecMap`]). `Option<T>` is absent when the tag key is.
 //!
 //! Per-field overrides (`Spec` / `SpecStruct`), all under `#[spec(...)]`:
 //!   * `rename = "key"`   — config key differs from the field name
@@ -42,6 +69,8 @@ struct FieldOpts {
     with: Option<Path>,
     parse: Option<Path>,
     ty: Option<Expr>,
+    flatten: bool,
+    alias: Option<String>,
 }
 
 fn parse_field_opts(attrs: &[syn::Attribute]) -> syn::Result<FieldOpts> {
@@ -64,6 +93,11 @@ fn parse_field_opts(attrs: &[syn::Attribute]) -> syn::Result<FieldOpts> {
                 opts.parse = Some(meta.value()?.parse()?);
             } else if meta.path.is_ident("ty") {
                 opts.ty = Some(meta.value()?.parse()?);
+            } else if meta.path.is_ident("flatten") {
+                opts.flatten = true;
+            } else if meta.path.is_ident("alias") {
+                let lit: LitStr = meta.value()?.parse()?;
+                opts.alias = Some(lit.value());
             } else {
                 return Err(meta.error("unknown `spec` field option"));
             }
@@ -149,6 +183,12 @@ struct FieldCodegen {
     field_inits: Vec<proc_macro2::TokenStream>,
     schema_fields: Vec<proc_macro2::TokenStream>,
     param_tys: Vec<proc_macro2::TokenStream>,
+    /// Config keys, parallel to `param_tys`. `SpecOneOf` needs the pair to
+    /// build a struct type per variant without re-evaluating a `DriverField`.
+    keys: Vec<String>,
+    /// Schema contributions from `#[spec(flatten)]` fields, each an expression
+    /// yielding a `Vec<DriverField>` to splice into the enclosing schema.
+    flattened_schema: Vec<proc_macro2::TokenStream>,
 }
 
 fn field_codegen(
@@ -159,6 +199,8 @@ fn field_codegen(
         field_inits: Vec::new(),
         schema_fields: Vec::new(),
         param_tys: Vec::new(),
+        keys: Vec::new(),
+        flattened_schema: Vec::new(),
     };
 
     for field in fields {
@@ -168,6 +210,26 @@ fn field_codegen(
         let key = opts.rename.clone().unwrap_or_else(|| ident.to_string());
         let doc = doc_string(&field.attrs);
         let required = opts.required;
+
+        // A flattened field has no key of its own: it reads its keys straight
+        // out of the enclosing map and removes them, so what remains is still
+        // the outer struct's to account for. This is what lets one parser serve
+        // both `{"provider": "exec", …}` nested in a list and the same keys
+        // spelled inline on the target, with no second key list to drift.
+        if opts.flatten {
+            let var = quote::format_ident!("__field_{}", ident);
+            out.parse_stmts.push(quote! {
+                let #var: #fty =
+                    <#fty as crate::htspec::FromSpecMap>::from_spec_map(&mut __m)?;
+            });
+            out.field_inits.push(quote! { #ident: #var });
+            out.flattened_schema.push(quote! {
+                <#fty as crate::htspec::FromSpecMap>::spec_schema_fields()
+            });
+            out.param_tys
+                .push(quote! { <#fty as crate::htspec::FromSpecValue>::spec_param_type() });
+            continue;
+        }
 
         let parse_call = if let Some(p) = &opts.parse {
             quote! { #p(__v) }
@@ -201,9 +263,26 @@ fn field_codegen(
             quote! { ::core::option::Option::None => #default_expr, }
         };
 
+        // A second accepted spelling for the same field. Both at once is a
+        // mistake worth naming: it reads as if they compose, and they do not.
+        let lookup = match &opts.alias {
+            None => quote! { __m.remove(#key) },
+            Some(alias) => quote! {{
+                let __primary = __m.remove(#key);
+                let __alias = __m.remove(#alias);
+                if __primary.is_some() && __alias.is_some() {
+                    ::anyhow::bail!(
+                        "`{}` and `{}` are two spellings of the same field; set one",
+                        #key, #alias
+                    );
+                }
+                __primary.or(__alias)
+            }},
+        };
+
         let var = quote::format_ident!("__field_{}", ident);
         out.parse_stmts.push(quote! {
-            let #var: #fty = match __m.remove(#key) {
+            let #var: #fty = match #lookup {
                 ::core::option::Option::Some(__v) => {
                     (#parse_call).with_context(|| ::std::format!("parse `{}`", #key))?
                 }
@@ -220,6 +299,7 @@ fn field_codegen(
             }
         });
         out.param_tys.push(param_ty);
+        out.keys.push(key);
     }
 
     Ok(out)
@@ -273,6 +353,7 @@ fn expand_spec(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         parse_stmts,
         field_inits,
         schema_fields,
+        flattened_schema,
         ..
     } = cg;
     let unknown = unknown_keys_check();
@@ -305,9 +386,12 @@ fn expand_spec(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             /// Declarative LSP schema for this spec; field types mirror the
             /// `FromSpecValue` impls used by `from`. Generated by `#[derive(Spec)]`.
             pub fn schema() -> crate::htspec::DriverSchema {
-                crate::htspec::DriverSchema {
-                    fields: ::std::vec![ #(#schema_fields),* ],
-                }
+                let mut __fields: ::std::vec::Vec<crate::htspec::DriverField> =
+                    ::std::vec![ #(#schema_fields),* ];
+                // A flattened field contributes its own keys inline, because
+                // that is how they are spelled on the target.
+                #( __fields.extend(#flattened_schema); )*
+                crate::htspec::DriverSchema { fields: __fields }
             }
         }
     })
@@ -457,6 +541,177 @@ pub fn derive_spec_union(input: TokenStream) -> TokenStream {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
+}
+
+/// `#[derive(SpecOneOf)]` — a tagged union: a map whose discriminant key
+/// chooses the variant.
+///
+/// The enum needs `#[spec(tag = "key")]`; every variant must have named fields
+/// (a variant with none is written `Foo {}`). Field attributes are the same set
+/// `SpecStruct` accepts.
+#[proc_macro_derive(SpecOneOf, attributes(spec))]
+pub fn derive_spec_one_of(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match expand_spec_one_of(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// The `#[spec(tag = "...")]` attribute on a `SpecOneOf` enum.
+fn parse_tag_attr(attrs: &[syn::Attribute], name: &syn::Ident) -> syn::Result<String> {
+    let mut tag = None;
+    for attr in attrs {
+        if !attr.path().is_ident("spec") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("tag") {
+                let lit: LitStr = meta.value()?.parse()?;
+                tag = Some(lit.value());
+                Ok(())
+            } else {
+                Err(meta.error("unknown `spec` option on a SpecOneOf enum"))
+            }
+        })?;
+    }
+    tag.ok_or_else(|| {
+        syn::Error::new_spanned(
+            name,
+            "`SpecOneOf` needs a discriminant: #[spec(tag = \"provider\")]",
+        )
+    })
+}
+
+fn expand_spec_one_of(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+    let tag = parse_tag_attr(&input.attrs, name)?;
+    let variants = match &input.data {
+        Data::Enum(e) => &e.variants,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                name,
+                "`SpecOneOf` can only be derived for enums",
+            ));
+        }
+    };
+
+    let mut match_arms = Vec::new();
+    let mut struct_tys = Vec::new();
+    let mut tag_names = Vec::new();
+    let mut all_schema_fields: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    for variant in variants {
+        let vident = &variant.ident;
+        let fields = match &variant.fields {
+            Fields::Named(f) => &f.named,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    vident,
+                    "`SpecOneOf` variants must have named fields (write `Foo {}` for none)",
+                ));
+            }
+        };
+        let opts = parse_variant_opts(&variant.attrs)?;
+        let key = opts
+            .rename
+            .unwrap_or_else(|| snake_case(&vident.to_string()));
+
+        let cg = field_codegen(fields)?;
+        let FieldCodegen {
+            parse_stmts,
+            field_inits,
+            param_tys,
+            keys,
+            schema_fields,
+            ..
+        } = cg;
+
+        match_arms.push(quote! {
+            #key => {
+                #(#parse_stmts)*
+                ::core::result::Result::Ok(#name::#vident { #(#field_inits),* })
+            }
+        });
+        all_schema_fields.push(quote! { #(#schema_fields),* });
+
+        // A struct type per variant, tag field included, so an editor can tell
+        // the author which keys this `provider` accepts.
+        struct_tys.push(quote! {
+            crate::htvalue::signature::ParamType::strukt(::std::vec![
+                (#tag, crate::htvalue::signature::ParamType::String),
+                #((#keys, #param_tys)),*
+            ])
+        });
+        tag_names.push(key);
+    }
+
+    let valid = tag_names.join(", ");
+    let unknown_after_variant = unknown_keys_check();
+
+    Ok(quote! {
+        impl crate::htspec::FromSpecMap for #name {
+            fn from_spec_map(
+                __m: &mut ::std::collections::HashMap<&str, &crate::htvalue::Value>,
+            ) -> ::anyhow::Result<Self> {
+                use ::anyhow::Context as _;
+                let __tag_value = __m
+                    .remove(#tag)
+                    .ok_or_else(|| ::anyhow::anyhow!(
+                        "missing `{}`; expected one of: {}", #tag, #valid
+                    ))?;
+                let __tag = <::std::string::String as crate::htspec::FromSpecValue>::from_spec_value(
+                    __tag_value
+                ).with_context(|| ::std::format!("parse `{}`", #tag))?;
+
+                // Each arm removes only the keys its own variant owns. Nested
+                // in a map that is all ours, `from_spec_value` then rejects
+                // whatever is left; flattened into a larger struct, the
+                // remainder is the outer struct's to account for.
+                match __tag.as_str() {
+                    #(#match_arms)*
+                    __other => ::anyhow::bail!(
+                        "unknown `{}` {:?}; expected one of: {}", #tag, __other, #valid
+                    ),
+                }
+            }
+
+            fn spec_tag() -> &'static str {
+                #tag
+            }
+
+            fn spec_schema_fields() -> ::std::vec::Vec<crate::htspec::DriverField> {
+                let mut __out = ::std::vec![
+                    crate::htspec::DriverField {
+                        name: #tag.to_string(),
+                        ty: crate::htvalue::signature::ParamType::String,
+                        doc: ::std::format!("One of: {}", #valid),
+                        required: false,
+                    }
+                ];
+                #( __out.extend(::std::vec![ #all_schema_fields ]); )*
+                __out
+            }
+        }
+
+        impl crate::htspec::FromSpecValue for #name {
+            fn from_spec_value(__value: &crate::htvalue::Value) -> ::anyhow::Result<Self> {
+                let __map = match __value {
+                    crate::htvalue::Value::Map(__m) => __m,
+                    __other => ::anyhow::bail!("invalid: expected a map, got: {:?}", __other),
+                };
+                let mut __m: ::std::collections::HashMap<&str, &crate::htvalue::Value> =
+                    __map.iter().map(|(__k, __v)| (__k.as_str(), __v)).collect();
+                let __parsed = <Self as crate::htspec::FromSpecMap>::from_spec_map(&mut __m)?;
+                #unknown_after_variant
+                ::core::result::Result::Ok(__parsed)
+            }
+
+            fn spec_param_type() -> crate::htvalue::signature::ParamType {
+                crate::htspec::flatten_union(::std::vec![ #(#struct_tys),* ])
+            }
+        }
+    })
 }
 
 fn expand_spec_union(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
