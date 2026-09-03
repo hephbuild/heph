@@ -28,11 +28,6 @@ use xxhash_rust::xxh3::Xxh3Default;
 const GOLIST_JSON_FIELDS: &str = "-json=Dir,ImportPath,Name,GoFiles,SFiles,HFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error";
 
 pub struct GoGolistDriver {
-    /// Resolves the `GOCACHE` each golist run uses — shared across sandboxes
-    /// when the engine handed us a home dir. See
-    /// [`crate::plugingo::golist_gocache`] for why sharing it is both sound and
-    /// the only thing that moves cold wall time.
-    gocache: crate::plugingo::golist_gocache::GolistGocache,
     /// Default exec runner for this driver's tool, from the plugin's `runner:`
     /// option in the config yaml. A target's own `runner` field overrides it,
     /// and `"local"` there opts back out. See [`crate::plugingo::runner`].
@@ -95,24 +90,8 @@ struct GoGolistSpec {
 }
 
 impl GoGolistDriver {
-    /// Sandbox-local `GOCACHE`, the pre-sharing behaviour. For in-process
-    /// constructions (tests, the e2e harness) that have no engine home dir to
-    /// share a cache through.
     pub fn new() -> Self {
         Self {
-            gocache: crate::plugingo::golist_gocache::GolistGocache::new(None),
-            default_runner: None,
-            host_go: Default::default(),
-        }
-    }
-
-    /// Share one `GOCACHE` per toolchain across golist sandboxes, under
-    /// `gocache_root` — a directory the caller owns and heph may write to (the
-    /// engine home dir). A plugin is handed its writable locations rather than
-    /// discovering them, so this is the only way sharing is turned on.
-    pub fn with_gocache_root(gocache_root: std::path::PathBuf) -> Self {
-        Self {
-            gocache: crate::plugingo::golist_gocache::GolistGocache::new(Some(gocache_root)),
             default_runner: None,
             host_go: Default::default(),
         }
@@ -348,6 +327,39 @@ impl ManagedDriver for GoGolistDriver {
         )?;
         dep_inputs.extend(runner_input);
 
+        // The shared `GOCACHE`, as a scratch reference. The engine resolves and
+        // locks the slot before this driver runs and hands the directory back on
+        // `RunRequest`, so nothing here creates or tears down a cache per
+        // sandbox — which is the only thing that ever moved cold wall time
+        // (`gocache`'s module docs have the numbers).
+        //
+        // `hashed: false, runtime: false`: it materializes no artifacts, and it
+        // must not touch this target's cache key, because a `go list` produces
+        // the same package metadata warm or cold.
+        let gocache_key = crate::plugingo::gocache::GocacheKey {
+            go_version: spec.go_version.clone(),
+            goos: spec.goos.clone(),
+            goarch: spec.goarch.clone(),
+            build_tags: spec.build_tags.clone(),
+            goexperiment: spec.goexperiment.clone(),
+            race: spec.race,
+        };
+        let gocache_input = Input {
+            r#ref: TargetAddr {
+                r#ref: gocache_key.addr(),
+                output: None,
+                filters: vec![],
+            },
+            mode: InputMode::Standard,
+            origin_id: format!("{}|0", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX),
+            annotations: std::collections::BTreeMap::from([(
+                hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
+                "true".to_string(),
+            )]),
+            hashed: false,
+            runtime: false,
+        };
+
         let def = GoGolistDef {
             runner,
             import_path: spec.import_path,
@@ -400,7 +412,7 @@ impl ManagedDriver for GoGolistDriver {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                inputs: dep_inputs,
+                inputs: dep_inputs.into_iter().chain([gocache_input]).collect(),
                 outputs,
                 support_files: vec![],
                 cache: CacheConfig::on(true),
@@ -441,23 +453,26 @@ impl ManagedDriver for GoGolistDriver {
             ctoken,
         )
         .await?;
-        // The build cache `go list` runs against. Shared across sandboxes per
-        // toolchain when the engine gave us a home dir, so the standard
-        // library's test metadata is derived once per repo instead of once per
-        // package — and, more to the point, so no cache is materialized and torn
-        // down inside each sandbox. The host GOCACHE is still never touched.
-        // See `golist_gocache` for why this is sound.
-        let gocache = self.gocache.resolve(
-            &crate::plugingo::golist_gocache::GocacheKey {
-                goroot: goroot.clone(),
-                goos: def.goos.clone(),
-                goarch: def.goarch.clone(),
-                build_tags: def.build_tags.clone(),
-                goexperiment: def.goexperiment.clone(),
-                race: def.race,
-            },
-            &req.sandbox_pkg_dir.join(".heph-gocache"),
-        )?;
+        // The build cache `go list` runs against, resolved and locked by the host
+        // from this target's scratch reference (see `gocache`). Shared across
+        // sandboxes, so the standard library's test metadata is derived once per
+        // repo instead of once per package — and, more to the point, so no cache
+        // is materialized and torn down inside each sandbox. The host GOCACHE is
+        // still never touched.
+        //
+        // A missing mount falls back to a sandbox-local directory rather than
+        // failing: an older host that does not carry scratch mounts on
+        // `RunRequest` still has to be able to run this driver, and a cold cache
+        // is slow, never wrong.
+        let gocache = match req.request.scratch.iter().find(|m| m.env == "GOCACHE") {
+            Some(mount) => mount.dir.clone(),
+            None => {
+                let local = req.sandbox_pkg_dir.join(".heph-gocache");
+                std::fs::create_dir_all(&local)
+                    .with_context(|| format!("create gocache dir {local:?}"))?;
+                local
+            }
+        };
 
         let env = golist_env(def, &goroot, &gocache, |n| std::env::var(n).ok());
 
