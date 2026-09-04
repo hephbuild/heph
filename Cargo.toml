@@ -116,6 +116,7 @@ hplugin = { package = "plugin", path = "crates/plugin" }
 hbuiltins = { package = "builtins", path = "crates/builtins" }
 hplugin-buildfile = { package = "plugin-buildfile", path = "crates/plugin-buildfile" }
 hdriver-support = { package = "driver-support", path = "crates/driver-support" }
+hsecrets = { package = "secrets", path = "crates/secrets" }
 hplugin-exec = { package = "plugin-exec", path = "crates/plugin-exec" }
 hplugin-nix = { package = "plugin-nix", path = "crates/plugin-nix" }
 hplugin-devenv = { package = "plugin-devenv", path = "crates/plugin-devenv" }

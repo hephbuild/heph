@@ -117,6 +117,15 @@ struct SecretSpec {
     /// For the `env` shape: variable name → pointer into the acquired value.
     /// `"$."` is the whole value, `"$.<field>"` one field.
     env: std::collections::HashMap<String, String>,
+    /// Which targets may hold this credential, as a query —
+    /// `"//svc/... + label(deploy)"`. Omit to permit any.
+    ///
+    /// Access control without a new ACL system: which credentials exist is
+    /// CODEOWNERS on this package, and which targets may use one is this line,
+    /// in the same reviewed file. Unhashed: it decides whether a build is
+    /// permitted, not what it computes.
+    #[spec(ty = ParamType::String)]
+    allow: Option<String>,
 
     // ---- acquisition: NOT hashed, never written to secret.json ----
     /// Ordered acquisition candidates. Each is a dict; the first whose
@@ -331,6 +340,7 @@ fn from_spec(
         addr: addr.to_string(),
         identity,
         acquire,
+        allow: spec.allow,
     })
 }
 
@@ -412,6 +422,9 @@ impl hplugin::driver::Driver for Driver {
                     enabled: true,
                     remote_enabled: false,
                     history: 1,
+                    // A descriptor is a recipe: identical for everyone, by
+                    // construction. It has nothing to scope by a subject.
+                    subject_scoped: false,
                 },
                 pty: false,
                 hash,

@@ -35,10 +35,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// A credential a target holds, resolved from its declaration.
-pub(crate) struct ResolvedSecret {
+pub struct ResolvedSecret {
     /// The consumer's name for it.
     pub name: String,
     pub desc: Descriptor,
+    /// The dependency chain that supplied it, empty when declared directly.
+    ///
+    /// `merge_sandbox` already builds this into the input's `origin_id`, so it
+    /// costs nothing to carry — and it is the only thing that makes a policy
+    /// failure legible to a target that named none of it.
+    pub via: Vec<String>,
 }
 
 /// What a target's credentials produced, and how to take it back.
@@ -70,6 +76,45 @@ impl SecretDelivery {
 }
 
 impl Engine {
+    /// [`Self::resolve_secrets`], for `heph auth`.
+    ///
+    /// A thin public alias rather than making the real one public: the CLI
+    /// genuinely needs to read what a target holds, and naming that need
+    /// separately keeps the execute path's version `pub(crate)` where it
+    /// belongs.
+    pub async fn resolve_secrets_for_check(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        consumer: &Addr,
+        inputs: &[Input],
+    ) -> anyhow::Result<Vec<ResolvedSecret>> {
+        self.resolve_secrets(rs, consumer, inputs).await
+    }
+
+    /// Mint one credential and drop it, for `heph auth check`.
+    ///
+    /// Nothing is rendered, written or returned — only whether the route
+    /// worked. That is deliberately all a check can report: printing the value
+    /// is how it reaches scrollback and a pasted bug report, which is why there
+    /// is no `heph auth token`.
+    pub async fn mint_for_check(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        secret: &ResolvedSecret,
+    ) -> anyhow::Result<()> {
+        let env_lookup = |k: &str| std::env::var(k).ok();
+        let ctx = BrokerCtx {
+            now: std::time::SystemTime::now(),
+            env: &env_lookup,
+            ctoken: rs.ctoken(),
+            request_id: rs.request_id(),
+            runner: None,
+            cwd: &self.cfg.root,
+        };
+        rs.broker().mint(&secret.desc, &secret.name, &ctx).await?;
+        Ok(())
+    }
+
     /// Read every credential declaration a target references.
     ///
     /// Cheap on the overwhelmingly common path: a target with no credential
@@ -115,13 +160,27 @@ impl Engine {
 
             let desc = hbuiltins::pluginsecret::parse_declaration(&spec)
                 .with_context(|| format!("{consumer} references secret {addr}"))?;
+            // `secret|<name>` is a direct declaration; anything longer was
+            // rewritten by `merge_sandbox` as it travelled up.
+            let via: Vec<String> = input
+                .origin_id
+                .split('_')
+                .filter(|part| !part.is_empty() && *part != "secret")
+                .map(str::to_string)
+                .collect();
             resolved.push(ResolvedSecret {
                 name: name.to_string(),
                 desc,
+                via: if input.origin_id.starts_with("secret|") {
+                    Vec::new()
+                } else {
+                    via
+                },
             });
         }
 
         check_slots(consumer, &resolved)?;
+        check_allow(consumer, &resolved)?;
         Ok(resolved)
     }
 
@@ -193,6 +252,50 @@ impl Engine {
     }
 }
 
+/// Reject a target that is not permitted to hold a credential it references.
+///
+/// **Evaluated on the effective set** — what a target holds after
+/// `apply_transitive`, not what it declared. Anything else lets a dependency
+/// launder a credential past its own policy: the consumer names nothing, and
+/// the check that was supposed to stop it never sees the edge.
+///
+/// The failure is legitimate even when the consumer wrote nothing, so the
+/// message carries the chain that supplied it. Without that a reader is told
+/// their target may not hold a credential they have never heard of.
+fn check_allow(consumer: &Addr, resolved: &[ResolvedSecret]) -> anyhow::Result<()> {
+    for r in resolved {
+        let Some(query) = r.desc.allow.as_deref().filter(|q| !q.trim().is_empty()) else {
+            continue;
+        };
+        let matcher = hmodel::htquery::parse(query, &consumer.package).with_context(|| {
+            format!(
+                "secret {}: `allow` is not a valid target query: {query:?}",
+                r.desc.addr
+            )
+        })?;
+        if matches!(
+            matcher.matches_addr(consumer),
+            hmodel::htmatcher::MatchResult::MatchYes
+        ) {
+            continue;
+        }
+        let via = if r.via.is_empty() {
+            String::new()
+        } else {
+            format!("\n  It reached this target through {}.", r.via.join(" → "))
+        };
+        anyhow::bail!(
+            "{consumer} is not permitted to hold secret {} (as {:?}).{via}\n  Its `allow` is \
+             {query:?}, and {consumer} does not match.\n  Widen `allow` on {}, or stop \
+             depending on the credential.",
+            r.desc.addr,
+            r.name,
+            r.desc.addr,
+        );
+    }
+    Ok(())
+}
+
 /// Reject a set of credentials that would fight over one file or variable.
 ///
 /// Runs from declarations alone, so it fails identically on every machine and
@@ -221,7 +324,7 @@ fn check_slots(consumer: &Addr, resolved: &[ResolvedSecret]) -> anyhow::Result<(
         .map(|r| Claim {
             name: r.name.clone(),
             addr: r.desc.addr.clone(),
-            via: Vec::new(),
+            via: r.via.clone(),
             identity: r.desc.identity.clone(),
         })
         .collect();

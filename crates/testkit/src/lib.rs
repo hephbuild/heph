@@ -16,6 +16,7 @@ type SetupFn = Box<dyn FnOnce(&mut Engine) -> anyhow::Result<()>>;
 pub struct WorkspaceBuilder {
     dir: TempDir,
     parallelism: Option<usize>,
+    run_subject: Option<String>,
     fs_skip: Vec<String>,
     setups: Vec<SetupFn>,
 }
@@ -25,6 +26,7 @@ impl WorkspaceBuilder {
         Ok(Self {
             dir: tempfile::tempdir().context("create workspace tempdir")?,
             parallelism: None,
+            run_subject: None,
             fs_skip: vec![],
             setups: vec![],
         })
@@ -34,9 +36,19 @@ impl WorkspaceBuilder {
         Self {
             dir,
             parallelism: None,
+            run_subject: None,
             fs_skip: vec![],
             setups: vec![],
         }
+    }
+
+    /// Fix who is running the build, for `cache.subject_scoped`.
+    ///
+    /// Detection reads the process environment, which a test cannot set without
+    /// racing every other test in its binary.
+    pub fn with_run_subject(mut self, subject: impl Into<String>) -> Self {
+        self.run_subject = Some(subject.into());
+        self
     }
 
     pub fn with_parallelism(mut self, p: usize) -> Self {
@@ -88,6 +100,7 @@ impl WorkspaceBuilder {
             root: self.dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: self.parallelism,
+            run_subject: self.run_subject,
             fs_skip: self.fs_skip,
             ..Default::default()
         })?;

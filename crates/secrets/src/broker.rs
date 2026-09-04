@@ -594,6 +594,7 @@ mod tests {
                 exchange: Vec::new(),
                 ttl: None,
             }],
+            allow: None,
         }
     }
 

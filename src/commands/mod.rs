@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod auth;
 pub mod bootstrap;
 pub mod completion;
 pub mod errors;
@@ -89,6 +90,14 @@ pub enum Commands {
     /// Maintenance and housekeeping subcommands that operate on the workspace
     /// or the local cache rather than on individual targets.
     Tool(tool::ToolArgs),
+    /// Credentials: what a target holds, and whether it can be obtained
+    ///
+    /// Everything credential-facing under one noun. There is deliberately no
+    /// `token` subcommand: printing a minted credential is how it reaches
+    /// scrollback, shell history and a pasted bug report. Use `check` to ask
+    /// the question anyone would reach for it to ask — whether the credential
+    /// can be obtained at all.
+    Auth(auth::AuthArgs),
     /// Generate markdown CLI reference
     #[command(name = "gen-docs", hide = true)]
     GenDocs(gendocs::GenDocsArgs),
@@ -97,6 +106,7 @@ pub enum Commands {
 impl Commands {
     pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match self {
+            Commands::Auth(args) => auth::execute(args, sink, global),
             Commands::Run(args) => run::execute(args, sink, global),
             Commands::Inspect(args) => args.execute(sink, global),
             Commands::Query(args) => query::execute(args, sink, global),

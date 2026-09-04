@@ -454,3 +454,175 @@ async fn two_dependencies_needing_the_same_credential_dedupe() -> anyhow::Result
     assert!(out.contains("shared_token_value"), "{out}");
     Ok(())
 }
+
+// ------------------------------------------------------------------- policy
+
+/// `allow` is access control without a new ACL system: which credentials exist
+/// is CODEOWNERS on the declaring package, and which targets may *use* one is a
+/// line in the same reviewed file.
+#[tokio::test]
+async fn allow_permits_a_matching_target_and_refuses_others() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        r#"target(name = "tok", driver = "secret", allow = "//svc/...",
+       provider = "exec", protocol = "raw", helper = ["/bin/echo", "allowed_value"])"#,
+    );
+    ws.write_build_file(
+        "svc/api",
+        r#"target(name = "ok", driver = "bash", out = "o.txt",
+       secrets = {"tok": "//creds:tok"}, run = ["cat $SECRET_TOK > o.txt"])"#,
+    );
+    ws.write_build_file(
+        "other",
+        r#"target(name = "nope", driver = "bash", out = "o.txt",
+       secrets = {"tok": "//creds:tok"}, run = ["cat $SECRET_TOK > o.txt"])"#,
+    );
+
+    let out = common::artifact_string(&*ws.run("//svc/api:ok").await?);
+    assert!(out.contains("allowed_value"), "{out}");
+
+    let err = match ws.run("//other:nope").await {
+        Ok(_) => panic!("a target outside `allow` must be refused"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("not permitted"), "{err}");
+    assert!(err.contains("//svc/..."), "{err}");
+    Ok(())
+}
+
+/// **Evaluated on the effective set.** A dependency must not be able to launder
+/// a credential past its own policy onto a consumer that names nothing — and
+/// the message has to carry the chain, or the reader is told their target may
+/// not hold a credential they have never heard of.
+#[tokio::test]
+async fn allow_is_checked_on_inherited_credentials_and_names_the_chain() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        r#"target(name = "tok", driver = "secret", allow = "//lib/...",
+       provider = "static_env", var = "TOKEN")"#,
+    );
+    ws.write_build_file(
+        "lib",
+        r#"target(name = "lib", driver = "bash", out = "l.txt", run = ["echo l > l.txt"],
+       transitive = {"secrets": {"tok": "//creds:tok"}})"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "use", driver = "bash", out = "o.txt",
+       deps = ["//lib:lib"], run = ["echo hi > o.txt"])"#,
+    );
+
+    let err = match ws.run("//app:use").await {
+        Ok(_) => panic!("a laundered credential must still be refused"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("not permitted"), "{err}");
+    assert!(err.contains("//creds:tok"), "{err}");
+    assert!(err.contains("reached this target through"), "{err}");
+    Ok(())
+}
+
+/// A policy edit must not invalidate a cache: `allow` decides whether a build is
+/// permitted, not what it computes.
+#[tokio::test]
+async fn allow_does_not_reach_the_cache_key() -> anyhow::Result<()> {
+    let hashin_of = async |allow: &str| -> anyhow::Result<String> {
+        let ws = Workspace::new();
+        ws.write_build_file(
+            "creds",
+            &format!(
+                r#"target(name = "tok", driver = "secret", allow = "{allow}",
+       provider = "static_env", var = "TOKEN")"#
+            ),
+        );
+        ws.write_build_file(
+            "app",
+            r#"target(name = "use", driver = "bash", out = "o.txt",
+       secrets = {"tok": "//creds:tok"}, run = ["echo hi > o.txt"])"#,
+        );
+        ws.hashin("//app:use").await
+    };
+
+    assert_eq!(
+        hashin_of("//...").await?,
+        hashin_of("//app/... + //svc/...").await?,
+        "editing a policy re-keyed every consumer"
+    );
+    Ok(())
+}
+
+// --------------------------------------------------------- subject scoping
+
+/// Where a result genuinely depends on who produced it, a target can ask to be
+/// keyed by the run's identity.
+#[tokio::test]
+async fn subject_scoped_partitions_the_cache_by_who_ran_it() -> anyhow::Result<()> {
+    let hashin_of = async |subject: &str, scoped: bool| -> anyhow::Result<String> {
+        // The subject is injected rather than set in the environment. Detection
+        // reads process-global state, which a test in a parallel binary cannot
+        // set without racing every other test — and a cache-key input deserves
+        // a test that is not a coin flip.
+        let ws = Workspace::with_run_subject(subject);
+        ws.write_build_file(
+            "app",
+            &format!(
+                r#"target(name = "t", driver = "bash", out = "o.txt",
+       cache = {{"subject_scoped": {}}}, run = ["echo hi > o.txt"])"#,
+                if scoped { "True" } else { "False" }
+            ),
+        );
+        ws.hashin("//app:t").await
+    };
+
+    // Scoped: two subjects, two keys.
+    let a = hashin_of("org/one", true).await?;
+    let b = hashin_of("org/two", true).await?;
+    assert_ne!(a, b, "a subject-scoped target did not partition");
+
+    // Unscoped: the subject is not written at all, so the key is unchanged.
+    let c = hashin_of("org/one", false).await?;
+    let d = hashin_of("org/two", false).await?;
+    assert_eq!(c, d, "an unscoped target picked up the subject anyway");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------- heph auth
+
+/// `heph auth show` is the other half of the design's bargain: a target holding
+/// a credential stays cacheable and *the author configures* — which is only
+/// fair to ask of someone who can see what they are configuring.
+#[tokio::test]
+async fn auth_show_reports_what_a_target_would_hold_without_minting() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        // `/bin/false` would fail if anything tried to mint. `show` must not.
+        r#"target(name = "gh", driver = "secret", shape = ["netrc"], machine = "github.com",
+       provider = "exec", protocol = "raw", helper = ["/bin/false"])"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "use", driver = "bash", out = "o.txt",
+       secrets = {"gh": "//creds:gh"}, run = ["echo hi > o.txt"])"#,
+    );
+
+    let addr = heph::htaddr::parse_addr("//app:use")?;
+    let rs = ws.engine.new_state();
+    let def = std::sync::Arc::clone(&ws.engine)
+        .get_def(rs.clone(), &addr)
+        .await?;
+    let held = ws
+        .engine
+        .resolve_secrets_for_check(&rs, &addr, &def.target_def.inputs)
+        .await?;
+
+    assert_eq!(held.len(), 1);
+    let h = held.first().expect("one");
+    assert_eq!(h.name, "gh");
+    assert_eq!(h.desc.addr, "//creds:gh");
+    assert_eq!(h.desc.identity.shape, vec!["netrc".to_string()]);
+    Ok(())
+}

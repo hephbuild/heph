@@ -92,6 +92,13 @@ pub struct Config {
     /// [`Engine::skip_dirs`]: crate::engine::Engine::skip_dirs
     pub fs_skip: Vec<String>,
     pub parallelism: Option<usize>,
+    /// Override for who is running this build (`cache.subject_scoped`).
+    ///
+    /// Detected from the environment when unset. Present because the detection
+    /// reads process-global state, which a test cannot set without racing every
+    /// other test in its binary — and a cache-key input deserves a test that is
+    /// not a coin flip.
+    pub run_subject: Option<String>,
     /// In-memory tier fronting the durable (SQLite) local cache.
     pub mem_cache: MemCacheOptions,
     /// Mem-only store for tmp/uncacheable revisions ([`LocalCacheTmp`]).
@@ -156,6 +163,7 @@ impl Default for Config {
             home_dir: PathBuf::new(),
             fs_skip: Vec::new(),
             parallelism: None,
+            run_subject: None,
             mem_cache: MemCacheOptions::default(),
             tmp_cache: MemCacheOptions::default_tmp(),
             fuse: FuseConfig::default(),
@@ -236,6 +244,7 @@ impl ConfigYamlExt for ConfigYaml {
                 .unwrap_or_else(|| root.join(".heph3")),
             fs_skip: self.fs.as_ref().map(|f| f.skip.clone()).unwrap_or_default(),
             parallelism: None,
+            run_subject: None,
             mem_cache: self
                 .mem_cache
                 .as_ref()

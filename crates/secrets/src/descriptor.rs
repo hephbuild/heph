@@ -808,6 +808,18 @@ pub struct Descriptor {
     pub identity: Identity,
     /// Ordered candidates. Non-empty after [`Self::validate`].
     pub acquire: Vec<Acquire>,
+    /// Which targets may hold this credential, as an `htmatcher` query —
+    /// `"//svc/... + label(deploy)"`. Empty permits any.
+    ///
+    /// Access control without a new ACL system: which credentials exist is
+    /// CODEOWNERS on the declaring package, and which targets may *use* one is
+    /// this line, in the same reviewed file.
+    ///
+    /// Unhashed, and deliberately so. It decides whether a build is permitted,
+    /// not what it computes — a target that passes the check produces exactly
+    /// what it would have without one, so folding it into a key would
+    /// invalidate every consumer for a policy edit that changed no output.
+    pub allow: Option<String>,
 }
 
 /// Which entry was chosen, and why — so `heph auth show` can report a route
@@ -1129,6 +1141,7 @@ mod tests {
                 },
                 exec_acq(),
             ],
+            allow: None,
         };
         d.validate().expect("valid");
 
@@ -1161,6 +1174,7 @@ mod tests {
                     ..exec_acq()
                 },
             ],
+            allow: None,
         };
         let err = d
             .select(&env_of(&[("GITHUB_ACTIONS", "")]))
@@ -1179,6 +1193,7 @@ mod tests {
             addr: "//x:y".into(),
             identity: Identity::default(),
             acquire: vec![exec_acq(), exec_acq()],
+            allow: None,
         };
         let err = d.validate().expect_err("unreachable entry");
         assert!(err.to_string().contains("must come last"), "{err}");

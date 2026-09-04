@@ -635,6 +635,24 @@ pub mod targetdef {
         pub enabled: bool,
         pub remote_enabled: bool,
         pub history: u32,
+        /// Fold the run's identity into this target's cache key.
+        ///
+        /// Keys on **who ran the build**, not on the credential's post-exchange
+        /// subject. That distinction is load-bearing: `hashin` is computed
+        /// before `execute`, while an exchanged subject only exists after a
+        /// mint — so hashing the latter would force every subject-scoped target
+        /// to mint before its own cache key existed, and a warm build would
+        /// mint once per target to discover it had nothing to do. The subject
+        /// of the token heph presents is knowable at the start of the run, and
+        /// is the better answer anyway: what "identity-dependent" turns on is
+        /// who is running the build.
+        ///
+        /// A welcome consequence: it is meaningful on a target holding no
+        /// credential at all, which is right — "my output depends on who ran
+        /// it" is a claim about the target, and credentials are merely its most
+        /// common cause.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub subject_scoped: bool,
     }
 
     impl CacheConfig {
@@ -647,6 +665,7 @@ pub mod targetdef {
                 enabled: true,
                 remote_enabled,
                 history: Self::DEFAULT_HISTORY,
+                subject_scoped: false,
             }
         }
 
@@ -656,6 +675,7 @@ pub mod targetdef {
                 enabled: false,
                 remote_enabled: false,
                 history: 0,
+                subject_scoped: false,
             }
         }
     }
