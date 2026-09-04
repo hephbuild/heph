@@ -8,8 +8,9 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::provider::GetError::NotFound;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
-    Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
+    ListPackagesRequest, ListRequest, ListResponse, ListSecretsRequest, ProbeRequest,
+    ProbeResponse, Provider as EProvider, ProviderFunctionRegistry, SecretDeclaration, SignIn,
+    State, TargetSpec,
 };
 use hwalk::{CachedWalker, Ignore};
 use once_cell::sync::OnceCell;
@@ -647,6 +648,61 @@ impl EProvider for Provider {
                     })
                     .collect(),
             })
+        })
+    }
+
+    /// Evaluate every package and report the `secret` targets.
+    ///
+    /// Implemented rather than left to the default so `heph auth login` gets a
+    /// definite answer from this provider. It is not *cheap* here — finding a
+    /// secret means evaluating the BUILD files, which is the bulk of the cost —
+    /// but the win was never this provider: it is that `plugin-go` and friends
+    /// answer `Some(vec![])` without discovering anything, so a login stops
+    /// paying for a `go list` to learn about credentials Go never declares.
+    fn list_secrets<'a>(
+        &'a self,
+        req: ListSecretsRequest,
+        ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Option<Vec<SecretDeclaration>>>> {
+        Box::pin(async move {
+            let list = self.packages();
+            let packages = match list.cached() {
+                Some(packages) => packages,
+                None => hcore::blocking::run(move || list.get()).await?,
+            };
+
+            let mut out = Vec::new();
+            for pkg in packages.iter() {
+                if !req.prefix.is_empty() && !pkg.as_str().starts_with(&req.prefix) {
+                    continue;
+                }
+                if ctoken.is_cancelled() {
+                    break;
+                }
+                let package = PkgBuf::from(pkg.as_str());
+                if self
+                    .skip
+                    .prunes_package(&self.root, std::path::Path::new(package.as_str()))
+                {
+                    continue;
+                }
+                let res = self.run_pkg(package.as_str()).await?;
+                for t in res.targets.iter() {
+                    let driver = if t.driver.is_empty() {
+                        self.default_driver.clone().unwrap_or_default()
+                    } else {
+                        t.driver.clone()
+                    };
+                    if driver != SECRET_DRIVER {
+                        continue;
+                    }
+                    out.push(SecretDeclaration {
+                        addr: Addr::new(package.clone(), t.name.clone(), Default::default()),
+                        sign_ins: sign_ins_of(&t.config),
+                    });
+                }
+            }
+            Ok(Some(out))
         })
     }
 
@@ -1679,5 +1735,179 @@ provider_state(provider = "go", root = "src", strict = True)
         };
         let msg = format!("{err:#}");
         assert!(msg.contains("missing provider"), "{msg}");
+    }
+}
+
+/// The driver whose targets `list_secrets` reports.
+///
+/// A literal rather than a dependency on `hbuiltins`: this provider sits below
+/// the driver registry and must not learn to depend on it just to spell one
+/// name.
+const SECRET_DRIVER: &str = "secret";
+
+/// Pull the `sign_in` maps out of a `secret` target's config.
+///
+/// Deliberately lenient. This runs *before* the driver has parsed anything, so
+/// a malformed declaration must not fail `heph auth login` for the whole
+/// workspace — a target whose `sign_in` is nonsense simply contributes no
+/// session here, and says so properly when the driver parses it. What is read
+/// is the inline `sign_in` and every `acquire` entry's.
+fn sign_ins_of(config: &HashMap<String, hcore::htvalue::Value>) -> Vec<SignIn> {
+    use hcore::htvalue::Value;
+
+    let mut out = Vec::new();
+    if let Some(v) = config.get("sign_in") {
+        out.extend(sign_in_of(v));
+    }
+    if let Some(Value::List(entries)) = config.get("acquire") {
+        for entry in entries {
+            if let Value::Map(m) = entry
+                && let Some(v) = m.get("sign_in")
+            {
+                out.extend(sign_in_of(v));
+            }
+        }
+    }
+    out
+}
+
+fn sign_in_of(v: &hcore::htvalue::Value) -> Option<SignIn> {
+    use hcore::htvalue::Value;
+    let Value::Map(m) = v else { return None };
+    let text = |k: &str| match m.get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let strings = |k: &str| match m.get(k) {
+        Some(Value::List(items)) => items
+            .iter()
+            .filter_map(|i| match i {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let ports = match m.get("redirect_ports") {
+        Some(Value::List(items)) => items
+            .iter()
+            .filter_map(|i| match i {
+                Value::Int(n) => u16::try_from(*n).ok(),
+                Value::Uint(n) => u16::try_from(*n).ok(),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    // Both are required by the driver; a declaration missing either is not a
+    // session anyone can establish, so it is dropped rather than half-reported.
+    Some(SignIn {
+        issuer: text("issuer")?,
+        client_id: text("client_id")?,
+        scopes: strings("scopes"),
+        redirect_ports: ports,
+    })
+}
+
+#[cfg(test)]
+mod sign_in_tests {
+    use super::*;
+    use hcore::htvalue::Value;
+
+    fn map(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        )
+    }
+
+    fn sign_in(issuer: &str, client: &str) -> Value {
+        map(&[
+            ("issuer", Value::String(issuer.to_string())),
+            ("client_id", Value::String(client.to_string())),
+        ])
+    }
+
+    /// The inline spelling and every `acquire` entry's are both read: a secret
+    /// whose CI route is ambient and whose laptop route signs in declares its
+    /// sign-in in the list, and login must see it.
+    #[test]
+    fn both_spellings_are_read() {
+        let inline: HashMap<_, _> =
+            [("sign_in".to_string(), sign_in("https://a.example", "c1"))].into();
+        assert_eq!(sign_ins_of(&inline).len(), 1);
+
+        let listed: HashMap<_, _> = [(
+            "acquire".to_string(),
+            Value::List(vec![
+                map(&[("provider", Value::String("oidc".into()))]),
+                map(&[
+                    ("provider", Value::String("oidc".into())),
+                    ("sign_in", sign_in("https://b.example", "c2")),
+                ]),
+            ]),
+        )]
+        .into();
+        let got = sign_ins_of(&listed);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].client_id, "c2");
+    }
+
+    /// One tenant, one application per integration — the shape an organization
+    /// actually has. Both must survive, because they are two sessions.
+    #[test]
+    fn two_integrations_on_one_issuer_are_both_reported() {
+        let cfg: HashMap<_, _> = [(
+            "acquire".to_string(),
+            Value::List(vec![
+                map(&[("sign_in", sign_in("https://org.okta.com", "aws-app"))]),
+                map(&[("sign_in", sign_in("https://org.okta.com", "gcp-app"))]),
+            ]),
+        )]
+        .into();
+        let got = sign_ins_of(&cfg);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_ne!(got[0].client_id, got[1].client_id);
+    }
+
+    /// Lenient by design: this runs before the driver has parsed anything, so a
+    /// malformed declaration must not fail `heph auth login` for the whole
+    /// workspace. It contributes no session and says so properly at parse time.
+    #[test]
+    fn a_malformed_declaration_is_skipped_rather_than_fatal() {
+        for bad in [
+            map(&[("issuer", Value::String("https://a.example".into()))]),
+            map(&[("client_id", Value::String("c".into()))]),
+            Value::String("not a map".into()),
+        ] {
+            let cfg: HashMap<_, _> = [("sign_in".to_string(), bad.clone())].into();
+            assert!(sign_ins_of(&cfg).is_empty(), "{bad:?} produced a sign-in");
+        }
+    }
+
+    /// Absent is the common case — CI has an ambient identity — and it must not
+    /// look like a parse failure.
+    #[test]
+    fn a_secret_with_no_sign_in_contributes_nothing() {
+        assert!(sign_ins_of(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn scopes_and_ports_come_through_when_given() {
+        let cfg: HashMap<_, _> = [(
+            "sign_in".to_string(),
+            map(&[
+                ("issuer", Value::String("https://a.example".into())),
+                ("client_id", Value::String("c".into())),
+                ("scopes", Value::List(vec![Value::String("openid".into())])),
+                ("redirect_ports", Value::List(vec![Value::Int(47113)])),
+            ]),
+        )]
+        .into();
+        let got = sign_ins_of(&cfg);
+        assert_eq!(got[0].scopes, vec!["openid".to_string()]);
+        assert_eq!(got[0].redirect_ports, vec![47113]);
     }
 }

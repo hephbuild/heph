@@ -56,7 +56,7 @@ async fn mint(desc: &Descriptor, env: &[(&str, &str)]) -> anyhow::Result<String>
         request_id: "test",
         runner: None,
         cwd: std::path::Path::new("."),
-        auth: None,
+        auth_home: None,
     };
     let cred = broker.mint(desc, "c", &ctx).await?;
     Ok(cred.resolve_pointer("$.")?.expose().to_string())
@@ -152,7 +152,7 @@ target(
                 request_id: "test",
                 runner: None,
                 cwd: std::path::Path::new("."),
-                auth: None,
+                auth_home: None,
             },
         )
         .await?;
@@ -203,7 +203,7 @@ target(
                 request_id: "test",
                 runner: None,
                 cwd: std::path::Path::new("."),
-                auth: None,
+                auth_home: None,
             },
         )
         .await?;
@@ -238,7 +238,7 @@ target(
 
     let ci = desc.select(&|k: &str| (k == "GITHUB_ACTIONS").then(|| "true".to_string()))?;
     assert_eq!(ci.index, 0);
-    assert!(matches!(ci.entry.source, Source::Oidc {}));
+    assert!(matches!(ci.entry.source, Source::Oidc { .. }));
 
     let laptop = desc.select(&|_: &str| None)?;
     assert_eq!(laptop.index, 1);
@@ -429,5 +429,105 @@ target(name = "r2", driver = "secret", shape = ["aws_profile"],
     assert!(msg.contains("//creds:ecr"), "{msg}");
     assert!(msg.contains("//creds:r2"), "{msg}");
     assert!(msg.contains("profile"), "{msg}");
+    Ok(())
+}
+
+/// The property that makes `list_secrets` safe to trust.
+///
+/// It is an *optimization*: a provider answers directly instead of the host
+/// discovering every target and parsing each spec. An optimization that returns
+/// a different answer from the thing it replaces is not an optimization, it is
+/// a bug that only shows up as a missing session in somebody's build — so the
+/// two paths are compared against a workspace with the shape an organization
+/// actually has: one issuer, one application per integration.
+#[tokio::test]
+async fn the_fast_and_slow_enumerations_agree() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        r#"
+OKTA = "https://org.okta.com/oauth2/default"
+
+# Federates to AWS, through the Okta application registered for AWS.
+target(
+    name = "ecr",
+    driver = "secret",
+    role = "arn:aws:iam::4711:role/heph-ci-push",
+    provider = "oidc",
+    sign_in = {"issuer": OKTA, "client_id": "aws-app"},
+    exchange = {"kind": "aws_sts"},
+)
+
+# Same tenant, different application — two sessions, not one.
+target(
+    name = "gar",
+    driver = "secret",
+    role = "heph-push@proj.iam.gserviceaccount.com",
+    provider = "oidc",
+    sign_in = {"issuer": OKTA, "client_id": "gcp-app"},
+    exchange = {"kind": "token_exchange", "issuer": "https://sts.googleapis.com"},
+)
+
+# A second secret through the AWS application: one sign-in, not two.
+target(
+    name = "s3",
+    driver = "secret",
+    role = "arn:aws:iam::4711:role/heph-read",
+    provider = "oidc",
+    sign_in = {"issuer": OKTA, "client_id": "aws-app"},
+    exchange = {"kind": "aws_sts"},
+)
+
+# No sign_in: CI ambient, or a vendor CLI. Contributes nothing.
+target(
+    name = "ambient",
+    driver = "secret",
+    role = "arn:aws:iam::4711:role/heph-ci",
+    provider = "oidc",
+    exchange = {"kind": "aws_sts"},
+)
+
+# Not a secret at all. The provider must not report it.
+target(name = "note", driver = "text_file", text = "hello")
+"#,
+    );
+
+    let engine = Arc::clone(&ws.engine);
+    let rs = engine.new_state();
+    let fast = engine.sign_ins(&rs, "").await?;
+
+    // Deduplicated by (issuer, client_id): three secrets, two applications.
+    assert_eq!(fast.len(), 2, "{fast:?}");
+    let clients: Vec<&str> = fast.iter().map(|s| s.client_id.as_str()).collect();
+    assert_eq!(clients, vec!["aws-app", "gcp-app"], "{fast:?}");
+    assert!(
+        fast.iter()
+            .all(|s| s.issuer == "https://org.okta.com/oauth2/default")
+    );
+
+    // Defaults are filled in, so a declaration that names only the two required
+    // keys still produces a session that can actually be established.
+    assert!(
+        fast[0].scopes.iter().any(|s| s == "offline_access"),
+        "{:?}",
+        fast[0]
+    );
+    assert!(!fast[0].redirect_ports.is_empty());
+
+    let slow = engine.sign_ins_by_query_for_test(&rs, "").await?;
+    let mut slow_keys: Vec<(String, String)> = slow
+        .iter()
+        .map(|s| (s.issuer.clone(), s.client_id.clone()))
+        .collect();
+    slow_keys.sort();
+    slow_keys.dedup();
+    let fast_keys: Vec<(String, String)> = fast
+        .iter()
+        .map(|s| (s.issuer.clone(), s.client_id.clone()))
+        .collect();
+    assert_eq!(
+        fast_keys, slow_keys,
+        "the provider's answer and the graph's disagree"
+    );
     Ok(())
 }

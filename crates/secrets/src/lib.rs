@@ -79,12 +79,12 @@ pub mod value;
 pub use broker::{Broker, BrokerCtx, Grant};
 pub use descriptor::{
     Acquire, Descriptor, Exchange, Identity, Protocol, ProviderKind, SECRET_JSON,
-    SECRET_JSON_VERSION, SecretJson, Selection, Source, WhenEnv,
+    SECRET_JSON_VERSION, SecretJson, Selection, SignIn, Source, WhenEnv,
 };
 pub use expiry::{Expiry, ExpirySource};
 pub use provider::{MintCtx, ProviderRegistry, SecretProvider};
 pub use redact::{Entry as RedactEntry, RedactStream, Redactor};
 pub use render::{Rendered, Rendering, render_all, scrub};
-pub use session::{AuthConfig, Metadata, Session, TokenSet};
+pub use session::{Metadata, Session, TokenSet};
 pub use shape::{Claim, Shape, Slot, check_collisions};
 pub use value::{Credential, SecretValue};

@@ -79,6 +79,13 @@ pub enum AuthCommands {
 
 #[derive(clap::Args, Clone)]
 pub struct LoginArgs {
+    /// Limit to the secrets under a package prefix
+    ///
+    /// Scoping matters on a large workspace: finding the sign-ins means asking
+    /// every provider, and one that has not implemented `list_secrets` is
+    /// enumerated the slow way.
+    #[arg(value_name = "PREFIX", default_value = "")]
+    pub target: String,
     /// Print a code to enter on another device instead of opening a browser
     ///
     /// For a machine with no browser — a remote shell, a container, a CI
@@ -95,6 +102,9 @@ pub struct LoginArgs {
 
 #[derive(clap::Args, Clone)]
 pub struct StatusArgs {
+    /// Limit to the secrets under a package prefix
+    #[arg(value_name = "PREFIX", default_value = "")]
+    pub target: String,
     /// List every session on this machine, not just this workspace's
     ///
     /// Works offline and outside a workspace. Sessions are keyed by issuer and
@@ -146,26 +156,42 @@ pub fn execute(args: &AuthArgs, sink: LogSink, global: &GlobalOptions) -> anyhow
         AuthCommands::Check(a) => bootstrap::block_on(check(a.clone(), sink, global.clone()))?,
         AuthCommands::Login(a) => bootstrap::block_on(login(a.clone()))?,
         AuthCommands::Status(a) => bootstrap::block_on(status(a.clone()))?,
-        AuthCommands::Logout(a) => logout(a),
+        AuthCommands::Logout(a) => bootstrap::block_on(logout(a))?,
     }
 }
 
-/// The workspace's `auth:` block, or a message naming what to add.
+/// Every sign-in this workspace federates through.
 ///
-/// A workspace with no block is not misconfigured — it may have no IdP at all —
-/// so the error explains the shape rather than reporting a parse failure, and
-/// names the file it looked in.
-fn auth_config() -> anyhow::Result<hsecrets::AuthConfig> {
-    let root = crate::engine::get_root()?;
-    let path = root.join(".hephconfig");
-    crate::engine::config_yaml::load_from_root(&root)?
-        .auth
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{}",
-                hsecrets::session::no_auth_block(&path.display().to_string())
-            )
-        })
+/// Read from the graph rather than from a config file, because a client id is
+/// registered per integration: an organization with one Okta tenant still has a
+/// separate application for AWS, for GCP, for each SaaS. A workspace-level
+/// block can structurally describe only one of them; the secrets that need them
+/// can describe all.
+///
+/// Deduplicated by `(issuer, client_id)`, so many secrets sharing an
+/// integration cost one browser round trip rather than one each.
+async fn workspace_sign_ins(prefix: &str) -> anyhow::Result<Vec<hsecrets::SignIn>> {
+    let (engine, _shutdown) = bootstrap::new_engine()?;
+    let rs = engine.new_state();
+    let found = engine.sign_ins(&rs, prefix).await?;
+    if found.is_empty() {
+        anyhow::bail!(concat!(
+            "no secret in this workspace declares a `sign_in`, so there is nothing to sign in ",
+            "to.\n",
+            "  A `secret()` federating through your own IdP names one:\n",
+            "\n    secret(",
+            "\n        name = \"ecr\",",
+            "\n        role = \"arn:aws:iam::4711:role/heph-ci-push\",",
+            "\n        provider = \"oidc\",",
+            "\n        sign_in = {\"issuer\": \"https://org.okta.com/oauth2/default\",",
+            "\n                   \"client_id\": \"<the app registered for this integration>\"},",
+            "\n        exchange = {\"kind\": \"aws_sts\"},",
+            "\n    )\n",
+            "\n  A credential reached through a vendor CLI you are already signed into uses ",
+            "`provider = \"exec\"` instead, and needs no session of heph's own.",
+        ));
+    }
+    Ok(found)
 }
 
 /// Everything a build or the CLI can conclude about this machine's identity.
@@ -208,7 +234,7 @@ impl State {
 /// `refresh_expires_in`, so a revoked grant looks identical on disk to a live
 /// one. Reporting "signed in" from the file alone is how every path ends up
 /// telling the user to run a command that then says there is nothing to do.
-async fn resolve_state(cfg: &hsecrets::AuthConfig, home: &std::path::Path) -> State {
+async fn resolve_state(cfg: &hsecrets::SignIn, home: &std::path::Path) -> State {
     if let Some(source) = hsecrets::oidc::AmbientIdentity::detect(&|k| std::env::var(k).ok()) {
         return State::Ambient(source.source);
     }
@@ -277,46 +303,73 @@ struct SessionView {
     /// sign-in from a no-op without diffing.
     #[serde(skip_serializing_if = "Option::is_none")]
     changed: Option<bool>,
+    /// Why a state is `unknown`, so a caller can tell "retry later" from
+    /// "authenticate again".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 impl SessionView {
-    fn of(state: &State, cfg: &hsecrets::AuthConfig, home: &std::path::Path) -> Self {
-        let base = Self {
-            state: state.name(),
+    fn blank(state: &'static str) -> Self {
+        Self {
+            state,
             source: None,
-            issuer: Some(cfg.issuer.clone()),
-            client_id: Some(cfg.client_id.clone()),
+            issuer: None,
+            client_id: None,
             subject: None,
             expires_at: None,
             path: None,
             changed: None,
-        };
+            detail: None,
+        }
+    }
+
+    /// An ambient identity has nothing to do with any configured IdP, so
+    /// claiming an issuer next to it would be a lie — and exactly the lie a CI
+    /// debugging session would act on.
+    fn ambient(source: &'static str) -> Self {
+        Self {
+            source: Some(source),
+            ..Self::blank("ambient")
+        }
+    }
+
+    fn active(
+        s: &hsecrets::Session,
+        cfg: &hsecrets::SignIn,
+        home: &std::path::Path,
+        changed: bool,
+    ) -> Self {
+        Self {
+            issuer: Some(cfg.issuer.clone()),
+            client_id: Some(cfg.client_id.clone()),
+            subject: s.subject.clone(),
+            expires_at: s.expires_at.map(rfc3339),
+            path: Some(
+                hsecrets::Session::path(home, &cfg.issuer, &cfg.client_id)
+                    .display()
+                    .to_string(),
+            ),
+            changed: Some(changed),
+            ..Self::blank("active")
+        }
+    }
+
+    fn of(state: &State, cfg: &hsecrets::SignIn, home: &std::path::Path) -> Self {
         match state {
-            State::Ambient(source) => Self {
-                source: Some(source),
-                // An ambient identity has nothing to do with the workspace's
-                // IdP, so claiming its issuer would be a lie.
-                issuer: None,
-                client_id: None,
-                ..base
-            },
-            State::Active(s) => Self {
-                subject: s.subject.clone(),
-                expires_at: s.expires_at.map(rfc3339),
-                path: Some(
-                    hsecrets::Session::path(home, &cfg.issuer, &cfg.client_id)
-                        .display()
-                        .to_string(),
-                ),
-                ..base
-            },
+            State::Ambient(source) => Self::ambient(source),
+            State::Active(s) => Self::active(s, cfg, home, false),
             State::Unknown(why) => Self {
-                // The reason, so an agent does not have to guess whether to
-                // retry or to re-authenticate.
-                subject: Some(why.clone()),
-                ..base
+                issuer: Some(cfg.issuer.clone()),
+                client_id: Some(cfg.client_id.clone()),
+                detail: Some(why.clone()),
+                ..Self::blank("unknown")
             },
-            State::Expired | State::None => base,
+            State::Expired | State::None => Self {
+                issuer: Some(cfg.issuer.clone()),
+                client_id: Some(cfg.client_id.clone()),
+                ..Self::blank(state.name())
+            },
         }
     }
 }
@@ -337,61 +390,82 @@ fn say(json: bool, msg: &str) {
     }
 }
 
-fn emit(view: &SessionView) -> anyhow::Result<()> {
+/// `--json` always emits a list, even for one integration: a workspace can
+/// federate through several, and a shape that changes with the count is a shape
+/// every consumer has to branch on.
+fn emit(views: &[SessionView]) -> anyhow::Result<()> {
     println!(
         "{}",
-        serde_json::to_string_pretty(view).context("render json")?
+        serde_json::to_string_pretty(views).context("render json")?
     );
     Ok(())
 }
 
 async fn login(args: LoginArgs) -> anyhow::Result<()> {
-    let cfg = auth_config()?;
     let home = hsecrets::Session::home()?;
     let now = std::time::SystemTime::now();
 
-    // A second sign-in is a wasted browser round trip and, on some IdPs, a
-    // burned rate limit. `--force` exists for the case where the *scopes*
-    // changed and the old session is valid but wrong.
-    if !args.force {
-        match resolve_state(&cfg, &home).await {
-            State::Ambient(source) => {
-                say(
-                    args.json,
-                    &format!(
-                        "this machine already has an ambient workload identity ({source}); a \
-                         local session is not needed here"
-                    ),
-                );
-                if args.json {
-                    emit(&SessionView::of(&State::Ambient(source), &cfg, &home))?;
-                }
-                return Ok(());
-            }
-            State::Active(s) => {
-                if args.json {
-                    let mut view = SessionView::of(&State::Active(s), &cfg, &home);
-                    view.changed = Some(false);
-                    return emit(&view);
-                }
-                println!("already signed in to {}{}", cfg.issuer, whom(&s));
-                println!("run `heph auth login --force` to sign in again");
-                return Ok(());
-            }
-            // Not knowing is a reason to sign in, not a reason to refuse:
-            // whatever the obstacle, the browser flow is the way through it,
-            // and the reason is worth saying first.
-            State::Unknown(why) => {
-                tracing::warn!(issuer = %cfg.issuer, "could not check the existing session: {why}");
-            }
-            // Both fall through to the browser. Expired is the whole point:
-            // the previous behaviour trusted the file, so a revoked grant read
-            // as "already signed in" and every path told the user to run the
-            // one command that refused to do anything.
-            State::Expired | State::None => {}
+    // Ambient wins outright: it is scoped to the job, so on CI no local session
+    // is needed and none would be used.
+    if let Some(source) = ambient() {
+        say(
+            args.json,
+            &format!(
+                "this machine already has an ambient workload identity ({source}); a local \
+                 session is not needed here"
+            ),
+        );
+        if args.json {
+            emit(&[SessionView::ambient(source)])?;
         }
+        return Ok(());
     }
 
+    let sign_ins = workspace_sign_ins(&args.target).await?;
+    if !args.json && sign_ins.len() > 1 {
+        println!(
+            "{} integrations to sign in to. After the first, your IdP session usually carries \
+             the rest through without a prompt.",
+            sign_ins.len()
+        );
+    }
+
+    let mut views = Vec::new();
+    for cfg in &sign_ins {
+        // A second sign-in is a wasted browser round trip and, on some IdPs, a
+        // burned rate limit. `--force` is for the case where the *scopes*
+        // changed and the old session is valid but wrong.
+        if !args.force
+            && let State::Active(existing) = resolve_state(cfg, &home).await
+        {
+            if !args.json {
+                println!("already signed in to {}{}", label(cfg), whom(&existing));
+            }
+            views.push(SessionView::active(&existing, cfg, &home, false));
+            continue;
+        }
+        let session = login_one(&args, cfg, now).await?;
+        session.store(&home)?;
+        if !args.json {
+            println!("signed in to {}{}", label(cfg), whom(&session));
+        }
+        views.push(SessionView::active(&session, cfg, &home, true));
+    }
+
+    if args.json {
+        emit(&views)?;
+    } else if views.iter().all(|v| v.changed == Some(false)) {
+        println!("run `heph auth login --force` to sign in again");
+    }
+    Ok(())
+}
+
+/// One integration's flow.
+async fn login_one(
+    args: &LoginArgs,
+    cfg: &hsecrets::SignIn,
+    now: std::time::SystemTime,
+) -> anyhow::Result<hsecrets::Session> {
     // Said before the browser opens, not after: a login that succeeds and then
     // cannot be stored is the confusing outcome.
     for w in cfg.warnings() {
@@ -408,8 +482,8 @@ async fn login(args: LoginArgs) -> anyhow::Result<()> {
         );
     }
 
-    let session = if args.device_code {
-        let auth = hsecrets::session::device_start(&client, &cfg, &meta).await?;
+    if args.device_code {
+        let auth = hsecrets::session::device_start(&client, cfg, &meta).await?;
         if args.json {
             // Newline-delimited, and emitted *before* the wait: a code that
             // only arrives after it has expired is no use to an agent showing
@@ -418,6 +492,8 @@ async fn login(args: LoginArgs) -> anyhow::Result<()> {
                 "{}",
                 serde_json::json!({
                     "event": "device_code",
+                    "issuer": cfg.issuer,
+                    "client_id": cfg.client_id,
                     "verification_uri": auth.verification_uri,
                     "verification_uri_complete": auth.verification_uri_complete,
                     "user_code": auth.user_code,
@@ -436,43 +512,41 @@ async fn login(args: LoginArgs) -> anyhow::Result<()> {
             }
             println!("waiting…");
         }
-        hsecrets::session::device_poll(&client, &cfg, &meta, &auth, now).await?
-    } else {
-        if let Some(hint) = headless_hint() {
-            say(args.json, &hint);
-        }
+        return hsecrets::session::device_poll(&client, cfg, &meta, &auth, now).await;
+    }
+
+    if let Some(hint) = headless_hint() {
+        say(args.json, &hint);
+    }
+    say(
+        args.json,
+        &format!("opening your browser to sign in to {}", label(cfg)),
+    );
+    hsecrets::session::login(&client, cfg, &meta, now, |url, redirect| {
+        // Both printed before the wait. The redirect URI is the usual cause of
+        // a failure the user sees in three seconds and heph would otherwise
+        // only diagnose after the three-minute timeout.
         say(
             args.json,
-            &format!("opening your browser to sign in to {}", cfg.issuer),
+            &format!(
+                "waiting for the callback on {redirect}\n  this exact URI must be registered as \
+                 a redirect URI for client {}",
+                cfg.client_id
+            ),
         );
-        hsecrets::session::login(&client, &cfg, &meta, now, |url, redirect| {
-            // Both printed before the wait. The redirect URI is the usual cause
-            // of a failure the user sees in three seconds and heph would
-            // otherwise only diagnose after the three-minute timeout.
-            say(
-                args.json,
-                &format!(
-                    "waiting for the callback on {redirect}\n  this exact URI must be \
-                     registered as a redirect URI for client {}",
-                    cfg.client_id
-                ),
-            );
-            // Always printed as well as opened: on a machine where the browser
-            // cannot be launched this is the whole flow, not a fallback.
-            say(args.json, &format!("if it does not open, go to:\n  {url}"));
-            hsecrets::session::open_in_browser(url);
-        })
-        .await?
-    };
+        // Always printed as well as opened: on a machine where the browser
+        // cannot be launched this is the whole flow, not a fallback.
+        say(args.json, &format!("if it does not open, go to:\n  {url}"));
+        hsecrets::session::open_in_browser(url);
+    })
+    .await
+}
 
-    session.store(&home)?;
-    if args.json {
-        let mut view = SessionView::of(&State::Active(Box::new(session)), &cfg, &home);
-        view.changed = Some(true);
-        return emit(&view);
-    }
-    println!("signed in to {}{}", session.issuer, whom(&session));
-    Ok(())
+/// `issuer (client)` — the client id is what distinguishes two integrations on
+/// one tenant, so a message naming only the issuer would say the same thing
+/// four times.
+fn label(cfg: &hsecrets::SignIn) -> String {
+    format!("{} ({})", cfg.issuer, cfg.client_id)
 }
 
 /// ` as alice@org.example`, or nothing when the IdP told us no subject.
@@ -481,6 +555,10 @@ fn whom(s: &hsecrets::Session) -> String {
         .as_deref()
         .map(|x| format!(" as {x}"))
         .unwrap_or_default()
+}
+
+fn ambient() -> Option<&'static str> {
+    hsecrets::oidc::AmbientIdentity::detect(&|k| std::env::var(k).ok()).map(|a| a.source)
 }
 
 /// Whether this looks like a machine whose browser is somewhere else.
@@ -514,56 +592,64 @@ async fn status(args: StatusArgs) -> anyhow::Result<()> {
         return status_all(&home, args.json);
     }
 
-    let cfg = auth_config()?;
-    let state = resolve_state(&cfg, &home).await;
-    if args.json {
-        emit(&SessionView::of(&state, &cfg, &home))?;
+    // Checked first, and free: on CI this is the whole answer, and reporting
+    // "not signed in" on a runner where every build works is the confidently
+    // wrong answer that sends someone debugging in the wrong direction.
+    if let Some(source) = ambient() {
+        if args.json {
+            emit(&[SessionView::ambient(source)])?;
+        } else {
+            println!("identity: ambient ({source})");
+            println!("  no local session is needed here");
+        }
+        return Ok(());
     }
 
-    match &state {
-        State::Ambient(source) => {
-            if !args.json {
-                println!("identity: ambient ({source})");
-                println!("  no local session is needed here");
-            }
-            Ok(())
+    let sign_ins = workspace_sign_ins(&args.target).await?;
+    let mut views = Vec::new();
+    let mut usable = 0usize;
+    for cfg in &sign_ins {
+        let state = resolve_state(cfg, &home).await;
+        if matches!(state, State::Active(_)) {
+            usable = usable.saturating_add(1);
         }
-        State::Active(s) => {
-            if !args.json {
-                println!("signed in to {}{}", cfg.issuer, whom(s));
-                println!(
-                    "  {}",
-                    hsecrets::Session::path(&home, &cfg.issuer, &cfg.client_id).display()
-                );
-            }
-            Ok(())
-        }
-        // Not signed in is a *state*, not a crash: the instruction goes to
-        // stdout with everything else, and the non-zero exit is what lets a
-        // setup script branch on it without parsing prose.
-        rest => {
-            if !args.json {
-                match rest {
-                    State::Expired => {
-                        println!("the session for {} is no longer valid", cfg.issuer);
-                        println!("  run `heph auth login`");
-                    }
-                    // Deliberately not "run `heph auth login`": on a plane that
-                    // sends the user to a browser that cannot reach the IdP
-                    // either.
-                    State::Unknown(why) => {
-                        println!("there is a session for {}, but it could not be", cfg.issuer);
-                        println!("  checked: {why}");
-                    }
-                    _ => {
-                        println!("not signed in to {}", cfg.issuer);
-                        println!("  run `heph auth login`");
-                    }
+        if !args.json {
+            match &state {
+                State::Active(s) => {
+                    println!("signed in to {}{}", label(cfg), whom(s));
+                    println!(
+                        "  {}",
+                        hsecrets::Session::path(&home, &cfg.issuer, &cfg.client_id).display()
+                    );
+                }
+                State::Expired => {
+                    println!("the session for {} is no longer valid", label(cfg));
+                    println!("  run `heph auth login`");
+                }
+                // Deliberately not "run `heph auth login`": on a plane that
+                // sends the user to a browser that cannot reach the IdP either.
+                State::Unknown(why) => {
+                    println!("there is a session for {}, but it could not be", label(cfg));
+                    println!("  checked: {why}");
+                }
+                _ => {
+                    println!("not signed in to {}", label(cfg));
+                    println!("  run `heph auth login`");
                 }
             }
-            Err(anyhow::Error::new(crate::commands::errors::QuietExit))
         }
+        views.push(SessionView::of(&state, cfg, &home));
     }
+
+    if args.json {
+        emit(&views)?;
+    }
+    if usable == sign_ins.len() {
+        return Ok(());
+    }
+    // A state, not a crash: the instruction was printed above with everything
+    // else, and the non-zero exit is what lets a setup script branch on it.
+    Err(anyhow::Error::new(crate::commands::errors::QuietExit))
 }
 
 /// Every session on this machine, whatever workspace put it there.
@@ -639,7 +725,7 @@ fn status_all(home: &std::path::Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn logout(args: &LogoutArgs) -> anyhow::Result<()> {
+async fn logout(args: &LogoutArgs) -> anyhow::Result<()> {
     let home = hsecrets::Session::home()?;
 
     let removed = if args.all {
@@ -651,12 +737,13 @@ fn logout(args: &LogoutArgs) -> anyhow::Result<()> {
         }
         found.len()
     } else {
-        let cfg = auth_config()?;
-        usize::from(hsecrets::Session::forget(
-            &home,
-            &cfg.issuer,
-            &cfg.client_id,
-        )?)
+        let mut n = 0usize;
+        for cfg in workspace_sign_ins("").await? {
+            if hsecrets::Session::forget(&home, &cfg.issuer, &cfg.client_id)? {
+                n = n.saturating_add(1);
+            }
+        }
+        n
     };
 
     if args.json {
@@ -896,12 +983,11 @@ async fn describe(engine: &Arc<Engine>, addr: &Addr) -> anyhow::Result<ShowView>
 mod tests {
     use super::*;
 
-    fn cfg() -> hsecrets::AuthConfig {
-        hsecrets::AuthConfig {
+    fn cfg() -> hsecrets::SignIn {
+        hsecrets::SignIn {
             issuer: "https://org.example/oauth2/default".into(),
             client_id: "client1".into(),
             scopes: vec!["openid".into(), "offline_access".into()],
-            audience: None,
             redirect_ports: Vec::new(),
         }
     }
@@ -931,6 +1017,7 @@ mod tests {
                 "active",
             ),
             (State::Expired, "expired"),
+            (State::Unknown("dns error".into()), "unknown"),
             (State::None, "none"),
         ] {
             let v = serde_json::to_value(SessionView::of(&state, &c, home)).expect("json");
@@ -944,28 +1031,19 @@ mod tests {
     /// lie a CI debugging session would act on.
     #[test]
     fn an_ambient_state_claims_no_issuer() {
-        let v = serde_json::to_value(SessionView::of(
-            &State::Ambient("github actions"),
-            &cfg(),
-            std::path::Path::new("/nonexistent"),
-        ))
-        .expect("json");
+        let v = serde_json::to_value(SessionView::ambient("github actions")).expect("json");
         assert_eq!(v["source"], "github actions");
         assert!(v.get("issuer").is_none(), "{v}");
         assert!(v.get("client_id").is_none(), "{v}");
     }
 
-    /// The message a workspace with no `auth:` block gets. It is shared with
-    /// the build path, so it has to carry both routes and name the file.
+    /// Two integrations on one tenant differ only by client id, so a message
+    /// naming the issuer alone would say the same thing several times.
     #[test]
-    fn the_missing_block_message_names_the_file_and_both_routes() {
-        let msg = hsecrets::session::no_auth_block("/repo/.hephconfig");
-        assert!(msg.contains("/repo/.hephconfig"), "{msg}");
-        assert!(msg.contains("heph auth login"), "{msg}");
-        assert!(msg.contains("id-token: write"), "{msg}");
-        assert!(msg.contains("acquire"), "{msg}");
-        // The substitution has to actually happen, or the placeholder ships.
-        assert!(!msg.contains("{path}"), "{msg}");
+    fn a_sign_in_is_labelled_by_issuer_and_client() {
+        let l = label(&cfg());
+        assert!(l.contains("org.example"), "{l}");
+        assert!(l.contains("client1"), "{l}");
     }
 
     /// Not knowing whether a session works is not the same as knowing it is
@@ -982,7 +1060,7 @@ mod tests {
         assert_eq!(v["state"], "unknown");
         // The reason travels with it, so an agent can decide between retrying
         // and re-authenticating.
-        assert!(v.to_string().contains("dns error"), "{v}");
+        assert_eq!(v["detail"], "dns error", "{v}");
     }
 
     /// Sessions are keyed by `(issuer, client_id)`, so one orphaned by an org

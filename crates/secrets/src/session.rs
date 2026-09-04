@@ -110,11 +110,8 @@ pub fn http_client() -> anyhow::Result<reqwest::Client> {
         .context("build an HTTP client")
 }
 
-/// Where `heph auth login` signs in, from `.hephconfig`.
-///
-/// Defined by [`hconfig`] rather than here: `.hephconfig` owns the shape, and a
-/// dependency the other way would point from configuration at the engine.
-pub use hconfig::AuthConfig;
+/// Re-exported from [`crate::descriptor`], where the declaration lives.
+pub use crate::descriptor::SignIn;
 
 /// A stored session: one refresh token, and enough to know whose it is.
 ///
@@ -537,7 +534,7 @@ pub async fn token_post(
 /// with an error that names the cloud and never the audience.
 pub async fn refresh_locked(
     client: &reqwest::Client,
-    cfg: &AuthConfig,
+    cfg: &SignIn,
     home: &Path,
     audience: Option<&str>,
     now: SystemTime,
@@ -570,7 +567,7 @@ pub async fn refresh_locked(
         &meta.token()?,
         &cfg.client_id,
         &session.refresh_token,
-        audience.or(cfg.audience.as_deref()),
+        audience,
     )
     .await?;
 
@@ -641,9 +638,13 @@ pub fn redirect_uri(port: u16) -> String {
 }
 
 /// The authorization URL a browser is sent to.
+///
+/// No `audience` parameter: the descriptor's `audience` is the identity's, it
+/// is checked on the token that comes back, and a second one here would be a
+/// value nothing verifies.
 pub fn authorization_url(
     endpoint: &str,
-    cfg: &AuthConfig,
+    cfg: &SignIn,
     pkce: &Pkce,
     state: &str,
     redirect_uri: &str,
@@ -659,9 +660,6 @@ pub fn authorization_url(
         q.append_pair("state", state);
         q.append_pair("code_challenge", &pkce.challenge);
         q.append_pair("code_challenge_method", "S256");
-        if let Some(aud) = &cfg.audience {
-            q.append_pair("audience", aud);
-        }
     }
     Ok(url.to_string())
 }
@@ -854,7 +852,7 @@ fn html_escape(s: &str) -> String {
 /// against a real socket without a browser ever opening.
 pub async fn login(
     client: &reqwest::Client,
-    cfg: &AuthConfig,
+    cfg: &SignIn,
     meta: &Metadata,
     now: SystemTime,
     // Given the redirect URI as well as the authorization URL: an unregistered
@@ -933,7 +931,7 @@ impl std::fmt::Debug for DeviceAuthorization {
 /// Start the device flow (RFC 8628) — for a machine with no browser.
 pub async fn device_start(
     client: &reqwest::Client,
-    cfg: &AuthConfig,
+    cfg: &SignIn,
     meta: &Metadata,
 ) -> anyhow::Result<DeviceAuthorization> {
     let url = meta.device_authorization()?;
@@ -958,7 +956,7 @@ pub async fn device_start(
 /// Poll the token endpoint until the user finishes, or the code expires.
 pub async fn device_poll(
     client: &reqwest::Client,
-    cfg: &AuthConfig,
+    cfg: &SignIn,
     meta: &Metadata,
     auth: &DeviceAuthorization,
     now: SystemTime,
@@ -1040,7 +1038,7 @@ fn device_error(body: &str) -> Option<DeviceError> {
 }
 
 /// Turn a token set into the session that will be stored.
-fn session_from(cfg: &AuthConfig, tokens: &TokenSet, now: SystemTime) -> anyhow::Result<Session> {
+fn session_from(cfg: &SignIn, tokens: &TokenSet, now: SystemTime) -> anyhow::Result<Session> {
     let refresh_token = tokens.refresh_token.clone().context(
         "the IdP returned no refresh token, so nothing durable can be stored. Add \
          `offline_access` to `auth.scopes` in `.hephconfig`, and check the client is allowed the \
@@ -1083,15 +1081,14 @@ pub fn open_in_browser(url: &str) {
 mod tests {
     use super::*;
 
-    fn cfg() -> AuthConfig {
-        AuthConfig {
+    fn cfg() -> SignIn {
+        SignIn {
             issuer: "https://org.example/oauth2/default".into(),
             client_id: "0oa8f3k2mQvR1nZx5d7".into(),
             scopes: ["openid", "profile", "email", "offline_access"]
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
-            audience: None,
             redirect_ports: vec![47113, 47114, 47115],
         }
     }
@@ -1565,12 +1562,11 @@ mod tests {
         (base, calls)
     }
 
-    fn stored(dir: &Path, issuer: &str, token: &str) -> AuthConfig {
-        let cfg = AuthConfig {
+    fn stored(dir: &Path, issuer: &str, token: &str) -> SignIn {
+        let cfg = SignIn {
             issuer: issuer.to_string(),
             client_id: "client1".into(),
             scopes: vec!["openid".into(), "offline_access".into()],
-            audience: None,
             redirect_ports: Vec::new(),
         };
         Session {
@@ -1719,11 +1715,10 @@ mod tests {
     #[tokio::test]
     async fn refreshing_without_a_session_says_to_log_in() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cfg = AuthConfig {
+        let cfg = SignIn {
             issuer: "http://127.0.0.1:1".into(),
             client_id: "c".into(),
             scopes: Vec::new(),
-            audience: None,
             redirect_ports: Vec::new(),
         };
         let client = http_client().expect("client");

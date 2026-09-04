@@ -932,7 +932,7 @@ mod tests {
     async fn swapping_acquisition_leaves_the_artifact_byte_identical() {
         let identity: &[(&str, Value)] = &[
             ("role", s("arn:aws:iam::4711:role/heph-read")),
-            ("region", s("eu-west-1")),
+            ("params", map(&[("region", s("eu-west-1"))])),
             ("shape", list(&["aws_profile"])),
             ("profile", s("artifacts")),
         ];

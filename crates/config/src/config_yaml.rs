@@ -1,5 +1,5 @@
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -73,9 +73,6 @@ pub struct ConfigYaml {
     pub caches: BTreeMap<String, RemoteCacheConfigPatch>,
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
-    /// Where `heph auth login` signs in. See [`AuthConfig`].
-    #[serde(default)]
-    pub auth: Option<AuthConfig>,
 }
 
 /// One resolved named remote cache: `caches: { name: { uri, read, write } }`.
@@ -296,9 +293,6 @@ impl ConfigYaml {
         if other.telemetry.is_some() {
             self.telemetry = other.telemetry;
         }
-        if other.auth.is_some() {
-            self.auth = other.auth;
-        }
 
         // Caches deep-merge by key: a profile patches individual fields (e.g.
         // flips read/write) while inheriting the rest of the base entry.
@@ -319,102 +313,6 @@ fn merge_plugins(base: &mut Vec<PluginSpec>, inc: Vec<PluginSpec>) {
             Some(existing) => *existing = entry,
             None => base.push(entry),
         }
-    }
-}
-
-/// Where `heph auth login` signs in.
-///
-/// ```yaml
-/// auth:
-///   issuer: https://org.okta.com/oauth2/default
-///   clientId: 0oa8f3k2mQvR1nZx5d7
-/// ```
-///
-/// Committed to the repo, so a fresh checkout is self-describing and
-/// `heph auth login` takes no flags — the setup step a new hire has to be told
-/// about is the one they never do. It holds no secret: a CLI is a public client
-/// (RFC 8252 §8.5) and PKCE replaces the client secret, so there is nothing here
-/// that should not be in version control.
-///
-/// Lives here rather than in `hsecrets` because `.hephconfig` owns it, and
-/// because a dependency the other way would point from configuration at the
-/// engine.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AuthConfig {
-    /// The IdP. Every endpoint is discovered from
-    /// `{issuer}/.well-known/openid-configuration`, so this is the only URL
-    /// anyone writes down.
-    pub issuer: String,
-    /// The registered public client.
-    pub client_id: String,
-    /// Requested scopes.
-    ///
-    /// `offline_access` is not decoration: without it most IdPs return no
-    /// refresh token and every session needs the browser again. That is the
-    /// most common way a setup that looks fine is quietly unusable, so
-    /// `heph auth login` names its absence rather than leaving it to be
-    /// discovered.
-    #[serde(default = "default_scopes")]
-    pub scopes: Vec<String>,
-    /// Some IdPs require an audience on the authorization request; most reject
-    /// one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audience: Option<String>,
-    /// Loopback ports to try, in order. Empty means "any free port", which is
-    /// what an IdP following RFC 8252 §7.3 permits.
-    ///
-    /// Where the IdP allows any loopback port, register the bare redirect URI
-    /// and leave this alone. Where it demands exact matches, register these
-    /// three — a redirect URI registered on a different port is the most common
-    /// first-run failure.
-    #[serde(default = "default_redirect_ports")]
-    pub redirect_ports: Vec<u16>,
-}
-
-// `default_scopes` and `default_redirect_ports` are **part of the schema's
-// frozen behaviour**, not an implementation detail. A committed `.hephconfig`
-// that omits either field is read by every heph version, so changing a default
-// changes what an unchanged file means — and it fails nowhere near the change:
-// dropping `offline_access` here would surface as `heph auth login` reporting
-// no refresh token, in a workspace where nothing was edited. Change them only
-// with the same care as a field rename, and only alongside the redirect URIs an
-// administrator has already registered.
-
-fn default_scopes() -> Vec<String> {
-    ["openid", "profile", "email", "offline_access"]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect()
-}
-
-fn default_redirect_ports() -> Vec<u16> {
-    vec![47113, 47114, 47115]
-}
-
-impl AuthConfig {
-    /// Configuration that will authenticate but not *stay* authenticated.
-    ///
-    /// Reported rather than enforced: an IdP may grant a refresh token without
-    /// being asked, and refusing to sign someone in over a guess would be worse
-    /// than telling them what to expect.
-    pub fn warnings(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if !self.scopes.iter().any(|s| s == "offline_access") {
-            out.push(
-                "auth.scopes does not include `offline_access`: most IdPs then return no refresh \
-                 token, and every session will need the browser again"
-                    .to_string(),
-            );
-        }
-        if !self.scopes.iter().any(|s| s == "openid") {
-            out.push(
-                "auth.scopes does not include `openid`: without it there is no ID token, so the \
-                 session records no subject and `oidc` has no assertion to present"
-                    .to_string(),
-            );
-        }
-        out
     }
 }
 
@@ -842,83 +740,6 @@ fn load_file<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::R
 mod tests {
     use super::*;
     use crate::options::{decode_opt, deny_unknown};
-
-    /// The block a workspace commits so `heph auth login` takes no flags.
-    #[test]
-    fn parses_the_auth_block_with_camel_case_and_defaults() {
-        let cfg: ConfigYaml = serde_yaml::from_str(
-            r#"
-auth:
-  issuer: https://org.okta.com/oauth2/default
-  clientId: 0oa8f3k2mQvR1nZx5d7
-"#,
-        )
-        .expect("parse");
-        let auth = cfg.auth.expect("auth block");
-        assert_eq!(auth.client_id, "0oa8f3k2mQvR1nZx5d7");
-        // The defaults are what make the two-line form work: without
-        // `offline_access` the session would not survive the first build.
-        assert!(
-            auth.scopes.iter().any(|s| s == "offline_access"),
-            "{auth:?}"
-        );
-        assert_eq!(auth.redirect_ports.len(), 3);
-        assert!(auth.warnings().is_empty(), "{:?}", auth.warnings());
-    }
-
-    /// The two ways a working-looking config is quietly unusable — reported,
-    /// not enforced, because an IdP may grant a refresh token unasked.
-    #[test]
-    fn missing_scopes_are_warned_about_by_name() {
-        let mut auth: AuthConfig =
-            serde_yaml::from_str("issuer: https://org.example\nclientId: c\nscopes: [openid]\n")
-                .expect("parse");
-        assert!(
-            auth.warnings().iter().any(|w| w.contains("offline_access")),
-            "{:?}",
-            auth.warnings()
-        );
-
-        auth.scopes = vec!["offline_access".into()];
-        assert!(
-            auth.warnings().iter().any(|w| w.contains("openid")),
-            "{:?}",
-            auth.warnings()
-        );
-    }
-
-    /// A profile replaces the block wholesale, like every other optional
-    /// section — half an issuer from one layer and a client id from another is
-    /// not a configuration anyone means.
-    #[test]
-    fn a_profile_replaces_the_auth_block() {
-        let mut base: ConfigYaml =
-            serde_yaml::from_str("auth:\n  issuer: https://a.example\n  clientId: a\n")
-                .expect("base");
-        let over: ConfigYaml =
-            serde_yaml::from_str("auth:\n  issuer: https://b.example\n  clientId: b\n")
-                .expect("over");
-        base.merge(over);
-        let auth = base.auth.as_ref().expect("auth");
-        assert_eq!(auth.issuer, "https://b.example");
-        assert_eq!(auth.client_id, "b");
-
-        // And a layer that says nothing about auth leaves it alone.
-        let mut kept = base;
-        kept.merge(serde_yaml::from_str("homeDir: .x\n").expect("unrelated"));
-        assert_eq!(kept.auth.expect("still there").client_id, "b");
-    }
-
-    /// A typo in a committed file is a silent misconfiguration otherwise: the
-    /// login would use the default scopes and nobody would know why.
-    #[test]
-    fn an_unknown_auth_key_is_rejected() {
-        let err = serde_yaml::from_str::<ConfigYaml>(
-            "auth:\n  issuer: https://a.example\n  clientId: a\n  scope: [openid]\n",
-        )
-        .expect_err("unknown key");
-        assert!(err.to_string().contains("scope"), "{err}");
-    }
 
     #[test]
     fn parses_full_example() {

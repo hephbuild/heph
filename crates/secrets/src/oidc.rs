@@ -17,9 +17,9 @@
 //! first place is a separate, explicit command. An expired or absent session
 //! fails the build at once, saying what to run.
 
-use crate::descriptor::{Acquire, Endpoint, Exchange, Identity, ProviderKind};
+use crate::descriptor::{Acquire, Endpoint, Exchange, Identity, ProviderKind, SignIn, Source};
 use crate::expiry::Expiry;
-use crate::provider::{AuthContext, MintCtx, SecretProvider};
+use crate::provider::{MintCtx, SecretProvider};
 use crate::session;
 use crate::value::{Credential, SecretValue};
 use anyhow::Context as _;
@@ -191,7 +191,7 @@ impl SecretProvider for OidcProvider {
             // path carries a credential today, and the asymmetry is what a
             // future edit trips over.
             None => self
-                .session_assertion(ctx, identity.audience.as_deref())
+                .session_assertion(ctx, sign_in(acquire)?, identity.audience.as_deref())
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!(
@@ -235,23 +235,23 @@ impl OidcProvider {
     async fn session_assertion(
         &self,
         ctx: &MintCtx<'_>,
+        sign_in: &SignIn,
         audience: Option<&str>,
     ) -> anyhow::Result<String> {
-        // One message for one condition, shared with `heph auth login` — the
-        // same problem reported two different ways is how it becomes two
-        // problems in the reader's head.
-        let auth = ctx
-            .auth
-            .ok_or_else(|| anyhow::anyhow!("{}", session::no_auth_block("`.hephconfig`")))?;
+        let home = ctx.auth_home.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no ambient workload identity, and no `$HOME` in which to keep a session"
+            )
+        })?;
         let key = session::key_of(&[
-            &auth.config.issuer,
-            &auth.config.client_id,
+            &sign_in.issuer,
+            &sign_in.client_id,
             audience.unwrap_or_default(),
         ]);
 
-        // One issuer at a time, for the whole request. The lock is held across
-        // the refresh deliberately: it is what stops ten descriptors minting at
-        // once from rotating the stored token ten times.
+        // One integration at a time, for the whole request. The lock is held
+        // across the refresh deliberately: it is what stops ten descriptors
+        // minting at once from rotating one stored token ten times.
         let mut cache = self.assertions.lock().await;
         // `stale_at`, deliberately not `has_handout_headroom`. That predicate
         // asks "is this worth giving to a target that will then run for a
@@ -265,7 +265,7 @@ impl OidcProvider {
             return Ok(hit.token.clone());
         }
 
-        let fresh = self.refresh_session(ctx, auth, audience).await?;
+        let fresh = self.refresh_session(ctx, sign_in, home, audience).await?;
         let token = fresh.token.clone();
         cache.insert(key, fresh);
         Ok(token)
@@ -280,29 +280,24 @@ impl OidcProvider {
     async fn refresh_session(
         &self,
         ctx: &MintCtx<'_>,
-        auth: &AuthContext,
+        sign_in: &SignIn,
+        home: &std::path::Path,
         audience: Option<&str>,
     ) -> anyhow::Result<CachedAssertion> {
-        let tokens = session::refresh_locked(
-            &self.client,
-            &auth.config,
-            &auth.home,
-            audience,
-            ctx.now,
-            ctx.ctoken,
-        )
-        .await
-        .map_err(|e| {
-            // The ordinary end of a session, not an outage. Saying so is the
-            // difference between "log in again" and "the IdP is down".
-            if session::is_invalid_grant(&e) {
-                return anyhow::anyhow!(
-                    "the session for {} is no longer valid — run `heph auth login`",
-                    auth.config.issuer
-                );
-            }
-            e
-        })?;
+        let tokens =
+            session::refresh_locked(&self.client, sign_in, home, audience, ctx.now, ctx.ctoken)
+                .await
+                .map_err(|e| {
+                    // The ordinary end of a session, not an outage. Saying so is
+                    // the difference between "log in again" and "the IdP is down".
+                    if session::is_invalid_grant(&e) {
+                        return anyhow::anyhow!(
+                            "the session for {} is no longer valid — run `heph auth login`",
+                            sign_in.issuer
+                        );
+                    }
+                    e
+                })?;
 
         let assertion = tokens.assertion()?.to_string();
 
@@ -319,7 +314,7 @@ impl OidcProvider {
                      [{}] — this IdP does not honour an audience on the refresh grant. Either \
                      drop `audience` from the identity and let the exchange step set it, or use \
                      an `acquire` entry whose provider can mint the audience directly.",
-                    auth.config.issuer,
+                    sign_in.issuer,
                     got.join(", ")
                 );
             }
@@ -718,6 +713,29 @@ impl OidcProvider {
     }
 }
 
+/// The `sign_in` on the entry this mint is running.
+///
+/// Reached from the [`Acquire`] rather than from anywhere ambient, which is the
+/// whole point of the move: two secrets federating to two clouds sign in to two
+/// Okta applications, and the one that applies is the one on the route that was
+/// selected.
+fn sign_in(acquire: &Acquire) -> anyhow::Result<&SignIn> {
+    let Source::Oidc { sign_in } = &acquire.source else {
+        // Unreachable through the registry, which dispatches on `Source::kind`.
+        anyhow::bail!("the oidc provider was given a {:?} source", acquire.source);
+    };
+    sign_in.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no ambient workload identity on this machine, and this route declares no \
+             `sign_in`.\n  In GitHub Actions a missing identity means the job has no \
+             `permissions: id-token: write` — without it the request variables are simply \
+             absent, which is why this is not an authorization error.\n  On a laptop, either \
+             give this route a `sign_in = {{\"issuer\": …, \"client_id\": …}}` and run `heph \
+             auth login`, or add an `acquire` entry using a CLI you are already signed into."
+        )
+    })
+}
+
 /// Substitute `{identity-field}` and `{token}` into a URL, header or body.
 ///
 /// A deliberately tiny substitution rather than a template language: this text
@@ -877,7 +895,7 @@ mod tests {
         env: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
         token: &'a hcore::hasync::StdCancellationToken,
         redactor: &'a crate::redact::Redactor,
-        auth: Option<&'a AuthContext>,
+        auth_home: Option<&'a std::path::Path>,
     ) -> MintCtx<'a> {
         MintCtx {
             addr: "//infra/creds:ecr",
@@ -888,14 +906,18 @@ mod tests {
             runner: None,
             cwd: std::path::Path::new("."),
             redactor,
-            auth,
+            auth_home,
         }
     }
 
     fn oidc_acquire() -> Acquire {
+        oidc_acquire_with(None)
+    }
+
+    fn oidc_acquire_with(sign_in: Option<SignIn>) -> Acquire {
         Acquire {
             when_env: None,
-            source: crate::descriptor::Source::Oidc {},
+            source: Source::Oidc { sign_in },
             exchange: vec![Exchange::AwsSts { endpoint: None }],
             ttl: None,
         }
@@ -928,18 +950,15 @@ mod tests {
     #[tokio::test]
     async fn a_configured_workspace_with_no_session_says_to_log_in() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let auth = AuthContext {
-            config: auth_config("https://unreachable.invalid"),
-            home: dir.path().to_path_buf(),
-        };
+        let sign_in = sign_in_cfg("https://unreachable.invalid");
         let token = hcore::hasync::StdCancellationToken::new();
         let redactor = crate::redact::Redactor::inert();
         let env = env_of(&[]);
         let err = OidcProvider::new()
             .mint(
-                &ctx_with(&env, &token, &redactor, Some(&auth)),
+                &ctx_with(&env, &token, &redactor, Some(dir.path())),
                 &Identity::default(),
-                &oidc_acquire(),
+                &oidc_acquire_with(Some(sign_in)),
             )
             .await
             .expect_err("no session");
@@ -953,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_session_says_to_log_in_again() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = auth_config("https://unreachable.invalid");
+        let config = sign_in_cfg("https://unreachable.invalid");
         crate::session::Session {
             issuer: config.issuer.clone(),
             client_id: config.client_id.clone(),
@@ -965,18 +984,14 @@ mod tests {
         .store(dir.path())
         .expect("store");
 
-        let auth = AuthContext {
-            config,
-            home: dir.path().to_path_buf(),
-        };
         let token = hcore::hasync::StdCancellationToken::new();
         let redactor = crate::redact::Redactor::inert();
         let env = env_of(&[]);
         let err = OidcProvider::new()
             .mint(
-                &ctx_with(&env, &token, &redactor, Some(&auth)),
+                &ctx_with(&env, &token, &redactor, Some(dir.path())),
                 &Identity::default(),
-                &oidc_acquire(),
+                &oidc_acquire_with(Some(config)),
             )
             .await
             .expect_err("expired");
@@ -991,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn an_ambient_identity_is_preferred_over_a_stored_session() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = auth_config("https://unreachable.invalid");
+        let config = sign_in_cfg("https://unreachable.invalid");
         crate::session::Session {
             issuer: config.issuer.clone(),
             client_id: config.client_id.clone(),
@@ -1003,10 +1018,6 @@ mod tests {
         .store(dir.path())
         .expect("store");
 
-        let auth = AuthContext {
-            config,
-            home: dir.path().to_path_buf(),
-        };
         let token = hcore::hasync::StdCancellationToken::new();
         let redactor = crate::redact::Redactor::inert();
         // An unroutable endpoint: reaching it at all is the assertion, and what
@@ -1017,7 +1028,7 @@ mod tests {
         ]);
         let err = OidcProvider::new()
             .mint(
-                &ctx_with(&env, &token, &redactor, Some(&auth)),
+                &ctx_with(&env, &token, &redactor, Some(dir.path())),
                 &Identity::default(),
                 &oidc_acquire(),
             )
@@ -1028,12 +1039,11 @@ mod tests {
         assert!(!msg.contains("heph auth login"), "{msg}");
     }
 
-    fn auth_config(issuer: &str) -> crate::session::AuthConfig {
-        crate::session::AuthConfig {
+    fn sign_in_cfg(issuer: &str) -> SignIn {
+        SignIn {
             issuer: issuer.to_string(),
             client_id: "client".into(),
             scopes: vec!["openid".into(), "offline_access".into()],
-            audience: None,
             redirect_ports: Vec::new(),
         }
     }

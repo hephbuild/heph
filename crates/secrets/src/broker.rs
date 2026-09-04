@@ -31,7 +31,7 @@
 //! fails at once instead of blocking on a human who is not watching.
 
 use crate::descriptor::Descriptor;
-use crate::provider::{AuthContext, EnvLookup, MintCtx, ProviderRegistry, SharedEnvLookup};
+use crate::provider::{EnvLookup, MintCtx, ProviderRegistry, SharedEnvLookup};
 use crate::redact::{Entry, Redactor};
 use crate::value::{Credential, SecretValue};
 use hcore::hasync::Cancellable;
@@ -60,9 +60,8 @@ pub struct BrokerCtx<'a> {
     /// Working directory for an `exec` helper — the workspace root, not
     /// whatever directory heph was invoked from. See [`MintCtx::cwd`].
     pub cwd: &'a std::path::Path,
-    /// The `heph auth login` session available to this machine, if any. See
-    /// [`MintCtx::auth`].
-    pub auth: Option<&'a AuthContext>,
+    /// Where this user's sessions live. See [`MintCtx::auth_home`].
+    pub auth_home: Option<&'a std::path::Path>,
 }
 
 /// A record of one mint, for `heph auth show` and for the grant event.
@@ -99,9 +98,9 @@ pub struct RefreshConfig {
     pub ctoken: Arc<dyn Cancellable + Send + Sync>,
     pub request_id: String,
     pub cwd: std::path::PathBuf,
-    /// Owned, unlike [`BrokerCtx::auth`]: the sweep outlives every individual
-    /// call, so it cannot borrow one's context.
-    pub auth: Option<AuthContext>,
+    /// Owned, unlike [`BrokerCtx::auth_home`]: the sweep outlives every
+    /// individual call, so it cannot borrow one's context.
+    pub auth_home: Option<std::path::PathBuf>,
 }
 
 /// Stops the background sweep when dropped.
@@ -325,7 +324,7 @@ impl Broker {
             runner,
             cwd: ctx.cwd,
             redactor: &redactor,
-            auth: ctx.auth,
+            auth_home: ctx.auth_home,
         };
 
         let cred = provider
@@ -400,7 +399,7 @@ impl Broker {
                     request_id: &cfg.request_id,
                     runner: None,
                     cwd: &cfg.cwd,
-                    auth: cfg.auth.as_ref(),
+                    auth_home: cfg.auth_home.as_deref(),
                 };
                 let n = broker.refresh_due(&ctx).await;
                 if n > 0 {
@@ -634,7 +633,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
         let d = descriptor("//infra/creds:ecr");
 
@@ -714,7 +713,7 @@ mod tests {
                     request_id: "req",
                     runner: None,
                     cwd: std::path::Path::new("."),
-                    auth: None,
+                    auth_home: None,
                 };
                 b.mint(&d, "ecr", &ctx).await.map(|_| ())
             }));
@@ -759,7 +758,7 @@ mod tests {
                     request_id: "req",
                     runner: None,
                     cwd: std::path::Path::new("."),
-                    auth: None,
+                    auth_home: None,
                 };
                 b.mint(&d, "s", &ctx).await.map(|_| ())
             }));
@@ -824,7 +823,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
         let d = descriptor("//c:x");
 
@@ -869,7 +868,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
 
         b.mint(&d, "x", &mk(t(0))).await.expect("first");
@@ -904,7 +903,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
 
         b.mint(&d, "x", &mk(t(0))).await.expect("first");
@@ -933,7 +932,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
 
         b.mint(&d, "x", &mk(t(0))).await.expect("first");
@@ -1004,7 +1003,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
 
         b.mint(&d, "x", &mk(t(0))).await.expect("first");
@@ -1039,7 +1038,7 @@ mod tests {
                 request_id: "req",
                 runner: None,
                 cwd: std::path::Path::new("."),
-                auth: None,
+                auth_home: None,
             },
         )
         .await
@@ -1048,7 +1047,7 @@ mod tests {
 
         let guard = b.spawn_refresher_every(
             RefreshConfig {
-                auth: None,
+                auth_home: None,
                 env: Arc::new(|_: &str| None),
                 ctoken: Arc::new(StdCancellationToken::new()),
                 request_id: "req".to_string(),
@@ -1099,7 +1098,7 @@ mod tests {
                 request_id: "req",
                 runner: None,
                 cwd: std::path::Path::new("."),
-                auth: None,
+                auth_home: None,
             };
             let c = b.mint(&d, "x", &ctx).await.expect("mint");
             if generation == 0 {
@@ -1131,7 +1130,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
         b.mint(&descriptor("//c:a"), "a", &ctx).await.expect("a");
         b.mint(&descriptor("//c:b"), "b", &ctx).await.expect("b");
@@ -1153,7 +1152,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
 
         b.mint(&d, "x", &mk(t(0))).await.expect("first");
@@ -1180,7 +1179,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
         assert!(b.redactor().await.is_inert());
 
@@ -1208,7 +1207,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
         let mut d = descriptor("//c:x");
         d.acquire.insert(
@@ -1255,7 +1254,7 @@ mod tests {
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            auth: None,
+            auth_home: None,
         };
         let mut d = descriptor("//c:x");
         d.acquire = vec![Acquire {

@@ -666,7 +666,7 @@ impl RequestState {
                     .as_ref()
                     .map(|c| c.root.clone())
                     .unwrap_or_else(std::env::temp_dir),
-                auth: cfg.and_then(|c| c.auth.clone()),
+                auth_home: cfg.and_then(|c| c.auth_home.clone()),
             });
             (broker, guard)
         });

@@ -99,16 +99,18 @@ pub struct Config {
     /// other test in its binary — and a cache-key input deserves a test that is
     /// not a coin flip.
     pub run_subject: Option<String>,
-    /// Where `heph auth login` signs in, paired with the per-user heph home.
+    /// Where this user's `heph auth login` sessions live — `$HOME/.heph`.
     ///
-    /// Resolved once here rather than looked up at mint time: a provider that
-    /// went reading `.hephconfig` and `$HOME` itself would behave differently
-    /// depending on where the build was invoked, which is exactly what
-    /// [`hsecrets::MintCtx`] exists to prevent. `None` when the workspace
-    /// configures no `auth:` block, or when `$HOME` is unset — neither is an
-    /// error unless a descriptor actually needs a session, so the diagnostic
-    /// belongs there rather than here.
-    pub auth: Option<hsecrets::provider::AuthContext>,
+    /// Resolved once here rather than at mint time: a provider that went
+    /// reading `$HOME` itself would behave differently depending on how the
+    /// build was invoked, which is exactly what [`hsecrets::MintCtx`] exists to
+    /// prevent. `None` when `$HOME` is unset, which is only an error if a
+    /// descriptor actually needs a session — so the diagnostic belongs there.
+    ///
+    /// *Which* IdP to sign in to is not here and never was workspace-level: a
+    /// client id is registered per integration, so it is declared on the secret
+    /// that needs it.
+    pub auth_home: Option<std::path::PathBuf>,
     /// In-memory tier fronting the durable (SQLite) local cache.
     pub mem_cache: MemCacheOptions,
     /// Mem-only store for tmp/uncacheable revisions ([`LocalCacheTmp`]).
@@ -182,7 +184,7 @@ impl Default for Config {
             telemetry_enabled: true,
             remote_caches: Vec::new(),
             scratch: ScratchOptions::default(),
-            auth: None,
+            auth_home: None,
         }
     }
 }
@@ -256,13 +258,9 @@ impl ConfigYamlExt for ConfigYaml {
             fs_skip: self.fs.as_ref().map(|f| f.skip.clone()).unwrap_or_default(),
             parallelism: None,
             run_subject: None,
-            auth: self.auth.clone().and_then(|config| {
-                // A machine with no `$HOME` cannot hold a session; that is not a
-                // reason to fail a build that never asks for one.
-                hsecrets::Session::home()
-                    .ok()
-                    .map(|home| hsecrets::provider::AuthContext { config, home })
-            }),
+            // A machine with no `$HOME` cannot hold a session; that is not a
+            // reason to fail a build that never asks for one.
+            auth_home: hsecrets::Session::home().ok(),
             mem_cache: self
                 .mem_cache
                 .as_ref()

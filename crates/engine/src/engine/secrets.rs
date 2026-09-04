@@ -91,6 +91,113 @@ impl Engine {
         self.resolve_secrets(rs, consumer, inputs).await
     }
 
+    /// Every sign-in this workspace federates through, deduplicated.
+    ///
+    /// What `heph auth login` and `heph auth status` need, and the only thing
+    /// they need. Asks each provider for its credential declarations directly
+    /// rather than resolving the graph: a provider that structurally cannot
+    /// produce a `secret` — `plugin-go`, say — answers at once instead of
+    /// running `go list` to establish that Go declares no credentials.
+    ///
+    /// A provider that has not implemented [`Provider::list_secrets`] returns
+    /// `None`, and is enumerated the slow way rather than silently contributing
+    /// nothing. Getting that backwards would make a third-party provider's
+    /// credentials invisible to login, and the failure would land later, in a
+    /// build, as a missing session nobody could explain.
+    ///
+    /// [`Provider::list_secrets`]: hplugin::provider::Provider::list_secrets
+    pub async fn sign_ins(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<hsecrets::SignIn>> {
+        let mut found: Vec<hsecrets::SignIn> = Vec::new();
+        let mut slow = Vec::new();
+
+        for provider in &self.providers {
+            let req = hplugin::provider::ListSecretsRequest {
+                prefix: prefix.to_string(),
+            };
+            match provider.provider.list_secrets(req, rs.ctoken()).await? {
+                Some(decls) => {
+                    for d in decls {
+                        found.extend(d.sign_ins.into_iter().map(convert_sign_in));
+                    }
+                }
+                None => slow.push(provider.name.clone()),
+            }
+        }
+
+        // The fallback: resolve the graph for the providers that could not
+        // answer. Deliberately a whole-workspace query rather than a per-
+        // provider one — `query` merges providers, and asking it to attribute a
+        // target back to the provider that surfaced it would be a new seam for
+        // one diagnostic's sake.
+        if !slow.is_empty() {
+            tracing::debug!(
+                providers = ?slow,
+                "enumerating the graph: these providers do not implement list_secrets"
+            );
+            found.extend(self.sign_ins_by_query(rs, prefix).await?);
+        }
+
+        // Deduplicated: an organization registers one application per
+        // integration, so many secrets share a sign-in and one browser round
+        // trip should serve all of them.
+        found.sort_by(|a, b| (&a.issuer, &a.client_id).cmp(&(&b.issuer, &b.client_id)));
+        found.dedup_by(|a, b| a.issuer == b.issuer && a.client_id == b.client_id);
+        Ok(found)
+    }
+
+    /// The slow path, exposed for the test that proves the two agree.
+    #[doc(hidden)]
+    pub async fn sign_ins_by_query_for_test(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<hsecrets::SignIn>> {
+        self.sign_ins_by_query(rs, prefix).await
+    }
+
+    /// The slow path: resolve specs and read their declarations.
+    async fn sign_ins_by_query(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<hsecrets::SignIn>> {
+        let pattern = if prefix.is_empty() {
+            "//...".to_string()
+        } else {
+            format!("//{}/...", prefix.trim_matches('/'))
+        };
+        let matcher = hmodel::htquery::parse(&pattern, &hmodel::htpkg::PkgBuf::from(""))?;
+        use futures::TryStreamExt as _;
+        let addrs: Vec<Addr> = Arc::clone(self)
+            .query(rs.clone(), &matcher)
+            .try_collect()
+            .await?;
+
+        let mut out = Vec::new();
+        for addr in addrs {
+            // A target that does not resolve is not this command's problem to
+            // report — `heph build` says it better.
+            let Ok(spec) = Arc::clone(self).get_spec(rs.clone(), &addr).await else {
+                continue;
+            };
+            if spec.spec.driver != hbuiltins::pluginsecret::DRIVER_NAME {
+                continue;
+            }
+            let Ok(desc) = hbuiltins::pluginsecret::parse_declaration(&spec.spec) else {
+                continue;
+            };
+            out.extend(desc.acquire.iter().filter_map(|a| match &a.source {
+                hsecrets::Source::Oidc { sign_in } => sign_in.clone(),
+                _ => None,
+            }));
+        }
+        Ok(out)
+    }
+
     /// Mint one credential and drop it, for `heph auth check`.
     ///
     /// Nothing is rendered, written or returned — only whether the route
@@ -110,7 +217,7 @@ impl Engine {
             request_id: rs.request_id(),
             runner: None,
             cwd: &self.cfg.root,
-            auth: self.cfg.auth.as_ref(),
+            auth_home: self.cfg.auth_home.as_deref(),
         };
         rs.broker().mint(&secret.desc, &secret.name, &ctx).await?;
         Ok(())
@@ -216,7 +323,7 @@ impl Engine {
             // is not wired yet; a helper runs local until it is.
             runner: None,
             cwd: &self.cfg.root,
-            auth: self.cfg.auth.as_ref(),
+            auth_home: self.cfg.auth_home.as_deref(),
         };
 
         let mut creds = Vec::with_capacity(resolved.len());
@@ -377,4 +484,25 @@ fn check_slots(consumer: &Addr, resolved: &[ResolvedSecret]) -> anyhow::Result<(
         })
         .collect();
     hsecrets::shape::check_collisions(&consumer.to_string(), &claims)
+}
+
+/// The plugin-facing shape back into the secrets crate's own.
+///
+/// Two types rather than one because `hplugin` sits below `hsecrets`: a shared
+/// definition would point the dependency the wrong way up the stack.
+fn convert_sign_in(s: hplugin::provider::SignIn) -> hsecrets::SignIn {
+    hsecrets::SignIn {
+        issuer: s.issuer,
+        client_id: s.client_id,
+        scopes: if s.scopes.is_empty() {
+            hsecrets::descriptor::default_scopes()
+        } else {
+            s.scopes
+        },
+        redirect_ports: if s.redirect_ports.is_empty() {
+            hsecrets::descriptor::default_redirect_ports()
+        } else {
+            s.redirect_ports
+        },
+    }
 }

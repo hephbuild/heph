@@ -666,63 +666,123 @@ CI hands a job an ambient workload identity; a laptop has none. `heph auth
 login` gives it one of the same kind, so a single `oidc` declaration works in
 both places instead of a laptop needing its own arrangement.
 
-The workspace commits where to sign in — it holds no secret, because a CLI is a
-public client (RFC 8252 §8.5) and PKCE replaces the client secret:
+**Where to sign in is declared on the secret that needs it**, in the `oidc`
+source's `sign_in`. It holds no secret — a CLI is a public client (RFC 8252
+§8.5) and PKCE replaces the client secret — so it belongs in version control,
+next to the credential it authenticates for, under the same CODEOWNERS.
 
-```yaml
-# .hephconfig
-auth:
-  issuer: https://org.okta.com/oauth2/default
-  clientId: 0oa8f3k2mQvR1nZx5d7
+```python
+# //infra/creds/BUILD
+OKTA = "https://org.okta.com/oauth2/default"
+
+secret(
+    name     = "ecr",
+    role     = "arn:aws:iam::4711:role/heph-ci-push",
+    provider = "oidc",
+    sign_in  = {"issuer": OKTA, "client_id": "aws-app"},
+    exchange = {"kind": "aws_sts"},
+)
+
+secret(
+    name     = "gar",
+    role     = "heph-push@proj.iam.gserviceaccount.com",
+    provider = "oidc",
+    sign_in  = {"issuer": OKTA, "client_id": "gcp-app"},
+    exchange = {"kind": "token_exchange", "issuer": "https://sts.googleapis.com"},
+)
 ```
 
-`scopes` defaults to `openid profile email offline_access`. **`offline_access`
-is the one that matters**: without it most IdPs return no refresh token, so
-every build session would need the browser again. `heph auth login` warns by
-name rather than leaving that to be discovered. `audience` and `redirectPorts`
-are there for IdPs that require them.
+**Not workspace-level, because a client id is per integration.** An
+organization with one Okta tenant still registers a separate application for
+AWS, for GCP, for each SaaS — so the issuer is shared and the client id is not.
+A single config block could describe exactly one of them; the secrets that need
+them can describe all. That is also why `sign_in` sits in the *acquisition*
+half: it is unhashed and per `acquire` entry, so how a laptop signs in can
+differ from how CI does without re-keying a single consumer.
+
+`scopes` defaults to `openid profile email offline_access`. **`offline_access` is
+the one that matters**: without it most IdPs return no refresh token, so every
+build session would need the browser again. `heph auth login` warns by name
+rather than leaving that to be discovered. `redirect_ports` is there for IdPs
+that demand exact redirect URIs.
+
+**`sign_in` is usually absent, and that is not a gap.** It is present only when a
+credential is reached by direct federation to your own IdP:
+
+| your setup | laptop route | `sign_in` |
+|---|---|---|
+| per-cloud SSO (`aws sso login`, `gcloud auth login`) | `provider = "exec"` → the vendor CLI | absent |
+| direct federation to your IdP | `provider = "oidc"` → heph's session | present |
+| CI, either way | ambient workload token | absent |
+
+A secret can carry all three as separate `acquire` entries — same hashed
+identity, three routes, no re-keying. That is what the list is for.
 
 ```
-heph auth login                 # opens a browser (RFC 8252 loopback + PKCE-S256)
+heph auth login                 # every integration this workspace needs
+heph auth login //infra/creds   # scoped to a package prefix
 heph auth login --device-code   # no browser: a code to enter elsewhere (RFC 8628)
-heph auth status                # what identity this machine has; non-zero if none
-heph auth logout                # forget the token here — not revoked at the IdP
-heph auth status --all          # every session on this machine, offline
-heph auth logout --all          # and forget all of them
+heph auth status [--all]        # what identity this machine has; non-zero if none
+heph auth logout [--all]        # forget it here — not revoked at the IdP
 ```
 
-`--json` on any of them puts an object on stdout and **nothing else** — every
-progress line moves to stderr — so `heph auth login --json | jq` works. Every
-outcome is an object naming a state (`ambient`, `active`, `expired`, `none`), and
-`login` reports `changed` so an agent can tell a fresh sign-in from a no-op.
+Several integrations means several sessions, keyed by `(issuer, client_id)` —
+but not several prompts: after the first flow your IdP session carries the rest
+through silently, so `heph auth login` is one interactive login and *n* − 1 quiet
+redirects.
+
+`--json` on any of them puts a **list** of objects on stdout and nothing else —
+every progress line moves to stderr — so `heph auth login --json | jq` works. A
+list even for one integration, because a shape that changes with the count is a
+shape every consumer has to branch on. Each object names a state (`ambient`,
+`active`, `expired`, `unknown`, `none`), and `login` reports `changed` so an
+agent can tell a fresh sign-in from a no-op.
 
 `status` reports the identity a *build* would use, not the file on disk: an
-ambient CI identity first, then the session — and the session is **probed**, not
-merely read. That matters because most IdPs never send `refresh_expires_in`, so
-a revoked grant is indistinguishable on disk from a live one. `login` probes on
-the same terms, which is what stops the loop where every error says "run `heph
-auth login`" and `heph auth login` replies "already signed in".
+ambient CI identity first, then each session — and each is **probed**, not merely
+read. That matters because most IdPs never send `refresh_expires_in`, so a
+revoked grant is indistinguishable on disk from a live one. `login` probes on the
+same terms, which is what stops the loop where every error says "run `heph auth
+login`" and `heph auth login` replies "already signed in".
 
 `--all` exists because sessions are keyed by `(issuer, client_id)`. The day an
 org rotates either, the old file becomes unreachable through the workspace
-config — and still holds a live refresh token. Both `--all` forms work offline
-and outside a workspace, which is where cleanup happens.
+declarations — and still holds a live refresh token. Both `--all` forms work
+offline and outside a workspace, which is where cleanup happens.
+
+### Finding the sign-ins without resolving the graph
+
+`heph auth login` needs the distinct sign-ins and nothing else. Reaching that
+through the graph means discovering every target in the repo, so a provider like
+`plugin-go` would run `go list` to answer a question about credentials Go never
+declares. `Provider::list_secrets` lets a provider answer directly.
+
+**Its default is `None`, not an empty list**, and the difference is the whole
+safety of the mechanism. An empty list is a claim — *"I have no credentials"* —
+and a provider that has some but has not implemented the method would make them
+invisible to login, surfacing later as a missing session in a build nobody could
+explain. `None` says nothing, and the host enumerates that provider properly.
+`Some(vec![])` is how a provider opts into being fast, and it means it.
+
+This names a *driver* in an interface every provider implements, which is a
+recorded trade: the alternative was a general `list_by_driver` costing one extra
+`get` per match, which would have served runners and tests later. Directness won;
+the cost is that the next such need adds a method rather than an argument.
 
 ### For whoever administers the IdP
 
-Register heph as a **public client** (no client secret) and hand back the issuer
-and client id. Then:
+Register heph as a **public client** (no client secret) per integration, and hand
+back the issuer and each client id. Then:
 
 - **Redirect URIs.** Either allow arbitrary loopback ports (RFC 8252 §7.3) and
   register `http://127.0.0.1/callback`, or register the three exact URIs
-  `http://127.0.0.1:47113/callback`, `:47114`, `:47115` — and keep
-  `redirectPorts` aligned with whatever you register. A URI registered on a
-  different port is the most common first-run failure; `heph auth login` prints
-  the exact URI it is waiting on, before the browser opens, for this reason.
-  Use the literal IP, never `localhost`: some IdPs treat them as different
-  registrations.
-- **Refresh grant**, or `offline_access` returns no token and every build
-  session needs the browser again.
+  `http://127.0.0.1:47113/callback`, `:47114`, `:47115` — keeping `redirect_ports`
+  aligned with whatever you register. A URI registered on a different port is the
+  most common first-run failure, which is why `heph auth login` prints the exact
+  URI it is waiting on before the browser opens. Use the literal IP, never
+  `localhost`: some IdPs treat them as different registrations.
+- **Refresh grant**, or `offline_access` returns no token and every build session
+  needs the browser again.
 - **Device grant**, if anyone will use `--device-code`. Without a published
   `device_authorization_endpoint` heph says so by name rather than failing
   obscurely.

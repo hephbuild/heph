@@ -505,6 +505,158 @@ pub fn parse_exchange_value(v: &crate::htvalue::Value) -> anyhow::Result<Vec<Exc
     }
 }
 
+/// Where an `oidc` source signs in, declared on the secret that needs it.
+///
+/// **Per secret, not per workspace, because a client id is per integration.**
+/// The shape an organization actually has is one issuer and many applications —
+/// one for AWS, one for GCP, one for each SaaS — so a single workspace-level
+/// block can only ever describe one of them. It was one, briefly, in
+/// `.hephconfig`; that could not express a repo touching two clouds, which is
+/// most of them.
+///
+/// It sits in the **acquisition half**: unhashed, per [`crate::Acquire`] entry,
+/// so how a laptop signs in can differ from how CI does without re-keying a
+/// single consumer. Absent is the common case — CI has an ambient identity, and
+/// a laptop federating through a vendor CLI uses `exec` instead.
+///
+/// The issuer repeats across the secrets that share it. That is deliberate:
+/// a BUILD file is Starlark, so `OKTA = "https://…"` at the top removes the
+/// duplication, and what is left reads as *which IdP this credential
+/// authenticates against* without opening another file.
+#[derive(SpecStruct, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignIn {
+    /// The IdP. Every endpoint is discovered from
+    /// `{issuer}/.well-known/openid-configuration`.
+    ///
+    /// Not to be confused with an [`crate::Exchange`]'s `issuer`, which names
+    /// where a grant is *sent*. Both are OIDC issuers; only the role differs,
+    /// which is why this one is nested under `sign_in` rather than sitting flat
+    /// beside it.
+    pub issuer: String,
+
+    /// The registered public client — one per integration.
+    ///
+    /// No client secret, by design: a CLI is a public client (RFC 8252 §8.5)
+    /// and PKCE replaces one. A secret committed to a repo is not a secret, so
+    /// an IdP demanding a confidential client here is misconfigured for this
+    /// use rather than something to work around.
+    pub client_id: String,
+
+    /// Requested scopes.
+    ///
+    /// `offline_access` is not decoration: without it most IdPs return no
+    /// refresh token, and every build session then needs the browser again.
+    /// That is the most common way a working-looking setup is quietly unusable,
+    /// so [`SignIn::warnings`] names it rather than leaving it to be found.
+    #[spec(default = default_scopes())]
+    pub scopes: Vec<String>,
+
+    /// Loopback ports to try, in order. Empty means any free port, which is
+    /// what an IdP following RFC 8252 §7.3 permits.
+    ///
+    /// Where it demands exact matches, register these three — a redirect URI
+    /// registered on a different port is the most common first-run failure,
+    /// which is why `heph auth login` prints the exact URI it waits on before
+    /// the browser opens.
+    #[spec(
+        default = default_redirect_ports(),
+        parse = parse_ports,
+        ty = crate::htvalue::signature::ParamType::list(
+            crate::htvalue::signature::ParamType::Int
+        )
+    )]
+    pub redirect_ports: Vec<u16>,
+}
+
+pub fn default_scopes() -> Vec<String> {
+    ["openid", "profile", "email", "offline_access"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+pub fn default_redirect_ports() -> Vec<u16> {
+    vec![47113, 47114, 47115]
+}
+
+impl SignIn {
+    /// Configuration that will authenticate but not *stay* authenticated.
+    ///
+    /// Reported rather than enforced: an IdP may grant a refresh token without
+    /// being asked, and refusing to sign someone in over a guess would be worse
+    /// than telling them what to expect.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.scopes.iter().any(|s| s == "offline_access") {
+            out.push(
+                "`scopes` does not include `offline_access`: most IdPs then return no refresh \
+                 token, and every session will need the browser again"
+                    .to_string(),
+            );
+        }
+        if !self.scopes.iter().any(|s| s == "openid") {
+            out.push(
+                "`scopes` does not include `openid`: without it there is no ID token, so the \
+                 session records no subject and `oidc` has no assertion to present"
+                    .to_string(),
+            );
+        }
+        out
+    }
+}
+
+/// A list of TCP ports. Hand-parsed because the spec layer has no `Vec<u16>`,
+/// and a port that does not fit is a typo worth naming rather than truncating.
+fn parse_ports(v: &crate::htvalue::Value) -> anyhow::Result<Vec<u16>> {
+    let items = match v {
+        crate::htvalue::Value::Null() => return Ok(default_redirect_ports()),
+        crate::htvalue::Value::List(items) => items,
+        other => anyhow::bail!("`redirect_ports` must be a list of ports, got {other:?}"),
+    };
+    items
+        .iter()
+        .map(|item| {
+            let n = match item {
+                crate::htvalue::Value::Int(n) => u64::try_from(*n).ok(),
+                crate::htvalue::Value::Uint(n) => Some(*n),
+                other => anyhow::bail!("`redirect_ports` must be a list of ports, got {other:?}"),
+            };
+            n.and_then(|n| u16::try_from(n).ok())
+                .ok_or_else(|| anyhow::anyhow!("{item:?} is not a TCP port"))
+        })
+        .collect()
+}
+
+/// Parse a `sign_in` map, rejecting one that names no IdP.
+///
+/// `SpecStruct` has no `required`, so the two mandatory keys are checked here —
+/// a presence check adjacent to the parse, not a cross-field rule downstream.
+fn parse_sign_in(v: &crate::htvalue::Value) -> anyhow::Result<Option<SignIn>> {
+    use crate::htspec::FromSpecValue as _;
+    if matches!(v, crate::htvalue::Value::Null()) {
+        return Ok(None);
+    }
+    let s = SignIn::from_spec_value(v)?;
+    anyhow::ensure!(
+        !s.issuer.is_empty(),
+        "`sign_in` needs an `issuer` — the IdP to sign in to, e.g. \
+         https://org.okta.com/oauth2/default"
+    );
+    anyhow::ensure!(
+        !s.client_id.is_empty(),
+        "`sign_in` needs a `client_id` — the public client registered for this integration. An \
+         organization typically registers one per integration, so this differs per secret even \
+         where the issuer does not."
+    );
+    Ok(Some(s))
+}
+
+fn sign_in_param_type() -> crate::htvalue::signature::ParamType {
+    use crate::htspec::FromSpecValue as _;
+    SignIn::spec_param_type()
+}
+
 /// How the raw material for a credential is obtained.
 ///
 /// A tagged union rather than a bag of options: the tag says which shape this
@@ -553,9 +705,21 @@ pub enum Source {
     },
     /// Present the ambient workload identity token, or the stored session.
     ///
-    /// It has no configuration of its own: what it asserts is the identity
-    /// half's `audience`, and what it becomes is the `exchange` pipeline.
-    Oidc {},
+    /// What it asserts is the identity half's `audience`; what it becomes is
+    /// the `exchange` pipeline. The only thing it configures is where a machine
+    /// with no ambient identity signs in.
+    Oidc {
+        /// How to establish a session on a machine that has no ambient
+        /// workload identity. See [`SignIn`].
+        ///
+        /// Absent is the common case, and it is not a gap: CI has an ambient
+        /// token, and a laptop federating through a vendor CLI it is already
+        /// signed into uses `exec` instead. Present exactly when this
+        /// credential is reached by direct federation to your own IdP.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[spec(parse = parse_sign_in, ty = sign_in_param_type())]
+        sign_in: Option<SignIn>,
+    },
 }
 
 impl Source {
@@ -564,7 +728,7 @@ impl Source {
         match self {
             Source::StaticEnv { .. } => ProviderKind::StaticEnv,
             Source::Exec { .. } => ProviderKind::Exec,
-            Source::Oidc {} => ProviderKind::Oidc,
+            Source::Oidc { .. } => ProviderKind::Oidc,
         }
     }
 }
@@ -762,7 +926,7 @@ impl Acquire {
                 self.helper_timeout()
                     .map_err(|e| anyhow::anyhow!("{}: {e}", at()))?;
             }
-            Source::Oidc {} => {
+            Source::Oidc { .. } => {
                 if self.exchange.is_empty() {
                     anyhow::bail!(
                         "{}: oidc needs an `exchange`. An assertion is not a credential: say \
@@ -1136,7 +1300,7 @@ mod tests {
                 Acquire {
                     when_env: Some(WhenEnv::Set("GITHUB_ACTIONS".into())),
                     exchange: vec![Exchange::AwsSts { endpoint: None }],
-                    ..acq(Source::Oidc {})
+                    ..acq(Source::Oidc { sign_in: None })
                 },
                 exec_acq(),
             ],
@@ -1218,7 +1382,7 @@ mod tests {
     /// it for cannot work, and says so at the declaration.
     #[test]
     fn oidc_without_an_exchange_is_rejected_at_spec_time() {
-        let err = acq(Source::Oidc {})
+        let err = acq(Source::Oidc { sign_in: None })
             .validate("//x:y", 0)
             .expect_err("needs an exchange");
         let msg = err.to_string();
@@ -1402,7 +1566,7 @@ mod tests {
     fn a_grant_with_no_destination_fails_when_the_route_is_validated() {
         let a = Acquire {
             exchange: vec![token_exchange(None, None)],
-            ..acq(Source::Oidc {})
+            ..acq(Source::Oidc { sign_in: None })
         };
         let err = a.validate("//x:y", 0).expect_err("no destination");
         let msg = err.to_string();

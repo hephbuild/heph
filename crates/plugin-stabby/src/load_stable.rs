@@ -28,9 +28,9 @@ use hplugin::driver::{
 use hplugin::hook::Hook;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
-    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
-    ProbeResponse, Provider, ProviderFn, ProviderFunctionDef, ProviderFunctionRegistry,
-    StateSchema,
+    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ListSecretsRequest,
+    ProbeRequest, ProbeResponse, Provider, ProviderFn, ProviderFunctionDef,
+    ProviderFunctionRegistry, SecretDeclaration, SignIn, StateSchema,
 };
 use plugin_abi::pb::frame::Body;
 use plugin_abi::{convert, pb};
@@ -514,6 +514,54 @@ impl Provider for StableRemoteProvider {
                 }),
                 Body::Error(e) => anyhow::bail!("{}", e.message),
                 other => anyhow::bail!("unexpected probe response: {other:?}"),
+            }
+        })
+    }
+
+    fn list_secrets<'a>(
+        &'a self,
+        req: ListSecretsRequest,
+        ct: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Option<Vec<SecretDeclaration>>>> {
+        Box::pin(async move {
+            let pb_req = pb::ListSecretsRequest { prefix: req.prefix }.encode_to_vec();
+            let fut = self
+                .inner
+                .invoke(pb::ProviderMethod::ListSecrets as u32, sv(&pb_req));
+            // No `request_id` on this method, so nothing to cancel plugin-side;
+            // a host cancellation still drops the future.
+            let bytes = await_with_cancel(ct, || {}, fut).await;
+            match decode_unary(&bytes)? {
+                Body::ListSecretsResp(r) => Ok(Some(
+                    r.secrets
+                        .into_iter()
+                        .filter_map(|d| {
+                            Some(SecretDeclaration {
+                                addr: convert::addr_from_pb(d.addr?),
+                                sign_ins: d
+                                    .sign_ins
+                                    .into_iter()
+                                    .map(|s| SignIn {
+                                        issuer: s.issuer,
+                                        client_id: s.client_id,
+                                        scopes: s.scopes,
+                                        redirect_ports: s
+                                            .redirect_ports
+                                            .into_iter()
+                                            .filter_map(|p| u16::try_from(p).ok())
+                                            .collect(),
+                                    })
+                                    .collect(),
+                            })
+                        })
+                        .collect(),
+                )),
+                // A plugin built against an older host does not know this method
+                // id and says so. `None` sends the caller to the slow path,
+                // which is the whole reason the default is `None` and not an
+                // empty list — see `Provider::list_secrets`.
+                Body::Error(_) => Ok(None),
+                other => anyhow::bail!("unexpected list_secrets response: {other:?}"),
             }
         })
     }
