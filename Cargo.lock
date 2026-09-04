@@ -5366,19 +5366,23 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "config",
  "core",
  "driver-support",
  "execrunner",
  "humantime",
+ "lock",
  "model",
  "plugin",
  "proc",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

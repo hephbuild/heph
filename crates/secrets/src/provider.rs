@@ -25,6 +25,7 @@
 use crate::descriptor::{Acquire, Identity, Protocol, ProviderKind, Source};
 use crate::protocol;
 use crate::redact::Redactor;
+use crate::session::AuthConfig;
 use crate::value::Credential;
 use anyhow::Context as _;
 use hcore::hasync::Cancellable;
@@ -77,6 +78,25 @@ pub struct MintCtx<'a> {
     /// A helper that fails *while printing the credential it just fetched* is
     /// not hypothetical.
     pub redactor: &'a Redactor,
+    /// The `heph auth login` session this machine could use, if it has one.
+    ///
+    /// Handed in, like everything else here, rather than discovered: the
+    /// workspace config and the user's heph home are the caller's to resolve,
+    /// and a provider that went looking for them would behave differently
+    /// depending on where the build was invoked.
+    pub auth: Option<&'a AuthContext>,
+}
+
+/// What `oidc` needs to present a session-based identity.
+///
+/// Two halves the provider cannot find on its own: *which* IdP this workspace
+/// signs into (workspace config) and *where* this user's session lives (the
+/// per-user heph home).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthContext {
+    pub config: AuthConfig,
+    /// `$HOME/.heph`.
+    pub home: std::path::PathBuf,
 }
 
 /// The env closure and cancellation token are not `Debug`; the redactor is, and
@@ -89,6 +109,7 @@ impl std::fmt::Debug for MintCtx<'_> {
             .field("runner", &self.runner.map(Addr::format))
             .field("cwd", &self.cwd)
             .field("redactor", self.redactor)
+            .field("auth", &self.auth.map(|a| a.config.issuer.as_str()))
             .finish_non_exhaustive()
     }
 }
@@ -500,6 +521,7 @@ mod tests {
                 runner: None,
                 cwd: std::path::Path::new("."),
                 redactor: &self.redactor,
+                auth: None,
             }
         }
     }
@@ -714,6 +736,7 @@ mod tests {
             runner: None,
             cwd: std::path::Path::new("."),
             redactor: &redactor,
+            auth: None,
         };
         let err = ExecProvider
             .mint(

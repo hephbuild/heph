@@ -19,7 +19,8 @@
 
 use crate::descriptor::{Acquire, Endpoint, Exchange, Identity, ProviderKind};
 use crate::expiry::Expiry;
-use crate::provider::{MintCtx, SecretProvider};
+use crate::provider::{AuthContext, MintCtx, SecretProvider};
+use crate::session;
 use crate::value::{Credential, SecretValue};
 use anyhow::Context as _;
 use std::collections::BTreeMap;
@@ -113,6 +114,34 @@ impl AmbientIdentity {
 #[derive(Debug)]
 pub struct OidcProvider {
     client: reqwest::Client,
+    /// The ID token a stored session last produced, per
+    /// `(issuer, client_id, audience)`.
+    ///
+    /// In memory only, for the life of the request — the assertion is a
+    /// credential and nothing but the refresh token is ever written down. It
+    /// exists because every refresh may *rotate* the stored token: without it a
+    /// run with ten descriptors would burn ten rotations, and any two of them
+    /// racing is how the next build finds a refresh token the IdP has already
+    /// invalidated.
+    ///
+    /// The audience is in the key because it is in the token: two descriptors
+    /// asking for different audiences must not share one assertion.
+    assertions: tokio::sync::Mutex<BTreeMap<String, CachedAssertion>>,
+}
+
+/// One issuer's assertion and when it stops being usable.
+struct CachedAssertion {
+    token: String,
+    expiry: Expiry,
+}
+
+/// The token is a live credential; only its clock is printable.
+impl std::fmt::Debug for CachedAssertion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedAssertion")
+            .field("expiry", &self.expiry)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for OidcProvider {
@@ -128,6 +157,7 @@ impl OidcProvider {
                 .timeout(HTTP_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
+            assertions: tokio::sync::Mutex::default(),
         }
     }
 }
@@ -144,27 +174,33 @@ impl SecretProvider for OidcProvider {
         identity: &Identity,
         acquire: &Acquire,
     ) -> anyhow::Result<Credential> {
-        let Some(ambient) = AmbientIdentity::detect(ctx.env) else {
-            anyhow::bail!(
-                "secret {}: no ambient workload identity on this machine.\n  In GitHub Actions \
-                 this means the job is missing `permissions: id-token: write` — without it the \
-                 request variables are simply absent, which is why this is not an authorization \
-                 error.\n  On a laptop, give the descriptor an `acquire` entry that uses a \
-                 vendor CLI you are already signed into.",
-                ctx.addr
-            );
+        // CI first: an ambient workload identity is scoped to the job, so it is
+        // strictly better than a session when both exist.
+        let token = match AmbientIdentity::detect(ctx.env) {
+            Some(ambient) => ambient
+                .id_token(&self.client, identity.audience.as_deref())
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}",
+                        ctx.redactor
+                            .redact_str(&format!("secret {}: {e:#}", ctx.addr))
+                    )
+                })?,
+            // Redacted on the same terms as the ambient arm: nothing in this
+            // path carries a credential today, and the asymmetry is what a
+            // future edit trips over.
+            None => self
+                .session_assertion(ctx, identity.audience.as_deref())
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}",
+                        ctx.redactor
+                            .redact_str(&format!("secret {}: {e:#}", ctx.addr))
+                    )
+                })?,
         };
-
-        let token = ambient
-            .id_token(&self.client, identity.audience.as_deref())
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "{}",
-                    ctx.redactor
-                        .redact_str(&format!("secret {}: {e:#}", ctx.addr))
-                )
-            })?;
 
         // The assertion on its own is not a credential. Every step consumes what
         // the last produced, so a two-hop federation is a list rather than a
@@ -190,6 +226,113 @@ impl SecretProvider for OidcProvider {
 }
 
 impl OidcProvider {
+    /// Present the identity `heph auth login` established.
+    ///
+    /// The laptop half of the same descriptor CI runs: one refresh-token grant,
+    /// producing an ID token that goes through the very same exchange pipeline.
+    /// Nothing here is interactive — when there is no session, or the grant is
+    /// gone, it fails immediately naming the command that fixes it.
+    async fn session_assertion(
+        &self,
+        ctx: &MintCtx<'_>,
+        audience: Option<&str>,
+    ) -> anyhow::Result<String> {
+        // One message for one condition, shared with `heph auth login` — the
+        // same problem reported two different ways is how it becomes two
+        // problems in the reader's head.
+        let auth = ctx
+            .auth
+            .ok_or_else(|| anyhow::anyhow!("{}", session::no_auth_block("`.hephconfig`")))?;
+        let key = session::key_of(&[
+            &auth.config.issuer,
+            &auth.config.client_id,
+            audience.unwrap_or_default(),
+        ]);
+
+        // One issuer at a time, for the whole request. The lock is held across
+        // the refresh deliberately: it is what stops ten descriptors minting at
+        // once from rotating the stored token ten times.
+        let mut cache = self.assertions.lock().await;
+        // `stale_at`, deliberately not `has_handout_headroom`. That predicate
+        // asks "is this worth giving to a target that will then run for a
+        // while", and conflating the two is the bug `crate::expiry` was split
+        // to fix: this assertion never leaves `mint` — it is consumed by
+        // `run_exchange` microseconds later — so a five-minute ID token, which
+        // is Keycloak's default, would otherwise never hit the cache at all.
+        if let Some(hit) = cache.get(&key)
+            && !hit.expiry.stale_at(ctx.now)
+        {
+            return Ok(hit.token.clone());
+        }
+
+        let fresh = self.refresh_session(ctx, auth, audience).await?;
+        let token = fresh.token.clone();
+        cache.insert(key, fresh);
+        Ok(token)
+    }
+
+    /// Trade the stored refresh token for an ID token.
+    ///
+    /// The locking, the re-read and the write-back of a rotated token all live
+    /// in [`session::refresh_locked`] — the same call `heph auth login` and
+    /// `heph auth status` make, so what a build does and what the CLI reports
+    /// can never diverge.
+    async fn refresh_session(
+        &self,
+        ctx: &MintCtx<'_>,
+        auth: &AuthContext,
+        audience: Option<&str>,
+    ) -> anyhow::Result<CachedAssertion> {
+        let tokens = session::refresh_locked(
+            &self.client,
+            &auth.config,
+            &auth.home,
+            audience,
+            ctx.now,
+            ctx.ctoken,
+        )
+        .await
+        .map_err(|e| {
+            // The ordinary end of a session, not an outage. Saying so is the
+            // difference between "log in again" and "the IdP is down".
+            if session::is_invalid_grant(&e) {
+                return anyhow::anyhow!(
+                    "the session for {} is no longer valid — run `heph auth login`",
+                    auth.config.issuer
+                );
+            }
+            e
+        })?;
+
+        let assertion = tokens.assertion()?.to_string();
+
+        // Asking for an audience is not the same as getting one. Most IdPs
+        // ignore an `audience` parameter on a refresh and hand back an ID token
+        // whose `aud` is the client id — which the exchange then presents, and
+        // the cloud rejects with an error naming itself and never the audience.
+        // Better to fail here, where the two values can be shown side by side.
+        if let Some(want) = audience {
+            let got = crate::jwt::audiences_of(&assertion);
+            if !got.is_empty() && !got.iter().any(|a| a == want) {
+                anyhow::bail!(
+                    "the descriptor asks for audience `{want}`, but {} issued an ID token for \
+                     [{}] — this IdP does not honour an audience on the refresh grant. Either \
+                     drop `audience` from the identity and let the exchange step set it, or use \
+                     an `acquire` entry whose provider can mint the audience directly.",
+                    auth.config.issuer,
+                    got.join(", ")
+                );
+            }
+        }
+
+        // The ID token's own `exp` when it has one, so the cache above expires
+        // with the token rather than on a guess.
+        Ok(CachedAssertion {
+            expiry: Expiry::resolve(ctx.now, None, Some(&assertion), None),
+            token: assertion,
+        })
+    }
+
     /// Resolve an [`Endpoint`] to a concrete token endpoint.
     ///
     /// The discovery form fetches `{issuer}/.well-known/openid-configuration`
@@ -726,38 +869,168 @@ mod tests {
         assert!(xml_text(body, "Missing").is_none());
     }
 
-    /// A laptop has no ambient identity, and the message has to say what to do
-    /// rather than reporting an authorization failure that did not happen.
-    #[tokio::test]
-    async fn no_ambient_identity_names_the_two_ways_out() {
-        let token = hcore::hasync::StdCancellationToken::new();
-        let redactor = crate::redact::Redactor::inert();
-        let env = env_of(&[]);
-        let ctx = MintCtx {
+    fn ctx_with<'a>(
+        env: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
+        token: &'a hcore::hasync::StdCancellationToken,
+        redactor: &'a crate::redact::Redactor,
+        auth: Option<&'a AuthContext>,
+    ) -> MintCtx<'a> {
+        MintCtx {
             addr: "//infra/creds:ecr",
             now: std::time::SystemTime::UNIX_EPOCH,
-            env: &env,
-            ctoken: &token,
+            env,
+            ctoken: token,
             request_id: "req",
             runner: None,
             cwd: std::path::Path::new("."),
-            redactor: &redactor,
-        };
+            redactor,
+            auth,
+        }
+    }
+
+    fn oidc_acquire() -> Acquire {
+        Acquire {
+            when_env: None,
+            source: crate::descriptor::Source::Oidc {},
+            exchange: vec![Exchange::AwsSts { endpoint: None }],
+            ttl: None,
+        }
+    }
+
+    /// No ambient identity *and* no configured IdP: the message has to name
+    /// both ways out rather than reporting an authorization failure that never
+    /// happened.
+    #[tokio::test]
+    async fn with_no_identity_and_no_auth_block_both_routes_are_named() {
+        let token = hcore::hasync::StdCancellationToken::new();
+        let redactor = crate::redact::Redactor::inert();
+        let env = env_of(&[]);
         let err = OidcProvider::new()
             .mint(
-                &ctx,
+                &ctx_with(&env, &token, &redactor, None),
                 &Identity::default(),
-                &Acquire {
-                    when_env: None,
-                    source: crate::descriptor::Source::Oidc {},
-                    exchange: vec![Exchange::AwsSts { endpoint: None }],
-                    ttl: None,
-                },
+                &oidc_acquire(),
             )
             .await
-            .expect_err("no ambient identity");
+            .expect_err("no identity");
         let msg = format!("{err:#}");
         assert!(msg.contains("id-token: write"), "{msg}");
-        assert!(msg.contains("acquire"), "{msg}");
+        assert!(msg.contains("heph auth login"), "{msg}");
+    }
+
+    /// A configured workspace on a machine nobody has signed in on. It must
+    /// fail *before* touching the network — a build that hangs on an
+    /// unreachable IdP to discover it was never logged in is the worst of both.
+    #[tokio::test]
+    async fn a_configured_workspace_with_no_session_says_to_log_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = AuthContext {
+            config: auth_config("https://unreachable.invalid"),
+            home: dir.path().to_path_buf(),
+        };
+        let token = hcore::hasync::StdCancellationToken::new();
+        let redactor = crate::redact::Redactor::inert();
+        let env = env_of(&[]);
+        let err = OidcProvider::new()
+            .mint(
+                &ctx_with(&env, &token, &redactor, Some(&auth)),
+                &Identity::default(),
+                &oidc_acquire(),
+            )
+            .await
+            .expect_err("no session");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not signed in"), "{msg}");
+        assert!(msg.contains("heph auth login"), "{msg}");
+    }
+
+    /// An expired refresh token is the ordinary end of a session, so it reads
+    /// as one — and, like the case above, without a network round trip.
+    #[tokio::test]
+    async fn an_expired_session_says_to_log_in_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = auth_config("https://unreachable.invalid");
+        crate::session::Session {
+            issuer: config.issuer.clone(),
+            client_id: config.client_id.clone(),
+            refresh_token: "rt".into(),
+            subject: Some("alice".into()),
+            expires_at: Some(std::time::SystemTime::UNIX_EPOCH),
+            updated_at: None,
+        }
+        .store(dir.path())
+        .expect("store");
+
+        let auth = AuthContext {
+            config,
+            home: dir.path().to_path_buf(),
+        };
+        let token = hcore::hasync::StdCancellationToken::new();
+        let redactor = crate::redact::Redactor::inert();
+        let env = env_of(&[]);
+        let err = OidcProvider::new()
+            .mint(
+                &ctx_with(&env, &token, &redactor, Some(&auth)),
+                &Identity::default(),
+                &oidc_acquire(),
+            )
+            .await
+            .expect_err("expired");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("expired"), "{msg}");
+        assert!(msg.contains("heph auth login"), "{msg}");
+    }
+
+    /// CI wins when both exist: an ambient identity is scoped to the job, so
+    /// falling back to a developer's personal session there would run the build
+    /// as the wrong principal.
+    #[tokio::test]
+    async fn an_ambient_identity_is_preferred_over_a_stored_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = auth_config("https://unreachable.invalid");
+        crate::session::Session {
+            issuer: config.issuer.clone(),
+            client_id: config.client_id.clone(),
+            refresh_token: "rt".into(),
+            subject: Some("alice".into()),
+            expires_at: None,
+            updated_at: None,
+        }
+        .store(dir.path())
+        .expect("store");
+
+        let auth = AuthContext {
+            config,
+            home: dir.path().to_path_buf(),
+        };
+        let token = hcore::hasync::StdCancellationToken::new();
+        let redactor = crate::redact::Redactor::inert();
+        // An unroutable endpoint: reaching it at all is the assertion, and what
+        // it reports is that the *ambient* route was taken.
+        let env = env_of(&[
+            ("ACTIONS_ID_TOKEN_REQUEST_URL", "http://127.0.0.1:1/token"),
+            ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "bearer"),
+        ]);
+        let err = OidcProvider::new()
+            .mint(
+                &ctx_with(&env, &token, &redactor, Some(&auth)),
+                &Identity::default(),
+                &oidc_acquire(),
+            )
+            .await
+            .expect_err("unroutable");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("github actions"), "{msg}");
+        assert!(!msg.contains("heph auth login"), "{msg}");
+    }
+
+    fn auth_config(issuer: &str) -> crate::session::AuthConfig {
+        crate::session::AuthConfig {
+            issuer: issuer.to_string(),
+            client_id: "client".into(),
+            scopes: vec!["openid".into(), "offline_access".into()],
+            audience: None,
+            redirect_ports: Vec::new(),
+        }
     }
 }

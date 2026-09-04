@@ -304,7 +304,12 @@ pub struct RequestStateData {
     /// the life of a `RequestState` and has no expiry — a credential has a
     /// clock on it, so the broker keeps a cache of its own with real TTL
     /// semantics.
-    pub(crate) broker: std::sync::OnceLock<Arc<hsecrets::broker::Broker>>,
+    /// Paired with the guard that stops its background refresh sweep: dropping
+    /// the request stops the sweep, so no task outlives the run it belongs to.
+    pub(crate) broker: std::sync::OnceLock<(
+        Arc<hsecrets::broker::Broker>,
+        hsecrets::broker::RefreshGuard,
+    )>,
     pub mem_spec: Memoizer<AddrKey, Result<Arc<EngineTargetSpec>, ArcErr>>,
     pub mem_def: Memoizer<AddrKey, Result<Arc<ExtendedTargetDef>, ArcErr>>,
     pub mem_expanded_inputs:
@@ -637,16 +642,35 @@ impl RequestState {
     ///
     /// One per run, so every target naming `//infra/creds:ecr` shares a single
     /// mint — which is the difference between one STS call and one per target.
+    /// Also starts the background refresh sweep, which is what keeps a long
+    /// build from handing target 900 a credential minted for target 1. Started
+    /// here rather than at engine construction so it exists only for runs that
+    /// actually hold credentials — the sweep is one wakeup a minute, but a run
+    /// with no secrets should not pay even that.
     pub(crate) fn broker(&self) -> Arc<hsecrets::broker::Broker> {
-        Arc::clone(self.data.broker.get_or_init(|| {
+        let (broker, _guard) = self.data.broker.get_or_init(|| {
             let registry = hsecrets::provider::ProviderRegistry::with_builtins()
-                // The builtins are two `register` calls on an empty registry;
+                // The builtins are three `register` calls on an empty registry;
                 // the only way this fails is a duplicate, which cannot happen
                 // for a set this code owns. An empty registry still reports a
                 // useful "no provider registered" per descriptor.
                 .unwrap_or_default();
-            Arc::new(hsecrets::broker::Broker::new(Arc::new(registry)))
-        }))
+            let broker = Arc::new(hsecrets::broker::Broker::new(Arc::new(registry)));
+
+            let cfg = self.data.engine.upgrade().map(|e| e.cfg.clone());
+            let guard = broker.spawn_refresher(hsecrets::broker::RefreshConfig {
+                env: Arc::new(|k: &str| std::env::var(k).ok()),
+                ctoken: Arc::new(self.data.ctoken.clone()),
+                request_id: self.data.request_id.clone(),
+                cwd: cfg
+                    .as_ref()
+                    .map(|c| c.root.clone())
+                    .unwrap_or_else(std::env::temp_dir),
+                auth: cfg.and_then(|c| c.auth.clone()),
+            });
+            (broker, guard)
+        });
+        Arc::clone(broker)
     }
 
     pub fn ctoken(&self) -> &StdCancellationToken {

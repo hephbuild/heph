@@ -56,6 +56,7 @@ async fn mint(desc: &Descriptor, env: &[(&str, &str)]) -> anyhow::Result<String>
         request_id: "test",
         runner: None,
         cwd: std::path::Path::new("."),
+        auth: None,
     };
     let cred = broker.mint(desc, "c", &ctx).await?;
     Ok(cred.resolve_pointer("$.")?.expose().to_string())
@@ -151,6 +152,7 @@ target(
                 request_id: "test",
                 runner: None,
                 cwd: std::path::Path::new("."),
+                auth: None,
             },
         )
         .await?;
@@ -201,6 +203,7 @@ target(
                 request_id: "test",
                 runner: None,
                 cwd: std::path::Path::new("."),
+                auth: None,
             },
         )
         .await?;

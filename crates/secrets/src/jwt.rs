@@ -78,6 +78,26 @@ pub fn expiry_of(token: &str) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_secs(exp))
 }
 
+/// Read the `aud` claim, which RFC 7519 allows to be a string or an array.
+///
+/// Used to *verify what we asked for was granted*, never to grant anything: an
+/// exchange that presents a token with the wrong audience fails at the far end
+/// with an error that names the cloud and never mentions the audience, so the
+/// check is worth making here where the answer is legible.
+pub fn audiences_of(token: &str) -> Vec<String> {
+    let Some(claims) = claims(token) else {
+        return Vec::new();
+    };
+    match claims.get("aud") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Read the `sub` claim, for a token heph obtained itself.
 ///
 /// The name carries the contract because the type cannot: there is no way to
@@ -100,6 +120,20 @@ pub fn subject_of_trusted(token: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 7519 §4.1.3 allows either form, and IdPs emit both.
+    #[test]
+    fn the_audience_reads_as_a_string_or_an_array() {
+        assert_eq!(audiences_of(&make(r#"{"aud":"one"}"#)), vec!["one"]);
+        assert_eq!(
+            audiences_of(&make(r#"{"aud":["one","two"]}"#)),
+            vec!["one", "two"]
+        );
+        // Absence and nonsense are both "we learned nothing", not a claim.
+        assert!(audiences_of(&make(r#"{"sub":"alice"}"#)).is_empty());
+        assert!(audiences_of(&make(r#"{"aud":42}"#)).is_empty());
+        assert!(audiences_of("not-a-jwt").is_empty());
+    }
 
     fn make(payload: &str) -> String {
         format!(

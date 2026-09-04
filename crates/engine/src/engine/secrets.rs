@@ -110,6 +110,7 @@ impl Engine {
             request_id: rs.request_id(),
             runner: None,
             cwd: &self.cfg.root,
+            auth: self.cfg.auth.as_ref(),
         };
         rs.broker().mint(&secret.desc, &secret.name, &ctx).await?;
         Ok(())
@@ -215,6 +216,7 @@ impl Engine {
             // is not wired yet; a helper runs local until it is.
             runner: None,
             cwd: &self.cfg.root,
+            auth: self.cfg.auth.as_ref(),
         };
 
         let mut creds = Vec::with_capacity(resolved.len());

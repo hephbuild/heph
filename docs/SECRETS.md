@@ -645,14 +645,120 @@ Revocation is mostly "rotate at the IdP", because nothing durable exists on the
 heph side: values live in a sandbox that is scrubbed the moment the process is
 done with it.
 
+## Signing in a laptop: `heph auth login`
+
+CI hands a job an ambient workload identity; a laptop has none. `heph auth
+login` gives it one of the same kind, so a single `oidc` declaration works in
+both places instead of a laptop needing its own arrangement.
+
+The workspace commits where to sign in — it holds no secret, because a CLI is a
+public client (RFC 8252 §8.5) and PKCE replaces the client secret:
+
+```yaml
+# .hephconfig
+auth:
+  issuer: https://org.okta.com/oauth2/default
+  clientId: 0oa8f3k2mQvR1nZx5d7
+```
+
+`scopes` defaults to `openid profile email offline_access`. **`offline_access`
+is the one that matters**: without it most IdPs return no refresh token, so
+every build session would need the browser again. `heph auth login` warns by
+name rather than leaving that to be discovered. `audience` and `redirectPorts`
+are there for IdPs that require them.
+
+```
+heph auth login                 # opens a browser (RFC 8252 loopback + PKCE-S256)
+heph auth login --device-code   # no browser: a code to enter elsewhere (RFC 8628)
+heph auth status                # what identity this machine has; non-zero if none
+heph auth logout                # forget the token here — not revoked at the IdP
+heph auth status --all          # every session on this machine, offline
+heph auth logout --all          # and forget all of them
+```
+
+`--json` on any of them puts an object on stdout and **nothing else** — every
+progress line moves to stderr — so `heph auth login --json | jq` works. Every
+outcome is an object naming a state (`ambient`, `active`, `expired`, `none`), and
+`login` reports `changed` so an agent can tell a fresh sign-in from a no-op.
+
+`status` reports the identity a *build* would use, not the file on disk: an
+ambient CI identity first, then the session — and the session is **probed**, not
+merely read. That matters because most IdPs never send `refresh_expires_in`, so
+a revoked grant is indistinguishable on disk from a live one. `login` probes on
+the same terms, which is what stops the loop where every error says "run `heph
+auth login`" and `heph auth login` replies "already signed in".
+
+`--all` exists because sessions are keyed by `(issuer, client_id)`. The day an
+org rotates either, the old file becomes unreachable through the workspace
+config — and still holds a live refresh token. Both `--all` forms work offline
+and outside a workspace, which is where cleanup happens.
+
+### For whoever administers the IdP
+
+Register heph as a **public client** (no client secret) and hand back the issuer
+and client id. Then:
+
+- **Redirect URIs.** Either allow arbitrary loopback ports (RFC 8252 §7.3) and
+  register `http://127.0.0.1/callback`, or register the three exact URIs
+  `http://127.0.0.1:47113/callback`, `:47114`, `:47115` — and keep
+  `redirectPorts` aligned with whatever you register. A URI registered on a
+  different port is the most common first-run failure; `heph auth login` prints
+  the exact URI it is waiting on, before the browser opens, for this reason.
+  Use the literal IP, never `localhost`: some IdPs treat them as different
+  registrations.
+- **Refresh grant**, or `offline_access` returns no token and every build
+  session needs the browser again.
+- **Device grant**, if anyone will use `--device-code`. Without a published
+  `device_authorization_endpoint` heph says so by name rather than failing
+  obscurely.
+
+On a remote shell the loopback flow cannot work — the browser is on a different
+machine and cannot reach `127.0.0.1` on this one. `heph auth login` detects that
+(`$SSH_CONNECTION`, or Linux with no display) and points at `--device-code`
+before opening anything.
+
+### What is stored
+
+**One refresh token**, in a mode-0600 file under `$HOME/.heph/auth`, named by a
+hash of `(issuer, client_id)`. That is the whole durable footprint: no access
+tokens, no cloud credentials, nothing under `~/.aws` or `~/.docker`, and nothing
+inside a workspace, a `.heph3`, or a sandbox. It is per-user rather than
+per-checkout on purpose — a session is a property of the person, so it survives
+`heph clean` and is shared by every worktree.
+
+A **file on all three supported targets**, deliberately, rather than the OS
+keychain where one exists. A keychain is stronger at rest on macOS and on a
+Linux desktop; it also makes *where a credential lives* depend on whether the
+machine happens to have a D-Bus session, which is how "works on my desktop,
+prompts forever on the build box" starts. One code path and one failure mode was
+judged worth more than the stronger locker on two of three configurations. The
+trade, stated rather than assumed: **a token there is readable by any process
+running as you.**
+
+### Nothing in a build is ever interactive
+
+That is why this is a command and not something the provider does. A build that
+opens a browser at target 400 of 900 is an ambush for a human and a silent hang
+for an agent. `oidc` only ever *presents* an identity that already exists:
+
+- ambient CI identity if there is one — it is scoped to the job, so it wins
+  whenever both exist;
+- otherwise the stored session, refreshed non-interactively;
+- otherwise an immediate failure naming `heph auth login`.
+
+The refresh happens once per run per `(issuer, client id, audience)`, under a
+lock file, and the ID token it yields is held in memory only. Both halves of that matter: most IdPs
+**rotate** the refresh token on use and invalidate the one presented, so two
+builds refreshing concurrently would each store a token the other had already
+spent — and the failure would land on the *next* build, the one that changed
+nothing.
+
+A laptop can still skip all of this and point an `acquire` entry at a vendor CLI
+it is already signed into, which needs no IAM ask at all.
+
 ## What is not built yet
 
-`heph auth login` — the PKCE loopback flow that gives a laptop a workload
-identity of the same kind CI has. Until it lands, a laptop federates by pointing
-an `acquire` entry at a vendor CLI it is already signed into, which is the
-interim the adoption path recommends anyway and needs no IAM ask.
-
-Also unbuilt: mid-target credential refresh, which needs a process credential the
+Mid-target credential refresh, which needs a process credential the
 tool re-reads (`credential_process`, `GOAUTH=command`, a git
 `credential.helper`).
 
