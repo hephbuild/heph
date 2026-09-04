@@ -359,14 +359,11 @@ target(
 // ------------------------------------------------------- not wired yet, and
 // ------------------------------------------------------- the error says so
 
-/// `oidc` declares and validates, and then has nowhere to go: no provider is
-/// registered for it in this release.
-///
-/// Pinned as a test because the gap is the kind that is easy to describe in a
-/// document and easy to forget in code. When the `oidc` provider lands, this
-/// test fails and is the reminder to update the docs with it.
+/// `oidc` is registered now, so the failure a laptop gets is "no ambient
+/// workload identity" rather than "no provider" — and it names the two ways
+/// out, because a build that cannot federate needs to know which it is.
 #[tokio::test]
-async fn oidc_parses_but_has_no_provider_registered_yet() -> anyhow::Result<()> {
+async fn oidc_without_an_ambient_identity_says_what_to_do() -> anyhow::Result<()> {
     let desc = declare(
         r#"
 target(
@@ -382,10 +379,16 @@ target(
     .await?;
     desc.validate()?;
 
-    let err = mint(&desc, &[]).await.expect_err("oidc ships separately");
+    let err = mint(&desc, &[])
+        .await
+        .expect_err("no ambient identity in a test");
     let msg = format!("{err:#}");
-    assert!(msg.contains("Oidc"), "{msg}");
-    assert!(msg.contains("no secret provider registered"), "{msg}");
+    assert!(msg.contains("no ambient workload identity"), "{msg}");
+    // The GitHub Actions case is the one people hit, and its cause is a missing
+    // permissions block rather than an authorization failure.
+    assert!(msg.contains("id-token: write"), "{msg}");
+    // And the laptop case, which is what the adoption path recommends.
+    assert!(msg.contains("acquire"), "{msg}");
     Ok(())
 }
 

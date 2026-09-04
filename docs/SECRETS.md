@@ -564,13 +564,97 @@ Two defaults are frozen the moment this ships, since changing a default breaks
 BUILD files that already exist: `shape` defaults to `["file"]`, and
 `aws_profile`'s `profile` defaults to `default`.
 
+## Policy: `allow`
+
+Which targets may *hold* a credential is a line in the same reviewed file that
+declares it:
+
+```python
+allow = "//svc/... + label(deploy)"
+```
+
+An ordinary target query. Omit it to permit any target. Access control without a
+new ACL system: which credentials exist is CODEOWNERS on the declaring package,
+and which targets may use one is this.
+
+**It is checked on the effective set** — what a target holds after transitive
+merging, not what it declared. Anything else lets a dependency launder a
+credential past its own policy onto a consumer that names nothing. When that
+happens the message carries the chain, because otherwise a reader is told their
+target may not hold a credential they have never heard of.
+
+`allow` is unhashed: it decides whether a build is *permitted*, not what it
+computes, so editing a policy invalidates nothing.
+
+## Credentials travel with dependencies
+
+A credential is usually a property of a *dependency*. Whatever pulls a private
+module needs the GitHub credential because of what it depends on — and for
+generated targets, which nobody authors, a transitive contribution is the only
+way one can arrive at all.
+
+```python
+target(name = "lib", driver = "bash", …,
+       transitive = {"secrets": {"github": "//infra/creds:github"}})
+```
+
+Three rules:
+
+- **Same name, same descriptor** — merges silently. Two deps needing one
+  credential is the common case.
+- **Same name, different descriptors** — an error naming both chains. Worse than
+  a slot collision, because the name is what the command references and neither
+  party appears at the failing target's call site.
+- **The target's own declaration wins.** That resembles the silent overwrite the
+  slot rule refuses and is not: here one of the two is written in the target
+  itself, and it is the escape hatch when a dependency's choice is wrong for one
+  consumer.
+
+An inherited credential reaches the consumer's cache key exactly like a declared
+one — otherwise the identity a target built under is not in its key.
+
+## `heph auth`
+
+```
+heph auth show //svc:push        # what it holds, where each shape writes
+heph auth check //...            # mint everything, drop it, report failures
+```
+
+`show` never mints, so it is safe to run anywhere, and it is where a slot
+collision is seen before it is hit. It is also the visibility half of a bargain:
+the design says a credential-bearing target stays cacheable and *the author
+configures*, which is only fair to ask of someone who can see what they are
+configuring — so `show` flags the credential-bearing-and-remotely-cached
+combination that warrants a decision.
+
+`check` mints and immediately drops, deduped by descriptor. On a warm workspace
+it is the only thing that ever validates the credential path, since a cache hit
+mints nothing.
+
+There is deliberately no `token` subcommand: printing a minted credential is how
+it reaches scrollback, shell history and a pasted bug report.
+
+## The audit trail
+
+Every mint emits a `SecretGranted` event: which descriptor, for which target, by
+which route, and how long the value lives. **Never the value, and never the
+subject** — a build log is not the place for either, and nothing an incident
+needs is missing without them.
+
+Revocation is mostly "rotate at the IdP", because nothing durable exists on the
+heph side: values live in a sandbox that is scrubbed the moment the process is
+done with it.
+
 ## What is not built yet
 
-This document describes the design in full; the tree currently implements the
-declaration and the broker. Still to land: consumer wiring (`secrets = {…}` on a
-target), sandbox delivery of the well-known shapes, the transitive `Sandbox`
-field, `cache.subject_scoped`, the `oidc` provider and `heph auth`. See the
-design proposal for the phasing.
+`heph auth login` — the PKCE loopback flow that gives a laptop a workload
+identity of the same kind CI has. Until it lands, a laptop federates by pointing
+an `acquire` entry at a vendor CLI it is already signed into, which is the
+interim the adoption path recommends anyway and needs no IAM ask.
+
+Also unbuilt: mid-target credential refresh, which needs a process credential the
+tool re-reads (`credential_process`, `GOAUTH=command`, a git
+`credential.helper`).
 
 **Do not assume that work needs an `ABI_SEMVER` bump.** `TargetDef` crosses the
 plugin seam on the *cold prost path* (`plugin-abi/src/convert.rs`), where

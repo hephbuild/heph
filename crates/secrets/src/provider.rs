@@ -131,6 +131,7 @@ impl ProviderRegistry {
         let mut r = Self::default();
         r.register(Arc::new(StaticEnvProvider))?;
         r.register(Arc::new(ExecProvider))?;
+        r.register(Arc::new(crate::oidc::OidcProvider::new()))?;
         Ok(r)
     }
 
@@ -150,12 +151,7 @@ impl ProviderRegistry {
         self.providers
             .iter()
             .find(|p| p.kind() == kind)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no secret provider registered for {kind:?}. The `oidc` provider ships \
-                     separately from the exec and static_env builtins."
-                )
-            })
+            .ok_or_else(|| anyhow::anyhow!("no secret provider registered for {kind:?}."))
     }
 }
 
@@ -815,14 +811,24 @@ mod tests {
         assert!(err.to_string().contains("already registered"), "{err}");
     }
 
+    /// All three builtins are registered; a registry that is missing one names
+    /// which, rather than failing wherever the gap first bites.
     #[test]
-    fn an_unregistered_provider_says_which_one_is_missing() {
-        let r = ProviderRegistry::with_builtins().expect("builtins");
-        assert!(r.get(ProviderKind::Exec).is_ok(), "exec is a builtin");
-        let err = r
+    fn every_builtin_provider_is_registered_and_a_gap_is_named() {
+        let full = ProviderRegistry::with_builtins().expect("builtins");
+        for kind in [
+            ProviderKind::StaticEnv,
+            ProviderKind::Exec,
+            ProviderKind::Oidc,
+        ] {
+            assert!(full.get(kind).is_ok(), "{kind:?} is not registered");
+        }
+
+        let empty = ProviderRegistry::default();
+        let err = empty
             .get(ProviderKind::Oidc)
             .map(|_| ())
-            .expect_err("oidc ships separately");
+            .expect_err("an empty registry has none");
         assert!(err.to_string().contains("Oidc"), "{err}");
     }
 

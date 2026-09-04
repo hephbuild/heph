@@ -300,7 +300,7 @@ fn parse_docker_credential(
 ///
 /// `None` for anything unparseable, which falls through to the declared `ttl` —
 /// the same best-effort contract the JWT reader has.
-fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+pub(crate) fn parse_rfc3339(s: &str) -> Option<SystemTime> {
     chrono::DateTime::parse_from_rfc3339(s.trim())
         .ok()
         .map(SystemTime::from)

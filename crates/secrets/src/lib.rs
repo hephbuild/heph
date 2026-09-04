@@ -46,6 +46,8 @@
 //! - [`shape`] — how a value reaches a tool, and the merge-key collision rule.
 //! - [`expiry`] — where an expiry comes from, in precedence order.
 //! - [`jwt`] — a best-effort claim reader that reads but does not verify.
+//! - [`oidc`] — the federated provider: present an assertion, run the exchange
+//!   pipeline, never interactively.
 //! - [`protocol`] — the four helper wire formats, encode and decode.
 //! - [`render`] — writing a minted value where a tool will find it, and
 //!   scrubbing it off a sandbox that is kept for diagnostics.
@@ -63,6 +65,7 @@ pub mod broker;
 pub mod descriptor;
 pub mod expiry;
 pub mod jwt;
+pub mod oidc;
 pub mod protocol;
 pub mod provider;
 pub mod redact;

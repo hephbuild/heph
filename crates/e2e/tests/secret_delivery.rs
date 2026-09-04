@@ -626,3 +626,61 @@ async fn auth_show_reports_what_a_target_would_hold_without_minting() -> anyhow:
     assert_eq!(h.desc.identity.shape, vec!["netrc".to_string()]);
     Ok(())
 }
+
+/// The audit trail. "This token leaked, what now" needs an answer, and the
+/// event stream is where it belongs — which descriptor, for which target, by
+/// which route. **Never the value, and never the subject.**
+#[tokio::test]
+async fn a_grant_is_recorded_on_the_event_stream_without_the_value() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        r#"target(name = "tok", driver = "secret", provider = "exec", protocol = "raw",
+       ttl = "1h", helper = ["/bin/sh", "-c", "printf 'audited_%s_value' secret"])"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "use", driver = "bash", out = "o.txt",
+       secrets = {"tok": "//creds:tok"}, run = ["cat $SECRET_TOK > o.txt"])"#,
+    );
+
+    let events = ws.run_collecting_events("//app:use").await?;
+    let granted: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            heph::engine::event::BuildEventKind::SecretGranted {
+                addr,
+                secret,
+                name,
+                provider,
+                ttl_secs,
+                expiry_source,
+                ..
+            } => Some((
+                addr.clone(),
+                secret.clone(),
+                name.clone(),
+                provider.clone(),
+                *ttl_secs,
+                expiry_source.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    let g = granted.first().expect("a grant was recorded");
+    assert_eq!(g.0, "//app:use");
+    assert_eq!(g.1, "//creds:tok");
+    assert_eq!(g.2, "tok");
+    assert_eq!(g.3, "exec");
+    assert!(g.4 > 0, "the grant recorded no usable life");
+    assert_eq!(g.5, "declared ttl");
+
+    // The whole point: nothing on the stream carries the credential.
+    let rendered = format!("{events:?}");
+    assert!(
+        !rendered.contains("audited_secret_value"),
+        "a credential reached the event stream"
+    );
+    Ok(())
+}

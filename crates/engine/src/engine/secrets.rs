@@ -223,6 +223,40 @@ impl Engine {
                 .mint(&r.desc, &r.name, &ctx)
                 .await
                 .with_context(|| format!("{consumer} needs secret {}", r.desc.addr))?;
+
+            // The audit record. "This token leaked, what now" needs an answer,
+            // and the event stream is where it belongs — which descriptor, for
+            // which target, by which route, and how long it lives. Never the
+            // value and never the subject: a build log is not the place for
+            // either, and nothing an incident needs is missing without them.
+            //
+            // Emitted per consumer rather than per mint, deliberately. The
+            // broker dedupes minting, but *who held it* is the question an
+            // incident actually asks, and one line per descriptor would answer
+            // a different one.
+            let route = broker
+                .grants()
+                .await
+                .into_iter()
+                .rfind(|g| g.addr == r.desc.addr);
+            rs.emit(crate::engine::event::BuildEventKind::SecretGranted {
+                addr: consumer.format(),
+                secret: r.desc.addr.clone(),
+                name: r.name.clone(),
+                // From the grant, not from `acquire[0]`: a descriptor with two
+                // routes reports whichever one actually ran, which is the whole
+                // reason the route is recorded.
+                provider: route
+                    .as_ref()
+                    .map(|g| provider_name(g.provider))
+                    .unwrap_or("unknown")
+                    .to_string(),
+                acquire_index: route.as_ref().map(|g| g.acquire_index).unwrap_or_default(),
+                selected_by: route.as_ref().and_then(|g| g.selected_by.clone()),
+                ttl_secs: cred.expiry.usable_for(ctx.now).as_secs(),
+                expiry_source: cred.expiry.source.as_str().to_string(),
+            });
+
             creds.push(cred);
         }
 
@@ -249,6 +283,18 @@ impl Engine {
             "delivered credentials"
         );
         Ok(SecretDelivery { env, values })
+    }
+}
+
+/// The stable spelling of a provider, for the event stream.
+///
+/// A `Debug` rendering would be `StaticEnv` and would silently change if the
+/// variant were ever renamed — and this is a consumer-facing field.
+fn provider_name(kind: hsecrets::descriptor::ProviderKind) -> &'static str {
+    match kind {
+        hsecrets::descriptor::ProviderKind::StaticEnv => "static_env",
+        hsecrets::descriptor::ProviderKind::Exec => "exec",
+        hsecrets::descriptor::ProviderKind::Oidc => "oidc",
     }
 }
 

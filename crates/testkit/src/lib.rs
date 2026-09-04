@@ -145,6 +145,30 @@ impl Workspace {
         self.run_addr(addr).await
     }
 
+    /// Run a target and return every event the engine emitted.
+    ///
+    /// The stream is a consumer-facing surface — a hook reads it, a report is
+    /// built from it, and for credentials it is the audit trail — so what lands
+    /// on it deserves assertions rather than trust.
+    pub async fn run_collecting_events(
+        &self,
+        addr_str: &str,
+    ) -> anyhow::Result<Vec<heph::engine::event::BuildEvent>> {
+        let addr = parse_addr(addr_str)?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = self.engine.new_state_with_events(false, Some(tx));
+        let res = Arc::clone(&self.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+            .await;
+        // Drained after the run so the send half is closed and this terminates.
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        res.map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        Ok(events)
+    }
+
     /// Resolve a single addr restricted to a subset of its outputs — the exact
     /// path `heph run --output NAME` takes. Returns the engine error verbatim
     /// (e.g. "output not found") without the failure-registry rewrite, so callers
