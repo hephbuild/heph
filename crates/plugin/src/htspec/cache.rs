@@ -22,6 +22,32 @@ pub struct TargetSpecCache {
     pub remote: bool,
     /// How many cache revisions to retain for this target. Default 1.
     pub history: u32,
+    /// Key this target by *who ran the build*, as well as by its inputs.
+    ///
+    /// For the minority of targets whose result genuinely differs per person —
+    /// `go list` over private modules resolves the graph its credential could
+    /// see, so if access varies by person the answer does too.
+    ///
+    /// **It belongs to the consumer, not to the credential.** Whether a result
+    /// varies by who produced it is a property of what the target computes, not
+    /// of the credential it happens to hold, and the same credential routinely
+    /// feeds both kinds: one descriptor serves `go list`, whose module graph is
+    /// exactly what that token could see, and `gh release upload`, whose result
+    /// does not vary by person at all. A flag on the descriptor would force one
+    /// answer on both, and the answer anyone would pick is the conservative one
+    /// — needlessly partitioning the cache for every target that never needed
+    /// it.
+    ///
+    /// It lives in `cache` rather than as a field of its own for two reasons.
+    /// Its only observable effect is on cache sharing, so it belongs beside
+    /// `remote` and `history` where an author looks when thinking about exactly
+    /// that. And this knob is shared across drivers, so one field reaches every
+    /// driver that already takes it — including generated targets — instead of
+    /// being added to each driver's spec separately.
+    ///
+    /// Unset it contributes nothing to `hashin`, so a target that does not ask
+    /// for it hashes byte-identically to before this existed.
+    pub subject_scoped: bool,
 }
 
 impl Default for TargetSpecCache {
@@ -30,6 +56,7 @@ impl Default for TargetSpecCache {
             local: true,
             remote: true,
             history: 1,
+            subject_scoped: false,
         }
     }
 }
@@ -40,6 +67,7 @@ impl From<TargetSpecCache> for CacheConfig {
             enabled: c.local,
             remote_enabled: c.remote,
             history: c.history,
+            subject_scoped: c.subject_scoped,
         }
     }
 }
@@ -55,6 +83,8 @@ struct CacheDict {
     remote: bool,
     #[spec(default = 1u32, parse = parse_cache_history)]
     history: u32,
+    #[spec(default = false)]
+    subject_scoped: bool,
 }
 
 impl From<CacheDict> for TargetSpecCache {
@@ -63,6 +93,7 @@ impl From<CacheDict> for TargetSpecCache {
             local: d.local,
             remote: d.remote,
             history: d.history,
+            subject_scoped: d.subject_scoped,
         }
     }
 }
@@ -80,6 +111,9 @@ impl FromSpecValue for TargetSpecCache {
                 local: *b,
                 remote: *b,
                 history: 1,
+                // The bool shorthand is about caching on or off; a target that
+                // wants subject scoping says so in the dict form.
+                subject_scoped: false,
             }),
             Value::Map(_) => CacheDict::from_spec_value(v).map(TargetSpecCache::from),
             _ => anyhow::bail!("`cache` must be a bool or a dict"),
@@ -178,6 +212,7 @@ mod tests {
             local: true,
             remote: false,
             history: 3,
+            subject_scoped: false,
         }
         .into();
         assert!(cfg.enabled);

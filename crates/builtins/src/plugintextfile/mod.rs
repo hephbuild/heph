@@ -201,6 +201,8 @@ mod tests {
             stderr: None,
             sandbox_dir: sandbox_dir.to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         }
     }
 

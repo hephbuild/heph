@@ -110,6 +110,9 @@ message Frame {
     // call_function request crosses as raw CallFunctionRequest bytes (like
     // list/get); only the response rides a frame body.
     CallFunctionResponse call_function_resp = 55;
+    // list_secrets crosses as raw ListSecretsRequest bytes (like list/get);
+    // only the response rides a frame body.
+    ListSecretsResponse list_secrets_resp = 56;
 
     // host-exported callbacks (plugin->host request / host->plugin response)
     ResultRequest result_req = 40;

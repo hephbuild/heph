@@ -223,12 +223,52 @@ pub mod sandbox {
         pub tools: Vec<Tool>,
         pub deps: Vec<Dep>,
         pub env: HashMap<String, Env>,
+        /// Credentials a dependency contributes to everything above it.
+        ///
+        /// A credential is usually a property of a *dependency*, not of the
+        /// target that happens to sit on top of it: whatever pulls a private
+        /// module needs the GitHub credential because of what it depends on.
+        /// Requiring every consumer to restate `secrets = {…}` is boilerplate
+        /// that drifts when hand-written and impossible when it is not — the Go
+        /// plugin emits targets per directory, thousands of them, and nobody
+        /// authors those.
+        ///
+        /// Keyed by name, like `env`, because the name is what the command
+        /// references as `$SECRET_<NAME>`.
+        ///
+        /// **No `hash` flag**, unlike `Tool` and `Dep`: a descriptor is always
+        /// hashed, and offering the choice would offer a way to take the
+        /// identity a target built under *out* of its cache key — which is the
+        /// one thing this design cannot allow.
+        ///
+        /// `skip_serializing_if` is load-bearing rather than tidy: `Sandbox`
+        /// serializes into `hashin`, so a field that always emitted would
+        /// re-key every target with any transitive sandbox at all, on upgrade,
+        /// for nothing.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub secrets: HashMap<String, Secret>,
         // Membership indexes for O(log n) dedup. Derived from tools/deps; not
         // serialized so wire format and hashin bytes are unchanged.
         #[serde(skip)]
         tool_keys: BTreeSet<String>,
         #[serde(skip)]
         dep_keys: BTreeSet<String>,
+        /// Name collisions found while merging. Not serialized: derived state,
+        /// and emitting it would move every consumer's `hashin`.
+        #[serde(skip)]
+        secret_conflicts: Vec<(String, Secret, Secret)>,
+    }
+
+    /// A credential contributed to every target above a dependency.
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    pub struct Secret {
+        /// The `secret` target that declares how to obtain it.
+        pub r#ref: TargetAddr,
+        /// Provenance: the chain of dependencies that supplied this, built up
+        /// by `merge_sandbox` the same way `Tool` and `Dep` ids are. It is what
+        /// a collision or a policy failure has to name, since the target that
+        /// fails declared none of it.
+        pub id: String,
     }
 
     fn tool_key(t: &Tool) -> String {
@@ -286,12 +326,61 @@ pub mod sandbox {
             }
 
             self.env.extend(inbound.env);
+
+            // Not `extend`: last-wins is tolerable for an environment variable
+            // and not for a credential. The name is what the command
+            // references, so picking one silently changes what
+            // `$SECRET_<NAME>` resolves to without touching a line the author
+            // can see — and neither colliding party appears at the call site,
+            // because both arrived through dependencies.
+            //
+            // Same name, same descriptor is the common case (two deps both
+            // needing `//infra/creds:github`) and merges silently. Same name,
+            // different descriptors is recorded here and reported by
+            // `secret_conflicts`, so one merge can collect every conflict
+            // rather than failing on the first.
+            for (name, inbound_secret) in inbound.secrets {
+                let rewritten = Secret {
+                    id: format!("{}_secret_{}", id, inbound_secret.id),
+                    ..inbound_secret
+                };
+                match self.secrets.get(&name) {
+                    // Compared by rendered address: `TargetAddr` carries
+                    // output/filter selectors that do not change *which*
+                    // descriptor this is.
+                    Some(existing) if existing.r#ref.to_string() != rewritten.r#ref.to_string() => {
+                        self.secret_conflicts.push((
+                            name.clone(),
+                            existing.clone(),
+                            rewritten.clone(),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.secrets.insert(name, rewritten);
+                    }
+                }
+            }
+        }
+
+        /// Credentials that arrived under one name from two different
+        /// descriptors.
+        ///
+        /// Reported rather than returned from `merge_sandbox` so that one merge
+        /// can collect every conflict and the error can name them all — and so
+        /// the merge itself stays infallible, which every existing caller
+        /// depends on.
+        pub fn secret_conflicts(&self) -> &[(String, Secret, Secret)] {
+            &self.secret_conflicts
         }
     }
 
     impl Sandbox {
         pub fn empty(&self) -> bool {
-            self.tools.is_empty() && self.deps.is_empty() && self.env.is_empty()
+            self.tools.is_empty()
+                && self.deps.is_empty()
+                && self.env.is_empty()
+                && self.secrets.is_empty()
         }
     }
 
@@ -546,6 +635,24 @@ pub mod targetdef {
         pub enabled: bool,
         pub remote_enabled: bool,
         pub history: u32,
+        /// Fold the run's identity into this target's cache key.
+        ///
+        /// Keys on **who ran the build**, not on the credential's post-exchange
+        /// subject. That distinction is load-bearing: `hashin` is computed
+        /// before `execute`, while an exchanged subject only exists after a
+        /// mint — so hashing the latter would force every subject-scoped target
+        /// to mint before its own cache key existed, and a warm build would
+        /// mint once per target to discover it had nothing to do. The subject
+        /// of the token heph presents is knowable at the start of the run, and
+        /// is the better answer anyway: what "identity-dependent" turns on is
+        /// who is running the build.
+        ///
+        /// A welcome consequence: it is meaningful on a target holding no
+        /// credential at all, which is right — "my output depends on who ran
+        /// it" is a claim about the target, and credentials are merely its most
+        /// common cause.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub subject_scoped: bool,
     }
 
     impl CacheConfig {
@@ -558,6 +665,7 @@ pub mod targetdef {
                 enabled: true,
                 remote_enabled,
                 history: Self::DEFAULT_HISTORY,
+                subject_scoped: false,
             }
         }
 
@@ -567,6 +675,7 @@ pub mod targetdef {
                 enabled: false,
                 remote_enabled: false,
                 history: 0,
+                subject_scoped: false,
             }
         }
     }
@@ -1051,6 +1160,41 @@ pub struct RunRequest<'a, 'io> {
     /// Scratch caches to mount for this run, already locked and created by the
     /// host. Empty for the overwhelming majority of targets.
     pub scratch: Vec<ScratchMount>,
+    /// Environment the host rendered from this target's credentials.
+    ///
+    /// The driver's whole job is to merge these into the command's environment.
+    /// Everything else — reading the declarations, checking the slots, minting,
+    /// writing the files, scrubbing them off a failed sandbox — is the host's
+    /// and deliberately not visible here.
+    ///
+    /// Mostly *paths*: `$SECRET_<NAME>`, `HOME`, `AWS_SHARED_CREDENTIALS_FILE`,
+    /// `DOCKER_CONFIG`. A value appears only for a credential whose declaration
+    /// asked for the `env` shape, which is an explicit per-secret opt-in to that
+    /// exposure.
+    ///
+    /// These take precedence over an exec runner's `env`, following the
+    /// precedence `docs/EXEC_RUNNERS.md` already sets: a target that declares
+    /// something gets what it declared.
+    pub secret_env: Vec<(String, String)>,
+    /// `(name, value)` for every credential this target holds, **for redaction
+    /// only**.
+    ///
+    /// The driver's obligation is to mask these out of anything it writes to
+    /// `log.txt`, a sink, or the event stream, and to do nothing else with
+    /// them. They are here because redaction has to happen where the output is
+    /// produced: a driver that spawns its own process is the only thing that
+    /// sees that process's bytes.
+    ///
+    /// Plain data rather than a compiled matcher because this struct lives in
+    /// the plugin contract, which cannot depend on the credential crate without
+    /// a cycle — the credential crate already depends on it for its config
+    /// schema.
+    ///
+    /// A value appears here whatever shape delivered it, including one written
+    /// only to a file the driver never reads. That is deliberate: a tool that
+    /// reads a credential out of a file and then echoes it is exactly the
+    /// accident redaction exists for.
+    pub secret_values: Vec<(String, String)>,
 }
 /// Cleanup closure a driver returns for the engine to run after `cache_locally`.
 /// The FUSE/OS sandbox layers each supply their own teardown; the engine's

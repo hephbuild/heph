@@ -570,6 +570,7 @@ dependencies = [
  "parking_lot",
  "plugin",
  "rustc-hash",
+ "secrets",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1505,6 +1506,7 @@ dependencies = [
  "heph",
  "plugin-devenv",
  "plugin-oci",
+ "secrets",
  "serde_json",
  "sha2 0.10.9",
  "tar",
@@ -1591,6 +1593,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "sandboxfuse",
+ "secrets",
  "serde",
  "serde-jsonlines",
  "serde_json",
@@ -2288,6 +2291,7 @@ dependencies = [
  "rusqlite",
  "rustc-hash",
  "sandboxfuse",
+ "secrets",
  "selfupdate",
  "serde",
  "serde-jsonlines",
@@ -4128,6 +4132,7 @@ dependencies = [
  "model",
  "plugin",
  "proc",
+ "secrets",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5351,6 +5356,34 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "secrets"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "config",
+ "core",
+ "driver-support",
+ "execrunner",
+ "humantime",
+ "lock",
+ "model",
+ "plugin",
+ "proc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "security-framework"

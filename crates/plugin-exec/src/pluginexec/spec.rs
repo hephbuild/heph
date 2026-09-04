@@ -48,6 +48,18 @@ pub(crate) struct TargetSpec {
     pub runtime_pass_env: Vec<String>,
     /// Environment variables set at runtime only (not hashed).
     pub runtime_env: HashMap<String, String>,
+    /// Credentials this target needs, as name → `secret` target address.
+    ///
+    /// The name is what the command references as `$SECRET_<NAME>`, what a
+    /// shape's variables are derived from, and what appears in
+    /// `«redacted:NAME»`. The address names a `secret` target whose declaration
+    /// says how to obtain the value; nothing about the value itself is written
+    /// here or anywhere else in the build graph.
+    ///
+    /// Each becomes a `hashed: true, runtime: false` input — the `hash_deps`
+    /// shape — so the *identity* a target builds under reaches its cache key
+    /// while the value never does.
+    pub secrets: HashMap<String, String>,
     /// Exec runner this command runs under: a target address producing a
     /// `runner.json`. Absent (or the literal `"local"`) spawns on this host as
     /// before. The runner is a hashed dependency, so changing it changes this
@@ -93,6 +105,7 @@ mod tests {
             "runtime_pass_env",
             "runtime_env",
             "runner",
+            "secrets",
         ] {
             assert!(by_name.contains_key(key), "schema missing field `{key}`");
         }

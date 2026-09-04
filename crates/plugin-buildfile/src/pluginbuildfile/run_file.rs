@@ -583,6 +583,25 @@ fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
         }
     }
 
+    if let Some(v) = m.remove("secrets") {
+        // A credential every target above this one inherits. The common case is
+        // a library that pulls a private module: whatever depends on it needs
+        // the credential because of what it depends on, not because of anything
+        // it does itself. Restating that on every consumer drifts when
+        // hand-written and is impossible for generated targets.
+        for (name, addr) in parse_map_string_string(v).with_context(|| "parse `secrets`")? {
+            let r#ref = TargetAddr::parse(&addr, pkg)
+                .with_context(|| format!("parse transitive `secrets[{name}]`"))?;
+            sandbox.secrets.insert(
+                name.clone(),
+                hplugin::driver::sandbox::Secret {
+                    r#ref,
+                    id: format!("secret|{name}"),
+                },
+            );
+        }
+    }
+
     if let Some(v) = m.remove("pass_env") {
         for name in parse_strings(v).with_context(|| "parse `pass_env`")? {
             sandbox.env.insert(
@@ -830,7 +849,7 @@ pub(crate) fn target_base_fields() -> Vec<hplugin::driver::DriverField> {
                 ParamType::list(ParamType::String),
                 ParamType::map(ParamType::list(ParamType::String)),
             ])),
-            "Sandbox applied transitively: `deps`, `tools`, `env`, `pass_env`, `runtime_pass_env`, `runtime_env`.",
+            "Sandbox applied transitively: `deps`, `tools`, `env`, `pass_env`, `runtime_pass_env`, `runtime_env`, `secrets`.",
             false,
         ),
         f(

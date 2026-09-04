@@ -60,6 +60,65 @@ fn filter_impl(env: &mut Vec<(String, String)>, args_len: i64, maxl: i64) {
     while env_byte_length(env) + args_len >= maxl && remove_longest(env) {}
 }
 
+/// [`filter_long_env`], with a set of variables that must never be evicted.
+///
+/// Eviction is a reasonable answer for an environment that merely got large. It
+/// is the wrong answer for a credential: dropping one produces an
+/// authentication failure with no stated cause, in the one subsystem where a
+/// mysterious 401 is most expensive to debug. A long token, or a long sandbox
+/// path, is exactly the entry the "evict the longest" rule would pick first.
+///
+/// So protected entries are held out of the eviction candidates entirely, and
+/// if what remains still does not fit, that is an error rather than a silent
+/// drop — the build fails saying so instead of failing later saying nothing.
+pub fn filter_long_env_protecting(
+    env: Vec<(String, String)>,
+    args: &[OsString],
+    protected: &std::collections::BTreeSet<&str>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let Some(maxl) = max_args() else {
+        return Ok(env);
+    };
+    if maxl <= 0 {
+        return Ok(env);
+    }
+    if protected.is_empty() {
+        return Ok(filter_long_env(env, args));
+    }
+
+    let args_len: i64 = args.iter().map(|a| a.len() as i64).sum();
+    let (keep, mut rest): (Vec<_>, Vec<_>) = env
+        .into_iter()
+        .partition(|(k, _)| protected.contains(k.as_str()));
+
+    // An individually overlong credential cannot be passed at all, whatever is
+    // evicted around it.
+    if let Some((k, v)) = keep.iter().find(|(k, v)| entry_len(k, v) > MAX_ARG_STRLEN) {
+        anyhow::bail!(
+            "credential variable `{k}` is {} bytes, over the {MAX_ARG_STRLEN}-byte per-entry \
+             limit `execve` imposes. Deliver it as a file instead: drop `env` from the \
+             secret's `shape` and read $SECRET_<NAME>.",
+            entry_len(k, v)
+        );
+    }
+
+    let reserved = env_byte_length(&keep);
+    let budget = maxl.saturating_sub(reserved);
+    filter_impl(&mut rest, args_len, budget);
+
+    if env_byte_length(&keep) + env_byte_length(&rest) + args_len >= maxl {
+        anyhow::bail!(
+            "the credential variables alone do not fit in this process environment \
+             ({reserved} bytes of {maxl}). Deliver them as files instead: drop `env` from the \
+             secret's `shape` and read $SECRET_<NAME>."
+        );
+    }
+
+    let mut out = keep;
+    out.extend(rest);
+    Ok(out)
+}
+
 pub fn filter_long_env(mut env: Vec<(String, String)>, args: &[OsString]) -> Vec<(String, String)> {
     let Some(maxl) = max_args() else { return env };
     if maxl <= 0 {
