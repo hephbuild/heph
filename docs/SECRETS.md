@@ -28,9 +28,9 @@ target(
 
     # identity — hashed. Consumers re-key when these move.
     role     = "arn:aws:iam::4711:role/heph-ci-push",
-    region   = "eu-west-1",
     shape    = ["aws_profile"],
     profile  = "ecr",
+    params   = {"region": "eu-west-1"},
 
     # acquisition — NOT hashed. Swap freely per environment.
     provider = "oidc",
@@ -48,7 +48,7 @@ A descriptor has two halves that behave completely differently.
 
 | | Fields | In the cache key? |
 |---|---|---|
-| **Identity** | `role`, `audience`, `scope`, `account`, `region`, `bucket`, `endpoint`, `registry`, `machine`, `profile`, `params`, `shape`, `env` | **Yes** |
+| **Identity** | `role`, `audience`, `scope`, `registry`, `machine`, `profile`, `params`, `shape`, `env` | **Yes** |
 | **Acquisition** | `provider`, `var`/`vars`, `helper`, `protocol`, `runner`, `timeout`, `exchange`, `ttl`, `acquire` | **No** |
 
 Getting this wrong costs the feature its main promise. If `provider` were
@@ -295,21 +295,36 @@ exchange = [
 
 A single hop may be written as one dict rather than a one-element list.
 
-### Vendor-shaped identity goes in `params`
+### What earns a named field, and what goes in `params`
 
-The named identity fields are the ones with a meaning across vendors. Anything
-vendor-specific — a GitHub App id and installation, a service account to
-impersonate, an Azure tenant — goes in `params`, which is hashed like the rest
-of the identity:
+An identity field is named only two ways:
+
+1. It is a **parameter of a standard** an exchange speaks — `role`, `audience`,
+   `scope`.
+2. It is a **slot key** the collision check reasons about, so two credentials
+   cannot silently claim one entry — `machine` (netrc, git), `registry`
+   (docker), `profile` (aws), `env` (variable names).
+
+Everything else is `params`, which is hashed exactly like the rest of the
+identity:
 
 ```python
-params = {"app_id": "1180022", "install": "org/heph"}
+params = {"region": "eu-west-1", "app_id": "1180022", "install": "org/heph"}
 ```
 
-Naming those as first-class fields was the earlier design, and it put vendor
-names into a format frozen into every consumer's cache key while making the next
-vendor a schema change. A map costs a little checkability and buys forward
-compatibility: a new vendor adds no field and re-keys nothing.
+That covers a region, an endpoint, a bucket, an account, a GitHub App id and
+installation, a service account to impersonate, an Azure tenant. `account`,
+`region`, `bucket` and `endpoint` *were* named fields in an earlier draft and
+earned nothing by it — `region` and `endpoint` were read in one line each by the
+`aws_profile` renderer, and `bucket` and `account` only as `{bucket}` /
+`{account}` template substitutions that `params` already performs. What they
+bought was a schema surface welded to S3, frozen into every consumer's cache
+key, that cost a release to extend: an organization with an internal IdP had no
+way to say what its identity was at all.
+
+The cost, stated so it is a decision rather than a surprise: a map has no
+schema, so a misspelled `regoin` renders no region rather than failing. That is
+the price of a vocabulary heph does not have to own.
 
 ### A helper has a deadline
 

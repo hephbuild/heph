@@ -126,7 +126,7 @@ target(
     name = "c",
     driver = "secret",
     role = "arn:aws:iam::4711:role/heph-read",
-    region = "eu-west-1",
+    params = {"region": "eu-west-1"},
     shape = ["aws_profile"],
     profile = "artifacts",
     provider = "exec",
@@ -221,7 +221,7 @@ target(
     name = "c",
     driver = "secret",
     role = "arn:aws:iam::4711:role/heph-read",
-    region = "eu-west-1",
+    params = {"region": "eu-west-1"},
     shape = ["aws_profile"],
     profile = "artifacts",
     acquire = [

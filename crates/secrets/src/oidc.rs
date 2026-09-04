@@ -725,13 +725,15 @@ impl OidcProvider {
 /// another thing that can differ between two machines.
 fn interpolate(s: &str, id: &Identity, token: &str) -> String {
     let mut out = s.replace("{token}", token);
+    // The named fields, then the open map. `{bucket}` and `{account}` used to
+    // appear in the first list *and* work through the second; they were named
+    // fields whose entire contribution was this substitution, which is why they
+    // are now simply `params` entries like any other vendor vocabulary.
     for (key, value) in [
-        ("account", id.account.as_deref()),
-        ("region", id.region.as_deref()),
-        ("bucket", id.bucket.as_deref()),
+        ("role", id.role.as_deref()),
         ("registry", id.registry.as_deref()),
         ("machine", id.machine.as_deref()),
-        ("role", id.role.as_deref()),
+        ("profile", id.profile.as_deref()),
     ] {
         if let Some(v) = value {
             out = out.replace(&format!("{{{key}}}"), v);
@@ -834,9 +836,11 @@ mod tests {
     #[test]
     fn interpolation_covers_named_fields_the_token_and_params() {
         let id = Identity {
-            account: Some("4711".into()),
             registry: Some("ghcr.io".into()),
-            params: BTreeMap::from([("install".to_string(), "42".to_string())]),
+            params: BTreeMap::from([
+                ("account".to_string(), "4711".to_string()),
+                ("install".to_string(), "42".to_string()),
+            ]),
             ..Identity::default()
         };
         assert_eq!(

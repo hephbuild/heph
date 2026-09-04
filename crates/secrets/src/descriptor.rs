@@ -76,43 +76,34 @@ pub struct Identity {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<String>,
 
-    /// Identity parameters that only one provider or exchange understands.
+    /// Everything else this identity needs, as an open map.
     ///
-    /// **The open half of the identity, and deliberately so.** The named fields
-    /// above are the ones with a meaning across vendors — a principal, an
-    /// audience, a scope, a region, an object store, a slot key. Everything
-    /// vendor-shaped lives here instead: a GitHub App id and installation, a
-    /// service account to impersonate, an Azure tenant.
+    /// **A named field earns its place only two ways**, and this is where
+    /// everything that does neither lives:
     ///
-    /// Naming those as first-class fields was the earlier design and it was
-    /// wrong twice over. It put vendor names in a format that is frozen into
-    /// every consumer's cache key, and it made supporting the next vendor a
-    /// schema change — so an organization with an internal IdP had no way to
-    /// say what its identity was at all. A map costs a little checkability and
-    /// buys forward compatibility: a new vendor adds no field and re-keys
-    /// nothing.
+    /// 1. It is a **parameter of a standard** an exchange speaks — `role`,
+    ///    `audience`, `scope`.
+    /// 2. It is a **slot key** [`crate::shape::Shape::slots`] reasons about, so
+    ///    two credentials cannot silently claim one entry — `machine`,
+    ///    `registry`, `profile`, `env`.
+    ///
+    /// Anything else is one vendor's vocabulary in a format that is frozen into
+    /// every consumer's cache key. `bucket`, `account`, `region` and `endpoint`
+    /// were named fields in an earlier draft and earned nothing by it: they
+    /// were read in one line each — `region` and `endpoint` by the
+    /// `aws_profile` renderer, `bucket` and `account` only as `{bucket}` /
+    /// `{account}` template substitutions that this map already performs. They
+    /// bought a schema surface welded to S3 and cost a release to extend, so an
+    /// organization with an internal IdP had no way to say what its identity
+    /// was at all.
+    ///
+    /// The cost, stated so it is a decision rather than a surprise: a map has
+    /// no schema, so a misspelled `regoin` renders no region rather than
+    /// failing. That is the price of a vocabulary heph does not have to own.
     ///
     /// Hashed, like the rest of the identity half.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, String>,
-
-    /// Cloud account id (AWS account, Cloudflare account).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account: Option<String>,
-
-    /// Region. A *profile key*, never a scalar environment variable — see
-    /// [`crate::shape`] for why no single `AWS_REGION`-shaped variable can
-    /// satisfy every SDK.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-
-    /// Object-store bucket the credential is scoped to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bucket: Option<String>,
-
-    /// Service endpoint, for non-AWS S3-compatible stores.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
 
     /// Slot key for `docker_config`: the registry host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -986,7 +977,7 @@ mod tests {
             "//infra/creds:ecr",
             Identity {
                 role: Some("arn:aws:iam::4711:role/heph-ci-push".into()),
-                region: Some("eu-west-1".into()),
+                params: BTreeMap::from([("region".to_string(), "eu-west-1".to_string())]),
                 profile: Some("ecr".into()),
                 shape: vec!["aws_profile".into()],
                 ..Identity::default()
@@ -999,7 +990,15 @@ mod tests {
             "  \"addr\": \"//infra/creds:ecr\",\n",
             "  \"identity\": {\n",
             "    \"role\": \"arn:aws:iam::4711:role/heph-ci-push\",\n",
-            "    \"region\": \"eu-west-1\",\n",
+            // `region` renders inside `params` and no longer as a field of its
+            // own. `SECRET_JSON_VERSION` deliberately does not move for it: the
+            // layout changed before anything shipped, and a version bump would
+            // promise a migration for artifacts that never existed. What it
+            // does change is every consumer's key, which is the correct and
+            // only consequence.
+            "    \"params\": {\n",
+            "      \"region\": \"eu-west-1\"\n",
+            "    },\n",
             "    \"profile\": \"ecr\",\n",
             "    \"shape\": [\n",
             "      \"aws_profile\"\n",
@@ -1046,7 +1045,7 @@ mod tests {
     fn secret_json_carries_identity_only() {
         let identity = Identity {
             role: Some("arn:aws:iam::4711:role/heph-read".into()),
-            region: Some("eu-west-1".into()),
+            params: BTreeMap::from([("region".to_string(), "eu-west-1".to_string())]),
             profile: Some("artifacts".into()),
             shape: vec!["aws_profile".into()],
             ..Identity::default()

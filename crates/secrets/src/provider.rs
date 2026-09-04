@@ -289,10 +289,14 @@ impl ExecProvider {
     fn uri_for(protocol: Protocol, identity: &Identity) -> Option<String> {
         match protocol {
             Protocol::DockerCredential => identity.registry.clone(),
+            // `machine` first, because it is the slot key a git credential
+            // helper is actually keyed by; `endpoint` is a `params` entry an
+            // S3-compatible descriptor may or may not carry.
             Protocol::CredentialHelper => identity
-                .endpoint
+                .machine
                 .clone()
-                .or_else(|| identity.machine.clone().map(|m| format!("https://{m}"))),
+                .map(|m| format!("https://{m}"))
+                .or_else(|| identity.params.get("endpoint").cloned()),
             Protocol::CredentialProcess | Protocol::Raw => None,
         }
     }

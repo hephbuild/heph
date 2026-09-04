@@ -74,20 +74,6 @@ struct SecretSpec {
     /// OAuth scopes requested. Sorted before hashing, so declaration order is
     /// not a cache-key component.
     scope: Vec<String>,
-    /// Cloud account id (an AWS account, a Cloudflare account).
-    #[spec(ty = ParamType::String)]
-    account: Option<String>,
-    /// Region. Rendered as a *profile key*, never a scalar environment
-    /// variable: no single `AWS_REGION`-shaped variable satisfies boto3, the JS
-    /// SDK and the Java SDK at once, and two secrets setting one would collide.
-    #[spec(ty = ParamType::String)]
-    region: Option<String>,
-    /// Bucket the credential is scoped to.
-    #[spec(ty = ParamType::String)]
-    bucket: Option<String>,
-    /// Service endpoint, for non-AWS S3-compatible stores.
-    #[spec(ty = ParamType::String)]
-    endpoint: Option<String>,
     /// Registry host. The merge key for the `docker_config` shape.
     #[spec(ty = ParamType::String)]
     registry: Option<String>,
@@ -99,14 +85,16 @@ struct SecretSpec {
     /// collide rather than silently overwriting each other.
     #[spec(ty = ParamType::String)]
     profile: Option<String>,
-    /// Identity parameters only one provider or exchange understands — a
-    /// GitHub App id and installation, a service account to impersonate, an
-    /// Azure tenant.
+    /// Everything else the identity needs: `region` and `endpoint` for an
+    /// `aws_profile`, a bucket or an account a template substitutes, a GitHub
+    /// App id and installation, a service account to impersonate, an Azure
+    /// tenant.
     ///
-    /// The open half of the identity. Naming those as first-class fields put
-    /// vendor names into a format frozen into every consumer's cache key, and
-    /// made the next vendor a schema change; a map re-keys nothing and needs no
-    /// release.
+    /// A field is named above only if a standard defines it (`role`,
+    /// `audience`, `scope`) or the collision check reasons about it
+    /// (`machine`, `registry`, `profile`, `env`). Everything else is one
+    /// vendor's vocabulary, and naming it would freeze that vocabulary into
+    /// every consumer's cache key and make the next vendor a release.
     params: std::collections::HashMap<String, String>,
     /// Which shapes this credential renders: `file` (the default), `env`,
     /// `netrc`, `docker_config`, `git_credential`, `aws_profile`, `gcloud_adc`.
@@ -276,10 +264,6 @@ fn from_spec(
         role: spec.role,
         audience: spec.audience,
         scope,
-        account: spec.account,
-        region: spec.region,
-        bucket: spec.bucket,
-        endpoint: spec.endpoint,
         registry: spec.registry,
         machine: spec.machine,
         profile: spec.profile,

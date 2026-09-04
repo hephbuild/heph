@@ -208,11 +208,15 @@ fn render_one(
             // single `AWS_REGION`-shaped variable satisfies boto3, the JS SDK and
             // the Java SDK at once, and two credentials setting one would collide
             // where two profile sections do not.
+            //
+            // Read from `params` rather than from named fields: they are one
+            // vendor's config vocabulary, and `Identity` only names what a
+            // standard or the collision check needs. See [`Identity::params`].
             let mut cfg = format!("[profile {profile}]\n");
-            if let Some(r) = &id.region {
+            if let Some(r) = id.params.get("region") {
                 cfg.push_str(&format!("region = {r}\n"));
             }
-            if let Some(e) = &id.endpoint {
+            if let Some(e) = id.params.get("endpoint") {
                 cfg.push_str(&format!("endpoint_url = {e}\n"));
                 // Since the Jan 2025 default-checksum change, uploads without
                 // this fail against R2 with `NotImplemented: x-amz-checksum-crc32`.
@@ -602,8 +606,13 @@ mod tests {
                 name: "r2",
                 identity: &Identity {
                     profile: Some("r2".into()),
-                    region: Some("auto".into()),
-                    endpoint: Some("https://acct.r2.cloudflarestorage.com".into()),
+                    params: BTreeMap::from([
+                        ("region".to_string(), "auto".to_string()),
+                        (
+                            "endpoint".to_string(),
+                            "https://acct.r2.cloudflarestorage.com".to_string(),
+                        ),
+                    ]),
                     ..id(&["aws_profile"])
                 },
                 cred: &cred,
