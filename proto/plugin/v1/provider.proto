@@ -30,6 +30,7 @@ enum ProviderMethod {
   PROVIDER_METHOD_STATE_SCHEMA = 7;
   PROVIDER_METHOD_SET_FUNCTION_REGISTRY = 8; // carries the registry (invoke_registry)
   PROVIDER_METHOD_CONFIG = 9; // sync metadata (StableMeta::meta)
+  PROVIDER_METHOD_LIST_SECRETS = 10;
 }
 
 message ListRequest {
@@ -202,4 +203,38 @@ message CallRegisteredRequest {
   string root = 4;
   repeated Value positional = 5;
   map<string, Value> named = 6;
+}
+
+// Credential declarations, without resolving the graph.
+//
+// `heph auth login` needs the set of distinct sign-ins a workspace federates
+// through, and nothing else. Reaching that through list+get means discovering
+// every target in the repo — which for a provider like plugin-go means running
+// `go list` to answer a question about credentials it never declares. This lets
+// a provider that structurally cannot produce a `secret` say so at once.
+message ListSecretsRequest {
+  // Limit to a package subtree. Empty means the whole workspace.
+  string prefix = 1;
+}
+
+// How a machine with no ambient workload identity signs in. Mirrors
+// hsecrets::SignIn. Per integration, not per workspace: an organization
+// registers one OIDC application per destination, so the client id differs
+// between two secrets that share an issuer.
+message SignIn {
+  string issuer = 1;
+  string client_id = 2;
+  repeated string scopes = 3;
+  repeated uint32 redirect_ports = 4;
+}
+
+message SecretDeclaration {
+  Addr addr = 1;
+  // One per acquire entry that declares one. Empty is the common case: CI has
+  // an ambient identity, and a laptop using a vendor CLI needs no session.
+  repeated SignIn sign_ins = 2;
+}
+
+message ListSecretsResponse {
+  repeated SecretDeclaration secrets = 1;
 }

@@ -144,6 +144,34 @@ pub enum BuildEventKind {
         addr: String,
         error: Option<String>,
     },
+    /// A credential was minted for a target.
+    ///
+    /// The audit trail. "This token leaked, what now" needs an answer, and the
+    /// event stream is the right place for it: which descriptor, which target,
+    /// which route, and how long the value lives.
+    ///
+    /// **Never the value, and never the subject.** A build log is not a place
+    /// to put either, and everything an incident actually needs — what was
+    /// minted, for whom, when, and by which route — is here without them.
+    SecretGranted {
+        /// The target that holds it.
+        addr: String,
+        /// The descriptor target that declared it.
+        secret: String,
+        /// The consumer's name for it, as `$SECRET_<NAME>`.
+        name: String,
+        /// Which provider obtained it: `static_env`, `exec`, `oidc`.
+        provider: String,
+        /// Which `acquire` entry ran, and what selected it. The route taken is
+        /// otherwise invisible in a build's output.
+        acquire_index: usize,
+        selected_by: Option<String>,
+        /// Seconds of usable life at the moment it was granted, and where that
+        /// number came from — a declared `ttl` and a protocol-reported expiry
+        /// are very different levels of confidence.
+        ttl_secs: u64,
+        expiry_source: String,
+    },
     LocalCacheHit {
         addr: String,
     },

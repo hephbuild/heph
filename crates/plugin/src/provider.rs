@@ -226,6 +226,34 @@ pub struct ProbeResponse {
     pub states: Vec<State>,
 }
 
+/// Ask a provider for its credential declarations without resolving the graph.
+pub struct ListSecretsRequest {
+    /// Limit to a package subtree. Empty means the whole workspace.
+    pub prefix: String,
+}
+
+/// One credential declaration, as [`Provider::list_secrets`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretDeclaration {
+    pub addr: Addr,
+    /// One per `acquire` entry that declares a sign-in. Empty is the common
+    /// case — CI has an ambient identity, and a laptop federating through a
+    /// vendor CLI needs no session of heph's own.
+    pub sign_ins: Vec<SignIn>,
+}
+
+/// How a machine with no ambient workload identity signs in.
+///
+/// Mirrors `hsecrets::SignIn`, restated here because `hplugin` sits below
+/// `hsecrets` and a dependency the other way would invert the stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignIn {
+    pub issuer: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    pub redirect_ports: Vec<u16>,
+}
+
 pub enum GetError {
     NotFound,
     Other(anyhow::Error),
@@ -422,6 +450,38 @@ pub trait Provider: Send + Sync {
         req: ProbeRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>>;
+
+    /// Every credential declaration this provider knows, without resolving the
+    /// graph. `Ok(None)` means "not implemented — ask the slow way".
+    ///
+    /// `heph auth login` needs the distinct sign-ins a workspace federates
+    /// through and nothing else. Reaching that through `list` + `get` means
+    /// discovering every target in the repo, so a provider like `plugin-go`
+    /// would run `go list` to answer a question about credentials it never
+    /// declares. Implementing this lets a provider that structurally cannot
+    /// produce a `secret` say so at once.
+    ///
+    /// **The default is `None`, not an empty list, and the difference is the
+    /// whole safety of the mechanism.** An empty list is a claim — "I have no
+    /// credentials" — and a provider that has some but has not implemented this
+    /// would make them invisible to `heph auth login`, which would then quietly
+    /// fail to sign in to something the build needs. `None` says nothing, and
+    /// the host falls back to enumerating that provider properly. Returning
+    /// `Some(vec![])` is how a provider opts into being fast, and it means it.
+    ///
+    /// Note this names a *driver* (`secret`) in an interface every provider
+    /// implements. That is a deliberate, recorded trade: the alternative
+    /// considered was a general `list_by_driver`, which costs one extra `get`
+    /// per match and would serve runners and tests later. Speed and directness
+    /// won; the cost is that the next such need adds another method rather than
+    /// another argument.
+    fn list_secrets<'a>(
+        &'a self,
+        _req: ListSecretsRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Option<Vec<SecretDeclaration>>>> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Functions this provider exposes to BUILD files as `heph.<name>.<fn>`.
     /// Default: none.

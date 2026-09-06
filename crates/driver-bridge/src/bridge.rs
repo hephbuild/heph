@@ -338,6 +338,8 @@ mod shell_fallback_tests {
         };
         let request_id = "shell-fallback-test".to_string();
         let req = RunRequest {
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
             request_id: &request_id,
             target: &target_def,
             tree_root_path: tmp.path().to_path_buf(),

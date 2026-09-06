@@ -133,6 +133,12 @@ pub struct Engine {
     /// into consumers (the buildfile provider) exactly once, lazily on the first
     /// provider dispatch — by which point all registration has completed.
     pub(crate) provider_functions_wired: std::sync::Once,
+    /// Who is running this build, for `cache.subject_scoped`.
+    ///
+    /// Resolved once and only when a target actually asks: a build with no
+    /// subject-scoped target never computes it, and one with many computes it
+    /// once rather than once per target.
+    pub(crate) run_subject: std::sync::OnceLock<String>,
 
     /// The remote cache's temp directory, created and swept of abandoned temps
     /// on first use (`Engine::remote_tmp_dir`). Lazy, so a build with no
@@ -524,11 +530,17 @@ impl Engine {
             scratch_lock,
             remote_caches,
             provider_functions_wired: std::sync::Once::new(),
+            run_subject: std::sync::OnceLock::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
         };
         engine.register_driver(|_| Box::new(hbuiltins::plugingroup::Driver))?;
         engine.register_driver(|_| Box::new(hbuiltins::pluginscratch::Driver))?;
+        // `secret`, like `scratch`, is a declaration driver: the engine reads
+        // its spec directly (see `hbuiltins::pluginsecret::parse_declaration`)
+        // so the shape-collision and policy checks run without building or
+        // minting anything, which is what keeps them alive on a warm build.
+        engine.register_driver(|_| Box::new(hbuiltins::pluginsecret::Driver))?;
         engine.register_provider(|_| Box::new(hplugin_query::pluginquery::Provider))?;
 
         // The `fs` provider + driver are always-on built-ins. Each builds its

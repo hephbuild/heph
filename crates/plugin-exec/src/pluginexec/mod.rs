@@ -493,6 +493,15 @@ impl SinkLoss {
 /// `stdout_bytes`/`stderr_bytes` mirror `tee_stream`'s `bytes_read`: a
 /// post-wait drain timeout reports how much of each stream it actually got
 /// before giving up, rather than just "it timed out".
+/// What the tee needs about the run, rather than five loose parameters.
+struct TeeCtx<'a> {
+    addr: &'a str,
+    stdout_bytes: &'a std::sync::atomic::AtomicUsize,
+    stderr_bytes: &'a std::sync::atomic::AtomicUsize,
+    /// Masks live credentials before anything durable or visible sees them.
+    redactor: &'a hsecrets::redact::Redactor,
+}
+
 async fn tee_output<'io>(
     reader: Option<proc_exec::OutputReader>,
     log: Arc<std::sync::Mutex<std::fs::File>>,
@@ -500,18 +509,49 @@ async fn tee_output<'io>(
     // chunk belongs to, so the two must be interchangeable.
     mut stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     mut stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
-    addr: &str,
-    stdout_bytes: &std::sync::atomic::AtomicUsize,
-    stderr_bytes: &std::sync::atomic::AtomicUsize,
+    ctx: &TeeCtx<'_>,
 ) {
+    let (addr, stdout_bytes, stderr_bytes, redactor) =
+        (ctx.addr, ctx.stdout_bytes, ctx.stderr_bytes, ctx.redactor);
     use tokio::io::AsyncWriteExt;
     let Some(mut reader) = reader else { return };
     let mut absorbed = SinkCost::default();
     let (mut lost_stdout, mut lost_stderr) = (SinkLoss::default(), SinkLoss::default());
+    // One per stream, never shared: stdout and stderr interleave in this loop,
+    // and a single matcher state would corrupt a match that spans the other
+    // stream's chunk. With no credentials live these are one branch per chunk
+    // and no copy, so a target that never touches the feature pays nothing.
+    let (mut red_stdout, mut red_stderr) = (redactor.stream(), redactor.stream());
     loop {
         let (stream, chunk) = match reader.recv().await {
             Ok(Some(c)) => c,
-            Ok(None) => break,
+            Ok(None) => {
+                // EOF: release whatever each stream was holding back as a
+                // possible partial match. Without this, output that shares a
+                // prefix with a live credential and arrives last is simply
+                // never written.
+                for (red, stream) in [
+                    (&mut red_stdout, proc_exec::StreamId::Stdout),
+                    (&mut red_stderr, proc_exec::StreamId::Stderr),
+                ] {
+                    let tail = red.flush();
+                    if tail.is_empty() {
+                        continue;
+                    }
+                    if let Ok(mut g) = log.lock() {
+                        drop(g.write_all(&tail));
+                    }
+                    let sink = match stream {
+                        proc_exec::StreamId::Stdout => stdout.as_mut(),
+                        proc_exec::StreamId::Stderr => stderr.as_mut(),
+                    };
+                    if let Some(out) = sink {
+                        drop(out.write_all(&tail).await);
+                        drop(out.flush().await);
+                    }
+                }
+                break;
+            }
             // One reader now carries both streams, so treating a read error as
             // EOF would stop teeing the *other* stream too — `log.txt` would
             // truncate with no note, and dropping the reader would SIGPIPE the
@@ -533,6 +573,16 @@ async fn tee_output<'io>(
             proc_exec::StreamId::Stderr => stderr_bytes,
         };
         bytes_counter.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+
+        // Mask before anything durable or visible sees it. The byte count above
+        // is of what the process produced, deliberately — it is a measure of the
+        // target, not of what survived redaction.
+        let red = match stream {
+            proc_exec::StreamId::Stdout => &mut red_stdout,
+            proc_exec::StreamId::Stderr => &mut red_stderr,
+        };
+        let chunk = red.push(&chunk);
+
         if let Ok(mut g) = log.lock() {
             drop(g.write_all(&chunk));
         }
@@ -995,6 +1045,41 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             }
         };
 
+        // Credential references. `hashed: true, runtime: false` — the same
+        // shape `hash_deps` uses, and for the same reason: the descriptor's
+        // hashout carries the *identity* into this target's cache key, while
+        // nothing about it is materialized into the sandbox. `runtime: false`
+        // also keeps the descriptor target's own tools and env from being
+        // folded into every consumer.
+        //
+        // Sorted by name, because a `HashMap` iterates arbitrarily and these
+        // inputs reach a def hash.
+        let mut secret_names: Vec<(String, String)> = spec.secrets.into_iter().collect();
+        secret_names.sort();
+        let mut secret_inputs: Vec<Input> = Vec::with_capacity(secret_names.len());
+        for (name, raw) in &secret_names {
+            if name.is_empty() {
+                anyhow::bail!(
+                    "a secret needs a name: it is what the command references as \
+                     `$SECRET_<NAME>` and what a redacted value is labelled with"
+                );
+            }
+            let r#ref = TargetAddr::parse(raw, &pkg).with_context(|| {
+                format!("`secrets[{name}]` must be the address of a `secret` target; got {raw:?}")
+            })?;
+            secret_inputs.push(Input {
+                r#ref,
+                mode: InputMode::Standard,
+                origin_id: format!("{}|{name}", hdriver_support::secret::SECRET_ORIGIN_PREFIX),
+                annotations: BTreeMap::from([(
+                    hdriver_support::secret::SECRET_ANNOTATION.to_string(),
+                    name.clone(),
+                )]),
+                hashed: true,
+                runtime: false,
+            });
+        }
+
         // hashed + NOT runtime: the config keys the cache but never enters the
         // sandbox. `runtime: false` also keeps `collect_transitive_deps` from
         // merging the runner target's own tools/deps/env into every consumer.
@@ -1051,6 +1136,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .chain(runtime_dep_inputs.into_iter().map(|(_, v)| v))
                     .chain(tool_inputs.into_iter().map(|(_, v)| v))
                     .chain(runner_input)
+                    .chain(secret_inputs)
                     .chain(scratch_inputs)
                     .collect(),
                 outputs,
@@ -1070,6 +1156,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
     ) -> anyhow::Result<ApplyTransitiveResponse> {
         let mut def = req.target_def.clone();
         let mut xdef = def.def::<TargetDef>().clone();
+        // Taken before the loops below consume the rest of the sandbox.
+        let secret_conflicts = req.sandbox.secret_conflicts().to_vec();
         for tool in req.sandbox.tools {
             let input = Input {
                 r#ref: tool.r#ref.clone(),
@@ -1146,6 +1234,61 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     }
                 }
             }
+        }
+
+        // Two deps that supplied one name from two different descriptors. Worse
+        // than a shape collision, because the name is what the command
+        // references: picking one silently changes what `$SECRET_<NAME>`
+        // resolves to, and neither party appears at this target's call site.
+        // The merged ids carry the chains, which is the only thing that makes
+        // the message actionable.
+        if let Some((name, a, b)) = secret_conflicts.first() {
+            anyhow::bail!(
+                "two dependencies supply a secret named {name:?} from different declarations:\n                   {} (via {})\n  {} (via {})\n\nThe name is what the command references as \
+                 `$SECRET_<NAME>`, so one would silently win. Rename one, or declare \
+                 `secrets = {{\"{name}\": …}}` on this target to choose.",
+                a.r#ref,
+                a.id,
+                b.r#ref,
+                b.id,
+            );
+        }
+
+        // A credential a dependency contributed. `hashed: true, runtime: false`,
+        // the same shape a directly declared one produces — the identity has to
+        // reach this target's key whether the author wrote it or inherited it.
+        //
+        // **The target's own declaration wins.** That resembles the silent
+        // overwrite the slot rule refuses and is not: there, neither colliding
+        // party appears at the call site; here one is written in the target
+        // itself. It is also the escape hatch when a dependency's choice is
+        // wrong for one consumer, and it follows the precedence
+        // `docs/EXEC_RUNNERS.md` already sets.
+        let declared: std::collections::BTreeSet<String> = def
+            .inputs
+            .iter()
+            .filter_map(|i| hdriver_support::secret::secret_name(&i.annotations))
+            .map(str::to_string)
+            .collect();
+        let mut inherited: Vec<(String, hplugin::driver::sandbox::Secret)> =
+            req.sandbox.secrets.into_iter().collect();
+        // Sorted: this reaches a def hash, and a `HashMap` iterates arbitrarily.
+        inherited.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, secret) in inherited {
+            if declared.contains(&name) {
+                continue;
+            }
+            def.inputs.push(Input {
+                r#ref: secret.r#ref.clone(),
+                mode: InputMode::Standard,
+                origin_id: secret.id.clone(),
+                annotations: BTreeMap::from([(
+                    hdriver_support::secret::SECRET_ANNOTATION.to_string(),
+                    name,
+                )]),
+                hashed: true,
+                runtime: false,
+            });
         }
 
         def.hash = {
@@ -1476,6 +1619,18 @@ impl Driver {
 
         env.extend(def.runtime_env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
+        // Credentials the host minted and rendered. Mostly paths — the pointer
+        // variables that aim a tool at a file it will find, plus `HOME` for the
+        // synthetic home — and a value only where a declaration asked for the
+        // `env` shape.
+        //
+        // Applied last of the target's own sources, so a rendered pointer wins
+        // over a `runtime_env` that happened to name the same variable. That is
+        // the precedence `docs/EXEC_RUNNERS.md` sets — a target that declares
+        // something gets what it declared — and here the declaration is the
+        // `secret()` the target named.
+        env.extend(rreq.secret_env.iter().cloned());
+
         // Scratch caches: each declaration names the variable its tool reads the
         // directory from, so a consumer needs no wiring of its own — declaring
         // `env = "GOCACHE"` is what makes `scratch = [...]` sufficient.
@@ -1555,7 +1710,18 @@ impl Driver {
         let mut argv_for_filter: Vec<OsString> = Vec::with_capacity(1 + args_os.len());
         argv_for_filter.push(OsString::from(&program));
         argv_for_filter.extend(args_os.iter().cloned());
-        let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter);
+        // Credential-bearing variables are exempt from eviction. `filter_long_env`
+        // drops the longest entries until the environment fits, and a long token
+        // or a long sandbox path is exactly what it would pick — producing an
+        // authentication failure with no stated cause, in the one subsystem
+        // where a mysterious 401 is most expensive to debug. If they genuinely
+        // cannot fit, that is a hard error rather than a silent drop.
+        let protected: std::collections::BTreeSet<&str> =
+            rreq.secret_env.iter().map(|(k, _)| k.as_str()).collect();
+        let env_vec = filterenv::filter_long_env_protecting(env_vec, &argv_for_filter, &protected)
+            .with_context(
+                || "a credential variable does not fit in the process environment (ARG_MAX)",
+            )?;
         let env_pairs: Vec<(OsString, OsString)> = env_vec
             .into_iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
@@ -1708,12 +1874,42 @@ impl Driver {
             },
         }
 
+        // Compiled once per run, from every value this target holds. Inert —
+        // one branch per chunk, no automaton, no copy — for the overwhelming
+        // majority of targets, which hold none.
+        //
+        // Best-effort by design: a value the tool derives before printing
+        // escapes it. This is a backstop for accidents, not a containment
+        // boundary, which is why the log-artifact leak is also fixed at source.
+        let (redactor, too_short) = {
+            let entries: Vec<hsecrets::redact::Entry<'_>> = rreq
+                .secret_values
+                .iter()
+                .map(|(name, value)| hsecrets::redact::Entry { name, value })
+                .collect();
+            hsecrets::redact::Redactor::new(&entries)
+        };
+        for name in &too_short {
+            tracing::warn!(
+                secret = %name,
+                min = hsecrets::redact::MIN_PATTERN_LEN,
+                "credential value is too short to mask safely; it will appear in this target's \
+                 output verbatim"
+            );
+        }
+
         // Target addr for the drain diagnostics below, and per-stream byte
         // counters so a post-wait drain timeout can report how much of the
         // tail it actually got before giving up.
         let addr_str = rreq.target.addr.format();
         let stdout_bytes = std::sync::atomic::AtomicUsize::new(0);
         let stderr_bytes = std::sync::atomic::AtomicUsize::new(0);
+        let tee_ctx = TeeCtx {
+            addr: &addr_str,
+            stdout_bytes: &stdout_bytes,
+            stderr_bytes: &stderr_bytes,
+            redactor: &redactor,
+        };
 
         let io_futures: IoFutures<'_> = if let Some(master) = pty_master {
             let read_fd = master.try_clone().context("dup pty master for read")?;
@@ -1750,9 +1946,7 @@ impl Driver {
                 log_for_out,
                 rreq.stdout,
                 rreq.stderr,
-                &addr_str,
-                &stdout_bytes,
-                &stderr_bytes,
+                &tee_ctx,
             ));
             let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
                 match (rreq.stdin, stdin_pump) {
@@ -2197,6 +2391,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         let res = tokio::time::timeout(
@@ -2522,6 +2718,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         let _res = driver.run(make_req(req), &ctoken).await?;
@@ -2581,6 +2779,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         let res = driver.run(make_req(req), &ctoken).await;
@@ -2653,6 +2853,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         // Use a timeout to detect the hang
@@ -2715,6 +2917,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2784,6 +2988,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2852,6 +3058,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         let res = tokio::time::timeout(
@@ -3029,6 +3237,8 @@ mod tests {
             stderr: Some(&mut err_handle),
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
@@ -3111,6 +3321,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         driver.run(make_req(req), &ctoken).await?;
@@ -3186,6 +3398,8 @@ mod tests {
             stderr: Some(&mut stderr),
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         tokio::time::timeout(
@@ -3343,6 +3557,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         tokio::time::timeout(
@@ -3442,6 +3658,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
@@ -4474,6 +4692,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
         driver
             .run(
@@ -4521,6 +4741,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
         driver
             .run(
@@ -4601,6 +4823,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
         driver
             .run(
@@ -4758,6 +4982,8 @@ mod tests {
             stderr: None,
             sandbox_dir: sandbox.clone(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         os.run_inner(req, &ctoken, false).await?;
@@ -4855,6 +5081,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
         driver
             .run(
@@ -4930,6 +5158,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
         driver.run(make_req(req), &ctoken).await?;
 
@@ -5017,6 +5247,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
         driver
             .run(
@@ -5120,6 +5352,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
         driver
             .run(
@@ -5210,6 +5444,8 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            secret_env: Vec::new(),
+            secret_values: Vec::new(),
         };
 
         driver.run(make_req(req), &ctoken).await?;

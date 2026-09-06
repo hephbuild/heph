@@ -21,7 +21,7 @@ use hplugin::driver::{
 use hplugin::hook::Hook;
 use hplugin::provider::{
     ConfigRequest, FnArgs, FnCallContext, GetError, GetRequest, ListPackagesRequest, ListRequest,
-    ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
+    ListSecretsRequest, ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
     ProviderFunctionRegistry,
 };
 use hplugin_stabby::abi::{
@@ -572,6 +572,46 @@ async fn provider_probe(
     unary(body)
 }
 
+/// A plugin that has not overridden `list_secrets` answers `None`, and that has
+/// to cross the seam as an *error*, not as an empty list.
+///
+/// The distinction is the whole safety of the mechanism: an empty list is a
+/// claim ("I have no credentials") the host will believe, while an error sends
+/// it to enumerate this provider properly. A plugin that does have secrets and
+/// has not implemented this must not have them silently disappear from
+/// `heph auth login`.
+async fn provider_list_secrets(
+    provider: Arc<dyn Provider>,
+    req: pb::ListSecretsRequest,
+    cancels: Arc<CancelRegistry>,
+) -> SVec<u8> {
+    let guard = cancels.enter("");
+    let preq = ListSecretsRequest { prefix: req.prefix };
+    let body = match provider.list_secrets(preq, guard.token()).await {
+        Ok(Some(secrets)) => Body::ListSecretsResp(pb::ListSecretsResponse {
+            secrets: secrets
+                .into_iter()
+                .map(|d| pb::SecretDeclaration {
+                    addr: Some(convert::addr_to_pb(&d.addr)),
+                    sign_ins: d
+                        .sign_ins
+                        .into_iter()
+                        .map(|s| pb::SignIn {
+                            issuer: s.issuer,
+                            client_id: s.client_id,
+                            scopes: s.scopes,
+                            redirect_ports: s.redirect_ports.into_iter().map(u32::from).collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }),
+        Ok(None) => err_body("list_secrets is not implemented by this provider".to_string()),
+        Err(e) => err_body(err_message(&e)),
+    };
+    unary(body)
+}
+
 async fn provider_call_function(
     provider: Arc<dyn Provider>,
     req: pb::CallFunctionRequest,
@@ -717,6 +757,17 @@ impl StableProvider for StableProviderImpl {
                     "probe",
                     key,
                     provider_probe(provider, req, Arc::clone(&self.cancels)),
+                    |m| unary(err_body(m)),
+                )))
+            }
+            Ok(pb::ProviderMethod::ListSecrets) => {
+                let req = pb::ListSecretsRequest::decode(&req[..]).unwrap_or_default();
+                let key = req.prefix.clone();
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "list_secrets",
+                    key,
+                    provider_list_secrets(provider, req, Arc::clone(&self.cancels)),
                     |m| unary(err_body(m)),
                 )))
             }
@@ -1259,6 +1310,8 @@ async fn run_once(
     let mut stdout_sink = FrameSink::new(out, false);
     let mut stderr_sink = FrameSink::new(out, true);
     let rr = RunRequest {
+        secret_env: Vec::new(),
+        secret_values: Vec::new(),
         request_id: &request_id,
         target: &target,
         tree_root_path: PathBuf::from(req.tree_root_path),

@@ -984,6 +984,10 @@ impl BuildState {
                     self.executed += 1;
                 }
             }
+            // Not build progress: a grant is an audit record for the event
+            // stream, and a progress view showing "minted a credential" would
+            // be noise on the one screen a human is watching for work.
+            BuildEventKind::SecretGranted { .. } => {}
             BuildEventKind::LocalCacheHit { addr } => {
                 self.local_hits += 1;
                 self.note_cache_hit(addr, CacheHitKind::Local);

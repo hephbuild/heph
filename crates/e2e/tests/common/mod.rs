@@ -51,8 +51,17 @@ impl Workspace {
         Self::with_parallelism(None)
     }
 
+    /// A workspace whose builds report a fixed subject, for
+    /// `cache.subject_scoped`.
+    pub fn with_run_subject(subject: &str) -> Self {
+        Self::build(None, Some(subject.to_string()))
+    }
+
     pub fn with_parallelism(parallelism: impl Into<Option<usize>>) -> Self {
-        let p = parallelism.into();
+        Self::build(parallelism.into(), None)
+    }
+
+    fn build(p: Option<usize>, run_subject: Option<String>) -> Self {
         let builder = WorkspaceBuilder::new()
             .expect("workspace tempdir")
             .with_provider(|init| {
@@ -66,6 +75,11 @@ impl Workspace {
             .with_managed_driver(Box::new(pluginhttp::Driver));
         let builder = if let Some(p) = p {
             builder.with_parallelism(p)
+        } else {
+            builder
+        };
+        let builder = if let Some(s) = run_subject {
+            builder.with_run_subject(s)
         } else {
             builder
         };

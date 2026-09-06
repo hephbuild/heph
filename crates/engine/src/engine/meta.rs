@@ -17,6 +17,51 @@ pub struct ResultMeta {
 }
 
 impl Engine {
+    /// Who is running this build, for `cache.subject_scoped`.
+    ///
+    /// Resolved **once per run** and cached, because a target that opts in
+    /// needs it before its own `hashin` exists — so a warm build pays one
+    /// resolution, not one per target, and a build with no subject-scoped
+    /// target pays none at all.
+    ///
+    /// The order is deliberate. A CI job's workload identity names the *build*,
+    /// which is what "who ran it" means there and is stable across the fleet;
+    /// only on a machine with no such identity does it fall back to the local
+    /// user. The fallback is honest rather than clever: it partitions per
+    /// developer, which is exactly what a subject-scoped target on a laptop
+    /// wants, and it never silently matches CI.
+    pub(crate) fn run_subject(&self) -> String {
+        self.run_subject
+            .get_or_init(|| {
+                if let Some(explicit) = self.cfg.run_subject.clone() {
+                    return explicit;
+                }
+                // GitHub Actions names the run; other CI systems announce
+                // themselves the same way and can be added without a release,
+                // because this is not a cache-key *format* — it is a value.
+                for (var, prefix) in [
+                    ("GITHUB_REPOSITORY", "gha"),
+                    ("CI_PROJECT_PATH", "gitlab"),
+                    ("BUILDKITE_PIPELINE_SLUG", "buildkite"),
+                ] {
+                    if let Ok(v) = std::env::var(var)
+                        && !v.is_empty()
+                    {
+                        return format!("{prefix}:{v}");
+                    }
+                }
+                match std::env::var("USER").or_else(|_| std::env::var("LOGNAME")) {
+                    Ok(u) if !u.is_empty() => format!("user:{u}"),
+                    // Neither a CI identity nor a user name. Partitioning by
+                    // nothing is the safe answer: every such run shares one
+                    // bucket rather than each inventing its own and never
+                    // hitting the cache.
+                    _ => "unknown".to_string(),
+                }
+            })
+            .clone()
+    }
+
     pub async fn meta(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -84,6 +129,20 @@ impl Engine {
 
         for hashout in results {
             Hasher::write(&mut h, hashout.as_bytes());
+        }
+
+        // Only for a target that asked. Unset, nothing is written at all, so
+        // every target that does not opt in hashes byte-identically to before
+        // this existed — which is the compatibility requirement, not a nicety.
+        //
+        // The subject is a hash input only: it is not recoverable from a
+        // `hashin` and never reaches an artifact. A miss caused by a subject
+        // change would otherwise be unexplainable, so `heph inspect hashin`
+        // names it as a component.
+        if def.target_def.cache.subject_scoped {
+            let subject = self.run_subject();
+            Hasher::write(&mut h, b"subject\0");
+            Hasher::write(&mut h, subject.as_bytes());
         }
 
         Ok(format!("{:x}", h.finish()))

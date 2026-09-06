@@ -8,6 +8,7 @@ publish = false
 workspace = true
 
 [dev-dependencies]
+hsecrets = { package = "secrets", path = "../secrets" }
 heph = { path = "../.." }
 htestkit = { package = "testkit", path = "../testkit" }
 hplugin-oci = { package = "plugin-oci", path = "../plugin-oci" }

@@ -1817,9 +1817,31 @@ impl Engine {
             hcore::blocking::run(move || Self::read_manifest_from(&local_cache, &addr, &hashin))
                 .await?
         };
-        let Some(manifest) = manifest else {
+        let Some(mut manifest) = manifest else {
             return Ok(());
         };
+
+        // Logs are never uploaded.
+        //
+        // They were, and it was a disclosure with nothing on the other side of
+        // the ledger: `artifact_is_needed` returns false for a log, so a remote
+        // hit never fetches one. Every log a fleet produced was pushed to the
+        // shared cache and read by nobody — while a tool that printed an
+        // authenticated URL published it org-wide.
+        //
+        // Redaction masks the credentials heph knows about, but it is
+        // best-effort by construction: a value the tool derives before printing
+        // escapes it. This closes the same hole at its source, and the
+        // bandwidth it saves is real on a cold fleet-wide build.
+        //
+        // Logs are still packed into the *local* cache, which is where the
+        // failure renderer reads them from.
+        manifest
+            .artifacts
+            .retain(|a| !matches!(a.r#type, ManifestArtifactType::Log));
+        // A target whose *only* artifact was a log still writes its revision:
+        // the manifest is what records the hit, so dropping it would make every
+        // consumer re-run that target forever.
 
         let tmp_dir = self.remote_tmp_dir().await?;
 

@@ -3,7 +3,8 @@ use heph::engine::driver::Driver as SDKDriver;
 use heph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use heph::engine::provider::Provider as SDKProvider;
 use heph::engine::{
-    Config, EResult, Engine, EngineTargetSpec, OutputMatcher, PluginInit, ResultOptions,
+    Config, EResult, Engine, EngineTargetSpec, ExtendedTargetDef, OutputMatcher, PluginInit,
+    ResultOptions,
 };
 use heph::htaddr::{Addr, parse_addr};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ type SetupFn = Box<dyn FnOnce(&mut Engine) -> anyhow::Result<()>>;
 pub struct WorkspaceBuilder {
     dir: TempDir,
     parallelism: Option<usize>,
+    run_subject: Option<String>,
     fs_skip: Vec<String>,
     setups: Vec<SetupFn>,
 }
@@ -24,6 +26,7 @@ impl WorkspaceBuilder {
         Ok(Self {
             dir: tempfile::tempdir().context("create workspace tempdir")?,
             parallelism: None,
+            run_subject: None,
             fs_skip: vec![],
             setups: vec![],
         })
@@ -33,9 +36,19 @@ impl WorkspaceBuilder {
         Self {
             dir,
             parallelism: None,
+            run_subject: None,
             fs_skip: vec![],
             setups: vec![],
         }
+    }
+
+    /// Fix who is running the build, for `cache.subject_scoped`.
+    ///
+    /// Detection reads the process environment, which a test cannot set without
+    /// racing every other test in its binary.
+    pub fn with_run_subject(mut self, subject: impl Into<String>) -> Self {
+        self.run_subject = Some(subject.into());
+        self
     }
 
     pub fn with_parallelism(mut self, p: usize) -> Self {
@@ -87,6 +100,7 @@ impl WorkspaceBuilder {
             root: self.dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: self.parallelism,
+            run_subject: self.run_subject,
             fs_skip: self.fs_skip,
             ..Default::default()
         })?;
@@ -129,6 +143,30 @@ impl Workspace {
     pub async fn run(&self, addr_str: &str) -> anyhow::Result<Arc<EResult>> {
         let addr = parse_addr(addr_str)?;
         self.run_addr(addr).await
+    }
+
+    /// Run a target and return every event the engine emitted.
+    ///
+    /// The stream is a consumer-facing surface — a hook reads it, a report is
+    /// built from it, and for credentials it is the audit trail — so what lands
+    /// on it deserves assertions rather than trust.
+    pub async fn run_collecting_events(
+        &self,
+        addr_str: &str,
+    ) -> anyhow::Result<Vec<heph::engine::event::BuildEvent>> {
+        let addr = parse_addr(addr_str)?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = self.engine.new_state_with_events(false, Some(tx));
+        let res = Arc::clone(&self.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+            .await;
+        // Drained after the run so the send half is closed and this terminates.
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        res.map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        Ok(events)
     }
 
     /// Resolve a single addr restricted to a subset of its outputs — the exact
@@ -211,6 +249,26 @@ impl Workspace {
         let addr = parse_addr(addr_str)?;
         let rs = self.engine.new_state();
         self.engine.clone().get_spec(rs, &addr).await
+    }
+
+    /// The parsed def, for asserting on what a driver produced — inputs, output
+    /// groups, cache settings — without running the target.
+    pub async fn get_def(&self, addr_str: &str) -> anyhow::Result<Arc<ExtendedTargetDef>> {
+        let addr = parse_addr(addr_str)?;
+        let rs = self.engine.new_state();
+        self.engine.clone().get_def(rs, &addr).await
+    }
+
+    /// A target's input hash: the cache key itself.
+    ///
+    /// The right assertion for anything claiming to change, or not change, what
+    /// a target is keyed by. Comparing artifacts instead proves only that two
+    /// builds agreed on an answer, not that they would have shared an entry —
+    /// which is the property a cache-key change actually breaks.
+    pub async fn hashin(&self, addr_str: &str) -> anyhow::Result<String> {
+        let addr = parse_addr(addr_str)?;
+        let rs = self.engine.new_state();
+        Ok(self.engine.clone().meta(rs, &addr).await?.hashin)
     }
 }
 

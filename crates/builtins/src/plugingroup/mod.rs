@@ -728,6 +728,8 @@ mod tests {
                     stderr: None,
                     sandbox_dir: Default::default(),
                     scratch: vec![],
+                    secret_env: Vec::new(),
+                    secret_values: Vec::new(),
                 },
                 &ctoken(),
             )

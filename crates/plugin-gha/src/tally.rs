@@ -402,6 +402,10 @@ impl Tally {
                 self.clear_phase(addr);
             }
 
+            // A grant is an audit record, not build progress: it belongs on the
+            // stream for an incident to read, and nothing in a job summary
+            // changes because of it.
+            BuildEventKind::SecretGranted { .. } => {}
             BuildEventKind::LocalCacheHit { addr } => {
                 self.hit(addr, ev.at_unix_ms, CacheHitKind::Local)
             }

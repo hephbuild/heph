@@ -407,6 +407,26 @@ impl std::error::Error for FailedTargets {}
 /// nothing renderable was found and the caller should fall back to its own log; a
 /// claimed error may still print nothing, when it was already reported at the
 /// failure site.
+/// "This command already said its piece; exit non-zero without a second
+/// rendering."
+///
+/// For a state that is expected rather than exceptional — `heph auth status`
+/// on a machine nobody has signed in on. The instruction belongs in the
+/// command's own output next to everything else it printed, and rendering it
+/// again as a `Failed error=…` line makes a normal state look like a crash.
+#[derive(Debug)]
+pub struct QuietExit;
+
+impl std::fmt::Display for QuietExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never printed by the CLI, but an error type with no message is worse
+        // for anyone who does format it.
+        f.write_str("already reported")
+    }
+}
+
+impl std::error::Error for QuietExit {}
+
 pub fn render_anyhow(e: &anyhow::Error) -> bool {
     match render_anyhow_to_string(e, color_enabled()) {
         Some(out) => {
@@ -424,6 +444,10 @@ pub fn render_anyhow(e: &anyhow::Error) -> bool {
 /// `Some("")` is a deliberate case: [`FailedTargets::reported`] already
 /// printed at the failure site, so the error is handled but adds no output.
 fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
+    // Claimed, and adds nothing: the command printed its own output already.
+    if downcast_chain_ref::<QuietExit>(e).is_some() {
+        return Some(String::new());
+    }
     // Registry failures from `finalize!`. Interactive runs deferred their render
     // to here — the viewport is torn down and nothing repaints over stderr now.
     if let Some(ft) = downcast_chain_ref::<FailedTargets>(e) {

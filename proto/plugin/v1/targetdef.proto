@@ -80,6 +80,10 @@ message CacheConfig {
   bool enabled = 1;
   bool remote_enabled = 2;
   uint32 history = 3;
+  // Fold the run's identity into this target's cache key. Additive on the cold
+  // prost path: an older plugin simply does not see it, and a target that does
+  // not set it serializes identically to before.
+  bool subject_scoped = 4;
 }
 
 // Driver parsed form. Mirrors driver::targetdef::TargetDef.
