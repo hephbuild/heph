@@ -580,9 +580,25 @@ fn headless_hint() -> Option<String> {
 /// without mutating the process environment — which parallel tests share.
 fn headless_hint_for(remote: bool, no_display: bool) -> Option<String> {
     (remote || no_display).then(|| {
-        "note: this looks like a machine with no local browser. A browser elsewhere cannot reach \
-         127.0.0.1 here — run `heph auth login --device-code` instead."
-            .to_string()
+        // Forwarding is offered first, and `--device-code` second, because the
+        // device authorization grant is the flow an organization is most likely
+        // to have taken away: Microsoft's own Conditional Access guidance is to
+        // block it, and on Okta it is a per-application feature that is off
+        // until someone ticks it. Forwarding asks nothing of the IdP — the
+        // redirect ports are fixed precisely so a tunnel can be set up ahead of
+        // time, and the IdP sees the same registered `127.0.0.1` URI either
+        // way.
+        let ports = hsecrets::descriptor::default_redirect_ports()
+            .iter()
+            .map(|p| format!("-L {p}:127.0.0.1:{p}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "note: this looks like a machine with no local browser. A browser elsewhere cannot \
+             reach 127.0.0.1 here.\n  Forward the callback ports and the normal flow works \
+             unchanged:\n    ssh {ports} <this-host>\n  Or run `heph auth login --device-code`, \
+             if your IdP permits that grant — many tenants disable it."
+        )
     })
 }
 
@@ -1127,15 +1143,27 @@ mod tests {
 
     /// A browser on your laptop cannot reach `127.0.0.1` on the box you SSH'd
     /// into, and the loopback flow would otherwise just time out with no clue.
+    ///
+    /// Port forwarding leads and `--device-code` follows: the device grant is
+    /// the flow an organization is most likely to have disabled, so a hint that
+    /// offered only that would be a dead end in exactly the locked-down
+    /// environment it exists for.
     #[test]
-    fn a_remote_shell_is_told_about_the_device_flow() {
+    fn a_remote_shell_is_told_to_forward_before_it_is_told_about_the_device_flow() {
         // Env-driven rather than `cfg!`, so this reads the same on all three
         // supported targets; the test drives the predicate, not the process.
-        assert!(
-            headless_hint_for(true, false)
-                .expect("remote")
-                .contains("--device-code")
-        );
+        let hint = headless_hint_for(true, false).expect("remote");
+        let forward = hint.find("ssh -L").expect("the forwarding recipe");
+        let device = hint.find("--device-code").expect("the device flow");
+        assert!(forward < device, "forwarding must be offered first: {hint}");
+        // Every registered redirect port, or the tunnel works for one attempt
+        // and the retry on a busy port fails.
+        for port in hsecrets::descriptor::default_redirect_ports() {
+            assert!(
+                hint.contains(&format!("{port}:127.0.0.1:{port}")),
+                "port {port} is registered with the IdP but not forwarded: {hint}"
+            );
+        }
         assert!(headless_hint_for(false, true).is_some());
         assert!(headless_hint_for(false, false).is_none());
     }

@@ -205,7 +205,33 @@ impl SecretProvider for StaticEnvProvider {
             }
         };
 
-        let Source::StaticEnv { vars } = &acquire.source else {
+        // Read a token a CI system projected into a file rather than into the
+        // environment: Kubernetes service account tokens and Azure Pipelines'
+        // `$AZURE_FEDERATED_TOKEN_FILE` are both files, and both are how their
+        // federation is meant to be reached.
+        let read_file = |path: &str| -> anyhow::Result<String> {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!(
+                    "secret {}: reading {path}: {e}. static_env reads a host path; check the file \
+                     exists and this process can read it, or name a variable with `var` instead.",
+                    ctx.addr
+                )
+            })?;
+            // A projected token file ends in a newline often enough that not
+            // trimming it would make this feature fail on its main use with a
+            // signature-verification error two hops away.
+            let value = raw.trim_end_matches(['\n', '\r']).to_string();
+            if value.is_empty() {
+                anyhow::bail!(
+                    "secret {}: {path} is empty. static_env treats that as unset, the same way an \
+                     empty variable is.",
+                    ctx.addr
+                );
+            }
+            Ok(value)
+        };
+
+        let Source::StaticEnv { vars, files } = &acquire.source else {
             anyhow::bail!(
                 "secret {}: static_env provider given a {:?} source",
                 ctx.addr,
@@ -217,8 +243,17 @@ impl SecretProvider for StaticEnvProvider {
         for (field, var) in vars {
             fields.insert(field.clone(), crate::value::SecretValue::new(read(var)?));
         }
+        for (field, path) in files {
+            fields.insert(
+                field.clone(),
+                crate::value::SecretValue::new(read_file(path)?),
+            );
+        }
         if fields.is_empty() {
-            anyhow::bail!("secret {}: static_env named no variables", ctx.addr);
+            anyhow::bail!(
+                "secret {}: static_env named no variables and no files",
+                ctx.addr
+            );
         }
         // A single-variable descriptor lands on the primary field, so the JWT
         // reader still gets a look: `var = "TOK"` is sugar for
@@ -542,6 +577,7 @@ mod tests {
     /// A `static_env` route reading one variable into the primary field.
     fn static_env(var: &str) -> Acquire {
         acquire(Source::StaticEnv {
+            files: Default::default(),
             vars: BTreeMap::from([(Credential::PRIMARY.to_string(), var.to_string())]),
         })
     }
@@ -612,6 +648,7 @@ mod tests {
                 &ctx.mint_ctx(&env),
                 &Identity::default(),
                 &acquire(Source::StaticEnv {
+                    files: Default::default(),
                     vars: BTreeMap::from([
                         ("aws_access_key_id".to_string(), "AK".to_string()),
                         ("aws_secret_access_key".to_string(), "SK".to_string()),
@@ -628,6 +665,66 @@ mod tests {
             c.get("aws_secret_access_key").expect("k").expose(),
             "secretkeyvalue"
         );
+    }
+
+    /// Kubernetes projects a service account token into a file, and Azure
+    /// Pipelines points `$AZURE_FEDERATED_TOKEN_FILE` at one. Both are the
+    /// documented way to reach that platform's federation, and neither is
+    /// reachable through a variable — without this the only route was a helper
+    /// whose entire body was `cat`.
+    #[tokio::test]
+    async fn static_env_reads_a_projected_token_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("token");
+        // Written with the trailing newline a projected token actually carries:
+        // not trimming it would fail this feature on its main use, two hops
+        // away, as a signature error.
+        std::fs::write(&path, "eyJhbGciOiJSUzI1NiJ9.payload.sig\n").expect("write");
+
+        let ctx = Ctx::new();
+        let env = env_of(&[]);
+        let c = StaticEnvProvider
+            .mint(
+                &ctx.mint_ctx(&env),
+                &Identity::default(),
+                &acquire(Source::StaticEnv {
+                    vars: BTreeMap::new(),
+                    files: BTreeMap::from([(
+                        Credential::PRIMARY.to_string(),
+                        path.display().to_string(),
+                    )]),
+                }),
+            )
+            .await
+            .expect("mint");
+        assert_eq!(
+            c.resolve_pointer("$.").expect("v").expose(),
+            "eyJhbGciOiJSUzI1NiJ9.payload.sig"
+        );
+    }
+
+    /// The same "say what to do" bar the missing-variable message meets.
+    #[tokio::test]
+    async fn a_missing_token_file_names_the_path_and_the_descriptor() {
+        let ctx = Ctx::new();
+        let env = env_of(&[]);
+        let err = StaticEnvProvider
+            .mint(
+                &ctx.mint_ctx(&env),
+                &Identity::default(),
+                &acquire(Source::StaticEnv {
+                    vars: BTreeMap::new(),
+                    files: BTreeMap::from([(
+                        Credential::PRIMARY.to_string(),
+                        "/definitely/not/here/token".to_string(),
+                    )]),
+                }),
+            )
+            .await
+            .expect_err("missing");
+        let msg = err.to_string();
+        assert!(msg.contains("/definitely/not/here/token"), "{msg}");
+        assert!(msg.contains("//infra/creds:test"), "{msg}");
     }
 
     #[tokio::test]

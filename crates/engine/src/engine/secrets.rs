@@ -191,7 +191,7 @@ impl Engine {
                 continue;
             };
             out.extend(desc.acquire.iter().filter_map(|a| match &a.source {
-                hsecrets::Source::Oidc { sign_in } => sign_in.clone(),
+                hsecrets::Source::Oidc { sign_in, .. } => sign_in.clone(),
                 _ => None,
             }));
         }

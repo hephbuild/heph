@@ -48,8 +48,8 @@ A descriptor has two halves that behave completely differently.
 
 | | Fields | In the cache key? |
 |---|---|---|
-| **Identity** | `role`, `audience`, `scope`, `registry`, `machine`, `profile`, `params`, `shape`, `env` | **Yes** |
-| **Acquisition** | `provider`, `var`/`vars`, `helper`, `protocol`, `runner`, `timeout`, `exchange`, `ttl`, `acquire` | **No** |
+| **Identity** | `role`, `scope`, `registry`, `machine`, `profile`, `params`, `shape`, `env` | **Yes** |
+| **Acquisition** | `provider`, `var`/`vars`, `file`/`files`, `helper`, `protocol`, `runner`, `timeout`, `sign_in`, `audience`, `exchange`, `ttl`, `acquire` | **No** |
 
 Getting this wrong costs the feature its main promise. If `provider` were
 hashed, CI saying `oidc` and a laptop saying `exec` would produce different
@@ -184,9 +184,9 @@ fields belong to it and to nothing else:
 
 | `provider` | Its fields | What it does |
 |---|---|---|
-| `static_env` | `var` / `vars` | Reads named host variables. The honest escape hatch and the migration path off `pass_env`. |
+| `static_env` | `var` / `vars`, `file` / `files` | Reads named host variables, or reads a host path. The honest escape hatch, the migration path off `pass_env`, and how a projected CI token is reached. |
 | `exec` | `helper`, `protocol`, `runner`, `timeout` | Runs a helper subprocess speaking one of four protocols. |
-| `oidc` | — | Presents the ambient workload identity token, or the stored session. |
+| `oidc` | `sign_in`, `audience` | Presents the ambient workload identity token, or the stored session. |
 
 That is what makes the wrong combinations **unwritable rather than merely
 rejected**. A `helper` on a `static_env` is an unknown key. An `exec` with no
@@ -232,7 +232,14 @@ response exists the request has already been sent in some encoding.
 ## Exchanges are standards, not vendors
 
 An exchange turns what the provider produced into the credential a target
-actually uses. It is named for the **grant**, and the grants have RFC numbers:
+actually uses. **It runs after every source, not only after `oidc`** — an
+assertion is not the only thing worth trading. A Cloudflare R2 parent token read
+out of 1Password becomes a bucket-scoped, twelve-hour credential through one
+`http` call; a Google service-account key becomes an access token through RFC
+7523. Both are `exec` sources with an `exchange`, and in both the long-lived
+parent value is spent at the endpoint rather than handed to the target.
+
+It is named for the **grant**, and the grants have RFC numbers:
 
 | `kind` | What it is |
 |---|---|
@@ -299,8 +306,7 @@ A single hop may be written as one dict rather than a one-element list.
 
 An identity field is named only two ways:
 
-1. It is a **parameter of a standard** an exchange speaks — `role`, `audience`,
-   `scope`.
+1. It is a **parameter of a standard** an exchange speaks — `role`, `scope`.
 2. It is a **slot key** the collision check reasons about, so two credentials
    cannot silently claim one entry — `machine` (netrc, git), `registry`
    (docker), `profile` (aws), `env` (variable names).
@@ -325,6 +331,85 @@ way to say what its identity was at all.
 The cost, stated so it is a decision rather than a surprise: a map has no
 schema, so a misspelled `regoin` renders no region rather than failing. That is
 the price of a vocabulary heph does not have to own.
+
+### `audience` is acquisition, not identity
+
+It reads like identity and is not, and this is the one field where getting that
+wrong is expensive rather than merely untidy.
+
+The `aud` an assertion can carry is decided by **whichever issuer minted it**,
+not by who you are. GitHub Actions will stamp any audience a job asks for, so
+the CI route asks for `sts.amazonaws.com` and AWS's IAM OIDC provider is
+registered against it. An OIDC ID token's `aud` is the client id — OIDC Core §2
+requires that — so the `heph auth login` route *cannot* ask for
+`sts.amazonaws.com`, and the cloud-side trust is registered against the client
+id instead. One principal, one `role`, two audiences:
+
+```python
+target(
+    name = "ecr",
+    driver = "secret",
+    role   = "arn:aws:iam::4711:role/heph-ci-push",   # identity — hashed, one for both
+
+    acquire = [
+        {"when_env": "GITHUB_ACTIONS", "provider": "oidc",
+         "audience": "sts.amazonaws.com",             # what Actions will stamp
+         "exchange": {"kind": "aws_sts"}},
+        {"provider": "oidc",                          # the laptop: aud is the client id
+         "sign_in": {"issuer": "https://org.okta.com", "client_id": "0oa_aws"},
+         "exchange": {"kind": "aws_sts"}},
+    ],
+)
+```
+
+While `audience` was hashed, writing that split every consumer's cache key by
+environment — `pass_env`'s disease one level up, in the one feature built to
+cure it. It is pinned by a test
+(`two_routes_asking_for_two_audiences_still_share_one_artifact`).
+
+Do not confuse it with the `audience` **on an exchange step**, which names what
+that hop is addressing — a GCP workload identity pool provider — rather than
+what the assertion must claim. Both are unhashed; a route usually sets one.
+
+### Any CI system, not just GitHub Actions
+
+heph detects exactly one CI system natively — GitHub Actions — because its ID
+token sits behind an authenticated HTTP call rather than in the environment.
+Everywhere else the token is simply *there*, so it needs no detection and no
+release to support: read it with `static_env` and keep the same `exchange`.
+
+```python
+acquire = [
+    {"when_env": "GITHUB_ACTIONS", "provider": "oidc",
+     "audience": "sts.amazonaws.com", "exchange": {"kind": "aws_sts"}},
+
+    {"when_env": "GITLAB_CI", "provider": "static_env",      # from `id_tokens:`
+     "var": "GITLAB_OIDC_TOKEN", "exchange": {"kind": "aws_sts"}},
+
+    {"when_env": "CIRCLECI", "provider": "static_env",
+     "var": "CIRCLE_OIDC_TOKEN_V2", "exchange": {"kind": "aws_sts"}},
+
+    {"when_env": "KUBERNETES_SERVICE_HOST", "provider": "static_env",
+     "file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+     "exchange": {"kind": "aws_sts"}},
+
+    {"when_env": "BUILDKITE", "provider": "exec", "protocol": "raw",
+     "helper": ["buildkite-agent", "oidc", "request-token",
+                "--audience", "sts.amazonaws.com"],
+     "exchange": {"kind": "aws_sts"}},
+
+    {"provider": "exec", "protocol": "credential_process",   # laptops
+     "helper": ["aws", "configure", "export-credentials", "--format", "process"]},
+]
+```
+
+`file`/`files` mirrors `var`/`vars` and exists for exactly this: Kubernetes
+projects a service account token to a path and Azure Pipelines points
+`$AZURE_FEDERATED_TOKEN_FILE` at one, and neither is reachable through a
+variable. It names a **location, never a literal**, like everything else in this
+half. The file is read once per mint and never watched.
+
+Adding a CI system is therefore a BUILD-file edit, not a heph release.
 
 ### A helper has a deadline
 
@@ -774,23 +859,48 @@ the cost is that the next such need adds a method rather than an argument.
 Register heph as a **public client** (no client secret) per integration, and hand
 back the issuer and each client id. Then:
 
-- **Redirect URIs.** Either allow arbitrary loopback ports (RFC 8252 §7.3) and
-  register `http://127.0.0.1/callback`, or register the three exact URIs
-  `http://127.0.0.1:47113/callback`, `:47114`, `:47115` — keeping `redirect_ports`
-  aligned with whatever you register. A URI registered on a different port is the
-  most common first-run failure, which is why `heph auth login` prints the exact
-  URI it is waiting on before the browser opens. Use the literal IP, never
-  `localhost`: some IdPs treat them as different registrations.
+- **Redirect URIs — register three exact ones**, not a wildcard:
+  `http://127.0.0.1:47113/callback`, `:47114`, `:47115`. RFC 8252 §7.3 says a
+  server *should* permit any loopback port, and the two IdPs most orgs run do
+  not oblige: **Okta does not support ephemeral or wildcard loopback ports at
+  all**, and on **Entra** the portal will not let you add a `127.0.0.1` reply
+  URL — it must go in the app manifest as `replyUrlsWithType` with type
+  `InstalledClient`, and the UI's `http://localhost` is a *different*
+  registration that will not match. Use the literal IP, never `localhost`. Keep
+  `sign_in.redirect_ports` aligned with whatever you register; a URI on a
+  different port is the most common first-run failure, which is why `heph auth
+  login` prints the exact URI it is waiting on before the browser opens.
 - **Refresh grant**, or `offline_access` returns no token and every build session
-  needs the browser again.
-- **Device grant**, if anyone will use `--device-code`. Without a published
+  needs the browser again. Check policy as well as the toggle: Okta's default
+  expires a refresh token after 7 days unused, Entra's public-client window is a
+  90-day slider, and a Conditional Access sign-in-frequency rule revokes on its
+  own schedule. All three surface as `invalid_grant` and "run `heph auth login`",
+  which is the right answer — it is policy, not an outage.
+- **Device grant**, only if you will actually allow it. Do not treat
+  `--device-code` as the guaranteed fallback: Microsoft's own Conditional Access
+  guidance is to block the device code flow, and on Okta it is a per-application
+  feature that is off until someone enables it. Without a published
   `device_authorization_endpoint` heph says so by name rather than failing
   obscurely.
+- **Which authorization server.** On Okta, `https://org.okta.com` (the org
+  server) is licence-free and issues ID tokens with refresh for native apps.
+  `https://org.okta.com/oauth2/default` is the *custom* server and needs the API
+  Access Management add-on — reach for it only when you need custom claims in a
+  cloud trust policy, or when Okta itself is the exchange endpoint.
 
 On a remote shell the loopback flow cannot work — the browser is on a different
-machine and cannot reach `127.0.0.1` on this one. `heph auth login` detects that
-(`$SSH_CONNECTION`, or Linux with no display) and points at `--device-code`
-before opening anything.
+machine and cannot reach `127.0.0.1` on this one. Because the redirect ports are
+**fixed**, forwarding them is the reliable answer and asks nothing of the IdP,
+which sees the same registered URI either way:
+
+```bash
+ssh -L 47113:127.0.0.1:47113 -L 47114:127.0.0.1:47114 -L 47115:127.0.0.1:47115 devbox
+```
+
+`heph auth login` detects the situation (`$SSH_CONNECTION`, or Linux with no
+display) and prints that recipe first, with `--device-code` second — in that
+order, because the device grant is the flow an organization is most likely to
+have taken away.
 
 ### What is stored
 
@@ -832,6 +942,18 @@ A laptop can still skip all of this and point an `acquire` entry at a vendor CLI
 it is already signed into, which needs no IAM ask at all.
 
 ## What is not built yet
+
+**Azure / Entra workload identity federation.** Entra presents the JWT as
+*client authentication* (RFC 7523 §2.2) rather than as an authorization grant:
+`grant_type=client_credentials` plus `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
+and `client_assertion=<the jwt>`, form-encoded. Neither exchange variant can
+spell that today — `client_credentials` resolves its subject token and then
+never sends it, carrying no client authentication at all, and `http` hard-codes
+`content-type: application/json` where the token endpoint needs a form. The fix
+is two fields on `client_credentials` and a body encoding on `http`; both are in
+the unhashed acquisition half, so it moves no cache key. Reaching Azure's
+*assertion* already works — `file = "$AZURE_FEDERATED_TOKEN_FILE"`'s path on a
+`static_env` route — it is only the far end that has no spelling.
 
 Mid-target credential refresh, which needs a process credential the
 tool re-reads (`credential_process`, `GOAUTH=command`, a git

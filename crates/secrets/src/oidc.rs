@@ -168,60 +168,47 @@ impl SecretProvider for OidcProvider {
         ProviderKind::Oidc
     }
 
+    /// Produce the assertion, and *only* the assertion.
+    ///
+    /// Trading it is [`Exchanger`]'s job, run by the broker over whatever any
+    /// source returned. What comes back from here is therefore not usable as a
+    /// credential on its own, which is why [`Acquire::validate`] refuses an
+    /// `oidc` entry with an empty `exchange`.
     async fn mint(
         &self,
         ctx: &MintCtx<'_>,
-        identity: &Identity,
+        _identity: &Identity,
         acquire: &Acquire,
     ) -> anyhow::Result<Credential> {
+        let audience = oidc_audience(acquire);
+        let redact = |e: anyhow::Error| {
+            anyhow::anyhow!(
+                "{}",
+                ctx.redactor
+                    .redact_str(&format!("secret {}: {e:#}", ctx.addr))
+            )
+        };
+
         // CI first: an ambient workload identity is scoped to the job, so it is
         // strictly better than a session when both exist.
         let token = match AmbientIdentity::detect(ctx.env) {
             Some(ambient) => ambient
-                .id_token(&self.client, identity.audience.as_deref())
+                .id_token(&self.client, audience)
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "{}",
-                        ctx.redactor
-                            .redact_str(&format!("secret {}: {e:#}", ctx.addr))
-                    )
-                })?,
+                .map_err(redact)?,
             // Redacted on the same terms as the ambient arm: nothing in this
             // path carries a credential today, and the asymmetry is what a
             // future edit trips over.
             None => self
-                .session_assertion(ctx, sign_in(acquire)?, identity.audience.as_deref())
+                .session_assertion(ctx, sign_in(acquire)?, audience)
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "{}",
-                        ctx.redactor
-                            .redact_str(&format!("secret {}: {e:#}", ctx.addr))
-                    )
-                })?,
+                .map_err(redact)?,
         };
 
-        // The assertion on its own is not a credential. Every step consumes what
-        // the last produced, so a two-hop federation is a list rather than a
-        // special case.
-        let mut current = Credential::single(
+        Ok(Credential::single(
             token,
             Expiry::resolve(ctx.now, None, None, acquire.ttl_duration()?),
-        );
-        for (i, step) in acquire.exchange.iter().enumerate() {
-            current = self
-                .run_exchange(ctx, identity, acquire, step, &current)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "{}",
-                        ctx.redactor
-                            .redact_str(&format!("secret {}: exchange[{i}]: {e:#}", ctx.addr))
-                    )
-                })?;
-        }
-        Ok(current)
+        ))
     }
 }
 
@@ -327,7 +314,74 @@ impl OidcProvider {
             token: assertion,
         })
     }
+}
 
+/// Run an `acquire` entry's [`Exchange`] pipeline over whatever its source
+/// produced.
+///
+/// # Why this is not part of the `oidc` provider
+///
+/// It was, and that was a silent-wrong-build bug rather than a layering
+/// nicety. An assertion is not the only thing worth trading: a Cloudflare R2
+/// parent token read out of 1Password becomes a bucket-scoped, twelve-hour
+/// credential through one `http` call, and a Google service-account key becomes
+/// an access token through RFC 7523. Both are `exec` sources with an
+/// `exchange`, both parse, both validate — and while this code lived inside
+/// [`OidcProvider::mint`], both silently handed the target the **parent token**
+/// while the reviewed BUILD file said otherwise. Nothing failed; the build
+/// simply authenticated as something other than what it declared.
+///
+/// So the pipeline belongs to the broker, which runs it after *any* source.
+/// The type nails that down: every step takes a [`Credential`] and returns one,
+/// and none of them can tell where the first came from.
+#[derive(Debug)]
+pub struct Exchanger {
+    client: reqwest::Client,
+}
+
+impl Default for Exchanger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Exchanger {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Feed `input` through every step in order.
+    ///
+    /// Returns it untouched when the entry declares no exchange, which is the
+    /// common case and costs nothing — a `static_env` credential is already the
+    /// credential.
+    pub async fn run(
+        &self,
+        ctx: &MintCtx<'_>,
+        identity: &Identity,
+        acquire: &Acquire,
+        input: Credential,
+    ) -> anyhow::Result<Credential> {
+        let mut current = input;
+        for (i, step) in acquire.exchange.iter().enumerate() {
+            current = self
+                .run_exchange(ctx, identity, acquire, step, &current)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}",
+                        ctx.redactor
+                            .redact_str(&format!("secret {}: exchange[{i}]: {e:#}", ctx.addr))
+                    )
+                })?;
+        }
+        Ok(current)
+    }
     /// Resolve an [`Endpoint`] to a concrete token endpoint.
     ///
     /// The discovery form fetches `{issuer}/.well-known/openid-configuration`
@@ -430,9 +484,12 @@ impl OidcProvider {
                     ),
                     ("subject_token", subject),
                 ];
-                // The descriptor's audience is the identity's; a step may
-                // override it for a hop that addresses something else.
-                if let Some(a) = audience.as_deref().or(identity.audience.as_deref()) {
+                // The step's own audience, and nothing else: what this hop
+                // addresses (a GCP workload identity pool provider) is a
+                // different question from what the assertion had to claim, and
+                // conflating them is what put a route-dependent value in the
+                // hashed half in the first place.
+                if let Some(a) = audience.as_deref() {
                     form.push(("audience", a.to_string()));
                 }
                 if let Some(r) = resource {
@@ -719,19 +776,32 @@ impl OidcProvider {
 /// whole point of the move: two secrets federating to two clouds sign in to two
 /// Okta applications, and the one that applies is the one on the route that was
 /// selected.
+fn oidc_audience(acquire: &Acquire) -> Option<&str> {
+    match &acquire.source {
+        Source::Oidc { audience, .. } => audience.as_deref(),
+        _ => None,
+    }
+}
+
 fn sign_in(acquire: &Acquire) -> anyhow::Result<&SignIn> {
-    let Source::Oidc { sign_in } = &acquire.source else {
+    let Source::Oidc { sign_in, .. } = &acquire.source else {
         // Unreachable through the registry, which dispatches on `Source::kind`.
         anyhow::bail!("the oidc provider was given a {:?} source", acquire.source);
     };
     sign_in.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "no ambient workload identity on this machine, and this route declares no \
-             `sign_in`.\n  In GitHub Actions a missing identity means the job has no \
-             `permissions: id-token: write` — without it the request variables are simply \
-             absent, which is why this is not an authorization error.\n  On a laptop, either \
-             give this route a `sign_in = {{\"issuer\": …, \"client_id\": …}}` and run `heph \
-             auth login`, or add an `acquire` entry using a CLI you are already signed into."
+             `sign_in`.\n  heph detects one CI system natively: GitHub Actions. A missing \
+             identity there means the job has no `permissions: id-token: write` — without it \
+             the request variables are simply absent, which is why this is not an \
+             authorization error.\n  On other CI systems the job's ID token is not behind an \
+             HTTP call, so read it directly and keep the same `exchange`: GitLab \
+             `static_env` on the variable named by `id_tokens:`, CircleCI `static_env` on \
+             `CIRCLE_OIDC_TOKEN_V2`, Kubernetes and Azure Pipelines `file` on the projected \
+             token path, Buildkite `exec` running `buildkite-agent oidc request-token`.\n  On \
+             a laptop, either give this route a `sign_in = {{\"issuer\": …, \"client_id\": …}}` \
+             and run `heph auth login`, or add an `acquire` entry using a CLI you are already \
+             signed into."
         )
     })
 }
@@ -917,7 +987,10 @@ mod tests {
     fn oidc_acquire_with(sign_in: Option<SignIn>) -> Acquire {
         Acquire {
             when_env: None,
-            source: Source::Oidc { sign_in },
+            source: Source::Oidc {
+                sign_in,
+                audience: None,
+            },
             exchange: vec![Exchange::AwsSts { endpoint: None }],
             ttl: None,
         }
@@ -927,7 +1000,7 @@ mod tests {
     /// both ways out rather than reporting an authorization failure that never
     /// happened.
     #[tokio::test]
-    async fn with_no_identity_and_no_auth_block_both_routes_are_named() {
+    async fn with_no_ambient_identity_and_no_sign_in_every_route_is_named() {
         let token = hcore::hasync::StdCancellationToken::new();
         let redactor = crate::redact::Redactor::inert();
         let env = env_of(&[]);
@@ -942,6 +1015,12 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("id-token: write"), "{msg}");
         assert!(msg.contains("heph auth login"), "{msg}");
+        // The other CI systems, which have no ambient detection and need none:
+        // their ID token is in a variable or a file, so the message has to say
+        // so rather than leaving a GitLab job reading GitHub's instructions.
+        for named in ["GitLab", "CircleCI", "Kubernetes", "Buildkite"] {
+            assert!(msg.contains(named), "{named} is not offered a route: {msg}");
+        }
     }
 
     /// A configured workspace on a machine nobody has signed in on. It must
@@ -1037,6 +1116,81 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("github actions"), "{msg}");
         assert!(!msg.contains("heph auth login"), "{msg}");
+    }
+
+    /// The requested `aud` comes from the **route**, not from the identity.
+    ///
+    /// GitHub Actions will stamp any audience a job asks for, which is what
+    /// makes `sts.amazonaws.com` reachable there and unreachable from an OIDC
+    /// ID token, whose `aud` is the client id by OIDC Core §2. So the value has
+    /// to travel with the acquisition entry: while it lived in `Identity` it
+    /// was hashed, and a descriptor spelling both routes gave CI and the laptop
+    /// two different cache keys for one principal.
+    ///
+    /// Asserting on the query string rather than on a returned token, because
+    /// what is being pinned is which parameter heph sends.
+    #[tokio::test]
+    async fn the_assertion_audience_is_read_from_the_route() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let record = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            *record.lock().await = req.lines().next().unwrap_or_default().to_string();
+            let body = r#"{"value":"assertion.jwt.here"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ignored = sock.write_all(resp.as_bytes()).await;
+            let _ignored = sock.shutdown().await;
+        });
+
+        let token = hcore::hasync::StdCancellationToken::new();
+        let redactor = crate::redact::Redactor::inert();
+        let url = format!("http://127.0.0.1:{port}/token");
+        let env = env_of(&[
+            ("ACTIONS_ID_TOKEN_REQUEST_URL", url.as_str()),
+            ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "bearer"),
+        ]);
+
+        let acquire = Acquire {
+            source: Source::Oidc {
+                sign_in: None,
+                audience: Some("sts.amazonaws.com".into()),
+            },
+            ..oidc_acquire()
+        };
+        // An identity with everything *except* an audience, because there is no
+        // longer anywhere on it to put one.
+        let identity = Identity {
+            role: Some("arn:aws:iam::4711:role/heph-ci-push".into()),
+            ..Identity::default()
+        };
+        OidcProvider::new()
+            .mint(
+                &ctx_with(&env, &token, &redactor, None),
+                &identity,
+                &acquire,
+            )
+            .await
+            .expect("assertion");
+
+        let line = seen.lock().await.clone();
+        assert!(
+            line.contains("audience=sts.amazonaws.com"),
+            "the route's audience was not requested: {line}"
+        );
     }
 
     fn sign_in_cfg(issuer: &str) -> SignIn {

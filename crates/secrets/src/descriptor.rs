@@ -68,10 +68,6 @@ pub struct Identity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
 
-    /// The `aud` claim the exchange will check.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audience: Option<String>,
-
     /// OAuth scope(s) requested, sorted for determinism.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<String>,
@@ -82,10 +78,19 @@ pub struct Identity {
     /// everything that does neither lives:
     ///
     /// 1. It is a **parameter of a standard** an exchange speaks — `role`,
-    ///    `audience`, `scope`.
+    ///    `scope`.
     /// 2. It is a **slot key** [`crate::shape::Shape::slots`] reasons about, so
     ///    two credentials cannot silently claim one entry — `machine`,
     ///    `registry`, `profile`, `env`.
+    ///
+    /// `audience` was a named field here and is now on the `oidc` source
+    /// instead, in the unhashed half. It failed test 1 on inspection: the `aud`
+    /// an assertion carries is a property of *which issuer minted it*, not of
+    /// who you are. GitHub Actions stamps `sts.amazonaws.com` on request; an
+    /// OIDC ID token's `aud` is the client id, because OIDC Core requires it.
+    /// So one descriptor reached by two routes needs two audiences — and while
+    /// it lived here, hashed, that split every consumer's cache key in exactly
+    /// the way this design exists to prevent.
     ///
     /// Anything else is one vendor's vocabulary in a format that is frozen into
     /// every consumer's cache key. `bucket`, `account`, `region` and `endpoint`
@@ -684,6 +689,28 @@ pub enum Source {
         /// mutual-exclusion rule to enforce downstream.
         #[spec(alias = "var", parse = parse_vars, ty = vars_param_type())]
         vars: BTreeMap<String, String>,
+
+        /// Credential field name → host **file** path, read at mint time.
+        ///
+        /// Spelled `file = "/var/run/…/token"`, or `files = {…}`, exactly like
+        /// `var`/`vars` above.
+        ///
+        /// The same rule applies as to `vars` and for the same reason: this
+        /// names a *location*, never a literal. What makes it necessary is that
+        /// half the CI systems worth federating hand a workload its identity as
+        /// a file rather than as a variable — a Kubernetes projected service
+        /// account token at
+        /// `/var/run/secrets/kubernetes.io/serviceaccount/token`, and Azure
+        /// Pipelines / AKS at `$AZURE_FEDERATED_TOKEN_FILE`. Without this the
+        /// only way to reach them was a helper whose whole body was `cat`.
+        ///
+        /// A file is read once per mint and never watched: a projected token is
+        /// rotated in place by the kubelet, and the value handed to a target is
+        /// the one that existed when the target started. That is the same
+        /// contract every other source has — see [`crate::broker`] on
+        /// mid-target expiry.
+        #[spec(alias = "file", parse = parse_vars, ty = vars_param_type())]
+        files: BTreeMap<String, String>,
     },
     /// Run a helper subprocess speaking one of the four wire protocols.
     Exec {
@@ -705,9 +732,8 @@ pub enum Source {
     },
     /// Present the ambient workload identity token, or the stored session.
     ///
-    /// What it asserts is the identity half's `audience`; what it becomes is
-    /// the `exchange` pipeline. The only thing it configures is where a machine
-    /// with no ambient identity signs in.
+    /// What it becomes is the `exchange` pipeline; what it configures is where
+    /// a machine with no ambient identity signs in, and what `aud` to ask for.
     Oidc {
         /// How to establish a session on a machine that has no ambient
         /// workload identity. See [`SignIn`].
@@ -719,6 +745,30 @@ pub enum Source {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[spec(parse = parse_sign_in, ty = sign_in_param_type())]
         sign_in: Option<SignIn>,
+
+        /// The `aud` to request on the assertion, and to insist it carries.
+        ///
+        /// **Unhashed, and this is the whole point of it being here.** It reads
+        /// like identity and is not: the `aud` an assertion can carry is fixed
+        /// by whichever issuer minted it. GitHub Actions will stamp any
+        /// audience you ask for, so the CI route says `sts.amazonaws.com`; an
+        /// OIDC ID token's `aud` is the client id, because OIDC Core §2
+        /// requires it, so the `heph auth login` route cannot say that and the
+        /// cloud-side trust is registered against the client id instead. Two
+        /// routes, two audiences, one identity — which only works if the value
+        /// travels with the route.
+        ///
+        /// Do not confuse it with [`Exchange::TokenExchange::audience`], which
+        /// names what the *exchange* is addressing (a GCP workload identity
+        /// pool provider) rather than what the assertion must claim. Both are
+        /// unhashed; they answer different questions and a route usually sets
+        /// only one.
+        ///
+        /// Absent means "take whatever the issuer gives", which is right
+        /// wherever the far end validates `aud` against a client id it already
+        /// knows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<String>,
     },
 }
 
@@ -911,10 +961,23 @@ impl Acquire {
     pub fn validate(&self, addr: &str, index: usize) -> anyhow::Result<()> {
         let at = || format!("secret {addr}: acquire[{index}]");
         match &self.source {
-            Source::StaticEnv { vars } => {
-                if vars.is_empty() {
+            Source::StaticEnv { vars, files } => {
+                if vars.is_empty() && files.is_empty() {
                     anyhow::bail!(
-                        "{}: static_env needs `var` (one variable) or `vars` (several)",
+                        "{}: static_env needs `var`/`vars` (host variables) or `file`/`files` \
+                         (host paths — a Kubernetes projected token, or \
+                         $AZURE_FEDERATED_TOKEN_FILE)",
+                        at()
+                    );
+                }
+                // Two sources for one field is not a precedence question worth
+                // having: it decides which credential a build runs as, and the
+                // answer would live in this file rather than in the BUILD file
+                // anyone reviews.
+                if let Some(dup) = vars.keys().find(|k| files.contains_key(*k)) {
+                    anyhow::bail!(
+                        "{}: field {dup:?} is named by both `vars` and `files`. One field, one \
+                         location.",
                         at()
                     );
                 }
@@ -1104,6 +1167,7 @@ mod tests {
                 crate::value::Credential::PRIMARY.to_string(),
                 var.to_string(),
             )]),
+            files: BTreeMap::new(),
         }
     }
 
@@ -1229,6 +1293,12 @@ mod tests {
         let text = String::from_utf8(ci).expect("utf8");
         for absent in [
             "provider", "helper", "acquire", "ttl", "runner", "exchange", "when_env",
+            // `audience` and `sign_in` live on the source. They read like
+            // identity, which is exactly why they are listed here: an edit that
+            // promoted either back into `Identity` would split the cache
+            // between the CI route and the laptop route and nothing else would
+            // complain.
+            "audience", "sign_in",
         ] {
             assert!(
                 !text.contains(absent),
@@ -1236,6 +1306,68 @@ mod tests {
             );
         }
         assert!(text.contains("heph-read"));
+    }
+
+    /// Two routes that must ask for two different `aud` values still emit one
+    /// artifact.
+    ///
+    /// This is the concrete case that forced `audience` out of the identity
+    /// half. AWS federation needs `aud = "sts.amazonaws.com"` from GitHub
+    /// Actions, which will stamp any audience asked of it — and cannot get that
+    /// from an OIDC ID token, whose `aud` is the client id because OIDC Core §2
+    /// requires it, so the laptop route registers the client id in the IAM
+    /// trust policy instead. One principal, one `role`, two audiences. While
+    /// `audience` was hashed, declaring both split every consumer's cache key
+    /// by environment — which is `pass_env`'s disease one level up, and the
+    /// exact thing this design claims to cure.
+    #[test]
+    fn two_routes_asking_for_two_audiences_still_share_one_artifact() {
+        let identity = Identity {
+            role: Some("arn:aws:iam::4711:role/heph-ci-push".into()),
+            ..Identity::default()
+        };
+        let two_routes = Descriptor {
+            addr: "//infra/creds:ecr".into(),
+            identity: identity.clone(),
+            acquire: vec![
+                Acquire {
+                    when_env: Some(WhenEnv::Set("GITHUB_ACTIONS".into())),
+                    source: Source::Oidc {
+                        sign_in: None,
+                        audience: Some("sts.amazonaws.com".into()),
+                    },
+                    exchange: vec![Exchange::AwsSts { endpoint: None }],
+                    ttl: None,
+                },
+                Acquire {
+                    when_env: None,
+                    source: Source::Oidc {
+                        sign_in: Some(SignIn {
+                            issuer: "https://org.okta.com".into(),
+                            client_id: "0oa_aws".into(),
+                            scopes: default_scopes(),
+                            redirect_ports: default_redirect_ports(),
+                        }),
+                        audience: None,
+                    },
+                    exchange: vec![Exchange::AwsSts { endpoint: None }],
+                    ttl: None,
+                },
+            ],
+            allow: None,
+        };
+        two_routes.validate().expect("valid");
+
+        let both = SecretJson::new(&two_routes.addr, two_routes.identity)
+            .to_bytes()
+            .expect("bytes");
+        let bare = SecretJson::new("//infra/creds:ecr", identity)
+            .to_bytes()
+            .expect("bytes");
+        assert_eq!(
+            both, bare,
+            "two audiences moved the artifact, so CI and the laptop no longer share a cache"
+        );
     }
 
     /// Empty identity fields must not serialize, or adding a field later
@@ -1300,7 +1432,10 @@ mod tests {
                 Acquire {
                     when_env: Some(WhenEnv::Set("GITHUB_ACTIONS".into())),
                     exchange: vec![Exchange::AwsSts { endpoint: None }],
-                    ..acq(Source::Oidc { sign_in: None })
+                    ..acq(Source::Oidc {
+                        sign_in: None,
+                        audience: None,
+                    })
                 },
                 exec_acq(),
             ],
@@ -1382,9 +1517,12 @@ mod tests {
     /// it for cannot work, and says so at the declaration.
     #[test]
     fn oidc_without_an_exchange_is_rejected_at_spec_time() {
-        let err = acq(Source::Oidc { sign_in: None })
-            .validate("//x:y", 0)
-            .expect_err("needs an exchange");
+        let err = acq(Source::Oidc {
+            sign_in: None,
+            audience: None,
+        })
+        .validate("//x:y", 0)
+        .expect_err("needs an exchange");
         let msg = err.to_string();
         assert!(msg.contains("needs an `exchange`"), "{msg}");
         assert!(msg.contains("token_exchange"), "{msg}");
@@ -1393,6 +1531,7 @@ mod tests {
     #[test]
     fn static_env_needs_a_variable_name() {
         let err = acq(Source::StaticEnv {
+            files: Default::default(),
             vars: BTreeMap::new(),
         })
         .validate("//x:y", 0)
@@ -1446,6 +1585,36 @@ mod tests {
             acq(static_env("TOK")).helper_timeout().expect("default"),
             DEFAULT_HELPER_TIMEOUT
         );
+    }
+
+    /// A source that names nowhere to read from is a declaration that cannot
+    /// mean anything, and the message has to name both spellings — someone on
+    /// Kubernetes reaching for `var` needs to learn `file` exists.
+    #[test]
+    fn static_env_with_neither_variables_nor_files_names_both() {
+        let err = acq(Source::StaticEnv {
+            vars: BTreeMap::new(),
+            files: BTreeMap::new(),
+        })
+        .validate("//c:x", 0)
+        .expect_err("empty");
+        let msg = err.to_string();
+        assert!(msg.contains("var"), "{msg}");
+        assert!(msg.contains("file"), "{msg}");
+    }
+
+    /// One field named by both a variable and a file is not a precedence
+    /// question worth having: the answer would decide which credential a build
+    /// runs as, and it would live in heph rather than in the reviewed file.
+    #[test]
+    fn a_field_read_from_both_a_variable_and_a_file_is_refused() {
+        let err = acq(Source::StaticEnv {
+            vars: BTreeMap::from([("token".to_string(), "TOK".to_string())]),
+            files: BTreeMap::from([("token".to_string(), "/run/token".to_string())]),
+        })
+        .validate("//c:x", 0)
+        .expect_err("both");
+        assert!(err.to_string().contains("token"), "{err}");
     }
 
     // ---- discovery ----
@@ -1566,7 +1735,10 @@ mod tests {
     fn a_grant_with_no_destination_fails_when_the_route_is_validated() {
         let a = Acquire {
             exchange: vec![token_exchange(None, None)],
-            ..acq(Source::Oidc { sign_in: None })
+            ..acq(Source::Oidc {
+                sign_in: None,
+                audience: None,
+            })
         };
         let err = a.validate("//x:y", 0).expect_err("no destination");
         let msg = err.to_string();

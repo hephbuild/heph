@@ -74,31 +74,6 @@ const MAX_REQUEST_LINE: u64 = 16 * 1024;
 /// enough that a login nobody completed does not hold a terminal forever.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// What to say when a workspace configures no identity provider.
-///
-/// One message, used by both the CLI and the build path — the same condition
-/// reported two different ways is how a user ends up believing they are two
-/// different problems. `{path}` is substituted with the resolved config file.
-/// The message, with the config file's path filled in.
-pub fn no_auth_block(path: &str) -> String {
-    NO_AUTH_BLOCK.replace("{path}", path)
-}
-
-const NO_AUTH_BLOCK: &str = "\
-this workspace has no `auth:` block in {path}, and this machine has no ambient \
-workload identity.\n\
-  In GitHub Actions a missing identity means the job has no `permissions: id-token: write` — \
-without it the request variables are simply absent, which is why this is not an authorization \
-error.\n\
-  On a laptop, add an `auth:` block naming the provider to sign in to, then run `heph auth \
-login`:\n\
-\n    auth:\n      issuer: https://org.okta.com/oauth2/default\n      clientId: <the registered \
-public client>\n\
-\n  Whoever administers your IdP supplies both, by registering heph as a public client. The \
-block holds no secret — a CLI is a public client (RFC 8252 §8.5) and PKCE replaces the client \
-secret — so it belongs in version control.\n\
-  Or give the descriptor an `acquire` entry that uses a CLI you are already signed into.";
-
 /// The HTTP client the login flow uses.
 ///
 /// Built here rather than by the caller so the CLI needs no HTTP dependency of
@@ -362,8 +337,8 @@ impl Metadata {
             .with_context(|| format!("fetch {url}"))?;
         if !resp.status().is_success() {
             anyhow::bail!(
-                "{url} returned {} — check `auth.issuer` in `.hephconfig`; it is the base URL, \
-                 not an endpoint",
+                "{url} returned {} — check the `issuer` in the `sign_in` block on the secret \
+                 you are signing in for; it is the IdP's base URL, not an endpoint",
                 resp.status()
             );
         }
@@ -439,9 +414,9 @@ impl TokenSet {
     /// opaque access token is not a JWT and no `token-exchange` endpoint will
     /// take one.
     pub fn assertion(&self) -> anyhow::Result<&str> {
-        self.id_token
-            .as_deref()
-            .context("the IdP returned no `id_token` — add `openid` to `auth.scopes`")
+        self.id_token.as_deref().context(
+            "the IdP returned no `id_token` — add `openid` to `sign_in.scopes` on the secret",
+        )
     }
 }
 
@@ -743,9 +718,10 @@ async fn bind_loopback(ports: &[u16]) -> anyhow::Result<(tokio::net::TcpListener
         }
     }
     anyhow::bail!(
-        "no configured loopback port could be bound:\n{}\nSet `auth.redirect_ports` in \
-         `.hephconfig` to ports this machine can use — and register the matching redirect URIs \
-         with the IdP.",
+        "no configured loopback port could be bound:\n{}\nSet `sign_in.redirect_ports` on the \
+         secret to ports this machine can use, and register the matching redirect URIs with the \
+         IdP. Note that some IdPs — Okta among them — will not accept a wildcard or ephemeral \
+         port, which is why these are fixed and must be registered one by one.",
         errs.join("\n")
     )
 }
@@ -1041,8 +1017,9 @@ fn device_error(body: &str) -> Option<DeviceError> {
 fn session_from(cfg: &SignIn, tokens: &TokenSet, now: SystemTime) -> anyhow::Result<Session> {
     let refresh_token = tokens.refresh_token.clone().context(
         "the IdP returned no refresh token, so nothing durable can be stored. Add \
-         `offline_access` to `auth.scopes` in `.hephconfig`, and check the client is allowed the \
-         refresh grant.",
+         `offline_access` to `sign_in.scopes` on the secret, and check the client is allowed the \
+         refresh grant — some tenants disable it for public clients by policy, in which case \
+         this route cannot work and the secret needs an `exec` entry instead.",
     )?;
     let mut session = Session {
         issuer: cfg.issuer.clone(),

@@ -121,6 +121,14 @@ impl Drop for RefreshGuard {
 /// Per-run credential broker.
 pub struct Broker {
     registry: Arc<ProviderRegistry>,
+    /// Runs the selected entry's `exchange` pipeline over whatever its source
+    /// returned — see [`crate::oidc::Exchanger`] for why this is here and not
+    /// inside the `oidc` provider.
+    ///
+    /// Built on first use rather than in `new`, because it owns an HTTP client
+    /// and most workspaces declare no exchange at all: a `static_env` or `exec`
+    /// descriptor should not pay for a connection pool it never opens.
+    exchanger: std::sync::OnceLock<crate::oidc::Exchanger>,
     /// Descriptor address → its single in-flight-or-cached slot. The outer lock
     /// is held only long enough to clone an `Arc`; the mint itself happens
     /// under the *slot's* lock, so two different descriptors never serialize
@@ -211,6 +219,7 @@ impl Broker {
     pub fn new(registry: Arc<ProviderRegistry>) -> Self {
         Self {
             registry,
+            exchanger: std::sync::OnceLock::new(),
             slots: Mutex::new(BTreeMap::new()),
             live: Mutex::new(LiveValues::default()),
             grants: Mutex::new(Vec::new()),
@@ -330,6 +339,20 @@ impl Broker {
         let cred = provider
             .mint(&mint_ctx, &desc.identity, selection.entry)
             .await?;
+
+        // Every source feeds the same pipeline. Running it here rather than
+        // inside one provider is what makes `exec` + `exchange` — a 1Password
+        // parent token traded for a bucket-scoped R2 credential, a service
+        // account key traded for an access token — do what the BUILD file says
+        // instead of silently handing the target the parent value.
+        let cred = if selection.entry.exchange.is_empty() {
+            cred
+        } else {
+            self.exchanger
+                .get_or_init(crate::oidc::Exchanger::new)
+                .run(&mint_ctx, &desc.identity, selection.entry, cred)
+                .await?
+        };
 
         // Register before returning, so the value is maskable from the moment
         // it exists rather than from the moment it is first delivered.
@@ -596,6 +619,7 @@ mod tests {
             acquire: vec![Acquire {
                 when_env: None,
                 source: Source::StaticEnv {
+                    files: Default::default(),
                     vars: BTreeMap::from([("token".to_string(), "X".to_string())]),
                 },
                 exchange: Vec::new(),
@@ -641,6 +665,104 @@ mod tests {
             b.mint(&d, "ecr", &ctx).await.expect("mint");
         }
         assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A one-shot endpoint that trades whatever bearer it is given for a
+    /// scoped value, and records what it was handed.
+    ///
+    /// Deliberately echoes the token it received: the assertion below is not
+    /// only that the exchange ran, but that it ran *on the source's output*.
+    async fn trading_endpoint() -> (String, Arc<Mutex<Option<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let record = Arc::clone(&seen);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let presented = req
+                    .lines()
+                    .find_map(|l| l.strip_prefix("authorization: Bearer "))
+                    .or_else(|| {
+                        req.lines()
+                            .find_map(|l| l.strip_prefix("Authorization: Bearer "))
+                    })
+                    .map(|v| v.trim().to_string());
+                *record.lock().await = presented;
+
+                let body = r#"{"token":"scoped_value_from_the_exchange"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ignored = sock.write_all(resp.as_bytes()).await;
+                let _ignored = sock.shutdown().await;
+            }
+        });
+        (format!("http://127.0.0.1:{port}/mint"), seen)
+    }
+
+    /// **The exchange runs after every source, not only after `oidc`.**
+    ///
+    /// This is a regression test for a silent wrong-credential bug, which is
+    /// the one class this whole design exists to make impossible. The pipeline
+    /// used to live inside the `oidc` provider, while `Acquire::validate`
+    /// happily accepted `exchange` on any source — so a descriptor reading a
+    /// Cloudflare R2 parent token out of 1Password and declaring a
+    /// `temp-access-credentials` call handed the target **the parent token**.
+    /// It did not fail, warn, or log: the reviewed BUILD file said one thing
+    /// and the build authenticated as another.
+    ///
+    /// The assertion is therefore two-sided — the target receives the exchanged
+    /// value, *and* the endpoint was presented the source's output — because a
+    /// pipeline that ran on the wrong input would satisfy the first alone.
+    #[tokio::test]
+    async fn an_exchange_runs_on_a_non_oidc_source_and_replaces_its_value() {
+        let (url, seen) = trading_endpoint().await;
+        let (b, _p) = broker(Duration::from_secs(3600));
+        let token = StdCancellationToken::new();
+        let env = env_of(&[]);
+        let ctx = BrokerCtx {
+            now: t(0),
+            env: &env,
+            ctoken: &token,
+            request_id: "req",
+            runner: None,
+            cwd: std::path::Path::new("."),
+            auth_home: None,
+        };
+
+        let mut d = descriptor("//infra/creds:r2");
+        d.acquire[0].exchange = vec![crate::descriptor::Exchange::Http {
+            url,
+            method: None,
+            headers: BTreeMap::new(),
+            body: None,
+            fields: BTreeMap::new(),
+        }];
+
+        let cred = b.mint(&d, "r2", &ctx).await.expect("mint");
+        assert_eq!(
+            cred.resolve_pointer("$.").expect("primary").expose(),
+            "scoped_value_from_the_exchange",
+        );
+        // The parent value is what `CountingProvider` returns; it must have
+        // been spent at the endpoint rather than delivered.
+        assert_eq!(
+            seen.lock().await.as_deref(),
+            Some("token_number_0_padded_out"),
+            "the exchange must consume the source's output"
+        );
     }
 
     /// A provider that blocks until every expected caller has arrived, so

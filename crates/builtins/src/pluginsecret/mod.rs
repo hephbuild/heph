@@ -68,9 +68,6 @@ struct SecretSpec {
     /// Role or principal to assume (an AWS role ARN, or a provider's equivalent).
     #[spec(ty = ParamType::String)]
     role: Option<String>,
-    /// The `aud` claim the exchange will check.
-    #[spec(ty = ParamType::String)]
-    audience: Option<String>,
     /// OAuth scopes requested. Sorted before hashing, so declaration order is
     /// not a cache-key component.
     scope: Vec<String>,
@@ -90,11 +87,15 @@ struct SecretSpec {
     /// App id and installation, a service account to impersonate, an Azure
     /// tenant.
     ///
-    /// A field is named above only if a standard defines it (`role`,
-    /// `audience`, `scope`) or the collision check reasons about it
-    /// (`machine`, `registry`, `profile`, `env`). Everything else is one
-    /// vendor's vocabulary, and naming it would freeze that vocabulary into
-    /// every consumer's cache key and make the next vendor a release.
+    /// A field is named above only if a standard defines it (`role`, `scope`)
+    /// or the collision check reasons about it (`machine`, `registry`,
+    /// `profile`, `env`). Everything else is one vendor's vocabulary, and
+    /// naming it would freeze that vocabulary into every consumer's cache key
+    /// and make the next vendor a release.
+    ///
+    /// `audience` was here and moved to the `oidc` source, in the unhashed
+    /// half — the `aud` an assertion can carry is decided by whichever issuer
+    /// minted it, so one identity reached by two routes needs two of them.
     params: std::collections::HashMap<String, String>,
     /// Which shapes this credential renders: `file` (the default), `env`,
     /// `netrc`, `docker_config`, `git_credential`, `aws_profile`, `gcloud_adc`.
@@ -262,7 +263,6 @@ fn from_spec(
 
     let identity = Identity {
         role: spec.role,
-        audience: spec.audience,
         scope,
         registry: spec.registry,
         machine: spec.machine,
@@ -773,6 +773,77 @@ mod tests {
         assert_eq!(
             d.identity.params.get("app_id").map(String::as_str),
             Some("1180022")
+        );
+    }
+
+    /// Half the CI systems worth federating hand a job its identity as a file.
+    ///
+    /// Kubernetes projects a service account token to a path and Azure
+    /// Pipelines sets `$AZURE_FEDERATED_TOKEN_FILE`; neither is reachable
+    /// through `var`. `file`/`files` mirrors `var`/`vars` exactly — one field,
+    /// two spellings, and the same "name a location, never a literal" rule.
+    #[test]
+    fn a_projected_token_file_is_a_static_env_route() {
+        let d = parse_declaration(&spec_of(&[
+            ("role", s("arn:aws:iam::4711:role/heph-ci-push")),
+            ("provider", s("static_env")),
+            (
+                "file",
+                s("/var/run/secrets/kubernetes.io/serviceaccount/token"),
+            ),
+            ("exchange", map(&[("kind", s("aws_sts"))])),
+        ]))
+        .expect("file route");
+        let Some(hsecrets::Source::StaticEnv { vars, files }) =
+            d.acquire.first().map(|a| &a.source)
+        else {
+            panic!("not a static_env route: {:?}", d.acquire.first());
+        };
+        assert!(vars.is_empty(), "{vars:?}");
+        assert_eq!(
+            files.get("token").map(String::as_str),
+            Some("/var/run/secrets/kubernetes.io/serviceaccount/token")
+        );
+    }
+
+    /// `audience` is written at top level exactly as before and lands in the
+    /// **acquisition** half, where it is not hashed.
+    ///
+    /// The BUILD surface is unchanged; where it lands is not. It reads like
+    /// identity and behaves like plumbing: the `aud` an assertion can carry is
+    /// decided by whichever issuer minted it, so the CI route asks GitHub
+    /// Actions for `sts.amazonaws.com` and the `heph auth login` route cannot
+    /// ask for anything but the client id. Hashing it split one principal's
+    /// cache key by environment.
+    #[test]
+    fn audience_is_acquisition_and_never_reaches_the_artifact() {
+        let with_aud = parse_declaration(&spec_of(&[
+            ("role", s("arn:aws:iam::4711:role/heph-ci-push")),
+            ("provider", s("oidc")),
+            ("audience", s("sts.amazonaws.com")),
+            ("exchange", map(&[("kind", s("aws_sts"))])),
+        ]))
+        .expect("with audience");
+
+        assert!(
+            matches!(
+                with_aud.acquire.first().map(|a| &a.source),
+                Some(hsecrets::Source::Oidc { audience: Some(a), .. }) if a == "sts.amazonaws.com"
+            ),
+            "audience did not land on the source: {:?}",
+            with_aud.acquire.first().map(|a| &a.source)
+        );
+
+        let without_aud = parse_declaration(&spec_of(&[
+            ("role", s("arn:aws:iam::4711:role/heph-ci-push")),
+            ("provider", s("oidc")),
+            ("exchange", map(&[("kind", s("aws_sts"))])),
+        ]))
+        .expect("without audience");
+
+        assert_eq!(
+            with_aud.identity, without_aud.identity,
+            "an audience moved the hashed identity"
         );
     }
 
