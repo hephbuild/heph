@@ -60,6 +60,13 @@ as a promise and then distrusted:
   real exchanges against real endpoints. They are here so the shapes are
   copyable, not so they execute in a demo.
 
+Every route in this package is either **GitHub Actions or a laptop**, because
+that is the pair worth showing. Nothing in the design is limited to it: heph
+detects one CI system natively — GitHub Actions, whose token sits behind an
+authenticated HTTP call — and every other CI system hands the token over in a
+variable or a file, so a `static_env` route reaches it with no heph release.
+`docs/SECRETS.md` has the GitLab, CircleCI, Kubernetes and Buildkite forms.
+
 Both halves are covered by `crates/e2e/tests/secret_examples.rs`, which reads
 *this file's* `BUILD` from the repository and parses every declaration in it. A
 field renamed in the schema breaks that test rather than rotting the example.
@@ -74,11 +81,10 @@ field renamed in the schema breaks that test rather than rotting the example.
 | `raw_helper` … `docker_credential_helper` | the four helper wire protocols |
 | `many_shapes` + `show_shapes` | shapes rendering into the sandbox |
 | `as_env` + `reads_env` | the `env` shape, and why it is opt-in |
-| `gcp` | a two-hop exchange pipeline |
-| `r2` | **`exec` + `exchange`** — mint something short-lived from something static |
+| `gcp` | a two-hop pipeline in CI, and zero hops on a laptop |
+| `r2` | **`exec` + `exchange`** — two routes, one exchange, short-lived from static |
 | `ecr` | `audience` per route, and why it is *not* hashed |
 | `ecr_via_cli` | the common case: an org that already has per-cloud SSO |
-| `ecr_anywhere` | GitLab, CircleCI, Kubernetes, Buildkite — no heph release needed |
 | `github` | a vendor REST call, because GitHub's IdP path is closed |
 | `gcp_sa_key` | RFC 7523: a service-account key *is* an assertion |
 | `restricted` + `permitted` | `allow`, evaluated on the effective set |

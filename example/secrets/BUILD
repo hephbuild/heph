@@ -345,33 +345,52 @@ target(
 #
 # GCP federation is RFC 8693 against the workload identity pool, then a
 # service-account impersonation call. Two steps, not a special case. Each step
-# consumes what the last produced.
+# consumes what the last produced — and the second reaches into `params` for
+# `{impersonate}`, which is why that value is identity rather than plumbing.
+#
+# Two hops in CI; ZERO on a laptop, where gcloud already holds a session and the
+# exchange has nothing left to do. Both land on the same two shapes, because
+# `shape` is hashed identity and may NOT vary per route: it decides which files
+# and variables exist in the sandbox, which is part of what the target reads.
+# What differs is what is inside `application_default_credentials.json`, and
+# contents are exactly what is never hashed.
+
 # The workload identity pool provider: what a GCP-side trust is registered as.
 POOL = "//iam.googleapis.com/projects/8801/locations/global/workloadIdentityPools/heph-ci/providers/github"
 
 target(
     name = "gcp",
     driver = "secret",
-    # identity — hashed
+    # ── identity: hashed ────────────────────────────────────────────────────
     params = {"impersonate": "heph-push@proj.iam.gserviceaccount.com"},
     scope = ["https://www.googleapis.com/auth/cloud-platform"],
     registry = "europe-west1-docker.pkg.dev",
     shape = ["gcloud_adc", "docker_config"],
-    # acquisition — not hashed
-    provider = "oidc",
-    # Two `audience` fields, one string, two different questions. The one on the
-    # SOURCE is what the assertion must claim — GitHub Actions is asked to stamp
-    # it. The one on the STEP is what that hop is addressing. They coincide for
-    # GCP because the pool provider validates the `aud` it is named by; they do
-    # not coincide for AWS, where the assertion says `sts.amazonaws.com` and no
-    # step takes an audience at all. Neither is hashed.
-    audience = POOL,
-    exchange = [
-        {"kind": "token_exchange", "issuer": "https://sts.googleapis.com",
-         "audience": POOL},
-        {"kind": "http",
-         "url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{impersonate}:generateAccessToken",
-         "fields": {"token": "/accessToken"}},
+    # ── acquisition: not hashed ─────────────────────────────────────────────
+    acquire = [
+        # In CI: the ambient GitHub Actions identity, traded twice.
+        #
+        # Two `audience` fields here, one string, two different questions. The
+        # one on the SOURCE is what the assertion must claim — Actions is asked
+        # to stamp it. The one on the STEP is what that hop is addressing. They
+        # coincide for GCP because the pool provider validates the `aud` it is
+        # named by; they do not coincide for AWS below, where the assertion says
+        # `sts.amazonaws.com` and no step takes an audience at all.
+        {"when_env": "GITHUB_ACTIONS", "provider": "oidc",
+         "audience": POOL,
+         "exchange": [
+             {"kind": "token_exchange", "issuer": "https://sts.googleapis.com",
+              "audience": POOL},
+             {"kind": "http",
+              "url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{impersonate}:generateAccessToken",
+              "fields": {"token": "/accessToken"}},
+         ]},
+
+        # On a laptop: gcloud is already signed in, and what it prints is the
+        # end of the pipeline rather than the start. No `exchange` — an access
+        # token needs no trading.
+        {"provider": "exec", "protocol": "raw",
+         "helper": ["gcloud", "auth", "print-access-token"]},
     ],
 )
 
@@ -393,6 +412,19 @@ target(
 #
 # `{account}` and `{token}` interpolate: named identity fields, every `params`
 # key, and the previous step's value.
+# The one API call, shared by both routes below. `{account}` interpolates from
+# `params`, and `{token}` — unused here — would interpolate the previous step's
+# value.
+R2_MINT = {
+    "kind": "http",
+    "url": "https://api.cloudflare.com/client/v4/accounts/{account}/r2/temp-access-credentials",
+    "fields": {
+        "aws_access_key_id": "/result/accessKeyId",
+        "aws_secret_access_key": "/result/secretAccessKey",
+        "aws_session_token": "/result/sessionToken",
+    },
+}
+
 target(
     name = "r2",
     driver = "secret",
@@ -404,24 +436,26 @@ target(
     },
     shape = ["aws_profile"],
     profile = "r2",
-    # acquisition — not hashed
-    provider = "exec",
-    protocol = "raw",
-    helper = ["/opt/homebrew/bin/op", "read", "op://build/r2/parent"],
-    exchange = {
-        "kind": "http",
-        "url": "https://api.cloudflare.com/client/v4/accounts/{account}/r2/temp-access-credentials",
-        "fields": {
-            "aws_access_key_id": "/result/accessKeyId",
-            "aws_secret_access_key": "/result/secretAccessKey",
-            "aws_session_token": "/result/sessionToken",
-        },
-    },
-    ttl = "12h",
+    # ── acquisition: not hashed ─────────────────────────────────────────────
+    #
+    # Two routes reaching the SAME exchange. Only where the parent token comes
+    # from differs — a CI secret in one, a desktop 1Password session in the
+    # other — and neither route lets the parent reach a target: it is spent at
+    # Cloudflare, and what the target holds is bucket-scoped and expires.
+    acquire = [
+        {"when_env": "GITHUB_ACTIONS", "provider": "static_env",
+         "var": "R2_PARENT_TOKEN", "exchange": R2_MINT, "ttl": "12h"},
+
+        # A laptop: `op` needs the real $HOME and a desktop-app session, which
+        # is why a helper runs unsandboxed and inherits heph's environment.
+        {"provider": "exec", "protocol": "raw",
+         "helper": ["/opt/homebrew/bin/op", "read", "op://build/r2/parent"],
+         "exchange": R2_MINT, "ttl": "12h"},
+    ],
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 6. Federation: the same identity from CI, from a laptop, from anywhere
+# 6. Federation: the same identity in GitHub Actions and on a laptop
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── AWS: the two-audience case, which is why `audience` is unhashed ─────────
@@ -491,49 +525,21 @@ target(
     ],
 )
 
-# ── every CI system, not just GitHub Actions ────────────────────────────────
+# ── other CI systems are a BUILD-file edit, not a heph release ──────────────
 #
-# heph detects exactly ONE CI system natively, and that is the correct number.
-# GitHub Actions is special only because its ID token sits behind an
-# authenticated HTTP call — a job is handed an endpoint and a bearer and has to
-# go and ask. Everywhere else the token is simply THERE, in a variable or a
-# file, so it needs no detection, no enum entry and no heph release.
+# Every route above is GitHub Actions or a laptop, because that is what this
+# example assumes. Nothing about the design is: heph detects exactly ONE CI
+# system natively, and that is the correct number. GitHub Actions is special
+# only because its ID token sits behind an authenticated HTTP call — a job is
+# handed an endpoint and a bearer and has to go and ask. Everywhere else the
+# token is simply THERE, so it needs no detection and no enum entry:
 #
-# Adding a CI system is a BUILD-file edit by whoever needs it.
-target(
-    name = "ecr_anywhere",
-    driver = "secret",
-    role = "arn:aws:iam::4711:role/heph-ci-push",
-    params = {"region": "eu-west-1"},
-    shape = ["aws_profile"],
-    profile = "ecr",
-    acquire = [
-        {"when_env": "GITHUB_ACTIONS", "provider": "oidc",
-         "audience": "sts.amazonaws.com", "exchange": {"kind": "aws_sts"}},
-
-        # GitLab: the variable named by the job's `id_tokens:` block.
-        {"when_env": "GITLAB_CI", "provider": "static_env",
-         "var": "GITLAB_OIDC_TOKEN", "exchange": {"kind": "aws_sts"}},
-
-        {"when_env": "CIRCLECI", "provider": "static_env",
-         "var": "CIRCLE_OIDC_TOKEN_V2", "exchange": {"kind": "aws_sts"}},
-
-        # Kubernetes and Azure Pipelines project the token into a FILE.
-        {"when_env": "KUBERNETES_SERVICE_HOST", "provider": "static_env",
-         "file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
-         "exchange": {"kind": "aws_sts"}},
-
-        # Buildkite: the agent mints one on demand.
-        {"when_env": "BUILDKITE", "provider": "exec", "protocol": "raw",
-         "helper": ["buildkite-agent", "oidc", "request-token",
-                    "--audience", "sts.amazonaws.com"],
-         "exchange": {"kind": "aws_sts"}},
-
-        # The catch-all: laptops. No guard, and it must come last.
-        {"provider": "exec", "protocol": "credential_process",
-         "helper": ["aws", "configure", "export-credentials", "--format", "process"]},
-    ],
-)
+#   GitLab      {"when_env": "GITLAB_CI", "provider": "static_env",
+#                "var": "GITLAB_OIDC_TOKEN", "exchange": {"kind": "aws_sts"}}
+#   Kubernetes  a `file` route on the projected service account token
+#   Buildkite   an `exec` route running `buildkite-agent oidc request-token`
+#
+# See docs/SECRETS.md, "Any CI system, not just GitHub Actions".
 
 # ── GitHub: a vendor call, because the IdP path is closed ───────────────────
 #

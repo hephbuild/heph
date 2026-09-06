@@ -704,8 +704,19 @@ async fn the_example_still_covers_an_exchange_on_a_non_oidc_source() -> anyhow::
     ws.write_build_file("secrets", &example_build_file()?);
     let spec = ws.get_spec("//secrets:r2").await?;
     let desc = heph::pluginsecret::parse_declaration(&spec)?;
-    let entry = desc.acquire.first().expect("one route");
-    assert!(matches!(entry.source, Source::Exec { .. }));
-    assert_eq!(entry.exchange.len(), 1, "the exchange step is what matters");
+    assert_eq!(desc.acquire.len(), 2, "a CI route and a laptop route");
+    for entry in &desc.acquire {
+        assert!(
+            matches!(entry.source, Source::StaticEnv { .. } | Source::Exec { .. }),
+            "the point is that neither route is `oidc`: {:?}",
+            entry.source.kind()
+        );
+        assert_eq!(
+            entry.exchange.len(),
+            1,
+            "both routes must reach the exchange, or the example teaches that \
+             only one source can trade"
+        );
+    }
     Ok(())
 }
