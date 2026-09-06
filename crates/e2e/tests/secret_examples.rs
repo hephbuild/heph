@@ -531,3 +531,181 @@ target(name = "note", driver = "text_file", text = "hello")
     );
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The shipped example workspace
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `example/secrets/BUILD`, as it sits in the repository.
+fn example_build_file() -> anyhow::Result<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../example/secrets/BUILD")
+        .canonicalize()?;
+    Ok(std::fs::read_to_string(path)?)
+}
+
+/// Every `driver = "secret"` declaration in it, by name.
+///
+/// Scraped from the text rather than listed here, so a target added to the
+/// example is covered without anyone remembering to add it — which is the only
+/// way a guard like this stays true a year from now.
+fn secret_targets_in(build: &str) -> Vec<String> {
+    build
+        .split("\ntarget(")
+        .filter(|block| block.contains("driver = \"secret\""))
+        .filter_map(|block| {
+            let rest = block.split_once("name = \"")?.1;
+            let (name, _) = rest.split_once('"')?;
+            Some(name.to_string())
+        })
+        .collect()
+}
+
+/// **Every credential declaration in `example/secrets/BUILD` parses.**
+///
+/// A published example that does not parse is worse than no example: it is read
+/// as a promise, tried once, and then the whole document is distrusted. The
+/// example workspace has no test of its own — nothing walks `example/` — so
+/// this is what keeps it from rotting as the schema moves.
+///
+/// It goes through the real BUILD-file evaluator and the real declaration
+/// parser, which is what catches the failure this is actually for: a field
+/// renamed in `SecretSpec` while the example keeps spelling the old name.
+#[tokio::test]
+async fn every_declaration_in_the_example_workspace_parses() -> anyhow::Result<()> {
+    let build = example_build_file()?;
+    let names = secret_targets_in(&build);
+
+    // A scrape that matched nothing would pass this test in silence, which is
+    // the same failure as a filter that selects no tests.
+    assert!(
+        names.len() >= 15,
+        "only found {} secret targets in the example; the scrape or the file is wrong: {names:?}",
+        names.len()
+    );
+
+    let ws = Workspace::new();
+    ws.write_build_file("secrets", &build);
+    for name in &names {
+        let addr = format!("//secrets:{name}");
+        let spec = ws
+            .get_spec(&addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("{addr}: evaluating the example: {e:#}"))?;
+        let desc = heph::pluginsecret::parse_declaration(&spec)
+            .map_err(|e| anyhow::anyhow!("{addr}: parsing the example: {e:#}"))?;
+        desc.validate()
+            .map_err(|e| anyhow::anyhow!("{addr}: validating the example: {e:#}"))?;
+    }
+    Ok(())
+}
+
+/// **The example's headline claim, executed: one identity, two environments,
+/// one artifact.**
+///
+/// `//secrets:api` guards its first `acquire` entry on `DEMO_CI` so a reader
+/// can flip between the routes on their own machine. Both are minted here
+/// through the real broker and real providers — one reading a variable the way
+/// a CI system sets it, one running a helper the way a laptop does.
+///
+/// The second assertion is the one that matters. Two different values arrived,
+/// and the emitted `secret.json` is byte-identical, so every consumer keys the
+/// same either way. If that ever stops holding, the example is teaching the
+/// opposite of the feature.
+#[tokio::test]
+async fn the_example_credential_resolves_in_both_environments() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("secrets", &example_build_file()?);
+    let spec = ws.get_spec("//secrets:api").await?;
+    let desc = heph::pluginsecret::parse_declaration(&spec)?;
+
+    let in_ci = mint(
+        &desc,
+        &[("DEMO_CI", "1"), ("DEMO_API_TOKEN", "ci-issued-token")],
+    )
+    .await?;
+    assert_eq!(in_ci, "ci-issued-token");
+
+    // No guard matches, so the catch-all runs the helper.
+    let on_a_laptop = mint(&desc, &[]).await?;
+    assert_eq!(on_a_laptop, "local-developer-token");
+
+    assert_ne!(
+        in_ci, on_a_laptop,
+        "the two routes must be distinguishable, or this proves nothing"
+    );
+
+    let artifact =
+        hsecrets::descriptor::SecretJson::new(&desc.addr, desc.identity.clone()).to_bytes()?;
+    let text = String::from_utf8(artifact)?;
+    for absent in ["DEMO_CI", "DEMO_API_TOKEN", "provider", "acquire", "helper"] {
+        assert!(
+            !text.contains(absent),
+            "acquisition detail {absent:?} reached the hashed artifact:\n{text}"
+        );
+    }
+    Ok(())
+}
+
+/// The example's runnable targets actually run.
+///
+/// Parsing is not the same claim as working, and the README tells a reader to
+/// type these. Everything asserted here uses only `static_env` and `exec`, which
+/// is the honest boundary of what mints with no cloud and no network — the
+/// federated declarations above it are reference, and the README says so.
+#[tokio::test]
+async fn the_examples_runnable_targets_run() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("secrets", &example_build_file()?);
+
+    // The headline demo, on the catch-all route: no guard matches here.
+    let out = common::artifact_string(&*ws.run("//secrets:whoami").await?);
+    assert_eq!(out.trim(), "authenticated as: local-developer-token");
+
+    // The shapes render, and the target is pointed at them. The README tells a
+    // reader to run this one, and a shape whose slot key is missing fails here
+    // rather than in their terminal.
+    let shapes = common::artifact_string(&*ws.run("//secrets:show_shapes").await?);
+    assert!(shapes.contains("netrc:    yes"), "{shapes}");
+    assert!(shapes.contains("gitcount: 1"), "{shapes}");
+
+    // A credential arriving through a dependency rather than a declaration.
+    let out = common::artifact_string(&*ws.run("//secrets:app").await?);
+    assert!(
+        out.contains("app has: /"),
+        "a transitive credential should arrive as a path: {out}"
+    );
+
+    // `allow` admits a target carrying the label it names.
+    let out = common::artifact_string(&*ws.run("//secrets:permitted").await?);
+    assert_eq!(out.trim(), "permitted");
+
+    // The `env` shape delivers a value, and the target reports its length
+    // rather than the value — which is the habit the example is teaching.
+    let out = common::artifact_string(&*ws.run("//secrets:reads_env").await?);
+    assert_eq!(out.trim(), "env-shaped-token".len().to_string());
+
+    Ok(())
+}
+
+/// The route that used to be a silent lie, taken from the example verbatim.
+///
+/// `//secrets:r2` is an `exec` source with an `http` exchange: read a parent
+/// token from a secret manager, trade it for a bucket-scoped credential. While
+/// the exchange pipeline lived inside the `oidc` provider this parsed,
+/// validated, and then handed the target the parent token with no error at all.
+///
+/// Asserting on the parsed shape rather than minting, because minting would
+/// call Cloudflare. What is pinned is that the example still declares the shape
+/// the fix exists for.
+#[tokio::test]
+async fn the_example_still_covers_an_exchange_on_a_non_oidc_source() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("secrets", &example_build_file()?);
+    let spec = ws.get_spec("//secrets:r2").await?;
+    let desc = heph::pluginsecret::parse_declaration(&spec)?;
+    let entry = desc.acquire.first().expect("one route");
+    assert!(matches!(entry.source, Source::Exec { .. }));
+    assert_eq!(entry.exchange.len(), 1, "the exchange step is what matters");
+    Ok(())
+}

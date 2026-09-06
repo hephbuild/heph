@@ -878,7 +878,7 @@ async fn check(args: CheckArgs, _sink: LogSink, _global: GlobalOptions) -> anyho
             Err(_) => continue,
         };
         for r in engine
-            .resolve_secrets_for_check(&rs, addr, &def.target_def.inputs)
+            .resolve_secrets_for_check(&rs, addr, &def.target_def.labels, &def.target_def.inputs)
             .await?
         {
             if seen.insert(r.desc.addr.clone()) {
@@ -957,7 +957,7 @@ async fn describe(engine: &Arc<Engine>, addr: &Addr) -> anyhow::Result<ShowView>
     let rs = engine.new_state();
     let def = Arc::clone(engine).get_def(rs.clone(), addr).await?;
     let held = engine
-        .resolve_secrets_for_check(&rs, addr, &def.target_def.inputs)
+        .resolve_secrets_for_check(&rs, addr, &def.target_def.labels, &def.target_def.inputs)
         .await?;
 
     let mut secrets = Vec::new();

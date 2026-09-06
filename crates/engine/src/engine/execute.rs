@@ -68,7 +68,7 @@ impl Engine {
         // also what keeps a cache hit from touching an IdP at all.
         hcore::hmemoizer::set_phase("execute:secrets_resolve");
         let resolved_secrets = self
-            .resolve_secrets(&rs, addr, &def.target.inputs)
+            .resolve_secrets(&rs, addr, &def.target.labels, &def.target.inputs)
             .await
             .with_context(|| format!("resolve secrets for {addr}"))?;
 

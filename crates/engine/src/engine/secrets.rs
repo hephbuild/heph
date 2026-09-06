@@ -86,9 +86,10 @@ impl Engine {
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
         consumer: &Addr,
+        labels: &[String],
         inputs: &[Input],
     ) -> anyhow::Result<Vec<ResolvedSecret>> {
-        self.resolve_secrets(rs, consumer, inputs).await
+        self.resolve_secrets(rs, consumer, labels, inputs).await
     }
 
     /// Every sign-in this workspace federates through, deduplicated.
@@ -231,6 +232,7 @@ impl Engine {
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
         consumer: &Addr,
+        labels: &[String],
         inputs: &[Input],
     ) -> anyhow::Result<Vec<ResolvedSecret>> {
         let refs: Vec<(&str, &Input)> = inputs
@@ -288,7 +290,7 @@ impl Engine {
         }
 
         check_slots(consumer, &resolved)?;
-        check_allow(consumer, &resolved)?;
+        check_allow(consumer, labels, &resolved)?;
         Ok(resolved)
     }
 
@@ -417,7 +419,38 @@ fn provider_name(kind: hsecrets::descriptor::ProviderKind) -> &'static str {
 /// The failure is legitimate even when the consumer wrote nothing, so the
 /// message carries the chain that supplied it. Without that a reader is told
 /// their target may not hold a credential they have never heard of.
-fn check_allow(consumer: &Addr, resolved: &[ResolvedSecret]) -> anyhow::Result<()> {
+/// Evaluate an `allow` matcher against a target's address **and its labels**.
+///
+/// `Matcher::matches_addr` answers `MatchShrug` for `label(…)`, because a label
+/// set is not derivable from an address — and `check_allow` used to require
+/// `MatchYes`. So **every `allow` mentioning a label denied everything**,
+/// including the exact `"//svc/... && label(deploy)"` form the documentation
+/// publishes. It failed closed, which is the safe direction and still a broken
+/// feature: an author writing the documented spelling got a flat refusal naming
+/// a query their target visibly satisfies.
+///
+/// The labels come from the consumer's own `TargetDef`, which the caller
+/// already holds — re-resolving its spec from inside its own resolution
+/// registers a self-edge and reports a cycle from the target to itself.
+///
+/// Anything still undecidable resolves to **deny**: `tree_output(…)` needs
+/// output paths, and a policy field is the wrong place to guess.
+fn allow_matches(m: &hmodel::htmatcher::Matcher, addr: &Addr, labels: &[String]) -> bool {
+    use hmodel::htmatcher::{MatchResult, Matcher};
+    match m {
+        Matcher::Label(want) => labels.iter().any(|l| l == want),
+        Matcher::And(ms) => ms.iter().all(|m| allow_matches(m, addr, labels)),
+        Matcher::Or(ms) => ms.iter().any(|m| allow_matches(m, addr, labels)),
+        Matcher::Not(inner) => !allow_matches(inner, addr, labels),
+        decidable => matches!(decidable.matches_addr(addr), MatchResult::MatchYes),
+    }
+}
+
+fn check_allow(
+    consumer: &Addr,
+    labels: &[String],
+    resolved: &[ResolvedSecret],
+) -> anyhow::Result<()> {
     for r in resolved {
         let Some(query) = r.desc.allow.as_deref().filter(|q| !q.trim().is_empty()) else {
             continue;
@@ -428,10 +461,7 @@ fn check_allow(consumer: &Addr, resolved: &[ResolvedSecret]) -> anyhow::Result<(
                 r.desc.addr
             )
         })?;
-        if matches!(
-            matcher.matches_addr(consumer),
-            hmodel::htmatcher::MatchResult::MatchYes
-        ) {
+        if allow_matches(&matcher, consumer, labels) {
             continue;
         }
         let via = if r.via.is_empty() {
@@ -439,9 +469,14 @@ fn check_allow(consumer: &Addr, resolved: &[ResolvedSecret]) -> anyhow::Result<(
         } else {
             format!("\n  It reached this target through {}.", r.via.join(" → "))
         };
+        let has = if labels.is_empty() {
+            " It carries no labels.".to_string()
+        } else {
+            format!(" Its labels are {}.", labels.join(", "))
+        };
         anyhow::bail!(
             "{consumer} is not permitted to hold secret {} (as {:?}).{via}\n  Its `allow` is \
-             {query:?}, and {consumer} does not match.\n  Widen `allow` on {}, or stop \
+             {query:?}, and {consumer} does not match.{has}\n  Widen `allow` on {}, or stop \
              depending on the credential.",
             r.desc.addr,
             r.name,

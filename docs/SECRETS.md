@@ -18,6 +18,12 @@ better:
 > **A credential grants read access, through the shared cache, to whatever its
 > consumers produced.**
 
+**A worked example lives in `example/secrets/`** — every case in this document,
+runnable where it can be. Its `//secrets:api` is the whole idea in one target:
+two `acquire` routes, one identity, and the same `heph inspect hashin` either
+way. `crates/e2e/tests/secret_examples.rs` reads that file from the repository
+and parses every declaration in it, so it cannot drift from the schema.
+
 ## Declaring one
 
 ```python
@@ -670,7 +676,7 @@ Which targets may *hold* a credential is a line in the same reviewed file that
 declares it:
 
 ```python
-allow = "//svc/... + label(deploy)"
+allow = "//svc/... && label(deploy)"
 ```
 
 An ordinary target query. Omit it to permit any target. Access control without a
@@ -760,16 +766,18 @@ next to the credential it authenticates for, under the same CODEOWNERS.
 # //infra/creds/BUILD
 OKTA = "https://org.okta.com/oauth2/default"
 
-secret(
+target(
     name     = "ecr",
+    driver   = "secret",
     role     = "arn:aws:iam::4711:role/heph-ci-push",
     provider = "oidc",
     sign_in  = {"issuer": OKTA, "client_id": "aws-app"},
     exchange = {"kind": "aws_sts"},
 )
 
-secret(
+target(
     name     = "gar",
+    driver   = "secret",
     role     = "heph-push@proj.iam.gserviceaccount.com",
     provider = "oidc",
     sign_in  = {"issuer": OKTA, "client_id": "gcp-app"},

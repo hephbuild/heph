@@ -491,6 +491,53 @@ async fn allow_permits_a_matching_target_and_refuses_others() -> anyhow::Result<
     Ok(())
 }
 
+/// **`label()` in an `allow` works**, which it did not.
+///
+/// `Matcher::matches_addr` answers `MatchShrug` for a label — a label set is not
+/// derivable from an address — and the policy check required `MatchYes`. So
+/// every `allow` mentioning a label denied everything, including the exact
+/// `"//svc/... && label(deploy)"` spelling `docs/SECRETS.md` publishes. It
+/// failed closed, which is the right direction to fail and still a feature that
+/// did not work: an author writing the documented form got a flat refusal
+/// naming a query their target visibly satisfies.
+///
+/// Both sides are asserted, because a fix that simply started answering "yes"
+/// would pass the first half alone.
+#[tokio::test]
+async fn allow_can_name_a_label_and_still_refuses_targets_without_it() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "creds",
+        r#"target(name = "tok", driver = "secret", allow = "//svc/... && label(deploy)",
+       provider = "exec", protocol = "raw", helper = ["/bin/echo", "deploy_value"])"#,
+    );
+    ws.write_build_file(
+        "svc/api",
+        r#"
+target(name = "ship", driver = "bash", out = "o.txt", labels = ["deploy"],
+       secrets = {"tok": "//creds:tok"}, run = ["cat $SECRET_TOK > o.txt"])
+target(name = "build", driver = "bash", out = "o.txt",
+       secrets = {"tok": "//creds:tok"}, run = ["cat $SECRET_TOK > o.txt"])
+"#,
+    );
+
+    let out = common::artifact_string(&*ws.run("//svc/api:ship").await?);
+    assert!(out.contains("deploy_value"), "{out}");
+
+    // In the right package, missing the label: the conjunction still has to
+    // bite, or the fix would have turned the policy into a no-op.
+    let err = match ws.run("//svc/api:build").await {
+        Ok(_) => panic!("a target without the label must be refused"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("not permitted"), "{err}");
+    assert!(err.contains("label(deploy)"), "{err}");
+    // The message names what the target actually carries, so the reader can see
+    // why it missed rather than re-deriving it.
+    assert!(err.contains("carries no labels"), "{err}");
+    Ok(())
+}
+
 /// **Evaluated on the effective set.** A dependency must not be able to launder
 /// a credential past its own policy onto a consumer that names nothing — and
 /// the message has to carry the chain, or the reader is told their target may
@@ -616,7 +663,7 @@ async fn auth_show_reports_what_a_target_would_hold_without_minting() -> anyhow:
         .await?;
     let held = ws
         .engine
-        .resolve_secrets_for_check(&rs, &addr, &def.target_def.inputs)
+        .resolve_secrets_for_check(&rs, &addr, &def.target_def.labels, &def.target_def.inputs)
         .await?;
 
     assert_eq!(held.len(), 1);
