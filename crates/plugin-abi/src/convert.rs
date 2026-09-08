@@ -188,6 +188,9 @@ use hplugin::provider::{StateField, StateSchema};
 
 pub fn state_schema_to_pb(s: &StateSchema) -> pb::Schema {
     pb::Schema {
+        // Provider state has no deferred values: `provider_state(...)` feeds
+        // target *identity*, which is the one thing a reference may never shape.
+        accepts_deferred: false,
         fields: s
             .fields
             .iter()
@@ -218,6 +221,7 @@ pub fn state_schema_from_pb(s: pb::Schema) -> StateSchema {
 
 pub fn driver_schema_to_pb(s: &DriverSchema) -> pb::Schema {
     pb::Schema {
+        accepts_deferred: s.accepts_deferred,
         fields: s
             .fields
             .iter()
@@ -233,6 +237,11 @@ pub fn driver_schema_to_pb(s: &DriverSchema) -> pb::Schema {
 
 pub fn driver_schema_from_pb(s: pb::Schema) -> DriverSchema {
     DriverSchema {
+        // Absent on the wire decodes as `false`, which is the whole point: a
+        // plugin built before this feature says nothing, and the host refuses
+        // references for it rather than letting its old `String` decoder read one
+        // as a literal.
+        accepts_deferred: s.accepts_deferred,
         fields: s
             .fields
             .into_iter()
@@ -910,6 +919,38 @@ pub fn raw_def_from_blob(blob: &pb::RawDefBlob) -> anyhow::Result<Arc<dyn RawDef
 
 #[cfg(test)]
 mod tests {
+
+    /// The `accepts_deferred` flag is the whole justification for the ABI bump,
+    /// and it only ever reaches a host across this conversion. Both directions,
+    /// both values.
+    #[test]
+    fn a_driver_schema_carries_accepts_deferred_both_ways() {
+        for flag in [true, false] {
+            let schema = DriverSchema {
+                fields: vec![],
+                accepts_deferred: flag,
+            };
+            let round = driver_schema_from_pb(driver_schema_to_pb(&schema));
+            assert_eq!(round.accepts_deferred, flag);
+        }
+    }
+
+    /// The mixed-version gate, at the wire. A plugin built before this feature
+    /// sends no field 2 at all; prost decodes that as `false`, and `false` is what
+    /// makes the host refuse a reference rather than let the plugin's old `String`
+    /// decoder read one as a literal.
+    #[test]
+    fn a_schema_from_an_older_plugin_refuses_deferred_values() {
+        assert!(!driver_schema_from_pb(pb::Schema::default()).accepts_deferred);
+    }
+
+    /// Provider state is not deferrable — it feeds target *identity* — so the
+    /// shared message always carries `false` for it.
+    #[test]
+    fn provider_state_never_accepts_deferred_values() {
+        let s = StateSchema { fields: vec![] };
+        assert!(!state_schema_to_pb(&s).accepts_deferred);
+    }
     use super::*;
     use std::collections::HashMap;
 

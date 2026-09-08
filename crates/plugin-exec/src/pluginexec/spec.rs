@@ -11,7 +11,19 @@ use std::collections::HashMap;
 #[derive(Spec)]
 pub(crate) struct TargetSpec {
     /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.
-    pub run: Vec<String>,
+    ///
+    /// In **exec** mode an element may carry a `${read://pkg:name}` reference —
+    /// the contents of that target's single output, resolved by the host before
+    /// the command runs. That is the one case with no workaround today: there is
+    /// no shell to expand `$SRC_<GROUP>` in, so a computed value could not reach
+    /// an `exec` argv at all.
+    ///
+    /// In **bash** mode it may not, and the refusal is deliberate rather than an
+    /// omission: `${src:0:3}` is valid bash — substring expansion on a lowercase
+    /// variable named `src` — so accepting references here would create a
+    /// collision class that an escape rule could only document, not remove. Bash
+    /// already has `$SRC_<GROUP>`, which is the better tool there.
+    pub run: Vec<hplugin::driver::Deferred<String>>,
     /// Hashed + runtime dependencies, grouped by name → list of target addresses.
     pub deps: HashMap<String, Vec<String>>,
     /// Dependencies that contribute to the input hash but are not materialized at runtime.

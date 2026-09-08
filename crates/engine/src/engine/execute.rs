@@ -80,6 +80,16 @@ impl Engine {
         // coherent?) already happened at `get_def`. What happens here is the part
         // that costs something: walking the chain, acquiring, and writing the
         // presented files into this run's sandbox.
+        // Deferred option values. The producers are already built — they are
+        // `hashed` inputs, so `hashin` waited on them — and what is left here is
+        // reading their bytes. Inside `execute`, so a cache hit resolves nothing.
+        hcore::hmemoizer::set_phase("execute:deferred_resolve");
+        let deferred_refs = self.deferred_refs(spec, &spec.driver)?;
+        let deferred = self
+            .resolve_deferred(&rs, &def.target, &deferred_refs)
+            .await
+            .with_context(|| format!("resolve deferred values for {addr}"))?;
+
         hcore::hmemoizer::set_phase("execute:credential_acquire");
         let resolved_credentials = self
             .resolve_credentials(&rs, addr, &def.target.inputs)
@@ -210,7 +220,7 @@ impl Engine {
                     let hashin = hashin.to_owned();
 
                     let inner: InteractiveInner = Box::new(enclose!(
-                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts, credential_mounts)
+                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts, credential_mounts, deferred)
                         move |stdin, stdout, stderr| {
                             Box::pin(async move {
                                 let req = RunRequest {
@@ -225,6 +235,7 @@ impl Engine {
                                     sandbox_dir,
                                     scratch: scratch_mounts,
                                     credentials: credential_mounts,
+                                    deferred,
                                 };
                                 let res = if shell {
                                     driver.driver.run_shell(req, rs.ctoken()).await?

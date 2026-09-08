@@ -25,6 +25,7 @@
 
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::ParamType;
+use hplugin::driver::Deferred;
 use hplugin::htspec::{FromSpecValue, SpecStruct};
 use std::collections::BTreeMap;
 
@@ -140,11 +141,11 @@ impl Helper {
 pub struct Presentation {
     /// Name → template. Injected as **runtime** environment — never `env`, never
     /// `pass_env` — so it cannot reach a def hash by construction.
-    pub env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, Deferred<String>>,
     /// Name → content template. Written by the host at `0600` under the sandbox
     /// root, beside the workspace directory and never inside it, and deleted at
     /// run end whatever the outcome. Reachable as `${file:<name>}`.
-    pub files: BTreeMap<String, String>,
+    pub files: BTreeMap<String, Deferred<String>>,
     /// A callback protocol. The only presentation that survives expiry.
     #[spec(parse = parse_helper)]
     pub helper: Option<Helper>,
@@ -198,7 +199,10 @@ impl Presentation {
             validate_file_name(name)?;
         }
         for (name, tmpl) in self.env.iter().chain(self.files.iter()) {
-            for piece in hcore::template::parse(tmpl).with_context_name(name)?.iter() {
+            for piece in hcore::template::parse(tmpl.raw())
+                .with_context_name(name)?
+                .iter()
+            {
                 let hcore::template::Piece::Ref(r) = piece else {
                     continue;
                 };
@@ -209,6 +213,17 @@ impl Presentation {
                     // field and the source that produced the material.
                     None => {}
                     Some("file") => {}
+                    // A deferred value: an ARN, an audience, a registry —
+                    // configuration whose owner is the Terraform that created it
+                    // rather than this BUILD file. The host resolves it before the
+                    // presentation is rendered, and folds the producer into *this
+                    // credential's* key.
+                    //
+                    // Note this is the one kind here that is not material: it is
+                    // read from a cached artifact, so it must be something you
+                    // would commit. A token is not — that is what makes it a
+                    // credential rather than configuration.
+                    Some("read") => {}
                     Some("helper") => match r.arg {
                         "command" | "args" => {}
                         other => anyhow::bail!(
@@ -219,8 +234,9 @@ impl Presentation {
                     },
                     Some(other) => anyhow::bail!(
                         "unknown template kind {other:?} in `{name}` — a presentation understands \
-                         `${{<field>}}`, `${{file:<name>}}`, `${{helper:command}}` and \
-                         `${{helper:args}}`. Write a literal `$` as `$$`"
+                         `${{<field>}}` (material), `${{file:<name>}}`, `${{helper:command}}`, \
+                         `${{helper:args}}` and `${{read://pkg:name}}` (a deferred value). Write a \
+                         literal `$` as `$$`"
                     ),
                 }
             }
@@ -250,7 +266,7 @@ impl Presentation {
                     .files
                     .values()
                     .chain(self.env.values())
-                    .any(|t| t.contains("${helper:command}"))
+                    .any(|t| t.raw().contains("${helper:command}"))
             {
                 anyhow::bail!(
                     "a `kubernetes` helper writes no document of its own, so nothing calls back \
@@ -362,8 +378,43 @@ mod tests {
         )]))
         .expect("parse");
         assert_eq!(
-            p.env.get("CLOUDFLARE_API_TOKEN").map(String::as_str),
+            p.env.get("CLOUDFLARE_API_TOKEN").map(|d| d.raw()),
             Some("${token}")
+        );
+    }
+
+    /// A deferred value belongs in a presentation template, where heph
+    /// substitutes it, and nowhere else in a credential — because nothing else in
+    /// a credential is rendered, so the text would reach the tool verbatim.
+    #[test]
+    fn a_deferred_reference_outside_a_presentation_template_is_refused() {
+        // The value of an `env`/`files` entry is a template: allowed.
+        Presentation::parse(&map(&[(
+            "env",
+            map(&[("AWS_ROLE_ARN", s("${read://infra:role-arn}"))]),
+        )]))
+        .expect("a presentation template renders references");
+
+        // Its *key* is not.
+        let err = Presentation::parse(&map(&[("env", map(&[("${read://infra:name}", s("x"))]))]))
+            .expect_err("a variable name is not a template");
+        assert!(
+            format!("{err:#}").contains("does not accept one"),
+            "{err:#}"
+        );
+
+        // Nor is a helper handle.
+        let err = Presentation::parse(&map(&[(
+            "helper",
+            map(&[
+                ("dialect", s("gcp")),
+                ("audience", s("${read://infra:wif}")),
+            ]),
+        )]))
+        .expect_err("a helper handle is not a template");
+        assert!(
+            format!("{err:#}").contains("does not accept one"),
+            "{err:#}"
         );
     }
 

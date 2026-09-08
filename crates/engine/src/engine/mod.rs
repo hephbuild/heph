@@ -28,6 +28,7 @@ pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest};
 pub mod credential;
 pub mod credential_store;
 mod cwd;
+pub mod deferred;
 mod result;
 pub use credential::{Acquired, CredentialTeardown, ResolvedCredential, WalkStep};
 pub use credential_store::{CredentialStore, Material};

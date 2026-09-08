@@ -424,6 +424,7 @@ mod tests {
         fn driver_schema(&self, name: &str) -> Option<DriverSchema> {
             match name {
                 "exec" => Some(DriverSchema {
+                    accepts_deferred: false,
                     fields: vec![
                         DriverField {
                             name: "cmd".to_string(),
@@ -443,6 +444,7 @@ mod tests {
                 // name — exercises the dedup/first-wins path in the
                 // missing-required check.
                 "shadow" => Some(DriverSchema {
+                    accepts_deferred: false,
                     fields: vec![DriverField {
                         name: "name".to_string(),
                         ty: ParamType::Int,

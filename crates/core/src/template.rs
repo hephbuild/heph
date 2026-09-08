@@ -27,9 +27,18 @@
 /// One piece of a parsed template.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Piece<'a> {
-    /// Verbatim text. `$$` arrives here as a one-character `"$"`, which is why
-    /// this is a `Cow`-shaped borrow-or-static rather than a plain `&str` slice.
+    /// Verbatim text, borrowed from the input.
     Text(&'a str),
+    /// A `$$` escape, kept as its own piece rather than folded into text.
+    ///
+    /// Separate because the two consumers disagree about it, and both are right.
+    /// A **credential presentation** is a document heph writes, so `$$` is heph's
+    /// escape and unescapes to `$`. A **driver option** is somebody else's shell
+    /// text — `echo tmp.$$` is the PID idiom — so heph must reproduce it byte for
+    /// byte. Folding `$$` into `Text("$")` made the second impossible, and the
+    /// symptom was a field whose meaning changed depending on whether a
+    /// `${read://…}` happened to appear elsewhere in the same string.
+    Escape,
     /// A `${…}` reference.
     Ref(Ref<'a>),
 }
@@ -47,8 +56,69 @@ pub struct Ref<'a> {
     pub raw: &'a str,
 }
 
-/// A `$$` escape, already unescaped.
+/// What a `$$` escape unescapes to, for the consumers that own their document.
 const DOLLAR: &str = "$";
+
+/// The `${…}` kinds heph **resolves** today.
+///
+/// One list, in the leaf crate, because two places consult it — the shared spec
+/// decoder that *refuses* one in a field that would never substitute it, and the
+/// engine walk that *resolves* them — and a kind added to one and not the other
+/// fails exactly the way this mechanism exists to prevent: silently, as a
+/// literal.
+///
+/// Deliberately just `read`. `src` and `env` are *designed* but not implemented,
+/// and reserving them now would be a break with no benefit: `${src:0:3}` is bash
+/// substring expansion on a variable named `src`, and `${env:FOO}` is a template
+/// syntax several tools use — both are legal in a `run` today and neither can be
+/// misread as something heph resolves, because heph resolves neither. When they
+/// ship, reserving them is a stated break in that release, and just as loud as
+/// this one. See [`RESERVED_LATER`].
+pub const DEFERRED_KINDS: &[&str] = &["read"];
+
+/// Kinds the design names but does not yet implement.
+///
+/// Refused — with "not yet", not "unknown" — but **only inside a driver that
+/// accepts deferred values**, where an author writing one plainly meant it to
+/// resolve. In any other driver they are somebody else's syntax and are left
+/// alone.
+pub const RESERVED_LATER: &[&str] = &["src", "env"];
+
+/// The first `${kind:…}` in `s` whose kind is in `kinds`.
+pub fn first_ref_of<'a>(s: &'a str, kinds: &[&str]) -> Option<Ref<'a>> {
+    if !has_ref(s) {
+        return None;
+    }
+    parse(s).ok()?.into_iter().find_map(|p| match p {
+        Piece::Ref(r) if r.kind.is_some_and(|k| kinds.contains(&k)) => Some(r),
+        _ => None,
+    })
+}
+
+/// Whether `s` carries a reference heph owns.
+///
+/// False for a string with no `${…}` at all, for one whose kinds are all
+/// somebody else's, and — deliberately — for one that does not tokenize. An
+/// unterminated `${` is a shell program's business until it appears in a field
+/// that actually takes a reference; refusing it everywhere would fail a `run`
+/// containing `sed 's/${/X/'`, which has nothing to do with this.
+pub fn has_deferred_ref(s: &str) -> bool {
+    if !has_ref(s) {
+        return false;
+    }
+    let Ok(pieces) = parse(s) else {
+        return false;
+    };
+    pieces.iter().any(|p| match p {
+        Piece::Ref(r) => r.kind.is_some_and(|k| DEFERRED_KINDS.contains(&k)),
+        Piece::Text(_) | Piece::Escape => false,
+    })
+}
+
+/// The first reference heph owns in `s`, if any.
+pub fn first_deferred_ref(s: &str) -> Option<Ref<'_>> {
+    first_ref_of(s, DEFERRED_KINDS)
+}
 
 /// Split `s` into literal and reference pieces.
 ///
@@ -68,7 +138,7 @@ pub fn parse(s: &str) -> anyhow::Result<Vec<Piece<'_>>> {
         match bytes.get(i + 1) {
             Some(&b'$') => {
                 push_text(&mut out, s.get(lit_start..i));
-                out.push(Piece::Text(DOLLAR));
+                out.push(Piece::Escape);
                 i += 2;
                 lit_start = i;
             }
@@ -150,7 +220,43 @@ pub fn render(
     for p in &pieces {
         match p {
             Piece::Text(t) => out.push_str(t),
+            Piece::Escape => out.push_str(DOLLAR),
             Piece::Ref(r) => out.push_str(&resolve(r)?),
+        }
+    }
+    Ok(out)
+}
+
+/// Replace only the references `want` names, reproducing **everything else byte
+/// for byte** — `$$` included.
+///
+/// This is the driver-option half of the split. A driver option is somebody
+/// else's text: `echo tmp.$$` is the shell's PID idiom, `${src:0:3}` is bash
+/// substring expansion, `${FOO:-x}` is a default. heph replaces the one
+/// construct it owns and touches nothing else, so a field's meaning does not
+/// change depending on whether a reference happens to appear elsewhere in it.
+pub fn substitute(
+    s: &str,
+    want: &[&str],
+    mut resolve: impl FnMut(&Ref<'_>) -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    let pieces = parse(s)?;
+    if !pieces
+        .iter()
+        .any(|p| matches!(p, Piece::Ref(r) if r.kind.is_some_and(|k| want.contains(&k))))
+    {
+        return Ok(s.to_string());
+    }
+    let mut out = String::with_capacity(s.len());
+    for p in &pieces {
+        match p {
+            Piece::Text(t) => out.push_str(t),
+            // Verbatim: not heph's escape here.
+            Piece::Escape => out.push_str("$$"),
+            Piece::Ref(r) if r.kind.is_some_and(|k| want.contains(&k)) => {
+                out.push_str(&resolve(r)?);
+            }
+            Piece::Ref(r) => out.push_str(r.raw),
         }
     }
     Ok(out)
@@ -166,7 +272,7 @@ mod tests {
             .into_iter()
             .filter_map(|p| match p {
                 Piece::Ref(r) => Some((r.kind.map(str::to_string), r.arg.to_string())),
-                Piece::Text(_) => None,
+                Piece::Text(_) | Piece::Escape => None,
             })
             .collect()
     }
@@ -227,6 +333,70 @@ mod tests {
         })
         .expect("render");
         assert_eq!(out, "machine h login u\n");
+    }
+
+    /// The two consumers disagree about `$$`, and both are right: a credential
+    /// presentation is heph's own document, a driver option is somebody else's
+    /// shell text.
+    #[test]
+    fn an_escape_is_unescaped_by_render_and_reproduced_by_substitute() {
+        assert_eq!(
+            render("tmp.$$", |_r| panic!("no refs")).expect("render"),
+            "tmp.$"
+        );
+        assert_eq!(
+            substitute("tmp.$$", &["read"], |_r| panic!("no refs")).expect("sub"),
+            "tmp.$$"
+        );
+    }
+
+    /// The bug this split exists to remove: a field whose meaning changed
+    /// depending on whether a reference happened to be elsewhere in the string.
+    #[test]
+    fn a_reference_elsewhere_does_not_change_what_the_rest_of_the_field_means() {
+        let sub = |s: &str| {
+            substitute(s, &["read"], |r| {
+                assert_eq!(r.arg, "//a:b");
+                Ok("V".to_string())
+            })
+            .expect("sub")
+        };
+        assert_eq!(sub("echo tmp.$$"), "echo tmp.$$");
+        assert_eq!(sub("echo tmp.$$ ${read://a:b}"), "echo tmp.$$ V");
+        // …and a kind heph does not own is left exactly as written.
+        assert_eq!(sub("${src:0:3} ${read://a:b}"), "${src:0:3} V");
+        assert_eq!(sub("${FOO:-d} ${read://a:b}"), "${FOO:-d} V");
+    }
+
+    #[test]
+    fn only_the_kind_heph_resolves_counts_as_deferred() {
+        assert!(has_deferred_ref("${read://a:b}"));
+        assert!(!has_deferred_ref("plain"));
+        assert!(
+            !has_deferred_ref("$${read://a:b}"),
+            "an escaped one is text"
+        );
+        // Designed, not implemented — and therefore not reserved, because
+        // `${src:0:3}` is bash and `${env:FOO}` is several tools' own syntax.
+        assert!(!has_deferred_ref("${src:0:3}"));
+        assert!(!has_deferred_ref("${env:NAME}"));
+        assert_eq!(
+            first_ref_of("${src:0:3}", RESERVED_LATER).map(|r| r.raw),
+            Some("${src:0:3}")
+        );
+        // Somebody else's, always.
+        assert!(!has_deferred_ref("${FOO:-default}"));
+        assert!(!has_deferred_ref("${OUT}"));
+    }
+
+    /// An unterminated `${` is a shell program's business. Refusing it in every
+    /// string field would fail a `run` containing `sed 's/${/X/'`, which has
+    /// nothing to do with deferred values.
+    #[test]
+    fn a_string_that_does_not_tokenize_is_not_ours() {
+        assert!(parse("sed 's/${/X/'").is_err());
+        assert!(!has_deferred_ref("sed 's/${/X/'"));
+        assert!(first_deferred_ref("sed 's/${/X/'").is_none());
     }
 
     #[test]

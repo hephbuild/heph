@@ -25,14 +25,24 @@ use crate::htspec::FromSpecValue;
 
 impl FromSpecValue for Rename {
     fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        // Hand-parsed, so the shared decoder's reservation does not run here — and
+        // a `rename` is a *selector* over emitted paths, which is the class a
+        // deferred value may never shape. Latent today (no driver has both a
+        // `Deferred` field and a `rename`), and the point of writing it down is
+        // that the next one that does would otherwise open it silently.
         match v {
-            Value::String(s) => Ok(Rename::Sole(s.clone())),
+            Value::String(s) => {
+                crate::htspec::reject_deferred_reference(s)?;
+                Ok(Rename::Sole(s.clone()))
+            }
             Value::Map(m) => {
                 let mut out = std::collections::BTreeMap::new();
                 for (k, val) in m {
                     let Value::String(dst) = val else {
                         anyhow::bail!("`rename` dict values must be strings; key '{k}' is not");
                     };
+                    crate::htspec::reject_deferred_reference(k)?;
+                    crate::htspec::reject_deferred_reference(dst)?;
                     out.insert(k.clone(), dst.clone());
                 }
                 Ok(Rename::Exact(out))
@@ -56,6 +66,21 @@ mod tests {
 
     fn parse(v: Value) -> anyhow::Result<Rename> {
         Rename::from_spec_value(&v)
+    }
+
+    /// A `rename` decides *which* emitted path goes where — a selector, not a
+    /// value — so it may never carry a deferred reference.
+    #[test]
+    fn a_deferred_reference_is_refused_in_either_form() {
+        assert!(parse(Value::String("${read://a:b}".into())).is_err());
+        assert!(
+            parse(Value::Map(
+                [("src".to_string(), Value::String("${read://a:b}".into()))]
+                    .into_iter()
+                    .collect()
+            ))
+            .is_err()
+        );
     }
 
     #[test]

@@ -327,6 +327,7 @@ mod tests {
             sandbox_dir: sandbox_dir.to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         }
     }
 

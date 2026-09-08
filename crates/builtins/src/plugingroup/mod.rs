@@ -729,6 +729,7 @@ mod tests {
                     sandbox_dir: Default::default(),
                     scratch: vec![],
                     credentials: vec![],
+                    deferred: Default::default(),
                 },
                 &ctoken(),
             )
