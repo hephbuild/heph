@@ -87,13 +87,42 @@ impl FromSpecValue for String {
     }
 }
 
-impl FromSpecValue for Option<String> {
+/// Any decodable type becomes optional for free: absent or null is `None`.
+///
+/// Blanket rather than one impl per `Option<T>`, so a nested config struct can
+/// have an optional field without the leaf type having to know about it.
+impl<T: FromSpecValue> FromSpecValue for Option<T> {
     fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
-        parse_string(v)
+        match v {
+            Value::Null() => Ok(None),
+            other => Ok(Some(T::from_spec_value(other)?)),
+        }
     }
 
     fn spec_param_type() -> ParamType {
-        ParamType::union(vec![ParamType::String, ParamType::Null])
+        ParamType::union(vec![T::spec_param_type(), ParamType::Null])
+    }
+}
+
+/// A `{name: value}` map that keeps its keys in order.
+///
+/// Strict where [`HashMap<String, String>`] is lenient: a bare string does not
+/// become `{"": s}`. The ordered form is used where the map *is* the document —
+/// a credential presentation's `env`, say — and a nameless entry has no meaning
+/// there.
+impl FromSpecValue for std::collections::BTreeMap<String, String> {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        match v {
+            Value::Map(m) => m
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), String::from_spec_value(v)?)))
+                .collect(),
+            other => anyhow::bail!("invalid: expected {{string: string}}, got: {other:?}"),
+        }
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::map(ParamType::String)
     }
 }
 

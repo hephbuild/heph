@@ -112,7 +112,7 @@ impl EProvider for Provider {
 // Signature helpers
 // ---------------------------------------------------------------------------
 
-fn strs() -> ParamType {
+pub(crate) fn strs() -> ParamType {
     ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)])
 }
 
@@ -126,7 +126,7 @@ fn str_map() -> ParamType {
 /// checked: a preset returning something a `present =` cannot accept would
 /// otherwise fail one layer down, in the credential driver's parser, with no
 /// mention of the preset that produced it.
-fn presentation_ty() -> ParamType {
+pub(crate) fn presentation_ty() -> ParamType {
     ParamType::strukt(vec![
         ("env", str_map()),
         ("files", str_map()),
@@ -148,7 +148,7 @@ fn presentation_ty() -> ParamType {
 
 /// The shape a source constructor returns: one struct covering every inline
 /// kind's fields, which is what the driver's own schema says too.
-fn source_ty() -> ParamType {
+pub(crate) fn source_ty() -> ParamType {
     ParamType::strukt(vec![
         ("kind", ParamType::String),
         ("when", ParamType::String),

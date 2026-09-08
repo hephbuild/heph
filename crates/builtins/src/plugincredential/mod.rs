@@ -35,8 +35,8 @@ use hcore::hasync::Cancellable;
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::ParamType;
 use hplugin::driver::{
-    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, DriverField,
-    DriverSchema, ParseRequest, ParseResponse, RunRequest, RunResponse,
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, DriverSchema,
+    ParseRequest, ParseResponse, RunRequest, RunResponse,
     targetdef::{CacheConfig, TargetDef},
 };
 use std::sync::Arc;
@@ -101,133 +101,81 @@ impl CredentialDef {
     }
 }
 
-/// Config for a `credential` target.
-///
-/// Hand-parsed rather than `#[derive(Spec)]`d: `sources` is a heterogeneous list
-/// (an address *or* an inline dict) and `present` is a nested document, neither of
-/// which the derive's field shapes describe. The schema below is written out for
-/// the same reason.
-fn schema() -> DriverSchema {
-    let strs = || ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
-    let present_ty = || {
-        ParamType::strukt(vec![
-            ("env", ParamType::map(ParamType::String)),
-            ("files", ParamType::map(ParamType::String)),
-            (
-                "helper",
-                ParamType::union(vec![
-                    ParamType::String,
-                    ParamType::strukt(vec![
-                        ("dialect", ParamType::String),
-                        ("registries", strs()),
-                        ("hosts", strs()),
-                        ("audience", ParamType::String),
-                        ("impersonate", ParamType::String),
-                    ]),
-                ]),
-            ),
-        ])
-    };
-    // An address, or one of the five inline kinds. Written out rather than
-    // derived because the union is genuinely heterogeneous — which is also why
-    // authors write `heph.auth.exec(...)` and get the fields checked by a
-    // function signature instead.
-    let source_ty = ParamType::union(vec![
-        ParamType::String,
-        ParamType::strukt(vec![
-            ("kind", ParamType::String),
-            ("when", ParamType::String),
-            ("credentials", strs()),
-            ("present", present_ty()),
-            ("hint", ParamType::String),
-            ("names", strs()),
-            ("path", ParamType::String),
-            ("run", strs()),
-            ("fields", ParamType::map(ParamType::String)),
-            ("expires", ParamType::String),
-            ("login", ParamType::list(strs())),
-            ("runner", ParamType::String),
-            ("paths", ParamType::map(ParamType::String)),
-            ("provider", ParamType::String),
-            ("audience", ParamType::String),
-        ]),
-    ]);
-    DriverSchema {
-        fields: vec![
-            DriverField {
-                name: "sources".to_string(),
-                ty: ParamType::list(source_ty),
-                doc: "Ordered ways to obtain this credential. Each is a target address or a \
-                      `heph.auth.*` constructor. The first *applicable* source is the source: an \
-                      acquire failure is terminal, not a fallthrough, so a misconfigured role in \
-                      CI cannot silently fall back to an ambient identity."
-                    .to_string(),
-                required: true,
-            },
-            DriverField {
-                name: "present".to_string(),
-                ty: present_ty(),
-                doc: "How the material reaches a consumer: `env` (name → template), `files` \
-                      (name → content template, written 0600 and deleted at run end) and/or \
-                      `helper` (a callback protocol — aws, gcp, docker, git, kubernetes). May \
-                      instead be set per source, which is required when two sources yield \
-                      different material shapes. A presentation carries material and handles \
-                      only: anything that selects content (a region, an account, a project) is an \
-                      ordinary hashed input on the consumer."
-                    .to_string(),
-                required: false,
-            },
-            DriverField {
-                name: "ttl".to_string(),
-                ty: ParamType::String,
-                doc: "A declared lifetime (`55m`, `6h`) for material whose source reports none. \
-                      Set it under the true lifetime, never at it. Without it, material with no \
-                      expiry is never written to the disk cache."
-                    .to_string(),
-                required: false,
-            },
-        ],
-    }
-}
-
 /// Parse and validate a credential declaration straight from a target spec.
 ///
 /// The engine calls this when a consumer references a credential. Reading the
 /// spec config — which *is* host-visible — through the same function the driver
 /// uses keeps one implementation of the parsing and validation rules.
-pub fn parse_declaration(spec: &hplugin::provider::TargetSpec) -> anyhow::Result<CredentialDef> {
-    let mut sources: Vec<SourceDecl> = Vec::new();
-    let mut present: Option<Presentation> = None;
-    let mut ttl: Option<Duration> = None;
+/// The `credential` driver's config, as the author writes it.
+///
+/// `#[derive(Spec)]` owns the key set, the per-field decoding, the unknown-key
+/// refusal and the LSP schema — so the parser and the schema are one thing, and
+/// the doc comments below are what `heph inspect schema` prints. Only the two
+/// fields whose *shape* the derive cannot express carry a `parse` function:
+/// `sources` is an ordered heterogeneous list, and `ttl` is a duration grammar.
+#[derive(hplugin::htspec::Spec)]
+struct CredentialSpec {
+    /// Ordered ways to obtain this credential. Each is a target address or a
+    /// `heph.auth.*` constructor. The first *applicable* source is the source:
+    /// an acquire failure is terminal, not a fallthrough, so a misconfigured
+    /// role in CI cannot silently fall back to an ambient identity.
+    #[spec(required, parse = parse_sources, ty = ParamType::list(functions::source_ty()))]
+    sources: Vec<SourceDecl>,
+    /// How the material reaches a consumer: `env` (name → template), `files`
+    /// (name → content template, written 0600 and deleted at run end) and/or
+    /// `helper` (a callback protocol — aws, gcp, docker, git, kubernetes). May
+    /// instead be set per source, which is required when two sources yield
+    /// different material shapes. A presentation carries material and handles
+    /// only: anything that selects content (a region, an account, a project) is
+    /// an ordinary hashed input on the consumer.
+    #[spec(parse = parse_present, ty = functions::presentation_ty())]
+    present: Option<Presentation>,
+    /// A declared lifetime (`55m`, `6h`) for material whose source reports none.
+    /// Set it under the true lifetime, never at it. Without it, material with no
+    /// expiry is never written to the disk cache.
+    #[spec(parse = parse_ttl, ty = ParamType::String)]
+    ttl: Option<Duration>,
+}
 
-    for (k, v) in &spec.config {
-        match k.as_str() {
-            "sources" => {
-                let Value::List(items) = v else {
-                    anyhow::bail!(
-                        "credential `sources` must be a list of sources, got {v:?} — the list is \
-                         ordered, and the order is the whole point"
-                    );
-                };
-                sources = items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, item)| {
-                        SourceDecl::parse(item).with_context(|| format!("sources[{i}]"))
-                    })
-                    .collect::<anyhow::Result<_>>()?;
-            }
-            "present" => present = Some(Presentation::parse(v)?),
-            "ttl" => {
-                let raw = present::string(v, "ttl")?;
-                ttl = Some(hcore::units::parse_duration(&raw).context("credential `ttl`")?);
-            }
-            other => anyhow::bail!(
-                "unknown key {other:?} on a `credential` target — it takes `sources`, `present` \
-                 and `ttl`"
-            ),
-        }
+/// An ordered, heterogeneous list: each entry is a bare address or a
+/// `heph.auth.*` dict, and the index is part of every diagnostic.
+fn parse_sources(v: &Value) -> anyhow::Result<Vec<SourceDecl>> {
+    let Value::List(items) = v else {
+        anyhow::bail!(
+            "credential `sources` must be a list of sources, got {v:?} — the list is ordered, \
+             and the order is the whole point"
+        );
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| SourceDecl::parse(item).with_context(|| format!("sources[{i}]")))
+        .collect()
+}
+
+fn parse_present(v: &Value) -> anyhow::Result<Option<Presentation>> {
+    match v {
+        Value::Null() => Ok(None),
+        other => Presentation::parse(other).map(Some),
     }
+}
+
+fn parse_ttl(v: &Value) -> anyhow::Result<Option<Duration>> {
+    let Some(raw) = <Option<String> as hplugin::htspec::FromSpecValue>::from_spec_value(v)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        hcore::units::parse_duration(&raw).context("credential `ttl`")?,
+    ))
+}
+
+pub fn parse_declaration(spec: &hplugin::provider::TargetSpec) -> anyhow::Result<CredentialDef> {
+    let CredentialSpec {
+        sources,
+        present,
+        ttl,
+    } = CredentialSpec::from(&spec.config)
+        .context("a `credential` target takes `sources`, `present` and `ttl`")?;
 
     if sources.is_empty() {
         anyhow::bail!(
@@ -262,7 +210,7 @@ impl hplugin::driver::Driver for Driver {
     }
 
     fn schema(&self) -> DriverSchema {
-        schema()
+        CredentialSpec::schema()
     }
 
     async fn parse(

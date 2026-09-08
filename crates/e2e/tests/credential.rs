@@ -146,7 +146,9 @@ async fn configuration_has_nowhere_to_hide_in_a_presentation() -> anyhow::Result
         "a region must not be a presentation",
     );
     let msg = format!("{err:#}");
-    assert!(msg.contains("unknown key"), "{msg}");
+    // The `SpecStruct` derive names the offending key; the context says where
+    // configuration does belong.
+    assert!(msg.contains("region"), "{msg}");
     assert!(
         msg.contains("hashed input on the consumer"),
         "the message must say where it does belong: {msg}"

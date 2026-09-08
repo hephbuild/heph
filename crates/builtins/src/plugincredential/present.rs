@@ -24,6 +24,8 @@
 //! check. See `docs/CREDENTIALS.md`, "The rule that is easiest to get wrong".
 
 use hcore::htvalue::Value;
+use hcore::htvalue::signature::ParamType;
+use hplugin::htspec::{FromSpecValue, SpecStruct};
 use std::collections::BTreeMap;
 
 /// A callback protocol heph speaks on a tool's behalf.
@@ -50,6 +52,19 @@ pub enum Dialect {
     /// document: the author templates the kubeconfig and places the argv with
     /// `${helper:command}` and `${helper:args}`.
     Kubernetes,
+}
+
+/// Decoded through [`Dialect::parse`] rather than `#[derive(SpecEnum)]`, so the
+/// name table and its message exist once: the same string is also parsed out of
+/// `heph __auth-helper <dialect>`'s argv, where there is no `Value` to decode.
+impl FromSpecValue for Dialect {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        Self::parse(&String::from_spec_value(v)?)
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::String
+    }
 }
 
 impl Dialect {
@@ -94,8 +109,9 @@ impl Dialect {
 /// which git hosts, which workload-identity audience to present it as. None of
 /// them selects content, which is the test §2 of the design applies to
 /// everything on this side of the line.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default, SpecStruct)]
 pub struct Helper {
+    /// Which callback protocol heph speaks.
     pub dialect: Option<Dialect>,
     /// Docker: registries this credential authenticates. Empty is an error —
     /// a credHelpers map with no entries authenticates nothing.
@@ -120,7 +136,7 @@ impl Helper {
 ///
 /// Three shapes, in preference order, and they compose: a kubernetes helper is a
 /// `files` kubeconfig plus an `env` pointing at it plus the callback argv.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default, SpecStruct)]
 pub struct Presentation {
     /// Name → template. Injected as **runtime** environment — never `env`, never
     /// `pass_env` — so it cannot reach a def hash by construction.
@@ -130,6 +146,7 @@ pub struct Presentation {
     /// run end whatever the outcome. Reachable as `${file:<name>}`.
     pub files: BTreeMap<String, String>,
     /// A callback protocol. The only presentation that survives expiry.
+    #[spec(parse = parse_helper)]
     pub helper: Option<Helper>,
 }
 
@@ -138,32 +155,24 @@ impl Presentation {
         self.env.is_empty() && self.files.is_empty() && self.helper.is_none()
     }
 
-    /// Parse a presentation from its BUILD-file value.
+    /// Parse a presentation from its BUILD-file value, then check it.
     ///
     /// Accepts the map form written by hand and the dicts the `heph.auth.*`
     /// presets return — which are the same thing, deliberately: a preset is a
     /// function returning a value the author could have typed.
+    ///
+    /// The parse is `#[derive(SpecStruct)]`: the key set, the per-field decoding
+    /// and the unknown-key refusal all come from the field list, so the parser
+    /// and the schema cannot drift. What stays here is the part that is not
+    /// parsing — the emptiness rule and [`validate`](Self::validate).
     pub fn parse(v: &Value) -> anyhow::Result<Self> {
-        let m = match v {
-            Value::Map(m) => m,
-            other => anyhow::bail!(
-                "credential `present` must be a dict with `env`, `files` and/or `helper` keys, \
-                 got {other:?}"
-            ),
-        };
-        let mut out = Self::default();
-        for (k, v) in m {
-            match k.as_str() {
-                "env" => out.env = str_map(v, "present.env")?,
-                "files" => out.files = str_map(v, "present.files")?,
-                "helper" => out.helper = Some(parse_helper(v)?),
-                other => anyhow::bail!(
-                    "unknown key {other:?} in credential `present` — expected `env`, `files` or \
-                     `helper`. Configuration that selects content (a region, an account, a \
-                     project) is a hashed input on the consumer, not part of a presentation"
-                ),
-            }
-        }
+        use anyhow::Context as _;
+        let out = Self::from_spec_value(v).context(
+            "credential `present` takes `env` (name → template), `files` (name → content \
+             template) and/or `helper` (a callback protocol). Configuration that selects content \
+             (a region, an account, a project) is a hashed input on the consumer, not part of a \
+             presentation",
+        )?;
         if out.is_empty() {
             anyhow::bail!(
                 "credential `present` is empty — a credential that presents nothing hands its \
@@ -282,61 +291,50 @@ pub fn validate_file_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_helper(v: &Value) -> anyhow::Result<Helper> {
-    match v {
-        // `helper = "kubernetes"` — the shorthand for a dialect that needs no
-        // options.
-        Value::String(s) => Ok(Helper {
+/// `helper = "kubernetes"` — the shorthand for a dialect that needs no options —
+/// or the full dict, whose keys [`Helper`]'s derive owns.
+///
+/// Shape dispatch rather than a union, for the reason `TargetSpecCache` gives:
+/// a map *commits* to the dict arm, so an unknown key inside it reports itself
+/// rather than being masked by a generic "expected string | map".
+fn parse_helper(v: &Value) -> anyhow::Result<Option<Helper>> {
+    let h = match v {
+        Value::Null() => return Ok(None),
+        Value::String(s) => Helper {
             dialect: Some(Dialect::parse(s)?),
             ..Helper::default()
-        }),
-        Value::Map(m) => {
-            let mut h = Helper::default();
-            for (k, v) in m {
-                match k.as_str() {
-                    "dialect" => h.dialect = Some(Dialect::parse(&string(v, "dialect")?)?),
-                    "registries" => h.registries = strings(v, "registries")?,
-                    "hosts" => h.hosts = strings(v, "hosts")?,
-                    "audience" => h.audience = Some(string(v, "audience")?),
-                    "impersonate" => h.impersonate = Some(string(v, "impersonate")?),
-                    other => anyhow::bail!(
-                        "unknown key {other:?} in credential `present.helper` — expected \
-                         `dialect`, `registries`, `hosts`, `audience` or `impersonate`"
-                    ),
-                }
-            }
-            h.dialect()?;
-            Ok(h)
-        }
-        other => anyhow::bail!(
-            "credential `present.helper` must be a dialect name or a dict, got {other:?}"
-        ),
-    }
+        },
+        other => Helper::from_spec_value(other)
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
+            .map_err(|e| {
+                anyhow::anyhow!("credential `present.helper` must be a dialect name or a dict: {e}")
+            })?,
+    };
+    // A helper with no dialect is inert — nothing to speak.
+    h.dialect()?;
+    Ok(Some(h))
 }
 
+// `sources` is an ordered, heterogeneous list — a bare address or one of five
+// inline kinds, discriminated by `kind` — which is the one shape the derive's
+// field types cannot describe, so [`SourceDecl::parse`] dispatches by hand. The
+// three helpers below exist only to carry the field name into the message; the
+// decoding itself is the shared `FromSpecValue` every other driver uses, so
+// "what is a string here" has exactly one answer workspace-wide.
+
 pub(crate) fn string(v: &Value, what: &str) -> anyhow::Result<String> {
-    match v {
-        Value::String(s) => Ok(s.clone()),
-        other => anyhow::bail!("credential `{what}` must be a string, got {other:?}"),
-    }
+    use anyhow::Context as _;
+    String::from_spec_value(v).with_context(|| format!("credential `{what}`"))
 }
 
 pub(crate) fn strings(v: &Value, what: &str) -> anyhow::Result<Vec<String>> {
-    match v {
-        Value::String(s) => Ok(vec![s.clone()]),
-        Value::List(l) => l.iter().map(|v| string(v, what)).collect(),
-        other => anyhow::bail!("credential `{what}` must be a string or a list, got {other:?}"),
-    }
+    use anyhow::Context as _;
+    Vec::<String>::from_spec_value(v).with_context(|| format!("credential `{what}`"))
 }
 
 pub(crate) fn str_map(v: &Value, what: &str) -> anyhow::Result<BTreeMap<String, String>> {
-    match v {
-        Value::Map(m) => m
-            .iter()
-            .map(|(k, v)| Ok((k.clone(), string(v, what)?)))
-            .collect(),
-        other => anyhow::bail!("credential `{what}` must be a dict, got {other:?}"),
-    }
+    use anyhow::Context as _;
+    BTreeMap::<String, String>::from_spec_value(v).with_context(|| format!("credential `{what}`"))
 }
 
 #[cfg(test)]
@@ -375,7 +373,9 @@ mod tests {
         // a check: there is no key a region fits in.
         let err = Presentation::parse(&map(&[("region", s("eu-west-1"))])).expect_err("must fail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("unknown key"), "{msg}");
+        // The derive names the offending key; the context says where a region
+        // does belong.
+        assert!(msg.contains("region"), "{msg}");
         assert!(msg.contains("hashed input on the consumer"), "{msg}");
     }
 
