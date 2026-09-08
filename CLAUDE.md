@@ -74,6 +74,20 @@ It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run i
 
 `tst` excludes `bin-e2e` deliberately: those tests need staged artifacts and hard-fail without `HEPH_E2E_DIST`, so a suite that never ran can't read as a suite that passed. See `.claude/testing.md` for what belongs there versus `crates/e2e`.
 
+### Credentials
+
+`docs/CREDENTIALS.md`. A credential is a target (`driver = "credential"`)
+declaring an identity, an ordered chain of ways to obtain it, and the shape it is
+presented in; a consumer names it with `credentials = [...]`.
+
+Read the doc before touching any of it. The two things to know going in: the
+reference is an `Input` with `hashed: false, runtime: false`, so **nothing about
+a credential can reach a cache key** and that exclusion is structural rather than
+conventional — and the other half of the contract, that a presentation carries
+material and handles but never anything that *selects content*, is a
+**convention** the parser cannot check. A target whose output depends on which
+identity ran it is not cacheable and says so with `cache = False`.
+
 ### Exec runners
 
 Every subprocess heph spawns goes through `crates/execrunner`, never

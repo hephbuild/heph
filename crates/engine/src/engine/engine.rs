@@ -125,6 +125,15 @@ pub struct Engine {
     pub(crate) result_lock: ResultLock,
     pub(crate) scratch_lock: crate::engine::scratch::ScratchLock,
 
+    /// Acquired credential material, per process. Not a `Memoizer`: material
+    /// expires, and a memoized cell is computed once and kept forever. See
+    /// [`CredentialCache`](crate::engine::credential::CredentialCache).
+    pub(crate) credential_cache: crate::engine::credential::CredentialCache,
+    /// Serializes acquisition across processes, per resolution key. Two
+    /// concurrent `heph` invocations must not both drive an interactive vendor
+    /// CLI for the same credential.
+    pub(crate) credential_lock: crate::engine::credential::CredentialLock,
+
     /// Ordered set of remote (shared) caches fronting the local cache. Empty
     /// (a cheap no-op on every path) unless `caches:` is configured.
     pub(crate) remote_caches: Arc<crate::engine::RemoteCacheSet>,
@@ -452,6 +461,13 @@ impl Engine {
             .with_context(|| format!("create scratch lock dir {scratch_lock_dir:?}"))?;
         let scratch_lock =
             crate::engine::scratch::ScratchLock::new(cfg.lock_backend, scratch_lock_dir);
+        // Third namespace, third directory: a credential is keyed by its
+        // resolution key, which is neither an addr nor a slot id.
+        let credential_lock_dir = lock_dir.join("auth");
+        std::fs::create_dir_all(&credential_lock_dir)
+            .with_context(|| format!("create credential lock dir {credential_lock_dir:?}"))?;
+        let credential_lock =
+            crate::engine::credential::CredentialLock::new(cfg.lock_backend, credential_lock_dir);
 
         // Remote caches: backends are constructed synchronously here (no
         // network); latency ordering is measured lazily on first use.
@@ -522,6 +538,8 @@ impl Engine {
             fuse,
             result_lock,
             scratch_lock,
+            credential_cache: Default::default(),
+            credential_lock,
             remote_caches,
             provider_functions_wired: std::sync::Once::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
@@ -529,6 +547,9 @@ impl Engine {
         };
         engine.register_driver(|_| Box::new(hbuiltins::plugingroup::Driver))?;
         engine.register_driver(|_| Box::new(hbuiltins::pluginscratch::Driver))?;
+        engine.register_driver(|_| Box::new(hbuiltins::plugincredential::Driver))?;
+        // Serves no targets; it exists to carry `heph.auth.*` into BUILD files.
+        engine.register_provider(|_| Box::new(hbuiltins::plugincredential::functions::Provider))?;
         engine.register_provider(|_| Box::new(hplugin_query::pluginquery::Provider))?;
 
         // The `fs` provider + driver are always-on built-ins. Each builds its

@@ -396,8 +396,20 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
         // fixed cap and let the signature validator enforce the real arity. Eight
         // is far beyond any provider function (the widest takes one positional);
         // more than that trips Starlark's own too-many-args error first.
-        let (_, optional) =
-            starlark::__derive_refs::parse_args::parse_positional::<0, 8>(args, eval.heap())?;
+        //
+        // The `_kwargs` variant, deliberately: the plain `parse_positional`
+        // begins with `no_named_args()`, which rejects **every** keyword argument
+        // before the declared signature is ever consulted. That made a
+        // `FnSignature`'s `named` params unreachable — `heph.go.gocache_addr(goos
+        // = …)` and every `heph.auth.*` constructor — with a Starlark-level
+        // "extra named parameter" rather than anything naming the function's own
+        // parameter list. Named args are read from `names_map` below and checked
+        // by `validate_args`, which is where an unknown keyword genuinely belongs.
+        let (_, optional, _kwargs) =
+            starlark::__derive_refs::parse_args::parse_positional_kwargs_alloc::<0, 8>(
+                args,
+                eval.heap(),
+            )?;
         let positional: Vec<htvalue::Value> = optional
             .iter()
             .flatten()
@@ -3990,6 +4002,121 @@ target(name = "t_in_app", driver = SHARED)
             Some(htvalue::Value::String(s)) => assert_eq!(s, "mypkg:hi"),
             other => panic!("expected echoed string, got {other:?}"),
         }
+    }
+
+    /// A provider function's declared **named** parameters must actually be
+    /// callable.
+    ///
+    /// They were not: the dispatch began with Starlark's `no_named_args()`, which
+    /// rejects every keyword argument before the function's own signature is
+    /// consulted — so `heph.go.gocache_addr(goos = "linux")` and every
+    /// `heph.auth.*` constructor failed with a Starlark-level "extra named
+    /// parameter" naming nothing useful, and a `FnSignature`'s `named` list was
+    /// unreachable surface.
+    #[test]
+    fn a_provider_function_accepts_its_declared_named_arguments() {
+        struct SuffixFn;
+        #[async_trait::async_trait]
+        impl ProviderFn for SuffixFn {
+            async fn call(
+                &self,
+                _ctx: &FnCallContext<'_>,
+                args: FnArgs,
+            ) -> anyhow::Result<htvalue::Value> {
+                let base = match args.positional.first() {
+                    Some(htvalue::Value::String(s)) => s.clone(),
+                    _ => anyhow::bail!("expected a string"),
+                };
+                let suffix = match args.named.get("suffix") {
+                    Some(htvalue::Value::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                Ok(htvalue::Value::String(format!("{base}{suffix}")))
+            }
+        }
+
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            r#"target(name = "t", driver = "d", v = heph.myprov.tag("a", suffix = "-b"))"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        };
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider(
+            "myprov",
+            vec![hplugin::provider::ProviderFunctionDef {
+                name: "tag".to_string(),
+                signature: FnSignature {
+                    positional: vec![Param::required("base", ParamType::String)],
+                    named: vec![Param::optional(
+                        "suffix",
+                        ParamType::String,
+                        htvalue::Value::String(String::new()),
+                    )],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: String::new(),
+                func: Arc::new(SuffixFn),
+            }],
+        );
+        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+
+        let result = run_pkg_blocking(&provider, "mypkg").unwrap();
+        match result.targets[0].config.get("v") {
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "a-b"),
+            other => panic!("expected the named argument to be applied, got {other:?}"),
+        }
+    }
+
+    /// …and an *undeclared* keyword is still rejected — now by the function's own
+    /// signature, which can name what it does accept, rather than by Starlark
+    /// before it ever looked.
+    #[test]
+    fn an_undeclared_keyword_argument_is_rejected_by_the_functions_own_signature() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            r#"target(name = "t", driver = "d", v = heph.myprov.echo("hi", nope = 1))"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        };
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider(
+            "myprov",
+            vec![hplugin::provider::ProviderFunctionDef {
+                name: "echo".to_string(),
+                signature: FnSignature {
+                    positional: vec![Param::required("v", ParamType::String)],
+                    named: vec![],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: String::new(),
+                func: Arc::new(EchoFn),
+            }],
+        );
+        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+
+        let err = run_pkg_blocking(&provider, "mypkg").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown keyword argument `nope`"),
+            "the function's own validator must be the one that answers: {msg}"
+        );
     }
 
     #[test]

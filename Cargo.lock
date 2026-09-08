@@ -1502,6 +1502,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "core",
+ "futures",
  "heph",
  "plugin-devenv",
  "plugin-oci",
@@ -4124,6 +4125,7 @@ dependencies = [
  "execrunner",
  "glob",
  "libc",
+ "memchr",
  "minijinja",
  "model",
  "plugin",
