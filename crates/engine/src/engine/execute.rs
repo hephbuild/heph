@@ -85,7 +85,7 @@ impl Engine {
         // reading their bytes. Inside `execute`, so a cache hit resolves nothing.
         hcore::hmemoizer::set_phase("execute:deferred_resolve");
         let deferred_refs = self.deferred_refs(spec, &spec.driver)?;
-        let deferred = self
+        let (deferred, deferred_pending) = self
             .resolve_deferred(&rs, &def.target, &deferred_refs)
             .await
             .with_context(|| format!("resolve deferred values for {addr}"))?;
@@ -220,7 +220,7 @@ impl Engine {
                     let hashin = hashin.to_owned();
 
                     let inner: InteractiveInner = Box::new(enclose!(
-                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts, credential_mounts, deferred)
+                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts, credential_mounts, deferred, deferred_pending)
                         move |stdin, stdout, stderr| {
                             Box::pin(async move {
                                 let req = RunRequest {
@@ -236,6 +236,7 @@ impl Engine {
                                     scratch: scratch_mounts,
                                     credentials: credential_mounts,
                                     deferred,
+                                    deferred_pending,
                                 };
                                 let res = if shell {
                                     driver.driver.run_shell(req, rs.ctoken()).await?

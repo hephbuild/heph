@@ -63,8 +63,8 @@
 //! BUILD file using one gets a clear refusal rather than a literal.
 
 use crate::engine::Engine;
-use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
+use crate::engine::driver::{DeferredPending, TargetAddr};
 use crate::engine::request_state::RequestState;
 use anyhow::Context as _;
 use hcore::htvalue::Value;
@@ -73,17 +73,16 @@ use hmodel::htpkg::PkgBuf;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The reference kind that ships: the *contents* of a producer's single output.
-pub const READ: &str = "read";
+/// The *contents* of a producer's single output.
+pub use hcore::template::READ_KIND as READ;
 
-/// Kinds the design names but does not implement, refused with "not yet" rather
-/// than "unknown" — which is a materially different thing to read while holding a
-/// design document that mentions both.
+/// The sandbox *path* of a producer's artifact.
 ///
-/// Refused **only inside a driver that accepts deferred values**, where an author
-/// writing one plainly meant it to resolve. Elsewhere `${src:0:3}` is bash and
-/// `${env:FOO}` is a tool's own syntax, and heph has no business claiming either.
-pub use hcore::template::RESERVED_LATER;
+/// The other edge shape: `(hashed, staged)`, because a path is only meaningful
+/// once the bytes are in the sandbox. Filled in by the managed-driver layer
+/// rather than here, since only the layer that staged the artifact knows where
+/// it landed — under FUSE the sandbox root is redirected after the host set it.
+pub use hcore::template::SRC_KIND as SRC;
 
 /// The largest a deferred value may be.
 ///
@@ -99,6 +98,24 @@ const MAX_VALUE_BYTES: u64 = 64 * 1024;
 /// path through the config that wanted it.
 pub const DEFERRED_ORIGIN_PREFIX: &str = "option";
 
+/// Marks a `${src:}` edge as staged-but-not-transitively-merged.
+///
+/// `collect_transitive_deps` filters on `runtime`, and a `${src:}` input must be
+/// `runtime: true` for the artifact to reach the sandbox at all — so the
+/// exclusion needs its own mark. See [`inputs_for_labelled`].
+pub const DEFERRED_SRC_ANNOTATION: &str = "heph.deferred.src";
+
+/// One producer a reference names, and what the author asked of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Producer {
+    /// [`READ`] or [`SRC`] — which decides the edge shape and who substitutes.
+    pub kind: &'static str,
+    /// The target, with any `|group` and `[filters]` the author wrote. Parsed by
+    /// [`TargetAddr::parse`], the same function `deps` goes through, so a
+    /// reference and a dep agree about what an address is.
+    pub addr: TargetAddr,
+}
+
 /// One reference found in a target's config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredRef {
@@ -107,11 +124,19 @@ pub struct DeferredRef {
     /// text it decoded and knows nothing about where in the config it came from.
     pub raw: String,
     /// The producers this text names, in order of appearance.
-    pub producers: Vec<Addr>,
+    pub producers: Vec<Producer>,
     /// Where in the config it was found, e.g. `sources[0].present.env.AWS_ROLE_ARN`.
     /// Diagnostics only: it is what makes `heph inspect deps` able to say *which
     /// field* wanted an edge.
     pub path: String,
+}
+
+impl DeferredRef {
+    /// Whether any producer here needs the sandbox, and therefore cannot be
+    /// substituted until the artifact has been staged.
+    pub fn needs_sandbox(&self) -> bool {
+        self.producers.iter().any(|p| p.kind == SRC)
+    }
 }
 
 /// Every deferred reference in a target's config, in a stable order.
@@ -154,23 +179,6 @@ pub fn collect(
     out.sort_by(|a, b| a.raw.cmp(&b.raw));
     out.dedup_by(|a, b| a.raw == b.raw);
     Ok(out)
-}
-
-/// The first designed-but-unimplemented reference anywhere under `v`.
-fn reserved_later(v: &Value) -> Option<String> {
-    match v {
-        Value::String(s) => {
-            hcore::template::first_ref_of(s, RESERVED_LATER).map(|r| r.raw.to_string())
-        }
-        Value::List(items) => items.iter().find_map(reserved_later),
-        Value::Map(m) => {
-            let mut keys: Vec<&String> = m.keys().collect();
-            keys.sort_unstable();
-            keys.into_iter()
-                .find_map(|k| m.get(k).and_then(reserved_later))
-        }
-        _ => None,
-    }
 }
 
 /// Whether any string anywhere under `v` contains a `${…}`.
@@ -232,19 +240,26 @@ fn parse_refs(s: &str, pkg: &PkgBuf, path: &str) -> anyhow::Result<Option<Deferr
         let hcore::template::Piece::Ref(r) = piece else {
             continue;
         };
-        let Some(kind) = r.kind else { continue };
-        if kind != READ {
-            // An unrecognized kind is not ours: `${FOO:-default}` and every other
-            // shell construct has to survive being written in a deferrable field.
+        // Not ours unless the kind is one heph resolves *and* the argument is an
+        // absolute address. `${FOO:-default}`, `${src:0:3}` and every other shell
+        // construct has to survive being written in a deferrable field.
+        if !hcore::template::claims(r.kind, r.arg, hcore::template::DEFERRED_KINDS) {
             continue;
         }
-        let addr = hmodel::htaddr::parse_addr_with_base(r.arg, pkg).with_context(|| {
+        let kind = match r.kind {
+            Some(SRC) => SRC,
+            _ => READ,
+        };
+        // `TargetAddr::parse`, not a bare address parse: `|group` and `[filters]`
+        // are how every other dep narrows a multi-output producer, and a
+        // reference has exactly the same need.
+        let addr = TargetAddr::parse(r.arg, pkg).with_context(|| {
             format!(
                 "`{}` in `{path}`: {:?} is not a target address",
                 r.raw, r.arg
             )
         })?;
-        producers.push(addr);
+        producers.push(Producer { kind, addr });
     }
     if producers.is_empty() {
         return Ok(None);
@@ -272,29 +287,48 @@ pub fn inputs_for(refs: &[DeferredRef]) -> Vec<Input> {
 /// have (`option|sources[0].present.env.AWS_ROLE_ARN`), which is the opposite of
 /// what an origin id is for; and two credentials with a reference at the same path
 /// would give one consumer two inputs with identical ids.
+/// The `origin_id` a reference's edge carries — and the key a pending `${src:}`
+/// entry uses to find the staged input again. One function, because a mismatch
+/// would mean the artifact was staged and the path still could not be found.
+fn origin_id_for(r: &DeferredRef, p: &Producer, via: Option<&Addr>) -> String {
+    match via {
+        Some(v) => format!("{DEFERRED_ORIGIN_PREFIX}|{v}|{}|{}", p.kind, r.path),
+        None => format!("{DEFERRED_ORIGIN_PREFIX}|{}|{}", p.kind, r.path),
+    }
+}
+
 pub fn inputs_for_labelled(refs: &[DeferredRef], via: Option<&Addr>) -> Vec<Input> {
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Keyed on the *cell* as well as the address. Deduping on the address alone
+    // silently dropped one of them the moment two kinds existed: `collect` sorts
+    // refs by their whole field text, so `"${read://a:b}"` sorts before
+    // `"${src://a:b}"`, the `read` edge won, and the artifact was never staged —
+    // with the winner depending on the surrounding literal characters.
+    let mut seen: std::collections::BTreeSet<(String, bool)> = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for r in refs {
-        for addr in &r.producers {
-            let key = addr.format();
-            if !seen.insert(key) {
+        for p in &r.producers {
+            let staged = p.kind == SRC;
+            if !seen.insert((p.addr.to_string(), staged)) {
                 continue;
             }
+            let mut annotations = BTreeMap::new();
+            if staged {
+                // The third cell: staged like a `deps` edge, but excluded from
+                // `collect_transitive_deps`. Writing `${src://tools:go}` asks for
+                // a path; it does not ask to inherit the producer's `transitive`
+                // environment — which `apply_transitive` would fold into this
+                // target's *def hash* from `std::env::var`, so a consumer's key
+                // would move with the host environment of a target it only
+                // wanted a filename from.
+                annotations.insert(DEFERRED_SRC_ANNOTATION.to_string(), String::new());
+            }
             out.push(Input {
-                r#ref: TargetAddr {
-                    r#ref: addr.clone(),
-                    output: None,
-                    filters: vec![],
-                },
+                r#ref: p.addr.clone(),
                 mode: InputMode::Standard,
-                origin_id: match via {
-                    Some(v) => format!("{DEFERRED_ORIGIN_PREFIX}|{v}|{}", r.path),
-                    None => format!("{DEFERRED_ORIGIN_PREFIX}|{}", r.path),
-                },
-                annotations: BTreeMap::new(),
+                origin_id: origin_id_for(r, p, via),
+                annotations,
                 hashed: true,
-                runtime: false,
+                runtime: staged,
             });
         }
     }
@@ -334,25 +368,6 @@ impl Engine {
             .get(driver)
             .is_some_and(|d| d.driver.schema().accepts_deferred);
 
-        // A kind the design names but does not implement, inside a driver that
-        // *does* take references, is an author expecting resolution and not
-        // getting it — so say "not yet". Outside such a driver `${src:0:3}` is
-        // bash and `${env:FOO}` is a tool's own syntax, and neither is heph's
-        // business.
-        if accepts
-            && let Some(r) = spec
-                .config
-                .values()
-                .filter(|v| any_ref(v))
-                .find_map(reserved_later)
-        {
-            anyhow::bail!(
-                "{}: `{r}` is reserved but not implemented yet. Today the only deferred value is \
-                 `${{read://pkg:name}}` — the contents of a target's single output",
-                spec.addr
-            );
-        }
-
         if refs.is_empty() {
             return Ok(refs);
         }
@@ -381,13 +396,44 @@ impl Engine {
         rs: &Arc<RequestState>,
         def: &TargetDef,
         refs: &[DeferredRef],
-    ) -> anyhow::Result<BTreeMap<String, String>> {
+    ) -> anyhow::Result<(BTreeMap<String, String>, Vec<DeferredPending>)> {
         if refs.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), Vec::new()));
         }
         let by_addr = self.deferred_values(rs, refs, &def.addr).await?;
         let mut values: BTreeMap<String, String> = BTreeMap::new();
+        let mut pending: Vec<DeferredPending> = Vec::new();
         for r in refs {
+            // A field naming a `${src://…}` cannot be finished here: the path
+            // exists only once the artifact is staged, and under FUSE the
+            // sandbox root is redirected after this runs. Hand it on whole,
+            // together with the `read` values it also names, so the completing
+            // pass runs **once** over the author's own text — half-substituting
+            // it here and finishing later would re-scan a producer's bytes,
+            // which is the re-interpretation `hcore::template` is single-pass to
+            // prevent.
+            if r.needs_sandbox() {
+                pending.push(DeferredPending {
+                    raw: r.raw.clone(),
+                    reads: r
+                        .producers
+                        .iter()
+                        .filter(|p| p.kind == READ)
+                        .filter_map(|p| {
+                            by_addr
+                                .get(&p.addr.to_string())
+                                .map(|v| (p.addr.to_string(), v.clone()))
+                        })
+                        .collect(),
+                    srcs: r
+                        .producers
+                        .iter()
+                        .filter(|p| p.kind == SRC)
+                        .map(|p| (p.addr.to_string(), origin_id_for(r, p, None)))
+                        .collect(),
+                });
+                continue;
+            }
             // `substitute`, not `render`: a driver option is somebody else's text.
             // `echo tmp.$$` is the shell's PID idiom and `${src:0:3}` is bash, so
             // heph replaces the one construct it owns and reproduces the rest
@@ -397,15 +443,15 @@ impl Engine {
             // Single-pass, over pieces of the *input*, so a producer whose output
             // contains `${` is never re-interpreted.
             let rendered = hcore::template::substitute(&r.raw, &[READ], |t| {
-                let addr = hmodel::htaddr::parse_addr_with_base(t.arg, &def.addr.package)?;
+                let addr = TargetAddr::parse(t.arg, &def.addr.package)?;
                 by_addr
-                    .get(&addr.format())
+                    .get(&addr.to_string())
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("no value for {addr}"))
             })?;
             values.insert(r.raw.clone(), rendered);
         }
-        Ok(values)
+        Ok((values, pending))
     }
 
     /// Every producer named by `refs`, resolved to its value, keyed by address.
@@ -422,13 +468,13 @@ impl Engine {
     ) -> anyhow::Result<BTreeMap<String, String>> {
         let mut by_addr: BTreeMap<String, String> = BTreeMap::new();
         for r in refs {
-            for addr in &r.producers {
-                let key = addr.format();
+            for p in r.producers.iter().filter(|p| p.kind == READ) {
+                let key = p.addr.to_string();
                 if by_addr.contains_key(&key) {
                     continue;
                 }
                 let value = self
-                    .read_deferred_value_cached(rs, addr)
+                    .read_deferred_value_cached(rs, &p.addr)
                     .await
                     .with_context(|| format!("{consumer}: `{}` in `{}`", r.raw, r.path))?;
                 by_addr.insert(key, value);
@@ -450,14 +496,19 @@ impl Engine {
     async fn read_deferred_value_cached(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
-        addr: &Addr,
+        addr: &TargetAddr,
     ) -> anyhow::Result<String> {
         // The producer's own `hashin` identifies its content: two consumers of one
         // producer share a key, and a producer whose inputs moved does not.
-        let meta = Arc::clone(self).meta(rs.clone(), addr).await?;
+        let meta = Arc::clone(self).meta(rs.clone(), &addr.r#ref).await?;
         self.deferred_values
             .once(
-                meta.hashin,
+                // The producer's `hashin` plus the group, because `|out` and
+                // `|meta` on one producer are two different values.
+                match &addr.output {
+                    Some(g) => format!("{}|{g}", meta.hashin),
+                    None => meta.hashin,
+                },
                 enclose::enclose!((self => engine, rs, addr) move || async move {
                     engine.read_deferred_value(&rs, &addr).await
                 }),
@@ -475,15 +526,21 @@ impl Engine {
     async fn read_deferred_value(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
-        addr: &Addr,
+        addr: &TargetAddr,
     ) -> anyhow::Result<String> {
         use hcore::hartifactcontent::WalkEntryKind;
 
         let res = Arc::clone(self)
             .result_addr(
                 rs.clone(),
-                addr,
-                crate::engine::OutputMatcher::All,
+                &addr.r#ref,
+                // `|group` narrows a multi-output producer exactly as it does on
+                // a dep, so a value can be read from a target that also emits
+                // something else.
+                match &addr.output {
+                    Some(g) => crate::engine::OutputMatcher::Exact(vec![g.clone()]),
+                    None => crate::engine::OutputMatcher::All,
+                },
                 &crate::engine::ResultOptions::default(),
             )
             .await?;
@@ -696,7 +753,10 @@ mod tests {
             collect(&cfg(&[("role", s("${read://infra/aws:role-arn}"))]), &pkg()).expect("collect");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].path, "role");
-        assert_eq!(refs[0].producers[0].format(), "//infra/aws:role-arn");
+        assert_eq!(
+            refs[0].producers[0].addr.to_string(),
+            "//infra/aws:role-arn"
+        );
     }
 
     /// The shape a flat per-field schema could not describe, and the reason the
@@ -723,7 +783,7 @@ mod tests {
     #[test]
     fn a_relative_address_resolves_against_the_declaring_package() {
         let refs = collect(&cfg(&[("role", s("${read://auth:arn}"))]), &pkg()).expect("collect");
-        assert_eq!(refs[0].producers[0].format(), "//auth:arn");
+        assert_eq!(refs[0].producers[0].addr.to_string(), "//auth:arn");
     }
 
     #[test]
@@ -776,40 +836,89 @@ mod tests {
         assert!(refs.is_empty());
     }
 
-    /// A kind the design names but does not implement is **not** collected as a
-    /// reference — and is only *recognized* in the shape that names a target.
-    /// `${src:0:3}` and `${src::3}` are bash substring expansion, legal in a
-    /// `run` today, and heph claims neither.
+    /// The two kinds are two *cells*, and the dedup has to know that.
     ///
-    /// The "not yet" refusal lives one level up, in `deferred_refs`, where the
-    /// driver is known — because an author writing one *inside a driver that
-    /// takes references* plainly meant it to resolve.
+    /// `collect` sorts refs by their whole field text, so `"${read://a:b}"`
+    /// sorts before `"${src://a:b}"`. Deduping on the address alone therefore
+    /// kept the `read` edge and dropped the `src` one — the artifact was never
+    /// staged, `${src://a:b}` resolved to a path that did not exist, and which
+    /// of the two survived depended on the surrounding literal characters.
     #[test]
-    fn a_reserved_but_unimplemented_kind_is_recognized_but_not_collected() {
-        for kind in RESERVED_LATER {
-            let text = s(&format!("${{{kind}://a:b}}"));
-            let refs = collect(&cfg(&[("v", text.clone())]), &pkg()).expect("not a reference");
-            assert!(refs.is_empty(), "{kind}");
-            assert_eq!(
-                reserved_later(&text).as_deref(),
-                Some(format!("${{{kind}://a:b}}").as_str()),
-                "{kind}"
+    fn one_producer_named_by_both_kinds_gets_both_edges() {
+        let both = |a: &str, b: &str| {
+            let refs = collect(&cfg(&[("x", s(a)), ("y", s(b))]), &pkg()).expect("collect");
+            let mut inputs = inputs_for(&refs);
+            inputs.sort_by_key(|i| i.runtime);
+            assert_eq!(inputs.len(), 2, "{a} {b}");
+            assert!(!inputs[0].runtime, "read is not staged");
+            assert!(inputs[1].runtime, "src is staged");
+            assert!(inputs.iter().all(|i| i.hashed));
+            assert_ne!(inputs[0].origin_id, inputs[1].origin_id);
+            assert!(
+                inputs[1].annotations.contains_key(DEFERRED_SRC_ANNOTATION),
+                "src is excluded from the transitive merge"
             );
-        }
-        // …and the shell forms that share those names are untouched: only the
-        // shape that names a target is heph's.
-        for bash in ["${src:0:3}", "${src::3}", "${src::-1}", "${FOO:-default}"] {
-            assert!(reserved_later(&s(bash)).is_none(), "{bash}");
+            assert!(!inputs[0].annotations.contains_key(DEFERRED_SRC_ANNOTATION));
+        };
+        // Both sort orders, because the bug depended on which text sorted first.
+        both("${read://a:b}", "${src://a:b}");
+        both("z ${src://a:b}", "a ${read://a:b}");
+    }
+
+    /// A `${src:}` edge is `(hashed, staged)` and a `${read:}` edge is not.
+    #[test]
+    fn the_two_kinds_land_in_different_cells() {
+        let src = inputs_for(&collect(&cfg(&[("v", s("${src://a:b}"))]), &pkg()).expect("collect"));
+        assert_eq!(src.len(), 1);
+        assert!(src[0].hashed && src[0].runtime);
+
+        let read =
+            inputs_for(&collect(&cfg(&[("v", s("${read://a:b}"))]), &pkg()).expect("collect"));
+        assert_eq!(read.len(), 1);
+        assert!(read[0].hashed && !read[0].runtime);
+    }
+
+    /// `|group` narrows a multi-output producer, exactly as it does on a dep.
+    #[test]
+    fn a_reference_may_name_an_output_group() {
+        let refs = collect(&cfg(&[("v", s("${src://tools:cli|bin}"))]), &pkg()).expect("collect");
+        assert_eq!(refs[0].producers[0].addr.output.as_deref(), Some("bin"));
+        assert_eq!(refs[0].producers[0].addr.r#ref.format(), "//tools:cli");
+    }
+
+    /// Bash keeps every form it had: only an absolute address is heph's.
+    #[test]
+    fn a_shell_brace_form_is_not_collected() {
+        for bash in [
+            "${src:0:3}",
+            "${src::3}",
+            "${src::-1}",
+            "${FOO:-default}",
+            "${OUT}",
+        ] {
+            let refs = collect(&cfg(&[("run", s(bash))]), &pkg()).expect("collect");
+            assert!(refs.is_empty(), "{bash}");
         }
     }
 
+    /// An argument that *starts* like an address and then is not one is a typo,
+    /// and is loud. One that never looked like an address at all is somebody
+    /// else's syntax and is left alone — that is the whole claiming rule, and the
+    /// two halves are tested together because the boundary is the point.
     #[test]
-    fn a_reference_to_something_that_is_not_an_address_is_rejected_where_it_was_written() {
-        let err =
-            collect(&cfg(&[("role", s("${read:not an address}"))]), &pkg()).expect_err("must fail");
+    fn a_malformed_address_is_rejected_but_a_shell_form_is_not() {
+        let err = collect(&cfg(&[("role", s("${read://infra/role-arn}"))]), &pkg())
+            .expect_err("a claimed argument that will not parse");
         let msg = format!("{err:#}");
         assert!(msg.contains("not a target address"), "{msg}");
         assert!(msg.contains("`role`"), "must name the field: {msg}");
+
+        // Not claimed, so not heph's business — it reaches the tool verbatim,
+        // exactly as it did before this feature existed.
+        for untouched in ["${read:not an address}", "${read:infra:role-arn}"] {
+            let refs = collect(&cfg(&[("role", s(untouched))]), &pkg()).expect("left alone");
+            assert!(refs.is_empty(), "{untouched}");
+        }
     }
 
     /// The order of synthesized inputs must not depend on `HashMap` iteration

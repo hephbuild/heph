@@ -50,6 +50,23 @@ One thing changes with the shell, though: heph substitutes, it does not quote. I
 `exec` the value fills one argv element; in `bash` it is spliced into a shell
 program, and those bytes may have come from the shared remote cache.
 
+## Two kinds
+
+`${read://x:y}` is the producer's **contents**; `${src://x:y}` is the sandbox
+**path** of its artifact. `//deferred:version-bytes` uses the second — it needs a
+file to measure, not a value to paste, and it is `exec` so there is no shell to
+reach `$SRC_<GROUP>` with.
+
+```bash
+heph run //deferred:version-bytes     # 5 — "1.4.2", newline trimmed by the producer
+```
+
+Both are hashed edges. The difference is that `${src:}` stages the bytes, and
+that it deliberately does *not* import the producer's `transitive` environment
+the way a `deps` entry would: writing a path expression asks for a path. Either
+may name an output group — `${src://tools:cli|bin}` — for a producer that emits
+more than one file.
+
 ## What is refused
 
 Two commented-out targets at the bottom of the BUILD file. Uncomment either and

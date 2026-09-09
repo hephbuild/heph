@@ -350,6 +350,7 @@ mod shell_fallback_tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
+            deferred_pending: Vec::new(),
         };
 
         bridge.run_shell(req, &ctoken).await?;

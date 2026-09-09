@@ -67,14 +67,18 @@ const DOLLAR: &str = "$";
 /// fails exactly the way this mechanism exists to prevent: silently, as a
 /// literal.
 ///
-/// Deliberately just `read`. `src` and `env` are *designed* but not implemented,
-/// and reserving them now would be a break with no benefit: `${src:0:3}` is bash
-/// substring expansion on a variable named `src`, and `${env:FOO}` is a template
-/// syntax several tools use — both are legal in a `run` today and neither can be
-/// misread as something heph resolves, because heph resolves neither. When they
-/// ship, reserving them is a stated break in that release, and just as loud as
-/// this one. See [`RESERVED_LATER`].
-pub const DEFERRED_KINDS: &[&str] = &["read"];
+/// `read` is a producer's *contents*; `src` is the sandbox *path* of its
+/// artifact. There is deliberately no `env`: `${env:NAME}` is legal bash
+/// (`${var:offset}`) and a template form several tools use, and the value it
+/// would have carried composes from a `pass_env` producer plus `${read:}` with
+/// better provenance. See `docs/DEFERRED_VALUES.md`.
+pub const DEFERRED_KINDS: &[&str] = &[READ_KIND, SRC_KIND];
+
+/// The contents of a producer's single output.
+pub const READ_KIND: &str = "read";
+
+/// The sandbox path of a producer's artifact.
+pub const SRC_KIND: &str = "src";
 
 /// Whether a `${kind:arg}` whose kind heph owns is *this* `${…}`.
 ///
@@ -102,14 +106,6 @@ pub const DEFERRED_KINDS: &[&str] = &["read"];
 pub fn claims(kind: Option<&str>, arg: &str, kinds: &[&str]) -> bool {
     kind.is_some_and(|k| kinds.contains(&k)) && arg.starts_with("//")
 }
-
-/// Kinds the design names but does not yet implement.
-///
-/// Refused — with "not yet", not "unknown" — but **only inside a driver that
-/// accepts deferred values**, where an author writing one plainly meant it to
-/// resolve. In any other driver they are somebody else's syntax and are left
-/// alone.
-pub const RESERVED_LATER: &[&str] = &["src"];
 
 /// The first `${kind:…}` in `s` whose kind is in `kinds`.
 pub fn first_ref_of<'a>(s: &'a str, kinds: &[&str]) -> Option<Ref<'a>> {
@@ -416,13 +412,8 @@ mod tests {
             !has_deferred_ref("$${read://a:b}"),
             "an escaped one is text"
         );
-        // Designed, not implemented — flagged only in the shape that names a
-        // target, because the other shapes belong to the shell.
-        assert!(!has_deferred_ref("${src://a:b}"));
-        assert_eq!(
-            first_ref_of("${src://a:b}", RESERVED_LATER).map(|r| r.raw),
-            Some("${src://a:b}")
-        );
+        // `src` is live too, and only in the shape that names a target.
+        assert!(has_deferred_ref("${src://a:b}"));
         // Bash, every one of them, and heph claims none.
         for bash in [
             "${src:0:3}",
@@ -432,14 +423,12 @@ mod tests {
             "${src:+x}",
         ] {
             assert!(!has_deferred_ref(bash), "{bash}");
-            assert!(first_ref_of(bash, RESERVED_LATER).is_none(), "{bash}");
         }
         // `${env:NAME}` is not heph's syntax at all: it is legal bash
         // (`${env:offset}`) and a template form several tools use, and the value
         // it would have carried composes from a `pass_env` producer plus
         // `${read:}` — see docs/DEFERRED_VALUES.md.
         assert!(!has_deferred_ref("${env:NAME}"));
-        assert!(first_ref_of("${env:NAME}", RESERVED_LATER).is_none());
         // Somebody else's, always.
         assert!(!has_deferred_ref("${FOO:-default}"));
         assert!(!has_deferred_ref("${OUT}"));

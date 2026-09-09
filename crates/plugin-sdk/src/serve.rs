@@ -1287,6 +1287,9 @@ async fn run_once(
             .collect(),
         credentials,
         deferred: req.deferred.into_iter().collect(),
+        // Completed host-side before this request was serialized: a plugin
+        // reached over the ABI always sees a finished map.
+        deferred_pending: Vec::new(),
     };
     let mrr = ManagedRunRequest {
         request: rr,

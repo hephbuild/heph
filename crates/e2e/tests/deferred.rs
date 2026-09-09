@@ -155,6 +155,141 @@ async fn an_all_whitespace_output_is_empty_not_a_value() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// `${src://…}` — the path, not the contents
+// ---------------------------------------------------------------------------
+
+/// The other kind: the sandbox *path* of a producer's artifact, which is
+/// `$SRC_<GROUP>` finally available in an exec argv and without a `deps` entry.
+#[tokio::test]
+async fn a_src_reference_resolves_to_the_staged_path() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "infra",
+        r#"target(name = "cfg", driver = "bash", out = "cfg.json", cache = False,
+       run = ["printf '{\"a\":1}' > cfg.json"])"#,
+    );
+    // exec mode: no shell, so this is the case with no workaround at all.
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "exec", out = "o.txt", cache = False,
+       run = ["sh", "-c", "cat \"$1\" > o.txt", "sh", "${src://infra:cfg}"])"#,
+    );
+    assert_eq!(
+        common::artifact_string(&*ws.run("//app:a").await?),
+        "{\"a\":1}",
+        "the substituted path must name a file that is actually there"
+    );
+    Ok(())
+}
+
+/// `${src:}` and `$SRC_<GROUP>` are two spellings of one artifact, and they must
+/// agree — two answers on one machine would be a bug, and the FUSE sandbox
+/// redirects the root after the host has set it.
+#[tokio::test]
+async fn a_src_reference_and_the_dep_group_give_the_same_path() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "infra",
+        r#"target(name = "cfg", driver = "bash", out = "cfg.json", cache = False,
+       run = ["printf 'x' > cfg.json"])"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       deps = {"cfg": ["//infra:cfg"]},
+       run = ['test "$SRC_CFG" = "${src://infra:cfg}" && printf same > $OUT'])"#,
+    );
+    assert_eq!(common::artifact_string(&*ws.run("//app:a").await?), "same");
+    Ok(())
+}
+
+/// The third cell: staged like a `deps` edge, but the producer's `transitive`
+/// environment does **not** follow. Writing `${src://x:y}` asks for a path.
+#[tokio::test]
+async fn a_src_reference_does_not_import_the_producers_transitive_env() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "tools",
+        r#"target(name = "t", driver = "bash", out = "t.txt", cache = False,
+       transitive = {"env": {"FROM_TRANSITIVE": "leaked"}},
+       run = ["printf 'x' > t.txt"])"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       run = ['printf "[%s]" "${FROM_TRANSITIVE:-absent}" > $OUT',
+              'test -f "${src://tools:t}"'])"#,
+    );
+    assert_eq!(
+        common::artifact_string(&*ws.run("//app:a").await?),
+        "[absent]",
+        "a path is a path: the producer's environment must not follow it"
+    );
+    Ok(())
+}
+
+/// A producer emitting several files has no single path, and the error lists
+/// them rather than substituting whichever sorted first.
+#[tokio::test]
+async fn a_src_reference_to_a_multi_file_producer_names_the_files() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "tools",
+        r#"target(name = "t", driver = "bash", out = ["a.txt", "b.txt"], cache = False,
+       run = ["printf x > a.txt", "printf y > b.txt"])"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "exec", out = [], cache = False,
+       run = ["true", "${src://tools:t}"])"#,
+    );
+    let err = expect_err(ws.run("//app:a").await, "two files is not one path");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("a.txt"), "{msg}");
+    assert!(msg.contains("b.txt"), "{msg}");
+    assert!(msg.contains("|<group>"), "must say how to narrow it: {msg}");
+    Ok(())
+}
+
+/// …and `|group` is how you narrow one, exactly as on a dep.
+#[tokio::test]
+async fn a_src_reference_may_name_an_output_group() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "tools",
+        r#"target(name = "t", driver = "bash", cache = False,
+       out = {"bin": "cli", "doc": "cli.1"},
+       run = ["printf 'iam-cli' > cli", "printf 'manpage' > cli.1"])"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "exec", out = "o.txt", cache = False,
+       run = ["sh", "-c", "cat \"$1\" > o.txt", "sh", "${src://tools:t|bin}"])"#,
+    );
+    assert_eq!(
+        common::artifact_string(&*ws.run("//app:a").await?),
+        "iam-cli"
+    );
+    Ok(())
+}
+
+/// A credential has no sandbox, so `${src:}` in one can never resolve — refused
+/// at the declaration rather than left to produce nothing.
+#[tokio::test]
+async fn a_src_reference_in_a_credential_is_refused() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "auth",
+        r#"target(name = "t", driver = "credential",
+       sources = [heph.auth.env(["T"])],
+       present = {"env": {"T": "${src://infra:cfg}"}})"#,
+    );
+    let err = expect_err(ws.run("//auth:t").await, "a credential has no sandbox");
+    assert!(format!("{err:#}").contains("no sandbox"), "{err:#}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // The edge, and the two hashes
 // ---------------------------------------------------------------------------
 
@@ -417,7 +552,8 @@ async fn a_failing_producer_names_itself_and_shows_its_log() -> anyhow::Result<(
         .find(|i| i.r#ref.r#ref.format() == "//infra:v")
         .map(|i| i.origin_id.clone())
         .expect("the edge exists");
-    assert_eq!(origin, "option|run[1]", "{origin}");
+    // The kind is in the id, because one producer may be named by both.
+    assert_eq!(origin, "option|read|run[1]", "{origin}");
     Ok(())
 }
 

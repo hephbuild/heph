@@ -70,6 +70,25 @@ target(
     ],
 )
 
+# ── the other kind: a path, not the contents ─────────────────────────────────
+#
+# `${src://pkg:name}` is the sandbox path of a producer's artifact — `$SRC_<GROUP>`
+# finally available in an `exec` argv, and without a `deps` entry to keep in sync.
+#
+# It is a `deps`-shaped edge (hashed, staged) with one deliberate difference: the
+# producer's `transitive` env and tools do NOT follow. Writing a path expression
+# asks for a path. Take the artifact as an ordinary `deps` entry when you do want
+# the environment.
+target(
+    name = "version-bytes",
+    driver = "exec",
+    out = "len.txt",
+    run = [
+        "sh", "-c", "wc -c < \"$1\" | tr -d ' ' > len.txt",
+        "sh", "${src://deferred:version}",
+    ],
+)
+
 # ── what is refused, and why ─────────────────────────────────────────────────
 #
 # Uncomment either of these and heph will tell you where the value belongs.

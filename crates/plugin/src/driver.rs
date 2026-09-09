@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::Display;
 use std::path::PathBuf;
 
-#[derive(Default, Clone, Hash, Debug)]
+#[derive(Default, Clone, Hash, Debug, PartialEq, Eq)]
 pub struct TargetAddr {
     pub r#ref: Addr,
     pub output: Option<String>,
@@ -1125,6 +1125,30 @@ pub struct RunRequest<'a, 'io> {
     /// driver that reached in here would have to know that a field with no
     /// reference in it has no entry.
     pub deferred: std::collections::BTreeMap<String, String>,
+    /// Fields the host could not finish, because they name a `${src://…}` — the
+    /// sandbox *path* of an artifact, which only the layer that staged it knows.
+    ///
+    /// The managed-driver layer completes these into `deferred` before any driver
+    /// runs, so nothing downstream of it ever sees a partial map. Kept separate
+    /// from `deferred` rather than half-substituted into it, because that would
+    /// mean a second substitution pass over text that already contains a
+    /// producer's bytes — which is exactly the re-interpretation
+    /// [`hcore::template`] is single-pass to prevent.
+    pub deferred_pending: Vec<DeferredPending>,
+}
+
+/// A deferred field waiting on the sandbox, and everything needed to finish it.
+#[derive(Clone, Debug, Default)]
+pub struct DeferredPending {
+    /// The field's raw text — the key it will take in `deferred`.
+    pub raw: String,
+    /// `${read://…}` values the host already resolved, keyed by the address as
+    /// written. Carried alongside rather than substituted in, so the completing
+    /// pass runs once over the *author's* text.
+    pub reads: std::collections::BTreeMap<String, String>,
+    /// `${src://…}` producers this field names, keyed by address, valued by the
+    /// `origin_id` of the input that staged them.
+    pub srcs: std::collections::BTreeMap<String, String>,
 }
 
 impl<'a, 'io> RunRequest<'a, 'io> {
