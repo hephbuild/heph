@@ -12,17 +12,22 @@ use std::collections::HashMap;
 pub(crate) struct TargetSpec {
     /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.
     ///
-    /// In **exec** mode an element may carry a `${read://pkg:name}` reference —
-    /// the contents of that target's single output, resolved by the host before
-    /// the command runs. That is the one case with no workaround today: there is
-    /// no shell to expand `$SRC_<GROUP>` in, so a computed value could not reach
-    /// an `exec` argv at all.
+    /// An element may carry a `${read://pkg:name}` reference — the contents of
+    /// that target's single output, resolved by the host before the command
+    /// runs — in **both** modes.
     ///
-    /// In **bash** mode it may not, and the refusal is deliberate rather than an
-    /// omission: `${src:0:3}` is valid bash — substring expansion on a lowercase
-    /// variable named `src` — so accepting references here would create a
-    /// collision class that an escape rule could only document, not remove. Bash
-    /// already has `$SRC_<GROUP>`, which is the better tool there.
+    /// In exec mode it is the case with no workaround at all: there is no shell
+    /// to expand `$SRC_<GROUP>` in. In bash mode it coexists with the shell
+    /// because a reference names an *absolute address*: `${read://a:b}` is an
+    /// arithmetic error for a set `read` and the empty string for an unset one,
+    /// so nobody writes it on purpose, while every form bash actually uses —
+    /// `${src:0:3}`, `${src::3}`, `${FOO:-d}` — fails `template::claims` and is
+    /// reproduced byte for byte.
+    ///
+    /// heph substitutes; it does not quote. In bash the value is spliced into a
+    /// shell program rather than filling one argv element, so a producer whose
+    /// output is `1.2.3; rm -rf /` runs it — and those bytes may have come from
+    /// the shared remote cache. See `docs/DEFERRED_VALUES.md`.
     pub run: Vec<hplugin::driver::Deferred<String>>,
     /// Hashed + runtime dependencies, grouped by name → list of target addresses.
     pub deps: HashMap<String, Vec<String>>,

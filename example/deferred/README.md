@@ -39,11 +39,16 @@ works at parse, and evaluation never blocks on one. That last is the whole of Ni
 import-from-derivation problem, which nixpkgs forbids outright. What is here is IFD
 with the recursion cut off at one level.
 
-**`exec`, not `bash`.** There is no shell in the consumer, so `$(cat $SRC_CFG)` was
-never available — this is the case with no workaround today. Bash mode is
-deliberately *not* deferrable: `${src:0:3}` is valid bash (substring expansion on a
-lowercase variable named `src`), and removing the collision class beats documenting
-an escape for it. Bash already has `$SRC_<GROUP>`.
+**`exec` here, but `bash` works too.** The consumer below has no shell, so
+`$(cat $SRC_CFG)` was never available — that is the case with no workaround at
+all. Bash gets references as well, because heph claims a `${…}` only when its
+argument is an absolute address: `${src:0:3}` and `${FOO:-d}` are bash and stay
+bash, `${read://a:b}` is an arithmetic error or `""` in bash and so is nobody's,
+and `$$` is not `${` so `echo tmp.$$` still prints a PID.
+
+One thing changes with the shell, though: heph substitutes, it does not quote. In
+`exec` the value fills one argv element; in `bash` it is spliced into a shell
+program, and those bytes may have come from the shared remote cache.
 
 ## What is refused
 

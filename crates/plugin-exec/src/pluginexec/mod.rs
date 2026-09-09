@@ -312,9 +312,12 @@ impl Driver {
                 bash_args_public(sandbox_dir, run.join("\n").as_str(), vec![])
             },
             wrap_run_shell: bash_args_shell,
-            // `${src:0:3}` is bash substring expansion. Bash already has
-            // `$SRC_<GROUP>`; removing the collision class beats documenting it.
-            run_is_deferrable: false,
+            // A reference names an absolute address, and `${read://a:b}` is not
+            // a bash construct anyone writes on purpose — with `read` set it is
+            // an arithmetic error, and unset it is the empty string. The forms
+            // bash *does* use (`${src:0:3}`, `${src::3}`, `${FOO:-d}`) fail
+            // `template::claims` and are reproduced byte for byte.
+            run_is_deferrable: true,
         }
     }
 

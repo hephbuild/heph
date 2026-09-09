@@ -83,8 +83,8 @@ target(
 #
 # target(name = "no", driver = "bash", out = "${read://deferred:version}", run = "true")
 #
-# And `bash` mode's `run` is not deferrable at all: `${src:0:3}` is valid bash —
-# substring expansion on a lowercase variable named `src`. Removing the collision
-# class beats documenting an escape for it, and bash already has `$SRC_<GROUP>`.
+# `bash` mode takes references too — heph claims a `${...}` only when its argument
+# is an absolute address, so `${src:0:3}` stays bash and `$$` stays a PID:
 #
-# target(name = "nope", driver = "bash", out = [], run = "echo ${read://deferred:version}")
+# target(name = "also-ok", driver = "bash", out = "v.txt", cache = False,
+#        run = 'printf "%s" "${read://deferred:version}" > $OUT')

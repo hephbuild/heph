@@ -482,21 +482,50 @@ async fn a_reference_in_a_graph_shaping_field_is_rejected() -> anyhow::Result<()
     Ok(())
 }
 
-/// `bash` mode is not deferrable, and that is a removal of a collision class
-/// rather than an omission: `${src:0:3}` is valid bash — substring expansion on a
-/// lowercase variable named `src`. Bash already has `$SRC_<GROUP>`.
+/// `bash` mode is deferrable too, and the shell keeps every construct it had.
+///
+/// The discriminator is the argument, not the kind name: a reference names an
+/// absolute address. `${read://a:b}` is an arithmetic error for a set `read` and
+/// `""` for an unset one — nobody writes it on purpose — while `${src:0:3}`,
+/// `${src::3}` and `${FOO:-d}` are real bash and are reproduced byte for byte.
 #[tokio::test]
-async fn a_reference_in_a_bash_run_is_refused_with_the_reason() -> anyhow::Result<()> {
+async fn a_bash_run_resolves_a_reference_and_leaves_every_shell_form_alone() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
-        "app",
-        r#"target(name = "a", driver = "bash", out = [], cache = False,
-       run = ["echo ${read://infra:v}"])"#,
+        "infra",
+        r#"target(name = "v", driver = "bash", out = "value.txt", cache = False,
+       run = ["printf '1.4.2' > value.txt"])"#,
     );
-    let err = expect_err(ws.run("//app:a").await, "bash `run` is not deferrable");
-    let msg = format!("{err:#}");
-    assert!(msg.contains("does not accept one"), "{msg}");
-    assert!(msg.contains("bash"), "must name the driver: {msg}");
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       run = [
+         'src=abcdef',
+         'printf "[%s][%s][%s][%s]" "${read://infra:v}" "${src:0:3}" "${src::2}" "${NOPE:-d}" > $OUT',
+       ])"#,
+    );
+    assert_eq!(
+        common::artifact_string(&*ws.run("//app:a").await?),
+        "[1.4.2][abc][ab][d]"
+    );
+    Ok(())
+}
+
+/// And the PID idiom survives, because `$$` is not `${`.
+#[tokio::test]
+async fn a_bash_run_keeps_the_pid_idiom() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "infra",
+        r#"target(name = "v", driver = "bash", out = "value.txt", cache = False,
+       run = ["printf 'x' > value.txt"])"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       run = ['test -n "$$" && printf "[%s]" "${read://infra:v}" > $OUT'])"#,
+    );
+    assert_eq!(common::artifact_string(&*ws.run("//app:a").await?), "[x]");
     Ok(())
 }
 

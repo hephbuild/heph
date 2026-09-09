@@ -150,24 +150,46 @@ document heph itself writes and therefore owns the escape for; see
 one piece, and both are right — a field whose meaning changed depending on whether
 a reference happened to be elsewhere in it is the bug that split them.
 
-**A substituted value is not quoted.** `${read:…}` in an exec-mode `run` fills one
-argv element, and argv needs no quoting — that is most of why exec mode is the
-deferrable one. But nothing stops a producer's bytes from later reaching a shell:
-`sh -c 'echo ${read://infra:version}'` splices them into a shell program, and a
-producer emitting `; rm -rf /` runs it. The value comes from a target in your own
-repository, so this is the same trust boundary as any `run` line — but it is
-splicing, not passing, and it is worth knowing which one you wrote.
+**A substituted value is not quoted, and in bash that is a code boundary.** In an
+exec-mode `run` a reference fills one argv element, and argv needs no quoting. In
+a bash `run` — and in `sh -c "…"` written from exec mode — the bytes are *spliced
+into a shell program*, so a producer emitting `1.2.3; rm -rf /` runs it.
 
-**Reserved, and only where it matters.** `${src://…}` (the sandbox *path* of an
-artifact) and `${env:NAME}` are named by this design and not implemented. They are
-refused — with "not yet", not "unknown" — but **only inside a driver that accepts
-deferred values**, where an author writing one plainly meant it to resolve.
-Anywhere else they are somebody else's syntax and are left alone: `${src:0:3}` is
-bash substring expansion on a variable named `src`, and `${env:FOO}` is a template
-form several tools use. Both are legal in a `run` today, and neither can be
-misread as something heph resolves, because heph resolves neither. Reserving them
-outright would be a break with no benefit; when they ship, the reservation is a
-stated break in that release and just as loud as this one.
+Two things make that worth stating rather than assuming. The bytes come from a
+target in your own repository, which is the same trust boundary as any `run`
+line — but a producer's output may have been **pulled from the shared remote
+cache**, written by another machine, another user, another CI job. And splicing
+is not passing: `["docker", "push", "${read://infra:registry}/app"]` in exec mode
+passes one argument, while the same text in a bash `run` is shell source. heph
+substitutes; it does not quote.
+
+**A reference names an absolute address, and that is the whole discriminator.**
+The kind name alone is not enough, because the shells and tools whose syntax
+shares this shape are not going away — so `${read:X}` is heph's only when `X`
+starts with `//`.
+
+| written | what it is |
+|---|---|
+| `${read://infra:v}` | heph. In bash, a `src`-style expansion of an unset lowercase variable — an arithmetic error, or `""` |
+| `${src::3}` | bash: the first three characters of `$src` |
+| `${src:0:3}` | bash: the same, spelled with an explicit offset |
+| `${FOO:-default}` | bash: `$FOO`, or `default` |
+
+The `:name` and `./` relative forms an address elsewhere accepts are deliberately
+**not** claimed here: `${src::3}` is the exact text of a real bash idiom, and no
+diagnostic is worth taking it over. One predicate (`template::claims`) answers
+"is this heph's?" for the spec decoder, the engine walk and the substitution
+alike — two answers would be the silent misclassification this exists to prevent.
+
+**Reserved, and only where it matters.** `${src://…}` — the sandbox *path* of an
+artifact — is named by this design and not implemented. It is refused with "not
+yet" rather than "unknown", but **only inside a driver that accepts deferred
+values**, where an author writing one plainly meant it to resolve.
+
+**A `${` inside a `${…}` is refused.** `${FOO:-${read://a:b}}` closes on the
+inner `}`, so the outer form would tokenize as an unknown kind, be reproduced
+verbatim, and the inner reference would silently never resolve. `${VAR:-default}`
+is the commonest bash brace form there is, so this one is loud.
 
 ## The refusal
 
@@ -197,6 +219,44 @@ one. A **runner spec is never deferrable**, as a standing rule: a runner target'
 fingerprint is what moves every consumer's cache key when the environment moves,
 and deferring it would make the identity of every target in the workspace depend on
 a build output.
+
+## There is no `${env:NAME}`
+
+An earlier draft had one: a host environment variable, snapshotted at parse and
+hashed. It is not here, and the reason is worth writing down, because it will be
+proposed again.
+
+It fails on its own terms. `${env:NAME}` is *legal bash* — `${var:offset}`, where
+a bare identifier is a valid arithmetic expression — so in a `run` it silently
+means something else already. Getting the value into the def hash requires
+substituting it into the spec **before** `parse`, which is also before the shared
+decoder that refuses a reference in `out`, `deps`, `runner` and `name`; a value
+from the ambient environment could then decide graph shape, and `inspect spec`
+would no longer show what the author wrote. And it reaches a credential
+declaration, where an `Input` is `hashed: false` by design, so nothing would fold
+it into any key at all.
+
+Every one of those disappears if the value enters through a node, which costs one
+target and needs no new mechanism:
+
+```python
+target(
+    name     = "role",
+    driver   = "bash",
+    pass_env = ["AWS_ROLE_ARN"],
+    cache    = False,
+    out      = "role.txt",
+    run      = 'printf %s "$AWS_ROLE_ARN" > $OUT',
+)
+
+role = "${read://:role}"
+```
+
+That is strictly better than the reference would have been. `pass_env` hashes the
+variable's **name** as well as its value, so "why did this rebuild" has an
+answer; `cache = False` states the freshness choice out loud instead of implying
+it; `heph inspect deps` shows `//:role` as an edge; and the refusals above apply
+to it like any other producer.
 
 ## Config or credential
 
@@ -253,18 +313,26 @@ which is the shape the credentials design already uses for delegation.
 ## What ships, and what does not
 
 **Ships:** `${read://…}`, the host-side walk and edge append, resolution from the
-store, `RunRequest.deferred`, `Deferred<String>`, the `read` prefix reservation,
-the whole-driver schema gate. Two consumers: the credential driver's presentation
-templates, and the `exec` driver's `run` in **exec mode**.
+store, `RunRequest.deferred`, `Deferred<String>`, the `//`-address claiming rule,
+the whole-driver schema gate. Consumers: the credential driver's presentation
+templates, and the `exec` driver's `run` in **both exec and bash mode**.
 
-`bash` mode's `run` is deliberately **not** deferrable. `${src:0:3}` is valid bash
-— substring expansion on a lowercase variable named `src` — so accepting references
-there would create a collision class that an escape rule could only document, not
-remove. Bash already has `$SRC_<GROUP>`, which is the better tool there. Only
-exec-mode argv, which has no shell and no alternative, gains references.
+An earlier draft of this design excluded bash, on the grounds that `${src:0:3}`
+is valid bash and accepting references there would create a collision an escape
+rule could only document. The claiming rule removes the collision instead: heph
+takes a `${…}` only when its argument is an absolute address, and `${src:0:3}`,
+`${src::3}` and `${FOO:-d}` are not. `${read://a:b}` is meanwhile an arithmetic
+error for a set `read` and `""` for an unset one, so claiming it takes nothing
+from anybody. `$$` is untouched, because it is not `${` — `echo tmp.$$` still
+prints a PID.
 
-**Does not ship yet:** `${src://…}` and `${env:NAME}` (named, refused with "not
-yet" inside a driver that takes references, left alone everywhere else); `heph.core.read()` as a Starlark function, which is discoverability
+`$SRC_<GROUP>` is still there and is still the right tool for a *declared dep
+group*: it names a group, and its value is the space-joined list of that group's
+paths. `${read://x:y}` declares the edge inline and is a single value. They are
+different things that happen to overlap.
+
+**Does not ship yet:** `${src://…}` (named, refused with "not yet" inside a
+driver that takes references, left alone everywhere else); `heph.core.read()` as a Starlark function, which is discoverability
 rather than capability; `inspect deps` "via" lines and `inspect def --resolved`;
 and the OCI family's `build_args`, `dest`, `labels`, `cache_from` — which is where
 the largest number of genuinely deferrable fields live, and is the cheapest to add
