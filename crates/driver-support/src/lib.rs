@@ -5,6 +5,7 @@
 //! `ManagedDriver` don't link `fuser`/libfuse. The FUSE backend and the
 //! `ManagedDriverBridge` that routes between OS and FUSE live in
 //! `heph-driver-bridge`, which the engine wires via `Engine::new_managed_driver`.
+pub mod credential;
 pub mod driver_managed;
 pub mod driver_managed_os;
 pub mod scratch;

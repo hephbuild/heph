@@ -1250,6 +1250,18 @@ async fn run_once(
     let request_id = req.request_id;
     let hashin = req.hashin;
     let sandbox_dir = PathBuf::from(req.sandbox_dir);
+    // Fallible and never lossy: a credential dropped here would leave the target
+    // with no identity, which fails much later somewhere else — or succeeds
+    // against whatever ambient identity the host happened to have.
+    let credentials = match req
+        .credentials
+        .into_iter()
+        .map(convert::credential_mount_from_pb)
+        .collect::<anyhow::Result<Vec<_>>>()
+    {
+        Ok(c) => c,
+        Err(e) => return run_out_err(err_message(&e)),
+    };
     let run_inputs: Vec<RunInput> = req.inputs.iter().map(run_input_from_pb).collect();
     let managed_inputs: Vec<ManagedRunInput> =
         req.inputs.into_iter().map(managed_input_from_pb).collect();
@@ -1273,6 +1285,7 @@ async fn run_once(
             .into_iter()
             .filter_map(convert::scratch_mount_from_pb)
             .collect(),
+        credentials,
     };
     let mrr = ManagedRunRequest {
         request: rr,

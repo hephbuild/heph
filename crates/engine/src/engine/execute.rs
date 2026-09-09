@@ -28,6 +28,9 @@ impl Engine {
         exec_wrapper: Option<InteractiveWrapper>,
         shell: bool,
         no_scratch: bool,
+        // `outputs_are_material`: this target's outputs are credential material.
+        // The one thing it changes is the failure path — see the `Err` arm below.
+        outputs_are_material: bool,
     ) -> anyhow::Result<(
         Vec<OutputArtifact>,
         crate::engine::sandbox_cleaner::SandboxTeardown,
@@ -61,6 +64,27 @@ impl Engine {
             .acquire_scratch(&rs, addr, &resolved_scratch, no_scratch)
             .await
             .with_context(|| format!("acquire scratch for {addr}"))?;
+
+        // Credentials, after scratch and after every dep has resolved.
+        //
+        // The ordering is load-bearing in two directions. **After the cache
+        // decision**, because a cache hit never reaches `execute` at all — which
+        // is what makes "zero cost on a hit" structural rather than aspirational:
+        // a fully cached build probes nothing, spawns nothing and prompts nobody.
+        // And **strictly downstream of runner preparation**, because the devenv
+        // `wrap` runner captures its entire resolved environment into a
+        // `runner.json` that is a cached, remotely-shippable artifact; a runner
+        // capture must never see material.
+        //
+        // Resolution (which declaration does this reference name, and is the set
+        // coherent?) already happened at `get_def`. What happens here is the part
+        // that costs something: walking the chain, acquiring, and writing the
+        // presented files into this run's sandbox.
+        hcore::hmemoizer::set_phase("execute:credential_acquire");
+        let resolved_credentials = self
+            .resolve_credentials(&rs, addr, &def.target.inputs)
+            .await
+            .with_context(|| format!("resolve credentials for {addr}"))?;
 
         // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
         // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
@@ -165,6 +189,16 @@ impl Engine {
                         format!("remove stale sandbox dir {}", sandbox_dir.display())
                     })?;
 
+                    // Presented *inside* the sandbox claim, so the files land
+                    // under a directory this run owns and the teardown below
+                    // deletes them whatever the outcome — including the failure
+                    // path, which deliberately keeps the rest of the sandbox for
+                    // diagnostics. The log tail is what makes that useful, not
+                    // the token.
+                    let (credential_mounts, _credential_teardown) = self
+                        .acquire_and_present(&rs, addr, &sandbox_dir, &resolved_credentials)
+                        .await
+                        .with_context(|| format!("credentials for {addr}"))?;
                     let exec_wrapper: InteractiveWrapper = exec_wrapper.unwrap_or_else(|| {
                         Arc::new(|inner: InteractiveInner| {
                             Box::pin(async move { inner(None, None, None).await })
@@ -176,7 +210,7 @@ impl Engine {
                     let hashin = hashin.to_owned();
 
                     let inner: InteractiveInner = Box::new(enclose!(
-                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts)
+                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts, credential_mounts)
                         move |stdin, stdout, stderr| {
                             Box::pin(async move {
                                 let req = RunRequest {
@@ -190,6 +224,7 @@ impl Engine {
                                     stderr,
                                     sandbox_dir,
                                     scratch: scratch_mounts,
+                                    credentials: credential_mounts,
                                 };
                                 let res = if shell {
                                     driver.driver.run_shell(req, rs.ctoken()).await?
@@ -221,7 +256,15 @@ impl Engine {
                         // cleanup and a failing target reports an exit status
                         // with no output. The tree survives until this target's
                         // next run, whose `remove_stale` reclaims it.
-                        sandbox_teardown.leave_for_diagnostics();
+                        //
+                        // Unless the outputs are material, in which case the
+                        // diagnostic is not worth the secret it would leave on
+                        // disk.
+                        if outputs_are_material {
+                            sandbox_teardown.complete(addr.format());
+                        } else {
+                            sandbox_teardown.leave_for_diagnostics();
+                        }
                         return Err(err);
                     }
                 };

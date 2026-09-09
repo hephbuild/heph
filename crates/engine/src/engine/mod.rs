@@ -25,8 +25,12 @@ pub mod approval;
 pub mod diag;
 pub mod execrunner_host;
 pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest};
+pub mod credential;
+pub mod credential_store;
 mod cwd;
 mod result;
+pub use credential::{Acquired, CredentialTeardown, ResolvedCredential, WalkStep};
+pub use credential_store::{CredentialStore, Material};
 pub use cwd::get_cwp;
 // The plugin contract (driver/provider/error + targetdef/eresult/htspec) now
 // lives in the `heph-plugin` crate; re-export at the original engine paths so

@@ -1,4 +1,6 @@
 pub mod approval;
+pub mod auth;
+pub mod auth_helper;
 pub mod bootstrap;
 pub mod completion;
 pub mod errors;
@@ -84,6 +86,23 @@ pub enum Commands {
     ///
     /// Prints the heph version string and exits.
     Version(version::Args),
+    /// Sign in, and see which credentials are available here
+    ///
+    /// A credential is a target (`driver = "credential"`) declaring what identity
+    /// a build needs and how it may be obtained. This is the preflight over them:
+    /// which apply in this environment, from which source, and until when.
+    ///
+    /// A build never signs anyone in — it fails with the exact command to run,
+    /// and `heph auth login` is where a human runs it.
+    ///
+    /// Examples:
+    ///
+    /// `heph auth status` — one row per declared credential
+    ///
+    /// `heph auth explain //auth:aws` — why a chain picked what it picked
+    ///
+    /// `heph auth login` — run whichever sign-ins have gone stale
+    Auth(auth::AuthArgs),
     /// Developer tools
     ///
     /// Maintenance and housekeeping subcommands that operate on the workspace
@@ -102,6 +121,7 @@ impl Commands {
             Commands::Query(args) => query::execute(args, sink, global),
             Commands::Validate(args) => validate::execute(args, sink, global),
             Commands::Version(args) => version::execute(args),
+            Commands::Auth(args) => args.execute(sink, global),
             Commands::Tool(args) => args.execute(sink, global),
             Commands::GenDocs(args) => gendocs::execute(args),
         }

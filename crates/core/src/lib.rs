@@ -27,5 +27,6 @@ pub mod htplatform;
 pub mod htvalue;
 pub mod paths;
 pub mod shutdown;
+pub mod template;
 pub mod units;
 pub mod version;

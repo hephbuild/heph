@@ -3082,7 +3082,7 @@ impl Engine {
                     hcore::hmemoizer::set_phase("execute_cache:engine_execute");
                     let (artifacts, sandbox_teardown, sandbox_guards) = engine
                         .clone()
-                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch)
+                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false)
                         .await
                         .with_context(|| format!("execute {addr}"))?;
 
@@ -3696,6 +3696,15 @@ impl Engine {
         // Returns immediately for a target with no references, which is nearly
         // all of them.
         self.resolve_scratch(&rs, addr, &def.inputs).await?;
+
+        // Credential references: same seam, same reasoning. Resolving here means
+        // a reference to the wrong kind of target, or two credentials claiming
+        // one environment variable, is reported by `heph query` and
+        // `heph inspect def` — where the author is still looking at the BUILD
+        // file — rather than only when something eventually executes. It
+        // acquires nothing: the chain walk and the material live behind
+        // `execute`, which a cache hit never reaches.
+        self.resolve_credentials(&rs, addr, &def.inputs).await?;
 
         // Validate approval notices against the finalized input set at definition
         // time — before any result resolution or execution — so a notice naming a
