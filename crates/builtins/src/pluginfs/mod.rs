@@ -1535,6 +1535,7 @@ mod tests {
             sandbox_dir: root,
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         }
     }
 

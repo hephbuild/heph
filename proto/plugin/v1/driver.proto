@@ -119,6 +119,19 @@ message RunRequest {
   bool shell = 10;
   repeated ScratchMount scratch = 11;
   repeated CredentialMount credentials = 12;
+  // Deferred option values the host resolved for this run: the field's raw text
+  // (`"${read://infra/aws:role-arn}"`, or a template containing one) mapped to
+  // the fully substituted result.
+  //
+  // Keyed by the raw text rather than by a field path because that is the only
+  // thing both ends hold: a driver's `Deferred<T>` carries the text it decoded
+  // and knows nothing about where in the config it came from.
+  //
+  // Never part of any hash. The value's contribution to the cache key already
+  // happened, through the producer's `hashout` reaching `hashin` on the ordinary
+  // dependency path — the def hash covers the *unresolved* reference, which is
+  // what keeps `heph query` and `heph inspect def` from triggering a build.
+  map<string, string> deferred = 13;
 }
 
 // fuse_slot_guards and sandbox_cleanup are non-transferable host RAII,
@@ -164,6 +177,7 @@ message ManagedRunRequest {
   string driver = 10;
   repeated ScratchMount scratch = 11;
   repeated CredentialMount credentials = 12;
+  map<string, string> deferred = 13;
 }
 
 message ManagedRunResponse {

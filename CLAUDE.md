@@ -88,6 +88,20 @@ material and handles but never anything that *selects content*, is a
 **convention** the parser cannot check. A target whose output depends on which
 identity ran it is not cacheable and says so with `cache = False`.
 
+### Deferred values
+
+`docs/DEFERRED_VALUES.md`. `${read://pkg:name}` in a driver option is the contents
+of that target's single output, resolved by the host at run.
+
+Two things to know going in. The host does **all** of it — the walk over
+`TargetSpec.config`, the edge it appends after `parse`, the substitution — because
+the two obligations a driver could have had both fail silently; a driver's whole
+diff is `String` → `Deferred<String>`. And the def hash covers the *unresolved*
+reference while `hashin` covers the producer's content, so `heph query` never
+builds and the consumer's key derives from what the value was derived from.
+A reference is refused in anything that shapes the graph or identity, and a
+**runner spec is never deferrable**.
+
 ### Exec runners
 
 Every subprocess heph spawns goes through `crates/execrunner`, never

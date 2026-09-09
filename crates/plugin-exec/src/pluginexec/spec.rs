@@ -11,7 +11,24 @@ use std::collections::HashMap;
 #[derive(Spec)]
 pub(crate) struct TargetSpec {
     /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.
-    pub run: Vec<String>,
+    ///
+    /// An element may carry a `${read://pkg:name}` reference — the contents of
+    /// that target's single output, resolved by the host before the command
+    /// runs — in **both** modes.
+    ///
+    /// In exec mode it is the case with no workaround at all: there is no shell
+    /// to expand `$SRC_<GROUP>` in. In bash mode it coexists with the shell
+    /// because a reference names an *absolute address*: `${read://a:b}` is an
+    /// arithmetic error for a set `read` and the empty string for an unset one,
+    /// so nobody writes it on purpose, while every form bash actually uses —
+    /// `${src:0:3}`, `${src::3}`, `${FOO:-d}` — fails `template::claims` and is
+    /// reproduced byte for byte.
+    ///
+    /// heph substitutes; it does not quote. In bash the value is spliced into a
+    /// shell program rather than filling one argv element, so a producer whose
+    /// output is `1.2.3; rm -rf /` runs it — and those bytes may have come from
+    /// the shared remote cache. See `docs/DEFERRED_VALUES.md`.
+    pub run: Vec<hplugin::driver::Deferred<String>>,
     /// Hashed + runtime dependencies, grouped by name → list of target addresses.
     pub deps: HashMap<String, Vec<String>>,
     /// Dependencies that contribute to the input hash but are not materialized at runtime.

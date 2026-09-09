@@ -45,11 +45,20 @@ pub struct Driver {
     default_runner: Option<String>,
     wrap_run: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
     wrap_run_shell: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
+    /// Whether this driver's `run` may hold a deferred reference.
+    ///
+    /// False for bash — see [`TargetSpec::run`](spec::TargetSpec::run).
+    run_is_deferrable: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
 struct TargetDef {
-    pub run: Vec<String>,
+    /// The command, still holding any `${read://…}` an author wrote.
+    ///
+    /// Unresolved deliberately: a `TargetDef` must be a pure function of the
+    /// spec, so `heph query` and `heph inspect def` never trigger a build. The
+    /// value arrives at `run`, through `RunRequest::resolve`.
+    pub run: Vec<hplugin::driver::Deferred<String>>,
     /// Deps wired into SRC_*/LIST_* at runtime AND folded into the def hash
     /// (their structure invalidates cache when group membership changes).
     /// Built from `deps` and from transitive Deps with `hash=true, runtime=true`.
@@ -268,6 +277,9 @@ impl Driver {
                 };
                 bash_args_shell(sandbox_dir, &joined)
             },
+            // exec-mode argv has no shell, so a computed value has no other way
+            // in — and no `${src:0:3}` to collide with.
+            run_is_deferrable: true,
         }
     }
 
@@ -300,6 +312,12 @@ impl Driver {
                 bash_args_public(sandbox_dir, run.join("\n").as_str(), vec![])
             },
             wrap_run_shell: bash_args_shell,
+            // A reference names an absolute address, and `${read://a:b}` is not
+            // a bash construct anyone writes on purpose — with `read` set it is
+            // an arithmetic error, and unset it is the empty string. The forms
+            // bash *does* use (`${src:0:3}`, `${src::3}`, `${FOO:-d}`) fail
+            // `template::claims` and are reproduced byte for byte.
+            run_is_deferrable: true,
         }
     }
 
@@ -851,7 +869,15 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
     }
 
     fn schema(&self) -> hplugin::driver::DriverSchema {
-        spec::TargetSpec::schema()
+        hplugin::driver::DriverSchema {
+            // Per driver, not per spec: `exec` and `bash` share one spec type and
+            // disagree about exactly one field. `#[derive(Spec)]` reports `true`
+            // because `run` is a `Deferred`, and bash overrides it — which is
+            // also what makes the host refuse a reference before bash's own
+            // parse ever sees one.
+            accepts_deferred: self.run_is_deferrable,
+            ..spec::TargetSpec::schema()
+        }
     }
 
     async fn parse(
@@ -860,6 +886,16 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let spec = spec::TargetSpec::from(&req.target_spec.config)?;
+        // Belt and braces with the host's whole-driver gate: the host refuses a
+        // reference for a driver whose schema says no, and this catches the same
+        // mistake if a driver is ever constructed outside that path. Named at the
+        // element, because a multi-line bash `run` is otherwise a hunt.
+        if !self.run_is_deferrable {
+            for (i, r) in spec.run.iter().enumerate() {
+                hplugin::htspec::reject_deferred_reference(r.raw())
+                    .with_context(|| format!("`run[{i}]` of a `{}` target", self.name))?;
+            }
+        }
 
         let pkg = req.target_spec.addr.package.clone();
 
@@ -1326,11 +1362,19 @@ impl Driver {
         let rreq = req.request;
         let def = rreq.target.def::<TargetDef>();
 
+        // Resolved here, by the host's map, and nowhere else — a driver that
+        // forgot would run the command with the reference text as an argument.
+        // `resolve` takes `&RunRequest`, so forgetting is a compile error.
+        let resolved_run: Vec<String> = def
+            .run
+            .iter()
+            .map(|d| rreq.resolve(d).map(str::to_string))
+            .collect::<anyhow::Result<_>>()?;
         let run = {
             if shell {
-                (self.wrap_run_shell)(&rreq.sandbox_dir, &def.run)?
+                (self.wrap_run_shell)(&rreq.sandbox_dir, &resolved_run)?
             } else {
-                (self.wrap_run)(&rreq.sandbox_dir, &def.run)?
+                (self.wrap_run)(&rreq.sandbox_dir, &resolved_run)?
             }
         };
 
@@ -2096,6 +2140,9 @@ mod tests {
     use hcore::hasync::StdCancellationToken;
     use hdriver_support::driver_managed::ManagedDriver;
     use hmodel::htaddr::{Addr, parse_addr};
+    /// A `run` element, which is a `Deferred<String>` now that exec-mode argv can
+    /// carry a `${read://…}`. Aliased because the fixtures build a lot of them.
+    use hplugin::driver::Deferred as D;
     use hplugin::driver::RunRequest;
     use hplugin::driver::targetdef::CacheConfig;
 
@@ -2332,9 +2379,9 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 run: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "sleep 5 & echo boom >&2; exit 3".to_string(),
+                    D::new("sh".to_string()),
+                    D::new("-c".to_string()),
+                    D::new("sleep 5 & echo boom >&2; exit 3".to_string()),
                 ],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -2372,6 +2419,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         let res = tokio::time::timeout(
@@ -2662,7 +2710,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["echo".to_string(), "hello".to_string()],
+                run: vec![D::new("echo".to_string()), D::new("hello".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -2698,6 +2746,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         let _res = driver.run(make_req(req), &ctoken).await?;
@@ -2723,7 +2772,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["definitely-not-a-real-binary-xyz".to_string()],
+                run: vec![D::new("definitely-not-a-real-binary-xyz".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -2758,6 +2807,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         let res = driver.run(make_req(req), &ctoken).await;
@@ -2794,7 +2844,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["cat".to_string()],
+                run: vec![D::new("cat".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -2831,6 +2881,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         // Use a timeout to detect the hang
@@ -2856,7 +2907,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["cat".to_string()],
+                run: vec![D::new("cat".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -2894,6 +2945,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2929,7 +2981,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 // Ignore SIGINT and hang, forcing the grace → SIGKILL path.
-                run: vec!["trap '' INT; sleep 30".to_string()],
+                run: vec![D::new("trap '' INT; sleep 30".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -2964,6 +3016,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2997,7 +3050,9 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec![format!("head -c {payload_bytes} /dev/urandom | base64")],
+                run: vec![D::new(format!(
+                    "head -c {payload_bytes} /dev/urandom | base64"
+                ))],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -3033,6 +3088,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         let res = tokio::time::timeout(
@@ -3169,10 +3225,10 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec![
+                run: vec![D::new(
                     "echo out-first; echo err-first >&2; sleep 1; echo out-last; echo err-last >&2"
                         .to_string(),
-                ],
+                )],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -3211,6 +3267,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
@@ -3257,10 +3314,10 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec![
+                run: vec![D::new(
                     "echo a; sleep 0.3; echo b >&2; sleep 0.3; echo c; sleep 0.3; echo d >&2"
                         .to_string(),
-                ],
+                )],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -3294,6 +3351,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         driver.run(make_req(req), &ctoken).await?;
@@ -3331,9 +3389,9 @@ mod tests {
                 // wrapper runs under `pipefail`, and a producer killed by
                 // SIGPIPE when `head` exits would fail the target for
                 // reasons that have nothing to do with the drain.
-                run: vec![format!(
+                run: vec![D::new(format!(
                     "head -c {PER_STREAM} /dev/zero & head -c {PER_STREAM} /dev/zero >&2; wait"
-                )],
+                ))],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -3370,6 +3428,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         tokio::time::timeout(
@@ -3489,9 +3548,9 @@ mod tests {
                 // comment further down) — routing the proof-of-stdin through
                 // the same channel would make this assertion flaky for a
                 // reason unrelated to what this test checks.
-                run: vec![format!(
+                run: vec![D::new(format!(
                     "head -c {OUT_BYTES} /dev/zero; wc -c > stdin_byte_count.txt"
-                )],
+                ))],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -3528,6 +3587,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         tokio::time::timeout(
@@ -3594,7 +3654,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec![run_cmd.to_string()],
+                run: vec![D::new(run_cmd.to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -3628,6 +3688,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
@@ -3898,6 +3959,55 @@ mod tests {
             "a scratch reference must not change the def hash"
         );
         Ok(())
+    }
+
+    /// **The invariant that makes retyping `run` safe.**
+    ///
+    /// `run` went from `Vec<String>` to `Vec<Deferred<String>>`. If that moved the
+    /// def hash, every exec and bash target in every workspace would invalidate on
+    /// upgrade — and a mixed fleet (laptops on N−1, CI on N, one shared remote)
+    /// would double-populate the remote for the whole workspace.
+    ///
+    /// The digest is pinned to a constant rather than compared against a `String`
+    /// version, because the point is that it does not move *at all*: a comparison
+    /// against something that also changed would pass while both drifted. Update
+    /// this only alongside a deliberate `EXEC_DEF_FORMAT_VERSION` bump.
+    #[test]
+    fn the_def_hash_of_a_reference_free_run_is_pinned() {
+        use std::hash::{Hash as _, Hasher as _};
+        let def = TargetDef {
+            run: vec![D::new("sh".to_string()), D::new("-c".to_string())],
+            dep_group_inputs: BTreeMap::new(),
+            runtime_dep_group_inputs: BTreeMap::new(),
+            tool_group_inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            support_files: vec![],
+            env: BTreeMap::new(),
+            pass_env: BTreeMap::new(),
+            runtime_pass_env: vec![],
+            runtime_env: HashMap::new(),
+            runner: None,
+        };
+        let mut h = Xxh3Default::new();
+        def.hash(&mut h);
+        assert_eq!(
+            format!("{:016x}", h.finish()),
+            "7004d3d29737c598",
+            "retyping `run` must not move the def hash — see the doc comment"
+        );
+
+        // …and the reason it does not: `Vec<T>` hashes a length prefix then each
+        // element, and `Deferred<String>` hashes as the `String` it holds. The two
+        // together are what make the pinned digest above the pre-change one.
+        let mut a = Xxh3Default::new();
+        vec!["sh".to_string(), "-c".to_string()].hash(&mut a);
+        let mut b = Xxh3Default::new();
+        vec![
+            D::<String>::new("sh".to_string()),
+            D::<String>::new("-c".to_string()),
+        ]
+        .hash(&mut b);
+        assert_eq!(a.finish(), b.finish());
     }
 
     /// A repeated reference would mount one directory twice and set one variable
@@ -4602,7 +4712,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run,
+                run: run.into_iter().map(D::new).collect(),
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -4661,6 +4771,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
         driver
             .run(
@@ -4709,6 +4820,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
         driver
             .run(
@@ -4743,7 +4855,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["echo $PATH".to_string()],
+                run: vec![D::new("echo $PATH".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -4790,6 +4902,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
         driver
             .run(
@@ -4894,7 +5007,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["true".to_string()],
+                run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -4948,6 +5061,7 @@ mod tests {
             sandbox_dir: sandbox.clone(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         os.run_inner(req, &ctoken, false).await?;
@@ -5046,6 +5160,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
         driver
             .run(
@@ -5089,7 +5204,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["true".to_string()],
+                run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -5122,6 +5237,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
         driver.run(make_req(req), &ctoken).await?;
 
@@ -5157,7 +5273,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["true".to_string()],
+                run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -5210,6 +5326,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
         driver
             .run(
@@ -5258,7 +5375,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["true".to_string()],
+                run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -5314,6 +5431,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
         driver
             .run(
@@ -5345,7 +5463,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
-                run: vec!["true".to_string()],
+                run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -5405,6 +5523,7 @@ mod tests {
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         driver.run(make_req(req), &ctoken).await?;

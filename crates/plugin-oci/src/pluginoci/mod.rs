@@ -467,6 +467,7 @@ pub(crate) mod testfake {
                 sandbox_dir: sandbox.dir.path().to_path_buf(),
                 scratch: vec![],
                 credentials: vec![],
+                deferred: Default::default(),
             },
             sandbox_dir: sandbox.dir.path().to_path_buf(),
             sandbox_ws_dir: sandbox.ws.clone(),
