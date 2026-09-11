@@ -2420,7 +2420,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         let res = tokio::time::timeout(
@@ -2748,7 +2747,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         let _res = driver.run(make_req(req), &ctoken).await?;
@@ -2810,7 +2808,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         let res = driver.run(make_req(req), &ctoken).await;
@@ -2885,7 +2882,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         // Use a timeout to detect the hang
@@ -2950,7 +2946,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -3022,7 +3017,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -3095,7 +3089,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         let res = tokio::time::timeout(
@@ -3275,7 +3268,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
@@ -3360,7 +3352,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         driver.run(make_req(req), &ctoken).await?;
@@ -3438,7 +3429,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         tokio::time::timeout(
@@ -3598,7 +3588,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         tokio::time::timeout(
@@ -3700,7 +3689,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
@@ -4784,7 +4772,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
         driver
             .run(
@@ -4834,7 +4821,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
         driver
             .run(
@@ -4917,7 +4903,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
         driver
             .run(
@@ -5077,7 +5062,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         os.run_inner(req, &ctoken, false).await?;
@@ -5177,7 +5161,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
         driver
             .run(
@@ -5255,7 +5238,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
         driver.run(make_req(req), &ctoken).await?;
 
@@ -5345,7 +5327,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
         driver
             .run(
@@ -5451,7 +5432,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
         driver
             .run(
@@ -5544,7 +5524,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         };
 
         driver.run(make_req(req), &ctoken).await?;

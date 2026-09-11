@@ -8,8 +8,8 @@ use hplugin::driver::outputartifact::Content::TarPath;
 use hplugin::driver::outputartifact::ContentPath;
 use hplugin::driver::targetdef::path::{self, Content};
 use hplugin::driver::{
-    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, RunInput, RunRequest, outputartifact,
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, DeferredValue,
+    ParseRequest, ParseResponse, RunInput, RunRequest, outputartifact,
 };
 use hplugin::provider::TargetSpec;
 use std::collections::{BTreeMap, HashMap};
@@ -251,7 +251,6 @@ async fn run_shell_fallback<'a, 'io>(
         scratch,
         credentials,
         deferred,
-        deferred_pending,
     } = request;
 
     let mut synthetic = (*shell_fallback.spec_template).clone();
@@ -289,7 +288,6 @@ async fn run_shell_fallback<'a, 'io>(
         scratch,
         credentials,
         deferred,
-        deferred_pending,
     };
     let new_mreq = ManagedRunRequest {
         request: new_req,
@@ -311,21 +309,20 @@ fn complete_deferred(
     req: &mut RunRequest<'_, '_>,
     inputs: &[ManagedRunInput],
 ) -> anyhow::Result<()> {
-    if req.deferred_pending.is_empty() {
-        return Ok(());
-    }
-    let pending = std::mem::take(&mut req.deferred_pending);
-    for p in pending {
+    for (raw, slot) in req.deferred.iter_mut() {
+        let DeferredValue::NeedsSandbox { reads, srcs } = slot else {
+            continue;
+        };
         let value = hcore::template::substitute(
-            &p.raw,
+            raw,
             hcore::template::DEFERRED_KINDS,
             |r| -> anyhow::Result<String> {
                 // The host keyed both maps by the address exactly as the author
                 // wrote it, so no re-parse and no normalization happens here.
-                if let Some(v) = p.reads.get(r.arg) {
+                if let Some(v) = reads.get(r.arg) {
                     return Ok(v.clone());
                 }
-                let origin_id = p.srcs.get(r.arg).ok_or_else(|| {
+                let origin_id = srcs.get(r.arg).ok_or_else(|| {
                     anyhow::anyhow!(
                         "the host did not resolve `{}` — a deferred value is filled in before the \
                          command runs, so this is a bug in heph rather than in the BUILD file",
@@ -335,7 +332,7 @@ fn complete_deferred(
                 staged_path(inputs, origin_id, r.arg)
             },
         )?;
-        req.deferred.insert(p.raw, value);
+        *slot = DeferredValue::Ready(value);
     }
     Ok(())
 }

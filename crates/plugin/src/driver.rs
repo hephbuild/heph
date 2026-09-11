@@ -1119,36 +1119,42 @@ pub struct RunRequest<'a, 'io> {
     /// Credentials to present for this run, already acquired and materialized by
     /// the host. Empty for the overwhelming majority of targets.
     pub credentials: Vec<CredentialMount>,
-    /// Deferred option values the host resolved, keyed by the field's raw text.
+    /// Deferred option values, keyed by the field's raw text.
     ///
     /// Read through [`resolve`](RunRequest::resolve) rather than directly: a
     /// driver that reached in here would have to know that a field with no
-    /// reference in it has no entry.
-    pub deferred: std::collections::BTreeMap<String, String>,
-    /// Fields the host could not finish, because they name a `${src://…}` — the
-    /// sandbox *path* of an artifact, which only the layer that staged it knows.
-    ///
-    /// The managed-driver layer completes these into `deferred` before any driver
-    /// runs, so nothing downstream of it ever sees a partial map. Kept separate
-    /// from `deferred` rather than half-substituted into it, because that would
-    /// mean a second substitution pass over text that already contains a
-    /// producer's bytes — which is exactly the re-interpretation
-    /// [`hcore::template`] is single-pass to prevent.
-    pub deferred_pending: Vec<DeferredPending>,
+    /// reference in it has no entry, and that an entry may not be finished yet.
+    pub deferred: std::collections::BTreeMap<String, DeferredValue>,
 }
 
-/// A deferred field waiting on the sandbox, and everything needed to finish it.
-#[derive(Clone, Debug, Default)]
-pub struct DeferredPending {
-    /// The field's raw text — the key it will take in `deferred`.
-    pub raw: String,
-    /// `${read://…}` values the host already resolved, keyed by the address as
-    /// written. Carried alongside rather than substituted in, so the completing
-    /// pass runs once over the *author's* text.
-    pub reads: std::collections::BTreeMap<String, String>,
-    /// `${src://…}` producers this field names, keyed by address, valued by the
-    /// `origin_id` of the input that staged them.
-    pub srcs: std::collections::BTreeMap<String, String>,
+/// A deferred field, before or after the sandbox exists.
+///
+/// Two states rather than two fields, because "not finished" has to be
+/// *representable* to be reportable: a separate pending list would be absent
+/// from this map, and an unfinished field would then look exactly like a field
+/// that was never deferred.
+#[derive(Clone, Debug)]
+pub enum DeferredValue {
+    /// Substituted by the host, ready to read.
+    Ready(String),
+    /// Names a `${src://…}` — the sandbox *path* of an artifact, which only the
+    /// layer that staged it knows. Completed into [`Ready`](Self::Ready) by the
+    /// managed-driver layer, host-side, before any driver sees the request; it
+    /// is therefore the one variant that never crosses the plugin ABI.
+    ///
+    /// The pieces are carried alongside the author's text rather than
+    /// substituted into it, so the completing pass runs **once** over what the
+    /// author wrote. Half-substituting here and finishing later would re-scan
+    /// text that already contains a producer's bytes — the re-interpretation
+    /// [`hcore::template`] is single-pass to prevent.
+    NeedsSandbox {
+        /// `${read://…}` values the host already resolved, keyed by the address
+        /// as written.
+        reads: std::collections::BTreeMap<String, String>,
+        /// `${src://…}` producers this field names, keyed by the address as
+        /// written, valued by the `origin_id` of the input that staged them.
+        srcs: std::collections::BTreeMap<String, String>,
+    },
 }
 
 impl<'a, 'io> RunRequest<'a, 'io> {
@@ -1160,8 +1166,18 @@ impl<'a, 'io> RunRequest<'a, 'io> {
     /// A field with no reference in it resolves to its own text, so a driver never
     /// branches on whether the author used one.
     pub fn resolve<'r, 'd: 'r>(&'r self, d: &'d Deferred<String>) -> anyhow::Result<&'r str> {
-        if let Some(v) = self.deferred.get(d.raw()) {
-            return Ok(v);
+        match self.deferred.get(d.raw()) {
+            Some(DeferredValue::Ready(v)) => return Ok(v),
+            // Only reachable if a request skipped the managed-driver layer that
+            // completes these. Distinguishable from "never deferred" precisely
+            // because the entry is here, which is why the two states share a map.
+            Some(DeferredValue::NeedsSandbox { .. }) => anyhow::bail!(
+                "{:?} names a `${{src://…}}` that was never completed — the sandbox path is \
+                 filled in after an artifact is staged and before any driver runs, so this is a \
+                 bug in heph rather than in the BUILD file",
+                d.raw()
+            ),
+            None => {}
         }
         // The host walks the whole config, so a reference it did not resolve is a
         // host bug rather than an author's — say so, instead of handing the
@@ -1180,6 +1196,110 @@ impl<'a, 'io> RunRequest<'a, 'io> {
         Ok(d.raw())
     }
 }
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn req<'a>(
+        id: &'a String,
+        target: &'a targetdef::TargetDef,
+        deferred: BTreeMap<String, DeferredValue>,
+    ) -> RunRequest<'a, 'static> {
+        RunRequest {
+            request_id: id,
+            target,
+            tree_root_path: Default::default(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: Default::default(),
+            scratch: vec![],
+            credentials: vec![],
+            deferred,
+        }
+    }
+
+    fn target() -> targetdef::TargetDef {
+        targetdef::TargetDef {
+            addr: Default::default(),
+            labels: vec![],
+            raw_def: std::sync::Arc::new(()),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: targetdef::CacheConfig::on(false),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        }
+    }
+
+    /// The three states a driver can be handed, and only one of them is a value.
+    #[test]
+    fn resolve_distinguishes_ready_from_unfinished_from_never_deferred() {
+        let (id, t) = ("r".to_string(), target());
+
+        // Finished: the value, not the reference text.
+        let r = req(
+            &id,
+            &t,
+            BTreeMap::from([(
+                "${read://a:b}".to_string(),
+                DeferredValue::Ready("1.4.2".to_string()),
+            )]),
+        );
+        assert_eq!(
+            r.resolve(&Deferred::new("${read://a:b}")).expect("ready"),
+            "1.4.2"
+        );
+
+        // A field with no reference resolves to its own text, so a driver never
+        // branches on whether the author used one.
+        assert_eq!(
+            r.resolve(&Deferred::new("echo hi")).expect("literal"),
+            "echo hi"
+        );
+        // …including one carrying a construct heph does not own.
+        assert_eq!(
+            r.resolve(&Deferred::new("${FOO:-d}")).expect("not ours"),
+            "${FOO:-d}"
+        );
+
+        // Present but unfinished: reported against the host, never handed over
+        // as if the reference text were a value. This is the state a separate
+        // pending list could not express — it would simply be absent, and an
+        // unfinished field would look exactly like a literal.
+        let stuck = req(
+            &id,
+            &t,
+            BTreeMap::from([(
+                "${src://a:b}".to_string(),
+                DeferredValue::NeedsSandbox {
+                    reads: Default::default(),
+                    srcs: Default::default(),
+                },
+            )]),
+        );
+        let err = stuck
+            .resolve(&Deferred::new("${src://a:b}"))
+            .expect_err("must not be swallowed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("never completed"), "{msg}");
+        assert!(msg.contains("bug in heph"), "blames the host: {msg}");
+
+        // Absent entirely, but the text does name a reference: also the host's
+        // fault, and also loud.
+        let missing = req(&id, &t, BTreeMap::new());
+        let err = missing
+            .resolve(&Deferred::new("${read://a:b}"))
+            .expect_err("must not be swallowed");
+        assert!(format!("{err:#}").contains("did not resolve"), "{err:#}");
+    }
+}
+
 /// Cleanup closure a driver returns for the engine to run after `cache_locally`.
 /// The FUSE/OS sandbox layers each supply their own teardown; the engine's
 /// `sandbox_cleaner` enqueues it. Defined here (the contract) because

@@ -1286,10 +1286,15 @@ async fn run_once(
             .filter_map(convert::scratch_mount_from_pb)
             .collect(),
         credentials,
-        deferred: req.deferred.into_iter().collect(),
-        // Completed host-side before this request was serialized: a plugin
-        // reached over the ABI always sees a finished map.
-        deferred_pending: Vec::new(),
+        // The wire carries finished values and nothing else: a `NeedsSandbox`
+        // is completed host-side before serialization, and `load_stable` refuses
+        // to serialize one that is not. So every entry arriving here is `Ready`
+        // by construction rather than by assumption.
+        deferred: req
+            .deferred
+            .into_iter()
+            .map(|(k, v)| (k, hplugin::driver::DeferredValue::Ready(v)))
+            .collect(),
     };
     let mrr = ManagedRunRequest {
         request: rr,

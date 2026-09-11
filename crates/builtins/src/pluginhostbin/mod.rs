@@ -328,7 +328,6 @@ mod tests {
             scratch: vec![],
             credentials: vec![],
             deferred: Default::default(),
-            deferred_pending: Vec::new(),
         }
     }
 

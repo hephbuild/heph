@@ -468,7 +468,6 @@ pub(crate) mod testfake {
                 scratch: vec![],
                 credentials: vec![],
                 deferred: Default::default(),
-                deferred_pending: Vec::new(),
             },
             sandbox_dir: sandbox.dir.path().to_path_buf(),
             sandbox_ws_dir: sandbox.ws.clone(),

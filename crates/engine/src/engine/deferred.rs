@@ -64,7 +64,7 @@
 
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
-use crate::engine::driver::{DeferredPending, TargetAddr};
+use crate::engine::driver::{DeferredValue, TargetAddr};
 use crate::engine::request_state::RequestState;
 use anyhow::Context as _;
 use hcore::htvalue::Value;
@@ -396,13 +396,12 @@ impl Engine {
         rs: &Arc<RequestState>,
         def: &TargetDef,
         refs: &[DeferredRef],
-    ) -> anyhow::Result<(BTreeMap<String, String>, Vec<DeferredPending>)> {
+    ) -> anyhow::Result<BTreeMap<String, DeferredValue>> {
         if refs.is_empty() {
-            return Ok((BTreeMap::new(), Vec::new()));
+            return Ok(BTreeMap::new());
         }
         let by_addr = self.deferred_values(rs, refs, &def.addr).await?;
-        let mut values: BTreeMap<String, String> = BTreeMap::new();
-        let mut pending: Vec<DeferredPending> = Vec::new();
+        let mut values: BTreeMap<String, DeferredValue> = BTreeMap::new();
         for r in refs {
             // A field naming a `${src://…}` cannot be finished here: the path
             // exists only once the artifact is staged, and under FUSE the
@@ -413,25 +412,27 @@ impl Engine {
             // which is the re-interpretation `hcore::template` is single-pass to
             // prevent.
             if r.needs_sandbox() {
-                pending.push(DeferredPending {
-                    raw: r.raw.clone(),
-                    reads: r
-                        .producers
-                        .iter()
-                        .filter(|p| p.kind == READ)
-                        .filter_map(|p| {
-                            by_addr
-                                .get(&p.addr.to_string())
-                                .map(|v| (p.addr.to_string(), v.clone()))
-                        })
-                        .collect(),
-                    srcs: r
-                        .producers
-                        .iter()
-                        .filter(|p| p.kind == SRC)
-                        .map(|p| (p.addr.to_string(), origin_id_for(r, p, None)))
-                        .collect(),
-                });
+                values.insert(
+                    r.raw.clone(),
+                    DeferredValue::NeedsSandbox {
+                        reads: r
+                            .producers
+                            .iter()
+                            .filter(|p| p.kind == READ)
+                            .filter_map(|p| {
+                                by_addr
+                                    .get(&p.addr.to_string())
+                                    .map(|v| (p.addr.to_string(), v.clone()))
+                            })
+                            .collect(),
+                        srcs: r
+                            .producers
+                            .iter()
+                            .filter(|p| p.kind == SRC)
+                            .map(|p| (p.addr.to_string(), origin_id_for(r, p, None)))
+                            .collect(),
+                    },
+                );
                 continue;
             }
             // `substitute`, not `render`: a driver option is somebody else's text.
@@ -449,9 +450,9 @@ impl Engine {
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("no value for {addr}"))
             })?;
-            values.insert(r.raw.clone(), rendered);
+            values.insert(r.raw.clone(), DeferredValue::Ready(rendered));
         }
-        Ok((values, pending))
+        Ok(values)
     }
 
     /// Every producer named by `refs`, resolved to its value, keyed by address.
