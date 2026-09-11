@@ -4,13 +4,13 @@ Run it:
 
 ```bash
 heph run //deferred:image
-heph inspect hashin //deferred:image     # note the hash
+heph inspect hashin //deferred:image     # bda27f9cec08eb6f
 
 echo "anything" >> deferred/notes
 heph inspect hashin //deferred:image     # unchanged — the producer re-ran, the value did not move
 
 echo "1.5.0" > deferred/version
-heph inspect hashin //deferred:image     # moved
+heph inspect hashin //deferred:image     # 793e79ba462c87de — moved
 ```
 
 ## What to read for
@@ -39,27 +39,30 @@ works at parse, and evaluation never blocks on one. That last is the whole of Ni
 import-from-derivation problem, which nixpkgs forbids outright. What is here is IFD
 with the recursion cut off at one level.
 
-**`exec` here, but `bash` works too.** The consumer below has no shell, so
-`$(cat $SRC_CFG)` was never available — that is the case with no workaround at
-all. Bash gets references as well, because heph claims a `${…}` only when its
-argument is an absolute address: `${src:0:3}` and `${FOO:-d}` are bash and stay
-bash, `${read://a:b}` is an arithmetic error or `""` in bash and so is nobody's,
-and `$$` is not `${` so `echo tmp.$$` still prints a PID.
+**Both modes take a reference, and the discriminator is the argument.** heph
+claims a `${…}` only when what follows the kind is an absolute address — so
+`${src:0:3}` and `${FOO:-d}` stay bash, `${read://a:b}` is an arithmetic error or
+`""` in bash and therefore nobody's, and `$$` is not `${`, so `echo tmp.$$` still
+prints a PID.
 
-One thing changes with the shell, though: heph substitutes, it does not quote. In
-`exec` the value fills one argv element; in `bash` it is spliced into a shell
-program, and those bytes may have come from the shared remote cache.
+What *does* change with the shell: heph substitutes, it does not quote.
+`//deferred:image` is `bash` and splices the value into a shell program;
+`//deferred:version-copy` is `exec` and hands a path to `cp` as one argv element,
+where nothing parses it. The two targets are there to show that difference.
 
 ## Two kinds
 
 `${read://x:y}` is the producer's **contents**; `${src://x:y}` is the sandbox
-**path** of its artifact. `//deferred:version-bytes` uses the second — it needs a
-file to measure, not a value to paste, and it is `exec` so there is no shell to
-reach `$SRC_<GROUP>` with.
+**path** of its artifact. `//deferred:version-copy` uses the second — `cp` wants
+a file to copy, not a value to paste:
 
 ```bash
-heph run //deferred:version-bytes     # 5 — "1.4.2", newline trimmed by the producer
+heph run //deferred:version-copy
 ```
+
+That target is the case `$SRC_<GROUP>` could never serve. Expanding `$SRC_<GROUP>`
+needs a shell; an `exec` target has none, so before this there was no way to put a
+dep's path into its argv at all.
 
 Both are hashed edges. The difference is that `${src:}` stages the bytes, and
 that it deliberately does *not* import the producer's `transitive` environment
@@ -78,17 +81,10 @@ in every driver at once, because the reservation lives in the shared string deco
 rather than in a per-field flag.
 
 An unknown `${…}` kind is left alone, so `${FOO:-default}` and every other shell
-construct still works in a deferrable field. `${src://…}` and `${env:NAME}` are
-named by the design and not implemented, and say "not yet" rather than being read
-as literals — but only *inside a driver that takes references*, where an author
-writing one plainly meant it to resolve. Anywhere else they are somebody else's
-syntax and are left alone, because `${src:0:3}` is bash and `${env:FOO}` is a
-form several tools use.
-
-And heph substitutes; it does not quote. Filling an argv element needs no
-quoting, which is most of why exec mode is the deferrable one — but the consumer
-here hands that element to `sh -c`, so the bytes are spliced into a shell program
-rather than passed to one. See the note in the BUILD file.
+construct still works in a deferrable field. There is deliberately no
+`${env:NAME}`: it is legal bash (`${var:offset}`), and the value it would have
+carried composes from a `pass_env` producer plus `${read:}` — which keeps the
+variable's *name* in the cache key and gives `inspect deps` something to say.
 
 See `docs/DEFERRED_VALUES.md` for the mechanism, the two hashes, and the
 config-or-credential test that decides which of these two features a value belongs

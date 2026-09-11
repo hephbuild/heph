@@ -357,11 +357,12 @@ group*: it names a group, and its value is the space-joined list of that group's
 paths. `${read://x:y}` declares the edge inline and is a single value. They are
 different things that happen to overlap.
 
-**Does not ship yet:** `heph.core.read()` as a Starlark function, which is discoverability
-rather than capability; `inspect deps` "via" lines and `inspect def --resolved`;
-and the OCI family's `build_args`, `dest`, `labels`, `cache_from` — which is where
-the largest number of genuinely deferrable fields live, and is the cheapest to add
-because none of them sits in a `Hash` impl shared with a hot path.
+**Does not ship yet:** `heph.core.read()` as a Starlark function, which is
+discoverability rather than capability; `inspect deps` "via" lines and
+`inspect def --resolved`; and the OCI family's `build_args`, `dest`, `labels`,
+`cache_from` — which is where the largest number of genuinely deferrable fields
+live, and is the cheapest to add because none of them sits in a `Hash` impl
+shared with a hot path.
 
 ## ABI
 
