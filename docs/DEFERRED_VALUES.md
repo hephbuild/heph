@@ -130,9 +130,30 @@ there is nothing to remember there either.
 
 ## Grammar
 
-| Form | Resolves to | Edge |
-|---|---|---|
-| `${read://pkg:name}` | contents of the producer's single output, surrounding whitespace trimmed | `(hashed, not staged)` |
+| Form | Resolves to | Edge | Transitives |
+|---|---|---|---|
+| `${read://pkg:name}` | contents of the producer's single output, surrounding whitespace trimmed | `(hashed, not staged)` | no |
+| `${src://pkg:name}` | the sandbox path of the producer's single file | `(hashed, staged)` | **no** |
+
+Either may name an output group — `${src://tools:cli\|bin}` — exactly as a dep
+does, which is how you narrow a producer that emits more than one file.
+
+`${src:}` is `$SRC_<GROUP>` finally available in an `exec` argv, and without a
+`deps` entry to keep in sync. The difference from `$SRC_<GROUP>` is worth
+knowing: that names a *group* and its value is the group's space-joined paths;
+`${src://x:y}` declares the edge inline and is a single path.
+
+**`${src:}` is a third cell, and that is deliberate.** `(hashed, staged)` is the
+`deps` cell, and an edge there is also merged by `collect_transitive_deps` — the
+producer's `transitive` tools, deps and env would follow into the consumer, and
+`apply_transitive` folds those env *values* into the consumer's def hash by
+reading `std::env::var`. So `${src://tools:go}` on a producer declaring
+`transitive = {"env": {"GOFLAGS": pass}}` would move the consumer's cache key
+with the host's `GOFLAGS` — for a target that only wanted a filename. Writing a
+path expression asks for a path, so the edge carries an annotation that excludes
+it from the merge. Take the artifact as an ordinary `deps` entry when you do want
+the environment.
+
 
 An **unknown kind is left untouched**, so `${FOO:-default}`, `${OUT}` and every
 other shell construct survives being written in a deferrable field.
@@ -180,11 +201,6 @@ The `:name` and `./` relative forms an address elsewhere accepts are deliberatel
 diagnostic is worth taking it over. One predicate (`template::claims`) answers
 "is this heph's?" for the spec decoder, the engine walk and the substitution
 alike — two answers would be the silent misclassification this exists to prevent.
-
-**Reserved, and only where it matters.** `${src://…}` — the sandbox *path* of an
-artifact — is named by this design and not implemented. It is refused with "not
-yet" rather than "unknown", but **only inside a driver that accepts deferred
-values**, where an author writing one plainly meant it to resolve.
 
 **A `${` inside a `${…}` is refused.** `${FOO:-${read://a:b}}` closes on the
 inner `}`, so the outer form would tokenize as an unknown kind, be reproduced
@@ -307,6 +323,9 @@ which is the shape the credentials design already uses for delegation.
 | the output is zero bytes | fail. A silently-empty ARN is worse than a stopped build |
 | the output has more than one line | fail; do not take the first line |
 | the producer emits several files | fail, listing them, pointing at `\|<group>` |
+| a `${src:}` producer emits several files | fail, listing them, pointing at `\|<group>` — checked against the staged file list, so the message is what is actually there |
+| a `${src:}` producer emits nothing | fail; there is no path to substitute |
+| a `${src:}` in a credential declaration | fail at parse: a credential has no sandbox |
 | a reference in a field that does not accept one | fail at parse, in every driver at once |
 | the driver's plugin predates this feature | fail at parse, naming the driver |
 
@@ -314,8 +333,15 @@ which is the shape the credentials design already uses for delegation.
 
 **Ships:** `${read://…}`, the host-side walk and edge append, resolution from the
 store, `RunRequest.deferred`, `Deferred<String>`, the `//`-address claiming rule,
-the whole-driver schema gate. Consumers: the credential driver's presentation
-templates, and the `exec` driver's `run` in **both exec and bash mode**.
+the whole-driver schema gate — and `${src://…}`, whose path is filled in by the
+managed-driver layer, the only place that knows where an artifact landed (under
+FUSE the sandbox root is redirected after the host has set it). Consumers: the
+credential driver's presentation templates, and the `exec` driver's `run` in
+**both exec and bash mode**.
+
+`${src:}` is refused in a credential declaration: a credential is a document the
+host reads, not a target that runs, so there is no sandbox for a path to point
+into.
 
 An earlier draft of this design excluded bash, on the grounds that `${src:0:3}`
 is valid bash and accepting references there would create a collision an escape
@@ -331,12 +357,12 @@ group*: it names a group, and its value is the space-joined list of that group's
 paths. `${read://x:y}` declares the edge inline and is a single value. They are
 different things that happen to overlap.
 
-**Does not ship yet:** `${src://…}` (named, refused with "not yet" inside a
-driver that takes references, left alone everywhere else); `heph.core.read()` as a Starlark function, which is discoverability
-rather than capability; `inspect deps` "via" lines and `inspect def --resolved`;
-and the OCI family's `build_args`, `dest`, `labels`, `cache_from` — which is where
-the largest number of genuinely deferrable fields live, and is the cheapest to add
-because none of them sits in a `Hash` impl shared with a hot path.
+**Does not ship yet:** `heph.core.read()` as a Starlark function, which is
+discoverability rather than capability; `inspect deps` "via" lines and
+`inspect def --resolved`; and the OCI family's `build_args`, `dest`, `labels`,
+`cache_from` — which is where the largest number of genuinely deferrable fields
+live, and is the cheapest to add because none of them sits in a `Hash` impl
+shared with a hot path.
 
 ## ABI
 

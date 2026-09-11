@@ -728,6 +728,34 @@ pub fn scratch_mount_from_pb(m: pb::ScratchMount) -> Option<hplugin::driver::Scr
 
 /// Credential mounts, host -> plugin.
 ///
+/// The deferred map, as the wire can carry it.
+///
+/// Only a finished value may cross. A `NeedsSandbox` is completed by the
+/// managed-driver layer — host-side, a few frames above the transport — and it
+/// has to stay there: `driver-support` is statically linked into every plugin
+/// cdylib, so a plugin built against an older copy would complete nothing and
+/// would run the command with `${src://x:y}` as a literal argv element.
+///
+/// So an unfinished entry reaching here is a bug, and it **fails** rather than
+/// being dropped. Dropping it would leave the driver with a missing key, which
+/// `RunRequest::resolve` would report against the *author's* field rather than
+/// against the host that skipped a step.
+pub fn deferred_to_pb(
+    deferred: &std::collections::BTreeMap<String, hplugin::driver::DeferredValue>,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    deferred
+        .iter()
+        .map(|(k, v)| match v {
+            hplugin::driver::DeferredValue::Ready(value) => Ok((k.clone(), value.clone())),
+            hplugin::driver::DeferredValue::NeedsSandbox { .. } => anyhow::bail!(
+                "deferred field {k:?} still needs a sandbox path at the plugin ABI — the \
+                 managed-driver layer fills those in before a request is serialized, so this is \
+                 a bug in heph rather than in the BUILD file"
+            ),
+        })
+        .collect()
+}
+
 /// One-way like a scratch mount, and for a sharper reason: nothing about an
 /// identity travels back, because a driver is never told which one it got.
 pub fn credential_mount_to_pb(m: &hplugin::driver::CredentialMount) -> pb::CredentialMount {
@@ -919,6 +947,34 @@ pub fn raw_def_from_blob(blob: &pb::RawDefBlob) -> anyhow::Result<Arc<dyn RawDef
 
 #[cfg(test)]
 mod tests {
+
+    /// A value that still needs the sandbox must not reach a plugin — and must
+    /// not be silently dropped on the way, which would surface as a missing key
+    /// blamed on the BUILD file.
+    #[test]
+    fn an_incomplete_deferred_value_is_refused_at_the_wire() {
+        use hplugin::driver::DeferredValue;
+        let ready = std::collections::BTreeMap::from([(
+            "${read://a:b}".to_string(),
+            DeferredValue::Ready("v".to_string()),
+        )]);
+        assert_eq!(
+            deferred_to_pb(&ready).expect("finished values cross")["${read://a:b}"],
+            "v"
+        );
+
+        let pending = std::collections::BTreeMap::from([(
+            "${src://a:b}".to_string(),
+            DeferredValue::NeedsSandbox {
+                reads: Default::default(),
+                srcs: Default::default(),
+            },
+        )]);
+        let err = deferred_to_pb(&pending).expect_err("must not cross");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("${src://a:b}"), "names the field: {msg}");
+        assert!(msg.contains("bug in heph"), "blames the host: {msg}");
+    }
 
     /// The `accepts_deferred` flag is the whole justification for the ABI bump,
     /// and it only ever reaches a host across this conversion. Both directions,

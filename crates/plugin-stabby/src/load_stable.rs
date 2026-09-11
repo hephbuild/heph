@@ -739,6 +739,7 @@ impl StableRemoteManagedDriver {
         ct: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let request_id = req.request.request_id.clone();
+        let deferred = convert::deferred_to_pb(&req.request.deferred)?;
         let pmrr = pb::ManagedRunRequest {
             request_id: req.request.request_id.clone(),
             target: Some(convert::target_def_to_pb(req.request.target)?),
@@ -762,12 +763,7 @@ impl StableRemoteManagedDriver {
                 .iter()
                 .map(convert::credential_mount_to_pb)
                 .collect(),
-            deferred: req
-                .request
-                .deferred
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            deferred,
         };
         // `run` is bidi: the request stream carries the run request (RunInFrame),
         // the response stream carries the result (RunOutFrame). `shell` rides pmrr.
