@@ -3758,9 +3758,21 @@ impl Engine {
     ) -> anyhow::Result<Sandbox> {
         // Hash-only inputs (`hash_deps`) don't participate in the runtime
         // sandbox, so their transitive sandbox state must not leak in either.
+        //
+        // A `${src://x:y}` edge is the third case: staged, so `runtime: true`,
+        // but excluded here. Writing it asks for a *path*; it does not ask to
+        // inherit the producer's `transitive` tools, deps and env — which
+        // `apply_transitive` would fold into this target's def hash from
+        // `std::env::var`, so a consumer's key would move with the host
+        // environment of a target it only wanted a filename from.
         let futures = inputs
             .iter()
-            .filter(|i| i.runtime)
+            .filter(|i| {
+                i.runtime
+                    && !i
+                        .annotations
+                        .contains_key(crate::engine::deferred::DEFERRED_SRC_ANNOTATION)
+            })
             .enumerate()
             .map(|(i, input)| {
                 let input_ref = input.r#ref.clone();

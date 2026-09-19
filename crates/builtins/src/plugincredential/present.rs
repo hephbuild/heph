@@ -232,6 +232,16 @@ impl Presentation {
                              argv tail that selects a dialect and this credential)"
                         ),
                     },
+                    // `${src:}` is the sandbox path of an artifact, and a
+                    // credential has no sandbox — it is a declaration the host
+                    // reads, not a target that runs. Refused at the declaration
+                    // rather than left to resolve to nothing.
+                    Some(hcore::template::SRC_KIND) => anyhow::bail!(
+                        "`{}` in `{name}`: a credential has no sandbox, so there is no path for \
+                         `${{src://…}}` to name. Use `${{read://…}}` for a producer's contents, \
+                         or take the artifact as an ordinary dep on the consumer",
+                        r.raw
+                    ),
                     Some(other) => anyhow::bail!(
                         "unknown template kind {other:?} in `{name}` — a presentation understands \
                          `${{<field>}}` (material), `${{file:<name>}}`, `${{helper:command}}`, \

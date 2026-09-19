@@ -46,28 +46,42 @@ target(
 
 # ── the consumer ─────────────────────────────────────────────────────────────
 #
-# `exec` mode, deliberately: there is no shell, so `$(cat $SRC_CFG)` was never an
-# option here. This is the case with no workaround today.
-#
 # A template may mix literals and references, and may name more than one
-# producer.
+# producer. Writing a computed string into a file is a shell's job, so this one
+# is `bash` — which takes references too, because heph claims a `${...}` only
+# when its argument is an absolute address. `${src:0:3}` stays bash, and `$$`
+# stays a PID.
 #
-# One thing to notice about this particular line: heph substitutes into an argv
-# element, and argv needs no quoting — but that element is then handed to `sh -c`,
-# which *does* parse it. The value is spliced into a shell program, so a producer
-# emitting `'; rm -rf /; '` would run it. The single quotes here are the example's
-# own doing, not heph's. The bytes come from a target in this repository, so it is
-# the same trust boundary as any `run` line — but splicing and passing are
-# different things, and this line splices. An argv that is really an argv —
-# `["docker", "push", "${read://deferred:registry}/app"]` — does not.
+# Worth knowing here: heph substitutes, it does not quote. This value is spliced
+# into a shell program, so a producer emitting `1.2.3; rm -rf /` would run it —
+# and those bytes may have come from the shared remote cache. See the `exec`
+# target below for the case where nothing is spliced into anything.
 target(
     name = "image",
-    driver = "exec",
+    driver = "bash",
     out = "image.txt",
-    run = [
-        "sh", "-c",
-        "printf '%s' '${read://deferred:registry}/app:${read://deferred:version}' > image.txt",
-    ],
+    run = 'printf "%s" "${read://deferred:registry}/app:${read://deferred:version}" > $OUT',
+)
+
+# ── the other kind: a path, not the contents ─────────────────────────────────
+#
+# `${src://pkg:name}` is the sandbox path of a producer's artifact — `$SRC_<GROUP>`
+# finally available in an `exec` argv, and without a `deps` entry to keep in sync.
+#
+# `exec`, and this time there is genuinely no shell: the path is one argv element
+# handed straight to `cp`. Nothing parses it, so nothing can be spliced into it.
+# That is the case `$SRC_<GROUP>` could never serve, because expanding it needs a
+# shell and there isn't one.
+#
+# It is a `deps`-shaped edge (hashed, staged) with one deliberate difference: the
+# producer's `transitive` env and tools do NOT follow. Writing a path expression
+# asks for a path. Take the artifact as an ordinary `deps` entry when you do want
+# the environment.
+target(
+    name = "version-copy",
+    driver = "exec",
+    out = "version.copy",
+    run = ["cp", "${src://deferred:version}", "version.copy"],
 )
 
 # ── what is refused, and why ─────────────────────────────────────────────────

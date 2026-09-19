@@ -8,8 +8,8 @@ use hplugin::driver::outputartifact::Content::TarPath;
 use hplugin::driver::outputartifact::ContentPath;
 use hplugin::driver::targetdef::path::{self, Content};
 use hplugin::driver::{
-    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, RunInput, RunRequest, outputartifact,
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, DeferredValue,
+    ParseRequest, ParseResponse, RunInput, RunRequest, outputartifact,
 };
 use hplugin::provider::TargetSpec;
 use std::collections::{BTreeMap, HashMap};
@@ -141,6 +141,12 @@ pub async fn invoke_inner<'a, 'io>(
     // mount, so there is no earlier moment at which the directory reliably
     // exists — and because putting it here covers both sandbox modes at once.
     mount_scratch(&sandbox_pkg_dir, &req.scratch)?;
+    // `${src://…}` values, finished here because this is the first moment the
+    // answer exists: the artifact has just been staged, and `sandbox_dir` above
+    // is the *redirected* one under FUSE. Host-side and shared, so no driver
+    // participates and no plugin ships its own copy of the rule.
+    complete_deferred(&mut req, &inputs)
+        .with_context(|| format!("deferred `${{src://…}}` for {}", req.target.addr.format()))?;
     let mreq = ManagedRunRequest {
         sandbox_dir,
         sandbox_ws_dir: ws_dir,
@@ -291,6 +297,80 @@ async fn run_shell_fallback<'a, 'io>(
         inputs,
     };
     shell_fallback.driver.run_shell(new_mreq, ctoken).await
+}
+
+/// Finish the deferred fields that needed the sandbox.
+///
+/// One substitution pass over the author's own text, with `read` values the host
+/// already resolved and `src` paths read off the staged inputs. Single-pass
+/// deliberately: substituting the `read` values first and re-scanning would let
+/// a producer's *output* be read as a reference.
+fn complete_deferred(
+    req: &mut RunRequest<'_, '_>,
+    inputs: &[ManagedRunInput],
+) -> anyhow::Result<()> {
+    for (raw, slot) in req.deferred.iter_mut() {
+        let DeferredValue::NeedsSandbox { reads, srcs } = slot else {
+            continue;
+        };
+        let value = hcore::template::substitute(
+            raw,
+            hcore::template::DEFERRED_KINDS,
+            |r| -> anyhow::Result<String> {
+                // The host keyed both maps by the address exactly as the author
+                // wrote it, so no re-parse and no normalization happens here.
+                if let Some(v) = reads.get(r.arg) {
+                    return Ok(v.clone());
+                }
+                let origin_id = srcs.get(r.arg).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the host did not resolve `{}` — a deferred value is filled in before the \
+                         command runs, so this is a bug in heph rather than in the BUILD file",
+                        r.raw
+                    )
+                })?;
+                staged_path(inputs, origin_id, r.arg)
+            },
+        )?;
+        *slot = DeferredValue::Ready(value);
+    }
+    Ok(())
+}
+
+/// The single staged path of the input `origin_id` names.
+///
+/// The count is checked here rather than assumed: a reference pointed at a
+/// producer that emits a binary *and* a man page has no single path, and saying
+/// so with the file list beats substituting the first one in sort order.
+fn staged_path(inputs: &[ManagedRunInput], origin_id: &str, arg: &str) -> anyhow::Result<String> {
+    let input = inputs
+        .iter()
+        .find(|m| m.input.origin_id == origin_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("`${{src:{arg}}}` was not staged (origin_id={origin_id})")
+        })?;
+    let list_path = input.require_list_path()?;
+    let listed = std::fs::read_to_string(list_path)
+        .with_context(|| format!("read staged file list {list_path:?}"))?;
+    let mut paths = listed.lines().filter(|l| !l.is_empty());
+    let first = paths.next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`${{src:{arg}}}` staged no files, so there is no path to substitute. A `${{src:}}` \
+             producer emits one file — narrow its `out`, or name a group with `|<group>`"
+        )
+    })?;
+    let rest: Vec<&str> = paths.collect();
+    if !rest.is_empty() {
+        let mut all: Vec<&str> = std::iter::once(first).chain(rest).collect();
+        all.sort_unstable();
+        anyhow::bail!(
+            "`${{src:{arg}}}` staged {} files ({}), so there is no single path to substitute. \
+             Name one with `${{src:{arg}|<group>}}`, or narrow the producer's `out`",
+            all.len(),
+            all.join(", ")
+        );
+    }
+    Ok(first.to_string())
 }
 
 /// Tar, hash and stage every collectable output of a finished run, through
