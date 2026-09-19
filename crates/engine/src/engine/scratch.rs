@@ -1377,42 +1377,69 @@ mod tests {
     /// during a multi-GB pull — so the end event carries whatever the body had
     /// committed to. Reporting `cold` there would tell an operator the remote
     /// had nothing for them, which is both false and reassuring.
-    #[tokio::test]
-    async fn a_cancelled_prepare_is_not_reported_as_a_finished_one() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let _rt = crate::engine::test_rt_enter();
-        let (engine, rec) = recording_engine(tmp.path());
-        let rs = engine.new_state_with_events(true, None);
-        let r = resolved(Access::Shared);
+    ///
+    /// The mid-flight park is *manufactured*, not hoped for. Every step of the
+    /// prepare is a `hcore::blocking::run`, and a `spawn_blocking` job that
+    /// finishes before its `JoinHandle` is first polled leaves that await
+    /// ready — win that race at each step and the whole prepare completes in
+    /// one poll, which is a cancellation of nothing. It flaked exactly that way
+    /// on `linux/arm64`. So the test runs on a private runtime whose blocking
+    /// pool is one thread, occupied for the duration: the pool is at its cap
+    /// and FIFO, so the prepare's first job cannot start and the first poll is
+    /// pending by construction.
+    #[test]
+    fn a_cancelled_prepare_is_not_reported_as_a_finished_one() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
 
-        // Poll once so the span opens and the end-guard arms, then drop the
-        // future mid-flight — the shape a Ctrl-C produces. The first poll parks
-        // on the lineage probe (a `blocking::run`), so nothing has committed to
-        // an outcome yet.
-        let slot = r.slot();
-        {
-            let mut fut =
-                std::pin::pin!(engine.prepare_scratch_dir(&rs, "//app:a", &slot, &r, false));
-            let waker = std::task::Waker::noop();
-            let mut cx = std::task::Context::from_waker(waker);
-            assert!(
-                std::future::Future::poll(fut.as_mut(), &mut cx).is_pending(),
-                "the prepare must still be in flight for this to be a cancellation",
-            );
-        }
+        let (announce, started) = std::sync::mpsc::channel::<()>();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        rt.spawn_blocking(move || {
+            announce.send(()).expect("the test is still waiting");
+            let _ = held.recv();
+        });
+        started.recv().expect("the one blocking thread is occupied");
 
-        let outcome = rec
-            .seen
-            .lock()
-            .iter()
-            .find_map(|k| match k {
-                crate::engine::event::BuildEventKind::ScratchPrepareEnd { outcome, .. } => {
-                    Some(outcome.clone())
-                }
-                _ => None,
-            })
-            .expect("the span still closes when cancelled");
+        let outcome = rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (engine, rec) = recording_engine(tmp.path());
+            let rs = engine.new_state_with_events(true, None);
+            let r = resolved(Access::Shared);
+
+            // Poll once so the span opens and the end-guard arms, then drop the
+            // future mid-flight — the shape a Ctrl-C produces. The poll parks on
+            // the lineage probe, so nothing has committed to an outcome yet.
+            let slot = r.slot();
+            {
+                let mut fut =
+                    std::pin::pin!(engine.prepare_scratch_dir(&rs, "//app:a", &slot, &r, false));
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                assert!(
+                    std::future::Future::poll(fut.as_mut(), &mut cx).is_pending(),
+                    "the prepare must still be in flight for this to be a cancellation",
+                );
+            }
+
+            rec.seen
+                .lock()
+                .iter()
+                .find_map(|k| match k {
+                    crate::engine::event::BuildEventKind::ScratchPrepareEnd { outcome, .. } => {
+                        Some(outcome.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the span still closes when cancelled")
+        });
         assert_eq!(outcome, INTERRUPTED);
+
+        // Let the occupier go, so the runtime can be torn down.
+        drop(release);
     }
 
     /// An uncontended acquire emits nothing.
