@@ -127,3 +127,105 @@ mod tests {
         assert!(parse_size("99999999999999999999TiB").is_err());
     }
 }
+
+/// Parse a human duration (`55m`, `6h`, `90s`, `1h30m`) into a [`Duration`].
+///
+/// Same shape as [`parse_size`] and for the same reason: a credential's `ttl` and
+/// a config timeout must not come to mean two things depending on which surface
+/// they were typed into.
+///
+/// A bare number is **seconds**, matching every vendor API that reports a lease
+/// in them (`lease_duration`, `expires_in`). Fractions are deliberately not
+/// accepted: a credential lifetime measured to the millisecond is a false
+/// precision, and rejecting `1.5h` is cheaper than deciding what it rounds to.
+///
+/// [`Duration`]: std::time::Duration
+pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    let t = s.trim();
+    if t.is_empty() {
+        anyhow::bail!("empty duration; try 30s, 55m, 6h, 1h30m");
+    }
+    let mut total = 0u64;
+    let mut rest = t;
+    let mut any = false;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            anyhow::bail!("{s:?} is not a duration; try 30s, 55m, 6h, 1h30m");
+        }
+        let (num, tail) = rest.split_at(digits);
+        let n: u64 = num
+            .parse()
+            .with_context(|| format!("{s:?} is not a duration"))?;
+        let unit_len = tail
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        let (unit, next) = tail.split_at(unit_len);
+        let mult = match unit.trim().to_ascii_lowercase().as_str() {
+            // Bare number => seconds. See the doc comment.
+            "" | "s" | "sec" | "secs" => 1,
+            "m" | "min" | "mins" => 60,
+            "h" | "hr" | "hrs" => 3600,
+            "d" => 86400,
+            other => anyhow::bail!("unknown duration unit {other:?} in {s:?}; try 30s, 55m, 6h"),
+        };
+        total = total
+            .checked_add(n.saturating_mul(mult))
+            .ok_or_else(|| anyhow::anyhow!("duration {s:?} overflows"))?;
+        any = true;
+        rest = next;
+    }
+    if !any {
+        anyhow::bail!("{s:?} is not a duration; try 30s, 55m, 6h, 1h30m");
+    }
+    Ok(std::time::Duration::from_secs(total))
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn a_bare_number_is_seconds() {
+        // Every vendor lease field reports seconds, so this is the form that
+        // arrives from an API rather than from a person.
+        assert_eq!(
+            parse_duration("3600").expect("parse"),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn units_and_compounds() {
+        assert_eq!(
+            parse_duration("55m").expect("parse"),
+            Duration::from_secs(3300)
+        );
+        assert_eq!(
+            parse_duration("6h").expect("parse"),
+            Duration::from_secs(21600)
+        );
+        assert_eq!(
+            parse_duration("1h30m").expect("parse"),
+            Duration::from_secs(5400)
+        );
+        assert_eq!(
+            parse_duration(" 2d ").expect("parse"),
+            Duration::from_secs(172800)
+        );
+    }
+
+    #[test]
+    fn a_fraction_is_rejected_rather_than_rounded() {
+        assert!(parse_duration("1.5h").is_err());
+    }
+
+    #[test]
+    fn an_unknown_unit_names_itself() {
+        let err = parse_duration("5y").expect_err("must fail");
+        assert!(format!("{err:#}").contains("\"y\""), "{err:#}");
+    }
+}

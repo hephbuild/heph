@@ -326,6 +326,7 @@ mod tests {
             stderr: None,
             sandbox_dir: sandbox_dir.to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         }
     }
 

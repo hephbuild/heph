@@ -1,5 +1,6 @@
 mod filterenv;
 mod pty;
+pub mod redact;
 mod spec;
 
 use anyhow::Context;
@@ -372,14 +373,23 @@ async fn tee_stream(
     addr: &str,
     stream: &str,
     bytes_read: &std::sync::atomic::AtomicUsize,
+    // `None` for every target that declares no credentials, which is nearly all
+    // of them — so the scrubbing path costs one null check.
+    needles: Option<Arc<redact::Needles>>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Some(mut source) = source else { return };
     let mut buf = vec![0u8; 8192];
     let mut lost = SinkLoss::default();
+    let mut redactor = needles.map(redact::Redactor::new);
     loop {
         match source.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => {
+                // Flush whatever the redactor held back across the last read
+                // boundary, or the tail of the output disappears.
+                flush_redacted(&mut redactor, &log, &mut sink, &mut lost).await;
+                break;
+            }
             Err(error) => {
                 tracing::warn!(
                     addr,
@@ -388,6 +398,9 @@ async fn tee_stream(
                     bytes_read = bytes_read.load(std::sync::atomic::Ordering::Relaxed),
                     "pluginexec: error draining child output; log tail may be truncated"
                 );
+                // Flush before leaving, or a read error costs the log the
+                // redactor's held-back tail on top of whatever the read lost.
+                flush_redacted(&mut redactor, &log, &mut sink, &mut lost).await;
                 break;
             }
             Ok(n) => {
@@ -397,6 +410,14 @@ async fn tee_stream(
                     reason = "n guaranteed <= buf.len() by AsyncRead contract"
                 )]
                 let slice = &buf[..n];
+                // Scrubbed BEFORE the log write, not after: `log.txt` is packed
+                // into the cache as an artifact and lifted into the failure
+                // event, so a token that reaches it has already escaped.
+                let scrubbed = redactor.as_mut().map(|r| r.push(slice));
+                let slice: &[u8] = scrubbed.as_deref().unwrap_or(slice);
+                if slice.is_empty() {
+                    continue;
+                }
                 if let Ok(mut g) = log.lock() {
                     drop(g.write_all(slice));
                 }
@@ -410,13 +431,43 @@ async fn tee_stream(
                     // surfaces at the flush rather than at `write_all` — take
                     // whichever failed.
                     if let Err(e) = wrote.and(flushed) {
-                        lost.record(n, e);
+                        lost.record(slice.len(), e);
                     }
                 }
             }
         }
     }
     lost.finish(addr, stream);
+}
+
+/// Write a redactor's held-back tail to the log and the sink.
+///
+/// Shared by every exit from a tee loop — EOF *and* a read error — because a tail
+/// that is not flushed is output that silently disappears, which is the failure
+/// [`SinkLoss`] exists to make visible.
+async fn flush_redacted(
+    redactor: &mut Option<redact::Redactor>,
+    log: &Arc<std::sync::Mutex<std::fs::File>>,
+    sink: &mut Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    lost: &mut SinkLoss,
+) {
+    use std::io::Write as _;
+    use tokio::io::AsyncWriteExt as _;
+    let Some(r) = redactor.as_mut() else { return };
+    let tail = r.finish();
+    if tail.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = log.lock() {
+        drop(g.write_all(&tail));
+    }
+    if let Some(out) = sink {
+        let wrote = out.write_all(&tail).await;
+        let flushed = out.flush().await;
+        if let Err(e) = wrote.and(flushed) {
+            lost.record(tail.len(), e);
+        }
+    }
 }
 
 /// Output the sink refused, and why.
@@ -493,6 +544,10 @@ impl SinkLoss {
 /// `stdout_bytes`/`stderr_bytes` mirror `tee_stream`'s `bytes_read`: a
 /// post-wait drain timeout reports how much of each stream it actually got
 /// before giving up, rather than just "it timed out".
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one tee over both streams: two sinks, two counters, and redaction"
+)]
 async fn tee_output<'io>(
     reader: Option<proc_exec::OutputReader>,
     log: Arc<std::sync::Mutex<std::fs::File>>,
@@ -503,15 +558,31 @@ async fn tee_output<'io>(
     addr: &str,
     stdout_bytes: &std::sync::atomic::AtomicUsize,
     stderr_bytes: &std::sync::atomic::AtomicUsize,
+    needles: Option<Arc<redact::Needles>>,
 ) {
     use tokio::io::AsyncWriteExt;
     let Some(mut reader) = reader else { return };
     let mut absorbed = SinkCost::default();
     let (mut lost_stdout, mut lost_stderr) = (SinkLoss::default(), SinkLoss::default());
+    // One redactor per stream, never one shared. The held-back tail is a
+    // property of *this* byte sequence; running both streams through one buffer
+    // would splice them together.
+    let (mut red_out, mut red_err) = (
+        needles.clone().map(redact::Redactor::new),
+        needles.map(redact::Redactor::new),
+    );
     loop {
         let (stream, chunk) = match reader.recv().await {
             Ok(Some(c)) => c,
-            Ok(None) => break,
+            Ok(None) => {
+                // Flush both redactors' held-back tails, or the last bytes of a
+                // target's output disappear. A refused write is recorded rather
+                // than dropped, for the same reason every other sink write here
+                // is — see [`SinkLoss`].
+                flush_redacted(&mut red_out, &log, &mut stdout, &mut lost_stdout).await;
+                flush_redacted(&mut red_err, &log, &mut stderr, &mut lost_stderr).await;
+                break;
+            }
             // One reader now carries both streams, so treating a read error as
             // EOF would stop teeing the *other* stream too — `log.txt` would
             // truncate with no note, and dropping the reader would SIGPIPE the
@@ -533,15 +604,25 @@ async fn tee_output<'io>(
             proc_exec::StreamId::Stderr => stderr_bytes,
         };
         bytes_counter.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+        // Scrubbed before the log write — see `tee_stream`.
+        let redactor = match stream {
+            proc_exec::StreamId::Stdout => red_out.as_mut(),
+            proc_exec::StreamId::Stderr => red_err.as_mut(),
+        };
+        let scrubbed = redactor.map(|r| r.push(&chunk));
+        let chunk: &[u8] = scrubbed.as_deref().unwrap_or(&chunk);
+        if chunk.is_empty() {
+            continue;
+        }
         if let Ok(mut g) = log.lock() {
-            drop(g.write_all(&chunk));
+            drop(g.write_all(chunk));
         }
         let sink = match stream {
             proc_exec::StreamId::Stdout => stdout.as_mut(),
             proc_exec::StreamId::Stderr => stderr.as_mut(),
         };
         if let Some(out) = sink {
-            let wrote = out.write_all(&chunk).await;
+            let wrote = out.write_all(chunk).await;
             // Flush immediately so an interactive consumer sees each chunk
             // as it appears rather than at process exit.
             let flushed = out.flush().await;
@@ -888,6 +969,46 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             });
         }
 
+        // Credential references. The same `hashed: false, runtime: false` edge a
+        // scratch uses, told apart by its annotation — and for a sharper reason
+        // than scratch's. Both flags false is not an optimization here, it is the
+        // contract: nothing about a credential may enter `hashin`, not the
+        // material, not the chosen source, not the declaration, not even the
+        // names of the variables it presents. Because the exclusion is
+        // structural, adding a credential to a target cannot move its cache key.
+        //
+        // What the edge *does* buy is the graph: `heph query revdeps` answers
+        // "who needs this identity?", `heph inspect deps` shows it, and a bad
+        // addr is an ordinary `TargetNotFoundError` rather than a 403 much later.
+        let mut seen_credential: BTreeMap<String, usize> = BTreeMap::new();
+        let mut credential_inputs: Vec<Input> = Vec::with_capacity(spec.credentials.len());
+        for (i, raw) in spec.credentials.iter().enumerate() {
+            let r#ref = TargetAddr::parse(raw, &pkg)?;
+            let key = r#ref.to_string();
+            if let Some(first) = seen_credential.insert(key.clone(), i) {
+                anyhow::bail!(
+                    "credential {key} is referenced twice (positions {first} and {i}) — a \
+                     credential presents one set of variables and files, so referencing it again \
+                     does nothing; drop the duplicate"
+                );
+            }
+            credential_inputs.push(Input {
+                r#ref,
+                mode: InputMode::Standard,
+                origin_id: format!(
+                    "{}|{}",
+                    hdriver_support::credential::CREDENTIAL_ORIGIN_PREFIX,
+                    i
+                ),
+                annotations: BTreeMap::from([(
+                    hdriver_support::credential::CREDENTIAL_ANNOTATION.to_string(),
+                    "true".to_string(),
+                )]),
+                hashed: false,
+                runtime: false,
+            });
+        }
+
         let tool_inputs = sorted_by_group(spec.tools)
             .into_iter()
             .flat_map(|(k, v)| {
@@ -1052,6 +1173,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .chain(tool_inputs.into_iter().map(|(_, v)| v))
                     .chain(runner_input)
                     .chain(scratch_inputs)
+                    .chain(credential_inputs)
                     .collect(),
                 outputs,
                 support_files,
@@ -1509,15 +1631,58 @@ impl Driver {
             env.insert(m.env.clone(), dir.to_string());
         }
 
+        // Credentials. The host already walked the chain, acquired the material
+        // and wrote every presented file into this run's sandbox at 0600; what is
+        // left is what a driver can actually do — set some environment, and
+        // prepend a directory to PATH for the one protocol (Docker's) that
+        // resolves a helper by executable name.
+        //
+        // Set last so a credential is never shadowed by the target's own `env`:
+        // the point of naming a credential is to get that identity, and a target
+        // that also sets the variable has written a conflict rather than an
+        // override. A collision is refused rather than resolved, exactly as for
+        // scratch — silently winning either way leaves one of the two
+        // inoperative with nothing to see.
+        let mut credential_env_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut credential_path_prefix: Vec<OsString> = Vec::new();
+        for m in &rreq.credentials {
+            for (k, v) in &m.env {
+                if let Some(existing) = env.get(k)
+                    && existing != v
+                {
+                    anyhow::bail!(
+                        "credential {} presents `{k}`, but this target already sets it. One would \
+                         shadow the other — drop it from this target's `env`, or change the \
+                         variable on the credential's presentation",
+                        m.addr
+                    );
+                }
+                env.insert(k.clone(), v.clone());
+                credential_env_names.insert(k.clone());
+            }
+            credential_path_prefix
+                .extend(m.path_prefix.iter().map(|p| p.as_os_str().to_os_string()));
+        }
+
+        // Values this target's output must be scrubbed of, before any byte of it
+        // reaches `log.txt` — which is packed into the cache as an artifact and
+        // lifted into the failure event. `None` for every target that declares no
+        // credentials.
+        let needles = redact::Needles::new(rreq.credentials.iter().flat_map(|m| m.redact.iter()));
+
         // The target's own tools lead, wherever it ends up running — composed by
         // `hexecrunner` rather than spliced into the string here, because under
         // a runner the rest of `PATH` is not known until the runner (or its
         // agent) has had its say.
+        //
+        // A credential helper shim goes ahead of even the target's tools: it is
+        // named `docker-credential-heph`, which nothing else in the tree provides,
+        // so leading costs nothing and guarantees Docker finds it.
         let path_policy = hexecrunner::PathPolicy {
-            prefix: tool_bin_dir
-                .as_ref()
-                .map(|d| d.as_os_str().to_os_string())
+            prefix: credential_path_prefix
                 .into_iter()
+                .chain(tool_bin_dir.as_ref().map(|d| d.as_os_str().to_os_string()))
                 .collect(),
             fallback: Some(std::ffi::OsString::from(self.sandbox_path_display())),
         };
@@ -1555,7 +1720,12 @@ impl Driver {
         let mut argv_for_filter: Vec<OsString> = Vec::with_capacity(1 + args_os.len());
         argv_for_filter.push(OsString::from(&program));
         argv_for_filter.extend(args_os.iter().cloned());
-        let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter);
+        // Credential names are protected from the size limiter: its eviction
+        // order is longest-first, which is precisely a session token, and
+        // `ARG_MAX` differs by operating system — so without this the same BUILD
+        // file would keep the credential on Linux and drop it on macOS, then run
+        // unauthenticated or against whatever ambient identity the host had.
+        let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter, &credential_env_names)?;
         let env_pairs: Vec<(OsString, OsString)> = env_vec
             .into_iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
@@ -1728,6 +1898,7 @@ impl Driver {
                 &addr_str,
                 "pty",
                 &stdout_bytes,
+                needles.clone(),
             ));
 
             let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
@@ -1753,6 +1924,7 @@ impl Driver {
                 &addr_str,
                 &stdout_bytes,
                 &stderr_bytes,
+                needles.clone(),
             ));
             let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
                 match (rreq.stdin, stdin_pump) {
@@ -2044,6 +2216,7 @@ mod tests {
             "//pkg:target",
             "pty",
             &bytes_read,
+            None,
         )
         .await;
         drop(guard);
@@ -2079,6 +2252,7 @@ mod tests {
             "//pkg:target",
             "stdout",
             &bytes_read,
+            None,
         )
         .await;
         drop(guard);
@@ -2197,6 +2371,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         let res = tokio::time::timeout(
@@ -2522,6 +2697,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         let _res = driver.run(make_req(req), &ctoken).await?;
@@ -2581,6 +2757,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         let res = driver.run(make_req(req), &ctoken).await;
@@ -2653,6 +2830,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         // Use a timeout to detect the hang
@@ -2715,6 +2893,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2784,6 +2963,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -2852,6 +3032,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         let res = tokio::time::timeout(
@@ -3029,6 +3210,7 @@ mod tests {
             stderr: Some(&mut err_handle),
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
@@ -3111,6 +3293,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         driver.run(make_req(req), &ctoken).await?;
@@ -3186,6 +3369,7 @@ mod tests {
             stderr: Some(&mut stderr),
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         tokio::time::timeout(
@@ -3343,6 +3527,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         tokio::time::timeout(
@@ -3442,6 +3627,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
@@ -4474,6 +4660,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
         driver
             .run(
@@ -4521,6 +4708,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
         driver
             .run(
@@ -4601,6 +4789,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
         driver
             .run(
@@ -4758,6 +4947,7 @@ mod tests {
             stderr: None,
             sandbox_dir: sandbox.clone(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         os.run_inner(req, &ctoken, false).await?;
@@ -4855,6 +5045,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
         driver
             .run(
@@ -4930,6 +5121,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
         driver.run(make_req(req), &ctoken).await?;
 
@@ -5017,6 +5209,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
         driver
             .run(
@@ -5120,6 +5313,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
         driver
             .run(
@@ -5210,6 +5404,7 @@ mod tests {
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
             scratch: vec![],
+            credentials: vec![],
         };
 
         driver.run(make_req(req), &ctoken).await?;

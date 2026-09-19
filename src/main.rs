@@ -45,6 +45,17 @@ fn main() -> ExitCode {
         None => {}
     }
 
+    // The credential helper, dispatched here for the same reason as the runner
+    // subcommands: its argv and its stdin belong to the *calling tool* — Docker
+    // appends `get`, git appends `get`/`store`/`erase`, and both write a request
+    // on stdin — so parsing it as flags would misread somebody else's protocol.
+    // It also must not pull in logging or the TUI: it is a callback running
+    // inside another tool, and anything it writes to stdout is that tool's
+    // document.
+    if let Some(inv) = commands::auth_helper::parse(std::env::args_os()) {
+        commands::auth_helper::run(inv);
+    }
+
     // Dynamic shell completion. A no-op unless the `COMPLETE` env var is set
     // (a tab press or `heph tool completions` registration), in which case it
     // emits candidates / the registration script and exits the process. Runs

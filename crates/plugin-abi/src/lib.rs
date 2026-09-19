@@ -21,6 +21,24 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.9.0: `RunRequest`/`ManagedRunRequest` gained `repeated CredentialMount
+/// credentials` — identities the host resolved, acquired and materialized for the
+/// run, which the driver applies as runtime environment, a PATH prefix, and a
+/// redaction set for its output tee. Additive and cold-path (a prost wire field,
+/// not a vtable change), so an old plugin still loads.
+///
+/// Minor, but with a sharper consequence than 0.8.0's if a plugin is *not*
+/// rebuilt: an old driver drops the mounts and runs its target with no identity,
+/// which either fails much later with a message from someone else's SDK or —
+/// worse — succeeds against whatever ambient identity the host happened to have.
+/// Nothing is silently wrong in the *cache*, because a credential contributes
+/// nothing to any hash in either direction; what is lost is the identity itself.
+/// Two things bound the exposure: a reference can only enter a definition through
+/// the plugin's own parser, and a plugin old enough to drop the field rejects the
+/// `credentials` attribute outright. Decoding on the plugin side is fallible and
+/// never lossy for the same reason — unlike a scratch mount, a credential that
+/// fails to decode is an error rather than a dropped mount.
+///
 /// 0.8.0: `RunRequest`/`ManagedRunRequest` gained `repeated ScratchMount
 /// scratch` — persistent cache directories the host resolved, locked and created
 /// for the run, which the driver symlinks into the sandbox and announces through
@@ -46,7 +64,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.8.0";
+pub const ABI_SEMVER: &str = "0.9.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

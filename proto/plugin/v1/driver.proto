@@ -65,6 +65,44 @@ message ScratchMount {
   string dir = 4;
 }
 
+// A credential the host resolved, acquired and materialized for this run.
+//
+// Deliberately the *smallest* thing that can carry an identity. Presentation
+// files were written by the host, under `RunRequest.sandbox_dir`, at 0600, and
+// are deleted when the run ends whatever its outcome — so they cross as nothing
+// at all and the driver never sees material it did not need. What is left is
+// what a driver genuinely has to do: set some environment, and (for the Docker
+// credential-helper protocol, which resolves a helper by executable name)
+// prepend a directory to PATH.
+//
+// `env` values ARE the material, so they cross inline; there is no other way to
+// hand a tool a token it reads from its environment. They carry a hard size
+// bound for that reason — see `CREDENTIAL_ENV_MAX_BYTES` — with anything larger
+// being a `files` presentation instead.
+//
+// Unlike a ScratchMount, a mount that fails to decode is an ERROR and never
+// dropped: a missing scratch costs a cold cache, whereas a missing credential
+// produces a run with no identity that either fails much later somewhere else,
+// or succeeds against whatever ambient identity the host happened to have.
+message CredentialMount {
+  Addr addr = 1;
+  // Runtime environment for the target. Never hashed, never `pass_env`.
+  map<string, string> env = 2;
+  // Directories to prepend to PATH, ahead of the target's own tools.
+  repeated string path_prefix = 3;
+  // Every material value the driver must scrub from this target's output before
+  // it reaches log.txt, the TUI, the failure event or the cache.
+  //
+  // These are secrets, and they cross even for material presented only as a file
+  // — which is the deliberate part. Redacting at render would be too late: the
+  // captured log is packed into the cache as an artifact and lifted into the
+  // failure event, the JSON output and the CI report, so the only place that
+  // covers all of them is the tee, before bytes reach disk. The driver already
+  // receives every env-presented value, so the marginal exposure is a file-only
+  // credential a build step chose to `cat`.
+  repeated string redact = 4;
+}
+
 message RunRequest {
   string request_id = 1;
   TargetDef target = 2;
@@ -80,6 +118,7 @@ message RunRequest {
   // true => run_shell, false => run
   bool shell = 10;
   repeated ScratchMount scratch = 11;
+  repeated CredentialMount credentials = 12;
 }
 
 // fuse_slot_guards and sandbox_cleanup are non-transferable host RAII,
@@ -124,6 +163,7 @@ message ManagedRunRequest {
   bool shell = 9;
   string driver = 10;
   repeated ScratchMount scratch = 11;
+  repeated CredentialMount credentials = 12;
 }
 
 message ManagedRunResponse {

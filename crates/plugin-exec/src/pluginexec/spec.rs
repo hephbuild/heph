@@ -29,6 +29,18 @@ pub(crate) struct TargetSpec {
     /// `env` variable is set for the run. A scratch is not an input: it is never
     /// materialized from artifacts and never affects this target's cache key.
     pub scratch: Vec<String>,
+    /// Credentials this target needs, as a list of `credential` target addresses.
+    /// Each is acquired from whatever environment the build is running in and
+    /// presented in the shape its declaration names — environment variables,
+    /// `0600` files, or a callback helper.
+    ///
+    /// A credential is not an input: nothing about it reaches this target's cache
+    /// key, in either direction. The contract that makes that sound is that a
+    /// credential grants *access* and is not an *input* — this target's outputs
+    /// must be identical whichever identity satisfied the requirement. A target
+    /// whose output depends on *who* ran it is not cacheable, and says so with
+    /// `cache = False`.
+    pub credentials: Vec<String>,
     /// Build tools, grouped by name → list of target addresses; symlinked under `tools/`.
     pub tools: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths the target writes.
@@ -93,6 +105,7 @@ mod tests {
             "runtime_pass_env",
             "runtime_env",
             "runner",
+            "credentials",
         ] {
             assert!(by_name.contains_key(key), "schema missing field `{key}`");
         }

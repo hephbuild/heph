@@ -1038,6 +1038,71 @@ pub struct ScratchMount {
     pub dir: PathBuf,
 }
 
+/// The largest a single presented environment value may be.
+///
+/// Environment values *are* the material — a token a tool reads from its
+/// environment has nowhere else to live — so unlike a presentation file they
+/// cross inline. That makes them the one place a credential can push against
+/// `execve`'s `ARG_MAX`, so the bound is stated here rather than discovered as a
+/// spawn failure. Anything larger is a `files` presentation, which is also the
+/// right shape for it: a 32 KiB credential is a document, not a token.
+///
+/// Generous next to every real credential (a session token is a few kilobytes, a
+/// JWT rarely more) and small next to the smallest `ARG_MAX` on any supported
+/// target.
+pub const CREDENTIAL_ENV_MAX_BYTES: usize = 32 * 1024;
+
+/// A credential the host resolved, acquired and materialized for this run.
+///
+/// Deliberately the *smallest* thing that can carry an identity. The material
+/// itself, the chain that produced it, which source won and when it expires are
+/// all the host's and are not visible here — a driver's job is to hand its child
+/// an environment, not to understand an identity.
+///
+/// Presentation **files** are not in this type at all: the host wrote them under
+/// the run's `sandbox_dir` at `0600` and deletes them when the run ends whatever
+/// its outcome, and the `env` templates that point at them already carry their
+/// paths. So a driver that does nothing but apply `env` and `path_prefix` is a
+/// complete implementation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CredentialMount {
+    /// The declaring target, for diagnostics.
+    pub addr: Addr,
+    /// Runtime environment for the target. Never hashed and never `pass_env`, so
+    /// it cannot reach a def hash by construction.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Directories to prepend to `PATH`, ahead of the target's own tools.
+    ///
+    /// Only the Docker credential-helper protocol needs this, because Docker
+    /// resolves a helper by executable name and nothing else will find a
+    /// `docker-credential-heph` shim.
+    pub path_prefix: Vec<std::path::PathBuf>,
+    /// Every material value this target's output must be scrubbed of.
+    ///
+    /// Redaction belongs at the **output tee**, before bytes reach disk — not at
+    /// render. The captured log is packed into the cache as an artifact and
+    /// lifted into the failure event, the JSON output and the CI report, so
+    /// redacting where it is displayed misses everything that matters.
+    ///
+    /// Best-effort by construction: a short secret cannot be scrubbed without
+    /// corrupting ordinary output, so [`REDACT_MIN_LEN`] is a floor and is
+    /// documented rather than hidden.
+    pub redact: Vec<String>,
+}
+
+/// The shortest material value worth scrubbing from a target's output.
+///
+/// Redaction is a substring replacement over a byte stream, so a short secret
+/// cannot be redacted without corrupting output that merely happens to contain
+/// those bytes — `"1"` would rewrite every number a build prints. Eight
+/// characters is short enough to cover every real token and long enough that a
+/// collision with ordinary output is vanishingly unlikely.
+///
+/// This is a stated limit, not a hidden one: a credential whose material is
+/// shorter than this is **not** redacted, and that must be said out loud rather
+/// than left for someone to discover in a log.
+pub const REDACT_MIN_LEN: usize = 8;
+
 pub struct RunRequest<'a, 'io> {
     pub request_id: &'a String,
     pub target: &'a targetdef::TargetDef,
@@ -1051,6 +1116,9 @@ pub struct RunRequest<'a, 'io> {
     /// Scratch caches to mount for this run, already locked and created by the
     /// host. Empty for the overwhelming majority of targets.
     pub scratch: Vec<ScratchMount>,
+    /// Credentials to present for this run, already acquired and materialized by
+    /// the host. Empty for the overwhelming majority of targets.
+    pub credentials: Vec<CredentialMount>,
 }
 /// Cleanup closure a driver returns for the engine to run after `cache_locally`.
 /// The FUSE/OS sandbox layers each supply their own teardown; the engine's

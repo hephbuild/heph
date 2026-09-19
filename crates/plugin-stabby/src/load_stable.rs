@@ -756,6 +756,12 @@ impl StableRemoteManagedDriver {
                 .iter()
                 .map(convert::scratch_mount_to_pb)
                 .collect(),
+            credentials: req
+                .request
+                .credentials
+                .iter()
+                .map(convert::credential_mount_to_pb)
+                .collect(),
         };
         // `run` is bidi: the request stream carries the run request (RunInFrame),
         // the response stream carries the result (RunOutFrame). `shell` rides pmrr.

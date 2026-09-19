@@ -717,6 +717,50 @@ pub fn scratch_mount_from_pb(m: pb::ScratchMount) -> Option<hplugin::driver::Scr
     })
 }
 
+/// Credential mounts, host -> plugin.
+///
+/// One-way like a scratch mount, and for a sharper reason: nothing about an
+/// identity travels back, because a driver is never told which one it got.
+pub fn credential_mount_to_pb(m: &hplugin::driver::CredentialMount) -> pb::CredentialMount {
+    pb::CredentialMount {
+        addr: Some(addr_to_pb(&m.addr)),
+        env: m.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        path_prefix: m
+            .path_prefix
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        redact: m.redact.clone(),
+    }
+}
+
+/// Credential mounts, as seen by a plugin.
+///
+/// **Fallible, and never lossy** — the opposite of [`scratch_mount_from_pb`],
+/// which drops a mount whose addr did not survive. A scratch that silently does
+/// not mount costs a cold cache; a credential that silently does not mount leaves
+/// the target with no identity, which either fails much later somewhere else with
+/// a message from someone else's SDK, or — worse — succeeds against whatever
+/// ambient identity the host happened to have. So a malformed mount stops the run
+/// here, where the reason is still legible.
+pub fn credential_mount_from_pb(
+    m: pb::CredentialMount,
+) -> anyhow::Result<hplugin::driver::CredentialMount> {
+    let addr = m
+        .addr
+        .ok_or_else(|| anyhow::anyhow!("credential mount carries no address"))?;
+    Ok(hplugin::driver::CredentialMount {
+        addr: addr_from_pb(addr),
+        env: m.env.into_iter().collect(),
+        path_prefix: m
+            .path_prefix
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+        redact: m.redact,
+    })
+}
+
 pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
     Ok(pb::TargetDef {
         addr: Some(addr_to_pb(&td.addr)),

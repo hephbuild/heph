@@ -7,6 +7,10 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+# Substring search for the credential-output scrubber: a needle there is a whole
+# session token, so the naive scan it replaced cost ~1000 byte-comparisons per
+# output byte on every credentialed target.
+memchr = "2.8"
 hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }

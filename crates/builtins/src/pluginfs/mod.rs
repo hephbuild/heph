@@ -1534,6 +1534,7 @@ mod tests {
             stderr: None,
             sandbox_dir: root,
             scratch: vec![],
+            credentials: vec![],
         }
     }
 
