@@ -1286,6 +1286,7 @@ async fn run_once(
             .filter_map(convert::scratch_mount_from_pb)
             .collect(),
         credentials,
+        deferred: req.deferred.into_iter().collect(),
     };
     let mrr = ManagedRunRequest {
         request: rr,
@@ -2610,6 +2611,7 @@ mod tests {
                         doc: "Command arguments.".into(),
                         required: true,
                     }],
+                    accepts_deferred: false,
                 }
             }
             async fn parse(

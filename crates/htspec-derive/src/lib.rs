@@ -149,6 +149,48 @@ struct FieldCodegen {
     field_inits: Vec<proc_macro2::TokenStream>,
     schema_fields: Vec<proc_macro2::TokenStream>,
     param_tys: Vec<proc_macro2::TokenStream>,
+    /// Whether any field is a `Deferred<…>`, which is what makes the whole
+    /// driver accept `${read://…}` references.
+    ///
+    /// Derived from the field types rather than declared, because "one field
+    /// type changes and nothing else" is the claim the whole design rests on. A
+    /// separate `#[spec(accepts_deferred)]` would be a second thing to remember,
+    /// and forgetting it fails the way this feature exists to stop: the host
+    /// refuses the reference and the author is told their driver does not take
+    /// one, when it plainly does.
+    any_deferred: bool,
+}
+
+/// Whether `ty` is a `Deferred<…>`, or a container of one.
+///
+/// Structural rather than a scan of the type's token text. A substring match
+/// answers `true` for `DeferredPolicy` and for a module path that merely contains
+/// the word, and a driver that advertises `accepts_deferred` it does not have
+/// stops the host refusing references for it — which is the mixed-version gate
+/// switched off by a name.
+///
+/// The remaining limit is honest and fails safe: a type alias
+/// (`type Role = Deferred<String>`) is invisible here, so the driver
+/// under-reports `false` and the host refuses a reference it could have handled,
+/// naming the driver. So is a `Deferred` nested inside another `#[derive(Spec)]`
+/// struct — which is why the credential driver, whose references live three
+/// levels inside a `sources` list, writes its schema by hand.
+fn mentions_deferred(ty: &syn::Type) -> bool {
+    let syn::Type::Path(p) = ty else { return false };
+    let Some(last) = p.path.segments.last() else {
+        return false;
+    };
+    if last.ident == "Deferred" {
+        return true;
+    }
+    // `Vec<Deferred<String>>`, `Option<Deferred<String>>`.
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return false;
+    };
+    args.args.iter().any(|a| match a {
+        syn::GenericArgument::Type(inner) => mentions_deferred(inner),
+        _ => false,
+    })
 }
 
 fn field_codegen(
@@ -159,12 +201,14 @@ fn field_codegen(
         field_inits: Vec::new(),
         schema_fields: Vec::new(),
         param_tys: Vec::new(),
+        any_deferred: false,
     };
 
     for field in fields {
         let ident = field.ident.as_ref().expect("named field");
         let fty = &field.ty;
         let opts = parse_field_opts(&field.attrs)?;
+        out.any_deferred |= mentions_deferred(fty);
         let key = opts.rename.clone().unwrap_or_else(|| ident.to_string());
         let doc = doc_string(&field.attrs);
         let required = opts.required;
@@ -273,6 +317,7 @@ fn expand_spec(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         parse_stmts,
         field_inits,
         schema_fields,
+        any_deferred,
         ..
     } = cg;
     let unknown = unknown_keys_check();
@@ -307,6 +352,7 @@ fn expand_spec(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             pub fn schema() -> crate::htspec::DriverSchema {
                 crate::htspec::DriverSchema {
                     fields: ::std::vec![ #(#schema_fields),* ],
+                    accepts_deferred: #any_deferred,
                 }
             }
         }

@@ -250,6 +250,11 @@ impl SourceDecl {
     }
 
     fn parse_inline(m: &std::collections::HashMap<String, Value>) -> anyhow::Result<Self> {
+        // Every field below is read through `string`/`strings`/`str_map`, which
+        // refuse a deferred reference — nothing here is a template, so the text
+        // would reach a subprocess, an OIDC endpoint or a file path verbatim. The
+        // one place a reference belongs is a `present` template, which
+        // `Presentation::parse` handles.
         let kind_name = m
             .get("kind")
             .ok_or_else(|| {
@@ -563,6 +568,47 @@ mod tests {
         ]))
         .expect_err("must fail");
         assert!(format!("{err:#}").contains("`produces`"), "{err:#}");
+    }
+
+    /// The failure the whole mechanism exists to remove, and the one place it
+    /// could still have shipped: a driver that opts in wholesale and then
+    /// substitutes in only some of its fields.
+    #[test]
+    fn a_deferred_reference_in_a_source_field_is_refused_rather_than_passed_through() {
+        // An argv element that would reach the subprocess verbatim.
+        let err = SourceDecl::parse(&map(&[
+            ("kind", s("exec")),
+            (
+                "run",
+                list(&[
+                    "aws",
+                    "sts",
+                    "assume-role",
+                    "--role-arn",
+                    "${read://infra:role-arn}",
+                ]),
+            ),
+        ]))
+        .expect_err("must refuse");
+        assert!(
+            format!("{err:#}").contains("does not accept one"),
+            "{err:#}"
+        );
+
+        // A handle that would reach the OIDC endpoint verbatim.
+        SourceDecl::parse(&map(&[
+            ("kind", s("oidc")),
+            ("audience", s("${read://infra:wif}")),
+        ]))
+        .expect_err("an audience selects the token, so it is hashed and cannot be deferred");
+
+        // And the standing rule that a runner spec is never deferrable.
+        SourceDecl::parse(&map(&[
+            ("kind", s("exec")),
+            ("run", list(&["vault"])),
+            ("runner", s("${read://infra:runner}")),
+        ]))
+        .expect_err("a runner's fingerprint moves every consumer's key, so it is never deferred");
     }
 
     #[test]

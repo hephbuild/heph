@@ -1900,6 +1900,7 @@ mod tests {
     #[test]
     fn builtin_call_hovers_narrow_to_the_selected_driver() {
         let schema = DriverSchema {
+            accepts_deferred: false,
             fields: vec![
                 hplugin::driver::DriverField {
                     name: "cmd".to_string(),

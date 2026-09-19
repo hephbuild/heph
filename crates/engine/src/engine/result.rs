@@ -3632,6 +3632,22 @@ impl Engine {
         // addr, which no provider serves.
         crate::engine::expand::expand_introspect_inputs(&mut def);
 
+        // Deferred values: every `${read://…}` in the target's *config*, at any
+        // nesting depth, becomes a `hashed: true, runtime: false` input appended
+        // to the def the driver just returned.
+        //
+        // Here, and by the host, for the reason the module docs give: both of the
+        // obligations a driver could have had — collect the edges, substitute the
+        // values — fail silently, and a missed edge means the producer never
+        // builds and the value never enters the key. Appending *after* the driver
+        // computed `def.hash` is also what makes the def hash cover the
+        // unresolved reference while the producer's content still reaches
+        // `hashin` — the correct behaviour as a consequence of where the work
+        // happens rather than as a rule anyone follows.
+        let deferred_refs = self.deferred_refs(&spec.spec, &spec.driver)?;
+        def.inputs
+            .extend(crate::engine::deferred::inputs_for(&deferred_refs));
+
         let all_transitive = if apply_transitive {
             let sb = Arc::clone(&self)
                 .collect_transitive_deps(rs.clone(), &def.inputs)
@@ -3704,7 +3720,23 @@ impl Engine {
         // file — rather than only when something eventually executes. It
         // acquires nothing: the chain walk and the material live behind
         // `execute`, which a cache hit never reaches.
-        self.resolve_credentials(&rs, addr, &def.inputs).await?;
+        let resolved_credentials = self.resolve_credentials(&rs, addr, &def.inputs).await?;
+        // A deferred value a *credential declaration* names becomes an input on
+        // this target, not on the credential.
+        //
+        // A credential's own `get_def` is never called on a build path — a
+        // reference resolves through `get_spec` + `parse_declaration` — so an edge
+        // appended to its def would never be resolved and would reach no key at
+        // all. A value that shapes a run and moves no cache key is the
+        // silently-wrong-build direction; carrying it here makes the producer an
+        // ordinary hashed dependency of the thing that actually uses it.
+        for rc in &resolved_credentials {
+            def.inputs
+                .extend(crate::engine::deferred::inputs_for_labelled(
+                    &rc.deferred,
+                    Some(&rc.addr),
+                ));
+        }
 
         // Validate approval notices against the finalized input set at definition
         // time — before any result resolution or execution — so a notice naming a

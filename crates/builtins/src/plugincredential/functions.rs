@@ -866,20 +866,17 @@ mod tests {
         )
         .expect("call");
         let p = Presentation::parse(&v).expect("parse");
+        assert_eq!(p.files.get("token").map(|d| d.raw()), Some("${id_token}"));
         assert_eq!(
-            p.files.get("token").map(String::as_str),
-            Some("${id_token}")
-        );
-        assert_eq!(
-            p.env.get("AWS_WEB_IDENTITY_TOKEN_FILE").map(String::as_str),
+            p.env.get("AWS_WEB_IDENTITY_TOKEN_FILE").map(|d| d.raw()),
             Some("${file:token}")
         );
         assert_eq!(
-            p.env.get("AWS_ROLE_ARN").map(String::as_str),
+            p.env.get("AWS_ROLE_ARN").map(|d| d.raw()),
             Some("arn:aws:iam::123:role/deployer")
         );
         assert_eq!(
-            p.env.get("AWS_ROLE_SESSION_NAME").map(String::as_str),
+            p.env.get("AWS_ROLE_SESSION_NAME").map(|d| d.raw()),
             Some("heph")
         );
         assert!(p.helper.is_none(), "web identity is not a callback");
@@ -910,7 +907,7 @@ mod tests {
         let v = call("netrc", vec![list(&["a.corp", "b.corp"])], &[]).expect("call");
         let p = Presentation::parse(&v).expect("parse");
         assert_eq!(
-            p.files.get("netrc").map(String::as_str),
+            p.files.get("netrc").map(|d| d.raw()),
             Some(
                 "machine a.corp login ${username} password ${token}\nmachine b.corp login ${username} password ${token}\n"
             )

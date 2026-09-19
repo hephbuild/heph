@@ -210,7 +210,16 @@ impl hplugin::driver::Driver for Driver {
     }
 
     fn schema(&self) -> DriverSchema {
-        CredentialSpec::schema()
+        DriverSchema {
+            // `mentions_deferred` reads the *declared* field types, and it does
+            // not follow a nested `SpecStruct` — `present` is an
+            // `Option<Presentation>`, whose `env`/`files` are the maps of
+            // `Deferred<String>` that actually take a reference. So the one bit
+            // the wire carries is set here, next to the derive that computes the
+            // rest, the same way `bash` overrides it in the other direction.
+            accepts_deferred: true,
+            ..CredentialSpec::schema()
+        }
     }
 
     async fn parse(

@@ -1119,6 +1119,42 @@ pub struct RunRequest<'a, 'io> {
     /// Credentials to present for this run, already acquired and materialized by
     /// the host. Empty for the overwhelming majority of targets.
     pub credentials: Vec<CredentialMount>,
+    /// Deferred option values the host resolved, keyed by the field's raw text.
+    ///
+    /// Read through [`resolve`](RunRequest::resolve) rather than directly: a
+    /// driver that reached in here would have to know that a field with no
+    /// reference in it has no entry.
+    pub deferred: std::collections::BTreeMap<String, String>,
+}
+
+impl<'a, 'io> RunRequest<'a, 'io> {
+    /// The value of a deferred field.
+    ///
+    /// Takes `&self`, which is what makes it reachable only at run — using an
+    /// unresolved value is therefore a compile error rather than a bug that ships.
+    ///
+    /// A field with no reference in it resolves to its own text, so a driver never
+    /// branches on whether the author used one.
+    pub fn resolve<'r, 'd: 'r>(&'r self, d: &'d Deferred<String>) -> anyhow::Result<&'r str> {
+        if let Some(v) = self.deferred.get(d.raw()) {
+            return Ok(v);
+        }
+        // The host walks the whole config, so a reference it did not resolve is a
+        // host bug rather than an author's — say so, instead of handing the
+        // driver the reference text as if it were a value.
+        //
+        // Only a *deferred* kind counts. `${FOO:-default}` and every other shell
+        // construct passes straight through, because heph does not own them and a
+        // deferrable field must still accept a command that uses one.
+        if hcore::template::has_deferred_ref(d.raw()) {
+            anyhow::bail!(
+                "the host did not resolve {:?} — a deferred field's value is filled in before the \
+                 run, so this is a bug in heph rather than in the BUILD file",
+                d.raw()
+            );
+        }
+        Ok(d.raw())
+    }
 }
 /// Cleanup closure a driver returns for the engine to run after `cache_locally`.
 /// The FUSE/OS sandbox layers each supply their own teardown; the engine's
@@ -1169,6 +1205,120 @@ pub struct DriverField {
 #[derive(Clone, Debug, Default)]
 pub struct DriverSchema {
     pub fields: Vec<DriverField>,
+    /// Whether this driver understands **deferred values** — a
+    /// `${read://pkg:name}` reference in an option, resolved by the host at run.
+    ///
+    /// Whole-driver granularity, and that is the whole of what the wire carries.
+    /// Per-*field* safety needs no flag: [`Deferred`] is the one type that
+    /// accepts a reference, and `String::from_spec_value` rejects the reserved
+    /// prefixes everywhere else, so a reference in `out`, `deps`, `name` or a
+    /// glob is a parse error in every driver at once. A flat per-field flag could
+    /// not describe a reference nested three levels inside a list-of-maps either,
+    /// which is exactly the shape a credential's `sources` has.
+    ///
+    /// What is left is the mixed-version case. A plugin built before this feature
+    /// carries an old `String` decoder that rejects nothing: it would decode
+    /// `"${read://infra:role-arn}"` as a literal, synthesize no edge, never build
+    /// the producer, and run the target with the reference *text* as the value —
+    /// exiting 0 if the tool tolerates it. Not cache poisoning (the two plugins
+    /// compute different `hashin`s, so neither serves the other's artifact), but a
+    /// silent wrong value is a break regardless. `false` is the default on every
+    /// path, including a schema decoded from an older plugin, so the host refuses
+    /// references for anything that has not said otherwise.
+    pub accepts_deferred: bool,
+}
+
+/// A driver option whose value may arrive late.
+///
+/// The problem it solves: a driver option's value has to be a literal in the
+/// BUILD file, but the value's owner is somewhere else — Terraform state, a
+/// release process, a script. Copying it in makes a second source of truth that
+/// someone has to keep agreeing with the first, purely to satisfy heph.
+///
+/// # The whole of a driver's diff
+///
+/// ```ignore
+///  #[derive(Spec)]
+///  struct MySpec {
+/// -    role: String,
+/// +    role: Deferred<String>,
+///  }
+/// ```
+///
+/// No parsing, no edge collection, no substitution call, no schema annotation.
+/// The host walks the raw config for references, appends the dependency edges
+/// after `parse`, resolves the producers and hands the values over — because both
+/// of the obligations a driver could have had here fail *silently*: a missed edge
+/// means the producer never builds and the value never enters the key, and a
+/// missed substitution means the reference text is used as the value.
+///
+/// # Why it does not deref
+///
+/// Reading it requires a [`RunRequest`], which exists only at run. So the one
+/// remaining way to get this wrong — using an unresolved value — is a compile
+/// error rather than a runtime surprise. The author cannot write the bug.
+/// `transparent`, so the serialized shape is the string it replaced.
+///
+/// Not cosmetic: `heph inspect def` prints a driver's `raw_def` verbatim, so
+/// without this, retyping `run` from `Vec<String>` to `Vec<Deferred<String>>`
+/// would turn `["sh", "-c", …]` into `[{"raw":"sh"}, …]` for every exec and bash
+/// target — a silent shape change for anything parsing that output. The `Hash`
+/// impl below carries the same invariant for the cache key.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Deferred<T> {
+    /// The field's text exactly as the BUILD file wrote it: a bare literal, a
+    /// lone `${read://…}`, or a template mixing the two.
+    raw: String,
+    // `fn() -> T` rather than `T`: the parameter is a tag, so `Deferred<T>`
+    // should not inherit `T`'s auto-traits or drop-check.
+    #[serde(skip)]
+    _t: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Deferred<T> {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self {
+            raw: raw.into(),
+            _t: std::marker::PhantomData,
+        }
+    }
+
+    /// The unresolved text.
+    ///
+    /// For the host (which does the substitution) and for diagnostics. A driver
+    /// wanting the *value* calls [`RunRequest::resolve`]; this deliberately does
+    /// not give it one.
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+}
+
+/// Delegates to the raw text, so a def hash is **byte-identical** to what it was
+/// before the field's type changed.
+///
+/// This is the invariant that makes retyping an existing field safe. Without it
+/// every target of that driver invalidates on upgrade, and a mixed fleet —
+/// laptops on N−1, CI on N, one shared remote — double-populates the remote for
+/// the whole workspace. The `runner` field carries exactly this invariant already.
+impl<T> std::hash::Hash for Deferred<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.raw.hash(state);
+    }
+}
+
+impl<T> PartialEq for Deferred<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl<T> Eq for Deferred<T> {}
+
+impl<T> std::fmt::Debug for Deferred<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Deferred({:?})", self.raw)
+    }
 }
 
 #[async_trait]

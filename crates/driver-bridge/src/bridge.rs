@@ -349,6 +349,7 @@ mod shell_fallback_tests {
             sandbox_dir: sandbox.clone(),
             scratch: vec![],
             credentials: vec![],
+            deferred: Default::default(),
         };
 
         bridge.run_shell(req, &ctoken).await?;

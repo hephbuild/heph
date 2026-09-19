@@ -21,6 +21,26 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.10.0: deferred values. `RunRequest`/`ManagedRunRequest` gained
+/// `map<string, string> deferred` — option values the host resolved from another
+/// target's output — and `Schema` gained `bool accepts_deferred`. Additive and
+/// cold-path on both counts.
+///
+/// The bump exists for the *schema* field rather than the map. A plugin built
+/// before this feature carries an old `String` decoder that rejects nothing: it
+/// would decode `"${read://infra:role-arn}"` as a literal, synthesize no edge,
+/// never build the producer, and run the target with the reference **text** as
+/// the value — exiting 0 if the tool tolerates it. Not cache poisoning (the two
+/// plugins compute different `hashin`s, so neither serves the other's artifact),
+/// but a silent wrong value regardless, and host/plugin skew is reachable today
+/// since the cdylibs ship as separate artifacts pinned independently of the
+/// binary.
+///
+/// prost decodes an absent `accepts_deferred` as `false`, so an old plugin's
+/// schema makes the host refuse every reference in that driver's config at parse
+/// — loudly, naming the driver — rather than letting one through. Minor,
+/// therefore: no plugin *must* be rebuilt, but one must be to accept a reference.
+///
 /// 0.9.0: `RunRequest`/`ManagedRunRequest` gained `repeated CredentialMount
 /// credentials` — identities the host resolved, acquired and materialized for the
 /// run, which the driver applies as runtime environment, a PATH prefix, and a
@@ -64,7 +84,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.9.0";
+pub const ABI_SEMVER: &str = "0.10.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

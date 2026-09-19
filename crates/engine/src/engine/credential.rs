@@ -45,7 +45,7 @@ use hbuiltins::plugincredential::{
 use hcore::template::Ref;
 use hdriver_support::credential::is_credential;
 use hmodel::htaddr::Addr;
-use hplugin::driver::{CREDENTIAL_ENV_MAX_BYTES, CredentialMount};
+use hplugin::driver::{CREDENTIAL_ENV_MAX_BYTES, CredentialMount, Deferred};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,6 +58,29 @@ pub use crate::engine::credential_store::{CredentialStore, Material};
 pub struct ResolvedCredential {
     pub addr: Addr,
     pub def: CredentialDef,
+    /// Deferred references in this declaration's own config.
+    ///
+    /// A role ARN, a workload-identity audience: values whose owner is the
+    /// Terraform that created them rather than this BUILD file.
+    ///
+    /// These become inputs on the **consumer**, not on the credential — and that
+    /// is the load-bearing part. A credential target's `get_def` is never called
+    /// on a build path (a reference resolves through `get_spec` +
+    /// `parse_declaration`), so an edge appended to the credential's own def is
+    /// never resolved and never reaches any key. A deferred value that shapes a
+    /// run and moves no cache key is the silently-wrong-build direction this
+    /// whole mechanism exists to forbid — one build reads `registry.dev`, the
+    /// next reads `registry.prod` under an identical `hashin`, and the second is
+    /// served the first's artifact.
+    ///
+    /// So the producer rides to the consumer as an ordinary `hashed: true,
+    /// runtime: false` input, exactly as a driver-option reference does. The cost
+    /// is over-invalidation — changing a role ARN rebuilds the targets that use
+    /// it — which is the direction that errs toward a spurious miss rather than a
+    /// wrong build, and is why *material* stays on the other side of the line: it
+    /// is unhashed because a target's output must be identical whichever identity
+    /// produced it, which is not true of an ARN that selects an account.
+    pub deferred: Vec<crate::engine::deferred::DeferredRef>,
 }
 
 /// What led to a credential: the addresses already being acquired, and the
@@ -320,7 +343,12 @@ impl Engine {
 
             let def = parse_declaration(&spec)
                 .with_context(|| format!("{consumer} references credential {addr}"))?;
-            resolved.push(ResolvedCredential { addr, def });
+            let deferred = self.deferred_refs(&spec, &spec.driver)?;
+            resolved.push(ResolvedCredential {
+                addr,
+                def,
+                deferred,
+            });
         }
 
         check_env_collisions(consumer, &resolved)?;
@@ -1015,8 +1043,11 @@ impl Engine {
             // directory means one acquisition's teardown deletes the other's
             // files while its subprocess is still reading them.
             let dir = presented.add_under(self.credential_store().root())?;
+            // A source credential's own declaration may name deferred values too.
+            let cred_refs = self.deferred_refs(&cred_spec, &cred_spec.driver)?;
+            let values = self.deferred_values(rs, &cred_refs, &cred_addr).await?;
             let mount = self
-                .present_material(&cred_addr, present, &acquired, &dir)
+                .present_material(&cred_addr, present, &acquired, &dir, &values)
                 .with_context(|| format!("present {cred_addr} to a credential command"))?;
             env.extend(
                 mount
@@ -1164,8 +1195,15 @@ impl Engine {
             })?;
             let present = rc.def.presentation_for(source)?;
             let dir = root.join(sanitize_addr(&rc.addr));
+            // Deferred values this declaration named, resolved from the store.
+            // The producers are already built: they are `hashed` inputs on the
+            // credential's own def, so its `hashin` waited on them.
+            let values = self
+                .deferred_values(rs, &rc.deferred, &rc.addr)
+                .await
+                .with_context(|| format!("resolve deferred values for credential {}", rc.addr))?;
             let mount = self
-                .present_material(&rc.addr, present, &acquired, &dir)
+                .present_material(&rc.addr, present, &acquired, &dir, &values)
                 .with_context(|| format!("present credential {} to {consumer}", rc.addr))?;
             mounts.push(mount);
         }
@@ -1179,6 +1217,7 @@ impl Engine {
         present: &Presentation,
         acquired: &Acquired,
         dir: &Path,
+        deferred: &BTreeMap<String, String>,
     ) -> anyhow::Result<CredentialMount> {
         let material = &acquired.material;
         let helper_command = helper_command()?;
@@ -1229,22 +1268,22 @@ impl Engine {
         // round either resolves at least one file or stops, and it does not
         // silently cap how deep a legitimate chain may be. Refusing to iterate
         // further than that is what keeps this from becoming a template language.
-        let dialect = present.helper.as_ref().map(|h| h.dialect()).transpose()?;
-        let mut pending: Vec<(&String, &String)> = present.files.iter().collect();
+        let ctx = RenderCtx {
+            material,
+            dialect: present.helper.as_ref().map(|h| h.dialect()).transpose()?,
+            helper_command: &helper_command,
+            helper_args: &helper_args,
+            deferred,
+            pkg: &addr.package,
+        };
+        let mut pending: Vec<(&String, &Deferred<String>)> = present.files.iter().collect();
         let mut stuck: Option<(String, anyhow::Error)> = None;
         while !pending.is_empty() {
             let before = pending.len();
-            let mut deferred = Vec::with_capacity(before);
+            let mut retry = Vec::with_capacity(before);
             stuck = None;
             for (name, tmpl) in pending {
-                match render(
-                    tmpl,
-                    material,
-                    &files,
-                    dialect,
-                    &helper_command,
-                    &helper_args,
-                ) {
+                match render(tmpl.raw(), &ctx, &files) {
                     Ok(body) => {
                         let path = dir.join(name);
                         crate::engine::credential_store::write_private_file(&path, body.as_bytes())
@@ -1258,15 +1297,15 @@ impl Engine {
                         if stuck.is_none() {
                             stuck = Some((name.clone(), e));
                         }
-                        deferred.push((name, tmpl));
+                        retry.push((name, tmpl));
                     }
                 }
             }
             // No file resolved this round, so none ever will.
-            if deferred.len() == before {
+            if retry.len() == before {
                 break;
             }
-            pending = deferred;
+            pending = retry;
         }
         if let Some((name, err)) = stuck {
             return Err(err.context(format!("credential {addr}: presented file `{name}`")));
@@ -1383,17 +1422,9 @@ impl Engine {
             }
         }
 
-        let dialect = present.helper.as_ref().map(|h| h.dialect()).transpose()?;
         for (name, tmpl) in &present.env {
-            let value = render(
-                tmpl,
-                material,
-                &files,
-                dialect,
-                &helper_command,
-                &helper_args,
-            )
-            .with_context(|| format!("credential {addr}: environment variable `{name}`"))?;
+            let value = render(tmpl.raw(), &ctx, &files)
+                .with_context(|| format!("credential {addr}: environment variable `{name}`"))?;
             if value.len() > CREDENTIAL_ENV_MAX_BYTES {
                 anyhow::bail!(
                     "credential {addr}: `{name}` is {} bytes, over the {CREDENTIAL_ENV_MAX_BYTES}-byte \
@@ -1411,7 +1442,7 @@ impl Engine {
                     "credential {addr}: `{name}` is set both by the `{}` helper and by this \
                      presentation's `env`. One would shadow the other — drop it from `env`, or \
                      use a different variable",
-                    dialect.map(Dialect::as_str).unwrap_or("?")
+                    ctx.dialect.map(Dialect::as_str).unwrap_or("?")
                 );
             }
             env.insert(name.clone(), value);
@@ -1813,18 +1844,30 @@ fn parse_expiry(v: &serde_json::Value) -> anyhow::Result<u64> {
     }
 }
 
+/// Everything a presentation template resolves against except the files, which
+/// are still being written while the templates naming them render — so they
+/// stay a separate argument rather than a borrow frozen into this.
+struct RenderCtx<'a> {
+    material: &'a Material,
+    dialect: Option<Dialect>,
+    helper_command: &'a Path,
+    helper_args: &'a dyn Fn(Dialect) -> Vec<String>,
+    deferred: &'a BTreeMap<String, String>,
+    /// The *declaring* package, which is what a relative `${read::v}` is
+    /// normalized against.
+    pkg: &'a hmodel::htpkg::PkgBuf,
+}
+
 /// Substitute a presentation template.
 ///
 /// Single-pass by construction (see [`hcore::template`]): material containing
 /// `${` is never re-interpreted.
 fn render(
     tmpl: &str,
-    material: &Material,
+    ctx: &RenderCtx<'_>,
     files: &BTreeMap<String, PathBuf>,
-    dialect: Option<Dialect>,
-    helper_command: &Path,
-    helper_args: &dyn Fn(Dialect) -> Vec<String>,
 ) -> anyhow::Result<String> {
+    let material = ctx.material;
     hcore::template::render(tmpl, |r: &Ref<'_>| match r.kind {
         None => material.fields.get(r.arg).cloned().ok_or_else(|| {
             anyhow::anyhow!(
@@ -1844,18 +1887,38 @@ fn render(
                 )
             }),
         Some("helper") => {
-            let dialect = dialect.ok_or_else(|| {
+            let dialect = ctx.dialect.ok_or_else(|| {
                 anyhow::anyhow!(
                     "`${{helper:{}}}` needs a `helper` dialect on this presentation",
                     r.arg
                 )
             })?;
             match r.arg {
-                "command" => Ok(helper_command.to_string_lossy().into_owned()),
-                "args" => Ok(serde_json::to_string(&helper_args(dialect))
+                "command" => Ok(ctx.helper_command.to_string_lossy().into_owned()),
+                "args" => Ok(serde_json::to_string(&(ctx.helper_args)(dialect))
                     .unwrap_or_else(|_e| "[]".to_string())),
                 other => anyhow::bail!("unknown `${{helper:{other}}}`"),
             }
+        }
+        // A deferred value: an ARN, an audience — config whose owner is somewhere
+        // else. Resolved by the host before this runs, so the lookup cannot fail
+        // for a reference the walk found.
+        //
+        // The address is normalized against the *declaring* package, the same way
+        // the walk normalized it when it keyed the map. Matching on the text
+        // instead would resolve `${read::v}` in package `zzz` to whichever key
+        // happened to end with `:v` — `//aaa:v`, in sort order — and hand the
+        // author a different producer's bytes with no diagnostic.
+        Some(crate::engine::deferred::READ) => {
+            let want = hmodel::htaddr::parse_addr_with_base(r.arg, ctx.pkg)?;
+            ctx.deferred.get(&want.format()).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the host did not resolve `{}` — a deferred value is read before the \
+                     presentation is rendered, so this is a bug in heph rather than in the BUILD \
+                     file",
+                    r.raw
+                )
+            })
         }
         Some(other) => anyhow::bail!("unknown template kind `{other}`"),
     })
@@ -2170,29 +2233,44 @@ mod tests {
         let files = BTreeMap::from([("kc".to_string(), PathBuf::from("/s/.heph/auth/a/kc"))]);
         let args = |d: Dialect| vec!["__auth-helper".to_string(), d.as_str().to_string()];
         let cmd = PathBuf::from("/usr/local/bin/heph");
+        let deferred = BTreeMap::from([(
+            "//infra:role-arn".to_string(),
+            "arn:aws:iam::1:role/deployer".to_string(),
+        )]);
+        let pkg = hmodel::htpkg::PkgBuf::from("auth");
+        let ctx = RenderCtx {
+            material: &material,
+            dialect: None,
+            helper_command: &cmd,
+            helper_args: &args,
+            deferred: &deferred,
+            pkg: &pkg,
+        };
         assert_eq!(
-            render("Bearer ${token}", &material, &files, None, &cmd, &args).expect("render"),
+            render("Bearer ${token}", &ctx, &files).expect("render"),
             "Bearer tok"
         );
+        // A deferred value: config whose owner is the Terraform that created it,
+        // resolved by the host before the presentation is rendered.
         assert_eq!(
-            render("${file:kc}", &material, &files, None, &cmd, &args).expect("render"),
-            "/s/.heph/auth/a/kc"
+            render("${read://infra:role-arn}", &ctx, &files).expect("render"),
+            "arn:aws:iam::1:role/deployer"
         );
         assert_eq!(
-            render(
-                "${helper:command}",
-                &material,
-                &files,
-                Some(Dialect::Kubernetes),
-                &cmd,
-                &args
-            )
-            .expect("render"),
+            render("${file:kc}", &ctx, &files).expect("render"),
+            "/s/.heph/auth/a/kc"
+        );
+        let with_dialect = RenderCtx {
+            dialect: Some(Dialect::Kubernetes),
+            ..ctx
+        };
+        assert_eq!(
+            render("${helper:command}", &with_dialect, &files).expect("render"),
             "/usr/local/bin/heph"
         );
         // An unknown field names what the source did yield, rather than
         // substituting an empty string.
-        let err = render("${nope}", &material, &files, None, &cmd, &args).expect_err("must fail");
+        let err = render("${nope}", &with_dialect, &files).expect_err("must fail");
         assert!(format!("{err:#}").contains("token"), "{err:#}");
     }
 
@@ -2229,11 +2307,12 @@ mod tests {
             def: CredentialDef {
                 sources: vec![],
                 present: Some(Presentation {
-                    env: BTreeMap::from([(var.to_string(), "${token}".to_string())]),
+                    env: BTreeMap::from([(var.to_string(), Deferred::new("${token}"))]),
                     ..Presentation::default()
                 }),
                 ttl: None,
             },
+            deferred: vec![],
         };
         let consumer = Addr::new(
             hmodel::htpkg::PkgBuf::from("svc"),

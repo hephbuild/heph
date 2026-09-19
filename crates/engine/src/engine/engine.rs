@@ -134,6 +134,20 @@ pub struct Engine {
     /// CLI for the same credential.
     pub(crate) credential_lock: crate::engine::credential::CredentialLock,
 
+    /// Deferred option values, keyed on the *producer's* `hashin`.
+    ///
+    /// Caches the derived value, never the resolution — the rule
+    /// `execrunner_host` already follows for a runner's config. The shape this
+    /// feature invites is fan-out (one `//infra:registry`, every image target),
+    /// and `result_addr` memoizes the producer's *build* but not the artifact
+    /// walk, so without this each consumer re-walks and re-reads the tar.
+    ///
+    /// Per engine rather than process-wide, and through the memoizer rather than
+    /// a bare map, so two concurrent misses single-flight instead of both doing
+    /// the read.
+    pub(crate) deferred_values:
+        hcore::hmemoizer::Memoizer<String, Result<String, Arc<anyhow::Error>>>,
+
     /// Ordered set of remote (shared) caches fronting the local cache. Empty
     /// (a cheap no-op on every path) unless `caches:` is configured.
     pub(crate) remote_caches: Arc<crate::engine::RemoteCacheSet>,
@@ -492,7 +506,7 @@ impl Engine {
         let mut engine = Engine {
             cfg: cfg.clone(),
             home: home.clone(),
-            runtime,
+            runtime: runtime.clone(),
             local_cache,
             local_cache_tmp,
             walker,
@@ -540,6 +554,7 @@ impl Engine {
             scratch_lock,
             credential_cache: Default::default(),
             credential_lock,
+            deferred_values: hcore::hmemoizer::Memoizer::with_tag_task("deferred_value", runtime),
             remote_caches,
             provider_functions_wired: std::sync::Once::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),

@@ -1265,6 +1265,7 @@ mod tests {
             use hplugin::driver::{DriverField, DriverSchema};
             match name {
                 "exec" => Some(DriverSchema {
+                    accepts_deferred: false,
                     fields: vec![DriverField {
                         name: "cmd".to_string(),
                         ty: ParamType::String,
