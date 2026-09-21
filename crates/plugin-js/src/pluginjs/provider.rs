@@ -6162,6 +6162,9 @@ mod tests {
                 stdout: None,
                 stderr: None,
                 sandbox_dir: PathBuf::new(),
+                scratch: vec![],
+                credentials: vec![],
+                deferred: Default::default(),
             },
             &ct,
         )
@@ -6293,6 +6296,9 @@ mod tests {
                 stdout: None,
                 stderr: None,
                 sandbox_dir: PathBuf::new(),
+                scratch: vec![],
+                credentials: vec![],
+                deferred: Default::default(),
             },
             &ct,
         )

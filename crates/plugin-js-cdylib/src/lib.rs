@@ -154,6 +154,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         drivers,
         // The js plugin exports no hooks yet.
         hooks: stabby::vec::Vec::new(),
+        // The js plugin exports no exec runners yet.
+        runners: stabby::vec::Vec::new(),
         // No return-side metadata to report yet.
         meta: stabby::vec::Vec::new(),
     })
