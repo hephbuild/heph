@@ -36,6 +36,7 @@
 use crate::SpecRewrite;
 use crate::agent::{AGENT_SUBCOMMAND, CLIENT_SUBCOMMAND, SOCK_ENV};
 use crate::registry::{ExecRunner, RunnerCtx};
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -117,14 +118,15 @@ struct Live {
 }
 
 pub struct SessionRunner {
-    /// Where agent sockets live. Handed over rather than discovered.
+    /// Where agent sockets live when the path fits. Handed over rather than
+    /// discovered.
     ///
-    /// `sun_path` is 104 bytes on macOS (108 on Linux) and a macOS `$TMPDIR` is
-    /// `/var/folders/xy/<~30 chars>/T/`, so a socket under it plus a digest
-    /// overflows — `bind` fails, or silently truncates and two sessions collide
-    /// on one socket. heph controls the depth of its own state directory, so it
-    /// supplies one. (`$TMPDIR` is also simply absent in a plugin's
-    /// environment, which is the other half of the rule.)
+    /// `sun_path` is 104 bytes on macOS (108 on Linux), and this directory sits
+    /// under heph's home, whose depth is the user's — a repository in a nested
+    /// worktree is enough to overflow it. When it does, the socket goes to
+    /// [`SHORT_SOCKET_ROOT`] instead: see [`socket_path`]. (`$TMPDIR` is not
+    /// the answer: a macOS one is `/var/folders/xy/<~30 chars>/T/`, most of the
+    /// budget on its own, and it is simply absent in a plugin's environment.)
     socket_dir: PathBuf,
     /// One slot per key, so two targets racing to first-use the same session
     /// start one agent rather than two — while two *different* sessions still
@@ -186,20 +188,11 @@ impl SessionRunner {
         let exe = std::env::current_exe()
             .map_err(|e| anyhow::anyhow!("runner {}: locate the heph binary: {e}", ctx.addr))?;
 
-        std::fs::create_dir_all(&self.socket_dir).map_err(|e| {
-            anyhow::anyhow!(
-                "runner {}: create agent socket dir {:?}: {e}",
-                ctx.addr,
-                self.socket_dir
-            )
-        })?;
-
         // Short and fixed-width, for `sun_path`. The pid disambiguates two heph
-        // processes sharing a home directory; the digest, two sessions in one.
-        let socket =
-            self.socket_dir
-                .join(format!("{}-{}.sock", short_digest(ctx), std::process::id()));
-        assert_socket_path_fits(&socket)?;
+        // processes sharing a directory; the digest, two sessions in one.
+        let name = format!("{}-{}.sock", short_digest(ctx), std::process::id());
+        let socket = socket_path(&self.socket_dir, Path::new(SHORT_SOCKET_ROOT), &name)
+            .with_context(|| format!("runner {}: place the agent socket", ctx.addr))?;
 
         let (program, args) = build_launch_argv(cfg, &exe, &socket)?;
 
@@ -389,16 +382,90 @@ fn cfg_launch_hint(ctx: &RunnerCtx<'_>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// macOS `sun_path` is 104 bytes, Linux 108. Checked rather than discovered as
-/// an `ENAMETOOLONG` from `bind`, or — worse on some libcs — a silent
-/// truncation that makes two sessions share one socket.
-fn assert_socket_path_fits(socket: &Path) -> anyhow::Result<()> {
-    const SUN_PATH_MIN: usize = 104;
-    let len = socket.as_os_str().as_encoded_bytes().len();
-    if len >= SUN_PATH_MIN {
+/// Where agent sockets go when heph's home is too deep for `sun_path`.
+///
+/// A literal `/tmp`, not `$TMPDIR`, for the length: this is the one directory
+/// that is short, present, and the same on every supported platform. Sockets go
+/// in a per-user subdirectory that [`ensure_private_dir`] vets, because `/tmp`
+/// is shared and a directory someone else pre-created there would otherwise
+/// hand them the socket every target's stdio is passed through.
+const SHORT_SOCKET_ROOT: &str = "/tmp";
+
+/// macOS `sun_path` is 104 bytes, Linux 108; the smaller is the budget, so the
+/// behavior is the same on both.
+const SUN_PATH_MIN: usize = 104;
+
+/// The socket named `name`: under `preferred` when that fits in `sun_path`,
+/// otherwise under a private per-user directory in `short_root`.
+///
+/// heph's home is wherever the repository is, and its depth is not heph's to
+/// choose, so refusing a long one would make agent mode unusable from a nested
+/// worktree. The preferred directory stays first so the common case keeps its
+/// sockets next to the rest of heph's state.
+fn socket_path(preferred: &Path, short_root: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let socket = preferred.join(name);
+    if fits_sun_path(&socket) {
+        std::fs::create_dir_all(preferred)
+            .with_context(|| format!("create agent socket dir {preferred:?}"))?;
+        return Ok(socket);
+    }
+
+    let dir = short_root.join(format!("heph-{}", rustix::process::geteuid().as_raw()));
+    let socket = dir.join(name);
+    if !fits_sun_path(&socket) {
+        // Only reachable with a pathological `name`; the root is a constant.
         anyhow::bail!(
-            "agent socket path is {len} bytes, over the {SUN_PATH_MIN}-byte unix-socket limit \
-             (macOS; Linux allows 108): {socket:?}. Move heph's home directory somewhere shorter."
+            "agent socket path is {} bytes, over the {SUN_PATH_MIN}-byte unix-socket limit: \
+             {socket:?}",
+            socket.as_os_str().len()
+        );
+    }
+    tracing::debug!(
+        preferred = ?preferred,
+        socket = ?socket,
+        "heph home too deep for a unix socket path; using the short socket directory"
+    );
+    ensure_private_dir(&dir)?;
+    Ok(socket)
+}
+
+/// Checked rather than discovered as an `ENAMETOOLONG` from `bind`, or — worse
+/// on some libcs — a silent truncation that makes two sessions share a socket.
+fn fits_sun_path(socket: &Path) -> bool {
+    socket.as_os_str().as_encoded_bytes().len() < SUN_PATH_MIN
+}
+
+/// Create `dir` as `0700`, or accept it only if it already is a real directory
+/// owned by this user that no one else can enter.
+///
+/// It lives in a world-writable parent, so its existence proves nothing: it
+/// could be another user's, or a symlink to one. `symlink_metadata` rather
+/// than `metadata` for exactly that reason.
+fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("create agent socket dir {dir:?}")),
+    }
+    let meta = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("inspect agent socket dir {dir:?}"))?;
+    let euid = rustix::process::geteuid().as_raw();
+    if !meta.file_type().is_dir() || meta.uid() != euid || meta.mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "agent socket dir {dir:?} is not a private directory of this user (want a directory \
+             owned by uid {euid} with mode 0700; found {}, uid {}, mode {:o}). Remove it and \
+             retry.",
+            if meta.file_type().is_symlink() {
+                "a symlink"
+            } else if meta.file_type().is_dir() {
+                "a directory"
+            } else {
+                "a file"
+            },
+            meta.uid(),
+            meta.mode() & 0o7777,
         );
     }
     Ok(())
@@ -561,19 +628,64 @@ mod tests {
         );
     }
 
-    /// Caught here rather than as an `ENAMETOOLONG` from `bind` — or, on some
-    /// libcs, a silent truncation that makes two sessions share a socket.
+    /// A home deep enough to overflow `sun_path` is where the user keeps their
+    /// repository, not a mistake to report — the socket moves somewhere short.
     #[test]
-    fn an_overlong_socket_path_is_refused_with_the_limit() {
-        let long = PathBuf::from(format!("/tmp/{}/agent.sock", "x".repeat(120)));
-        let err = assert_socket_path_fits(&long).expect_err("must refuse");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("104"), "{msg}");
+    fn a_deep_home_falls_back_to_the_short_socket_dir() {
+        let root = tempfile::Builder::new()
+            .prefix("hs")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let deep = PathBuf::from(format!("/nonexistent/{}/run", "x".repeat(120)));
+        let socket = socket_path(&deep, root.path(), "ab12cd34-999.sock").expect("placed");
+
+        assert!(fits_sun_path(&socket), "{socket:?}");
+        let dir = socket.parent().expect("parent");
+        assert_eq!(dir.parent(), Some(root.path()));
+        assert!(!deep.exists(), "the overlong directory must not be created");
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(dir).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Reused, not refused, the second time.
+        socket_path(&deep, root.path(), "ab12cd34-1000.sock").expect("reused");
     }
 
     #[test]
-    fn a_short_socket_path_is_accepted() {
-        assert_socket_path_fits(Path::new("/tmp/h/ab12cd34-999.sock")).expect("fits");
+    fn a_home_that_fits_keeps_its_sockets() {
+        let home = tempfile::Builder::new()
+            .prefix("hh")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let run = home.path().join("run");
+        let socket = socket_path(&run, Path::new("/unused"), "ab12cd34-999.sock").expect("placed");
+        assert_eq!(socket, run.join("ab12cd34-999.sock"));
+        assert!(run.is_dir());
+    }
+
+    /// `/tmp` is shared: a directory anyone else can enter would let them at the
+    /// socket every target's stdio passes through.
+    #[test]
+    fn a_short_socket_dir_others_can_enter_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("open");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let err = ensure_private_dir(&dir).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("mode 777"), "{err:#}");
+    }
+
+    #[test]
+    fn a_symlinked_short_socket_dir_is_refused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let target = root.path().join("real");
+        std::fs::create_dir(&target).expect("mkdir");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = ensure_private_dir(&link).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("a symlink"), "{err:#}");
     }
 
     #[test]
