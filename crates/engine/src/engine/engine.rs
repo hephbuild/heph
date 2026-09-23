@@ -518,14 +518,8 @@ impl Engine {
             requests: Mutex::new(HashMap::new()),
             exec_runners: Arc::new({
                 let mut registry = hexecrunner::registry::RunnerRegistry::with_builtins();
-                // The agent-mode runner needs a directory for its sockets, and
-                // is handed one rather than discovering `$TMPDIR`: a macOS
-                // `sun_path` is 104 bytes and a macOS `$TMPDIR` is most of that
-                // on its own. heph controls the depth of its own home.
                 registry
-                    .register(Arc::new(hexecrunner::session::SessionRunner::new(
-                        home.join("run"),
-                    )))
+                    .register(Arc::new(hexecrunner::session::SessionRunner::new()))
                     .context("register the builtin session exec runner")?;
                 registry
             }),

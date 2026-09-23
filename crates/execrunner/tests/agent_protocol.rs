@@ -421,10 +421,17 @@ fn a_session_whose_launch_dies_fails_fast() {
     use hcore::hasync::StdCancellationToken;
     use std::sync::Arc;
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    // Under `/tmp`, because macOS caps `sun_path` at 104 bytes and a `$TMPDIR`
+    // is most of that already.
+    let dir = tempfile::Builder::new()
+        .prefix("hs")
+        .tempdir_in("/tmp")
+        .expect("tempdir");
     let mut reg = RunnerRegistry::default();
-    reg.register(Arc::new(SessionRunner::new(dir.path().to_path_buf())))
-        .expect("register");
+    reg.register(Arc::new(SessionRunner::with_socket_root(
+        dir.path().to_path_buf(),
+    )))
+    .expect("register");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
