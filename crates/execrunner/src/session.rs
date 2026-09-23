@@ -118,16 +118,9 @@ struct Live {
 }
 
 pub struct SessionRunner {
-    /// Where agent sockets live when the path fits. Handed over rather than
-    /// discovered.
-    ///
-    /// `sun_path` is 104 bytes on macOS (108 on Linux), and this directory sits
-    /// under heph's home, whose depth is the user's — a repository in a nested
-    /// worktree is enough to overflow it. When it does, the socket goes to
-    /// [`SHORT_SOCKET_ROOT`] instead: see [`socket_path`]. (`$TMPDIR` is not
-    /// the answer: a macOS one is `/var/folders/xy/<~30 chars>/T/`, most of the
-    /// budget on its own, and it is simply absent in a plugin's environment.)
-    socket_dir: PathBuf,
+    /// The directory under which this user's private socket directory is
+    /// made: [`SOCKET_ROOT`] outside tests. See [`socket_path`].
+    socket_root: PathBuf,
     /// One slot per key, so two targets racing to first-use the same session
     /// start one agent rather than two — while two *different* sessions still
     /// start concurrently.
@@ -140,10 +133,23 @@ pub struct SessionRunner {
     live: Mutex<Vec<Live>>,
 }
 
+impl Default for SessionRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionRunner {
-    pub fn new(socket_dir: PathBuf) -> Self {
+    /// Sockets go under [`SOCKET_ROOT`].
+    pub fn new() -> Self {
+        Self::with_socket_root(PathBuf::from(SOCKET_ROOT))
+    }
+
+    /// Sockets go under `socket_root` instead, so a test does not share the
+    /// real per-user directory with every other heph on the machine.
+    pub fn with_socket_root(socket_root: PathBuf) -> Self {
         Self {
-            socket_dir,
+            socket_root,
             slots: Mutex::new(HashMap::new()),
             live: Mutex::new(Vec::new()),
         }
@@ -191,7 +197,7 @@ impl SessionRunner {
         // Short and fixed-width, for `sun_path`. The pid disambiguates two heph
         // processes sharing a directory; the digest, two sessions in one.
         let name = format!("{}-{}.sock", short_digest(ctx), std::process::id());
-        let socket = socket_path(&self.socket_dir, Path::new(SHORT_SOCKET_ROOT), &name)
+        let socket = socket_path(&self.socket_root, &name)
             .with_context(|| format!("runner {}: place the agent socket", ctx.addr))?;
 
         let (program, args) = build_launch_argv(cfg, &exe, &socket)?;
@@ -382,49 +388,36 @@ fn cfg_launch_hint(ctx: &RunnerCtx<'_>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Where agent sockets go when heph's home is too deep for `sun_path`.
+/// Where agent sockets go.
 ///
-/// A literal `/tmp`, not `$TMPDIR`, for the length: this is the one directory
-/// that is short, present, and the same on every supported platform. Sockets go
-/// in a per-user subdirectory that [`ensure_private_dir`] vets, because `/tmp`
-/// is shared and a directory someone else pre-created there would otherwise
-/// hand them the socket every target's stdio is passed through.
-const SHORT_SOCKET_ROOT: &str = "/tmp";
+/// Not heph's home: its depth is wherever the user keeps the repository, and
+/// `sun_path` is 104 bytes on macOS (108 on Linux) — a nested worktree is
+/// enough to overflow it. Not `$TMPDIR` either: a macOS one is
+/// `/var/folders/xy/<~30 chars>/T/`, most of the budget on its own, and it is
+/// absent in a plugin's environment. A literal `/tmp` is short, present, and
+/// the same on every supported platform.
+///
+/// It is shared, so sockets go in a per-user subdirectory that
+/// [`ensure_private_dir`] vets: a directory someone else pre-created there
+/// would otherwise hand them the socket every target's stdio is passed through.
+const SOCKET_ROOT: &str = "/tmp";
 
 /// macOS `sun_path` is 104 bytes, Linux 108; the smaller is the budget, so the
 /// behavior is the same on both.
 const SUN_PATH_MIN: usize = 104;
 
-/// The socket named `name`: under `preferred` when that fits in `sun_path`,
-/// otherwise under a private per-user directory in `short_root`.
-///
-/// heph's home is wherever the repository is, and its depth is not heph's to
-/// choose, so refusing a long one would make agent mode unusable from a nested
-/// worktree. The preferred directory stays first so the common case keeps its
-/// sockets next to the rest of heph's state.
-fn socket_path(preferred: &Path, short_root: &Path, name: &str) -> anyhow::Result<PathBuf> {
-    let socket = preferred.join(name);
-    if fits_sun_path(&socket) {
-        std::fs::create_dir_all(preferred)
-            .with_context(|| format!("create agent socket dir {preferred:?}"))?;
-        return Ok(socket);
-    }
-
-    let dir = short_root.join(format!("heph-{}", rustix::process::geteuid().as_raw()));
+/// The socket named `name`, in this user's private directory under `root`.
+fn socket_path(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let dir = root.join(format!("heph-{}", rustix::process::geteuid().as_raw()));
     let socket = dir.join(name);
     if !fits_sun_path(&socket) {
-        // Only reachable with a pathological `name`; the root is a constant.
+        // Only reachable with a deep test root; the real one is `/tmp`.
         anyhow::bail!(
             "agent socket path is {} bytes, over the {SUN_PATH_MIN}-byte unix-socket limit: \
              {socket:?}",
             socket.as_os_str().len()
         );
     }
-    tracing::debug!(
-        preferred = ?preferred,
-        socket = ?socket,
-        "heph home too deep for a unix socket path; using the short socket directory"
-    );
     ensure_private_dir(&dir)?;
     Ok(socket)
 }
@@ -628,40 +621,33 @@ mod tests {
         );
     }
 
-    /// A home deep enough to overflow `sun_path` is where the user keeps their
-    /// repository, not a mistake to report — the socket moves somewhere short.
     #[test]
-    fn a_deep_home_falls_back_to_the_short_socket_dir() {
+    fn sockets_go_in_a_private_per_user_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
         let root = tempfile::Builder::new()
             .prefix("hs")
             .tempdir_in("/tmp")
             .expect("tempdir");
-        let deep = PathBuf::from(format!("/nonexistent/{}/run", "x".repeat(120)));
-        let socket = socket_path(&deep, root.path(), "ab12cd34-999.sock").expect("placed");
+        let socket = socket_path(root.path(), "ab12cd34-999.sock").expect("placed");
 
         assert!(fits_sun_path(&socket), "{socket:?}");
         let dir = socket.parent().expect("parent");
         assert_eq!(dir.parent(), Some(root.path()));
-        assert!(!deep.exists(), "the overlong directory must not be created");
-
-        use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(dir).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
 
         // Reused, not refused, the second time.
-        socket_path(&deep, root.path(), "ab12cd34-1000.sock").expect("reused");
+        socket_path(root.path(), "ab12cd34-1000.sock").expect("reused");
     }
 
+    /// Caught here rather than as an `ENAMETOOLONG` from `bind` — or, on some
+    /// libcs, a silent truncation that makes two sessions share a socket.
     #[test]
-    fn a_home_that_fits_keeps_its_sockets() {
-        let home = tempfile::Builder::new()
-            .prefix("hh")
-            .tempdir_in("/tmp")
-            .expect("tempdir");
-        let run = home.path().join("run");
-        let socket = socket_path(&run, Path::new("/unused"), "ab12cd34-999.sock").expect("placed");
-        assert_eq!(socket, run.join("ab12cd34-999.sock"));
-        assert!(run.is_dir());
+    fn an_overlong_socket_path_is_refused_with_the_limit() {
+        let deep = PathBuf::from(format!("/nonexistent/{}", "x".repeat(120)));
+        let err = socket_path(&deep, "ab12cd34-999.sock").expect_err("must refuse");
+        assert!(format!("{err:#}").contains("104"), "{err:#}");
+        assert!(!deep.exists(), "nothing is created for a refused path");
     }
 
     /// `/tmp` is shared: a directory anyone else can enter would let them at the
