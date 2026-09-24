@@ -126,12 +126,14 @@ in one direction and a permanent full-miss in the other.
 Don't run the full test suite locally — CI runs `tst` on every push, so running it first only delays the push.
 
 1. Make the change, with tests.
-2. Run `lint` and the tests relevant to the change (`cargo test <test_name>`).
+2. Run `lint` and the tests relevant to the change (`cargo test -p <crate> <test_name>`).
 3. Commit, push, open the PR — if the change depends on an unmerged PR, stack it (see below). CI takes it from there.
 
 The same applies to subsequent pushes on an open PR: push the fix and let CI run the suite.
 
 Run the full `tst` suite locally only for a large blast radius change — one touching the engine core, provider/driver traits, or caching, where a break is likely to be wide rather than local. Run it before opening the PR: the cost of a broken PR there is higher than the wait.
+
+A `PreToolUse` hook (`.claude/hooks/gate-heavy-commands.sh`) enforces this for agents: a bare `tst` or `e2e` is refused, as is a foreground `sleep` of 30s or more. When the change is one of the exceptions above, prefix the command with `HEPH_FULL_SUITE=1` — that prefix is the decision, stated where it can be seen.
 
 ### Stacked PRs
 
@@ -157,6 +159,17 @@ Plain `gh stack submit` opens an editor for PR titles — pass `--auto` from a s
 - **What the skip costs you: an upper layer's break surfaces late.** A change that only fails on `darwin/arm64`, or only under `--no-default-features`, sits undetected at layer 3 until the two below it land. On a deep stack that serializes debugging into one cycle per layer. `ci/force-ci` is the answer when a layer is worth testing on its own — a large refactor low in the stack, anything platform-specific, a flake hunt. Use it rather than assuming green-when-it-gets-there.
 - **Sync after the base merges.** GitHub retargets the child at `master` itself, and that retarget *is* an `edited` event, so it now starts a full run — but the tree it builds still carries the base's commits. `gh stack sync` force-pushes the rebased branch (`synchronize` → another run), and that is the run whose result means anything. You need the rebase regardless, since `master` is squash-only.
 - **Don't add a `branches:` filter to `pull_request:`.** It matches the PR's *base*, so stacked PRs got zero runs and an empty check list that reads like a pass (fixed in #240) — invisible, and not overridable by a label. That is why the skip lives in `gate` instead. `tests/ci_gate.rs` guards this, plus the rule that every job hangs off `gate`.
+
+## Session economy
+
+Every turn re-sends the whole context, so a long session pays for its history on every call — and a turn over 400k tokens is slower as well as dearer. Across ten recent sessions, the four that ran past 300 turns took 92% of the tokens, at a median context of 300–470k; 64% of all input was context beyond the first 150k.
+
+- **One phase per session.** Design (artifact plan, board consult), implementation, and PR follow-up are separate sessions. The published artifact or the PR is the hand-off: start the next session from its link (`/goal implement <artifact-url>`), not from the conversation that produced it. If a session has to carry on past a phase boundary, `/compact` there rather than waiting for auto-compact.
+- **Read narrowly.** `rg -n` to locate, then `sed -n 'A,Bp'` for the range — not `cat` of a whole source file or a whole `docs/*.md`. A 20KB dump is paid again on every later turn. A sweep across many files goes to an `Explore` agent, which returns the conclusion rather than the files.
+- **Send long output to a file.** Redirect build and test output into the scratchpad and grep what you need from the file, instead of letting a whole run into context. Judge the run by its exit code, not by the grep: rustfmt prints `Diff in`, not `error`, and `| tail` hides the status.
+- **Don't poll.** CI: `gh run watch <run-id> --exit-status` with `run_in_background` wakes the session when the run ends. A local process: `run_in_background`, or Monitor with an until-loop.
+- **Artifacts: one publish per round of feedback.** Collect the changes, edit the local file with `Edit`, publish once. Don't read back the published page — the local file is the source.
+- **The shell is zsh with GNU coreutils from nix**, not bash or BSD: `stat -c` (not `-f`), no `mapfile`, `sed -i` takes no suffix argument. A directory under `~/.claude/projects/` starts with `-`, so it needs `--` or `./` before it reaches `ls`/`du`/`find`.
 
 ## Review Board
 
@@ -185,6 +198,7 @@ Mechanical triggers — if the change touches it, consult. Not a judgment call.
 ### Rules
 
 - Consults at the same stage run in parallel — one message, multiple agents.
+- **Brief the agent; don't send it to rediscover the change.** Give it the diff range or artifact link, the specific question, and the files that matter. An agent told only "review this" re-reads the codebase from scratch: one design session spent 124M tokens on 36 consults, nearly twice its own 67M. Consult the always-consult three plus only the agents whose trigger fired. For a follow-up round, continue the same agent with `SendMessage` rather than spawning a fresh one.
 - A **BLOCKER** from `feature-quality`, `code-quality`, `hermeticity`, or `compatibility` is fixed, or explicitly overruled with a stated reason, before the commit.
 - **NOT HERMETIC** and **BREAKING** are never silently accepted — either fix, or record the decision in the commit body.
 - A **RETHINK** / **DON'T BUILD** from `product-vision` goes back to the user, not around them.
