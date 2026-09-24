@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -121,7 +122,7 @@ func TestLintStamp(t *testing.T) {
 	dir := t.TempDir()
 	run := func(args ...string) string {
 		t.Helper()
-		out, err := gitOut(dir, args...)
+		out, err := git(dir, nil, args...)
 		if err != nil {
 			t.Fatalf("git %v: %v", args, err)
 		}
@@ -154,5 +155,90 @@ func TestLintStamp(t *testing.T) {
 	commit("-m", "b")
 	if lintStamp(dir) == "" {
 		t.Error("a commit after lint should block")
+	}
+}
+
+func TestStampLintRewritesOnlyLint(t *testing.T) {
+	const w = "WRAP"
+	for cmd, want := range map[string]string{
+		"lint":                                 "WRAP",
+		"lint > /tmp/l.log 2>&1; echo rc=$?":   "WRAP > /tmp/l.log 2>&1; echo rc=$?",
+		"cd x && timeout 900 lint && git push": "cd x && timeout 900 WRAP && git push",
+		"devenv shell -- lint":                 "devenv shell -- WRAP",
+		"lint;  lint":                          "WRAP;  WRAP",
+		"echo \"$(lint)\"  # keep  spacing":    "echo \"$(WRAP)\"  # keep  spacing",
+		"cat <<EOF\nlint\nEOF\nlint":           "cat <<EOF\nlint\nEOF\nWRAP",
+		"echo lint":                            "",
+		"git commit -m 'lint'":                 "",
+		"cargo clippy -p lint":                 "",
+		"linter":                               "",
+		"bash -c lint":                         "",
+	} {
+		if got := stampLint(cmd, w); got != want {
+			t.Errorf("stampLint(%q) = %q, want %q", cmd, got, want)
+		}
+	}
+}
+
+func TestShQuote(t *testing.T) {
+	const dir = "/it's a $dir"
+	out, err := exec.Command("sh", "-c", "printf %s "+shQuote(dir)).Output()
+	if err != nil || string(out) != dir {
+		t.Errorf("sh read %q back as %q (%v)", dir, out, err)
+	}
+}
+
+// runLint is what makes a push allowed: it must stamp only a passing run, and
+// stamp the tree it checked — which is HEAD's once that tree is committed.
+func TestRunLintStampsOnlyAPass(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "lint"), []byte("#!/bin/sh\nexit $FAKE_LINT_RC\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if _, err := git(dir, nil, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commit := func(msg string) {
+		run("add", "-A")
+		run("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-q", "-m", msg)
+	}
+	run("init", "-q")
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commit("a")
+
+	t.Setenv("FAKE_LINT_RC", "3")
+	if code := runLint(dir, nil); code != 3 {
+		t.Errorf("exit code %d, want lint's 3", code)
+	}
+	if lintStamp(dir) == "" {
+		t.Error("a failing lint must not stamp")
+	}
+
+	// Lint an uncommitted edit and a new file, then commit exactly that.
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_LINT_RC", "0")
+	if code := runLint(dir, nil); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	// Trimmed " M a": unstaged edit, untracked new file — as before the run.
+	if status, _ := git(dir, nil, "status", "--porcelain"); status != "M a\n?? b" {
+		t.Errorf("lint touched the real index: %q", status)
+	}
+	commit("b")
+	if r := lintStamp(dir); r != "" {
+		t.Errorf("committing the linted tree should allow the push: %s", r)
 	}
 }

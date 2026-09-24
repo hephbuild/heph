@@ -269,19 +269,6 @@ in
   # than the flags guards nothing.
   scripts.lint.exec = ''
     set -euo pipefail
-    # The tree this run checks — the working tree, uncommitted changes and new
-    # files included — written to the git dir on success. The agent command gate
-    # (.claude/hooks/gate) refuses a push whose HEAD tree differs, so CI is not
-    # the first place a clippy or rustfmt failure shows up. Taken before the
-    # passes run, so an edit made mid-run is not stamped as checked. A scratch
-    # index keeps the real one untouched.
-    lint_tree=""
-    if git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null); then
-      scratch_index=$(mktemp)
-      cp "$git_dir/index" "$scratch_index" 2>/dev/null || true
-      lint_tree=$(GIT_INDEX_FILE=$scratch_index git add -A && GIT_INDEX_FILE=$scratch_index git write-tree) || lint_tree=""
-      rm -f "$scratch_index"
-    fi
     echo '> clippy'
     cargo clippy --workspace --all-targets --locked -- -D warnings
     echo '> clippy --all-features'
@@ -317,9 +304,6 @@ in
     cargo clippy --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --exclude bench --all-targets --no-default-features --locked -- -D warnings
     echo '> fmt'
     cargo fmt --check ${qualityCrates}
-    if [ -n "$lint_tree" ]; then
-      printf '%s\n' "$lint_tree" > "$git_dir/heph-lint-ok"
-    fi
   '';
   # The write half of `lint`, and it must select the same code — a `fix` that
   # only reaches the root package leaves the member lints `lint` reports with

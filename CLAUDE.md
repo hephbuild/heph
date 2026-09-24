@@ -140,7 +140,11 @@ Run the full `tst` suite locally only for a large blast radius change — one to
 A `PreToolUse` hook (`.claude/hooks/gate`, a Go program run with `go run`; tests are `go test` there) enforces this for agents:
 - `tst` or `e2e` anywhere in a command is refused. When the change is one of the exceptions above, prefix the command with `HEPH_FULL_SUITE=1`. That prefix is the decision, stated where it can be seen.
 - A foreground `sleep` of 30s or more is refused.
-- `git push` and `gh stack submit` are refused unless `lint` passed on exactly HEAD's tree. `lint` writes the tree it checked to `<git-dir>/heph-lint-ok`, so any edit or commit after the run means running it again. A red Lint job costs a whole CI round-trip to learn what `lint` would have said in a minute. `HEPH_PUSH_UNLINTED=1` pushes anyway. A shell started before `lint` learned to write the stamp needs a new `devenv shell`.
+- `git push` and `gh stack submit` are refused unless `lint` passed on exactly HEAD's tree.
+  - A red Lint job costs a whole CI round-trip to learn what `lint` would have said in a minute.
+  - The hook rewrites each `lint` in an agent's command into a call back to itself. That call records the working tree, runs the real `lint`, and writes `<git-dir>/heph-lint-ok` only when `lint` exits 0.
+  - Nothing is added to `lint` itself, which CI runs.
+  - Any edit or commit after the run means running `lint` again. `HEPH_PUSH_UNLINTED=1` pushes anyway.
 
 The hook needs `go` on `PATH` (devenv provides it) and lets everything through without it.
 

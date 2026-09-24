@@ -43,9 +43,22 @@ type gate struct {
 	unlinted func() string
 }
 
+func parse(cmd string) (*syntax.File, error) {
+	return syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(cmd), "")
+}
+
+// literals is each argument's fixed text, "" where it depends on expansion.
+func literals(call *syntax.CallExpr) []string {
+	args := make([]string, 0, len(call.Args))
+	for _, w := range call.Args {
+		args = append(args, literal(w))
+	}
+	return args
+}
+
 // check returns why cmd is refused, or "" to allow it.
 func check(cmd string, g gate) string {
-	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(cmd), "")
+	file, err := parse(cmd)
 	if err != nil {
 		return ""
 	}
@@ -70,11 +83,7 @@ func checkCall(call *syntax.CallExpr, g gate) string {
 		}
 	}
 
-	args := make([]string, 0, len(call.Args))
-	for _, w := range call.Args {
-		args = append(args, literal(w))
-	}
-	args = unwrap(args, optIns)
+	args := unwrap(literals(call), optIns)
 	if len(args) == 0 {
 		return ""
 	}
