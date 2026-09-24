@@ -9,7 +9,11 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
-const optIn = "HEPH_FULL_SUITE"
+// Prefix assignments, set to 1, that let a refused command through.
+const (
+	optIn         = "HEPH_FULL_SUITE"
+	unlintedOptIn = "HEPH_PUSH_UNLINTED"
+)
 
 const tstReason = "Blocked: `tst` is the full suite, and CI runs it on every push.\n" +
 	"Run the tests for what you changed: `cargo test -p <crate> <name>`, then push.\n" +
@@ -30,8 +34,17 @@ var wrappers = map[string]int{
 	"command": 0, "exec": 0, "nohup": 0, "nice": 0, "env": 0, "timeout": 1,
 }
 
+// gate is what a check needs besides the command itself.
+type gate struct {
+	background bool
+	// unlinted says why HEAD should not be pushed yet, or "" when `lint`
+	// passed on exactly HEAD's tree. Called only for a command that pushes;
+	// nil allows every push.
+	unlinted func() string
+}
+
 // check returns why cmd is refused, or "" to allow it.
-func check(cmd string, background bool) string {
+func check(cmd string, g gate) string {
 	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(cmd), "")
 	if err != nil {
 		return ""
@@ -42,18 +55,18 @@ func check(cmd string, background bool) string {
 			return false
 		}
 		if call, ok := node.(*syntax.CallExpr); ok {
-			reason = checkCall(call, background)
+			reason = checkCall(call, g)
 		}
 		return true
 	})
 	return reason
 }
 
-func checkCall(call *syntax.CallExpr, background bool) string {
-	allow := false
+func checkCall(call *syntax.CallExpr, g gate) string {
+	optIns := map[string]bool{}
 	for _, a := range call.Assigns {
-		if a.Name != nil && a.Name.Value == optIn && literal(a.Value) == "1" {
-			allow = true
+		if a.Name != nil && literal(a.Value) == "1" {
+			optIns[a.Name.Value] = true
 		}
 	}
 
@@ -61,41 +74,75 @@ func checkCall(call *syntax.CallExpr, background bool) string {
 	for _, w := range call.Args {
 		args = append(args, literal(w))
 	}
-	args = unwrap(args, &allow)
+	args = unwrap(args, optIns)
 	if len(args) == 0 {
 		return ""
 	}
 
 	switch args[0] {
 	case "tst":
-		if !allow {
+		if !optIns[optIn] {
 			return tstReason
 		}
 	case "e2e":
-		if !allow {
+		if !optIns[optIn] {
 			return e2eReason
 		}
 	case "sleep":
-		if !background && len(args) > 1 {
+		if !g.background && len(args) > 1 {
 			if d, ok := sleepDuration(args[1:]); ok && d >= 30*time.Second {
 				return fmt.Sprintf(sleepReason, strings.Join(args[1:], " "))
 			}
+		}
+	case "git", "gh":
+		if pushes(args) && !optIns[unlintedOptIn] && g.unlinted != nil {
+			return g.unlinted()
 		}
 	case "bash", "sh", "zsh":
 		// `bash -c '<script>'` runs the script: check it as a command line.
 		for i, a := range args[:len(args)-1] {
 			if a == "-c" || (strings.HasPrefix(a, "-") && strings.HasSuffix(a, "c") && !strings.HasPrefix(a, "--")) {
-				return check(args[i+1], background)
+				return check(args[i+1], g)
 			}
 		}
 	}
 	return ""
 }
 
+// pushes reports whether a git or gh command line pushes commits: `git push`
+// (not a branch or tag deletion) and `gh stack submit`. `gh stack sync` is
+// left alone — it rebases onto a fresh trunk and pushes in one step, so no
+// lint could have seen its tree.
+func pushes(args []string) bool {
+	switch args[0] {
+	case "git":
+		// Skip git's global options; -C and -c take a value.
+		i := 1
+		for i < len(args) && strings.HasPrefix(args[i], "-") {
+			if args[i] == "-C" || args[i] == "-c" {
+				i++
+			}
+			i++
+		}
+		if i >= len(args) || args[i] != "push" {
+			return false
+		}
+		for _, a := range args[i+1:] {
+			if a == "--delete" || a == "-d" || a == "--tags" {
+				return false
+			}
+		}
+		return true
+	case "gh":
+		return len(args) > 2 && args[1] == "stack" && args[2] == "submit"
+	}
+	return false
+}
+
 // unwrap strips wrappers that still run the command after them — `timeout
-// 600 tst`, `env X=1 tst`, `devenv shell -- e2e` — collecting an opt-in
-// assignment given to env on the way.
-func unwrap(args []string, allow *bool) []string {
+// 600 tst`, `env X=1 tst`, `devenv shell -- e2e` — collecting opt-in
+// assignments given to env on the way.
+func unwrap(args []string, optIns map[string]bool) []string {
 	for len(args) > 0 {
 		if n, ok := wrappers[args[0]]; ok {
 			args = args[1:]
@@ -107,8 +154,8 @@ func unwrap(args []string, allow *bool) []string {
 			}
 			args = args[n:]
 			for len(args) > 0 && strings.Contains(args[0], "=") {
-				if args[0] == optIn+"=1" {
-					*allow = true
+				if name, value, _ := strings.Cut(args[0], "="); value == "1" {
+					optIns[name] = true
 				}
 				args = args[1:]
 			}

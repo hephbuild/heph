@@ -49,6 +49,10 @@ gen                                  # regenerate protobuf bindings (runs buf ge
 
 The `gen` script is a devenv-provided alias, assume its present. It must be run at the beginning of all sessions, or after any `.proto` file changes before building.
 
+`lint`, `fix`, `tst` and `e2e` are devenv scripts, and their text is **baked into the shell when it starts**. After editing `devenv.nix`, the running shell still has the old scripts. For example, a new crate added to `qualityCrates` is not format-checked, so `lint` is green locally and red in CI. Start a new `devenv shell` before trusting them.
+
+`fix` can fail with "output file … is not writeable": kache restores `target/` as read-only reflinks. `cargo fmt --all` is the reliable way to format.
+
 ### `e2e` — testing the shipped binary
 
 `e2e` runs `crates/bin-e2e`: black-box tests that spawn the **release binary and plugin cdylibs** as a child process, rather than linking the crates. It is the only way to cover things that have no in-process form — `dlopen` of a real cdylib, the TUI under a PTY, process exit codes, whether the binary launches at all on this host.
@@ -133,7 +137,12 @@ The same applies to subsequent pushes on an open PR: push the fix and let CI run
 
 Run the full `tst` suite locally only for a large blast radius change — one touching the engine core, provider/driver traits, or caching, where a break is likely to be wide rather than local. Run it before opening the PR: the cost of a broken PR there is higher than the wait.
 
-A `PreToolUse` hook (`.claude/hooks/gate`, a Go program run with `go run`; tests are `go test` there) enforces this for agents: `tst` or `e2e` anywhere in a command is refused, as is a foreground `sleep` of 30s or more. When the change is one of the exceptions above, prefix the command with `HEPH_FULL_SUITE=1` — that prefix is the decision, stated where it can be seen. The hook needs `go` on `PATH` (devenv provides it) and lets everything through without it.
+A `PreToolUse` hook (`.claude/hooks/gate`, a Go program run with `go run`; tests are `go test` there) enforces this for agents:
+- `tst` or `e2e` anywhere in a command is refused. When the change is one of the exceptions above, prefix the command with `HEPH_FULL_SUITE=1`. That prefix is the decision, stated where it can be seen.
+- A foreground `sleep` of 30s or more is refused.
+- `git push` and `gh stack submit` are refused unless `lint` passed on exactly HEAD's tree. `lint` writes the tree it checked to `<git-dir>/heph-lint-ok`, so any edit or commit after the run means running it again. A red Lint job costs a whole CI round-trip to learn what `lint` would have said in a minute. `HEPH_PUSH_UNLINTED=1` pushes anyway. A shell started before `lint` learned to write the stamp needs a new `devenv shell`.
+
+The hook needs `go` on `PATH` (devenv provides it) and lets everything through without it.
 
 ### Stacked PRs
 
@@ -155,20 +164,51 @@ Plain `gh stack submit` opens an editor for PR titles — pass `--auto` from a s
 - **A red check on a stacked PR is not necessarily its own.** Before debugging, check the base: `gh pr checks <base-pr>`. Same job red there → not your bug; say so on your PR and fix it in the base, not in yours. This has already cost real time — a stacked PR reddened on a flake inherited from its base, and the fix for it lived in a third PR entirely.
 - **Don't fold a fix for the base into your stack.** It muddies the revert line — the fix disappears if your PR is reverted, and it lands bundled with an unrelated change. Fix the base in the base, or in its own PR.
 - **After resolving a stack conflict, diff against the lower branch and re-run the *lower* PR's tests.** For each conflicted file, `git diff <lower-branch> -- <file>` and confirm every remaining difference is deliberately yours. A resolution can compile, pass your tests, and still revert the change below you: git applies an upper-PR copy of a moved code block cleanly *above* the conflict region and marks only the code below, so taking the upper side verbatim silently dropped a lower PR's `sort`/`dedup` and put a `HashSet` seed back into a def hash.
+- **A `git rebase --skip` drops the whole commit, not just the redundant part.** A constructor added in the same commit as an unrelated removal vanished when that commit was skipped, and two call sites went back to writing a value the reader rejects. A rebase reports that each commit applied, not that each layer still works. After a skip or a non-trivial conflict, check out every branch in the stack and run its lint and tests.
 - **A stacked PR does not build until it reaches the bottom.** The `gate` job in `.github/workflows/heph.yml` runs CI for a push, or for a PR whose base is `master`; a PR based on another branch is skipped — every check reports "skipped" and the `Summary` job says why. Add the **`ci/force-ci`** label to build one anyway (labelling starts the run on its own; no push needed). This does not weaken the merge gate: required status checks live in the `master` ruleset, whose condition is `~DEFAULT_BRANCH`, so they apply to exactly the PRs the gate builds. A stacked PR merges with skipped checks because nothing is required of it, and its code still cannot reach `master` without first becoming a `master`-targeting PR, which builds.
 - **What the skip costs you: an upper layer's break surfaces late.** A change that only fails on `darwin/arm64`, or only under `--no-default-features`, sits undetected at layer 3 until the two below it land. On a deep stack that serializes debugging into one cycle per layer. `ci/force-ci` is the answer when a layer is worth testing on its own — a large refactor low in the stack, anything platform-specific, a flake hunt. Use it rather than assuming green-when-it-gets-there.
 - **Sync after the base merges.** GitHub retargets the child at `master` itself, and that retarget *is* an `edited` event, so it now starts a full run — but the tree it builds still carries the base's commits. `gh stack sync` force-pushes the rebased branch (`synchronize` → another run), and that is the run whose result means anything. You need the rebase regardless, since `master` is squash-only.
 - **Don't add a `branches:` filter to `pull_request:`.** It matches the PR's *base*, so stacked PRs got zero runs and an empty check list that reads like a pass (fixed in #240) — invisible, and not overridable by a label. That is why the skip lives in `gate` instead. `tests/ci_gate.rs` guards this, plus the rule that every job hangs off `gate`.
 
+## Phases and hand-offs
+
+A change goes through three phases, and **each phase is its own session**:
+
+| Phase | Starts from | Ends with |
+|---|---|---|
+| Design | the request | a published **spec** |
+| Implementation | `/goal implement <spec-url>` | an open PR whose spec tests pass |
+| Follow-up | `/goal get PR #<n> green and through review` | a merged PR |
+
+The next session starts from the hand-off's link, never from the conversation that produced it. `/handoff` closes a phase: it brings the spec or the PR description up to date and prints the next session's prompt. If a session has to carry on past a phase boundary, `/compact` there instead of waiting for auto-compact.
+
+**The spec is the contract.** A plan that only describes the change leaves the implementation session to work the details out again, and gives the reviewer nothing to check the code against. The spec has these sections:
+
+- **Goal / Non-goals**: one paragraph each.
+- **Decisions**: each settled decision with its reason. The implementation session does not reopen these.
+- **Tests**: each test that defines done, with its layer (unit, `crates/e2e` or `crates/bin-e2e`; see `.claude/testing.md`) and what it proves. Implementation is done when these pass and `lint` exits 0. A test that is dropped or changed is recorded in the PR description.
+- **Files**: the files and seams the change touches, and so which board triggers fire.
+- **Board**: the verdicts from `/board`, one line per agent and round.
+- **Open**: the real remaining questions, each marked for the user or for implementation.
+
+**Independent changes run in parallel.** One design session can produce several specs. Each gets its own implementation session in its own workspace or worktree, branched off `master`. Stack only when a change can't compile or be reviewed without the one below it (see "Stacked PRs"). Wall-clock time is then the slowest PR, not the sum of all of them.
+
+**Match the model to the job.** Lookups and triage don't need the strongest model: `Explore`, `/ci-triage` (which runs forked on Sonnet), and the design-stage `product-vision` and `feature-quality` consults use `model: "sonnet"`. Review-stage consults (`code-quality`, `hermeticity`, `compatibility`) and the implementation itself inherit the session model.
+
+**Knowledge goes in the repo, not in memory.** Memory reaches one user's sessions, and only when it happens to be recalled. A trap about this repo belongs in the repo:
+- a CI failure signature goes in `/ci-triage`;
+- a tooling gotcha goes here or in the doc next to the code;
+- a rule that can be checked becomes a test or a hook.
+
+Memory is for the user's preferences.
+
 ## Session economy
 
-Every turn re-sends the whole context, so a long session pays for its history on every call — and a turn over 400k tokens is slower as well as dearer. Across ten recent sessions, the four that ran past 300 turns took 92% of the tokens, at a median context of 300–470k; 64% of all input was context beyond the first 150k.
-
-- **One phase per session.** Design (artifact plan, board consult), implementation, and PR follow-up are separate sessions. The published artifact or the PR is the hand-off: start the next session from its link (`/goal implement <artifact-url>`), not from the conversation that produced it. If a session has to carry on past a phase boundary, `/compact` there rather than waiting for auto-compact.
+Every turn re-sends the whole context, so a long session pays for its history on every call — and a turn over 400k tokens is slower as well as dearer. Across ten recent sessions, the four that ran past 300 turns took 92% of the tokens, at a median context of 300–470k; 64% of all input was context beyond the first 150k. The biggest saving is the phase split above.
 - **Read narrowly.** `rg -n` to locate, then `sed -n 'A,Bp'` for the range — not `cat` of a whole source file or a whole `docs/*.md`. A 20KB dump is paid again on every later turn. A sweep across many files goes to an `Explore` agent, which returns the conclusion rather than the files.
 - **Edit files with Edit/Write, not scripts.** A `python3 - <<EOF … s.replace(…)`, `sed -i` or `perl -pi` edit hides the diff from the user, leaves the harness's view of the file stale (every later touch re-sends it as "changed on disk"), and a heredoc of markdown mentioning `tst` trips the command gate. Several changes are several Edit calls in one message. Bash is for running things.
 - **Send long output to a file.** Redirect build and test output into the scratchpad and grep what you need from the file, instead of letting a whole run into context. Judge the run by its exit code, not by the grep: rustfmt prints `Diff in`, not `error`, and `| tail` hides the status.
-- **Don't poll.** CI: `gh run watch <run-id> --exit-status` with `run_in_background` wakes the session when the run ends. A local process: `run_in_background`, or Monitor with an until-loop.
+- **Don't poll.** CI: `/ci-triage` waits on the run and classifies each failure: a known flake (it reruns it), a failure inherited from a stacked base, or a real break. It reads the failed logs from a file, not into context. The primitive underneath is `gh run watch <run-id> --exit-status` with `run_in_background`. `gh pr checks` right after a push prints "no checks reported", which is not a pass. A local process: `run_in_background`, or Monitor with an until-loop.
 - **Artifacts: one publish per round of feedback.** Collect the changes, edit the local file with `Edit`, publish once. Don't read back the published page — the local file is the source.
 - **The shell is zsh with GNU coreutils from nix**, not bash or BSD: `stat -c` (not `-f`), no `mapfile`, `sed -i` takes no suffix argument. A directory under `~/.claude/projects/` starts with `-`, so it needs `--` or `./` before it reaches `ls`/`du`/`find`.
 
@@ -199,12 +239,15 @@ Mechanical triggers — if the change touches it, consult. Not a judgment call.
 ### Rules
 
 - Consults at the same stage run in parallel — one message, multiple agents.
+- **`/board design` and `/board review` run a consult.** The skill works out the triggered agents from the files touched, writes one brief, runs the consults in parallel, and records the verdicts in the spec's Board section.
 - **Brief the agent; don't send it to rediscover the change.** Give it the diff range or artifact link, the specific question, and the files that matter. An agent told only "review this" re-reads the codebase from scratch: one design session spent 124M tokens on 36 consults, nearly twice its own 67M. Consult the always-consult three plus only the agents whose trigger fired. For a follow-up round, continue the same agent with `SendMessage` rather than spawning a fresh one.
 - A **BLOCKER** from `feature-quality`, `code-quality`, `hermeticity`, or `compatibility` is fixed, or explicitly overruled with a stated reason, before the commit.
 - **NOT HERMETIC** and **BREAKING** are never silently accepted — either fix, or record the decision in the commit body.
 - A **RETHINK** / **DON'T BUILD** from `product-vision` goes back to the user, not around them.
 - **Per-platform behavior is the user's decision.** The supported set is `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` — no BSD, no Windows, no 32-bit — and features work uniformly across all three by default, on the OS axis (Linux vs macOS) and the arch axis (x86_64 vs aarch64) alike. A divergence may be the right answer — but it is never settled by an agent or by the implementation. Flag it (what differs, on which target, what each option costs) and put the call to the user before writing the code. CI runs the suite natively on all three supported targets, so a green CI does cover an arch-conditional change — but the `linux/arm64` *release* binary is cross-compiled while its test job builds natively, so a toolchain-specific break there is still uncovered.
-- **Adding a dependency is allowed** when it gets the job done reliably. A maintained crate beats a fragile hand-rolled version. What still gets flagged: duplicating a crate already in the tree, a second copy of an ecosystem (async runtime, TLS, HTTP client, allocator), hot-path or startup cost, and support limited to one OS or one arch.
+- **Adding a dependency is allowed** when it gets the job done reliably. A maintained crate beats a fragile hand-rolled version. What still gets flagged: duplicating a crate already in the tree, a second copy of an ecosystem (async runtime, TLS, HTTP client, allocator), hot-path or startup cost, and support limited to one OS or one arch. Adding a dependency also re-resolves the **whole** lockfile.
+  - Once, adding 40 crates bumped tokio and 200 other packages, and it broke an unrelated engine test on macOS only. It looked like a flake.
+  - Check `git diff master -- Cargo.lock | grep -c '^-version'`. If existing pins moved, run `git checkout master -- Cargo.lock && cargo check --workspace` so that only what the new crates need changes.
 
 @.claude/rust.md
 @.claude/testing.md

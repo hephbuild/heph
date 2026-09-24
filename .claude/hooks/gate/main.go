@@ -7,6 +7,10 @@
 //     CLAUDE.md allows ("Workflow", "e2e").
 //   - sleep >= 30s in the foreground: polling CI burned ~5h of wall-clock over
 //     the same sessions. gh run watch in the background wakes the session.
+//   - git push / gh stack submit of a tree `lint` has not passed on: a red
+//     Lint job is a whole CI round-trip to learn what `lint` says locally.
+//     `lint` stamps the tree it passed on into the git dir (devenv.nix);
+//     HEPH_PUSH_UNLINTED=1 is the opt-out.
 //
 // The command is parsed with mvdan.cc/sh (shfmt's parser), so quoting,
 // heredocs, command substitution and `bash -c` are read the way the shell
@@ -25,6 +29,7 @@ import (
 )
 
 type hookInput struct {
+	Cwd       string `json:"cwd"`
 	ToolInput struct {
 		Command         string `json:"command"`
 		RunInBackground bool   `json:"run_in_background"`
@@ -36,7 +41,10 @@ func main() {
 	if err := json.NewDecoder(os.Stdin).Decode(&in); err != nil {
 		return
 	}
-	reason := check(in.ToolInput.Command, in.ToolInput.RunInBackground)
+	reason := check(in.ToolInput.Command, gate{
+		background: in.ToolInput.RunInBackground,
+		unlinted:   func() string { return lintStamp(in.Cwd) },
+	})
 	if reason == "" {
 		return
 	}
