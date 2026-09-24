@@ -209,8 +209,12 @@ pub fn build_test_spec(
     // `-race` links the TSan runtime out of `runtime/race.a`, which the caller
     // put in `all_libs`.
     let race = if factors.race { " -race" } else { "" };
+    // `testing.Testing()` reads a string that `go test` sets at link time
+    // (`cmd/go/internal/load/test.go`); without it the binary reports it is not
+    // a test. Placed after the variant's ldflags, as `go test` does, so the
+    // last `-X` for the symbol — this one — wins.
     script.push(format!(
-        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode={mode}{race}{ldflags} -o test_binary \"$SRC_TESTMAIN\""
+        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode={mode}{race}{ldflags} -X testing.testBinary=1 -o test_binary \"$SRC_TESTMAIN\""
     ));
 
     let mut deps: BTreeMap<String, Value> = BTreeMap::new();
@@ -681,6 +685,28 @@ mod tests {
             V,
         ));
         assert!(pie.contains("-buildmode=pie"), "{pie}");
+    }
+
+    // `testing.Testing()` is true only when the link sets `testing.testBinary`,
+    // which `go test` does and a bare `go tool link` does not. It must come after
+    // the variant's ldflags so a variant cannot switch it off.
+    #[test]
+    fn test_build_test_spec_link_marks_the_binary_as_a_test() {
+        let testmain_lib = mk_addr("pkg", "build_testmain_lib");
+        let run = run_str(&build_test_spec(
+            mk_addr("pkg", "build_test"),
+            &Factors {
+                ldflags: vec!["-X".to_string(), "main.v=1".to_string()],
+                ..test_factors()
+            },
+            &testmain_lib,
+            &[],
+            V,
+        ));
+        assert!(
+            run.contains("-X main.v=1 -X testing.testBinary=1 -o test_binary"),
+            "{run}"
+        );
     }
 
     #[test]

@@ -46,7 +46,9 @@ async fn testmain_exit_code_survives_the_pinned_toolchain() -> anyhow::Result<()
     let ws = make_workspace_hermetic(dir)?;
 
     // Exit 0 must reach heph as success. A panic in the reflection read (the
-    // field renamed out from under us) also lands here, as a failed target.
+    // field renamed out from under us) also lands here, as a failed target. So
+    // does a link that forgot `-X testing.testBinary=1`: the fixture's
+    // `TestTestingReportsTrue` fails when `testing.Testing()` is false.
     ws.run("//pass:test@v=host").await?;
 
     // …and a failing Go test must fail the target. This is the half that catches
