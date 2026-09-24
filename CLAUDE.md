@@ -133,7 +133,7 @@ The same applies to subsequent pushes on an open PR: push the fix and let CI run
 
 Run the full `tst` suite locally only for a large blast radius change — one touching the engine core, provider/driver traits, or caching, where a break is likely to be wide rather than local. Run it before opening the PR: the cost of a broken PR there is higher than the wait.
 
-A `PreToolUse` hook (`.claude/hooks/gate-heavy-commands.sh`) enforces this for agents: a bare `tst` or `e2e` is refused, as is a foreground `sleep` of 30s or more. When the change is one of the exceptions above, prefix the command with `HEPH_FULL_SUITE=1` — that prefix is the decision, stated where it can be seen.
+A `PreToolUse` hook (`.claude/hooks/gate`, Go, run with `go run` from a vendored shell parser) enforces this for agents: `tst` or `e2e` anywhere in a command is refused, as is a foreground `sleep` of 30s or more. When the change is one of the exceptions above, prefix the command with `HEPH_FULL_SUITE=1` — that prefix is the decision, stated where it can be seen. The hook needs `go` on `PATH` (devenv provides it) and lets everything through without it.
 
 ### Stacked PRs
 

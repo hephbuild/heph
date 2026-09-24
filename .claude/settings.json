@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/gate-heavy-commands.sh"
+            "command": "command -v go >/dev/null 2>&1 || exit 0; GOTOOLCHAIN=local GOWORK=off GOFLAGS=-mod=vendor exec go run -C \"$CLAUDE_PROJECT_DIR/.claude/hooks/gate\" ."
           }
         ]
       }

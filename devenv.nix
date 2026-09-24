@@ -61,10 +61,6 @@ in
   # https://devenv.sh/packages/
   packages = [
     pkgs.git
-    # The Claude Code hooks in `.claude/settings.json` parse their JSON input
-    # with it, and `tests/claude_hooks.rs` runs them — pinned so neither
-    # depends on the host happening to ship one.
-    pkgs.jq
     # The Go toolchain the go-plugin tests build against. Everything that calls
     # `require_go!` runs `go` from PATH (`gotool = "host"`), so without this the
     # whole suite depends on whatever the machine happens to have — and CI's
