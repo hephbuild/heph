@@ -22,6 +22,16 @@ Goal: measure heph hot paths, surface concrete bottlenecks, propose actionable f
 
    Devenv script (`cargo build --profile profiling`). Assume already inside `devenv shell`.
 
+   > **Confirm every hot spot against the release binary before acting on it.**
+   > - The `profiling` profile inlines less than release, so cheap helpers show up as their own frames and look expensive. On one warm Go corpus it blamed `RequestState::track_dep` for 10.4% of CPU. In the release profile, `track_dep` did not appear at all.
+   > - `[profile.release]` keeps debug info, so release can be profiled directly: `heph --no-tui --pprof-cpu=<file> r -e '<query>'`, then `go tool pprof -top <file>`.
+   > - Believe a fix only after an interleaved A/B run.
+   >
+   > **Check that the query runs in parallel before timing it.**
+   > - `label()` matchers resolve serially by design (`query.rs`, `MatchShrug`), so benchmark engine-wide work with a package matcher (`//go/large/...`).
+   > - To see how much actually runs at once, send SIGQUIT mid-run. It writes `.heph3/diag/dump-*.txt`; count the `incomplete cells` there.
+   > - Check the matched-target count too. A query that matched 0 targets still exits 0. For example, `heph r build //go/...` on a generated corpus with no `host` variant BUILD file builds nothing.
+
 2. **Warmup run** — prime caches, FS, allocator. Discard output. `heph r test //...` must run from `example/`:
 
    ```bash

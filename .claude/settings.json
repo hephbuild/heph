@@ -37,6 +37,17 @@
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v go >/dev/null 2>&1 || exit 0; GOTOOLCHAIN=local GOWORK=off exec go run -C \"$CLAUDE_PROJECT_DIR/.claude/hooks/gate\" ."
+          }
+        ]
+      }
+    ],
     "WorktreeCreate": [
       {
         "hooks": [
