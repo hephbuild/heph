@@ -1,0 +1,63 @@
+[package]
+name = "plugin-js"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hmodel = { package = "model", path = "../model" }
+hwalk = { package = "walk", path = "../walk" }
+hplugin = { package = "plugin", path = "../plugin" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+hbuiltins = { package = "builtins", path = "../builtins" }
+hproc = { package = "proc", path = "../proc" }
+hplugin-query = { package = "plugin-query", path = "../plugin-query" }
+anyhow = "1.0.102"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+async-trait = "0.1.89"
+futures = "0.3.32"
+enclose = "1"
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs", "time"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+wax = "0.7"
+tracing = "0.1"
+# Hermetic third-party fetch (`js_install`): download (reqwest), integrity
+# verify (sha2/sha1 + base64, SRI format), and extract (flate2 + tar) the
+# npm-registry tarball a lockfile entry names. Same versions plugin-go pins
+# for the analogous Go SDK/module download path.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+sha2 = "0.10"
+sha1 = "0.10"
+base64 = "0.22"
+flate2 = "1.1.9"
+tar = "0.4"
+# M2 import-graph resolver (`ai-docs/js-plugin-plan.md`): parse (oxc_parser +
+# oxc_ast/oxc_ast_visit/oxc_allocator/oxc_span, all one lockstepped `0.142.0`
+# oxc-workspace release) and resolve (oxc_resolver, versioned independently by
+# upstream — latest at the time this was pinned, `11.24.2`) real import/
+# require/dynamic-import specifiers. Pinned to latest-stable-as-of-writing
+# per crates.io/docs.rs; both crates version-bump aggressively (oxc_parser
+# alone has shipped 140+ 0.x releases), so expect to re-pin periodically
+# rather than treating these as a one-time choice.
+oxc_parser = "0.142.0"
+oxc_ast = "0.142.0"
+oxc_ast_visit = "0.142.0"
+oxc_span = "0.142.0"
+oxc_allocator = "0.142.0"
+oxc_resolver = "11.24.2"
+# Both already sit in the tree transitively (`oxc_resolver` itself depends on
+# them for the identical purpose) — taken as direct deps rather than
+# hand-rolled so this crate's own hermetic bare-specifier check (see
+# `importgraph.rs` module docs) recognizes Node builtins and tolerates a
+# JSONC (`// comment`, trailing-comma) `tsconfig.json` the same way
+# `oxc_resolver` does, instead of drifting from it.
+nodejs-built-in-modules = "1.0.0"
+json-strip-comments = "3.1"
+
+[dev-dependencies]
+tempfile = "3"
