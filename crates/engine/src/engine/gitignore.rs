@@ -18,12 +18,14 @@ use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
 use hmodel::htaddr::{Addr, parse_addr};
 use hmodel::htmatcher::{MatchResult, Matcher};
+use hwalk::Claim;
 
 /// Markers delimiting the heph-managed region. Lines between them (inclusive)
 /// are owned by heph and rewritten on every run; everything outside is
 /// preserved verbatim.
 pub const BEGIN_MARKER: &str =
     "# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)";
+/// The section's closing marker.
 pub const END_MARKER: &str = "# END heph-generated";
 
 /// Stable prefix of [`BEGIN_MARKER`]. Detection matches on this rather than the
@@ -79,6 +81,10 @@ impl GitignoreEntry {
 /// Sort, then drop exact `(pattern, addr)` duplicates so the rendered section is
 /// deterministic. Two *different* targets emitting the same path stay as two
 /// distinct lines (that collision is a `validate` error, not a gitignore one).
+pub fn normalize_entries(entries: Vec<GitignoreEntry>) -> Vec<GitignoreEntry> {
+    normalize(entries)
+}
+
 fn normalize(mut entries: Vec<GitignoreEntry>) -> Vec<GitignoreEntry> {
     entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     entries.dedup();
@@ -113,35 +119,192 @@ impl Engine {
             v
         };
 
+        let scan = self.codegen_copy_scan(rs, addrs).await?;
+        Ok(normalize(scan.gitignore_entries()))
+    }
+
+    /// The `codegen = "copy"` declarations of every target in `addrs`, plus which
+    /// of them could not be resolved.
+    ///
+    /// One resolution serves both derived artifacts — the `.gitignore` section and
+    /// the claim store — because resolving the whole workspace is the expensive
+    /// part and doing it twice would be the only reason they disagreed.
+    pub async fn codegen_copy_scan_for(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        matcher: &Matcher,
+    ) -> anyhow::Result<CodegenCopyScan> {
+        let addrs: Vec<Addr> = {
+            let stream = Arc::clone(&self).query(rs.clone(), matcher);
+            tokio::pin!(stream);
+            let mut v = Vec::new();
+            while let Some(addr) = stream.try_next().await? {
+                v.push(addr);
+            }
+            v
+        };
+        self.codegen_copy_scan(rs, addrs).await
+    }
+
+    async fn codegen_copy_scan(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addrs: Vec<Addr>,
+    ) -> anyhow::Result<CodegenCopyScan> {
         let fail_fast = rs.fail_fast();
         let futs = addrs.iter().map(|addr| {
             enclose!((self => engine, rs, addr) async move {
                 // A listed candidate that doesn't resolve standalone (e.g. go's
                 // `//pkg:build` for a non-main package, resolved only as an
-                // in-context dep) emits no codegen-copy output. The helper rather
-                // than a `query_*` stream: the fan-out below reports *every*
+                // in-context dep) tells us NOTHING about what it emits. That is
+                // not the same as "emits nothing", and the difference decides
+                // whether reconciliation may release its claims — releasing a
+                // live target's claim leaves a generated file on disk unclaimed,
+                // the failure this whole mechanism exists to prevent. The helper
+                // rather than a `query_*` stream: the fan-out reports *every*
                 // failure, and a stream stops at the first.
                 let Some(def) = skip_unresolvable(&addr, engine.get_def(rs, &addr).await)? else {
-                    return Ok(Vec::new());
+                    return Ok((addr.format(), None));
                 };
-                let entries: Vec<GitignoreEntry> = def
+                let claims: Vec<Claim> = def
                     .target_def
                     .outputs
                     .iter()
                     .flat_map(|output| output.paths.iter())
                     .filter(|path| path.codegen_tree == CodegenMode::Copy)
-                    .map(|path| GitignoreEntry {
-                        pattern: content_to_pattern(&path.content),
-                        addr: Some(addr.clone()),
-                    })
+                    .map(|path| content_to_claim(&path.content))
                     .collect();
-                Ok::<Vec<GitignoreEntry>, anyhow::Error>(entries)
+                Ok::<(String, Option<Vec<Claim>>), anyhow::Error>((addr.format(), Some(claims)))
             })
         });
         let per_target = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
-        let entries: Vec<GitignoreEntry> = per_target.into_iter().flatten().collect();
-        Ok(normalize(entries))
+
+        let mut scan = CodegenCopyScan::default();
+        for (addr, claims) in per_target {
+            match claims {
+                Some(claims) if !claims.is_empty() => {
+                    scan.claims.insert(addr, claims);
+                }
+                Some(_) => {
+                    scan.resolved_without_output.insert(addr);
+                }
+                None => {
+                    scan.unresolved.insert(addr);
+                }
+            }
+        }
+        Ok(scan)
     }
+}
+
+/// What one whole-or-scoped resolution learned about `codegen = "copy"` outputs.
+#[derive(Debug, Default)]
+pub struct CodegenCopyScan {
+    /// Targets that resolved and declare copy output.
+    pub claims: std::collections::BTreeMap<String, Vec<Claim>>,
+    /// Targets that resolved and declare none — positive evidence they own
+    /// nothing, so a stale claim for one of them may be released.
+    pub resolved_without_output: std::collections::HashSet<String>,
+    /// Targets that did not resolve. We learned nothing about them, so their
+    /// claims must be left alone.
+    pub unresolved: std::collections::HashSet<String>,
+}
+
+impl CodegenCopyScan {
+    /// The `.gitignore` lines these declarations imply. Every claim kind anchors
+    /// the same way; only the claim store cares which kind it was.
+    pub fn gitignore_entries(&self) -> Vec<GitignoreEntry> {
+        self.claims
+            .iter()
+            .flat_map(|(addr, claims)| {
+                claims.iter().map(move |c| GitignoreEntry {
+                    pattern: format!("/{}", c.path),
+                    addr: parse_addr(addr).ok(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The claim a declared `codegen = "copy"` output path makes, preserving the
+/// shape it was declared with.
+///
+/// The kind is the whole point: a literal path must never reach the glob engine
+/// (`data[1].go` would compile to a character class, failing to claim the real
+/// file and silently claiming `data1.go`), and only a real glob output should
+/// cost a glob match.
+pub(crate) fn content_to_claim(content: &Content) -> Claim {
+    match content {
+        Content::FilePath(p) => Claim::file(p.clone()),
+        Content::DirPath(p) => Claim::dir(p.clone()),
+        Content::Glob(g) => Claim::glob(g.clone()),
+    }
+}
+
+/// Reconcile the codegen claim ledger against the live set of `codegen = "copy"`
+/// targets, and report which targets' claims were dropped.
+///
+/// The write-back can only add a target's claims or update them in place — it
+/// runs when a target generates, and a target deleted from the tree never runs
+/// again. Without this its claims would outlive it forever, and a stale claim
+/// silently hides a real source file at that path.
+///
+/// This is the reconciliation pass, not a claim source: the ledger alone decides
+/// what is generated, and the `.gitignore` section this module renders only tells
+/// git to ignore build outputs. They share a command because both derive from one
+/// whole-workspace resolution, which is expensive enough to want doing once.
+///
+/// `fresh` is the freshly-resolved set; `scoped` says whether it covers the whole
+/// workspace or only what `matcher` selects. Scoped runs leave other targets'
+/// claims alone, exactly as [`merge_section`] leaves their `.gitignore` lines
+/// alone: this run resolved nothing about them, so their absence proves nothing,
+/// and guessing would drop a *live* claim — a generated file with no claim is the
+/// failure the whole mechanism exists to prevent.
+pub fn reconcile_claims(
+    claims: &hwalk::CodegenClaims,
+    scan: &CodegenCopyScan,
+    matcher: &Matcher,
+    scoped: bool,
+) -> anyhow::Result<Vec<String>> {
+    let current = claims.entries()?;
+    let mut next = scan.claims.clone();
+    let mut dropped = Vec::new();
+
+    for (addr, claims_now) in &current {
+        if scan.claims.contains_key(addr) {
+            continue;
+        }
+        // Releasing a claim needs POSITIVE evidence that the target no longer
+        // emits it. Two things look identical in `scan.claims` and are not:
+        // a target that resolved and declares no copy output (safe to release)
+        // and one that failed to resolve (we learned nothing). Dropping the
+        // latter would leave its generated file on disk unclaimed — the failure
+        // this mechanism exists to prevent — and `heph tool gen-gitignore` is a
+        // routine command, so it would happen quietly and often.
+        if scan.unresolved.contains(addr) {
+            next.insert(addr.clone(), claims_now.clone());
+            continue;
+        }
+        // Out of a scoped run's reach: this run resolved nothing about that
+        // target either, so its absence proves nothing.
+        let in_scope = !scoped
+            || parse_addr(addr).is_ok_and(|a| matcher.matches_addr(&a) == MatchResult::MatchYes);
+        if in_scope && scan.resolved_without_output.contains(addr) {
+            dropped.push(addr.clone());
+        } else if in_scope && !scoped {
+            // A whole-workspace run that never listed the addr at all: the target
+            // is gone from the graph, which is the evidence we need.
+            dropped.push(addr.clone());
+        } else {
+            next.insert(addr.clone(), claims_now.clone());
+        }
+    }
+
+    if next != current {
+        claims.rewrite(&next)?;
+    }
+    dropped.sort();
+    Ok(dropped)
 }
 
 /// Extract the entries currently inside the heph-managed marker section of
@@ -462,6 +625,119 @@ mod tests {
                 attributed("/bar/b.go", "//bar:gen"),
             ]
         );
+    }
+
+    fn scan_of(
+        live: &[(&str, &str)],
+        resolved_empty: &[&str],
+        unresolved: &[&str],
+    ) -> CodegenCopyScan {
+        let mut scan = CodegenCopyScan::default();
+        for (addr, path) in live {
+            scan.claims
+                .entry((*addr).to_string())
+                .or_default()
+                .push(Claim::file(*path));
+        }
+        for a in resolved_empty {
+            scan.resolved_without_output.insert((*a).to_string());
+        }
+        for a in unresolved {
+            scan.unresolved.insert((*a).to_string());
+        }
+        scan
+    }
+
+    fn store() -> (tempfile::TempDir, hwalk::CodegenClaims) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let claims = hwalk::CodegenClaims::open(dir.path().join("claims.db")).expect("claim store");
+        (dir, claims)
+    }
+
+    /// Reconciliation drops a claim whose target resolved and no longer emits
+    /// copy output — the target was deleted, or its `out` moved. Without it, a
+    /// deleted target's claim hides a real source file at that path for good.
+    #[test]
+    fn reconcile_releases_claims_with_no_live_target() {
+        let (_dir, claims) = store();
+        claims
+            .record("//pkg:gone", &[Claim::file("/pkg/gone.go")])
+            .expect("record");
+        claims
+            .record("//pkg:live", &[Claim::file("/pkg/live.go")])
+            .expect("record");
+
+        let scan = scan_of(&[("//pkg:live", "/pkg/live.go")], &["//pkg:gone"], &[]);
+        let dropped = reconcile_claims(
+            &claims,
+            &scan,
+            &Matcher::TreeOutputTo(hmodel::htpkg::PkgBuf::from("")),
+            false,
+        )
+        .expect("reconcile");
+
+        assert_eq!(dropped, vec!["//pkg:gone".to_string()]);
+        let set = claims.snapshot();
+        assert!(!set.claims(std::path::Path::new("pkg/gone.go")));
+        assert!(set.claims(std::path::Path::new("pkg/live.go")));
+    }
+
+    /// A target that merely FAILED TO RESOLVE tells us nothing about what it
+    /// emits. Releasing its claims would leave its generated file on disk
+    /// unclaimed — the failure the mechanism exists to prevent — and
+    /// `gen-gitignore` is a routine command, so it would happen quietly.
+    #[test]
+    fn reconcile_keeps_claims_of_a_target_that_did_not_resolve() {
+        let (_dir, claims) = store();
+        claims
+            .record("//pkg:flaky", &[Claim::file("/pkg/flaky.go")])
+            .expect("record");
+
+        let scan = scan_of(&[], &[], &["//pkg:flaky"]);
+        let dropped = reconcile_claims(
+            &claims,
+            &scan,
+            &Matcher::TreeOutputTo(hmodel::htpkg::PkgBuf::from("")),
+            false,
+        )
+        .expect("reconcile");
+
+        assert!(
+            dropped.is_empty(),
+            "an unresolved target must not be released"
+        );
+        assert!(
+            claims
+                .snapshot()
+                .claims(std::path::Path::new("pkg/flaky.go")),
+            "its generated file stays claimed"
+        );
+    }
+
+    /// A scoped run resolved nothing about targets outside its matcher, so their
+    /// absence proves nothing. Keep their claims — the same rule
+    /// [`merge_section`] applies to their `.gitignore` lines.
+    #[test]
+    fn reconcile_leaves_out_of_scope_claims_alone() {
+        let (_dir, claims) = store();
+        claims
+            .record("//other:gen", &[Claim::file("/other/gen.go")])
+            .expect("record");
+        claims
+            .record("//pkg:gone", &[Claim::file("/pkg/gone.go")])
+            .expect("record");
+
+        let scan = scan_of(&[], &["//pkg:gone"], &[]);
+        let matcher = Matcher::Package(hmodel::htpkg::PkgBuf::from("pkg"));
+        let dropped = reconcile_claims(&claims, &scan, &matcher, true).expect("reconcile");
+
+        assert_eq!(dropped, vec!["//pkg:gone".to_string()]);
+        let set = claims.snapshot();
+        assert!(
+            set.claims(std::path::Path::new("other/gen.go")),
+            "a claim outside the scope must survive"
+        );
+        assert!(!set.claims(std::path::Path::new("pkg/gone.go")));
     }
 
     #[test]

@@ -56,9 +56,15 @@ impl App for GenGitignoreApp {
 
         let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
-            let fresh = Arc::clone(&self.engine)
-                .codegen_copy_gitignore_patterns(rs.clone(), &self.matcher)
+            // One whole-or-scoped resolution feeds both derived artifacts: the
+            // claim store (which decides what is generated) and the `.gitignore`
+            // section (which only tells git to ignore build outputs). They ride
+            // the same command because the resolution is the expensive part, not
+            // because they are the same thing.
+            let scan = Arc::clone(&self.engine)
+                .codegen_copy_scan_for(rs.clone(), &self.matcher)
                 .await?;
+            let fresh = gitignore::normalize_entries(scan.gitignore_entries());
 
             let path = self.root.join(".gitignore");
             let existing = match std::fs::read_to_string(&path) {
@@ -71,6 +77,29 @@ impl App for GenGitignoreApp {
             // Scoped: graft the freshly-scanned slice over the existing section,
             // keeping every line emitted by a target outside the matcher.
             // Whole-workspace: replace the section wholesale.
+            // Reconcile the codegen claim ledger from the same freshly-resolved
+            // data, before touching `.gitignore`. The ledger is what decides which
+            // tree paths are generated; the `.gitignore` section below only tells
+            // git to ignore build outputs. They ride the same command because both
+            // need one whole-workspace resolution.
+            //
+            // Reconciliation is needed because the write-back that maintains the
+            // ledger only ever sees targets that still exist and still run, so a
+            // target deleted from the tree keeps its old claim indefinitely — and
+            // a stale claim silently hides a real source file at that path.
+            let dropped = gitignore::reconcile_claims(
+                self.engine.codegen_claims(),
+                &scan,
+                &self.matcher,
+                self.scoped,
+            )
+            .context("reconciling the codegen claim ledger")?;
+            for addr in &dropped {
+                out.println(format!(
+                    "Released codegen claims for {addr} (no longer emits codegen = \"copy\" output)"
+                ));
+            }
+
             let entries = if self.scoped {
                 gitignore::merge_section(&existing, fresh, &self.matcher)
             } else {

@@ -139,25 +139,45 @@ impl App for ValidateApp {
                 .codegen_copy_overlaps(rs.clone(), &overlap_matcher)
                 .await;
 
-            // 3. Verify `.gitignore` is up to date (whole-workspace runs only).
-            let gitignore_res: anyhow::Result<bool> = async {
+            // 3. Verify `.gitignore` and the codegen claim ledger are up to date
+            //    (whole-workspace runs only). Both are derived from the same
+            //    freshly-resolved set of `codegen = "copy"` outputs.
+            let gitignore_res: anyhow::Result<(bool, Vec<String>)> = async {
                 if scoped {
-                    return Ok(false);
+                    return Ok((false, Vec::new()));
                 }
-                let entries = Arc::clone(&engine)
-                    .codegen_copy_gitignore_patterns(
-                        rs.clone(),
-                        &Matcher::TreeOutputTo(PkgBuf::from("")),
-                    )
+                let scan = Arc::clone(&engine)
+                    .codegen_copy_scan_for(rs.clone(), &Matcher::TreeOutputTo(PkgBuf::from("")))
                     .await?;
+                let entries = gitignore::normalize_entries(scan.gitignore_entries());
+
+                // Claims whose target no longer emits them. Reported, not
+                // repaired: `validate` is a check, and the repair belongs to the
+                // command that rewrites these declarations. A stale claim is the
+                // quiet failure — it hides a real source file at that path — so
+                // silence here would be the wrong kind of clean run.
+                // Only a target that RESOLVED and declares no copy output is
+                // positive evidence of an orphan. One that failed to resolve tells
+                // us nothing, and reporting it would send the user to a command
+                // that would then release a live claim.
+                let orphans: Vec<String> = engine
+                    .codegen_claims()
+                    .entries()
+                    .context("reading the codegen claim store")?
+                    .into_keys()
+                    .filter(|addr| {
+                        !scan.claims.contains_key(addr) && !scan.unresolved.contains(addr)
+                    })
+                    .collect();
+
                 let path = root.join(".gitignore");
                 let existing = match std::fs::read_to_string(&path) {
                     Ok(s) => s,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                     Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
                 };
-                let want = gitignore::render(&existing, &entries);
-                Ok(want != existing) // true = stale
+                let rendered = gitignore::render(&existing, &entries);
+                Ok((rendered != existing, orphans))
             }
             .await;
 
@@ -175,12 +195,21 @@ impl App for ValidateApp {
                     })
                     .collect::<Vec<String>>()
             });
-            let gitignore_res = gitignore_res.map(|stale| {
+            let gitignore_res = gitignore_res.map(|(stale, orphans)| {
+                let mut msgs = Vec::new();
                 if stale {
-                    vec!["`.gitignore` is out of date — run `heph tool gen-gitignore`".to_string()]
-                } else {
-                    Vec::new()
+                    msgs.push(
+                        "`.gitignore` is out of date — run `heph tool gen-gitignore`".to_string(),
+                    );
                 }
+                for addr in orphans {
+                    msgs.push(format!(
+                        "codegen claim for `{addr}` outlives the target — it no longer emits \
+                         codegen = \"copy\" output, so its claimed paths are hidden from every \
+                         glob; run `heph tool gen-gitignore`"
+                    ));
+                }
+                msgs
             });
 
             finish(vec![
