@@ -11,6 +11,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use anyhow::Context;
+use sha2::{Digest, Sha256};
 
 /// Timeouts for a download. See the crate docs for why there is no total one.
 #[derive(Debug, Clone, Copy)]
@@ -98,6 +99,36 @@ pub fn get(url: &str, w: &mut (impl Write + Send)) -> anyhow::Result<u64> {
     Fetcher::default().get(url, w, |_| {})
 }
 
+/// [`get`], also returning the lowercase hex SHA-256 of the body, computed as
+/// it streams into `w` — so a large artifact can be checked against a pinned
+/// checksum without holding it in memory or reading it back.
+pub fn get_sha256(url: &str, w: &mut (impl Write + Send)) -> anyhow::Result<String> {
+    let mut hw = HashingWriter {
+        inner: w,
+        hasher: Sha256::new(),
+    };
+    get(url, &mut hw)?;
+    Ok(hex::encode(hw.hasher.finalize()))
+}
+
+/// Writes through to `inner`, hashing every byte that lands.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(data)?;
+        self.hasher.update(data.get(..n).unwrap_or(data));
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +183,21 @@ mod tests {
         assert_eq!(out, body);
         assert_eq!(n, body.len() as u64);
         assert_eq!(announced, Some(body.len() as u64));
+    }
+
+    /// The streamed hash is the SHA-256 of exactly the bytes written.
+    #[test]
+    fn get_sha256_hashes_the_written_body() {
+        let body: &[u8] = b"test";
+        let url = serve_dribble(body.len(), body, Duration::ZERO, Duration::ZERO);
+        let mut out = Vec::new();
+        let got = get_sha256(&url, &mut out).unwrap();
+        assert_eq!(out, body);
+        // sha256("test")
+        assert_eq!(
+            got,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
     }
 
     /// A body that stops arriving fails on the read timeout, and the error

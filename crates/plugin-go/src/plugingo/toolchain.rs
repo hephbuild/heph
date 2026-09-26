@@ -52,7 +52,6 @@ use hplugin::driver::{
 };
 use hplugin::htspec::Spec;
 use hplugin::provider::TargetSpec;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -631,6 +630,9 @@ impl ManagedDriver for GoToolchainDriver {
         let def = req.request.target.def_de::<GoToolchainDef>();
         let url = sdk_url(&def.version, &def.goos, &def.goarch);
         let dest = req.sandbox_pkg_dir.clone();
+        // The sandbox root, outside the workspace dir outputs are collected
+        // from, so the tarball can never end up in an artifact.
+        let tarball = req.sandbox_dir.join("go-sdk.tar.gz");
         let expected = def.sha256.clone();
         let version = def.version.clone();
 
@@ -639,7 +641,7 @@ impl ManagedDriver for GoToolchainDriver {
         // token (the blocking work itself can't be interrupted mid-syscall, but
         // we stop awaiting it promptly on cancel).
         let work = tokio::task::spawn_blocking(move || {
-            download_verify_extract(&url, &expected, &version, &dest)
+            download_verify_extract(&url, &expected, &version, &tarball, &dest)
         });
 
         let extract = async {
@@ -657,23 +659,56 @@ impl ManagedDriver for GoToolchainDriver {
     }
 }
 
-/// Download `url`, verify it against `expected_sha256`, and extract the SDK tree
-/// into `dest` (producing `dest/go/...`). Pure blocking work.
+/// Download `url` to `tarball`, verify it against `expected_sha256`, and
+/// extract the SDK tree into `dest` (producing `dest/go/...`). Pure blocking
+/// work. The tarball streams to disk rather than memory, and is checked
+/// before anything is unpacked from it.
 fn download_verify_extract(
     url: &str,
     expected_sha256: &str,
     version: &str,
+    tarball: &std::path::Path,
     dest: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let mut bytes = Vec::new();
-    hfetch::get(url, &mut bytes).with_context(|| format!("download Go {version} SDK"))?;
+    let extracted = download_verified(url, expected_sha256, version, tarball)
+        .and_then(|f| extract_sdk(f, version, dest));
+    if let Err(rm_err) = std::fs::remove_file(tarball) {
+        tracing::debug!(path = ?tarball, error = %rm_err, "remove Go SDK tarball");
+    }
+    extracted
+}
 
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let got = hex::encode(hasher.finalize());
+/// Stream `url` into `tarball` and verify its checksum, returning the file
+/// rewound for reading.
+fn download_verified(
+    url: &str,
+    expected_sha256: &str,
+    version: &str,
+    tarball: &std::path::Path,
+) -> anyhow::Result<std::fs::File> {
+    use std::io::Seek;
+
+    let mut f = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(tarball)
+        .with_context(|| format!("create {tarball:?}"))?;
+    let got = hfetch::get_sha256(url, &mut std::io::BufWriter::new(&mut f))
+        .with_context(|| format!("download Go {version} SDK"))?;
     verify_checksum(expected_sha256, &got, version, url)?;
+    f.rewind().with_context(|| format!("rewind {tarball:?}"))?;
+    Ok(f)
+}
 
-    let gz = flate2::read::GzDecoder::new(bytes.as_slice());
+/// Unpack a verified SDK tarball into `dest` and check the promised layout.
+fn extract_sdk(
+    tarball: std::fs::File,
+    version: &str,
+    dest: &std::path::Path,
+) -> anyhow::Result<()> {
+    let gz = flate2::read::GzDecoder::new(std::io::BufReader::new(tarball));
     let mut archive = tar::Archive::new(gz);
     archive.set_preserve_permissions(true);
     archive
@@ -1075,5 +1110,81 @@ mod tests {
             spec.config.get("sha256"),
             Some(Value::String(s)) if s == "abc123"
         ));
+    }
+
+    /// A gzipped tar holding just `go/bin/go`, and its sha256.
+    fn fake_sdk_tarball() -> (Vec<u8>, String) {
+        use sha2::Digest as _;
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let data = b"#!/bin/sh\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, "go/bin/go", &data[..])
+            .expect("append");
+        let bytes = tar.into_inner().expect("tar").finish().expect("gz");
+        let sha = hex::encode(sha2::Sha256::digest(&bytes));
+        (bytes, sha)
+    }
+
+    /// Serve `body` once on a local port and return its URL.
+    fn serve_once(body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).expect("read request");
+            assert!(n > 0, "empty request");
+            write!(
+                s,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write headers");
+            s.write_all(&body).expect("write body");
+        });
+        format!("http://{addr}/go.tar.gz")
+    }
+
+    /// The tarball streams to disk (not memory), is extracted once verified,
+    /// and is gone afterwards so it can't linger in the sandbox.
+    #[test]
+    fn test_download_verify_extract_streams_through_a_removed_tarball() {
+        let (bytes, sha) = fake_sdk_tarball();
+        let url = serve_once(bytes);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tarball = dir.path().join("go-sdk.tar.gz");
+        let dest = dir.path().join("pkg");
+
+        download_verify_extract(&url, &sha, "1.27.0", &tarball, &dest).expect("provision");
+
+        assert!(dest.join("go/bin/go").exists());
+        assert!(!tarball.exists(), "the tarball must be removed");
+    }
+
+    /// A checksum mismatch unpacks nothing, and still removes the tarball.
+    #[test]
+    fn test_download_verify_extract_mismatch_extracts_nothing() {
+        let (bytes, _) = fake_sdk_tarball();
+        let url = serve_once(bytes);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tarball = dir.path().join("go-sdk.tar.gz");
+        let dest = dir.path().join("pkg");
+
+        let err = download_verify_extract(&url, "00", "1.27.0", &tarball, &dest)
+            .expect_err("mismatch must fail");
+
+        assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
+        assert!(
+            !dest.exists(),
+            "nothing may be unpacked from an unverified tarball"
+        );
+        assert!(!tarball.exists(), "the tarball must be removed");
     }
 }
