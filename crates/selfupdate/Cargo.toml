@@ -12,10 +12,8 @@ hcore = { package = "core", path = "../core" }
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1"
-# Blocking HTTP client, used only to download the pinned release binary. rustls
-# avoids a system OpenSSL link; blocking runs on its own thread (matches the
-# engine's plugin downloader).
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# Downloads the pinned release binary.
+hfetch = { package = "fetch", path = "../fetch" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -665,25 +665,15 @@ fn download_verify_extract(
     version: &str,
     dest: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .build()
-        .context("build http client")?;
-    let resp = client
-        .get(url)
-        .send()
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("download {url}"))?;
-    let bytes = resp
-        .bytes()
-        .with_context(|| format!("read body of {url}"))?;
+    let mut bytes = Vec::new();
+    hfetch::get(url, &mut bytes).with_context(|| format!("download Go {version} SDK"))?;
 
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let got = hex::encode(hasher.finalize());
     verify_checksum(expected_sha256, &got, version, url)?;
 
-    let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.as_ref()));
+    let gz = flate2::read::GzDecoder::new(bytes.as_slice());
     let mut archive = tar::Archive::new(gz);
     archive.set_preserve_permissions(true);
     archive

@@ -1,0 +1,15 @@
+[package]
+name = "fetch"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+tokio = { version = "1.52.3", features = ["rt", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

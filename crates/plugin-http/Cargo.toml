@@ -14,7 +14,7 @@ hdriver-support = { package = "driver-support", path = "../driver-support" }
 anyhow = "1.0.102"
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1.89"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+hfetch = { package = "fetch", path = "../fetch" }
 sha2 = "0.11"
 # sha2 0.11 (digest 0.11) returns an `Array` that no longer implements
 # `LowerHex`, so the old `format!("{:x}", ..)` is out. `hex::encode` emits the

@@ -279,35 +279,52 @@ fn render(template: &str, args: &BTreeMap<String, String>) -> anyhow::Result<Str
 }
 
 /// Download `url`, verify it against `expected_sha256` (when non-empty), and
-/// write it to `dest`. Pure blocking work.
+/// write it to `dest`. Pure blocking work. The body is streamed to `dest` and
+/// hashed on the way; a mismatch removes it again.
 fn fetch(
     url: &str,
     expected_sha256: &str,
     executable: bool,
     dest: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .build()
-        .context("build http client")?;
-    let bytes = client
-        .get(url)
-        .send()
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("GET {url}"))?
-        .bytes()
-        .with_context(|| format!("read body of {url}"))?;
+    let f = std::fs::File::create(dest).with_context(|| format!("create {dest:?}"))?;
+    let mut sink = HashingWriter {
+        inner: std::io::BufWriter::new(f),
+        hasher: Sha256::new(),
+    };
+    hfetch::get(url, &mut sink).with_context(|| format!("download to {dest:?}"))?;
+    let got = hex::encode(sink.hasher.finalize());
+    if let Err(err) = verify_checksum(expected_sha256, &got, url) {
+        drop(sink.inner);
+        if let Err(rm_err) = std::fs::remove_file(dest) {
+            tracing::debug!(path = ?dest, error = %rm_err, "remove mismatched download");
+        }
+        return Err(err);
+    }
+    drop(sink.inner);
 
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let got = hex::encode(hasher.finalize());
-    verify_checksum(expected_sha256, &got, url)?;
-
-    std::fs::write(dest, &bytes).with_context(|| format!("write {dest:?}"))?;
     if executable {
         set_executable(dest).with_context(|| format!("chmod +x {dest:?}"))?;
     }
     Ok(())
+}
+
+/// Writes through to `inner`, hashing every byte that lands.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(data)?;
+        self.hasher.update(data.get(..n).unwrap_or(data));
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[cfg(unix)]

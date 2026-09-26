@@ -287,7 +287,7 @@ fn download_url(tag: &str, flavour: &str, os: &str, arch: &str) -> String {
 mod imp {
     use super::{UPGRADED_ENV, binary_name, download_url, host_os_arch};
     use anyhow::{Context, anyhow};
-    use std::io::{IsTerminal, Read, Write};
+    use std::io::{IsTerminal, Write};
     use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -420,40 +420,38 @@ mod imp {
     }
 
     /// Fetch `url` fully into memory, streaming so `progress` (when present) tracks
-    /// bytes as they arrive. `reqwest::blocking` spins up its own runtime, so run it
-    /// on a dedicated thread to stay safe if ever called from within an async
-    /// runtime (matches the engine's plugin downloader).
+    /// bytes as they arrive.
     fn download(url: &str, progress: Option<Arc<Progress>>) -> anyhow::Result<Vec<u8>> {
-        let url = url.to_string();
-        std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
-            let mut resp = reqwest::blocking::get(&url)
-                .with_context(|| format!("GET {url}"))?
-                .error_for_status()
-                .with_context(|| format!("GET {url}"))?;
-            if let Some(p) = &progress
-                && let Some(len) = resp.content_length()
-            {
+        let mut sink = ProgressSink {
+            buf: Vec::new(),
+            progress: progress.as_deref(),
+        };
+        hfetch::Fetcher::default().get(url, &mut sink, |len| {
+            if let Some(p) = progress.as_deref() {
                 p.total.store(len, Ordering::Relaxed);
             }
-            let mut buf = Vec::with_capacity(resp.content_length().unwrap_or(0) as usize);
-            let mut chunk = [0u8; 64 * 1024];
-            loop {
-                let n = resp
-                    .read(&mut chunk)
-                    .with_context(|| format!("reading response body from {url}"))?;
-                if n == 0 {
-                    break;
-                }
-                let Some(part) = chunk.get(..n) else { break };
-                buf.extend_from_slice(part);
-                if let Some(p) = &progress {
-                    p.downloaded.fetch_add(n as u64, Ordering::Relaxed);
-                }
+        })?;
+        Ok(sink.buf)
+    }
+
+    /// Collects the body, counting bytes into `progress` as they land.
+    struct ProgressSink<'a> {
+        buf: Vec<u8>,
+        progress: Option<&'a Progress>,
+    }
+
+    impl Write for ProgressSink<'_> {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            if let Some(p) = self.progress {
+                p.downloaded.fetch_add(data.len() as u64, Ordering::Relaxed);
             }
-            Ok(buf)
-        })
-        .join()
-        .map_err(|_e| anyhow!("self-upgrade download thread panicked"))?
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// Write `bytes` to a temp file, mark it executable, then rename into place so
