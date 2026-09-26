@@ -99,6 +99,35 @@ pub fn telemetry_enabled_from_config() -> bool {
 /// on the engine, so one engine serves an ordinary request and an audit request
 /// without being rebuilt, and each switch has exactly one source of truth. Only
 /// workspace-level policy reaches `Config`.
+/// Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
+/// <name> }` entry selects them. The go plugin is no longer compiled in: it
+/// ships as a separate cdylib loaded from a `path:`/`url:` manifest entry,
+/// under its own `go`/`go_*` names.
+///
+/// Public so a config generated elsewhere (`heph-bench`'s Tier B corpus) can be
+/// checked against the set the binary actually accepts.
+pub fn register_builtin_factories(e: &mut engine::Engine) -> anyhow::Result<()> {
+    e.register_provider_factory("buildfile", |init, opts| {
+        Ok(Box::new(
+            pluginbuildfile::Provider::from_options(
+                init.root.to_path_buf(),
+                &init.skip_dirs,
+                &init.skip_globs,
+                opts,
+                init.runtime.clone(),
+            )?
+            .with_walker(init.walker.clone()),
+        ))
+    })?;
+    e.register_managed_driver_factory("exec", |_init, opts| {
+        Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
+    })?;
+    e.register_managed_driver_factory("bash", |_init, opts| {
+        Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
+    })?;
+    Ok(())
+}
+
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -144,28 +173,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // `oci_push` / `oci_load` names.
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
-    // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
-    // <name> }` entry selects them. The go plugin is no longer compiled in: it
-    // ships as a separate cdylib loaded from a `path:`/`url:` manifest entry,
-    // under its own `go`/`go_*` names.
-    e.register_provider_factory("buildfile", |init, opts| {
-        Ok(Box::new(
-            pluginbuildfile::Provider::from_options(
-                init.root.to_path_buf(),
-                &init.skip_dirs,
-                &init.skip_globs,
-                opts,
-                init.runtime.clone(),
-            )?
-            .with_walker(init.walker.clone()),
-        ))
-    })?;
-    e.register_managed_driver_factory("exec", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
-    })?;
-    e.register_managed_driver_factory("bash", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
-    })?;
+    register_builtin_factories(&mut e)?;
 
     // Apply every `plugins:` entry: a `builtin:` instantiates the matching
     // factory above; a `path:`/`url:` resolves a manifest, loads the cdylib, and
@@ -307,24 +315,7 @@ mod tests {
             Box::new(pluginnix::Driver::new(home_dir.join("nix-driver")))
         })?;
 
-        e.register_provider_factory("buildfile", |init, opts| {
-            Ok(Box::new(
-                pluginbuildfile::Provider::from_options(
-                    init.root.to_path_buf(),
-                    &init.skip_dirs,
-                    &init.skip_globs,
-                    opts,
-                    init.runtime.clone(),
-                )?
-                .with_walker(init.walker.clone()),
-            ))
-        })?;
-        e.register_managed_driver_factory("exec", |_init, opts| {
-            Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
-        })?;
-        e.register_managed_driver_factory("bash", |_init, opts| {
-            Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
-        })?;
+        register_builtin_factories(&mut e)?;
 
         // The helper exercises built-in plugins only (no cdylib loading).
         for spec in &file.plugins {
