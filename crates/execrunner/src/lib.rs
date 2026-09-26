@@ -140,6 +140,20 @@ pub struct PathPolicy {
     /// Used only when nothing else provides a `PATH`, and never under a runner
     /// that supplies an environment of its own.
     pub fallback: Option<OsString>,
+    /// Entries that come **last**, behind everything the environment provides.
+    ///
+    /// For tools heph supplies rather than the target: they should fill a gap
+    /// the environment leaves, and never shadow a binary that environment
+    /// deliberately ships. `prefix` is the opposite — what the target declared,
+    /// which wins over everything.
+    ///
+    /// It is composed into the environment *this process* spawns, and so it
+    /// deliberately does not reach a runner that carries the environment out of
+    /// band: those entries are host paths, and a container's filesystem is not
+    /// this one. A runner that relocates the environment gets the prefix (which
+    /// is the target's own, and lives on paths the runner is responsible for
+    /// making visible) and not the suffix.
+    pub suffix: Vec<OsString>,
 }
 
 /// The `PATH` key, as an `OsStr` comparison target.
@@ -362,6 +376,7 @@ async fn prepare(
         // local spawn, unchanged.
         let declared = get_env(&spec.env, "PATH");
         compose_path(&mut spec.env, path, declared, true);
+        append_path(&mut spec.env, path.suffix.iter().cloned());
         return Ok(());
     };
 
@@ -392,6 +407,23 @@ async fn prepare(
     // side could equally be either.
     let declared = get_env(&spec.env, "PATH");
 
+    // The prefix has to be on the environment the runner *carries*, not only on
+    // the one this process ends up spawning. A runner may move the target's
+    // environment out of band — `oci` turns it into `docker exec -e KEY=VALUE`
+    // arguments and hands back the *client's* environment — and anything
+    // composed after `prepare` then decorates the docker client while the
+    // target inside the container gets neither its declared tools nor heph's
+    // builtins. Silently: the container falls back to the image's own tools, so
+    // the recipe keeps working with a different binary than its cache key names.
+    //
+    // Composing here puts the prefix on the wire the runner already carries.
+    // The composition after `prepare` still runs, and still orders the runner's
+    // own `PATH` behind the prefix for every runner that leaves the environment
+    // in place; `join_path` dedupes, so doing both is idempotent.
+    if let Some(carried) = carried_path(path, declared.as_ref()) {
+        set_path(&mut spec.env, carried);
+    }
+
     let outcome = host
         .prepare(runner.request_id, addr, SpecRewrite::split(spec), ctoken)
         .await?;
@@ -412,11 +444,13 @@ async fn prepare(
         !supplies_environment,
     );
     if let Some(provided) = provided {
-        let so_far = get_env(&spec.env, "PATH");
-        if let Some(joined) = join_path(so_far.into_iter().chain(std::iter::once(provided))) {
-            set_path(&mut spec.env, joined);
-        }
+        append_path(&mut spec.env, std::iter::once(provided));
     }
+    // Last, behind the environment the target asked to run in. Only for a
+    // runner that left the environment in `spec.env`: one that carried it out
+    // of band is holding a copy this never touches, which is the intended
+    // outcome — see [`PathPolicy::suffix`].
+    append_path(&mut spec.env, path.suffix.iter().cloned());
     Ok(())
 }
 
@@ -439,6 +473,24 @@ fn compose_path(
     // every `execvp` in the target fail with a confusing ENOENT.
     if let Some(p) = composed {
         set_path(env, p);
+    }
+}
+
+/// The `PATH` handed to the runner: the target's prefix ahead of what it
+/// declared.
+///
+/// Separate from the composition that follows `prepare` because a runner may
+/// carry the environment out of band, and then this is the only copy the target
+/// ever sees. See [`PathPolicy`].
+fn carried_path(path: &PathPolicy, declared: Option<&OsString>) -> Option<OsString> {
+    join_path(path.prefix.iter().cloned().chain(declared.cloned()))
+}
+
+/// Append `items` behind whatever `PATH` the environment already has.
+fn append_path(env: &mut Vec<(OsString, OsString)>, items: impl IntoIterator<Item = OsString>) {
+    let so_far = get_env(env, "PATH");
+    if let Some(joined) = join_path(so_far.into_iter().chain(items)) {
+        set_path(env, joined);
     }
 }
 
@@ -586,6 +638,15 @@ mod tests {
         PathPolicy {
             prefix: prefix.iter().map(|p| os(p)).collect(),
             fallback: fallback.map(os),
+            suffix: vec![],
+        }
+    }
+
+    fn policy_with_suffix(prefix: &[&str], suffix: &[&str]) -> PathPolicy {
+        PathPolicy {
+            prefix: prefix.iter().map(|p| os(p)).collect(),
+            fallback: None,
+            suffix: suffix.iter().map(|p| os(p)).collect(),
         }
     }
 
@@ -652,6 +713,79 @@ mod tests {
             path_of(&spec.env).as_deref(),
             Some("/sandbox/bin:/usr/local/bin:/usr/bin")
         );
+    }
+
+    /// A runner may carry the target's environment **out of band**: `oci` turns
+    /// it into `docker exec -e KEY=VALUE` arguments and hands back the *docker
+    /// client's* environment. So the prefix — the target's declared tools, and
+    /// heph's builtin utilities — has to be on the environment handed *to* the
+    /// runner, because for such a runner that is the only copy the target ever
+    /// sees.
+    ///
+    /// Composing only after `prepare` decorated the docker client instead, and
+    /// the target inside the container got neither. Silently: the container
+    /// falls back to the image's own tools, so the recipe keeps working with a
+    /// different binary than its cache key names.
+    #[test]
+    fn the_path_handed_to_a_runner_leads_with_the_targets_prefix() {
+        let carried = carried_path(
+            &policy(&["/sandbox/bin", "/heph/coreutils/bin"], Some("/fallback")),
+            Some(&os("/declared")),
+        );
+        assert_eq!(
+            carried.as_deref(),
+            Some(std::ffi::OsStr::new(
+                "/sandbox/bin:/heph/coreutils/bin:/declared"
+            )),
+            "the target's tools and heph's builtins must lead the PATH the runner carries"
+        );
+    }
+
+    /// The suffix is for tools *heph* supplies rather than the target: they fill
+    /// a gap the environment leaves and never shadow what it deliberately
+    /// ships. So it composes behind everything — the target's tools lead, what
+    /// the target declared follows, then the environment, then these.
+    #[tokio::test]
+    async fn what_heph_supplies_composes_behind_the_environment() {
+        let mut spec = spec("/bin/true");
+        spec.env.push((os("PATH"), os("/declared")));
+        let ctoken = StdCancellationToken::new();
+        let policy = policy_with_suffix(&["/sandbox/bin"], &["/heph/coreutils/bin"]);
+        prepare(RunnerRef::local(), &mut spec, &policy, &ctoken)
+            .await
+            .expect("local prepare");
+        assert_eq!(
+            path_of(&spec.env).as_deref(),
+            Some("/sandbox/bin:/declared:/heph/coreutils/bin")
+        );
+    }
+
+    /// The suffix is not part of what a runner carries. Those entries are host
+    /// paths, and the whole point of naming a runner is that the filesystem may
+    /// not be this one — a container would get a directory of symlinks into a
+    /// binary built for the wrong platform.
+    ///
+    /// The prefix still is carried: it is the target's own, on paths the runner
+    /// is responsible for making visible.
+    #[test]
+    fn what_heph_supplies_is_not_carried_to_a_runner() {
+        let carried = carried_path(
+            &policy_with_suffix(&["/sandbox/bin"], &["/heph/coreutils/bin"]),
+            Some(&os("/declared")),
+        );
+        assert_eq!(
+            carried.as_deref(),
+            Some(std::ffi::OsStr::new("/sandbox/bin:/declared")),
+            "a runner carries the target's own PATH, not heph's host-path builtins"
+        );
+    }
+
+    /// The fallback is the driver's sandbox `PATH`, and it is not part of what a
+    /// runner carries: reinstating it out of band would put `/usr/bin` inside
+    /// the environment the target asked to run in.
+    #[test]
+    fn nothing_is_carried_to_a_runner_when_there_is_no_prefix_and_no_declaration() {
+        assert_eq!(carried_path(&policy(&[], Some("/usr/bin")), None), None);
     }
 
     #[test]

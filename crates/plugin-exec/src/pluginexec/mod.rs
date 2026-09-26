@@ -1729,6 +1729,9 @@ impl Driver {
                 .chain(tool_bin_dir.as_ref().map(|d| d.as_os_str().to_os_string()))
                 .collect(),
             fallback: Some(std::ffi::OsString::from(self.sandbox_path_display())),
+            // Nothing heph supplies behind the environment yet; the builtin
+            // toolbox is what this tier exists for.
+            suffix: vec![],
         };
 
         let output_log_path = req.sandbox_dir.join("log.txt");
