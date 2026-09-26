@@ -364,7 +364,6 @@ fn cache_entry_name(url: &str) -> String {
 /// the manifest carries fully-qualified per-os/arch artifact URLs.
 #[cfg(unix)]
 fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
-    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     let name = cache_entry_name(url);
@@ -383,33 +382,88 @@ fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
         return Ok(dest);
     }
 
-    // reqwest::blocking spins up its own runtime; run it on a dedicated std
-    // thread so it is safe to call from within the async runtime new_engine runs
-    // on (a nested block_on would otherwise panic).
-    let url_for_thread = url.to_string();
-    let bytes = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
-        let resp = reqwest::blocking::get(&url_for_thread)
-            .with_context(|| format!("GET {url_for_thread}"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url_for_thread}"))?;
-        Ok(resp.bytes()?.to_vec())
-    })
-    .join()
-    .map_err(|_e| anyhow::anyhow!("plugin download thread panicked"))??;
-
-    // Write to a temp path then rename so a partial download is never seen as a
-    // usable binary by a concurrent run.
+    // Download to a temp path then rename so a partial download is never seen as
+    // a usable binary by a concurrent run.
     let tmp = dir.join(format!(".{name}.download"));
-    {
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(&bytes)?;
-        f.flush()?;
+    if let Err(err) = fetch_to_file(url, &tmp, DOWNLOAD_READ_TIMEOUT) {
+        // Best effort: a leftover is truncated by the next attempt anyway.
+        if let Err(rm_err) = std::fs::remove_file(&tmp) {
+            tracing::debug!(path = %tmp.display(), error = %rm_err, "remove partial plugin download");
+        }
+        return Err(err);
     }
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {}", tmp.display()))?;
     std::fs::rename(&tmp, &dest)
         .with_context(|| format!("install plugin to {}", dest.display()))?;
     Ok(dest)
+}
+
+/// Bound on establishing the connection to a plugin download host.
+#[cfg(unix)]
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound on a single read making no progress. There is deliberately no bound on
+/// the whole request: a plugin dylib is tens of MB, and a total timeout fails a
+/// slow-but-progressing link on every attempt, while a stalled one still trips
+/// this.
+#[cfg(unix)]
+const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// GET `url` and stream its body into `dest` (created or truncated). Fails if
+/// the connection can't be made within [`DOWNLOAD_CONNECT_TIMEOUT`] or any read
+/// waits longer than `read_timeout`; the total transfer time is unbounded.
+///
+/// Runs on a dedicated std thread with its own runtime so it is safe to call
+/// from within the async runtime `new_engine` runs on (a nested `block_on`
+/// would otherwise panic). The blocking client isn't used because it only
+/// offers a total timeout, not a per-read one.
+#[cfg(unix)]
+fn fetch_to_file(
+    url: &str,
+    dest: &std::path::Path,
+    read_timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let url = url.to_string();
+    let dest = dest.to_path_buf();
+    std::thread::spawn(move || -> anyhow::Result<()> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build plugin download runtime")?;
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+                .read_timeout(read_timeout)
+                .build()
+                .context("build plugin download client")?;
+            let mut resp = client
+                .get(&url)
+                .send()
+                .await
+                .and_then(|r| r.error_for_status())
+                .with_context(|| format!("GET {url}"))?;
+
+            let f = std::fs::File::create(&dest)
+                .with_context(|| format!("create {}", dest.display()))?;
+            let mut f = std::io::BufWriter::new(f);
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .with_context(|| format!("download {url}"))?
+            {
+                f.write_all(&chunk)
+                    .with_context(|| format!("write {}", dest.display()))?;
+            }
+            f.flush()
+                .with_context(|| format!("write {}", dest.display()))?;
+            Ok(())
+        })
+    })
+    .join()
+    .map_err(|_e| anyhow::anyhow!("plugin download thread panicked"))?
 }
 
 #[cfg(test)]
@@ -491,5 +545,69 @@ mod tests {
         // Relative (incl. `~user`) anchors onto base.
         assert_eq!(resolve_path("rel/path", base), base.join("rel/path"));
         assert_eq!(resolve_path("~bob/x", base), base.join("~bob/x"));
+    }
+
+    /// Serve one HTTP response on a local port: headers announcing `len` body
+    /// bytes, then `body` one byte every `gap`, then hold the connection open for
+    /// `hold`. Returns the URL.
+    #[cfg(unix)]
+    fn serve_dribble(
+        len: usize,
+        body: &'static [u8],
+        gap: std::time::Duration,
+        hold: std::time::Duration,
+    ) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).expect("read request");
+            assert!(n > 0, "empty request");
+            write!(
+                s,
+                "HTTP/1.1 200 OK\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n"
+            )
+            .expect("write headers");
+            for b in body {
+                std::thread::sleep(gap);
+                s.write_all(&[*b]).expect("write body");
+                s.flush().expect("flush");
+            }
+            std::thread::sleep(hold);
+        });
+        format!("http://{addr}/heph-go-plugin_linux_amd64.so")
+    }
+
+    /// A transfer taking far longer in total than the read timeout still
+    /// completes, as long as every read makes progress — the regression was a
+    /// 30s bound on the whole request.
+    #[cfg(unix)]
+    #[test]
+    fn fetch_to_file_tolerates_slow_but_progressing_body() {
+        use std::time::Duration;
+        let body: &[u8] = b"0123456789";
+        let url = serve_dribble(body.len(), body, Duration::from_millis(100), Duration::ZERO);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("out");
+        // ~1s total, 400ms per read.
+        super::fetch_to_file(&url, &dest, Duration::from_millis(400)).expect("download");
+        assert_eq!(std::fs::read(&dest).expect("read"), body);
+    }
+
+    /// A body that stops arriving fails on the read timeout, and the error
+    /// names the artifact.
+    #[cfg(unix)]
+    #[test]
+    fn fetch_to_file_fails_on_stalled_body_naming_the_url() {
+        use std::time::Duration;
+        let url = serve_dribble(10, b"01", Duration::ZERO, Duration::from_secs(5));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("out");
+        let err = super::fetch_to_file(&url, &dest, Duration::from_millis(200))
+            .expect_err("stalled body must time out");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&url), "{msg}");
     }
 }
