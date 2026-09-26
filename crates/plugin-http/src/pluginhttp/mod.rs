@@ -15,8 +15,9 @@
 //! error rather than a silently mis-fetched file.
 //!
 //! Fetching is a side-effect-free, content-addressed step like any other target:
-//! `sha256` (when set) is verified before the file is written, so a changed
-//! remote asset fails the build closed instead of poisoning the cache.
+//! `sha256` (when set) is verified before the target succeeds — a mismatched
+//! file is removed again — so a changed remote asset fails the build closed
+//! instead of poisoning the cache.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -31,7 +32,6 @@ use hplugin::driver::{
     ParseResponse,
 };
 use hplugin::htspec::{Spec, TargetSpecCache};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -279,31 +279,28 @@ fn render(template: &str, args: &BTreeMap<String, String>) -> anyhow::Result<Str
 }
 
 /// Download `url`, verify it against `expected_sha256` (when non-empty), and
-/// write it to `dest`. Pure blocking work.
+/// write it to `dest`. Pure blocking work. The body is streamed to `dest` and
+/// hashed on the way; a failed download or a mismatch removes it again.
 fn fetch(
     url: &str,
     expected_sha256: &str,
     executable: bool,
     dest: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .build()
-        .context("build http client")?;
-    let bytes = client
-        .get(url)
-        .send()
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("GET {url}"))?
-        .bytes()
-        .with_context(|| format!("read body of {url}"))?;
+    let verified = std::fs::File::create(dest)
+        .with_context(|| format!("create {dest:?}"))
+        .and_then(|f| {
+            hfetch::get_sha256(url, &mut std::io::BufWriter::new(f))
+                .with_context(|| format!("download to {dest:?}"))
+        })
+        .and_then(|got| verify_checksum(expected_sha256, &got, url));
+    if let Err(err) = verified {
+        if let Err(rm_err) = std::fs::remove_file(dest) {
+            tracing::debug!(path = ?dest, error = %rm_err, "remove failed download");
+        }
+        return Err(err);
+    }
 
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let got = hex::encode(hasher.finalize());
-    verify_checksum(expected_sha256, &got, url)?;
-
-    std::fs::write(dest, &bytes).with_context(|| format!("write {dest:?}"))?;
     if executable {
         set_executable(dest).with_context(|| format!("chmod +x {dest:?}"))?;
     }

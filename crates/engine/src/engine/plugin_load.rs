@@ -364,7 +364,6 @@ fn cache_entry_name(url: &str) -> String {
 /// the manifest carries fully-qualified per-os/arch artifact URLs.
 #[cfg(unix)]
 fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
-    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     let name = cache_entry_name(url);
@@ -383,33 +382,30 @@ fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
         return Ok(dest);
     }
 
-    // reqwest::blocking spins up its own runtime; run it on a dedicated std
-    // thread so it is safe to call from within the async runtime new_engine runs
-    // on (a nested block_on would otherwise panic).
-    let url_for_thread = url.to_string();
-    let bytes = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
-        let resp = reqwest::blocking::get(&url_for_thread)
-            .with_context(|| format!("GET {url_for_thread}"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url_for_thread}"))?;
-        Ok(resp.bytes()?.to_vec())
-    })
-    .join()
-    .map_err(|_e| anyhow::anyhow!("plugin download thread panicked"))??;
-
-    // Write to a temp path then rename so a partial download is never seen as a
-    // usable binary by a concurrent run.
+    // Download to a temp path then rename so a partial download is never seen as
+    // a usable binary by a concurrent run.
     let tmp = dir.join(format!(".{name}.download"));
-    {
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(&bytes)?;
-        f.flush()?;
+    if let Err(err) = download_to(url, &tmp) {
+        // Best effort: a leftover is truncated by the next attempt anyway.
+        if let Err(rm_err) = std::fs::remove_file(&tmp) {
+            tracing::debug!(path = %tmp.display(), error = %rm_err, "remove partial plugin download");
+        }
+        return Err(err);
     }
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {}", tmp.display()))?;
     std::fs::rename(&tmp, &dest)
         .with_context(|| format!("install plugin to {}", dest.display()))?;
     Ok(dest)
+}
+
+/// Stream `url` into `dest` (created or truncated).
+#[cfg(unix)]
+fn download_to(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+    let f = std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+    hfetch::get(url, &mut std::io::BufWriter::new(f))
+        .with_context(|| format!("download plugin to {}", dest.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]

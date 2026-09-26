@@ -1563,6 +1563,7 @@ dependencies = [
  "driver-support",
  "enclose",
  "execrunner",
+ "fetch",
  "flate2",
  "futures",
  "glob",
@@ -1774,6 +1775,18 @@ dependencies = [
  "cfg-if",
  "rustix",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "fetch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "reqwest",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -4181,6 +4194,7 @@ dependencies = [
  "driver-support",
  "enclose",
  "execrunner",
+ "fetch",
  "flate2",
  "futures",
  "glob",
@@ -4191,7 +4205,6 @@ dependencies = [
  "plugin-exec",
  "plugin-query",
  "proc",
- "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4226,12 +4239,10 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
- "hex",
+ "fetch",
  "model",
  "plugin",
- "reqwest",
  "serde",
- "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -5384,8 +5395,8 @@ dependencies = [
  "anyhow",
  "config",
  "core",
+ "fetch",
  "libc",
- "reqwest",
  "tempfile",
  "thiserror 2.0.19",
  "tracing",

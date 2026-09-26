@@ -29,10 +29,10 @@ borsh = { version = "1.6.1", features = ["derive"] }
 glob = "0.3"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
-# Hermetic Go toolchain provisioning: download (reqwest), checksum (sha2),
+# Hermetic Go toolchain provisioning: download (hfetch), checksum (sha2),
 # and extract (flate2 + tar) the pinned Go SDK tarball so the build never
 # reads a `go` binary or GOROOT from the host.
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+hfetch = { package = "fetch", path = "../fetch" }
 sha2 = "0.11"
 # sha2 0.11 (digest 0.11) returns an `Array` that no longer implements
 # `LowerHex`, so the old `format!("{:x}", ..)` is out. `hex::encode` emits the
