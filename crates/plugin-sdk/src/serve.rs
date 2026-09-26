@@ -11,7 +11,6 @@ use anyhow::{Context, Result};
 use hcore::hartifactcontent::tar::TarPacker;
 use hcore::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
 use hcore::hasync::StdCancellationToken;
-use hcore::htvalue::Value;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunInput, ManagedRunRequest};
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::{
@@ -20,8 +19,8 @@ use hplugin::driver::{
 };
 use hplugin::hook::Hook;
 use hplugin::provider::{
-    ConfigRequest, FnArgs, FnCallContext, GetError, GetRequest, ListPackagesRequest, ListRequest,
-    ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
+    ConfigRequest, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest, ListPackagesRequest,
+    ListRequest, ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
     ProviderFunctionRegistry,
 };
 use hplugin_stabby::abi::{
@@ -605,7 +604,15 @@ async fn provider_call_function(
             .map(|(k, v)| (k, convert::value_from_pb(v)))
             .collect(),
     };
-    let body = match def.func.call(&ctx, args).await {
+    // The CallFunction wire carries the return value alone: a function that
+    // declared targets / provider-state fails loudly rather than losing them
+    // across the seam. Carrying declarations over the ABI is the follow-up that
+    // unlocks out-of-process (e.g. JS) plugins.
+    let res = def.func.call(&ctx, args).await.and_then(|o| {
+        o.into_value_only()
+            .with_context(|| format!("plugin function {:?}", req.name))
+    });
+    let body = match res {
         Ok(v) => Body::CallFunctionResp(pb::CallFunctionResponse {
             value: Some(convert::value_to_pb(&v)),
         }),
@@ -861,7 +868,7 @@ struct GuestRegisteredFn {
 
 #[async_trait::async_trait]
 impl ProviderFn for GuestRegisteredFn {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<Value> {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<FnOutcome> {
         let pb_req = pb::CallRegisteredRequest {
             provider: self.provider.clone(),
             name: self.name.clone(),
@@ -881,7 +888,7 @@ impl ProviderFn for GuestRegisteredFn {
             .await;
         match pb::Frame::decode(&bytes[..])?.body {
             Some(Body::CallFunctionResp(r)) => {
-                Ok(convert::value_from_pb(r.value.unwrap_or_default()))
+                Ok(convert::value_from_pb(r.value.unwrap_or_default()).into())
             }
             Some(Body::Error(e)) => anyhow::bail!("{}", e.message),
             other => anyhow::bail!("unexpected call_registered response: {other:?}"),
@@ -1631,8 +1638,8 @@ mod tests {
     use hcore::htvalue::Value;
     use hcore::htvalue::signature::{FnSignature, Param, ParamType};
     use hplugin::provider::{
-        ConfigResponse, GetResponse, ListPackageResponse, ListResponse, ProbeResponse, ProviderFn,
-        ProviderFunctionDef,
+        ConfigResponse, FnOutcome, GetResponse, ListPackageResponse, ListResponse, ProbeResponse,
+        ProviderFn, ProviderFunctionDef,
     };
     use std::path::Path;
 
@@ -1644,11 +1651,22 @@ mod tests {
     struct EchoFn;
     #[async_trait::async_trait]
     impl ProviderFn for EchoFn {
-        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<Value> {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<FnOutcome> {
             let msg = match args.positional.first() {
                 Some(Value::String(s)) => s.clone(),
                 _ => anyhow::bail!("echo: `msg` must be a string"),
             };
+            // Declaring is in-process only: the seam must refuse it, not drop it.
+            if msg == "declare" {
+                return Ok(FnOutcome {
+                    value: Value::String("declared".into()),
+                    targets: vec![hplugin::provider::DeclaredTarget {
+                        name: "t".into(),
+                        ..Default::default()
+                    }],
+                    states: vec![],
+                });
+            }
             let times = match args.named.get("times") {
                 Some(Value::Int(n)) => *n,
                 _ => 1,
@@ -1657,7 +1675,8 @@ mod tests {
                 "{}:{}",
                 ctx.pkg,
                 msg.repeat(usize::try_from(times).unwrap_or(0))
-            )))
+            ))
+            .into())
         }
     }
 
@@ -2465,7 +2484,7 @@ mod tests {
             },
         ))
         .expect("call echo");
-        assert_eq!(out, Value::String("mypkg:hi".into()));
+        assert_eq!(out.value, Value::String("mypkg:hi".into()));
 
         // Named arg crosses and is honored.
         let mut named = std::collections::HashMap::new();
@@ -2478,7 +2497,21 @@ mod tests {
             },
         ))
         .expect("call echo times=3");
-        assert_eq!(out, Value::String("mypkg:ababab".into()));
+        assert_eq!(out.value, Value::String("mypkg:ababab".into()));
+
+        // A plugin function that declares fails loudly at the seam rather than
+        // reaching the host as a bare value with its declarations dropped.
+        let err = futures::executor::block_on(def.func.call(
+            &ctx,
+            FnArgs {
+                positional: vec![Value::String("declare".into())],
+                named: Default::default(),
+            },
+        ))
+        .expect_err("declarations must not cross the ABI");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("\"echo\""), "{msg}");
+        assert!(msg.contains("in-process only"), "{msg}");
 
         // The provider's state schema crosses too (Some, with its one field).
         let schema = host.state_schema().expect("state schema crosses as Some");
@@ -2590,7 +2623,20 @@ mod tests {
             },
         ))
         .expect("call proxied echo");
-        assert_eq!(out, Value::String("callerpkg:yo".into()));
+        assert_eq!(out.value, Value::String("callerpkg:yo".into()));
+
+        // …and the reverse seam refuses a host function's declarations too.
+        let err = futures::executor::block_on(rf.func.call(
+            &ctx,
+            FnArgs {
+                positional: vec![Value::String("declare".into())],
+                named: Default::default(),
+            },
+        ))
+        .expect_err("declarations must not cross the ABI");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("greeter.echo"), "{msg}");
+        assert!(msg.contains("in-process only"), "{msg}");
     }
 
     // A managed driver's config schema survives the round trip (LSP kwargs).

@@ -235,9 +235,117 @@ pub enum GetError {
 /// `heph.<provider name>.<function name>`. Args and the return value are the loose
 /// dynamic [`Value`] type so calls can cross provider boundaries (in-process now,
 /// out-of-process plugins later).
+///
+/// A function may also *declare* targets and provider-state as a side effect of
+/// being called — see [`FnOutcome`]. This is what turns a provider function into a
+/// "build-file plugin": a convenience wrapper that a BUILD file calls to emit fully
+/// configured `target(...)`/`provider_state(...)` declarations, without the author
+/// shipping a cdylib. The host (the buildfile provider) merges the declared targets
+/// into the calling package exactly as if the BUILD file had written them.
 #[async_trait]
 pub trait ProviderFn: Send + Sync {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value>;
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome>;
+}
+
+/// A target a provider function declares when called from a BUILD file. Mirrors the
+/// arguments of the `target()` builtin; the host merges each declaration into the
+/// caller's package ([`FnCallContext::pkg`]) as if the BUILD file had written the
+/// `target(...)` call itself. An empty `driver` falls back to the declaring
+/// package's provider default, same as `target()`.
+#[derive(Debug)]
+pub struct DeclaredTarget {
+    pub name: String,
+    pub driver: String,
+    pub labels: Vec<String>,
+    /// The same map `target(transitive = {...})` takes (`deps`, `env`, …), or
+    /// `Null` for none. Deliberately untyped: the host parses it exactly as it
+    /// parses the builtin's argument — resolving relative addresses against the
+    /// calling package, hashing every dep, assigning deterministic ids — so a
+    /// declared target cannot carry a transitive sandbox a BUILD file could not.
+    pub transitive: Value,
+    pub approval: Approval,
+    /// Driver options. The keys `target()` consumes itself (`name`, `driver`,
+    /// `labels`, `transitive`, `approval`) are rejected here — they have fields.
+    pub config: HashMap<String, Value>,
+}
+
+impl Default for DeclaredTarget {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            driver: String::new(),
+            labels: Vec::new(),
+            transitive: Value::Null(),
+            approval: Approval::default(),
+            config: HashMap::new(),
+        }
+    }
+}
+
+/// Package-level provider state a provider function declares, mirroring the
+/// `provider_state(provider=…, **args)` builtin.
+#[derive(Debug, Default)]
+pub struct DeclaredState {
+    pub provider: String,
+    pub args: HashMap<String, Value>,
+}
+
+/// What a [`ProviderFn`] returns: the [`Value`] substituted at the call site, plus
+/// any targets and provider-state the call declared. Value-only functions (the
+/// common case — `glob`, `join`, …) build this with `Value::into`; a wrapper function that stands up a target also pushes
+/// [`DeclaredTarget`]s / [`DeclaredState`]s.
+///
+/// Declarations are honored only for **in-process** provider functions. The
+/// out-of-process plugin ABI (`CallFunction`) carries the return value alone, so
+/// crossing it with a non-empty declaration set is a hard error rather than a
+/// silent drop — see the CallFunction wire handlers. Extending the ABI to carry
+/// declarations is the follow-up that unlocks out-of-process (e.g. JS) plugins.
+///
+/// What a declaring function owes, since it runs unsandboxed while BUILD files
+/// are evaluated:
+/// - **Order does not matter.** The host sorts declared targets by name (and
+///   rejects duplicates) and states by provider before merging, because package
+///   order reaches downstream def hashes — iterating a `HashMap` must not flap
+///   cache keys. States for the same provider keep their relative order.
+/// - **No host-specific values.** [`FnCallContext::root`] is an absolute path;
+///   putting it (or anything derived from the machine) into a declaration puts
+///   it into the def hash, and the cache is never shared across machines.
+/// - **Whatever it reads is captured only through what it declares.** Package
+///   evaluation is not cached beyond one invocation, so that is enough today; a
+///   long-lived engine would have to track what these functions read.
+#[derive(Debug)]
+pub struct FnOutcome {
+    pub value: Value,
+    pub targets: Vec<DeclaredTarget>,
+    pub states: Vec<DeclaredState>,
+}
+
+impl FnOutcome {
+    /// The return value, for a caller that can only carry a value — the
+    /// out-of-process plugin ABI. Errors when the call declared anything, since
+    /// reading `.value` alone would silently drop the declarations.
+    pub fn into_value_only(self) -> anyhow::Result<Value> {
+        if !self.targets.is_empty() || !self.states.is_empty() {
+            anyhow::bail!(
+                "declared {} target(s) and {} provider_state(s), but the plugin ABI \
+                 carries only a return value: declaring functions are supported \
+                 in-process only",
+                self.targets.len(),
+                self.states.len()
+            );
+        }
+        Ok(self.value)
+    }
+}
+
+impl From<Value> for FnOutcome {
+    fn from(value: Value) -> Self {
+        Self {
+            value,
+            targets: Vec::new(),
+            states: Vec::new(),
+        }
+    }
 }
 
 /// One exposed function: its bare name (no `heph.<provider>.` prefix), its

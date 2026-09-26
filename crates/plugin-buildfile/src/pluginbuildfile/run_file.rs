@@ -436,16 +436,97 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
         };
         let fn_args = FnArgs { positional, named };
 
-        let result = futures::executor::block_on(self.func.call(&ctx, fn_args))
+        let outcome = futures::executor::block_on(self.func.call(&ctx, fn_args))
             .map_err(starlark::Error::new_other)?;
+
+        // A provider function may declare targets / provider-state (a "build-file
+        // plugin" wrapping a driver). Everything is checked before anything is
+        // merged, so a call either lands whole or not at all. Declarations go
+        // through the same checks and sinks as the `target()` / `provider_state()`
+        // builtins, so a declared target is indistinguishable from a hand-written
+        // one. Call-site provenance is captured once (when enabled) and stamped on
+        // every declared target, so tooling traces them back to the
+        // `heph.<plugin>.<fn>(…)` call.
 
         // Native `return_type` is documentation-only for native fns, so validate
         // the actual return value here.
         self.signature
-            .validate_return(&self.display, &result)
+            .validate_return(&self.display, &outcome.value)
             .map_err(starlark::Error::new_other)?;
 
-        Ok(rust_to_starlark(eval.heap(), &result))
+        // Declaration order is the function's (often a `HashMap` walk), but
+        // package order reaches downstream def hashes: fix it here.
+        let mut declared = outcome.targets;
+        declared.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Some([a, _]) = declared
+            .windows(2)
+            .find(|w| matches!(w, [a, b] if a.name == b.name))
+        {
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "{}: declared target {:?} more than once",
+                self.display,
+                a.name
+            )));
+        }
+        let mut states = outcome.states;
+        states.sort_by(|a, b| a.provider.cmp(&b.provider));
+
+        let pkg = PkgBuf::from(extra.pkg);
+        let targets = declared
+            .into_iter()
+            .map(|dt| -> anyhow::Result<_> {
+                validate_target_decl(&dt.name, &dt.labels)?;
+                if let Some(k) = dt
+                    .config
+                    .keys()
+                    .find(|k| TARGET_RESERVED_KEYS.contains(&k.as_str()))
+                {
+                    anyhow::bail!(
+                        "target {:?}: `{k}` is a field of the declaration, not a driver option",
+                        dt.name
+                    );
+                }
+                let transitive = sandbox_from(dt.transitive, &pkg)
+                    .with_context(|| format!("target {:?} transitive", dt.name))?;
+                Ok(OnTargetPayload {
+                    name: dt.name,
+                    driver: dt.driver,
+                    labels: dt.labels,
+                    transitive,
+                    approval: dt.approval,
+                    config: dt.config,
+                    provenance: Vec::new(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .with_context(|| format!("{}: declared target", self.display))
+            .map_err(starlark::Error::new_other)?;
+        for ds in &states {
+            validate_state_decl(&ds.provider)
+                .with_context(|| format!("{}: declared provider_state", self.display))
+                .map_err(starlark::Error::new_other)?;
+        }
+
+        if !targets.is_empty() {
+            let provenance = if extra.capture_provenance {
+                capture_provenance(eval)
+            } else {
+                Vec::new()
+            };
+            for mut t in targets {
+                t.provenance = provenance.clone();
+                (extra.on_target)(t).map_err(starlark::Error::new_other)?;
+            }
+        }
+        for ds in states {
+            (extra.on_state)(OnStatePayload {
+                provider: ds.provider,
+                args: ds.args,
+            })
+            .map_err(starlark::Error::new_other)?;
+        }
+
+        Ok(rust_to_starlark(eval.heap(), &outcome.value))
     }
 }
 
@@ -467,6 +548,35 @@ fn rust_to_starlark<'v>(heap: starlark::values::Heap<'v>, v: &htvalue::Value) ->
                 |(k, val)| (heap.alloc(k.as_str()), rust_to_starlark(heap, val)),
             ))),
     }
+}
+
+/// The `target()` arguments it consumes itself rather than passing to the
+/// driver as config.
+const TARGET_RESERVED_KEYS: &[&str] = &["name", "driver", "labels", "transitive", "approval"];
+
+/// The check a provider_state must pass, whether a BUILD file wrote
+/// `provider_state()` or a provider function declared it.
+fn validate_state_decl(provider: &str) -> anyhow::Result<()> {
+    if provider.is_empty() {
+        anyhow::bail!("provider_state: missing provider");
+    }
+    Ok(())
+}
+
+/// The checks a target must pass before it reaches the package, whether a
+/// BUILD file wrote `target()` or a provider function declared it — a declared
+/// target must not be able to carry what a hand-written one cannot.
+fn validate_target_decl(name: &str, labels: &[String]) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("target name cannot be empty");
+    }
+    // Reject a label outside the grammar here, where the BUILD file and
+    // target name are still in the error, rather than letting it become a
+    // tag no `label(...)` query can ever name.
+    for l in labels {
+        hmodel::htlabel::validate(l).with_context(|| format!("target {name:?} labels"))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -930,19 +1040,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             .flatten()
             .collect::<HashMap<String, htvalue::Value>>();
 
-        if name.is_empty() {
-            return Err(starlark::Error::new_other(anyhow::anyhow!(
-                "target name cannot be empty"
-            )));
-        }
-        // Reject a label outside the grammar here, where the BUILD file and
-        // target name are still in the error, rather than letting it become a
-        // tag no `label(...)` query can ever name.
-        for l in &labels {
-            hmodel::htlabel::validate(l)
-                .with_context(|| format!("target {name:?} labels"))
-                .map_err(starlark::Error::new_other)?;
-        }
+        validate_target_decl(&name, &labels).map_err(starlark::Error::new_other)?;
         // An empty driver is allowed here: the provider resolves it against the
         // configured `defaultDriver` (and errors if neither is set).
 
@@ -1079,11 +1177,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             .flatten()
             .collect::<HashMap<String, htvalue::Value>>();
 
-        if provider.is_empty() {
-            return Err(starlark::Error::new_other(anyhow::anyhow!(
-                "provider_state: missing provider"
-            )));
-        }
+        validate_state_decl(&provider).map_err(starlark::Error::new_other)?;
 
         (extra.on_state)(OnStatePayload {
             provider,
@@ -1865,6 +1959,7 @@ fn eval_ast(
 mod tests {
     use super::*;
     use hcore::htvalue::signature::Param;
+    use hplugin::provider::{DeclaredState, DeclaredTarget, FnOutcome};
     use std::fs;
     use tempfile::tempdir;
 
@@ -3953,16 +4048,12 @@ target(name = "t_in_app", driver = SHARED)
     struct EchoFn;
     #[async_trait::async_trait]
     impl ProviderFn for EchoFn {
-        async fn call(
-            &self,
-            ctx: &FnCallContext<'_>,
-            args: FnArgs,
-        ) -> anyhow::Result<htvalue::Value> {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
             let arg = match args.positional.first() {
                 Some(htvalue::Value::String(s)) => s.clone(),
                 _ => anyhow::bail!("echo expects a string"),
             };
-            Ok(htvalue::Value::String(format!("{}:{}", ctx.pkg, arg)))
+            Ok(htvalue::Value::String(format!("{}:{}", ctx.pkg, arg)).into())
         }
     }
 
@@ -4005,6 +4096,303 @@ target(name = "t_in_app", driver = SHARED)
         }
     }
 
+    /// A "build-file plugin" function: called from a BUILD file, it declares a
+    /// fully-configured `exec` target plus package provider-state, and returns the
+    /// new target's address. This is the wrapper pattern a tool author ships instead
+    /// of a cdylib.
+    struct CodegenFn;
+    #[async_trait::async_trait]
+    impl ProviderFn for CodegenFn {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+            let name = match args.named.get("name") {
+                Some(htvalue::Value::String(s)) => s.clone(),
+                _ => anyhow::bail!("codegen expects a string `name`"),
+            };
+            let addr = format!("//{}:{}", ctx.pkg, name);
+            let mut config = HashMap::new();
+            config.insert(
+                "run".to_string(),
+                htvalue::Value::List(vec![
+                    htvalue::Value::String("gen".to_string()),
+                    htvalue::Value::String("$OUT".to_string()),
+                ]),
+            );
+            let outcome = FnOutcome {
+                value: htvalue::Value::String(addr),
+                targets: vec![DeclaredTarget {
+                    name,
+                    driver: "exec".to_string(),
+                    config,
+                    ..Default::default()
+                }],
+                states: vec![DeclaredState {
+                    provider: "codegen".to_string(),
+                    args: HashMap::from([(
+                        "toolchain".to_string(),
+                        htvalue::Value::String("v1".to_string()),
+                    )]),
+                }],
+            };
+            Ok(outcome)
+        }
+    }
+
+    fn provider_with_fn(
+        tmp_dir: &tempfile::TempDir,
+        name: &str,
+        f: Arc<dyn ProviderFn>,
+    ) -> Provider {
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        };
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider(
+            "codegen",
+            vec![hplugin::provider::ProviderFunctionDef {
+                name: name.to_string(),
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![Param::required("name", ParamType::String)],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: String::new(),
+                func: f,
+            }],
+        );
+        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+        provider
+    }
+
+    #[test]
+    fn test_provider_function_declares_target() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        // The call's return value — the declared target's address — is usable by
+        // the rest of the BUILD file.
+        fs::write(
+            pkg.join("BUILD"),
+            r#"a = heph.codegen.rule(name = "gen_a")
+target(name = "use", driver = "d", dep = a)"#,
+        )
+        .unwrap();
+
+        let provider = provider_with_fn(&tmp_dir, "rule", Arc::new(CodegenFn));
+        let result = run_pkg_blocking(&provider, "mypkg").unwrap();
+
+        // The declared target lands in the calling package as if hand-written.
+        assert_eq!(result.targets.len(), 2, "declared + hand-written");
+        assert_eq!(
+            result.targets[1].config.get("dep"),
+            Some(&htvalue::Value::String("//mypkg:gen_a".to_string()))
+        );
+        let t = &result.targets[0];
+        assert_eq!(t.name, "gen_a");
+        assert_eq!(t.driver, "exec");
+        assert_eq!(
+            expect_string_list(t.config.get("run")),
+            vec!["gen".to_string(), "$OUT".to_string()]
+        );
+
+        // The declared provider_state lands in the package too.
+        assert_eq!(result.states.len(), 1, "one declared state");
+        assert_eq!(result.states[0].provider, "codegen");
+        assert_eq!(
+            result.states[0].args.get("toolchain"),
+            Some(&htvalue::Value::String("v1".to_string()))
+        );
+    }
+
+    /// A declaring function whose whole outcome is fixed by the test.
+    struct DeclareFn(fn() -> FnOutcome);
+    #[async_trait::async_trait]
+    impl ProviderFn for DeclareFn {
+        async fn call(&self, _ctx: &FnCallContext<'_>, _args: FnArgs) -> anyhow::Result<FnOutcome> {
+            Ok((self.0)())
+        }
+    }
+
+    fn declared(targets: Vec<DeclaredTarget>, states: Vec<DeclaredState>) -> FnOutcome {
+        FnOutcome {
+            value: htvalue::Value::String("//mypkg:x".to_string()),
+            targets,
+            states,
+        }
+    }
+
+    fn exec_target(name: &str) -> DeclaredTarget {
+        DeclaredTarget {
+            name: name.to_string(),
+            driver: "exec".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Evaluate `BUILD` in `mypkg` with `heph.codegen.rule` bound to `f`.
+    fn run_declaring(build: &str, f: fn() -> FnOutcome) -> anyhow::Result<Arc<RunResult>> {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("BUILD"), build).unwrap();
+        let provider = provider_with_fn(&tmp_dir, "rule", Arc::new(DeclareFn(f)));
+        run_pkg_blocking(&provider, "mypkg")
+    }
+
+    fn declaring_err(f: fn() -> FnOutcome) -> String {
+        let err = run_declaring(r#"heph.codegen.rule(name = "x")"#, f).unwrap_err();
+        format!("{err:#}")
+    }
+
+    /// A plugin function returning an empty target name must fail loudly, mirroring
+    /// the `target()` builtin's own guard — a wrapper bug must not emit a nameless
+    /// target.
+    #[test]
+    fn test_provider_function_empty_target_name_errors() {
+        let chain = declaring_err(|| declared(vec![exec_target("")], vec![]));
+        assert!(chain.contains("heph.codegen.rule"), "{chain}");
+        assert!(chain.contains("name cannot be empty"), "{chain}");
+    }
+
+    /// A declared target is held to the same label grammar as `target()`: a
+    /// label no `label(...)` query can name must not slip in through a plugin.
+    #[test]
+    fn test_provider_function_declared_target_label_is_validated() {
+        let chain = declaring_err(|| {
+            let mut t = exec_target("x");
+            t.labels = vec!["has space".to_string()];
+            declared(vec![t], vec![])
+        });
+        assert!(chain.contains("heph.codegen.rule"), "{chain}");
+        assert!(chain.contains("invalid label"), "{chain}");
+    }
+
+    /// A key `target()` consumes itself can't be smuggled in as a driver option.
+    #[test]
+    fn test_provider_function_declared_reserved_config_key_errors() {
+        let chain = declaring_err(|| {
+            let mut t = exec_target("x");
+            t.config.insert(
+                "labels".to_string(),
+                htvalue::Value::String("l".to_string()),
+            );
+            declared(vec![t], vec![])
+        });
+        assert!(
+            chain.contains("`labels` is a field of the declaration"),
+            "{chain}"
+        );
+    }
+
+    #[test]
+    fn test_provider_function_declared_state_without_provider_errors() {
+        let chain = declaring_err(|| declared(vec![], vec![DeclaredState::default()]));
+        assert!(chain.contains("heph.codegen.rule"), "{chain}");
+        assert!(chain.contains("missing provider"), "{chain}");
+    }
+
+    /// Two declarations of one name would silently shadow each other (`get`
+    /// takes the first); fail at the call instead.
+    #[test]
+    fn test_provider_function_duplicate_declared_target_errors() {
+        let chain = declaring_err(|| declared(vec![exec_target("x"), exec_target("x")], vec![]));
+        assert!(
+            chain.contains("declared target \"x\" more than once"),
+            "{chain}"
+        );
+    }
+
+    /// Package order reaches downstream def hashes, so it must not depend on how
+    /// the function happened to order its declarations (a `HashMap` walk, say).
+    /// The call's targets still land at the call site relative to hand-written
+    /// ones.
+    #[test]
+    fn test_provider_function_declarations_are_ordered_by_name() {
+        let result = run_declaring(
+            "target(name = \"first\", driver = \"d\")\n\
+             heph.codegen.rule(name = \"x\")\n\
+             target(name = \"last\", driver = \"d\")",
+            || {
+                declared(
+                    vec![exec_target("b"), exec_target("a")],
+                    vec![
+                        DeclaredState {
+                            provider: "zed".to_string(),
+                            ..Default::default()
+                        },
+                        DeclaredState {
+                            provider: "alpha".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                )
+            },
+        )
+        .unwrap();
+        let names: Vec<&str> = result.targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["first", "a", "b", "last"]);
+        let providers: Vec<&str> = result.states.iter().map(|s| s.provider.as_str()).collect();
+        assert_eq!(providers, ["alpha", "zed"]);
+    }
+
+    /// A declared `transitive` is parsed exactly as `target(transitive = …)` is:
+    /// relative addresses resolve against the calling package, every dep is
+    /// hashed, ids are deterministic. A typed sandbox would have let a plugin
+    /// declare an unhashed transitive dep — a stale cache hit for every consumer.
+    #[test]
+    fn test_provider_function_declared_transitive_matches_hand_written() {
+        let result = run_declaring(
+            r#"
+heph.codegen.rule(name = "x")
+target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//other:t"], "a": [":one"]}})
+"#,
+            || {
+                let mut t = exec_target("decl");
+                t.transitive = htvalue::Value::Map(
+                    [(
+                        "deps".to_string(),
+                        htvalue::Value::Map(
+                            [
+                                (
+                                    "g".to_string(),
+                                    htvalue::Value::List(vec![
+                                        htvalue::Value::String(":sib".to_string()),
+                                        htvalue::Value::String("//other:t".to_string()),
+                                    ]),
+                                ),
+                                (
+                                    "a".to_string(),
+                                    htvalue::Value::List(vec![htvalue::Value::String(
+                                        ":one".to_string(),
+                                    )]),
+                                ),
+                            ]
+                            .into(),
+                        ),
+                    )]
+                    .into(),
+                );
+                declared(vec![t], vec![])
+            },
+        )
+        .unwrap();
+        let by_name = |n: &str| {
+            result
+                .targets
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap_or_else(|| panic!("no target {n}"))
+        };
+        let (decl, hand) = (by_name("decl"), by_name("hand"));
+        assert_eq!(decl.transitive.deps.len(), 3);
+        assert!(decl.transitive.deps.iter().all(|d| d.hash && d.runtime));
+        assert_eq!(
+            format!("{:?}", decl.transitive.deps),
+            format!("{:?}", hand.transitive.deps)
+        );
+    }
+
     /// A provider function's declared **named** parameters must actually be
     /// callable.
     ///
@@ -4023,7 +4411,7 @@ target(name = "t_in_app", driver = SHARED)
                 &self,
                 _ctx: &FnCallContext<'_>,
                 args: FnArgs,
-            ) -> anyhow::Result<htvalue::Value> {
+            ) -> anyhow::Result<FnOutcome> {
                 let base = match args.positional.first() {
                     Some(htvalue::Value::String(s)) => s.clone(),
                     _ => anyhow::bail!("expected a string"),
@@ -4032,7 +4420,7 @@ target(name = "t_in_app", driver = SHARED)
                     Some(htvalue::Value::String(s)) => s.clone(),
                     _ => String::new(),
                 };
-                Ok(htvalue::Value::String(format!("{base}{suffix}")))
+                Ok(htvalue::Value::String(format!("{base}{suffix}")).into())
             }
         }
 
