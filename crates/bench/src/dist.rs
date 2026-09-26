@@ -105,26 +105,33 @@ fn write_go_config(corpus: &Path, dist: &Dist) -> Result<()> {
     std::fs::write(&manifest_path, serde_json::to_vec_pretty(&doc)?)
         .with_context(|| format!("write {}", manifest_path.display()))?;
 
-    // `gotool: host` — the go provider requires an explicit choice (host /
-    // pinned version / a toolchain-producing target) and has no default.
-    // `host` uses the Go `actions/setup-go` already installed for
-    // `tools/gorepogen`, so this stays offline and pays no extra hermetic-
-    // SDK download — same choice `bin-e2e`'s own go-plugin fixture makes,
-    // and for the same reason.
-    // `sh` is not optional: the go provider's stdlib `build_lib` targets are
-    // sh-driven, so without it every first-party compile fails at
-    // `//@heph/go/std/...: driver not found: sh`. It went unnoticed while this
-    // scenario matched zero targets and therefore never resolved a std dep.
-    let config = format!(
+    std::fs::write(corpus.join(".hephconfig"), go_config_yaml(&manifest_path))
+        .context("write .hephconfig")
+}
+
+/// The `.hephconfig` Tier B runs under. Every `builtin:` here must be one the
+/// shipped `heph` registers (`bootstrap::register_builtin_factories`) — an
+/// unknown one fails `prepare` before a single target runs; the test below
+/// holds that.
+///
+/// `gotool: host` — the go provider requires an explicit choice (host /
+/// pinned version / a toolchain-producing target) and has no default.
+/// `host` uses the Go `actions/setup-go` already installed for
+/// `tools/gorepogen`, so this stays offline and pays no extra hermetic-
+/// SDK download — same choice `bin-e2e`'s own go-plugin fixture makes,
+/// and for the same reason.
+///
+/// `bash` is not optional: the go provider's generated targets (stdlib
+/// `build_lib` included) are bash-driven.
+fn go_config_yaml(manifest_path: &Path) -> String {
+    format!(
         "plugins:\n  \
          - builtin: buildfile\n    options:\n      patterns:\n        - BUILD\n  \
          - builtin: exec\n  \
          - builtin: bash\n  \
-         - builtin: sh\n  \
          - path: {}\n    options:\n      gotool: \"host\"\n",
         manifest_path.display()
-    );
-    std::fs::write(corpus.join(".hephconfig"), config).context("write .hephconfig")
+    )
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -276,5 +283,41 @@ mod tests {
     #[test]
     fn absent_line_is_none() {
         assert_eq!(matched_targets("no such line here\n"), None);
+    }
+
+    /// Every `builtin:` in the generated config must be one `heph` registers.
+    /// Removing the `sh` driver left `builtin: sh` here, and Tier B failed at
+    /// `prepare` on every master push with `unknown builtin plugin 'sh'`.
+    #[tokio::test]
+    async fn generated_config_names_only_registered_builtins() {
+        use heph::engine::config_yaml::{self, PluginIdentifier};
+        use heph::engine::{Config, Engine};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".hephconfig");
+        std::fs::write(
+            &path,
+            super::go_config_yaml(&dir.path().join("heph-go-plugin.json")),
+        )
+        .expect("write config");
+        let file = config_yaml::load(&path).expect("parse generated config");
+
+        let mut e = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: dir.path().join(".heph3"),
+            ..Default::default()
+        })
+        .expect("engine");
+        heph::commands::bootstrap::register_builtin_factories(&mut e).expect("register");
+
+        let mut builtins = 0;
+        for spec in &file.plugins {
+            if let PluginIdentifier::Builtin(name) = &spec.identifier {
+                e.apply_builtin(name, &spec.options)
+                    .unwrap_or_else(|err| panic!("builtin `{name}`: {err:#}"));
+                builtins += 1;
+            }
+        }
+        assert!(builtins > 0, "config lists no builtins: {:?}", file.plugins);
     }
 }
