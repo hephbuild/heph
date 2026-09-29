@@ -6,18 +6,19 @@
 //! from a stock Mac — the reason the default `format = "oci"` was awkward to
 //! recommend.
 //!
-//! What skopeo did for free and is done here instead: resolving credentials from
-//! `~/.docker/config.json` and the `docker-credential-*` helpers (see
-//! [`auth_for`]), and pushing a manifest list rather than a single image when
-//! the layout holds more than one platform.
+//! What skopeo did for free and is done here instead: resolving credentials —
+//! from a target's declared `credentials`, or from `~/.docker/config.json` and
+//! the `docker-credential-*` helpers when it declares none (see [`super::auth`])
+//! — and pushing a manifest list rather than a single image when the layout
+//! holds more than one platform.
 
 use anyhow::Context as _;
 use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::OciImageIndex;
-use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
 use super::archive::{Blob, Layout};
+use super::auth::RegistryCredentials;
 
 /// How much of a blob is read at a time on its way to the registry. Bounded so
 /// a layer's size never becomes the driver's peak memory.
@@ -70,30 +71,6 @@ fn client(insecure: bool) -> Client {
     })
 }
 
-/// Credentials for `reference`'s registry, from the same places the docker CLI
-/// looks: `$DOCKER_CONFIG`/`$HOME/.docker/config.json`, podman's `auth.json`,
-/// and the `docker-credential-*` helper named by `credsStore` / `credHelpers`.
-///
-/// Anonymous when nothing is configured — a public pull needs no credentials,
-/// and failing here would break the common case to serve the rare one.
-fn auth_for(reference: &Reference) -> RegistryAuth {
-    let server = reference.resolve_registry();
-    match docker_credential::get_credential(server) {
-        Ok(docker_credential::DockerCredential::UsernamePassword(user, pass)) => {
-            RegistryAuth::Basic(user, pass)
-        }
-        Ok(docker_credential::DockerCredential::IdentityToken(token)) => {
-            RegistryAuth::Bearer(token)
-        }
-        Err(e) => {
-            // Not an error: an unconfigured registry is the normal case for a
-            // public pull. Logged so an unexpected 401 has something to point at.
-            tracing::debug!(server, error = %e, "no docker credentials; continuing anonymously");
-            RegistryAuth::Anonymous
-        }
-    }
-}
-
 /// Push every image in `layout` to `reference`, and a manifest list when there
 /// is more than one.
 ///
@@ -103,12 +80,13 @@ pub(crate) async fn push_layout(
     layout: &Layout,
     reference: &str,
     insecure: bool,
+    creds: &RegistryCredentials<'_>,
 ) -> anyhow::Result<String> {
     let reference: Reference = reference
         .parse()
         .with_context(|| format!("parse image reference {reference:?}"))?;
     let client = client(insecure);
-    let auth = auth_for(&reference);
+    let auth = creds.resolve(reference.resolve_registry()).await?;
     client
         .auth(&reference, &auth, oci_client::RegistryOperation::Push)
         .await
@@ -247,12 +225,13 @@ pub(crate) async fn pull_layout(
     platforms: &super::pull::PlatformSelect,
     insecure: bool,
     blob_dir: &std::path::Path,
+    creds: &RegistryCredentials<'_>,
 ) -> anyhow::Result<Pulled> {
     let reference: Reference = reference
         .parse()
         .with_context(|| format!("parse image reference {reference:?}"))?;
     let client = client(insecure);
-    let auth = auth_for(&reference);
+    let auth = creds.resolve(reference.resolve_registry()).await?;
 
     const ACCEPTED: &[&str] = &[
         oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,

@@ -46,6 +46,52 @@ pub fn is_credential(annotations: &std::collections::BTreeMap<String, String>) -
     annotations.get(CREDENTIAL_ANNOTATION).map(String::as_str) == Some("true")
 }
 
+/// The dep edges for a target's `credentials` attribute, resolved against
+/// `package`.
+///
+/// Both flags false is not an optimization, it is the contract: nothing about a
+/// credential may enter `hashin` — not the material, not the chosen source, not
+/// the declaration, not even the names of the variables it presents. Because the
+/// exclusion is structural, adding a credential to a target cannot move its
+/// cache key.
+///
+/// What the edge *does* buy is the graph: `heph query revdeps` answers "who
+/// needs this identity?", `heph inspect deps` shows it, and a bad addr is an
+/// ordinary `TargetNotFoundError` rather than a 403 much later.
+///
+/// One function for every driver that takes the attribute, so the origin ids,
+/// the annotation and the duplicate refusal cannot drift between them.
+pub fn inputs(
+    refs: &[String],
+    package: &hmodel::htpkg::PkgBuf,
+) -> anyhow::Result<Vec<hplugin::driver::targetdef::Input>> {
+    use hplugin::driver::targetdef::{Input, InputMode};
+    use std::collections::BTreeMap;
+
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut out = Vec::with_capacity(refs.len());
+    for (i, raw) in refs.iter().enumerate() {
+        let r#ref = hplugin::driver::TargetAddr::parse(raw, package)?;
+        let key = r#ref.to_string();
+        if let Some(first) = seen.insert(key.clone(), i) {
+            anyhow::bail!(
+                "credential {key} is referenced twice (positions {first} and {i}) — a credential \
+                 presents one set of variables and files, so referencing it again does nothing; \
+                 drop the duplicate"
+            );
+        }
+        out.push(Input {
+            r#ref,
+            mode: InputMode::Standard,
+            origin_id: format!("{CREDENTIAL_ORIGIN_PREFIX}|{i}"),
+            annotations: BTreeMap::from([(CREDENTIAL_ANNOTATION.to_string(), "true".to_string())]),
+            hashed: false,
+            runtime: false,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

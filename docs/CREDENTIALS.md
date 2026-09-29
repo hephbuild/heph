@@ -418,6 +418,55 @@ only once the material has earned the right to outlive the process. An unbounded
 producer credential works for the whole run; what it does not do is leave a
 `0600` secret behind that only `heph auth logout` would collect.
 
+## Registry drivers: `oci_pull` and `oci_push`
+
+These two speak the registry protocol in-process rather than spawning a tool, so
+they cannot simply inherit a presented environment. Instead they read the one
+presentation a registry client already understands, the Docker helper:
+
+```python
+ghcr = target(
+    name    = "ghcr",
+    driver  = "credential",
+    sources = [heph.auth.env(["GITHUB_TOKEN"])],
+    present = heph.auth.docker(["ghcr.io"]),
+)
+
+oci_pull(name = "base", ref = "ghcr.io/acme/base@sha256:…", credentials = [ghcr])
+oci_push(name = "push", image = ":img", ref = "ghcr.io/acme/app:1.2", credentials = [ghcr])
+```
+
+The driver reads `credHelpers` from the mount's `DOCKER_CONFIG` and calls the
+`docker-credential-heph` shim the same way the docker CLI would. The pinned
+source and the refresh rules therefore apply exactly as they do for any other
+consumer. A `Username` of `<token>` is sent as a bearer token. Any other username
+is sent as basic auth, so set a `username` field in the material when the
+registry wants basic auth with a token as the password.
+
+**Naming credentials turns the ambient login off.** A target with no
+`credentials` authenticates with the host's own Docker config, as before, and
+falls back to anonymous. A target that names any authenticates with those
+credentials only. A registry none of them covers is an error that names the
+registry. Two credentials covering one registry are also refused. Falling back
+would let a typo in a declaration run the pull or push as whoever is logged in
+on the host.
+
+The registry must be listed in `heph.auth.docker([...])`. Scheme, path and the
+Docker Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`) are
+normalized, so `["docker.io"]` covers `alpine`. A credential presented as plain
+`env` is not consulted, and the error names it.
+
+`oci_pull` is cacheable, so the rule under "Two more places the naive reading
+breaks" applies directly. A credential-gated pull by tag resolves against the
+caller's identity. Pin by `@sha256:`, or set `cache = False`.
+
+`docker_build` does not take `credentials` yet. Its `docker buildx` reads
+`DOCKER_CONFIG` for more than auth: contexts, builder instances, and on Docker
+Desktop the `cli-plugins` directory that buildx itself lives in. Pointing it at
+a generated directory would break the build rather than authenticate it. A
+private base image goes through `oci_pull(layout = True, credentials = [...])`
+and `bases`, which is also the hermetic way to take one.
+
 ## The CLI
 
 | Command | Does |

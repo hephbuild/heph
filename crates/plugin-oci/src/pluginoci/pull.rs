@@ -98,6 +98,18 @@ struct OciPullSpec {
     /// Pull from an insecure (HTTP / self-signed) registry: plain HTTP, and
     /// certificate validation off.
     insecure: bool,
+    /// Credentials to pull with, as `credential` target addresses presented
+    /// with `heph.auth.docker([...])`. When set, the registry is authenticated
+    /// with these only — never with the host's own docker login — and a
+    /// registry none of them covers is an error. When empty, the host's docker
+    /// config is used, as the docker CLI would.
+    ///
+    /// Not an input: nothing about a credential reaches the cache key. So a
+    /// credential-gated pull is only as cacheable as its `ref` is
+    /// content-addressed — a tag resolves against the caller's identity, and two
+    /// identities behind one tag would share one entry. Pin by `@sha256:`, or
+    /// set `cache = False`.
+    credentials: Vec<String>,
     /// Caching for the pulled archive. Defaults to on for both tiers. A pull is
     /// content-addressed only when the ref is digest-pinned.
     cache: TargetSpecCache,
@@ -247,6 +259,9 @@ impl ManagedDriver for Driver {
             );
         }
 
+        let credential_inputs =
+            hdriver_support::credential::inputs(&spec.credentials, &addr.package)?;
+
         let def = OciPullDef {
             src: spec.src,
             out: out.clone(),
@@ -269,7 +284,9 @@ impl ManagedDriver for Driver {
                 // The bytes come from the registry, not from other targets — the
                 // one edge here is the shared blob store, which materializes
                 // nothing and never reaches this target's cache key.
-                inputs: vec![super::platform::blobs_input()],
+                inputs: std::iter::once(super::platform::blobs_input())
+                    .chain(credential_inputs)
+                    .collect(),
                 outputs: vec![Output {
                     group: String::new(),
                     paths: vec![OutPath {
@@ -304,7 +321,7 @@ impl ManagedDriver for Driver {
     async fn run<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
-        _ctoken: &(dyn Cancellable + Send + Sync),
+        ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<OciPullDef>().clone();
         let out_name = std::path::Path::new(&def.out)
@@ -328,9 +345,15 @@ impl ManagedDriver for Driver {
             // wrong.
             None => req.sandbox_dir.join("heph-oci-blobs"),
         };
-        let pulled = super::registry::pull_layout(&def.src, &def.platform, def.insecure, &blob_dir)
-            .await
-            .with_context(|| format!("pull image {}", def.src))?;
+        let creds = super::auth::RegistryCredentials::for_run(
+            &req.request.credentials,
+            &req.sandbox_dir,
+            ctoken,
+        );
+        let pulled =
+            super::registry::pull_layout(&def.src, &def.platform, def.insecure, &blob_dir, &creds)
+                .await
+                .with_context(|| format!("pull image {}", def.src))?;
         let super::registry::Pulled {
             index,
             blobs,
@@ -442,6 +465,39 @@ mod tests {
         ));
         assert!(resp.target_def.cache.enabled);
         assert!(resp.target_def.cache.remote_enabled);
+    }
+
+    /// A credential is an edge the cache key cannot see: annotated, neither
+    /// hashed nor materialized, and the def hash does not move — the same image
+    /// is the same image whoever was allowed to fetch it.
+    #[tokio::test]
+    async fn credentials_are_unhashed_edges() {
+        let without = parse(
+            "//base:alpine",
+            cfg(&[("ref", Value::String(PINNED.to_string()))]),
+        )
+        .await;
+        let with = parse(
+            "//base:alpine",
+            cfg(&[
+                ("ref", Value::String(PINNED.to_string())),
+                (
+                    "credentials",
+                    Value::List(vec![Value::String("//auth:hub".to_string())]),
+                ),
+            ]),
+        )
+        .await;
+
+        let cred = with
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| hdriver_support::credential::is_credential(&i.annotations))
+            .expect("a credential edge");
+        assert_eq!(cred.r#ref.r#ref.format(), "//auth:hub");
+        assert!(!cred.hashed && !cred.runtime);
+        assert_eq!(with.target_def.hash, without.target_def.hash);
     }
 
     /// The platform is part of the key: an arm64 host and an amd64 host must not
