@@ -65,13 +65,15 @@ pub fn inputs(
     refs: &[String],
     package: &hmodel::htpkg::PkgBuf,
 ) -> anyhow::Result<Vec<hplugin::driver::targetdef::Input>> {
+    use anyhow::Context as _;
     use hplugin::driver::targetdef::{Input, InputMode};
     use std::collections::BTreeMap;
 
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut out = Vec::with_capacity(refs.len());
     for (i, raw) in refs.iter().enumerate() {
-        let r#ref = hplugin::driver::TargetAddr::parse(raw, package)?;
+        let r#ref = hplugin::driver::TargetAddr::parse(raw, package)
+            .with_context(|| format!("credentials[{i}] {raw:?}"))?;
         let key = r#ref.to_string();
         if let Some(first) = seen.insert(key.clone(), i) {
             anyhow::bail!(

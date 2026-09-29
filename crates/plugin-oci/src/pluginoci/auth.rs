@@ -25,6 +25,7 @@
 use anyhow::Context as _;
 use hcore::hasync::Cancellable;
 use hplugin::driver::CredentialMount;
+use hplugin::driver::targetdef::TargetDef;
 use oci_client::secrets::RegistryAuth;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,32 +45,54 @@ pub(crate) enum RegistryCredentials<'a> {
 }
 
 impl<'a> RegistryCredentials<'a> {
-    /// The source for a run that received `mounts`.
+    /// The source for a run of `target` that received `mounts`.
     ///
-    /// Keyed on the mounts rather than on the spec, because the host is what
-    /// decides which of a target's references arrive: a target that declared
-    /// credentials always receives them, and one that did not never does.
+    /// Decided by what the target *declared* — its credential edges — and
+    /// checked against what arrived. A target that declared credentials and
+    /// received none is refused rather than run on the ambient login: a mount
+    /// lost anywhere between host and driver would otherwise swap the declared
+    /// identity for whoever the host is logged in as, silently.
     pub(crate) fn for_run(
+        target: &TargetDef,
         mounts: &'a [CredentialMount],
         cwd: &'a Path,
         ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> Self {
-        if mounts.is_empty() {
-            Self::Ambient
-        } else {
-            Self::Declared {
-                mounts,
-                cwd,
-                ctoken,
-            }
+    ) -> anyhow::Result<Self> {
+        let declared = target
+            .inputs
+            .iter()
+            .filter(|i| hdriver_support::credential::is_credential(&i.annotations))
+            .count();
+        if declared == 0 && mounts.is_empty() {
+            return Ok(Self::Ambient);
         }
+        // The host presents exactly one mount per declared credential, or
+        // fails the run itself.
+        anyhow::ensure!(
+            mounts.len() >= declared,
+            "{} declares {declared} credential(s), but the host presented {} — refusing to fall \
+             back to the host's own docker login. The host is likely older than the plugin; \
+             upgrade heph",
+            target.addr.format(),
+            mounts.len()
+        );
+        Ok(Self::Declared {
+            mounts,
+            cwd,
+            ctoken,
+        })
     }
 
     /// The auth to present to `registry` (as `Reference::resolve_registry`
     /// spells it).
     pub(crate) async fn resolve(&self, registry: &str) -> anyhow::Result<RegistryAuth> {
         match self {
-            Self::Ambient => Ok(ambient(registry)),
+            // Off the async worker: a `credsStore` of `osxkeychain` or `desktop`
+            // makes this spawn and wait on a helper.
+            Self::Ambient => {
+                let registry = registry.to_string();
+                Ok(hcore::blocking::run(move || ambient(&registry)).await)
+            }
             Self::Declared {
                 mounts,
                 cwd,
@@ -196,7 +219,7 @@ fn normalize_registry(s: &str) -> String {
         .strip_prefix("https://")
         .or_else(|| s.strip_prefix("http://"))
         .unwrap_or(s);
-    let host = s.split('/').next().unwrap_or(s).to_ascii_lowercase();
+    let host = s.split_once('/').map_or(s, |(h, _)| h).to_ascii_lowercase();
     match host.as_str() {
         "index.docker.io" | "registry-1.docker.io" | "registry.hub.docker.com" => {
             "docker.io".to_string()
@@ -225,13 +248,7 @@ async fn call_helper(
         )
     })?;
 
-    // Docker writes the server on stdin and closes it. A registry host is a few
-    // bytes, far under a pipe's buffer, so it is written before the spawn and
-    // no pump is needed.
-    let (reader, mut writer) = std::io::pipe().context("create the helper's stdin pipe")?;
-    std::io::Write::write_all(&mut writer, helper.server.as_bytes())
-        .context("write the registry to the helper's stdin")?;
-    drop(writer);
+    let stdin = stdin_file(cwd, &helper.server)?;
 
     let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = mount
         .env
@@ -246,7 +263,7 @@ async fn call_helper(
         args: vec!["get".into()],
         env,
         cwd: cwd.to_path_buf(),
-        stdin: hproc::proc_exec::StdioSpec::Fd(reader.into()),
+        stdin: hproc::proc_exec::StdioSpec::Fd(stdin.into()),
         stdout: hproc::proc_exec::StdioSpec::Piped,
         stderr: hproc::proc_exec::StdioSpec::Piped,
         setsid: false,
@@ -259,7 +276,7 @@ async fn call_helper(
         out.status.success(),
         "{exe} (credential {addr}) failed for {}: {}",
         helper.server,
-        String::from_utf8_lossy(&out.stderr).trim()
+        redact(&String::from_utf8_lossy(&out.stderr), &mount.redact).trim()
     );
     parse_helper_answer(&out.stdout).with_context(|| {
         format!(
@@ -267,6 +284,37 @@ async fn call_helper(
             helper.server
         )
     })
+}
+
+/// The helper's stdin: `server`, as an unlinked regular file opened for reading.
+///
+/// Docker writes the server on stdin and closes it. A file rather than a pipe,
+/// because a pipe's EOF depends on every write end being closed: on macOS
+/// `pipe()` sets close-on-exec in a second step, so a sibling fork landing in
+/// between keeps the write end open in some unrelated long-lived process and
+/// the helper waits for EOF forever. A file's EOF is its size, whoever else
+/// holds it; std opens it close-on-exec atomically on every supported target.
+/// Unlinked once open, so nothing is left behind whatever happens next.
+fn stdin_file(dir: &Path, server: &str) -> anyhow::Result<std::fs::File> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!(
+        ".heph-docker-helper-stdin-{}-{n}",
+        std::process::id()
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, server.as_bytes()))
+        .with_context(|| format!("write the helper's stdin to {path:?}"))?;
+    let file =
+        std::fs::File::open(&path).with_context(|| format!("open the helper's stdin {path:?}"));
+    // Removed whether or not the open worked: an open fd reads it regardless.
+    let removed = std::fs::remove_file(&path);
+    let file = file?;
+    removed.with_context(|| format!("remove the helper's stdin {path:?}"))?;
+    Ok(file)
 }
 
 fn find_executable(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
@@ -277,10 +325,33 @@ fn find_executable(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Scrub `needles` out of `text` before it reaches an error — and from there a
+/// log, an event and a CI report. A helper's stderr is written by a tool heph
+/// does not control, so it may echo the material it was about to answer with.
+///
+/// Same floor as the output tee: a needle shorter than
+/// [`REDACT_MIN_LEN`](hplugin::driver::REDACT_MIN_LEN) cannot be scrubbed
+/// without corrupting ordinary text. Longest first, so a secret that contains
+/// another is replaced whole.
+fn redact(text: &str, needles: &[String]) -> String {
+    let mut needles: Vec<&str> = needles
+        .iter()
+        .map(String::as_str)
+        .filter(|n| n.len() >= hplugin::driver::REDACT_MIN_LEN)
+        .collect();
+    needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    needles
+        .into_iter()
+        .fold(text.to_string(), |t, n| t.replace(n, "[redacted]"))
+}
+
 /// The Docker credential-helper answer: `{"ServerURL", "Username", "Secret"}`.
 ///
-/// `Username` of `<token>` is the protocol's marker for an identity token,
-/// presented as a bearer token — the same reading the ambient path gives it.
+/// A `Username` of `<token>` is refused. To the docker CLI it marks an OAuth
+/// refresh token to exchange at the registry's token endpoint; sent as-is it
+/// would be a raw `Authorization: Bearer`, which skips that exchange and which
+/// registries reject for a personal access token. The fix is one field on the
+/// credential, and the error says so — better than a 401 from the registry.
 fn parse_helper_answer(stdout: &[u8]) -> anyhow::Result<RegistryAuth> {
     #[derive(serde::Deserialize)]
     struct Answer {
@@ -295,11 +366,14 @@ fn parse_helper_answer(stdout: &[u8]) -> anyhow::Result<RegistryAuth> {
         !a.secret.is_empty(),
         "the helper returned an empty `Secret`"
     );
-    Ok(if a.username == "<token>" {
-        RegistryAuth::Bearer(a.secret)
-    } else {
-        RegistryAuth::Basic(a.username, a.secret)
-    })
+    anyhow::ensure!(
+        a.username != "<token>" && !a.username.is_empty(),
+        "the credential's material has a token but no username. A registry takes a token as \
+         the password of basic auth, under a username it chooses — give the material a \
+         `username` field (ghcr.io and GitLab accept any name, Google Artifact Registry wants \
+         `oauth2accesstoken`, ECR `AWS`, Docker Hub your account name)"
+    );
+    Ok(RegistryAuth::Basic(a.username, a.secret))
 }
 
 #[cfg(test)]
@@ -362,10 +436,28 @@ mod tests {
         }
     }
 
+    /// A def declaring `n` credentials, the way `oci_pull`/`oci_push` parse one.
+    fn def(n: usize) -> TargetDef {
+        let refs: Vec<String> = (0..n).map(|i| format!("//auth:c{i}")).collect();
+        let addr = parse_addr("//img:app").expect("addr");
+        TargetDef {
+            inputs: hdriver_support::credential::inputs(&refs, &addr.package).expect("inputs"),
+            addr,
+            labels: vec![],
+            raw_def: std::sync::Arc::new(()),
+            outputs: vec![],
+            support_files: vec![],
+            cache: hplugin::driver::targetdef::CacheConfig::off(),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        }
+    }
+
     async fn resolve(mounts: &[CredentialMount], registry: &str) -> anyhow::Result<RegistryAuth> {
         let cwd = tempfile::tempdir().expect("tempdir");
         let ctoken = StdCancellationToken::new();
-        RegistryCredentials::for_run(mounts, cwd.path(), &ctoken)
+        RegistryCredentials::for_run(&def(mounts.len()), mounts, cwd.path(), &ctoken)?
             .resolve(registry)
             .await
     }
@@ -389,18 +481,122 @@ mod tests {
         assert_eq!(p.asked(), "get|ghcr.io");
     }
 
-    /// `<token>` is the protocol's identity-token marker.
+    /// `<token>` is what the host's helper answers for material with no
+    /// username. Sent as a raw bearer it would skip the registry's token
+    /// exchange, so it is refused with the fix spelled out.
     #[tokio::test]
-    async fn a_token_username_is_a_bearer_token() {
+    async fn a_token_without_a_username_is_refused() {
         let p = Presented::new(
             "//auth:t",
             &["reg.example"],
             r#"{"ServerURL":"reg.example","Username":"<token>","Secret":"tok-material"}"#,
         );
-        let auth = resolve(std::slice::from_ref(&p.mount), "reg.example")
+        let err = resolve(std::slice::from_ref(&p.mount), "reg.example")
             .await
-            .expect("resolve");
-        assert_eq!(auth, RegistryAuth::Bearer("tok-material".into()));
+            .expect_err("a bare token must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`username` field"), "{msg}");
+        assert!(msg.contains("//auth:t"), "{msg}");
+        assert!(!msg.contains("tok-material"), "material leaked: {msg}");
+    }
+
+    /// Malformed answers fail naming the credential, never as auth.
+    #[test]
+    fn malformed_helper_answers_are_errors() {
+        for (answer, needle) in [
+            ("not json", "`Username` and `Secret`"),
+            (r#"{"Secret":"x"}"#, "`Username` and `Secret`"),
+            (r#"{"Username":"u","Secret":""}"#, "empty `Secret`"),
+            (r#"{"Username":"","Secret":"s"}"#, "`username` field"),
+        ] {
+            let err = parse_helper_answer(answer.as_bytes()).expect_err(answer);
+            assert!(format!("{err:#}").contains(needle), "{answer}: {err:#}");
+        }
+        // The real helper ends its answer with a newline.
+        assert_eq!(
+            parse_helper_answer(b"{\"Username\":\"u\",\"Secret\":\"s\"}\n").expect("parse"),
+            RegistryAuth::Basic("u".into(), "s".into())
+        );
+    }
+
+    #[test]
+    fn registry_spellings_normalize_to_one_key() {
+        for (a, b) in [
+            ("localhost:5000", "localhost:5000"),
+            ("LOCALHOST:5000", "localhost:5000"),
+            ("http://localhost:5000/v2/", "localhost:5000"),
+            ("ghcr.io/", "ghcr.io"),
+            ("https://ghcr.io", "ghcr.io"),
+            ("registry-1.docker.io", "docker.io"),
+        ] {
+            assert_eq!(normalize_registry(a), normalize_registry(b), "{a} vs {b}");
+        }
+        // A port is part of the registry's identity: not the same key.
+        assert_ne!(
+            normalize_registry("ghcr.io:443"),
+            normalize_registry("ghcr.io")
+        );
+    }
+
+    /// A target that declared credentials and received none must not run on
+    /// the host's own login — the mount was lost somewhere, and that is a bug
+    /// to surface, not an identity to substitute.
+    #[test]
+    fn declared_credentials_without_mounts_are_refused() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let ctoken = StdCancellationToken::new();
+        let err = match RegistryCredentials::for_run(&def(1), &[], cwd.path(), &ctoken) {
+            Ok(_) => panic!("must refuse"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("//img:app"), "{err}");
+        assert!(err.contains("docker login"), "{err}");
+    }
+
+    /// Material a helper echoes to stderr is scrubbed before it becomes an
+    /// error — which is a log line, an event and a CI report.
+    #[tokio::test]
+    async fn a_helper_error_is_redacted() {
+        let mut p = Presented::new("//auth:t", &["ghcr.io"], "{}");
+        p.mount.redact = vec!["leaky-secret-material".to_string()];
+        hcore::fsutil::write_executable(
+            &p.mount.path_prefix[0].join("docker-credential-heph"),
+            b"#!/bin/sh\necho 'bad token leaky-secret-material' >&2\nexit 1\n",
+        )
+        .expect("rewrite shim");
+        let err = resolve(std::slice::from_ref(&p.mount), "ghcr.io")
+            .await
+            .expect_err("helper failed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bad token [redacted]"), "{msg}");
+        assert!(!msg.contains("leaky-secret-material"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_docker_config_names_the_credential() {
+        let p = Presented::new("//auth:t", &["ghcr.io"], "{}");
+        let cfg = std::path::PathBuf::from(&p.mount.env["DOCKER_CONFIG"]).join("config.json");
+        std::fs::write(&cfg, "{not json").expect("write");
+        let err = resolve(std::slice::from_ref(&p.mount), "ghcr.io")
+            .await
+            .expect_err("bad config");
+        assert!(format!("{err:#}").contains("//auth:t"), "{err:#}");
+    }
+
+    /// A helper that is present but not executable is not a helper.
+    #[tokio::test]
+    async fn a_non_executable_helper_is_not_found() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let p = Presented::new("//auth:t", &["ghcr.io"], "{}");
+        let shim = p.mount.path_prefix[0].join("docker-credential-heph");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let err = resolve(std::slice::from_ref(&p.mount), "ghcr.io")
+            .await
+            .expect_err("no helper");
+        assert!(
+            format!("{err:#}").contains("presents no `docker-credential-heph`"),
+            "{err:#}"
+        );
     }
 
     /// Docker Hub has three hostnames and config keys may carry a scheme and a
@@ -518,13 +714,160 @@ mod tests {
         );
     }
 
+    /// A registry that demands basic auth, serving one image whose manifest
+    /// names a single `{}` config blob. Every `Authorization` header it sees is
+    /// recorded, so a test asserts on what actually went over the wire rather
+    /// than on the `RegistryAuth` value handed to `oci_client`.
+    struct StubRegistry {
+        port: u16,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    const CONFIG_DIGEST: &str =
+        "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+
+    impl StubRegistry {
+        fn start(expected_basic: &'static str) -> Self {
+            use std::io::{BufRead as _, Write as _};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = std::sync::Arc::clone(&seen);
+            let manifest = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": CONFIG_DIGEST,
+                    "size": 2,
+                },
+                "layers": [],
+            })
+            .to_string();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    let mut auth = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.eq_ignore_ascii_case("authorization")
+                        {
+                            auth = Some(v.trim().to_string());
+                        }
+                    }
+                    if let Some(a) = &auth {
+                        log.lock().expect("lock").push(a.clone());
+                    }
+                    let (status, ctype, body) = if auth.as_deref() != Some(expected_basic) {
+                        ("401 Unauthorized", "application/json", String::new())
+                    } else if path.contains("/manifests/") {
+                        (
+                            "200 OK",
+                            "application/vnd.oci.image.manifest.v1+json",
+                            manifest.clone(),
+                        )
+                    } else if path.contains("/blobs/") {
+                        ("200 OK", "application/octet-stream", "{}".to_string())
+                    } else {
+                        ("200 OK", "application/json", "{}".to_string())
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+                         WWW-Authenticate: Basic realm=\"stub\"\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+            StubRegistry { port, seen }
+        }
+
+        fn host(&self) -> String {
+            format!("127.0.0.1:{}", self.port)
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().expect("lock").clone()
+        }
+    }
+
+    async fn pull(stub: &StubRegistry, mount: &CredentialMount) -> anyhow::Result<()> {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let blobs = tempfile::tempdir().expect("tempdir");
+        let ctoken = StdCancellationToken::new();
+        let creds = RegistryCredentials::for_run(
+            &def(1),
+            std::slice::from_ref(mount),
+            cwd.path(),
+            &ctoken,
+        )?;
+        super::super::registry::pull_layout(
+            &format!("{}/acme/app:1", stub.host()),
+            &super::super::pull::PlatformSelect::Only(vec!["linux/amd64".to_string()]),
+            true,
+            blobs.path(),
+            &creds,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// End to end over the wire: the helper's username and secret reach the
+    /// registry as basic auth, and the image is pulled with it.
+    #[tokio::test]
+    async fn a_declared_credential_authenticates_a_pull_over_the_wire() {
+        let stub = StubRegistry::start("Basic Ym90OnMzY3JldC1tYXRlcmlhbA==");
+        let p = Presented::new(
+            "//auth:reg",
+            &[&stub.host()],
+            r#"{"Username":"bot","Secret":"s3cret-material"}"#,
+        );
+        pull(&stub, &p.mount).await.expect("pull");
+        assert!(
+            stub.seen()
+                .iter()
+                .any(|a| a == "Basic Ym90OnMzY3JldC1tYXRlcmlhbA=="),
+            "{:?}",
+            stub.seen()
+        );
+        assert_eq!(p.asked(), format!("get|{}", stub.host()));
+    }
+
+    /// Credentials the registry rejects fail the pull, naming the registry —
+    /// and do not retry anonymously.
+    #[tokio::test]
+    async fn rejected_credentials_fail_the_pull() {
+        let stub = StubRegistry::start("Basic Ym90OnMzY3JldC1tYXRlcmlhbA==");
+        let p = Presented::new(
+            "//auth:reg",
+            &[&stub.host()],
+            r#"{"Username":"bot","Secret":"wrong-material"}"#,
+        );
+        let err = pull(&stub, &p.mount).await.expect_err("rejected");
+        assert!(format!("{err:#}").contains(&stub.host()), "{err:#}");
+    }
+
     #[test]
-    fn no_mounts_is_the_ambient_config() {
+    fn no_declaration_is_the_ambient_config() {
         let cwd = tempfile::tempdir().expect("tempdir");
         let ctoken = StdCancellationToken::new();
         assert!(matches!(
-            RegistryCredentials::for_run(&[], cwd.path(), &ctoken),
-            RegistryCredentials::Ambient
+            RegistryCredentials::for_run(&def(0), &[], cwd.path(), &ctoken),
+            Ok(RegistryCredentials::Ambient)
         ));
     }
 }

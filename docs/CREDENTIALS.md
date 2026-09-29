@@ -428,7 +428,9 @@ presentation a registry client already understands, the Docker helper:
 ghcr = target(
     name    = "ghcr",
     driver  = "credential",
-    sources = [heph.auth.env(["GITHUB_TOKEN"])],
+    # An `env` source names each field after its variable, lowercased: this
+    # yields `username` and `password`, which the docker helper answers with.
+    sources = [heph.auth.env(["USERNAME", "PASSWORD"])],
     present = heph.auth.docker(["ghcr.io"]),
 )
 
@@ -439,9 +441,20 @@ oci_push(name = "push", image = ":img", ref = "ghcr.io/acme/app:1.2", credential
 The driver reads `credHelpers` from the mount's `DOCKER_CONFIG` and calls the
 `docker-credential-heph` shim the same way the docker CLI would. The pinned
 source and the refresh rules therefore apply exactly as they do for any other
-consumer. A `Username` of `<token>` is sent as a bearer token. Any other username
-is sent as basic auth, so set a `username` field in the material when the
-registry wants basic auth with a token as the password.
+consumer.
+
+The answer is sent as basic auth, which is how a registry takes a token: as the
+password, under a username the registry chooses. ghcr.io and GitLab accept any
+name, Google Artifact Registry wants `oauth2accesstoken`, ECR wants `AWS`, and
+Docker Hub wants your account name. **Material with no `username` is refused.**
+The helper answers it with the docker CLI's `<token>` marker, which means an
+OAuth refresh token to exchange. Sent as-is, it would be a raw bearer token that
+skips the registry's token exchange, which registries reject for a personal
+access token. The error names the missing field.
+
+The declared path always authenticates with basic auth. The ambient path, used
+when a target names no credentials, still turns a Docker `identitytoken` into a
+bearer token, exactly as it did before this change.
 
 **Naming credentials turns the ambient login off.** A target with no
 `credentials` authenticates with the host's own Docker config, as before, and
@@ -457,8 +470,16 @@ normalized, so `["docker.io"]` covers `alpine`. A credential presented as plain
 `env` is not consulted, and the error names it.
 
 `oci_pull` is cacheable, so the rule under "Two more places the naive reading
-breaks" applies directly. A credential-gated pull by tag resolves against the
-caller's identity. Pin by `@sha256:`, or set `cache = False`.
+breaks" applies directly. Its default is cache on for both tiers, so an
+unpinned credential-gated pull meets all three conditions of the residual risk
+on its own. The tag resolves against the caller's identity, and a registry that
+filters a tag by permission, such as an Artifactory or Nexus virtual repository,
+can serve one identity's image to another through the shared remote. The driver
+warns at parse. Pin by `@sha256:`, or set `cache = False`.
+
+A digest-pinned gated pull is remote-cached like any other. Anyone who can read
+the remote cache can read the image, so pinning restores reproducibility, not
+access control.
 
 `docker_build` does not take `credentials` yet. Its `docker buildx` reads
 `DOCKER_CONFIG` for more than auth: contexts, builder instances, and on Docker

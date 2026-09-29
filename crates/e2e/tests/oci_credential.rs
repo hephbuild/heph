@@ -30,6 +30,9 @@ fn workspace() -> htestkit::Workspace {
             ))
         })
         .with_provider(|_| Box::new(pluginoci::platform::Provider))
+        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(pluginoci::layer::Driver::new()))
+        .with_managed_driver(Box::new(pluginoci::image::Driver::new()))
         .with_managed_driver(Box::new(pluginoci::push::Driver::new()))
         .with_managed_driver(Box::new(pluginoci::pull::Driver::new()))
         .build()
@@ -91,6 +94,40 @@ async fn a_pull_whose_credentials_do_not_cover_the_registry_fails_before_the_net
     Ok(())
 }
 
+/// The same for a push, which is the case that matters more: a push that fell
+/// back to the host's own login would publish as the developer. The image is
+/// built offline so the only thing standing between it and the network is the
+/// credential check.
+#[tokio::test]
+async fn a_push_whose_credentials_do_not_cover_the_registry_fails_before_the_network()
+-> anyhow::Result<()> {
+    let _guard = EnvVar::set("HEPH_E2E_OCI_PUSH_TOKEN", "oci-push-material");
+    let ws = workspace();
+    ws.write_build_file(
+        "auth",
+        r#"target(name = "ghcr", driver = "credential",
+       sources = [heph.auth.env(["HEPH_E2E_OCI_PUSH_TOKEN"])],
+       present = heph.auth.docker(["ghcr.io"]))"#,
+    );
+    ws.write_build_file(
+        "img",
+        r#"
+target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
+target(name = "etc", driver = "oci_layer", srcs = [":conf"], prefix = "/etc")
+target(name = "img", driver = "oci_image", layers = [":etc"], platforms = ["linux/amd64"])
+target(name = "push", driver = "oci_push", image = ":img", ref = "quay.io/acme/app:1",
+       credentials = ["//auth:ghcr"])
+"#,
+    );
+    let err = match ws.run("//img:push").await {
+        Ok(_) => panic!("an uncovered registry must fail"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("no declared credential covers"), "{err}");
+    assert!(err.contains("quay.io"), "{err}");
+    Ok(())
+}
+
 /// A reference to something that is not a target at all is an ordinary
 /// resolution error at the consumer — not a 401 from the registry much later.
 #[tokio::test]
@@ -107,6 +144,6 @@ async fn a_missing_credential_is_a_graph_error() -> anyhow::Result<()> {
         Ok(_) => panic!("a missing credential must fail"),
         Err(e) => format!("{e:#}"),
     };
-    assert!(err.contains("//auth:nope"), "{err}");
+    assert!(err.contains("target not found: //auth:nope"), "{err}");
     Ok(())
 }

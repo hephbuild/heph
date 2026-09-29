@@ -245,6 +245,8 @@ impl ManagedDriver for Driver {
         );
         let out = ws_path(addr.package.as_str(), &out_rel);
 
+        let cache: hplugin::driver::targetdef::CacheConfig = spec.cache.into();
+
         // Fail open, but warn: an unpinned tag makes the cache key (the ref
         // string) lie if the tag later moves — same tradeoff as an http_fetch
         // without sha256. A `@` alone is not enough; require a real digest so
@@ -257,6 +259,19 @@ impl ManagedDriver for Driver {
                  pull reproducible",
                 spec.src
             );
+            // The second axis of the same defect: behind a credential, a tag
+            // resolves against the caller's identity, and the key cannot see
+            // which identity that was — so a shared remote entry serves one
+            // identity's image to another.
+            if !spec.credentials.is_empty() && cache.enabled {
+                tracing::warn!(
+                    image = spec.src,
+                    "oci_pull: {:?} is pulled with credentials, so the tag resolves against \
+                     whichever identity ran it, and the cache entry (remote included) is shared \
+                     across identities; pin the ref by @sha256:digest, or set `cache = False`",
+                    spec.src
+                );
+            }
         }
 
         let credential_inputs =
@@ -300,7 +315,7 @@ impl ManagedDriver for Driver {
                     }],
                 }],
                 support_files: vec![],
-                cache: spec.cache.into(),
+                cache,
                 pty: false,
                 hash,
                 transparent: false,
@@ -346,10 +361,11 @@ impl ManagedDriver for Driver {
             None => req.sandbox_dir.join("heph-oci-blobs"),
         };
         let creds = super::auth::RegistryCredentials::for_run(
+            req.request.target,
             &req.request.credentials,
             &req.sandbox_dir,
             ctoken,
-        );
+        )?;
         let pulled =
             super::registry::pull_layout(&def.src, &def.platform, def.insecure, &blob_dir, &creds)
                 .await

@@ -177,8 +177,12 @@ impl ManagedDriver for Driver {
         let layout =
             Layout::read(&path).with_context(|| format!("read the image to push from {path:?}"))?;
 
-        let creds =
-            RegistryCredentials::for_run(&req.request.credentials, &req.sandbox_dir, ctoken);
+        let creds = RegistryCredentials::for_run(
+            req.request.target,
+            &req.request.credentials,
+            &req.sandbox_dir,
+            ctoken,
+        )?;
         registry::push_layout(&layout, &def.dest, def.insecure, &creds)
             .await
             .with_context(|| format!("push {}", def.dest))?;
