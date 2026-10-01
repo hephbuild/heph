@@ -418,6 +418,88 @@ only once the material has earned the right to outlive the process. An unbounded
 producer credential works for the whole run; what it does not do is leave a
 `0600` secret behind that only `heph auth logout` would collect.
 
+## Registry drivers: `oci_pull` and `oci_push`
+
+These two speak the registry protocol in-process rather than spawning a tool, so
+they cannot simply inherit a presented environment. Instead they read the one
+presentation a registry client already understands, the Docker helper:
+
+```python
+ghcr = target(
+    name    = "ghcr",
+    driver  = "credential",
+    # An `env` source names each field after its variable, lowercased: this
+    # yields `username` and `password`, which the docker helper answers with.
+    sources = [heph.auth.env(["USERNAME", "PASSWORD"])],
+    present = heph.auth.docker(["ghcr.io"]),
+)
+
+oci_pull(name = "base", ref = "ghcr.io/acme/base@sha256:…", credentials = [ghcr])
+oci_push(name = "push", image = ":img", ref = "ghcr.io/acme/app:1.2", credentials = [ghcr])
+```
+
+The driver reads `credHelpers` from the mount's `DOCKER_CONFIG` and calls the
+`docker-credential-heph` shim the same way the docker CLI would. The pinned
+source and the refresh rules therefore apply exactly as they do for any other
+consumer.
+
+The answer is sent as basic auth, which is how a registry takes a token: as the
+password, under a username the registry chooses. ghcr.io and GitLab accept any
+name, Google Artifact Registry wants `oauth2accesstoken`, ECR wants `AWS`, and
+Docker Hub wants your account name. **Material with no `username` is refused.**
+The helper answers it with the docker CLI's `<token>` marker, which means an
+OAuth refresh token to exchange. Sent as-is, it would be a raw bearer token that
+skips the registry's token exchange, which registries reject for a personal
+access token. The error names the missing field.
+
+The declared path always authenticates with basic auth. `ambient_credentials`
+turns a Docker `identitytoken` into a bearer token, as the ambient lookup always
+has.
+
+**Three modes, chosen in the BUILD file:**
+
+| The target sets | It authenticates as |
+|---|---|
+| nothing (the default) | anonymous |
+| `credentials = [...]` | those credentials only |
+| `ambient_credentials = True` | the host's own Docker config (`~/.docker/config.json`, its `credsStore`/`credHelpers`, podman's `auth.json`), and anonymous for a registry it has nothing for |
+
+The default is anonymous, not the host's login. An identity nobody declared is
+not one heph should pick up by itself, and the same BUILD file would otherwise
+make different requests on a laptop and on a runner. `ambient_credentials` is
+the opt-in for a developer who wants their own `docker login`. It is visible in
+the BUILD file, where a reviewer sees it. A failed anonymous request says it was
+anonymous, and names both attributes.
+
+The two attributes are exclusive, and setting both is refused at parse. With
+`credentials`, a registry none of them covers is an error that names the
+registry. Two credentials covering one registry are also refused. Falling back
+would let a typo in a declaration run the pull or push as someone else.
+
+The registry must be listed in `heph.auth.docker([...])`. Scheme, path and the
+Docker Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`) are
+normalized, so `["docker.io"]` covers `alpine`. A credential presented as plain
+`env` is not consulted, and the error names it.
+
+`oci_pull` is cacheable, so the rule under "Two more places the naive reading
+breaks" applies directly. Its default is cache on for both tiers, so an
+unpinned credential-gated pull meets all three conditions of the residual risk
+on its own. The tag resolves against the caller's identity, and a registry that
+filters a tag by permission, such as an Artifactory or Nexus virtual repository,
+can serve one identity's image to another through the shared remote. The driver
+warns at parse. Pin by `@sha256:`, or set `cache = False`.
+
+A digest-pinned gated pull is remote-cached like any other. Anyone who can read
+the remote cache can read the image, so pinning restores reproducibility, not
+access control.
+
+`docker_build` does not take `credentials` yet. Its `docker buildx` reads
+`DOCKER_CONFIG` for more than auth: contexts, builder instances, and on Docker
+Desktop the `cli-plugins` directory that buildx itself lives in. Pointing it at
+a generated directory would break the build rather than authenticate it. A
+private base image goes through `oci_pull(layout = True, credentials = [...])`
+and `bases`, which is also the hermetic way to take one.
+
 ## The CLI
 
 | Command | Does |

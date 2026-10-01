@@ -25,6 +25,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
+use super::auth::RegistryCredentials;
 use super::{archive::Layout, dep_single_file, registry};
 
 pub const DRIVER_NAME: &str = "oci_push";
@@ -46,12 +47,27 @@ struct OciPushSpec {
     /// Push to an insecure (HTTP / self-signed) registry: plain HTTP, and
     /// certificate validation off.
     insecure: bool,
+    /// Credentials to push with, as `credential` target addresses presented
+    /// with `heph.auth.docker([...])`. When set, the registry is authenticated
+    /// with these only — never with the host's own docker login — and a
+    /// registry none of them covers is an error. When empty, the host's docker
+    /// config is used, as the docker CLI would.
+    ///
+    /// Not an input: nothing about a credential reaches the cache key.
+    credentials: Vec<String>,
+    /// Push with the host's own docker login (`~/.docker/config.json`, its
+    /// `credsStore`/`credHelpers`, podman's `auth.json`). Off by default: a
+    /// target that sets neither this nor `credentials` pushes anonymously.
+    /// Not combinable with `credentials`.
+    ambient_credentials: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciPushDef {
     dest: String,
     insecure: bool,
+    /// Who the push runs as, not what it pushes: deliberately not hashed.
+    ambient_credentials: bool,
 }
 
 /// v2: pushed in-process over the distribution protocol; `tool` and `format` are
@@ -108,10 +124,14 @@ impl ManagedDriver for Driver {
         let mut image_ref = TargetAddr::parse(&spec.image, &addr.package)
             .with_context(|| format!("parse image ref {:?}", spec.image))?;
         super::pin_archive_group(&mut image_ref, &spec.image)?;
+        super::auth::check_exclusive(&spec.credentials, spec.ambient_credentials)?;
+        let credential_inputs =
+            hdriver_support::credential::inputs(&spec.credentials, &addr.package)?;
 
         let def = OciPushDef {
             dest: spec.dest,
             insecure: spec.insecure,
+            ambient_credentials: spec.ambient_credentials,
         };
         let hash = {
             let mut h =
@@ -125,14 +145,16 @@ impl ManagedDriver for Driver {
                 addr: addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                inputs: vec![Input {
+                inputs: std::iter::once(Input {
                     r#ref: image_ref,
                     mode: InputMode::Standard,
                     origin_id: IMAGE_ORIGIN.to_string(),
                     annotations: BTreeMap::new(),
                     hashed: true,
                     runtime: true,
-                }],
+                })
+                .chain(credential_inputs)
+                .collect(),
                 outputs: vec![],
                 support_files: vec![],
                 // An action with an external side effect: never cached, always runs.
@@ -157,16 +179,23 @@ impl ManagedDriver for Driver {
     async fn run<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
-        _ctoken: &(dyn Cancellable + Send + Sync),
+        ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<OciPushDef>().clone();
         let path = dep_single_file(&req, IMAGE_ORIGIN)?;
         let layout =
             Layout::read(&path).with_context(|| format!("read the image to push from {path:?}"))?;
 
-        registry::push_layout(&layout, &def.dest, def.insecure)
+        let creds = RegistryCredentials::for_run(
+            req.request.target,
+            def.ambient_credentials,
+            &req.request.credentials,
+            &req.sandbox_dir,
+            ctoken,
+        )?;
+        registry::push_layout(&layout, &def.dest, def.insecure, &creds)
             .await
-            .with_context(|| format!("push {}", def.dest))?;
+            .with_context(|| format!("push {} ({})", def.dest, creds.failure_hint()))?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -226,6 +255,62 @@ mod tests {
         // An action: never cached.
         assert!(!resp.target_def.cache.enabled);
         assert!(!resp.target_def.cache.remote_enabled);
+    }
+
+    /// A credential is an edge the cache key cannot see: annotated, neither
+    /// hashed nor materialized, and the def hash does not move.
+    #[tokio::test]
+    async fn credentials_are_unhashed_edges() {
+        let base = [
+            ("image", Value::String(":img".to_string())),
+            ("ref", Value::String("reg.io/app:1".to_string())),
+        ];
+        let without = parse("//app:push", cfg(&base)).await;
+        let mut with_cfg = cfg(&base);
+        with_cfg.insert(
+            "credentials".to_string(),
+            Value::List(vec![Value::String("//auth:reg".to_string())]),
+        );
+        let with = parse("//app:push", with_cfg).await;
+
+        let cred = with
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| hdriver_support::credential::is_credential(&i.annotations))
+            .expect("a credential edge");
+        assert_eq!(cred.r#ref.r#ref.format(), "//auth:reg");
+        assert!(!cred.hashed && !cred.runtime);
+        assert_eq!(with.target_def.hash, without.target_def.hash);
+    }
+
+    /// Opting in to the host's login is who pushes, not what: the key holds
+    /// still. Combined with `credentials` it is refused at parse.
+    #[tokio::test]
+    async fn ambient_credentials_is_unhashed_and_exclusive() {
+        let base = [
+            ("image", Value::String(":img".to_string())),
+            ("ref", Value::String("reg.io/app:1".to_string())),
+        ];
+        let without = parse("//app:push", cfg(&base)).await;
+        let mut ambient = cfg(&base);
+        ambient.insert("ambient_credentials".to_string(), Value::Bool(true));
+        let with = parse("//app:push", ambient.clone()).await;
+        assert_eq!(with.target_def.hash, without.target_def.hash);
+
+        ambient.insert(
+            "credentials".to_string(),
+            Value::List(vec![Value::String("//auth:reg".to_string())]),
+        );
+        let err = Driver::new()
+            .parse(
+                parse_req("//app:push", ambient),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("both must be refused");
+        assert!(format!("{err:#}").contains("exclusive"), "{err:#}");
     }
 
     #[tokio::test]

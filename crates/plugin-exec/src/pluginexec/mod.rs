@@ -1007,43 +1007,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
 
         // Credential references. The same `hashed: false, runtime: false` edge a
         // scratch uses, told apart by its annotation — and for a sharper reason
-        // than scratch's. Both flags false is not an optimization here, it is the
-        // contract: nothing about a credential may enter `hashin`, not the
-        // material, not the chosen source, not the declaration, not even the
-        // names of the variables it presents. Because the exclusion is
-        // structural, adding a credential to a target cannot move its cache key.
-        //
-        // What the edge *does* buy is the graph: `heph query revdeps` answers
-        // "who needs this identity?", `heph inspect deps` shows it, and a bad
-        // addr is an ordinary `TargetNotFoundError` rather than a 403 much later.
-        let mut seen_credential: BTreeMap<String, usize> = BTreeMap::new();
-        let mut credential_inputs: Vec<Input> = Vec::with_capacity(spec.credentials.len());
-        for (i, raw) in spec.credentials.iter().enumerate() {
-            let r#ref = TargetAddr::parse(raw, &pkg)?;
-            let key = r#ref.to_string();
-            if let Some(first) = seen_credential.insert(key.clone(), i) {
-                anyhow::bail!(
-                    "credential {key} is referenced twice (positions {first} and {i}) — a \
-                     credential presents one set of variables and files, so referencing it again \
-                     does nothing; drop the duplicate"
-                );
-            }
-            credential_inputs.push(Input {
-                r#ref,
-                mode: InputMode::Standard,
-                origin_id: format!(
-                    "{}|{}",
-                    hdriver_support::credential::CREDENTIAL_ORIGIN_PREFIX,
-                    i
-                ),
-                annotations: BTreeMap::from([(
-                    hdriver_support::credential::CREDENTIAL_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )]),
-                hashed: false,
-                runtime: false,
-            });
-        }
+        // than scratch's; see `credential::inputs`.
+        let credential_inputs = hdriver_support::credential::inputs(&spec.credentials, &pkg)?;
 
         let tool_inputs = sorted_by_group(spec.tools)
             .into_iter()

@@ -22,6 +22,7 @@ use hplugin::driver::TargetAddr;
 use std::path::{Path, PathBuf};
 
 pub mod archive;
+mod auth;
 pub mod docker_build;
 pub mod exec_runner;
 pub mod image;
