@@ -452,17 +452,29 @@ OAuth refresh token to exchange. Sent as-is, it would be a raw bearer token that
 skips the registry's token exchange, which registries reject for a personal
 access token. The error names the missing field.
 
-The declared path always authenticates with basic auth. The ambient path, used
-when a target names no credentials, still turns a Docker `identitytoken` into a
-bearer token, exactly as it did before this change.
+The declared path always authenticates with basic auth. `ambient_credentials`
+turns a Docker `identitytoken` into a bearer token, as the ambient lookup always
+has.
 
-**Naming credentials turns the ambient login off.** A target with no
-`credentials` authenticates with the host's own Docker config, as before, and
-falls back to anonymous. A target that names any authenticates with those
-credentials only. A registry none of them covers is an error that names the
+**Three modes, chosen in the BUILD file:**
+
+| The target sets | It authenticates as |
+|---|---|
+| nothing (the default) | anonymous |
+| `credentials = [...]` | those credentials only |
+| `ambient_credentials = True` | the host's own Docker config (`~/.docker/config.json`, its `credsStore`/`credHelpers`, podman's `auth.json`), and anonymous for a registry it has nothing for |
+
+The default is anonymous, not the host's login. An identity nobody declared is
+not one heph should pick up by itself, and the same BUILD file would otherwise
+make different requests on a laptop and on a runner. `ambient_credentials` is
+the opt-in for a developer who wants their own `docker login`. It is visible in
+the BUILD file, where a reviewer sees it. A failed anonymous request says it was
+anonymous, and names both attributes.
+
+The two attributes are exclusive, and setting both is refused at parse. With
+`credentials`, a registry none of them covers is an error that names the
 registry. Two credentials covering one registry are also refused. Falling back
-would let a typo in a declaration run the pull or push as whoever is logged in
-on the host.
+would let a typo in a declaration run the pull or push as someone else.
 
 The registry must be listed in `heph.auth.docker([...])`. Scheme, path and the
 Docker Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`) are

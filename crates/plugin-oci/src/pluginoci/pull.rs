@@ -110,6 +110,12 @@ struct OciPullSpec {
     /// identities behind one tag would share one entry. Pin by `@sha256:`, or
     /// set `cache = False`.
     credentials: Vec<String>,
+    /// Pull with the host's own docker login (`~/.docker/config.json`, its
+    /// `credsStore`/`credHelpers`, podman's `auth.json`). Off by default: a
+    /// target that sets neither this nor `credentials` pulls anonymously.
+    /// Not combinable with `credentials`, and subject to the same caveat about
+    /// tags.
+    ambient_credentials: bool,
     /// Caching for the pulled archive. Defaults to on for both tiers. A pull is
     /// content-addressed only when the ref is digest-pinned.
     cache: TargetSpecCache,
@@ -146,6 +152,8 @@ struct OciPullDef {
     /// is" — that is what makes the key honest.
     platform: PlatformSelect,
     insecure: bool,
+    /// Who the pull runs as, not what it pulls: deliberately not hashed.
+    ambient_credentials: bool,
 }
 
 /// v3: `all_platforms` pulls the whole index, so the platform selection is no
@@ -263,7 +271,7 @@ impl ManagedDriver for Driver {
             // resolves against the caller's identity, and the key cannot see
             // which identity that was — so a shared remote entry serves one
             // identity's image to another.
-            if !spec.credentials.is_empty() && cache.enabled {
+            if (!spec.credentials.is_empty() || spec.ambient_credentials) && cache.enabled {
                 tracing::warn!(
                     image = spec.src,
                     "oci_pull: {:?} is pulled with credentials, so the tag resolves against \
@@ -274,6 +282,7 @@ impl ManagedDriver for Driver {
             }
         }
 
+        super::auth::check_exclusive(&spec.credentials, spec.ambient_credentials)?;
         let credential_inputs =
             hdriver_support::credential::inputs(&spec.credentials, &addr.package)?;
 
@@ -283,6 +292,7 @@ impl ManagedDriver for Driver {
             layout: spec.layout,
             platform,
             insecure: spec.insecure,
+            ambient_credentials: spec.ambient_credentials,
         };
         let hash = {
             let mut h =
@@ -362,6 +372,7 @@ impl ManagedDriver for Driver {
         };
         let creds = super::auth::RegistryCredentials::for_run(
             req.request.target,
+            def.ambient_credentials,
             &req.request.credentials,
             &req.sandbox_dir,
             ctoken,
@@ -369,7 +380,7 @@ impl ManagedDriver for Driver {
         let pulled =
             super::registry::pull_layout(&def.src, &def.platform, def.insecure, &blob_dir, &creds)
                 .await
-                .with_context(|| format!("pull image {}", def.src))?;
+                .with_context(|| format!("pull image {} ({})", def.src, creds.failure_hint()))?;
         let super::registry::Pulled {
             index,
             blobs,
@@ -514,6 +525,37 @@ mod tests {
         assert_eq!(cred.r#ref.r#ref.format(), "//auth:hub");
         assert!(!cred.hashed && !cred.runtime);
         assert_eq!(with.target_def.hash, without.target_def.hash);
+    }
+
+    /// Opting in to the host's login is who pulls, not what: the key holds
+    /// still. Combined with `credentials` it is refused at parse.
+    #[tokio::test]
+    async fn ambient_credentials_is_unhashed_and_exclusive() {
+        let without = parse(
+            "//base:alpine",
+            cfg(&[("ref", Value::String(PINNED.to_string()))]),
+        )
+        .await;
+        let mut ambient = cfg(&[
+            ("ref", Value::String(PINNED.to_string())),
+            ("ambient_credentials", Value::Bool(true)),
+        ]);
+        let with = parse("//base:alpine", ambient.clone()).await;
+        assert_eq!(with.target_def.hash, without.target_def.hash);
+
+        ambient.insert(
+            "credentials".to_string(),
+            Value::List(vec![Value::String("//auth:hub".to_string())]),
+        );
+        let err = Driver::new()
+            .parse(
+                parse_req("//base:alpine", ambient),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("both must be refused");
+        assert!(format!("{err:#}").contains("exclusive"), "{err:#}");
     }
 
     /// The platform is part of the key: an arm64 host and an amd64 host must not

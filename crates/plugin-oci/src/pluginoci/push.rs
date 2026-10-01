@@ -55,12 +55,19 @@ struct OciPushSpec {
     ///
     /// Not an input: nothing about a credential reaches the cache key.
     credentials: Vec<String>,
+    /// Push with the host's own docker login (`~/.docker/config.json`, its
+    /// `credsStore`/`credHelpers`, podman's `auth.json`). Off by default: a
+    /// target that sets neither this nor `credentials` pushes anonymously.
+    /// Not combinable with `credentials`.
+    ambient_credentials: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciPushDef {
     dest: String,
     insecure: bool,
+    /// Who the push runs as, not what it pushes: deliberately not hashed.
+    ambient_credentials: bool,
 }
 
 /// v2: pushed in-process over the distribution protocol; `tool` and `format` are
@@ -117,12 +124,14 @@ impl ManagedDriver for Driver {
         let mut image_ref = TargetAddr::parse(&spec.image, &addr.package)
             .with_context(|| format!("parse image ref {:?}", spec.image))?;
         super::pin_archive_group(&mut image_ref, &spec.image)?;
+        super::auth::check_exclusive(&spec.credentials, spec.ambient_credentials)?;
         let credential_inputs =
             hdriver_support::credential::inputs(&spec.credentials, &addr.package)?;
 
         let def = OciPushDef {
             dest: spec.dest,
             insecure: spec.insecure,
+            ambient_credentials: spec.ambient_credentials,
         };
         let hash = {
             let mut h =
@@ -179,13 +188,14 @@ impl ManagedDriver for Driver {
 
         let creds = RegistryCredentials::for_run(
             req.request.target,
+            def.ambient_credentials,
             &req.request.credentials,
             &req.sandbox_dir,
             ctoken,
         )?;
         registry::push_layout(&layout, &def.dest, def.insecure, &creds)
             .await
-            .with_context(|| format!("push {}", def.dest))?;
+            .with_context(|| format!("push {} ({})", def.dest, creds.failure_hint()))?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -272,6 +282,35 @@ mod tests {
         assert_eq!(cred.r#ref.r#ref.format(), "//auth:reg");
         assert!(!cred.hashed && !cred.runtime);
         assert_eq!(with.target_def.hash, without.target_def.hash);
+    }
+
+    /// Opting in to the host's login is who pushes, not what: the key holds
+    /// still. Combined with `credentials` it is refused at parse.
+    #[tokio::test]
+    async fn ambient_credentials_is_unhashed_and_exclusive() {
+        let base = [
+            ("image", Value::String(":img".to_string())),
+            ("ref", Value::String("reg.io/app:1".to_string())),
+        ];
+        let without = parse("//app:push", cfg(&base)).await;
+        let mut ambient = cfg(&base);
+        ambient.insert("ambient_credentials".to_string(), Value::Bool(true));
+        let with = parse("//app:push", ambient.clone()).await;
+        assert_eq!(with.target_def.hash, without.target_def.hash);
+
+        ambient.insert(
+            "credentials".to_string(),
+            Value::List(vec![Value::String("//auth:reg".to_string())]),
+        );
+        let err = Driver::new()
+            .parse(
+                parse_req("//app:push", ambient),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("both must be refused");
+        assert!(format!("{err:#}").contains("exclusive"), "{err:#}");
     }
 
     #[tokio::test]

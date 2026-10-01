@@ -1,18 +1,21 @@
 //! Registry credentials for the in-process drivers (`oci_pull`, `oci_push`).
 //!
-//! Two sources, and which one applies is decided by the BUILD file, never by
-//! what happens to be configured:
+//! Three modes, and which one applies is decided by the BUILD file, never by
+//! what happens to be configured on the host:
 //!
-//! - **No `credentials`**: the developer's own Docker config, found where the
-//!   docker CLI finds it, and anonymous when there is none — a public pull
-//!   needs nothing, and failing there would break the common case to serve the
-//!   rare one.
-//! - **`credentials = [...]`**: those, and only those. The ambient config is not
-//!   consulted, and a registry none of them covers is an error rather than an
-//!   anonymous request. Falling back would turn a typo in a declaration into a
-//!   build that quietly runs as whoever the host happens to be logged in as —
-//!   the exact accident a credential exists to prevent (see
+//! - **Neither attribute** (the default): anonymous. A public pull needs
+//!   nothing, and an identity nobody declared is not one heph picks up on its
+//!   own — the same build on a laptop and on a runner then makes the same
+//!   request.
+//! - **`credentials = [...]`**: those, and only those. A registry none of them
+//!   covers is an error rather than an anonymous request. Falling back would
+//!   turn a typo in a declaration into a build that quietly runs as someone
+//!   else — the exact accident a credential exists to prevent (see
 //!   `docs/CREDENTIALS.md`).
+//! - **`ambient_credentials = True`**: the developer's own Docker config, found
+//!   where the docker CLI finds it, anonymous for a registry it has nothing for.
+//!   An explicit opt-in to whatever identity the host happens to have, visible
+//!   in the BUILD file where a reviewer can see it.
 //!
 //! A declared credential reaches this driver the way it reaches any other: as a
 //! [`CredentialMount`] the host already acquired. The presentation read here is
@@ -30,9 +33,23 @@ use oci_client::secrets::RegistryAuth;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Refuse `credentials` and `ambient_credentials` together, at parse, where the
+/// BUILD author sees it. Two sources for one request is two identities with
+/// nothing to choose between them.
+pub(crate) fn check_exclusive(credentials: &[String], ambient: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !ambient || credentials.is_empty(),
+        "`credentials` and `ambient_credentials = True` are exclusive: a target authenticates \
+         either with its declared credentials or with the host's own docker login. Drop one"
+    );
+    Ok(())
+}
+
 /// Where a registry operation's credentials come from.
 pub(crate) enum RegistryCredentials<'a> {
-    /// The target declared no `credentials`: the ambient Docker config.
+    /// The target declared nothing: anonymous.
+    None,
+    /// `ambient_credentials = True`: the host's own Docker config.
     Ambient,
     /// The target declared `credentials`: these mounts, exclusively.
     Declared {
@@ -45,15 +62,18 @@ pub(crate) enum RegistryCredentials<'a> {
 }
 
 impl<'a> RegistryCredentials<'a> {
-    /// The source for a run of `target` that received `mounts`.
+    /// The source for a run of `target` that received `mounts`, where
+    /// `ambient` is the target's `ambient_credentials`.
     ///
-    /// Decided by what the target *declared* — its credential edges — and
-    /// checked against what arrived. A target that declared credentials and
-    /// received none is refused rather than run on the ambient login: a mount
-    /// lost anywhere between host and driver would otherwise swap the declared
-    /// identity for whoever the host is logged in as, silently.
+    /// Decided by what the target *declared* — its credential edges and its
+    /// opt-in — and checked against what arrived. A target that declared
+    /// credentials and received none is refused rather than run anonymously: a
+    /// mount lost anywhere between host and driver would otherwise turn a
+    /// declared identity into none, and the 401 that follows would point at
+    /// the registry rather than at the lost mount.
     pub(crate) fn for_run(
         target: &TargetDef,
+        ambient: bool,
         mounts: &'a [CredentialMount],
         cwd: &'a Path,
         ctoken: &'a (dyn Cancellable + Send + Sync),
@@ -64,15 +84,20 @@ impl<'a> RegistryCredentials<'a> {
             .filter(|i| hdriver_support::credential::is_credential(&i.annotations))
             .count();
         if declared == 0 && mounts.is_empty() {
-            return Ok(Self::Ambient);
+            return Ok(if ambient { Self::Ambient } else { Self::None });
         }
+        // Parse refuses both at once; a def that has both was not made by it.
+        anyhow::ensure!(
+            !ambient,
+            "{} sets both `credentials` and `ambient_credentials`",
+            target.addr.format()
+        );
         // The host presents exactly one mount per declared credential, or
         // fails the run itself.
         anyhow::ensure!(
             mounts.len() >= declared,
-            "{} declares {declared} credential(s), but the host presented {} — refusing to fall \
-             back to the host's own docker login. The host is likely older than the plugin; \
-             upgrade heph",
+            "{} declares {declared} credential(s), but the host presented {}. The host is likely \
+             older than the plugin; upgrade heph",
             target.addr.format(),
             mounts.len()
         );
@@ -83,10 +108,24 @@ impl<'a> RegistryCredentials<'a> {
         })
     }
 
+    /// What to add to a failed registry operation, so a 401 on an anonymous
+    /// request says how to authenticate rather than only that it did not.
+    pub(crate) fn failure_hint(&self) -> &'static str {
+        match self {
+            Self::None => {
+                "the request was anonymous: this target names no `credentials` and does not set \
+                 `ambient_credentials = True`. A private image needs one of them"
+            }
+            Self::Ambient => "authenticated with the host's own docker config",
+            Self::Declared { .. } => "authenticated with the target's declared credentials",
+        }
+    }
+
     /// The auth to present to `registry` (as `Reference::resolve_registry`
     /// spells it).
     pub(crate) async fn resolve(&self, registry: &str) -> anyhow::Result<RegistryAuth> {
         match self {
+            Self::None => Ok(RegistryAuth::Anonymous),
             // Off the async worker: a `credsStore` of `osxkeychain` or `desktop`
             // makes this spawn and wait on a helper.
             Self::Ambient => {
@@ -457,7 +496,7 @@ mod tests {
     async fn resolve(mounts: &[CredentialMount], registry: &str) -> anyhow::Result<RegistryAuth> {
         let cwd = tempfile::tempdir().expect("tempdir");
         let ctoken = StdCancellationToken::new();
-        RegistryCredentials::for_run(&def(mounts.len()), mounts, cwd.path(), &ctoken)?
+        RegistryCredentials::for_run(&def(mounts.len()), false, mounts, cwd.path(), &ctoken)?
             .resolve(registry)
             .await
     }
@@ -545,12 +584,12 @@ mod tests {
     fn declared_credentials_without_mounts_are_refused() {
         let cwd = tempfile::tempdir().expect("tempdir");
         let ctoken = StdCancellationToken::new();
-        let err = match RegistryCredentials::for_run(&def(1), &[], cwd.path(), &ctoken) {
+        let err = match RegistryCredentials::for_run(&def(1), false, &[], cwd.path(), &ctoken) {
             Ok(_) => panic!("must refuse"),
             Err(e) => format!("{e:#}"),
         };
         assert!(err.contains("//img:app"), "{err}");
-        assert!(err.contains("docker login"), "{err}");
+        assert!(err.contains("host presented 0"), "{err}");
     }
 
     /// Material a helper echoes to stderr is scrubbed before it becomes an
@@ -811,6 +850,7 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let creds = RegistryCredentials::for_run(
             &def(1),
+            false,
             std::slice::from_ref(mount),
             cwd.path(),
             &ctoken,
@@ -862,12 +902,57 @@ mod tests {
     }
 
     #[test]
-    fn no_declaration_is_the_ambient_config() {
+    fn no_declaration_is_anonymous_and_ambient_is_opt_in() {
         let cwd = tempfile::tempdir().expect("tempdir");
         let ctoken = StdCancellationToken::new();
         assert!(matches!(
-            RegistryCredentials::for_run(&def(0), &[], cwd.path(), &ctoken),
+            RegistryCredentials::for_run(&def(0), false, &[], cwd.path(), &ctoken),
+            Ok(RegistryCredentials::None)
+        ));
+        assert!(matches!(
+            RegistryCredentials::for_run(&def(0), true, &[], cwd.path(), &ctoken),
             Ok(RegistryCredentials::Ambient)
         ));
+    }
+
+    /// An anonymous request never consults the host: not even a configured
+    /// `DOCKER_CONFIG` reaches it.
+    #[tokio::test]
+    async fn no_declaration_sends_nothing_over_the_wire() {
+        let stub = StubRegistry::start("Basic Ym90OnMzY3JldC1tYXRlcmlhbA==");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let blobs = tempfile::tempdir().expect("tempdir");
+        let ctoken = StdCancellationToken::new();
+        let creds =
+            RegistryCredentials::for_run(&def(0), false, &[], cwd.path(), &ctoken).expect("none");
+        let err = super::super::registry::pull_layout(
+            &format!("{}/acme/app:1", stub.host()),
+            &super::super::pull::PlatformSelect::Only(vec!["linux/amd64".to_string()]),
+            true,
+            blobs.path(),
+            &creds,
+        )
+        .await
+        .err()
+        .expect("an authenticated registry refuses an anonymous pull");
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+        assert!(format!("{err:#}").contains(&stub.host()), "{err:#}");
+    }
+
+    #[test]
+    fn credentials_and_ambient_together_are_refused() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let ctoken = StdCancellationToken::new();
+        let mount = CredentialMount::default();
+        assert!(
+            RegistryCredentials::for_run(
+                &def(1),
+                true,
+                std::slice::from_ref(&mount),
+                cwd.path(),
+                &ctoken
+            )
+            .is_err()
+        );
     }
 }
