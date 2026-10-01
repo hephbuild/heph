@@ -30,6 +30,7 @@ use anyhow::Context as _;
 use clap::{Args, Subcommand};
 use hbuiltins::plugincredential::{CredentialDef, DRIVER_NAME, parse_declaration};
 use hmodel::htaddr::Addr;
+use hmodel::htmatcher::Matcher;
 use std::sync::Arc;
 
 #[derive(Args)]
@@ -418,7 +419,6 @@ async fn find_credentials(
     rs: &Arc<crate::engine::request_state::RequestState>,
     matcher: Option<&str>,
 ) -> anyhow::Result<Vec<(Addr, CredentialDef)>> {
-    use futures::TryStreamExt as _;
     let cwp = get_cwp()?;
     // Through the expression slot, not the positional one: the single-positional
     // form takes an *address*, and the selection here is a package matcher.
@@ -429,14 +429,25 @@ async fn find_credentials(
         &cwp,
         true,
     )?;
-    let stream = Arc::clone(engine).query(rs.clone(), &m);
+    credentials_matching(engine, rs, &m).await
+}
+
+async fn credentials_matching(
+    engine: &Arc<Engine>,
+    rs: &Arc<crate::engine::request_state::RequestState>,
+    m: &Matcher,
+) -> anyhow::Result<Vec<(Addr, CredentialDef)>> {
+    use futures::TryStreamExt as _;
+    // `query_spec`, not `query` + `get_spec`: a listed candidate may not resolve
+    // standalone (go's per-platform variants), and that is not a broken target.
+    let stream = Arc::clone(engine).query_spec(rs.clone(), m);
     tokio::pin!(stream);
     let mut out = Vec::new();
-    while let Some(addr) = stream.try_next().await? {
-        let spec = Arc::clone(engine).get_spec(rs.clone(), &addr).await?;
+    while let Some(spec) = stream.try_next().await? {
         if spec.driver != DRIVER_NAME {
             continue;
         }
+        let addr = spec.addr.clone();
         let def = parse_declaration(&spec).with_context(|| format!("credential {addr}"))?;
         out.push((addr, def));
     }
@@ -447,6 +458,127 @@ async fn find_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Config;
+    use crate::engine::provider::{
+        ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+        ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
+    };
+    use futures::future::BoxFuture;
+    use hbuiltins::pluginstatictarget;
+    use hcore::hasync::Cancellable;
+    use hcore::htvalue::Value;
+    use hmodel::htpkg::PkgBuf;
+
+    /// Lists `//auth:phantom` and can `get` nothing — the shape of go's
+    /// per-platform variants, which `list` advertises and `get` declines.
+    struct PhantomLister;
+
+    impl Provider for PhantomLister {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "phantom".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            let addr = Addr::new(
+                req.package.clone(),
+                "phantom".to_string(),
+                Default::default(),
+            );
+            Box::pin(async move {
+                let items = vec![Ok(ListResponse { addr })];
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            Box::pin(async { Err(GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+        }
+    }
+
+    /// `heph auth login` walks the whole workspace for credentials, so one
+    /// listed-but-unresolvable candidate anywhere used to fail it with
+    /// `target not found`.
+    #[tokio::test]
+    async fn an_unresolvable_candidate_does_not_fail_the_credential_walk() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: root.path().join(".heph3"),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let s = |v: &str| Value::String(v.to_string());
+        let credential = pluginstatictarget::Target {
+            addr: "//auth:token".to_string(),
+            driver: DRIVER_NAME.to_string(),
+            raw_config: [
+                (
+                    "sources".to_string(),
+                    Value::List(vec![Value::Map(
+                        [
+                            ("kind".to_string(), s("env")),
+                            ("names".to_string(), Value::List(vec![s("MY_TOKEN")])),
+                        ]
+                        .into(),
+                    )]),
+                ),
+                (
+                    "present".to_string(),
+                    Value::Map(
+                        [(
+                            "env".to_string(),
+                            Value::Map([("MY_TOKEN".to_string(), s("${my_token}"))].into()),
+                        )]
+                        .into(),
+                    ),
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let provider = pluginstatictarget::Provider::new(vec![credential])?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        engine.register_provider(|_| Box::new(PhantomLister))?;
+        let engine = Arc::new(engine);
+
+        let rs = engine.new_state();
+        let creds =
+            credentials_matching(&engine, &rs, &Matcher::PackagePrefix(PkgBuf::from(""))).await?;
+
+        let addrs: Vec<String> = creds.iter().map(|(a, _)| a.format()).collect();
+        assert_eq!(addrs, vec!["//auth:token".to_string()]);
+        Ok(())
+    }
 
     #[test]
     fn a_status_row_serializes_the_fix_as_data_not_prose() {
