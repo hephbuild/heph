@@ -483,13 +483,69 @@ fn elapsed_ms() -> u64 {
     u64::try_from(PROCESS_START.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// A remote cache refused who we are, or we could not establish who we are: a
+/// 401/403 from the store, or a credential that could not be obtained for a
+/// reason other than the network (an expired login, a revoked key, an
+/// unreadable credential file).
+///
+/// Unlike every other failure this does not heal within a run — the user has to
+/// log in again — so the breaker does not back off and re-probe on it: the
+/// first one disables the cache for the rest of the run. A backend marks the
+/// failures it can only classify at its own seam (a token-endpoint rejection
+/// arrives as an opaque store error) by putting this in the error chain;
+/// [`is_auth_failure`] recognizes it, and the store's own 401/403 variants, from
+/// there.
+#[derive(Debug)]
+pub(crate) struct AuthError(pub(crate) Box<dyn std::error::Error + Send + Sync>);
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("authentication failed")
+    }
+}
+
+impl std::error::Error for AuthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+/// Whether `e` is an [`AuthError`]-class failure anywhere in its chain.
+pub(crate) fn is_auth_failure(e: &anyhow::Error) -> bool {
+    e.chain().any(is_auth_link)
+}
+
+/// One link of [`is_auth_failure`]. An `io::Error` built around another error
+/// (object_store's `BufWriter` reports a failed upload that way) hides it from
+/// `source()`, so it is unwrapped by hand.
+fn is_auth_link(e: &(dyn std::error::Error + 'static)) -> bool {
+    if e.is::<AuthError>() {
+        return true;
+    }
+    if let Some(os) = e.downcast_ref::<object_store::Error>() {
+        return matches!(
+            os,
+            object_store::Error::Unauthenticated { .. }
+                | object_store::Error::PermissionDenied { .. }
+        );
+    }
+    e.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+        .is_some_and(|inner| is_auth_link(inner))
+}
+
 /// Per-cache failure tracking. The first error for a cache is logged once, then
 /// every later error is suppressed; after [`FAILURE_THRESHOLD`] consecutive
 /// failures the cache is paused for a backing-off cooldown so we stop hitting it
 /// at all. A success resets the consecutive-failure run *and* the backoff.
+///
+/// An [`AuthError`] skips all of that: the cache is disabled for the rest of the
+/// run on the first one, and no later success re-arms it.
 #[derive(Default)]
 struct CacheHealth {
     warned: AtomicBool,
+    /// Set by the first [`AuthError`]; the cache is skipped from then on.
+    auth_failed: AtomicBool,
     consecutive_failures: AtomicUsize,
     /// Milliseconds since [`PROCESS_START`] until which the breaker stays open;
     /// `0` when the cache has never tripped.
@@ -580,6 +636,9 @@ impl ConfiguredCache {
 
     /// Whether the cache's breaker is currently open and it should be skipped.
     fn broken(&self) -> bool {
+        if self.health.auth_failed.load(Ordering::Relaxed) {
+            return true;
+        }
         let until = self.health.disabled_until_ms.load(Ordering::Relaxed);
         until != 0 && elapsed_ms() < until
     }
@@ -594,8 +653,24 @@ impl ConfiguredCache {
     }
 
     /// Record a failed op: warn exactly once per cache, suppress the rest, and
-    /// trip the breaker after [`FAILURE_THRESHOLD`] consecutive failures.
+    /// trip the breaker after [`FAILURE_THRESHOLD`] consecutive failures — or
+    /// disable the cache outright on an [`AuthError`].
     fn note_err(&self, op: &str, e: &anyhow::Error) {
+        if is_auth_failure(e) {
+            // Retrying cannot fix a rejected credential, so there is no
+            // backoff: every probe would fail the same way, add its latency to
+            // a target, and repeat the warning. Ops already in flight land here
+            // too and stay quiet.
+            self.health.warned.store(true, Ordering::Relaxed);
+            if !self.health.auth_failed.swap(true, Ordering::Relaxed) {
+                warn!(
+                    cache = %self.def.name,
+                    op,
+                    "remote cache authentication failed, disabling it for the rest of this run: {e:#}",
+                );
+            }
+            return;
+        }
         if !self.health.warned.swap(true, Ordering::Relaxed) {
             // `{e:#}` is anyhow's alternate Display: the cause chain on one line,
             // no backtrace. (`{e:?}` would dump the full `Caused by:` ladder plus
@@ -2431,6 +2506,69 @@ mod tests {
             set.caches.first().expect("cache").broken(),
             "cache must be circuit-broken after {FAILURE_THRESHOLD} consecutive failures"
         );
+    }
+
+    /// A rejected credential cannot heal within a run, so the first one
+    /// disables the cache for good: no threshold, no cooldown to wait out, and
+    /// a straggling in-flight success does not re-arm it.
+    #[tokio::test(start_paused = true)]
+    async fn auth_failure_disables_the_cache_for_the_run() {
+        let cache =
+            ConfiguredCache::new(def("x", "memory:///x", true, true), Arc::new(FailBackend));
+        let e = anyhow::Error::new(AuthError("invalid_grant".into())).context("manifest read");
+        assert!(is_auth_failure(&e));
+        cache.note_err("op", &e);
+        assert!(cache.broken(), "one auth failure must disable the cache");
+        tokio::time::advance(BREAKER_COOLDOWN_MAX * 2).await;
+        assert!(cache.broken(), "an auth failure has no cooldown");
+        cache.note_ok();
+        assert!(cache.broken(), "a later success must not re-arm the cache");
+    }
+
+    /// Every shape an auth failure reaches the breaker in, and the near
+    /// misses that must still go through the ordinary backoff.
+    #[test]
+    fn auth_failure_is_recognized_through_wrappers() {
+        let unauth = || object_store::Error::Unauthenticated {
+            path: "p".into(),
+            source: "401".into(),
+        };
+        let denied = object_store::Error::PermissionDenied {
+            path: "p".into(),
+            source: "403".into(),
+        };
+        // A store's own 401/403, under context.
+        assert!(is_auth_failure(
+            &anyhow::Error::new(unauth()).context("open remote object")
+        ));
+        assert!(is_auth_failure(&anyhow::Error::new(denied)));
+        // Behind an io::Error, as `BufWriter` reports a failed upload.
+        let io = std::io::Error::other(unauth());
+        assert!(is_auth_failure(
+            &anyhow::Error::new(io).context("upload blob")
+        ));
+        // Behind a store error, as `AuthClassifying` reports a credential.
+        let tagged = object_store::Error::Generic {
+            store: "GCS",
+            source: Box::new(AuthError("invalid_rapt".into())),
+        };
+        assert!(is_auth_failure(&anyhow::Error::new(tagged)));
+
+        // Not auth: a generic store error, a missing object, a bare io error
+        // whose kind merely reads like one.
+        let generic = object_store::Error::Generic {
+            store: "GCS",
+            source: "503 Service Unavailable".into(),
+        };
+        assert!(!is_auth_failure(&anyhow::Error::new(generic)));
+        let missing = object_store::Error::NotFound {
+            path: "p".into(),
+            source: "404".into(),
+        };
+        assert!(!is_auth_failure(&anyhow::Error::new(missing)));
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!is_auth_failure(&anyhow::Error::new(io)));
+        assert!(!is_auth_failure(&anyhow::anyhow!("auth failed")));
     }
 
     #[test]
