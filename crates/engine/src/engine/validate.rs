@@ -19,6 +19,7 @@ use enclose::enclose;
 use futures::TryStreamExt;
 
 use crate::engine::Engine;
+use crate::engine::discovery::Discovery;
 use crate::engine::driver::targetdef::path::CodegenMode;
 use crate::engine::gitignore::content_to_pattern;
 use crate::engine::query::skip_unresolvable;
@@ -72,10 +73,11 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         matcher: &Matcher,
+        discovery: Discovery,
     ) -> anyhow::Result<Vec<CodegenOverlap>> {
         // Drain the addr stream first, then fan the def fetches out in parallel.
         let addrs: Vec<Addr> = {
-            let stream = Arc::clone(&self).query(rs.clone(), matcher);
+            let stream = Arc::clone(&self).query(rs.clone(), matcher, discovery);
             tokio::pin!(stream);
             let mut v = Vec::new();
             while let Some(addr) = stream.try_next().await? {
@@ -226,7 +228,7 @@ mod tests {
         let rs = engine.new_state();
 
         let overlaps = Arc::clone(&engine)
-            .codegen_copy_overlaps(rs, &all())
+            .codegen_copy_overlaps(rs, &all(), Discovery::Complete)
             .await?;
 
         assert_eq!(overlaps.len(), 1, "one collision: {overlaps:?}");
@@ -265,7 +267,7 @@ mod tests {
         let rs = engine.new_state();
 
         let overlaps = Arc::clone(&engine)
-            .codegen_copy_overlaps(rs, &all())
+            .codegen_copy_overlaps(rs, &all(), Discovery::Complete)
             .await?;
 
         assert_eq!(overlaps.len(), 1, "one collision: {overlaps:?}");
@@ -293,7 +295,7 @@ mod tests {
         let rs = engine.new_state();
 
         let overlaps = Arc::clone(&engine)
-            .codegen_copy_overlaps(rs, &all())
+            .codegen_copy_overlaps(rs, &all(), Discovery::Complete)
             .await?;
 
         assert!(overlaps.is_empty(), "siblings do not overlap: {overlaps:?}");
@@ -308,7 +310,7 @@ mod tests {
         let rs = engine.new_state();
 
         let overlaps = Arc::clone(&engine)
-            .codegen_copy_overlaps(rs, &all())
+            .codegen_copy_overlaps(rs, &all(), Discovery::Complete)
             .await?;
 
         assert!(overlaps.is_empty(), "same-target nesting ok: {overlaps:?}");
@@ -324,7 +326,7 @@ mod tests {
         let rs = engine.new_state();
 
         let overlaps = Arc::clone(&engine)
-            .codegen_copy_overlaps(rs, &all())
+            .codegen_copy_overlaps(rs, &all(), Discovery::Complete)
             .await?;
 
         assert!(overlaps.is_empty(), "no overlap expected: {overlaps:?}");
@@ -342,7 +344,7 @@ mod tests {
         let rs = engine.new_state();
 
         let overlaps = Arc::clone(&engine)
-            .codegen_copy_overlaps(rs, &all())
+            .codegen_copy_overlaps(rs, &all(), Discovery::Complete)
             .await?;
 
         assert!(
@@ -362,7 +364,7 @@ mod tests {
         let rs = engine.new_state();
 
         let overlaps = Arc::clone(&engine)
-            .codegen_copy_overlaps(rs, &all())
+            .codegen_copy_overlaps(rs, &all(), Discovery::Complete)
             .await?;
 
         assert!(
@@ -473,7 +475,11 @@ mod tests {
         // (no spec resolution), so the per-target `get_def` NotFound is what the
         // skip must absorb. Result: no error, no overlaps.
         let overlaps = Arc::clone(&engine)
-            .codegen_copy_overlaps(rs, &Matcher::PackagePrefix(PkgBuf::from("virt")))
+            .codegen_copy_overlaps(
+                rs,
+                &Matcher::PackagePrefix(PkgBuf::from("virt")),
+                Discovery::Complete,
+            )
             .await?;
 
         assert!(overlaps.is_empty(), "ghost target skipped: {overlaps:?}");

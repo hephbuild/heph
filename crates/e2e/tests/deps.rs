@@ -350,7 +350,7 @@ async fn revisions(ws: &Workspace, addr_str: &str) -> anyhow::Result<usize> {
     let m = heph::htmatcher::Matcher::Addr(heph::htaddr::parse_addr(addr_str)?);
     Ok(engine
         .clone()
-        .clean(engine.new_state(), &m)
+        .clean(engine.new_state(), &m, heph::engine::Discovery::Complete)
         .await?
         .revisions_removed)
 }

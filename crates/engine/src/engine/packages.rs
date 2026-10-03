@@ -93,43 +93,59 @@ impl Engine {
         for res in self.provider_packages(m, rs).await {
             per_provider.push(res?);
         }
+        Ok(Box::new(
+            merge_packages(m, &per_provider).into_iter().map(Ok),
+        ))
+    }
+}
 
-        let mut all_packages = Vec::new();
-        // Different providers can list the same package; dedup so callers
-        // (e.g. `query`) don't scan a package more than once. A package listed
-        // by two providers keeps the position of the first one that listed it.
-        //
-        // Overlapping the walks in `provider_packages` must not be allowed to
-        // reorder this merge: the fold runs over `per_provider` in
-        // provider-registration order, exactly as the serial loop did,
-        // regardless of which walk finished first.
-        let mut seen: FxHashSet<String> = FxHashSet::default();
+/// [`Engine::packages`]' merge: the per-provider blocks deduped across
+/// providers in registration order, minus the packages `m` rejects outright.
+///
+/// Split out so a keep-going walk can merge just the providers whose listing
+/// succeeded, in the same order, without [`Engine::packages`] ever answering
+/// with a short list — that one stays all-or-nothing, because `states_under`
+/// reads it and its answer reaches a def hash.
+pub(crate) fn merge_packages(
+    m: &htmatcher::Matcher,
+    per_provider: &[Arc<Vec<String>>],
+) -> Vec<String> {
+    let mut all_packages = Vec::new();
+    // Different providers can list the same package; dedup so callers
+    // (e.g. `query`) don't scan a package more than once. A package listed
+    // by two providers keeps the position of the first one that listed it.
+    //
+    // Overlapping the walks in `provider_packages` must not be allowed to
+    // reorder this merge: the fold runs over `per_provider` in
+    // provider-registration order, exactly as the serial loop did,
+    // regardless of which walk finished first.
+    let mut seen: FxHashSet<String> = FxHashSet::default();
 
-        // A whole-graph selector rejects nothing, so skip the check rather than
-        // build a `PkgBuf` per package to be told so — `//...` is the single
-        // most common selector and the one with the most packages to say it
-        // about. Every other matcher pays one `PkgBuf` per *unique* package
-        // (after the dedup below), and saves a probe plus a `list` for each one
-        // it rejects.
-        let scoped = !matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
+    // A whole-graph selector rejects nothing, so skip the check rather than
+    // build a `PkgBuf` per package to be told so — `//...` is the single
+    // most common selector and the one with the most packages to say it
+    // about. Every other matcher pays one `PkgBuf` per *unique* package
+    // (after the dedup below), and saves a probe plus a `list` for each one
+    // it rejects.
+    let scoped = !matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
 
-        for pkgs in &per_provider {
-            for p in pkgs.iter() {
-                if !seen.insert(p.clone()) {
-                    continue;
-                }
-                if scoped
-                    && m.matches_pkg(&PkgBuf::from(p.as_str())) == htmatcher::MatchResult::MatchNo
-                {
-                    continue;
-                }
-                all_packages.push(p.clone());
+    for pkgs in per_provider {
+        for p in pkgs.iter() {
+            if !seen.insert(p.clone()) {
+                continue;
             }
+            if scoped && m.matches_pkg(&PkgBuf::from(p.as_str())) == htmatcher::MatchResult::MatchNo
+            {
+                continue;
+            }
+            all_packages.push(p.clone());
         }
-
-        Ok(Box::new(all_packages.into_iter().map(Ok)))
     }
 
+    all_packages
+}
+
+impl Engine {
     /// Each provider's package list for `m`, in provider-registration order:
     /// the memoized, sorted, deduped blocks [`packages`](Self::packages) merges.
     ///

@@ -1042,6 +1042,9 @@ impl BuildState {
             // elapsed-clock anchor at the top of `apply` still runs, so the
             // clock works during a gc sweep.
             BuildEventKind::GcTargetSwept { .. } => {}
+            // Emitted once at the end, after the live view; the command prints
+            // its own "incomplete selection" block.
+            BuildEventKind::SelectionIncomplete { .. } => {}
             // An event kind newer than this build knows about. Skipped rather
             // than fatal — see `BuildEventKind::Unknown`.
             BuildEventKind::Unknown => {}

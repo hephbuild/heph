@@ -452,6 +452,10 @@ impl Tally {
             // report on — those commands have their own output.
             BuildEventKind::GcTargetSwept { .. } => {}
 
+            // The command prints its own "incomplete selection" block; the
+            // job summary does not render it yet.
+            BuildEventKind::SelectionIncomplete { .. } => {}
+
             // An event kind from a host newer than this plugin. Skipping it keeps
             // the rest of the stream flowing; the alternative is a decode failure,
             // which the SDK treats as end-of-stream and would silently truncate

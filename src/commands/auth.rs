@@ -165,10 +165,12 @@ struct Row {
     login: Vec<Vec<String>>,
 }
 
-async fn status(args: StatusArgs, _global: GlobalOptions) -> anyhow::Result<()> {
+async fn status(args: StatusArgs, global: GlobalOptions) -> anyhow::Result<()> {
     let (engine, _shutdown) = bootstrap::new_engine()?;
     let rs = engine.new_state();
-    let creds = find_credentials(&engine, &rs, args.matcher.as_deref()).await?;
+    let gaps = crate::engine::Gaps::new(args.matcher.as_deref().unwrap_or("//..."));
+    let discovery = crate::engine::Discovery::keep_going_unless(global.fail_fast, &gaps);
+    let creds = find_credentials(&engine, &rs, args.matcher.as_deref(), discovery).await?;
 
     let mut rows = Vec::with_capacity(creds.len());
     for (addr, def) in &creds {
@@ -181,7 +183,11 @@ async fn status(args: StatusArgs, _global: GlobalOptions) -> anyhow::Result<()> 
             serde_json::to_string_pretty(&rows).context("render --json")?
         );
     } else if rows.is_empty() {
-        println!("no `credential` targets in this workspace");
+        // "None here" would be a claim the walk cannot make if it skipped
+        // part of the workspace; the incomplete block below says that instead.
+        if gaps.is_empty() {
+            println!("no `credential` targets in this workspace");
+        }
     } else {
         let widest = rows.iter().map(|r| r.addr.len()).max().unwrap_or(0);
         for r in &rows {
@@ -199,6 +205,9 @@ async fn status(args: StatusArgs, _global: GlobalOptions) -> anyhow::Result<()> 
         }
     }
 
+    // A credential the walk could not reach is not in the table at all, which
+    // is worse than one that is not ok.
+    crate::commands::errors::require_complete_selection(&gaps)?;
     // Non-zero unless every row is ok, so a caller can branch on the exit status
     // and only then parse to learn what to run.
     if rows.iter().any(|r| r.state != State::Ok) {
@@ -346,9 +355,10 @@ async fn explain(args: ExplainArgs, _global: GlobalOptions) -> anyhow::Result<()
     Ok(())
 }
 
-async fn login(args: LoginArgs, _global: GlobalOptions) -> anyhow::Result<()> {
+async fn login(args: LoginArgs, global: GlobalOptions) -> anyhow::Result<()> {
     let (engine, _shutdown) = bootstrap::new_engine()?;
     let rs = engine.new_state();
+    let gaps = crate::engine::Gaps::new("//...");
     let creds = match &args.addr {
         Some(raw) => {
             let cwp = get_cwp()?;
@@ -359,7 +369,10 @@ async fn login(args: LoginArgs, _global: GlobalOptions) -> anyhow::Result<()> {
             }
             vec![(addr, parse_declaration(&spec)?)]
         }
-        None => find_credentials(&engine, &rs, None).await?,
+        None => {
+            let discovery = crate::engine::Discovery::keep_going_unless(global.fail_fast, &gaps);
+            find_credentials(&engine, &rs, None, discovery).await?
+        }
     };
 
     let mut ran = 0usize;
@@ -391,10 +404,10 @@ async fn login(args: LoginArgs, _global: GlobalOptions) -> anyhow::Result<()> {
             }
         }
     }
-    if ran == 0 {
+    if ran == 0 && gaps.is_empty() {
         println!("nothing to sign in to — every declared credential already applies here");
     }
-    Ok(())
+    crate::commands::errors::require_complete_selection(&gaps)
 }
 
 async fn logout() -> anyhow::Result<()> {
@@ -414,10 +427,16 @@ async fn logout() -> anyhow::Result<()> {
 /// Resolves each spec, which is what makes this a preflight rather than something
 /// on a build's path. There is no "by driver" matcher in the query language and
 /// adding one for this would be a lot of surface for one command.
+///
+/// Unless `--fail-fast`, keeps going past a candidate that cannot be resolved:
+/// a broken package elsewhere in the workspace must not hide the credentials
+/// that do resolve. The caller reports the skips once it has shown what it
+/// found.
 async fn find_credentials(
     engine: &Arc<Engine>,
     rs: &Arc<crate::engine::request_state::RequestState>,
     matcher: Option<&str>,
+    discovery: crate::engine::Discovery,
 ) -> anyhow::Result<Vec<(Addr, CredentialDef)>> {
     let cwp = get_cwp()?;
     // Through the expression slot, not the positional one: the single-positional
@@ -429,18 +448,19 @@ async fn find_credentials(
         &cwp,
         true,
     )?;
-    credentials_matching(engine, rs, &m).await
+    credentials_matching(engine, rs, &m, discovery).await
 }
 
 async fn credentials_matching(
     engine: &Arc<Engine>,
     rs: &Arc<crate::engine::request_state::RequestState>,
     m: &Matcher,
+    discovery: crate::engine::Discovery,
 ) -> anyhow::Result<Vec<(Addr, CredentialDef)>> {
     use futures::TryStreamExt as _;
     // `query_spec`, not `query` + `get_spec`: a listed candidate may not resolve
     // standalone (go's per-platform variants), and that is not a broken target.
-    let stream = Arc::clone(engine).query_spec(rs.clone(), m);
+    let stream = Arc::clone(engine).query_spec(rs.clone(), m, discovery);
     tokio::pin!(stream);
     let mut out = Vec::new();
     while let Some(spec) = stream.try_next().await? {
@@ -572,11 +592,21 @@ mod tests {
         let engine = Arc::new(engine);
 
         let rs = engine.new_state();
-        let creds =
-            credentials_matching(&engine, &rs, &Matcher::PackagePrefix(PkgBuf::from(""))).await?;
+        let gaps = crate::engine::Gaps::new("//...");
+        let creds = credentials_matching(
+            &engine,
+            &rs,
+            &Matcher::PackagePrefix(PkgBuf::from("")),
+            crate::engine::Discovery::KeepGoing(Arc::clone(&gaps)),
+        )
+        .await?;
 
         let addrs: Vec<String> = creds.iter().map(|(a, _)| a.format()).collect();
         assert_eq!(addrs, vec!["//auth:token".to_string()]);
+        assert!(
+            gaps.is_empty(),
+            "a candidate that was never there is not an incomplete selection"
+        );
         Ok(())
     }
 

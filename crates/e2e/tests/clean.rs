@@ -73,7 +73,10 @@ async fn run_and_settle(ws: &Workspace, addr_str: &str) -> anyhow::Result<String
 /// `heph tool clean <selection>` over a fresh engine, as a separate invocation would.
 async fn clean(ws: &Workspace, m: &Matcher) -> anyhow::Result<heph::engine::CleanStats> {
     let engine = ws.reopen()?;
-    engine.clone().clean(engine.new_state(), m).await
+    engine
+        .clone()
+        .clean(engine.new_state(), m, heph::engine::Discovery::Complete)
+        .await
 }
 
 #[tokio::test]

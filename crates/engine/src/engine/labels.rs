@@ -1,4 +1,5 @@
 use crate::engine::Engine;
+use crate::engine::discovery::Discovery;
 use crate::engine::request_state::RequestState;
 use futures::TryStreamExt;
 use hmodel::htmatcher;
@@ -17,8 +18,9 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         m: &htmatcher::Matcher,
+        discovery: Discovery,
     ) -> anyhow::Result<BTreeSet<String>> {
-        let specs = self.query_spec(rs, m);
+        let specs = self.query_spec(rs, m, discovery);
         tokio::pin!(specs);
 
         let mut labels = BTreeSet::new();
@@ -77,7 +79,11 @@ mod tests {
 
         let rs = engine.new_state();
         let labels: Vec<String> = engine
-            .labels(rs, &Matcher::PackagePrefix(PkgBuf::from("foo")))
+            .labels(
+                rs,
+                &Matcher::PackagePrefix(PkgBuf::from("foo")),
+                Discovery::Complete,
+            )
             .await?
             .into_iter()
             .collect();
@@ -99,7 +105,11 @@ mod tests {
 
         let rs = engine.new_state();
         let labels: Vec<String> = engine
-            .labels(rs, &Matcher::Package(PkgBuf::from("foo")))
+            .labels(
+                rs,
+                &Matcher::Package(PkgBuf::from("foo")),
+                Discovery::Complete,
+            )
             .await?
             .into_iter()
             .collect();
@@ -114,7 +124,11 @@ mod tests {
 
         let rs = engine.new_state();
         let labels = engine
-            .labels(rs, &Matcher::Package(PkgBuf::from("foo")))
+            .labels(
+                rs,
+                &Matcher::Package(PkgBuf::from("foo")),
+                Discovery::Complete,
+            )
             .await?;
 
         assert!(labels.is_empty());

@@ -29,6 +29,8 @@ pub mod credential;
 pub mod credential_store;
 mod cwd;
 pub mod deferred;
+pub mod discovery;
+pub use discovery::{Discovery, Gaps};
 mod result;
 pub use credential::{Acquired, CredentialTeardown, ResolvedCredential, WalkStep};
 pub use credential_store::{CredentialStore, Material};

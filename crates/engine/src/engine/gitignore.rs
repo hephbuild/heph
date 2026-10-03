@@ -13,6 +13,7 @@ use enclose::enclose;
 use futures::TryStreamExt;
 
 use crate::engine::Engine;
+use crate::engine::discovery::Discovery;
 use crate::engine::driver::targetdef::path::{CodegenMode, Content};
 use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
@@ -104,7 +105,10 @@ impl Engine {
         // `codegen_copy_overlaps`). The sequential await-per-addr loop this
         // replaced serialized every `get_def`.
         let addrs: Vec<Addr> = {
-            let stream = Arc::clone(&self).query(rs.clone(), matcher);
+            // Always complete: the patterns are written to a file, and a short
+            // set would delete the entries of every target the walk skipped —
+            // and make `heph validate` report a correct file as out of date.
+            let stream = Arc::clone(&self).query(rs.clone(), matcher, Discovery::Complete);
             tokio::pin!(stream);
             let mut v = Vec::new();
             while let Some(addr) = stream.try_next().await? {
@@ -597,6 +601,33 @@ mod tests {
         {
             Box::pin(async { Ok(crate::engine::provider::ProbeResponse { states: vec![] }) })
         }
+    }
+
+    /// The patterns are written to a file, so the walk behind them is always
+    /// complete: one candidate that cannot be resolved fails the call instead
+    /// of producing a file missing that candidate's entries.
+    #[tokio::test]
+    async fn gitignore_patterns_refuse_a_partial_selection() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(|_| {
+            Box::new(crate::engine::discovery::test_support::Unresolvable {
+                addrs: vec![parse_addr("//gen:bad").expect("addr")],
+            })
+        })?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+        let res = Arc::clone(&engine)
+            .codegen_copy_gitignore_patterns(rs, &Matcher::TreeOutputTo(PkgBuf::from("")))
+            .await;
+        let err = res.expect_err("a partial set must not reach the file");
+        assert!(format!("{err:#}").contains("go list"), "{err:#}");
+        Ok(())
     }
 
     // Several targets are enumerated concurrently, so completion order is

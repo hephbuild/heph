@@ -156,6 +156,181 @@ fn render_failures_to_string(failures: &[Arc<TargetFailure>], color: bool) -> St
     out
 }
 
+/// Render the "incomplete selection" block: what the selector walk skipped,
+/// grouped by stage and provider, and what to do about it. Pure, like
+/// [`render_failures_to_string`]. `after_failures` points the reader at the
+/// failure boxes printed above it, which is only true when there are some.
+/// ```text
+/// ! selection incomplete: 412 skipped while matching `label(nix) && //...`
+///   412 targets could not be loaded (provider go)
+///       //svc/api:build   go list: exit status 1
+///       ... 411 more
+///   Targets that matched were still processed; the skipped ones were not, and
+///   may also have matched. Fix the cause and re-run, or pass --fail-fast to
+///   stop at the first one with its full error.
+/// ```
+///
+/// The stage is said in words (`could not be loaded`), not by its key
+/// (`spec`): the key is the machine contract and travels on the
+/// `SelectionIncomplete` event.
+fn render_incomplete(
+    report: &crate::engine::discovery::GapReport,
+    after_failures: bool,
+    color: bool,
+) -> String {
+    let bang = if color {
+        format!("{}", "!".yellow())
+    } else {
+        "!".to_string()
+    };
+    let mut out = format!(
+        "{bang} selection incomplete: {} skipped while matching `{}`\n",
+        report.skipped, report.selector
+    );
+    for group in &report.groups {
+        let provider = if group.provider.is_empty() {
+            String::new()
+        } else {
+            format!(" (provider {})", group.provider)
+        };
+        out.push_str(&format!(
+            "  {} {} {}{provider}\n",
+            group.count,
+            group.stage.noun(group.count),
+            group.stage.phrase(),
+        ));
+        let width = group
+            .examples
+            .iter()
+            .map(|e| e.scope.chars().count())
+            .max()
+            .unwrap_or(0);
+        for example in &group.examples {
+            let scope = if color {
+                format!("{:<width$}", example.scope).dim().to_string()
+            } else {
+                format!("{:<width$}", example.scope)
+            };
+            out.push_str(&format!("      {scope}   {}\n", example.cause));
+        }
+        let more = group.count.saturating_sub(group.examples.len());
+        if more > 0 {
+            out.push_str(&format!("      ... {more} more\n"));
+        }
+    }
+    if after_failures {
+        out.push_str("  Target failures above may be the cause.\n");
+    }
+    out.push_str(
+        "  Targets that matched were still processed; the skipped ones were not, and may also \
+         have matched.\n  Fix the cause and re-run, or pass --fail-fast to stop at the first one \
+         with its full error.\n",
+    );
+    out
+}
+
+/// What a keep-going walk skipped, read once at the end of a command. `None`
+/// when nothing was skipped, or when the command was cancelled: a Ctrl-C cuts
+/// the selection short on purpose, and exits as cancelled rather than as
+/// incomplete. [`finalize!`] announces it on the event stream.
+pub fn incomplete_selection(
+    gaps: &crate::engine::Gaps,
+    cancelled: bool,
+) -> Option<crate::engine::discovery::GapReport> {
+    (!gaps.is_empty() && !cancelled).then(|| gaps.report())
+}
+
+/// A command whose selector walk skipped part of the workspace. It acted on
+/// everything that resolved, and exits non-zero with the "incomplete
+/// selection" block — the same rule [`require_non_empty`] applies to an empty
+/// selection: a CI job that skipped part of what it was asked to cover must not
+/// go green.
+///
+/// Built like [`FailedTargets`]: interactive mode defers the render to
+/// [`render_anyhow`], after the viewport is torn down; otherwise it prints at
+/// the failure site.
+#[derive(Debug)]
+pub struct IncompleteSelection {
+    report: crate::engine::discovery::GapReport,
+    /// A genuine error the command also hit, rendered above the block.
+    cause: Option<anyhow::Error>,
+    rendered: bool,
+}
+
+impl IncompleteSelection {
+    pub fn new(
+        report: crate::engine::discovery::GapReport,
+        cause: Option<anyhow::Error>,
+        interactive: bool,
+    ) -> Self {
+        let mut this = Self {
+            report,
+            cause,
+            rendered: false,
+        };
+        if !interactive {
+            use std::io::Write as _;
+            // A failed write to the terminal is not actionable; the exit code
+            // still carries the outcome out.
+            drop(write!(
+                io::stderr(),
+                "{}",
+                this.render_to_string(color_enabled())
+            ));
+            this.rendered = true;
+        }
+        this
+    }
+
+    fn render_to_string(&self, color: bool) -> String {
+        let mut out = self
+            .cause
+            .as_ref()
+            .and_then(|c| render_anyhow_to_string(c, color))
+            .unwrap_or_default();
+        out.push_str(&render_incomplete(&self.report, false, color));
+        out
+    }
+
+    pub fn into_error(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+}
+
+impl std::fmt::Display for IncompleteSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "selection incomplete: {} skipped while matching `{}`",
+            self.report.skipped, self.report.selector
+        )
+    }
+}
+
+impl std::error::Error for IncompleteSelection {
+    /// The genuine error the command also hit, so `chain()` walks into it.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause
+            .as_ref()
+            .map(|c| c.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// For a command that does not end in [`finalize!`]: `Err` with the
+/// "incomplete selection" block when the walk skipped anything, rendered by
+/// [`render_anyhow`] on the way out.
+pub fn require_complete_selection(gaps: &crate::engine::Gaps) -> anyhow::Result<()> {
+    if gaps.is_empty() {
+        return Ok(());
+    }
+    Err(IncompleteSelection {
+        report: gaps.report(),
+        cause: None,
+        rendered: false,
+    }
+    .into_error())
+}
+
 /// True when the error chain carries a Ctrl-C cancellation. A cancellation is
 /// never recorded as a [`TargetFailure`]; it aborts the build but is not a target
 /// fault, so commands surface it separately from the failure registry.
@@ -245,16 +420,41 @@ pub fn require_non_empty(
     Ok(results)
 }
 
+/// [`require_non_empty`], unless the selector walk skipped something. Then an
+/// empty match is answered by what was skipped — the "incomplete selection"
+/// block `finalize!` prints — not by "check your selector", which would send
+/// the user after a typo that is not there.
+pub fn require_non_empty_unless_incomplete(
+    results: Vec<Arc<crate::engine::EResult>>,
+    gaps: &crate::engine::Gaps,
+) -> anyhow::Result<Vec<Arc<crate::engine::EResult>>> {
+    if gaps.is_empty() {
+        require_non_empty(results)
+    } else {
+        Ok(results)
+    }
+}
+
+/// Paved-road command finalizer; the outcomes are described above
+/// [`fold_batch`]. One more applies to a command whose walk ran
+/// [`Discovery::KeepGoing`](crate::engine::Discovery) and passes its sink as
+/// `gaps = &sink`: anything skipped — and the command not cancelled — emits one
+/// `SelectionIncomplete` event, renders the "incomplete selection" block after
+/// any failure boxes (and after a genuine error), and exits non-zero even when
+/// the success body ran.
 macro_rules! finalize {
-    ($ctx:expr, $rs:expr, $res:expr $(,)?) => {
-        $crate::commands::errors::finalize!($ctx, $rs, $res, _ => { Ok(()) })
-    };
-    ($ctx:expr, $rs:expr, $res:expr, $val:pat => $body:block) => {{
+    (@inner $ctx:expr, $rs:expr, $res:expr, $gaps:expr, $announce:expr, $val:pat => $body:block) => {{
         let res = $res;
         let cancelled = res
             .as_ref()
             .err()
             .is_some_and($crate::commands::errors::is_cancelled);
+        let gaps: ::std::option::Option<&::std::sync::Arc<$crate::engine::Gaps>> = $gaps;
+        let incomplete =
+            gaps.and_then(|g| $crate::commands::errors::incomplete_selection(g, cancelled));
+        if let Some(report) = &incomplete {
+            ($announce)(report);
+        }
         let failures = $rs.take_failures();
         if !failures.is_empty() {
             // `res` is a collateral marker here — dropped either way.
@@ -264,7 +464,9 @@ macro_rules! finalize {
                 // boxes off screen. Carry the failures out; `render_anyhow` in
                 // `main` prints them once the viewport is fully torn down.
                 ::anyhow::Result::<()>::Err(
-                    $crate::commands::errors::FailedTargets::deferred(failures).into_error(),
+                    $crate::commands::errors::FailedTargets::deferred(failures)
+                        .with_incomplete(incomplete)
+                        .into_error(),
                 )
             } else {
                 // No viewport, so nothing ever repaints stderr and there is no
@@ -276,8 +478,10 @@ macro_rules! finalize {
                 // (Interactive has no such choice — teardown must come first, so it
                 // necessarily prints verdict-then-errors.)
                 ::anyhow::Result::<()>::Err(
-                    $crate::commands::errors::FailedTargets::reported_to_stderr(failures)
-                        .into_error(),
+                    $crate::commands::errors::FailedTargets::reported_to_stderr(
+                        failures, incomplete,
+                    )
+                    .into_error(),
                 )
             }
         } else {
@@ -290,10 +494,45 @@ macro_rules! finalize {
                     Err(_) => Ok(()),
                 }
             });
-            printed?;
-            $crate::commands::errors::finish_exit(cancelled)
+            match incomplete {
+                None => {
+                    printed?;
+                    $crate::commands::errors::finish_exit(cancelled)
+                }
+                // What matched was processed; the run still fails for what was not.
+                Some(report) => ::anyhow::Result::<()>::Err(
+                    $crate::commands::errors::IncompleteSelection::new(
+                        report,
+                        printed.err(),
+                        $ctx.interactive(),
+                    )
+                    .into_error(),
+                ),
+            }
         }
     }};
+    ($ctx:expr, $rs:expr, $res:expr, gaps = $gaps:expr $(,)?) => {
+        $crate::commands::errors::finalize!($ctx, $rs, $res, gaps = $gaps, _ => { Ok(()) })
+    };
+    ($ctx:expr, $rs:expr, $res:expr, gaps = $gaps:expr, $val:pat => $body:block) => {
+        $crate::commands::errors::finalize!(
+            @inner $ctx, $rs, $res, Some($gaps),
+            // Once per command, so a hook learns the run was incomplete even
+            // when it never sees the terminal.
+            |report: &$crate::engine::discovery::GapReport| $rs.emit(report.to_event()),
+            $val => $body
+        )
+    };
+    ($ctx:expr, $rs:expr, $res:expr $(,)?) => {
+        $crate::commands::errors::finalize!($ctx, $rs, $res, _ => { Ok(()) })
+    };
+    ($ctx:expr, $rs:expr, $res:expr, $val:pat => $body:block) => {
+        $crate::commands::errors::finalize!(
+            @inner $ctx, $rs, $res, None,
+            |_: &$crate::engine::discovery::GapReport| {},
+            $val => $body
+        )
+    };
 }
 pub(crate) use finalize;
 
@@ -326,6 +565,10 @@ pub(crate) fn finish_exit(cancelled: bool) -> anyhow::Result<()> {
 #[derive(Debug)]
 pub struct FailedTargets {
     failures: Vec<Arc<TargetFailure>>,
+    /// What the selector walk skipped, rendered after the boxes. A failed target
+    /// is often why a candidate could not be resolved, so the block points back
+    /// at them.
+    incomplete: Option<crate::engine::discovery::GapReport>,
     /// Already printed at the failure site; `render_anyhow` must not print twice.
     rendered: bool,
 }
@@ -335,8 +578,29 @@ impl FailedTargets {
     pub fn deferred(failures: Vec<Arc<TargetFailure>>) -> Self {
         Self {
             failures,
+            incomplete: None,
             rendered: false,
         }
+    }
+
+    /// Attach the walk's skips to a [`deferred`](Self::deferred) set.
+    pub fn with_incomplete(
+        mut self,
+        incomplete: Option<crate::engine::discovery::GapReport>,
+    ) -> Self {
+        self.incomplete = incomplete;
+        self
+    }
+
+    /// Everything this error prints: the boxes, then any incomplete-selection
+    /// block.
+    fn render_to_string(&self, color: bool) -> String {
+        let mut out = render_failures_to_string(&self.failures, color);
+        if let Some(report) = &self.incomplete {
+            out.push('\n');
+            out.push_str(&render_incomplete(report, true, color));
+        }
+        out
     }
 
     /// Print the failures to `out` and record that it happened, so
@@ -348,25 +612,27 @@ impl FailedTargets {
     /// bug this module exists to prevent, and one no test of the marker can see.
     pub fn reported(
         failures: Vec<Arc<TargetFailure>>,
+        incomplete: Option<crate::engine::discovery::GapReport>,
         out: &mut dyn io::Write,
         color: bool,
     ) -> Self {
+        let this = Self {
+            failures,
+            incomplete,
+            rendered: true,
+        };
         // A failed write to the terminal is not actionable, and the exit code still
         // has to carry the failure out.
-        drop(write!(
-            out,
-            "{}",
-            render_failures_to_string(&failures, color)
-        ));
-        Self {
-            failures,
-            rendered: true,
-        }
+        drop(write!(out, "{}", this.render_to_string(color)));
+        this
     }
 
     /// [`FailedTargets::reported`] against the real stderr — what `finalize!` uses.
-    pub fn reported_to_stderr(failures: Vec<Arc<TargetFailure>>) -> Self {
-        Self::reported(failures, &mut io::stderr(), color_enabled())
+    pub fn reported_to_stderr(
+        failures: Vec<Arc<TargetFailure>>,
+        incomplete: Option<crate::engine::discovery::GapReport>,
+    ) -> Self {
+        Self::reported(failures, incomplete, &mut io::stderr(), color_enabled())
     }
 
     pub fn failures(&self) -> &[Arc<TargetFailure>] {
@@ -435,7 +701,13 @@ fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
         if ft.rendered {
             return Some(String::new());
         }
-        return Some(render_failures_to_string(ft.failures(), color));
+        return Some(ft.render_to_string(color));
+    }
+    if let Some(inc) = downcast_chain_ref::<IncompleteSelection>(e) {
+        if inc.rendered {
+            return Some(String::new());
+        }
+        return Some(inc.render_to_string(color));
     }
     if let Some(tf) = downcast_chain_ref::<TargetFailure>(e) {
         return Some(render_target_failure(tf, color));
@@ -540,7 +812,7 @@ mod tests {
         // for the exit code, and `render_anyhow` must claim it — but print nothing,
         // or every failing CI run shows its diagnostics twice.
         let mut sink: Vec<u8> = Vec::new();
-        let e = FailedTargets::reported(two_failures(), &mut sink, false).into_error();
+        let e = FailedTargets::reported(two_failures(), None, &mut sink, false).into_error();
         // The constructor is what printed them — the only way to make the `rendered`
         // promise — so the flag cannot drift from what is actually on the terminal.
         assert_eq!(
@@ -696,15 +968,183 @@ mod tests {
         assert!(format!("{err:#}").contains("//pkg:b"));
     }
 
-    struct FakeRs(std::cell::RefCell<Vec<Arc<TargetFailure>>>);
+    struct FakeRs(
+        std::cell::RefCell<Vec<Arc<TargetFailure>>>,
+        std::cell::RefCell<Vec<crate::engine::event::BuildEventKind>>,
+    );
 
     impl FakeRs {
         fn new(failures: Vec<Arc<TargetFailure>>) -> Self {
-            Self(std::cell::RefCell::new(failures))
+            Self(
+                std::cell::RefCell::new(failures),
+                std::cell::RefCell::new(Vec::new()),
+            )
         }
         fn take_failures(&self) -> Vec<Arc<TargetFailure>> {
             std::mem::take(&mut *self.0.borrow_mut())
         }
+        fn emit(&self, kind: crate::engine::event::BuildEventKind) {
+            self.1.borrow_mut().push(kind);
+        }
+    }
+
+    /// A sink holding what one walk skipped: 7 go specs and one probe.
+    fn some_gaps() -> Arc<crate::engine::Gaps> {
+        use crate::engine::discovery::Stage;
+        let gaps = crate::engine::Gaps::new("label(nix) && //...");
+        for i in 0..7 {
+            gaps.record(
+                Stage::Spec,
+                "go",
+                format!("//svc/api:t{i}"),
+                &anyhow::anyhow!("go list: exit status 1"),
+            );
+        }
+        gaps.record(
+            Stage::Probe,
+            "",
+            "//broken".to_string(),
+            &anyhow::anyhow!("BUILD: syntax error"),
+        );
+        gaps
+    }
+
+    #[test]
+    fn incomplete_selection_groups_by_stage_and_provider_and_caps_examples() {
+        let report = some_gaps().report();
+        assert_eq!(
+            render_incomplete(&report, false, false),
+            "! selection incomplete: 8 skipped while matching `label(nix) && //...`\n\
+             \x20 1 package could not be read\n\
+             \x20     //broken   BUILD: syntax error\n\
+             \x20 7 targets could not be loaded (provider go)\n\
+             \x20     //svc/api:t0   go list: exit status 1\n\
+             \x20     //svc/api:t1   go list: exit status 1\n\
+             \x20     //svc/api:t2   go list: exit status 1\n\
+             \x20     //svc/api:t3   go list: exit status 1\n\
+             \x20     //svc/api:t4   go list: exit status 1\n\
+             \x20     ... 2 more\n\
+             \x20 Targets that matched were still processed; the skipped ones were not, and may \
+             also have matched.\n\
+             \x20 Fix the cause and re-run, or pass --fail-fast to stop at the first one with its \
+             full error.\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_selection_fails_the_command_when_every_target_passed() -> anyhow::Result<()>
+    {
+        for interactive in [true, false] {
+            let ctx = FakeCtx::new(interactive);
+            let rs = FakeRs::new(vec![]);
+            let gaps = some_gaps();
+            let res: anyhow::Result<u8> = Ok(1);
+            let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+            let inc = downcast_chain_ref::<IncompleteSelection>(&e).expect("incomplete");
+            assert_eq!(inc.rendered, !interactive);
+            assert_eq!(inc.report.skipped, 8);
+            assert_eq!(
+                rs.1.borrow().len(),
+                1,
+                "one SelectionIncomplete event per command"
+            );
+            if interactive {
+                let out = render_anyhow_to_string(&e, false).expect("claimed");
+                assert!(out.starts_with("! selection incomplete"), "{out}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_match_with_skips_reports_the_skips() {
+        let empty = crate::engine::Gaps::new("//...");
+        let Err(err) = require_non_empty_unless_incomplete(vec![], &empty) else {
+            panic!("an empty run with nothing skipped must fail");
+        };
+        assert!(err.to_string().contains("no targets matched"), "{err}");
+        assert!(
+            require_non_empty_unless_incomplete(vec![], &some_gaps()).is_ok(),
+            "the skips are the answer; `finalize!` reports them"
+        );
+    }
+
+    #[tokio::test]
+    async fn points_at_failures_only_when_one_is_registered() -> anyhow::Result<()> {
+        let ctx = FakeCtx::new(true);
+        let rs = FakeRs::new(two_failures());
+        let gaps = some_gaps();
+        let res: anyhow::Result<u8> = Ok(1);
+        let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+        let out = render_anyhow_to_string(&e, false).expect("claimed");
+        let boxes = out.find("× target failed").expect("boxes first");
+        let block = out.find("! selection incomplete").expect("then the block");
+        assert!(boxes < block, "{out}");
+        assert!(
+            out.contains("Target failures above may be the cause."),
+            "{out}"
+        );
+
+        let ctx = FakeCtx::new(true);
+        let rs = FakeRs::new(vec![]);
+        let res: anyhow::Result<u8> = Ok(1);
+        let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+        let out = render_anyhow_to_string(&e, false).expect("claimed");
+        assert!(!out.contains("Target failures above"), "{out}");
+        Ok(())
+    }
+
+    /// A genuine error alongside skips: the error renders first, then the
+    /// block, and neither hides the other.
+    #[tokio::test]
+    async fn a_genuine_error_with_skips_renders_both() -> anyhow::Result<()> {
+        let ctx = FakeCtx::new(true);
+        let rs = FakeRs::new(vec![]);
+        let gaps = some_gaps();
+        let res: anyhow::Result<u8> = Err(anyhow::anyhow!("boom"));
+        let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+        let out = render_anyhow_to_string(&e, false).expect("claimed");
+        let boom = out.find("boom").expect("the error");
+        let block = out.find("! selection incomplete").expect("the block");
+        assert!(boom < block, "{out}");
+        Ok(())
+    }
+
+    /// Non-interactive, the boxes and the block print together at the failure
+    /// site, boxes first, with the pointer back at them.
+    #[test]
+    fn reported_failures_print_the_block_after_the_boxes() {
+        let mut sink: Vec<u8> = Vec::new();
+        let ft =
+            FailedTargets::reported(two_failures(), Some(some_gaps().report()), &mut sink, false);
+        let out = String::from_utf8(sink).expect("utf8");
+        let boxes = out.find("× target failed").expect("boxes");
+        let block = out.find("! selection incomplete").expect("block");
+        assert!(boxes < block, "{out}");
+        assert!(
+            out.contains("Target failures above may be the cause."),
+            "{out}"
+        );
+        let e = ft.into_error();
+        assert_eq!(
+            render_anyhow_to_string(&e, false).as_deref(),
+            Some(""),
+            "already printed; render_anyhow must stay quiet"
+        );
+    }
+
+    /// Ctrl-C cuts a selection short on purpose: the command exits as
+    /// cancelled, not as incomplete, and says nothing about the skips.
+    #[tokio::test]
+    async fn a_cancelled_command_with_skips_exits_as_cancelled() -> anyhow::Result<()> {
+        let ctx = FakeCtx::new(false);
+        let rs = FakeRs::new(vec![]);
+        let gaps = some_gaps();
+        let res: anyhow::Result<u8> = Err(anyhow::Error::new(CancelledError));
+        let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+        assert_eq!(e.to_string(), "cancelled");
+        assert!(rs.1.borrow().is_empty());
+        Ok(())
     }
 
     #[tokio::test]

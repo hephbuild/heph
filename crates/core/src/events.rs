@@ -105,6 +105,20 @@ pub enum BuildEventKind {
         addrs: Vec<String>,
         complete: bool,
     },
+    /// The selector walk could not resolve part of the workspace and carried on
+    /// without it, so the matched set may be missing targets. Emitted once, at
+    /// the end of a command whose walk skipped something.
+    ///
+    /// Every field defaults, so a frame from a host that trims this down still
+    /// decodes; a consumer older than the variant decodes it as `Unknown`.
+    SelectionIncomplete {
+        /// Exact number of distinct things skipped: targets, packages and
+        /// provider listings, across every group.
+        #[serde(default)]
+        skipped: usize,
+        #[serde(default)]
+        groups: Vec<SelectionGap>,
+    },
     ResultStart {
         addr: String,
     },
@@ -313,6 +327,33 @@ pub enum BuildEventKind {
     Unknown,
 }
 
+/// One group of [`BuildEventKind::SelectionIncomplete`]: what one stage of the
+/// walk could not resolve for one provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectionGap {
+    /// `packages`, `probe`, `list`, `spec` or `def`.
+    #[serde(default)]
+    pub stage: String,
+    /// Empty when the failure did not say which provider it came from.
+    #[serde(default)]
+    pub provider: String,
+    /// Exact number of distinct things skipped in this group.
+    #[serde(default)]
+    pub count: usize,
+    /// Up to five of them, the smallest by name, each with one line of cause.
+    #[serde(default)]
+    pub examples: Vec<SelectionGapExample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectionGapExample {
+    /// The addr, package (`//pkg`) or provider listing that was skipped.
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub cause: String,
+}
+
 /// A bounded slice of a target's process log, carried on the event stream.
 ///
 /// A mirror of `hplugin::error::LogTail` rather than that type itself: it has no
@@ -486,5 +527,65 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// `SelectionIncomplete` survives the wire, and a consumer built before it
+    /// existed skips it as `Unknown` instead of ending its stream.
+    #[test]
+    fn selection_incomplete_round_trips_and_old_decoders_see_unknown() {
+        let groups = vec![SelectionGap {
+            stage: "spec".into(),
+            provider: "go".into(),
+            count: 412,
+            examples: vec![SelectionGapExample {
+                scope: "//svc/api:build".into(),
+                cause: "go list: exit status 1".into(),
+            }],
+        }];
+        let ev = BuildEvent {
+            at_unix_ms: 9,
+            kind: BuildEventKind::SelectionIncomplete {
+                skipped: 412,
+                groups: groups.clone(),
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        match back.kind {
+            BuildEventKind::SelectionIncomplete {
+                skipped,
+                groups: got,
+            } => {
+                assert_eq!(skipped, 412);
+                assert_eq!(got, groups);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // The shape of this enum before the variant existed: tagged the same
+        // way, with the same catch-all.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type")]
+        enum OlderKind {
+            #[expect(dead_code, reason = "only the variant tag is under test")]
+            Matched { addrs: Vec<String>, complete: bool },
+            #[serde(other)]
+            Unknown,
+        }
+        #[derive(Debug, Deserialize)]
+        struct OlderEvent {
+            kind: OlderKind,
+        }
+        let old: OlderEvent =
+            serde_json::from_str(&json).expect("an older consumer must decode it");
+        assert!(matches!(old.kind, OlderKind::Unknown), "{old:?}");
+
+        // And a trimmed frame decodes with every field defaulted.
+        let bare = r#"{"at_unix_ms":1,"kind":{"type":"SelectionIncomplete"}}"#;
+        let ev: BuildEvent = serde_json::from_str(bare).expect("must decode");
+        assert!(matches!(
+            ev.kind,
+            BuildEventKind::SelectionIncomplete { skipped: 0, ref groups } if groups.is_empty()
+        ));
     }
 }

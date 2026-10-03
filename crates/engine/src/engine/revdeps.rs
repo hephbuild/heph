@@ -7,6 +7,7 @@ use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
 
 use crate::engine::Engine;
+use crate::engine::discovery::{Discovery, Gaps, Stage, is_cancellation, provider_of};
 use crate::engine::error::CycleError;
 use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
@@ -27,6 +28,7 @@ impl Engine {
         rs: Arc<RequestState>,
         target: Addr,
         scope: &'a Matcher,
+        discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         // Cap in-flight def resolutions; the engine's own semaphores gate the
         // real work, this just bounds the orchestration set held off the stream.
@@ -34,13 +36,17 @@ impl Engine {
             .map(|n| n.get())
             .unwrap_or(1)
             .saturating_mul(2);
+        // The walk itself rarely resolves anything for a package scope; the
+        // candidate's def is resolved here, so this is where most of a revdeps
+        // run's skips happen.
+        let gaps = discovery.gaps().cloned();
 
         Arc::clone(&self)
-            .query(rs.clone(), scope)
+            .query(rs.clone(), scope, discovery)
             .map_err(|e| e.context("listing candidate targets"))
             .map_ok(move |candidate| {
-                enclose!((self => engine, rs, target) async move {
-                    resolve_dependent(&engine, &rs, candidate, &target).await
+                enclose!((self => engine, rs, target, gaps) async move {
+                    resolve_dependent(&engine, &rs, candidate, &target, gaps.as_deref()).await
                 })
             })
             .try_buffer_unordered(concurrency)
@@ -51,12 +57,14 @@ impl Engine {
 
 /// Resolve one candidate: is `target` among its direct inputs? Returns the
 /// candidate's addr when it is, `None` when it isn't or when the candidate can't
-/// be resolved standalone.
+/// be resolved standalone — or, with `gaps`, when it could not be resolved at
+/// all, which is then recorded rather than failing the whole run.
 async fn resolve_dependent(
     engine: &Arc<Engine>,
     rs: &Arc<RequestState>,
     candidate: Addr,
     target: &Addr,
+    gaps: Option<&Gaps>,
 ) -> anyhow::Result<Option<Addr>> {
     let res = Arc::clone(engine)
         .get_direct_def(rs.clone(), &candidate)
@@ -68,8 +76,14 @@ async fn resolve_dependent(
         Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => return Ok(None),
         res => res,
     };
-    let Some(def) = skip_unresolvable(&candidate, res)? else {
-        return Ok(None);
+    let def = match (skip_unresolvable(&candidate, res), gaps) {
+        (Ok(Some(def)), _) => def,
+        (Ok(None), _) => return Ok(None),
+        (Err(e), Some(gaps)) if !is_cancellation(rs, &e) => {
+            gaps.record(Stage::Def, provider_of(&e), candidate.format(), &e);
+            return Ok(None);
+        }
+        (Err(e), _) => return Err(e),
     };
     let uses = def
         .target_def
@@ -135,7 +149,10 @@ mod tests {
         target: Addr,
         scope: Matcher,
     ) -> anyhow::Result<Vec<String>> {
-        let dependents: Vec<Addr> = engine.revdeps(rs, target, &scope).try_collect().await?;
+        let dependents: Vec<Addr> = engine
+            .revdeps(rs, target, &scope, Discovery::Complete)
+            .try_collect()
+            .await?;
         let mut dependents: Vec<String> = dependents.iter().map(|a| a.format()).collect();
         dependents.sort();
         Ok(dependents)
@@ -183,6 +200,49 @@ mod tests {
 
         let users = collect_sorted(Arc::clone(&engine), rs, core, all()).await?;
         assert!(users.is_empty());
+        Ok(())
+    }
+
+    /// A package scope decides every candidate from its address, so revdeps
+    /// meets an unresolvable candidate when it resolves the def, not in the
+    /// walk. Kept going, that candidate is recorded and the real dependents
+    /// are still found.
+    #[tokio::test]
+    async fn keep_going_records_a_candidate_whose_def_fails() -> anyhow::Result<()> {
+        let (mut engine, _root) = make_engine(vec![
+            target("//lib:core", &[]),
+            target("//app:a", &["//lib:core"]),
+        ])?;
+        Arc::get_mut(&mut engine)
+            .expect("unshared")
+            .register_provider(|_| {
+                Box::new(crate::engine::discovery::test_support::Unresolvable {
+                    addrs: vec![parse_addr("//go/broken:x").expect("addr")],
+                })
+            })?;
+        let core = parse_addr("//lib:core")?;
+        let scope = all();
+
+        let gaps = Gaps::new("//...");
+        let users: Vec<Addr> = Arc::clone(&engine)
+            .revdeps(
+                engine.new_state(),
+                core.clone(),
+                &scope,
+                Discovery::KeepGoing(gaps.clone()),
+            )
+            .try_collect()
+            .await?;
+        assert_eq!(users, [parse_addr("//app:a")?]);
+        let report = gaps.report();
+        assert_eq!(report.skipped, 1, "{report:?}");
+        assert_eq!(report.groups[0].examples[0].scope, "//go/broken:x");
+
+        let complete: anyhow::Result<Vec<Addr>> = Arc::clone(&engine)
+            .revdeps(engine.new_state(), core, &scope, Discovery::Complete)
+            .try_collect()
+            .await;
+        assert!(complete.is_err(), "a complete run still fails on it");
         Ok(())
     }
 }
