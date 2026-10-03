@@ -726,7 +726,9 @@ impl RemoteCacheBackend for ObjStoreBackend {
                 Ok(Some(Box::pin(reader)))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("open remote object {path}")),
+            Err(e) => {
+                Err(classify_store_error(e)).with_context(|| format!("open remote object {path}"))
+            }
         }
     }
 
@@ -761,7 +763,9 @@ impl RemoteCacheBackend for ObjStoreBackend {
         match self.store.head(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(e).with_context(|| format!("head remote object {path}")),
+            Err(e) => {
+                Err(classify_store_error(e)).with_context(|| format!("head remote object {path}"))
+            }
         }
     }
 
@@ -772,6 +776,7 @@ impl RemoteCacheBackend for ObjStoreBackend {
         while let Some(meta) = objects
             .try_next()
             .await
+            .map_err(classify_store_error)
             .with_context(|| format!("list remote objects under {path}"))?
         {
             // Keys never nest below a revision, so the filename is the artifact
@@ -932,6 +937,53 @@ fn credential_error_is_transient(e: &object_store::Error) -> bool {
         }
         if let Some(gcp) = err.downcast_ref::<google_cloud_auth::errors::CredentialsError>() {
             return gcp.is_transient();
+        }
+        link = err.source();
+    }
+    false
+}
+
+/// S3 error codes meaning the request's credentials are no good, which S3
+/// answers with a **400** rather than 401/403 — so object_store reports them
+/// as an opaque `Generic` error instead of `Unauthenticated`. The commonest is
+/// an expired `AWS_SESSION_TOKEN` (e.g. one exported from an SSO login).
+const S3_AUTH_ERROR_CODES: &[&str] = &["ExpiredToken", "InvalidToken", "TokenRefreshRequired"];
+
+/// Mark a store error that is an S3 credential rejection in disguise (see
+/// [`S3_AUTH_ERROR_CODES`]) as an [`AuthError`]; pass everything else through.
+///
+/// The status is crate-private in object_store, so the code is read from the
+/// response body it folds into the message. A `HEAD` response has no body and
+/// cannot be classified this way; a cache's first `GET` (a manifest read)
+/// still is, and disables it for every op.
+fn classify_store_error(e: object_store::Error) -> object_store::Error {
+    match e {
+        object_store::Error::Generic { store, source }
+            if store == "S3" && has_s3_auth_code(&*source) =>
+        {
+            object_store::Error::Generic {
+                store,
+                source: Box::new(AuthError(source)),
+            }
+        }
+        e => e,
+    }
+}
+
+/// Whether any link of `e`'s chain carries an S3 error body whose `<Code>` is
+/// one of [`S3_AUTH_ERROR_CODES`] — compared whole, so `ExpiredTokenFoo` or the
+/// code merely appearing elsewhere in the message (an object key) does not
+/// match.
+fn has_s3_auth_code(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut link = Some(e);
+    while let Some(err) = link {
+        let msg = err.to_string();
+        let code = msg
+            .split_once("<Code>")
+            .and_then(|(_, rest)| rest.split_once("</Code>"))
+            .map(|(code, _)| code);
+        if code.is_some_and(|code| S3_AUTH_ERROR_CODES.contains(&code)) {
+            return true;
         }
         link = err.source();
     }
@@ -1185,23 +1237,178 @@ mod tests {
         );
     }
 
-    /// Credential provider that always fails with `err`.
+    /// Credential provider that always fails with `err`, for any store's
+    /// credential type.
     #[derive(Debug)]
-    struct FailingCredentials(fn() -> object_store::Error);
+    struct FailingCredentials<T>(fn() -> object_store::Error, std::marker::PhantomData<T>);
 
     #[async_trait]
-    impl CredentialProvider for FailingCredentials {
-        type Credential = GcpCredential;
-        async fn get_credential(&self) -> object_store::Result<Arc<GcpCredential>> {
+    impl<T: std::fmt::Debug + Send + Sync + 'static> CredentialProvider for FailingCredentials<T> {
+        type Credential = T;
+        async fn get_credential(&self) -> object_store::Result<Arc<T>> {
             Err((self.0)())
         }
+    }
+
+    fn failing_credentials<T: std::fmt::Debug + Send + Sync + 'static>(
+        err: fn() -> object_store::Error,
+    ) -> Arc<dyn CredentialProvider<Credential = T>> {
+        Arc::new(FailingCredentials(err, std::marker::PhantomData))
+    }
+
+    /// An HTTP server on loopback that answers every request with `status` and
+    /// `body`, standing in for S3. Returns its base URL.
+    async fn canned_http_server(status: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Read up to the end of the request head; no request here
+                    // carries a body.
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(buf.get(..n).unwrap_or_default()),
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _closed = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An S3 backend pointed at `endpoint` with static credentials, behind
+    /// [`AuthClassifying`] as `from_uri` builds it.
+    fn s3_backend(
+        endpoint: &str,
+        creds: Option<Arc<dyn CredentialProvider<Credential = object_store::aws::AwsCredential>>>,
+    ) -> ObjStoreBackend {
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("us-east-1")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_access_key_id("AKID")
+            .with_secret_access_key("secret")
+            .with_retry(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            });
+        if let Some(creds) = creds {
+            builder = builder.with_credentials(auth_classifying(&creds));
+        }
+        ObjStoreBackend {
+            store: Arc::new(builder.build().expect("build S3 store")),
+            prefix: ObjPath::from("repo"),
+        }
+    }
+
+    /// An S3 error body with the given `<Code>`, as S3 sends it.
+    macro_rules! s3_error_body {
+        ($code:literal) => {
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>",
+                $code,
+                "</Code><Message>The provided token has expired.</Message></Error>"
+            )
+        };
+    }
+
+    /// An expired `AWS_SESSION_TOKEN` is a **400** `ExpiredToken`, not a 401/403,
+    /// so it reaches us as an opaque store error. It must still be an auth
+    /// failure, through every op that has a response body to read.
+    #[tokio::test]
+    async fn an_expired_s3_session_token_is_an_auth_failure() {
+        let endpoint = canned_http_server("400 Bad Request", s3_error_body!("ExpiredToken")).await;
+        let backend = s3_backend(&endpoint, None);
+        let e = backend.open_read("k").await.err().expect("400");
+        assert!(
+            crate::engine::remote_cache::is_auth_failure(&e),
+            "open_read: {e:#}"
+        );
+        let e = backend.list_names("k").await.expect_err("400");
+        assert!(
+            crate::engine::remote_cache::is_auth_failure(&e),
+            "list: {e:#}"
+        );
+    }
+
+    /// Any other 400 from S3 is not a credential problem and stays on the
+    /// breaker's backoff.
+    #[tokio::test]
+    async fn another_s3_400_is_not_an_auth_failure() {
+        let endpoint =
+            canned_http_server("400 Bad Request", s3_error_body!("InvalidArgument")).await;
+        let backend = s3_backend(&endpoint, None);
+        let e = backend.open_read("k").await.err().expect("400");
+        assert!(!crate::engine::remote_cache::is_auth_failure(&e), "{e:#}");
+    }
+
+    /// S3's own 403 arrives typed and needs no body.
+    #[tokio::test]
+    async fn an_s3_403_is_an_auth_failure() {
+        let endpoint =
+            canned_http_server("403 Forbidden", s3_error_body!("InvalidAccessKeyId")).await;
+        let backend = s3_backend(&endpoint, None);
+        let e = backend.exists("k").await.expect_err("403");
+        assert!(crate::engine::remote_cache::is_auth_failure(&e), "{e:#}");
+    }
+
+    /// A refused S3 credential fetch (an STS web-identity exchange, the
+    /// metadata endpoint) is an auth failure, as for GCS.
+    #[tokio::test]
+    async fn a_refused_s3_credential_is_an_auth_failure() {
+        let creds = failing_credentials(|| object_store::Error::Generic {
+            store: "S3",
+            source: "Error performing AssumeRoleWithWebIdentity: 400 InvalidIdentityToken".into(),
+        });
+        // Never reached: the credential is fetched before the request is sent.
+        let backend = s3_backend("http://127.0.0.1:9", Some(creds));
+        let e = backend.exists("k").await.expect_err("credential fails");
+        assert!(crate::engine::remote_cache::is_auth_failure(&e), "{e:#}");
+    }
+
+    /// The `<Code>` match is exact, so near misses fall through to the backoff.
+    #[test]
+    fn s3_auth_code_matches_whole_codes_only() {
+        let yes = |msg: &str| has_s3_auth_code(&std::io::Error::other(msg.to_owned()));
+        assert!(yes(s3_error_body!("ExpiredToken")));
+        assert!(yes(s3_error_body!("InvalidToken")));
+        assert!(yes(s3_error_body!("TokenRefreshRequired")));
+        assert!(!yes(s3_error_body!("ExpiredTokenX")));
+        assert!(!yes(s3_error_body!("expiredtoken")));
+        assert!(!yes(s3_error_body!("SlowDown")));
+        assert!(!yes(
+            "open remote object repo/ExpiredToken: 400 Bad Request"
+        ));
+        assert!(!yes("<Code>ExpiredToken"));
+        assert!(!yes(""));
+        // Only an S3 store's error is reinterpreted.
+        let gcs = classify_store_error(object_store::Error::Generic {
+            store: "GCS",
+            source: s3_error_body!("ExpiredToken").into(),
+        });
+        assert!(!crate::engine::remote_cache::is_auth_failure(
+            &anyhow::Error::new(gcs)
+        ));
     }
 
     /// A GCS backend whose credential provider fails with `err`, behind
     /// [`AuthClassifying`] as `from_uri` builds it. The credential is fetched
     /// before any request is sent, so this never reaches the network.
     fn gcs_backend_failing_with(err: fn() -> object_store::Error) -> ObjStoreBackend {
-        let creds: GcpCredentialProvider = Arc::new(FailingCredentials(err));
+        let creds: GcpCredentialProvider = failing_credentials(err);
         let store = GoogleCloudStorageBuilder::new()
             .with_bucket_name("bucket")
             .with_credentials(auth_classifying(&creds))
