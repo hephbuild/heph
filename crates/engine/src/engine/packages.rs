@@ -89,83 +89,8 @@ impl Engine {
         m: &htmatcher::Matcher,
         rs: &Arc<RequestState>,
     ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<String>> + Send>> {
-        let prefix = narrowing_prefix(m);
-
-        // Each provider's `list_packages` is an independent workspace walk — the
-        // buildfile provider's recursive BUILD-file scan and the go provider's
-        // `collect_go_packages` cover the same tree and never touched the same
-        // state, yet ran one after the other. Overlap them: the walks are the
-        // producer for the whole pipeline, so their latency is on the critical
-        // path of every `query` / `validate` / `labels` / `revdeps`.
-        //
-        // `join_all`, not `try_join_all`: the walks are few (one per registered
-        // provider) and already running, so short-circuiting saves nothing — and
-        // `try_join_all` would return whichever walk failed *first in time*,
-        // making "which provider does heph blame" a race on a flaky mount. The
-        // serial loop always blamed the earliest-registered failing provider;
-        // taking the lowest-index error below keeps that.
-        let results: Vec<anyhow::Result<Arc<Vec<String>>>> =
-            futures::future::join_all(self.providers.iter().map(|provider| {
-                let req = ListPackagesRequest {
-                    prefix: prefix.clone(),
-                };
-                let key = format!("{}:{}", provider.name, prefix);
-
-                async move {
-                    rs.data
-                        .mem_packages
-                        .once(
-                            key,
-                            enclose!((provider, rs) move || async move {
-                                let it = provider
-                                    .provider
-                                    .list_packages(req, rs.ctoken())
-                                    .await?;
-                                let mut pkgs = Vec::new();
-                                for res in it {
-                                    pkgs.push(res?.pkg.to_string());
-                                }
-                                // Canonicalize the provider's block rather than
-                                // trusting it to be ordered — see this method's
-                                // docs for why the order matters and why the
-                                // sort is per provider. Inside the memoizer, so
-                                // it is paid once per (provider, prefix) per
-                                // request, not once per call.
-                                //
-                                // This is the canonical package ordering for the
-                                // whole engine, and it must stay a
-                                // byte-lexicographic `String` compare. A
-                                // collation-aware or case-folding comparator
-                                // would make `LC_COLLATE` an undeclared hash
-                                // input: two machines would order the same tree
-                                // differently and could never share a
-                                // remote-cache entry for a query-backed target.
-                                //
-                                // `dedup` is free once sorted (adjacent, no
-                                // hashing) and shrinks the `Arc<Vec<String>>`
-                                // shared for the rest of the request. The
-                                // cross-provider dedup below still needs its own
-                                // set: `Vec::dedup` only collapses adjacent
-                                // equals, and the blocks are memoized apart.
-                                //
-                                // The sort lives inside the per-provider
-                                // memoizer cell, which is also why overlapping
-                                // the walks cannot disturb it: each block is
-                                // canonicalized by its own future, and the merge
-                                // below re-imposes registration order.
-                                pkgs.sort_unstable();
-                                pkgs.dedup();
-                                Ok(Arc::new(pkgs))
-                            }),
-                        )
-                        .await
-                        .map_err(unwrap_arc_err)
-                }
-            }))
-            .await;
-
-        let mut per_provider: Vec<Arc<Vec<String>>> = Vec::with_capacity(results.len());
-        for res in results {
+        let mut per_provider: Vec<Arc<Vec<String>>> = Vec::with_capacity(self.providers.len());
+        for res in self.provider_packages(m, rs).await {
             per_provider.push(res?);
         }
 
@@ -174,10 +99,10 @@ impl Engine {
         // (e.g. `query`) don't scan a package more than once. A package listed
         // by two providers keeps the position of the first one that listed it.
         //
-        // Overlapping the walks above must not be allowed to reorder this
-        // merge: the fold runs over `per_provider` in provider-registration
-        // order, exactly as the serial loop did, regardless of which walk
-        // finished first.
+        // Overlapping the walks in `provider_packages` must not be allowed to
+        // reorder this merge: the fold runs over `per_provider` in
+        // provider-registration order, exactly as the serial loop did,
+        // regardless of which walk finished first.
         let mut seen: FxHashSet<String> = FxHashSet::default();
 
         // A whole-graph selector rejects nothing, so skip the check rather than
@@ -203,6 +128,97 @@ impl Engine {
         }
 
         Ok(Box::new(all_packages.into_iter().map(Ok)))
+    }
+
+    /// Each provider's package list for `m`, in provider-registration order:
+    /// the memoized, sorted, deduped blocks [`packages`](Self::packages) merges.
+    ///
+    /// One entry per provider, each its own `Result`, so a caller that can do
+    /// without one provider's packages is not forced to lose the others. The
+    /// cells are the ones `packages` reads, keyed by provider and narrowing
+    /// prefix, so asking twice in one request walks the workspace once.
+    ///
+    /// The blocks are not filtered by `m`: a block may hold packages the
+    /// matcher rejects (the prefix is only a hint to the provider). Each block
+    /// is sorted byte-lexicographically, so membership is a binary search.
+    pub(crate) async fn provider_packages(
+        &self,
+        m: &htmatcher::Matcher,
+        rs: &Arc<RequestState>,
+    ) -> Vec<anyhow::Result<Arc<Vec<String>>>> {
+        let prefix = narrowing_prefix(m);
+
+        // Each provider's `list_packages` is an independent workspace walk — the
+        // buildfile provider's recursive BUILD-file scan and the go provider's
+        // `collect_go_packages` cover the same tree and never touched the same
+        // state, yet ran one after the other. Overlap them: the walks are the
+        // producer for the whole pipeline, so their latency is on the critical
+        // path of every `query` / `validate` / `labels` / `revdeps`.
+        //
+        // `join_all`, not `try_join_all`: the walks are few (one per registered
+        // provider) and already running, so short-circuiting saves nothing — and
+        // `try_join_all` would return whichever walk failed *first in time*,
+        // making "which provider does heph blame" a race on a flaky mount. The
+        // serial loop always blamed the earliest-registered failing provider;
+        // taking the lowest-index error in `packages` keeps that.
+        futures::future::join_all(self.providers.iter().map(|provider| {
+            let req = ListPackagesRequest {
+                prefix: prefix.clone(),
+            };
+            let key = format!("{}:{}", provider.name, prefix);
+
+            async move {
+                rs.data
+                    .mem_packages
+                    .once(
+                        key,
+                        enclose!((provider, rs) move || async move {
+                            let it = provider
+                                .provider
+                                .list_packages(req, rs.ctoken())
+                                .await?;
+                            let mut pkgs = Vec::new();
+                            for res in it {
+                                pkgs.push(res?.pkg.to_string());
+                            }
+                            // Canonicalize the provider's block rather than
+                            // trusting it to be ordered — see `packages`'
+                            // docs for why the order matters and why the
+                            // sort is per provider. Inside the memoizer, so
+                            // it is paid once per (provider, prefix) per
+                            // request, not once per call.
+                            //
+                            // This is the canonical package ordering for the
+                            // whole engine, and it must stay a
+                            // byte-lexicographic `String` compare. A
+                            // collation-aware or case-folding comparator
+                            // would make `LC_COLLATE` an undeclared hash
+                            // input: two machines would order the same tree
+                            // differently and could never share a
+                            // remote-cache entry for a query-backed target.
+                            //
+                            // `dedup` is free once sorted (adjacent, no
+                            // hashing) and shrinks the `Arc<Vec<String>>`
+                            // shared for the rest of the request. The
+                            // cross-provider dedup in `packages` needs its own
+                            // set: `Vec::dedup` only collapses adjacent
+                            // equals, and the blocks are memoized apart.
+                            //
+                            // The sort lives inside the per-provider
+                            // memoizer cell, which is also why overlapping
+                            // the walks cannot disturb it: each block is
+                            // canonicalized by its own future, and the merge
+                            // in `packages` re-imposes registration order.
+                            pkgs.sort_unstable();
+                            pkgs.dedup();
+                            Ok(Arc::new(pkgs))
+                        }),
+                    )
+                    .await
+                    .map_err(unwrap_arc_err)
+            }
+        }))
+        .await
     }
 }
 

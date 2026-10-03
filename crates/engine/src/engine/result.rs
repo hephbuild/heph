@@ -820,8 +820,8 @@ fn in_place_fs_addrs(
 
 /// Build an [`EResult`] from produced artifacts, filtering by output group and
 /// type, and attaching `guard` (the read lock for this target's cache entry) to
-/// each kept artifact. `guard` is `None` only for the non-cacheable (force/shell)
-/// path, whose artifacts are ephemeral and need no long-lived lock.
+/// each kept artifact. `guard` is `None` only for a shell run or a cache-off
+/// target, whose artifacts are ephemeral and need no long-lived lock.
 fn build_eresult(
     produced: Vec<ResultArtifact>,
     artifacts_meta: Vec<ArtifactMeta>,
@@ -961,8 +961,9 @@ struct ExecuteOptions<'a> {
 /// per-addr result lock — the self-deadlock this prevents.
 pub(crate) struct LockedResolution {
     /// The single riding read shared by all callers, pinning the cache entry for
-    /// the request lifetime. `None` only on the non-cacheable force/shell path
-    /// (ephemeral artifacts, no long-lived read).
+    /// the request lifetime. `None` only for a shell run or a cache-off target
+    /// (ephemeral artifacts, no long-lived read); a forced run of a cacheable
+    /// target rewrote the durable entry and rides a read like any other.
     guard: Option<Arc<ResultReadGuard>>,
     /// `Some(full set)` when THIS cell produced the artifacts (cacheable execute,
     /// or the force/shell branch); [`build_eresult`] filters it to each caller's
@@ -1686,6 +1687,14 @@ impl Engine {
             });
         }
 
+        // Before the walk resolves anything: the walk itself can reach a
+        // selected target as a dependency (a provider's `get` building through
+        // it to answer a label check), and that first touch is the one that
+        // decides force. See `Selection`.
+        if opts.force || opts.no_scratch {
+            self.install_selection(&rs, matcher, &opts).await;
+        }
+
         // First genuine (non-cancellation) failure — from the matcher walk below
         // or from a target. We never leave either loop by `?`: returning drops
         // the `JoinSet`, and the futures the spawned tasks were driving live in
@@ -1915,6 +1924,36 @@ impl Engine {
         Ok(BatchResult { ok, errors })
     }
 
+    /// Scope this request's `--force` / `--no-scratch` to `matcher`. See
+    /// [`Selection`](crate::engine::request_state::Selection).
+    ///
+    /// Reads the same memoized per-provider package lists the walk is about to
+    /// read, so it walks the workspace no more than the walk alone would. A
+    /// provider whose listing fails contributes no packages: none of its
+    /// targets is selected, and the walk reports the failure from the same
+    /// cell. Nothing here can fail, which is the point — an `Err` inside the
+    /// per-addr cell would have no good answer, and "not forced" is the
+    /// defect this exists to fix.
+    async fn install_selection(
+        &self,
+        rs: &Arc<RequestState>,
+        matcher: &Matcher,
+        opts: &ResultOptions,
+    ) {
+        let packages = self
+            .provider_packages(matcher, rs)
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect();
+        rs.install_selection(crate::engine::request_state::Selection::new(
+            matcher.clone(),
+            packages,
+            opts.force,
+            opts.no_scratch,
+        ));
+    }
+
     async fn inner_result_addr(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -1953,6 +1992,18 @@ impl Engine {
                     .await?;
                 let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
 
+                // Computed once, here, and read from `ExecuteOptions` by both
+                // places that decide cacheability — the per-addr cell and the
+                // fixpoint check — so they cannot disagree. On a forced selector
+                // run every caller of a selected addr gets the same answer,
+                // whichever reaches the per-addr cell first; see `Selection`.
+                let (force, no_scratch) = match rs.selection() {
+                    Some(sel) => {
+                        sel.effective(opts.force, opts.no_scratch, addr, &spec, &def.target_def)
+                    }
+                    None => (opts.force, opts.no_scratch),
+                };
+
                 // `link` and `meta` operate on disjoint data once `def` is known: link
                 // resolves output names + filter checks across the input list; meta
                 // recursively walks inputs to compute hashin. Run them concurrently
@@ -1989,11 +2040,11 @@ impl Engine {
                             hashin: &meta.hashin,
                             spec: &spec,
                             def: &def,
-                            force: opts.force,
+                            force,
                             interactive: opts.interactive.clone(),
                             shell: opts.shell,
                             frozen: opts.frozen,
-                            no_scratch: opts.no_scratch,
+                            no_scratch,
                             is_top,
                         },
                     )
@@ -2454,6 +2505,15 @@ impl Engine {
         let def_owned = opts.def.clone();
         let hashin = opts.hashin.clone();
         let spec = opts.spec.clone();
+        // Whichever caller creates the cell decides `force` and `no_scratch` for
+        // every later one. On a selector run neither is per-caller for a
+        // selected target: both come from the request's `Selection` (see
+        // `inner_result_addr`), so one reached first as an unforced dependency
+        // is still forced here. Members of a forced transparent group still
+        // inherit the flag through the call path, so for them the first caller
+        // decides between a rebuild and a hit. That costs time, never a wrong
+        // key: the cell is shared, so every caller sees one output, and the
+        // fixpoint and write-back are `is_top`-gated, which a member never is.
         let force = opts.force;
         let shell = opts.shell;
         let interactive = opts.interactive.clone();
@@ -2530,26 +2590,42 @@ impl Engine {
         let ctoken = rs.ctoken();
 
         // Non-cacheable (force/shell): execute under an exclusive write lock —
-        // serializing per addr across requests/processes — and return ephemeral
-        // artifacts with no long-lived read lock.
+        // serializing per addr across requests/processes.
+        //
+        // A shell run, or a target with caching off, writes nowhere durable and
+        // returns ephemeral artifacts with no long-lived read lock. A forced (or
+        // `--no-scratch`) run of a *cacheable* target is different: it rewrites
+        // the durable entry at the same `(addr, hashin)`, and on a forced
+        // selector run it is every selected target, wherever in the request it
+        // is first resolved (see `Selection`) — so a dependent folds this
+        // output's `hashout` into its own key and then stages the bytes. Without
+        // a riding read, another process forcing the same addr in between could
+        // rename different bytes over them (blobs are keyed by inputs, not by
+        // content), and the dependent would be cached under a key that names
+        // the first output while built from the second. So it downgrades to a
+        // riding read exactly as the miss path below does.
         if !can_cache {
+            let durable = def.target.cache.enabled && !opts.shell && !rs.hash_only();
             // pluginfs targets are pure, ephemeral filesystem reads (cache off):
             // no cross-process state to serialize and GC never touches them, so
             // the per-addr write lock is pure overhead. Skip it.
             // TODO(targetdef): expose this as an explicit flag on TargetDef
             // (e.g. `needs_lock`) instead of hardcoding the fs driver name here.
             let skip_lock = opts.spec.driver == hbuiltins::pluginfs::DRIVER_NAME;
-            let _w = if skip_lock {
+            let write = if skip_lock {
                 None
             } else {
                 // Hash-only requests may take THIS write lock, unlike the
                 // cacheable paths below. The self-deadlock they guard against
                 // needs the outer request to be riding a read guard on the
-                // addr, and uncacheable resolutions hand out no guard at all
-                // (`guard: None` below) — by the time a nested recompute runs,
-                // the outer request holds nothing here. Blanket-refusing made
-                // the in_place write-back guard structurally unable to verify
-                // any target whose meta chain crosses a cache-off dep (e.g. a
+                // addr, and the resolutions a hash-only request can reach here
+                // hand out no guard at all: it never carries `force` or
+                // `no_scratch` (no `Selection` reaches it either), so only a
+                // cache-off or shell target lands in this branch, and those keep
+                // `guard: None` below. By the time a nested recompute runs, the
+                // outer request holds nothing here. Blanket-refusing made the
+                // in_place write-back guard structurally unable to verify any
+                // target whose meta chain crosses a cache-off dep (e.g. a
                 // toolchain reached through `//@heph/bin:*` — hostbin is
                 // cache-off), failing `r lint //...` on already-linted trees.
                 Some(
@@ -2561,8 +2637,21 @@ impl Engine {
                 .clone()
                 .execute_and_cache_inner(rs.clone(), opts)
                 .await?;
+            let guard = match write {
+                Some(write) if durable => {
+                    // Same gap-free hand-off as the miss path below.
+                    let up = write
+                        .downgrade(ctoken)
+                        .await
+                        .with_context(|| format!("downgrading result lock for {addr}"))?;
+                    let read = self.result_lock().read(addr, ctoken).await?;
+                    drop(up);
+                    Some(Arc::new(read))
+                }
+                _ => None,
+            };
             return Ok(Arc::new(LockedResolution {
-                guard: None,
+                guard,
                 executed: Some(Arc::new(ExecutedArtifacts { cached, meta })),
                 manifest: None,
                 remote: known_remote(None),
@@ -11688,5 +11777,682 @@ mod tests {
             "the codegen write-back must run inside a blocking::run job (None = never walked)"
         );
         Ok(())
+    }
+
+    // ─── Forced selector runs (`Selection`) ──────────────────────────────────
+
+    mod forced_selection {
+        use super::*;
+
+        /// The static provider, reshaped the ways a real provider can be:
+        /// packages it resolves but never lists (`hidden`, a get-only package),
+        /// targets it resolves but never lists inside a listed package
+        /// (`unlisted`, go's `_lint-analyze`), a `get` that builds another
+        /// target through the executor first (`builds`, the go provider's
+        /// `_golist` shape), a package listing that fails (`fail_listing`), and
+        /// a count of its `list_packages` walks.
+        struct Shaped {
+            inner: pluginstatictarget::Provider,
+            hidden: Vec<String>,
+            unlisted: Vec<Addr>,
+            builds: Option<(Addr, Addr)>,
+            fail_listing: bool,
+            list_packages_calls: SArc<AtomicUsize>,
+        }
+
+        /// How [`shaped_engine`] reshapes the static provider. See [`Shaped`].
+        #[derive(Default)]
+        struct Shape<'a> {
+            hidden: &'a [&'a str],
+            unlisted: &'a [&'a str],
+            builds: Option<(&'a str, &'a str)>,
+            fail_listing: bool,
+        }
+
+        impl crate::engine::provider::Provider for Shaped {
+            fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                self.inner.config(req)
+            }
+            fn list<'a>(
+                &'a self,
+                req: ListRequest,
+                ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                if self.hidden.iter().any(|h| h == req.package.as_str()) {
+                    return Box::pin(async {
+                        Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+                    });
+                }
+                Box::pin(async move {
+                    let listed: Vec<_> = self
+                        .inner
+                        .list(req, ctoken)
+                        .await?
+                        .filter(|res| !matches!(res, Ok(t) if self.unlisted.contains(&t.addr)))
+                        .collect();
+                    Ok(Box::new(listed.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+                })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                req: ListPackagesRequest,
+                ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                self.list_packages_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if self.fail_listing {
+                        anyhow::bail!("walking the workspace: permission denied");
+                    }
+                    let listed: Vec<_> = self
+                        .inner
+                        .list_packages(req, ctoken)
+                        .await?
+                        .filter(|res| {
+                            !matches!(res, Ok(p) if self.hidden.iter().any(|h| h == p.pkg.as_str()))
+                        })
+                        .collect();
+                    Ok(Box::new(listed.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+                })
+            }
+            fn get<'a>(
+                &'a self,
+                req: GetRequest,
+                ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async move {
+                    if let Some((target, through)) = &self.builds
+                        && req.addr == *target
+                    {
+                        req.executor
+                            .result(through)
+                            .await
+                            .map_err(GetError::Other)?;
+                    }
+                    self.inner.get(req, ctoken).await
+                })
+            }
+            fn probe<'a>(
+                &'a self,
+                req: ProbeRequest,
+                ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                self.inner.probe(req, ctoken)
+            }
+        }
+
+        /// Engine over a [`Shaped`] provider and the bash driver, plus the
+        /// provider's `list_packages` counter. Hold the `TempDir` for the test.
+        fn shaped_engine(
+            targets: Vec<pluginstatictarget::Target>,
+            shape: Shape<'_>,
+        ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, SArc<AtomicUsize>)> {
+            let root = tempdir()?;
+            let mut engine = Engine::new(Config {
+                root: root.path().to_path_buf(),
+                home_dir: std::path::PathBuf::new(),
+                parallelism: None,
+                ..Default::default()
+            })?;
+            engine.register_managed_driver(|_| {
+                Box::new(hplugin_exec::pluginexec::Driver::new_bash())
+            })?;
+            let builds = match shape.builds {
+                Some((target, through)) => Some((
+                    hmodel::htaddr::parse_addr(target)?,
+                    hmodel::htaddr::parse_addr(through)?,
+                )),
+                None => None,
+            };
+            let calls = SArc::new(AtomicUsize::new(0));
+            let provider = Shaped {
+                inner: pluginstatictarget::Provider::new(targets)?,
+                hidden: shape.hidden.iter().map(|s| (*s).to_string()).collect(),
+                unlisted: shape
+                    .unlisted
+                    .iter()
+                    .map(|a| hmodel::htaddr::parse_addr(a))
+                    .collect::<anyhow::Result<_>>()?,
+                builds,
+                fail_listing: shape.fail_listing,
+                list_packages_calls: SArc::clone(&calls),
+            };
+            engine.register_provider(move |_| Box::new(provider))?;
+            Ok((Arc::new(engine), root, calls))
+        }
+
+        /// An output-writing bash target carrying `labels`, so a dependent's
+        /// `hashin` reads its `hashout`.
+        fn labelled(addr: &str, labels: &[&str], deps: &[&str]) -> pluginstatictarget::Target {
+            pluginstatictarget::Target {
+                labels: labels.iter().map(|s| (*s).to_string()).collect(),
+                ..out_target_with_deps(addr, deps)
+            }
+        }
+
+        /// [`labelled`], but its output differs on every execution, so a
+        /// dependent's `hashin` moves exactly when this one re-executes.
+        fn fresh(addr: &str, labels: &[&str], deps: &[&str]) -> pluginstatictarget::Target {
+            pluginstatictarget::Target {
+                run: Some("echo $RANDOM$RANDOM$$ > $OUT".to_string()),
+                ..labelled(addr, labels, deps)
+            }
+        }
+
+        /// Build `addr` and its graph into the cache, then let go of the
+        /// request and the result: a riding read guard kept alive across a
+        /// forced run would block its write lock.
+        async fn warm(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<()> {
+            let addr = hmodel::htaddr::parse_addr(addr)?;
+            let rs = engine.new_state();
+            drop(
+                Arc::clone(engine)
+                    .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+                    .await?,
+            );
+            Ok(())
+        }
+
+        /// `heph r <matcher>` with `opts`, collecting every event the request
+        /// emitted.
+        async fn run_selection(
+            engine: &Arc<Engine>,
+            matcher: &Matcher,
+            opts: &ResultOptions,
+        ) -> (anyhow::Result<BatchResult>, Vec<BuildEvent>) {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let rs = engine.new_state_with_events(false, Some(tx));
+            let res = Arc::clone(engine)
+                .result(rs.clone(), matcher, OutputMatcher::All, opts)
+                .await;
+            drop(rs);
+            let mut events = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+            (res, events)
+        }
+
+        fn executions(events: &[BuildEvent], addr: &str) -> usize {
+            count_kind(
+                events,
+                |e| matches!(e, BuildEventKind::ExecuteStart { addr: a, .. } if a == addr),
+            )
+        }
+
+        fn forced() -> ResultOptions {
+            ResultOptions {
+                force: true,
+                ..Default::default()
+            }
+        }
+
+        fn label(l: &str) -> Matcher {
+            Matcher::Label(l.to_string())
+        }
+
+        /// `heph r x //... --force` in miniature. `//a:probe`'s `get` builds
+        /// `//c:c`, which depends on `//x:d` (label `x`). The walk reaches `d`
+        /// first as `c`'s dependency, while resolving `probe`'s spec for the
+        /// label check, and only afterwards as a match. That first touch is
+        /// unforced, and it used to settle `d`'s per-addr cell from cache, so
+        /// the forced top-level call found nothing left to run.
+        #[tokio::test]
+        async fn force_reaches_a_selected_target_first_resolved_as_a_dependency()
+        -> anyhow::Result<()> {
+            let (engine, _root, _) = shaped_engine(
+                vec![
+                    labelled("//a:probe", &[], &[]),
+                    labelled("//c:c", &[], &["//x:d"]),
+                    fresh("//x:d", &["x"], &[]),
+                ],
+                Shape {
+                    builds: Some(("//a:probe", "//c:c")),
+                    ..Default::default()
+                },
+            )?;
+            warm(&engine, "//c:c").await?;
+
+            let (res, events) = run_selection(&engine, &label("x"), &forced()).await;
+            let batch = res?;
+            assert!(batch.errors.is_empty(), "{:?}", batch.errors);
+            assert_eq!(
+                executions(&events, "//x:d"),
+                1,
+                "d is selected: forced on its first touch, as c's dependency, and not again \
+                 as a match: {events:?}"
+            );
+            assert_eq!(
+                executions(&events, "//c:c"),
+                1,
+                "c must rebuild on d's fresh output, not consume the cached one: {events:?}"
+            );
+            Ok(())
+        }
+
+        /// `--no-scratch` implies force and has the same first-caller shape, so
+        /// it rides the same selection.
+        #[tokio::test]
+        async fn no_scratch_reaches_a_selected_target_first_resolved_as_a_dependency()
+        -> anyhow::Result<()> {
+            let (engine, _root, _) = shaped_engine(
+                vec![
+                    labelled("//a:probe", &[], &[]),
+                    labelled("//c:c", &[], &["//x:d"]),
+                    fresh("//x:d", &["x"], &[]),
+                ],
+                Shape {
+                    builds: Some(("//a:probe", "//c:c")),
+                    ..Default::default()
+                },
+            )?;
+            warm(&engine, "//c:c").await?;
+
+            let opts = ResultOptions {
+                no_scratch: true,
+                ..Default::default()
+            };
+            let (res, events) = run_selection(&engine, &label("x"), &opts).await;
+            assert!(res?.errors.is_empty());
+            assert_eq!(executions(&events, "//x:d"), 1, "{events:?}");
+            Ok(())
+        }
+
+        /// Force is not deep: a dependency the selector does not match still
+        /// comes from cache.
+        #[tokio::test]
+        async fn an_unselected_dependency_still_comes_from_cache() -> anyhow::Result<()> {
+            let (engine, _root, _) = shaped_engine(
+                vec![
+                    labelled("//x:d", &["x"], &["//e:e"]),
+                    labelled("//e:e", &[], &[]),
+                ],
+                Shape::default(),
+            )?;
+            warm(&engine, "//x:d").await?;
+
+            let (res, events) = run_selection(&engine, &label("x"), &forced()).await;
+            assert!(res?.errors.is_empty());
+            assert_eq!(executions(&events, "//x:d"), 1, "{events:?}");
+            assert_eq!(
+                executions(&events, "//e:e"),
+                0,
+                "e is not selected, so it must stay a cache hit: {events:?}"
+            );
+            Ok(())
+        }
+
+        /// `//...` matches every address by prefix, including ones the walk
+        /// never lists. Only a package the walk enumerates is in the selection.
+        #[tokio::test]
+        async fn force_skips_packages_the_selector_cannot_enumerate() -> anyhow::Result<()> {
+            let (engine, _root, _) = shaped_engine(
+                vec![
+                    labelled("//a:a", &[], &["//hidden:h"]),
+                    labelled("//hidden:h", &[], &[]),
+                ],
+                Shape {
+                    hidden: &["hidden"],
+                    ..Default::default()
+                },
+            )?;
+            warm(&engine, "//a:a").await?;
+
+            let all = Matcher::PackagePrefix(PkgBuf::from(""));
+            let (res, events) = run_selection(&engine, &all, &forced()).await;
+            assert!(res?.errors.is_empty());
+            assert_eq!(executions(&events, "//a:a"), 1, "{events:?}");
+            assert_eq!(
+                executions(&events, "//hidden:h"),
+                0,
+                "h's package is never listed, so `//...` does not select it: {events:?}"
+            );
+            Ok(())
+        }
+
+        /// Two selected targets, one depending on the other: whichever path
+        /// reaches the dependency first, it runs once.
+        #[tokio::test]
+        async fn forced_target_that_is_a_dependency_of_another_forced_target_runs_once()
+        -> anyhow::Result<()> {
+            let (engine, _root, _) = shaped_engine(
+                vec![
+                    labelled("//a:a", &["x"], &["//b:b"]),
+                    labelled("//b:b", &["x"], &[]),
+                ],
+                Shape::default(),
+            )?;
+            warm(&engine, "//a:a").await?;
+
+            let (res, events) = run_selection(&engine, &label("x"), &forced()).await;
+            assert!(res?.errors.is_empty());
+            assert_eq!(executions(&events, "//a:a"), 1, "{events:?}");
+            assert_eq!(executions(&events, "//b:b"), 1, "{events:?}");
+            Ok(())
+        }
+
+        /// Force does not cascade upward: a selected dependency whose output
+        /// comes out the same leaves its unselected dependents cache hits.
+        #[tokio::test]
+        async fn a_forced_dependency_with_stable_output_does_not_rebuild_its_dependents()
+        -> anyhow::Result<()> {
+            let (engine, _root, _) = shaped_engine(
+                vec![
+                    labelled("//a:probe", &[], &[]),
+                    labelled("//c:c", &[], &["//x:d"]),
+                    labelled("//x:d", &["x"], &[]),
+                ],
+                Shape {
+                    builds: Some(("//a:probe", "//c:c")),
+                    ..Default::default()
+                },
+            )?;
+            warm(&engine, "//c:c").await?;
+
+            let (res, events) = run_selection(&engine, &label("x"), &forced()).await;
+            assert!(res?.errors.is_empty());
+            assert_eq!(executions(&events, "//x:d"), 1, "{events:?}");
+            assert_eq!(
+                executions(&events, "//c:c"),
+                0,
+                "d's hashout did not move, so c's key did not either: {events:?}"
+            );
+            Ok(())
+        }
+
+        /// The selection is per package, not per listed target: inside a
+        /// package the walk lists, a matched target the provider resolves but
+        /// does not list is forced too (go's `_lint-analyze`, `_go_mod`). A
+        /// deliberate choice — see `Selection`.
+        #[tokio::test]
+        async fn force_reaches_unlisted_targets_in_listed_packages() -> anyhow::Result<()> {
+            let (engine, _root, _) = shaped_engine(
+                vec![
+                    labelled("//a:top", &[], &["//a:_internal"]),
+                    labelled("//a:_internal", &[], &[]),
+                ],
+                Shape {
+                    unlisted: &["//a:_internal"],
+                    ..Default::default()
+                },
+            )?;
+            warm(&engine, "//a:top").await?;
+
+            let all = Matcher::PackagePrefix(PkgBuf::from(""));
+            let (res, events) = run_selection(&engine, &all, &forced()).await;
+            let batch = res?;
+            assert_eq!(
+                batch.ok.len(),
+                1,
+                "only //a:top is listed, so only it matched"
+            );
+            assert_eq!(executions(&events, "//a:_internal"), 1, "{events:?}");
+            Ok(())
+        }
+
+        /// A forced run of a cacheable dependency rewrites its durable entry,
+        /// and its dependents fold that output's hashout into their own keys.
+        /// It keeps a riding read for the rest of the request, like any cache
+        /// hit, so another process forcing the same addr cannot rename
+        /// different bytes over the ones the dependents are reading.
+        #[tokio::test]
+        async fn a_forced_target_keeps_a_read_lock_while_the_request_lives() -> anyhow::Result<()> {
+            let (engine, _root, _) =
+                shaped_engine(vec![labelled("//x:d", &["x"], &[])], Shape::default())?;
+            warm(&engine, "//x:d").await?;
+
+            let rs = engine.new_state();
+            let batch = Arc::clone(&engine)
+                .result(rs.clone(), &label("x"), OutputMatcher::All, &forced())
+                .await?;
+            assert_eq!(batch.ok.len(), 1);
+            let d = hmodel::htaddr::parse_addr("//x:d")?;
+            assert!(
+                engine.result_lock().try_write(&d)?.is_none(),
+                "a forced target was released with no riding read"
+            );
+            Ok(())
+        }
+
+        /// Smoke test for the forced read lock around in_place write-back: a
+        /// forced in_place target over a selected, cacheable dependency, both
+        /// now riding reads, still writes the tree back and completes. (The
+        /// write-back guard itself resolves only `@heph/fs` addrs on its
+        /// hash-only request, and a forced run stores no fixpoint, so neither
+        /// nested request reaches the dependency today; this pins that the
+        /// combination stays deadlock-free if one ever does.)
+        #[tokio::test]
+        async fn an_in_place_target_over_a_forced_dependency_completes() -> anyhow::Result<()> {
+            let (engine, root) = engine_with_home_fs(vec![
+                codegen_run_target_with_deps(
+                    "//pkg:fmt",
+                    "in_place",
+                    &["in.txt"],
+                    "printf '%s\\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.tmp && mv in.txt.tmp in.txt",
+                    &["//pkg:dep"],
+                ),
+                out_target("//pkg:dep"),
+            ])?;
+            let pkg_dir = root.path().join("pkg");
+            std::fs::create_dir_all(&pkg_dir)?;
+            std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+
+            let pkg = Matcher::Package(PkgBuf::from("pkg"));
+            let (res, events) = tokio::time::timeout(
+                Duration::from_secs(60),
+                run_selection(&engine, &pkg, &forced()),
+            )
+            .await
+            .expect("the nested hash-only request deadlocked against the forced read");
+            assert!(res?.errors.is_empty());
+            assert_eq!(executions(&events, "//pkg:dep"), 1, "{events:?}");
+            assert_eq!(executions(&events, "//pkg:fmt"), 1, "{events:?}");
+            assert_eq!(std::fs::read(pkg_dir.join("in.txt"))?, b"HELLO\n");
+            Ok(())
+        }
+
+        /// A forced in_place target writes the tree back but registers no
+        /// fixpoint revision: the fixpoint check reads the same effective
+        /// `force` the per-addr cell executed with.
+        #[tokio::test]
+        async fn a_forced_in_place_target_stores_no_fixpoint() -> anyhow::Result<()> {
+            let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["in.txt"],
+                "printf '%s\\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.tmp && mv in.txt.tmp in.txt",
+            )])?;
+            let pkg_dir = root.path().join("pkg");
+            std::fs::create_dir_all(&pkg_dir)?;
+            std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+
+            let pkg = Matcher::Package(PkgBuf::from("pkg"));
+            let (res, events) = run_selection(&engine, &pkg, &forced()).await;
+            assert!(res?.errors.is_empty());
+            assert_eq!(executions(&events, "//pkg:fmt"), 1, "{events:?}");
+            assert_eq!(std::fs::read(pkg_dir.join("in.txt"))?, b"HELLO\n");
+
+            // The tree now hashes to what a fixpoint would be keyed on. Only a
+            // stored fixpoint could make this unforced run a hit.
+            let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+            let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+            second?;
+            assert_eq!(
+                executions(&ev2, "//pkg:fmt"),
+                1,
+                "a forced run stored a fixpoint revision: {ev2:?}"
+            );
+            Ok(())
+        }
+
+        /// The deadlock-freedom argument in `resolve_locked_inner`'s forced
+        /// branch rests on this: a hash-only request is its own request data,
+        /// inherits no selection, and refuses one. If a selection ever reached
+        /// one, a forced cacheable dependency would take the write lock under
+        /// the outer request's riding read and hang.
+        #[tokio::test]
+        async fn hash_only_state_never_carries_the_selector() -> anyhow::Result<()> {
+            let (engine, _root, _) =
+                shaped_engine(vec![labelled("//x:d", &["x"], &[])], Shape::default())?;
+            let rs = engine.new_state();
+            engine.install_selection(&rs, &label("x"), &forced()).await;
+            assert!(rs.selection().is_some());
+
+            let nested = engine.new_hash_only_state(hmodel::htaddr::parse_addr("//x:d")?);
+            assert!(nested.selection().is_none(), "inherited a selection");
+            engine
+                .install_selection(&nested, &label("x"), &forced())
+                .await;
+            assert!(nested.selection().is_none(), "accepted a selection");
+            Ok(())
+        }
+
+        /// An unforced selector run installs nothing and adds no work: the
+        /// whole warm graph stays cache hits.
+        #[tokio::test]
+        async fn an_unforced_selector_run_installs_nothing_and_executes_nothing()
+        -> anyhow::Result<()> {
+            let (engine, _root, _) = shaped_engine(
+                vec![
+                    labelled("//a:probe", &[], &[]),
+                    labelled("//c:c", &[], &["//x:d"]),
+                    labelled("//x:d", &["x"], &[]),
+                ],
+                Shape {
+                    builds: Some(("//a:probe", "//c:c")),
+                    ..Default::default()
+                },
+            )?;
+            warm(&engine, "//c:c").await?;
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let rs = engine.new_state_with_events(false, Some(tx));
+            let batch = Arc::clone(&engine)
+                .result(
+                    rs.clone(),
+                    &label("x"),
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                )
+                .await?;
+            assert_eq!(batch.ok.len(), 1);
+            assert!(rs.selection().is_none());
+            drop((batch, rs));
+            let mut events = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+            assert_eq!(
+                count_kind(&events, |e| matches!(
+                    e,
+                    BuildEventKind::ExecuteStart { .. }
+                )),
+                0,
+                "{events:?}"
+            );
+            Ok(())
+        }
+
+        /// A provider whose listing fails contributes no packages to the
+        /// selection, and the walk then fails on the very same memoized cell —
+        /// a forced run never succeeds unforced for that provider's targets.
+        #[tokio::test]
+        async fn a_failed_listing_under_force_fails_the_run_from_the_same_cell()
+        -> anyhow::Result<()> {
+            let (engine, _root, calls) = shaped_engine(
+                vec![labelled("//x:d", &["x"], &[])],
+                Shape {
+                    fail_listing: true,
+                    ..Default::default()
+                },
+            )?;
+            let (res, _) = run_selection(&engine, &label("x"), &forced()).await;
+            let Err(err) = res else {
+                panic!("a failed listing must fail the walk");
+            };
+            assert!(format!("{err:#}").contains("permission denied"), "{err:#}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "install and walk share one cell"
+            );
+            Ok(())
+        }
+
+        /// `Selection::selects` is a second copy of the walk's matching ladder.
+        /// Over every candidate the walk lists, the two must pick the same set,
+        /// or a top-level target and the same target reached as a dependency
+        /// would disagree about force again.
+        #[tokio::test]
+        async fn the_selection_agrees_with_the_walk() -> anyhow::Result<()> {
+            let targets = vec![
+                labelled("//a:one", &["x"], &[]),
+                labelled("//a:two", &[], &[]),
+                labelled("//a/b:three", &["x", "y"], &[]),
+                labelled("//c:four", &["y"], &[]),
+            ];
+            let all: Vec<Addr> = targets
+                .iter()
+                .map(|t| hmodel::htaddr::parse_addr(&t.addr))
+                .collect::<anyhow::Result<_>>()?;
+            let (engine, _root, _) = shaped_engine(targets, Shape::default())?;
+            let root = Matcher::PackagePrefix(PkgBuf::from(""));
+            let matchers = [
+                label("x"),
+                Matcher::And(vec![label("y"), root.clone()]),
+                Matcher::Or(vec![Matcher::Package(PkgBuf::from("a")), label("y")]),
+                Matcher::And(vec![Matcher::Not(Box::new(label("x"))), root.clone()]),
+                Matcher::PackagePrefix(PkgBuf::from("a")),
+                Matcher::Addr(hmodel::htaddr::parse_addr("//c:four")?),
+            ];
+            for m in &matchers {
+                let rs = engine.new_state();
+                engine.install_selection(&rs, m, &forced()).await;
+                let walked: std::collections::BTreeSet<String> = Arc::clone(&engine)
+                    .query(rs.clone(), m)
+                    .map_ok(|a| a.format())
+                    .try_collect()
+                    .await?;
+                let sel = rs.selection().expect("installed");
+                let mut selected = std::collections::BTreeSet::new();
+                for addr in &all {
+                    let spec = Arc::clone(&engine).get_spec(rs.clone(), addr).await?;
+                    let def = Arc::clone(&engine).get_def(rs.clone(), addr).await?;
+                    if sel.selects(addr, &spec, &def.target_def) {
+                        selected.insert(addr.format());
+                    }
+                }
+                assert_eq!(walked, selected, "{}", hmodel::htquery::format(m));
+            }
+            Ok(())
+        }
+
+        /// The selection reads the walk's own memoized package lists.
+        #[tokio::test]
+        async fn package_lists_are_read_once_per_request() -> anyhow::Result<()> {
+            let (engine, _root, calls) = shaped_engine(
+                vec![
+                    labelled("//a:probe", &[], &[]),
+                    labelled("//c:c", &[], &["//x:d"]),
+                    labelled("//x:d", &["x"], &[]),
+                ],
+                Shape {
+                    builds: Some(("//a:probe", "//c:c")),
+                    ..Default::default()
+                },
+            )?;
+            let m = Matcher::And(vec![label("x"), Matcher::PackagePrefix(PkgBuf::from(""))]);
+            let (res, _) = run_selection(&engine, &m, &forced()).await;
+            assert!(res?.errors.is_empty());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            Ok(())
+        }
     }
 }
