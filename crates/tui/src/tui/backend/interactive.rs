@@ -99,6 +99,12 @@ pub async fn run<A: App + 'static>(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut spinner_idx: usize = 0;
     let mut paused = false;
+    // A resume received but not yet carried out. Rebuilding the viewport costs a
+    // cursor query, one terminal round-trip, so the resume waits for the next
+    // tick: a pause arriving first cancels it, and a run that ends first exits
+    // still paused. The usual case is the pause that prints a run's results at
+    // the very end, whose resume would rebuild a box only to tear it down again.
+    let mut resume_pending = false;
     let mut cols = terminal_cols(&terminal);
     // Set when a resize event arrives; handled (coalesced) at the next tick so a
     // drag-resize burst triggers at most one re-anchor per tick instead of a
@@ -150,22 +156,26 @@ pub async fn run<A: App + 'static>(
             ctrl = control_rx.recv() => {
                 match ctrl {
                     Some(Control::Pause(ack, kind)) => {
+                        // Leaving raw mode re-arms the terminal's ISIG, so from
+                        // here until resume a Ctrl-C arrives as a real SIGINT
+                        // instead of a key event. Suppress the trigger only when
+                        // the pause is handing the keyboard to something else
+                        // (`--shell`) — that session's Ctrl-C is not a request to
+                        // cancel the build. For a plain pause (a diagnostic, a
+                        // stdout flush, a target running with the terminal
+                        // attached) the press is still heph's, and suppressing it
+                        // left `heph run //pkg:target` with no working Ctrl-C at
+                        // all for the whole of that target's run: the key handler
+                        // is not reading (the event stream is dropped below), so
+                        // the kernel SIGINT was the only surviving producer, and
+                        // dropping it also put the second-press abort out of reach.
+                        //
+                        // Set even when already paused: a resume still pending is
+                        // cancelled here, and this pause may own input where the
+                        // last one did not.
+                        suppression.set(kind.owns_input());
+                        resume_pending = false;
                         if !paused {
-                            // Leaving raw mode below re-arms the terminal's ISIG,
-                            // so from here until resume a Ctrl-C arrives as a real
-                            // SIGINT instead of a key event. Suppress the trigger
-                            // only when the pause is handing the keyboard to
-                            // something else (`--shell`) — that session's Ctrl-C is
-                            // not a request to cancel the build. For a plain pause
-                            // (a diagnostic, a stdout flush, a target running with
-                            // the terminal attached) the press is still heph's, and
-                            // suppressing it left `heph run //pkg:target` with no
-                            // working Ctrl-C at all for the whole of that target's
-                            // run: the key handler is not reading (the event stream
-                            // is dropped just below), so the kernel SIGINT was the
-                            // only surviving producer, and dropping it also put the
-                            // second-press abort out of reach.
-                            suppression.set(kind.owns_input());
                             // Drop the EventStream *before* `clear()`. `clear()`
                             // issues a cursor DSR query (`get_cursor_position`),
                             // which reads its reply through crossterm's single
@@ -195,25 +205,9 @@ pub async fn run<A: App + 'static>(
                         }
                     }
                     Some(Control::Resume) if paused => {
-                        drop(enable_raw_mode());
-                        // Cooked-mode writes during pause moved the cursor by an
-                        // unknown amount; ratatui's internal state (viewport_area,
-                        // last_known_cursor_pos, both buffers) is stale. Rebuild
-                        // the terminal so `with_options`+`compute_inline_size`
-                        // re-queries the cursor and positions the viewport below
-                        // the printed output instead of clobbering it.
-                        if let Ok(new_term) = Terminal::with_options(
-                            StderrBackend::new(io::stderr()),
-                            TerminalOptions {
-                                viewport: Viewport::Inline(rows),
-                            },
-                        ) {
-                            terminal = new_term;
-                        }
-                        events = Some(EventStream::new());
-                        rx = sink.switch_to_buffered();
-                        cols = terminal_cols(&terminal);
-                        paused = false;
+                        // The terminal is rebuilt at the next tick (see
+                        // `resume_pending`). The keyboard is heph's again now.
+                        resume_pending = true;
                         suppression.set(false);
                     }
                     Some(Control::Resume) => {}
@@ -395,7 +389,29 @@ pub async fn run<A: App + 'static>(
                 // re-enters the loop and the next `select!` re-polls the
                 // control channel, observing any message whose wake vanished.
                 if paused {
-                    continue;
+                    if !resume_pending {
+                        continue;
+                    }
+                    drop(enable_raw_mode());
+                    // Cooked-mode writes during pause moved the cursor by an
+                    // unknown amount; ratatui's internal state (viewport_area,
+                    // last_known_cursor_pos, both buffers) is stale. Rebuild
+                    // the terminal so `with_options`+`compute_inline_size`
+                    // re-queries the cursor and positions the viewport below
+                    // the printed output instead of clobbering it.
+                    if let Ok(new_term) = Terminal::with_options(
+                        StderrBackend::new(io::stderr()),
+                        TerminalOptions {
+                            viewport: Viewport::Inline(rows),
+                        },
+                    ) {
+                        terminal = new_term;
+                    }
+                    events = Some(EventStream::new());
+                    rx = sink.switch_to_buffered();
+                    cols = terminal_cols(&terminal);
+                    paused = false;
+                    resume_pending = false;
                 }
                 if needs_resize {
                     // Re-anchor the inline viewport at the new size before drawing.
@@ -422,48 +438,32 @@ pub async fn run<A: App + 'static>(
         }
     };
 
-    if paused {
-        // The run finished while a `BufferedStdout` flush had the TUI paused: the
-        // pause already tore the viewport down (cleared + cooked mode) and wrote
-        // straight to stdout, so the live cursor now sits just below that output.
-        // Rebuild the terminal so its inline viewport re-anchors there (a DSR
-        // query with no `EventStream` alive — the pause dropped it), then fall
-        // through to the same collapse. Without this the summary would print at
-        // the stale paused cursor, stranding the reserved viewport rows as a
-        // blank gap above it.
-        //
-        // Use a 1-row viewport, not the full box height: we only render the
-        // one-line summary from here on, and a tall viewport whose cursor sits at
-        // the bottom of the screen (after a long stdout dump) makes
-        // `compute_inline_size` scroll a box-height of blank rows in to reserve
-        // space — exactly the gap we're avoiding.
-        drop(enable_raw_mode());
-        if let Ok(rebuilt) = Terminal::with_options(
-            StderrBackend::new(io::stderr()),
-            TerminalOptions {
-                viewport: Viewport::Inline(1),
-            },
-        ) {
-            terminal = rebuilt;
+    // The run can finish while the TUI is paused (a target holding the terminal,
+    // a `BufferedStdout` flush, the pause that prints the results), resume still
+    // pending or not. The pause already did this teardown: it
+    // drained `rx`, collapsed the box, showed the cursor, left raw mode and
+    // flipped the sink to direct writes. The cursor sits just below whatever
+    // the target wrote, which is where the summary belongs. Rebuilding a
+    // terminal here only to tear it down again cost a cursor query at exit:
+    // one terminal round-trip on every `heph r //pkg:target`, up to its
+    // 2s timeout on a terminal that never answers.
+    if !paused {
+        // Flush any still-buffered build-event logs into the terminal scrollback
+        // *above* the viewport. This must stay on the terminal path (`insert_before`):
+        // it wraps to the viewport width and skips blank lines. The post-teardown
+        // `drain_logs_to_stderr` fallback writes raw bytes, so letting empties fall
+        // through to it dumps stray newlines after the box.
+        drain_logs_to_terminal(&mut terminal, &mut rx, cols, None);
+        // Collapse the viewport to its origin so the final summary (printed below)
+        // lands where the box started, not below it.
+        collapse_inline_viewport(&mut terminal);
+        {
+            let backend = terminal.backend_mut();
+            drop(backend.show_cursor());
+            drop(Backend::flush(backend));
         }
-        cols = terminal_cols(&terminal);
+        drop(disable_raw_mode());
     }
-
-    // Flush any still-buffered build-event logs into the terminal scrollback
-    // *above* the viewport. This must stay on the terminal path (`insert_before`):
-    // it wraps to the viewport width and skips blank lines. The post-teardown
-    // `drain_logs_to_stderr` fallback writes raw bytes, so letting empties fall
-    // through to it dumps stray newlines after the box.
-    drain_logs_to_terminal(&mut terminal, &mut rx, cols, None);
-    // Collapse the viewport to its origin so the final summary (printed below)
-    // lands where the box started, not below it.
-    collapse_inline_viewport(&mut terminal);
-    {
-        let backend = terminal.backend_mut();
-        drop(backend.show_cursor());
-        drop(Backend::flush(backend));
-    }
-    drop(disable_raw_mode());
     hcore::shutdown::clear_terminal_restore();
     sink.switch_to_direct();
     drain_logs_to_stderr(&mut rx);
