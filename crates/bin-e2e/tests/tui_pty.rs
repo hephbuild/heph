@@ -106,6 +106,44 @@ fn tui_renders_the_run_and_restores_the_terminal() {
     );
 }
 
+/// A run prints its results in a last pause, and nothing is drawn after it, so
+/// the resume that follows must not rebuild the viewport. Rebuilding costs a
+/// cursor query, and the run is over before a slow terminal (a remote box)
+/// answers it. That reply then reached the user's shell as `^[[35;1R`, and on
+/// any terminal the exit waited one round-trip for a box nobody saw.
+#[test]
+fn no_cursor_query_after_the_results_are_printed() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"out\", driver = \"bash\", run = \"echo e2e-final-output > out.txt\", \
+         out = \"out.txt\", cache = False)\n",
+    )
+    .expect("write BUILD");
+
+    let session = run_in_pty(&dist, ws.root(), &["run", "--cat-out", "//pkg:out"]);
+
+    assert!(
+        session.status_success,
+        "run failed under a tty\n{}",
+        session.report()
+    );
+    let printed = last_index(&session.raw, b"e2e-final-output")
+        .unwrap_or_else(|| panic!("--cat-out never printed the output\n{}", session.report()));
+    assert!(
+        contains(&session.raw, DSR_CURSOR),
+        "interactive TUI never engaged with a tty attached\n{}",
+        session.report()
+    );
+    let after = session.raw.get(printed..).unwrap_or_default();
+    assert!(
+        !contains(after, DSR_CURSOR),
+        "queried the cursor after printing the results\n{}",
+        session.report()
+    );
+}
+
 /// With `--no-tui` the interactive renderer must stay off even though stderr
 /// *is* a terminal — the escape hatch for users piping through a tool that
 /// allocates a tty, and the only configuration in which the flag can be
