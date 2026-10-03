@@ -216,9 +216,12 @@ mod tests {
         Arc::get_mut(&mut engine)
             .expect("unshared")
             .register_provider(|_| {
-                Box::new(crate::engine::discovery::test_support::Unresolvable {
-                    addrs: vec![parse_addr("//go/broken:x").expect("addr")],
-                })
+                Box::new(
+                    crate::engine::fault_provider::FaultProvider::unresolvable(vec![
+                        parse_addr("//go/broken:x").expect("addr"),
+                    ])
+                    .expect("fault provider"),
+                )
             })?;
         let core = parse_addr("//lib:core")?;
         let scope = all();

@@ -2,6 +2,8 @@
 
 - Run `lint` before committing (it runs clippy + `cargo fmt --check`). Clippy warnings are treated as errors.
   - A bare `cargo clippy` at the repo root lints **only the root package** — the root is itself a package, so members are compiled as plain dependencies with no lints applied and their test targets are not built at all. Use `cargo clippy --workspace --all-targets` (what `lint` runs), or `-p <crate> --all-targets` for a narrow loop.
+  - The edit loop is `cargo clippy -p <every crate you touched> --all-targets --keep-going -- -D warnings`, not `cargo check`. `check` never shows the workspace's restriction lints (`string_slice`, `useless_conversion`, `panic`…), so they surface only at `lint`, one round-trip later; and without `--keep-going` a signature change reports one crate per round — one session spent seven compile rounds that way.
+  - Before changing a signature, `rg -n '\.name\('` for every caller, tests included; the caller list is the size of the change.
 - Use `anyhow::Result` for fallible functions at the application layer; define typed errors (like `TargetNotFoundError`) only when callers need to match on the error type.
 - Prefer `async_trait` for async trait methods. Async closures passed to the engine's `Memoizer` must return `WrappedError`-wrapped results.
 - All new `Provider` and `Driver` implementations must be registered via `Engine::register_provider` / `Engine::register_driver` — the engine owns the registry.

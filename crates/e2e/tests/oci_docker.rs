@@ -52,6 +52,44 @@ fn probe_bin(bin: &str, args: &[&str], timeout: std::time::Duration) -> bool {
     probe_status(bin, args, timeout) == Some(true)
 }
 
+/// The command's stdout when it exited successfully inside the deadline. For
+/// probes whose answer is in what they print, not in their exit status.
+fn probe_output(bin: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read as _;
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    // Drained while the child runs, so output past the pipe buffer cannot
+    // block it into the deadline and turn a working docker into a skip. The
+    // reader ends at EOF, which a kill also produces.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).ok().map(|_| out)
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = reader.join().ok()??;
+                return status.success().then_some(out);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    drop(child.kill());
+                    drop(child.wait());
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// `Some(success)` when the command ran to completion inside the deadline,
 /// `None` when it could not be spawned or had to be killed.
 ///
@@ -97,9 +135,71 @@ fn docker_available() -> bool {
     // Deliberately not `docker info`: it walks every configured builder, so one
     // stale context (a Docker Desktop entry left behind after switching to
     // another runtime) makes it hang even though builds run fine.
+    //
+    // Its exit status is not enough: with the daemon down (OrbStack stopped,
+    // say) `buildx inspect --bootstrap` still exits 0 and prints `Error: failed
+    // to connect to the docker API` where the platforms would be. The
+    // `Platforms:` line is what `docker_build::parse` reads, so it is what the
+    // probe requires — otherwise every docker test runs, and fails, against a
+    // daemon that is not there.
     *OK.get_or_init(|| {
-        probe(&["buildx", "version"]) && probe(&["buildx", "inspect", "--bootstrap"])
+        probe(&["buildx", "version"])
+            && probe_output(
+                "docker",
+                &["buildx", "inspect", "--bootstrap"],
+                PROBE_TIMEOUT,
+            )
+            .is_some_and(|out| has_platforms(&out))
     })
+}
+
+/// Whether `buildx inspect` output names a platform: a `Platforms:` line whose
+/// first entry is non-empty, the same rule `docker_build`'s parser applies.
+fn has_platforms(inspect: &str) -> bool {
+    inspect.lines().any(|l| {
+        l.trim_start()
+            .strip_prefix("Platforms:")
+            .and_then(|p| p.split(',').next())
+            .is_some_and(|first| !first.trim().is_empty())
+    })
+}
+
+#[test]
+fn the_docker_probe_needs_a_platform() {
+    let down = "Name:          orbstack\nDriver:        \nError:         failed to connect to the docker API at unix:///x.sock\n\nNodes:\n";
+    assert!(!has_platforms(down), "a daemon that is down is a skip");
+    let up = "Name: default\nDriver: docker\nNodes:\nName: default\nStatus: running\nPlatforms: linux/arm64, linux/amd64\n";
+    assert!(has_platforms(up));
+    assert!(!has_platforms("Platforms:\n"));
+    assert!(
+        !has_platforms("Platforms: , linux/amd64\n"),
+        "the parser reads the first entry"
+    );
+    let two_nodes = "Nodes:\nName: a\nPlatforms:\nName: b\nPlatforms: linux/amd64*\n";
+    assert!(has_platforms(two_nodes));
+}
+
+#[test]
+fn probe_output_reports_success_failure_and_timeout() {
+    let ok = probe_output("sh", &["-c", "echo hi"], PROBE_TIMEOUT);
+    assert_eq!(ok.as_deref(), Some("hi\n"));
+    assert_eq!(
+        probe_output("sh", &["-c", "echo hi; exit 1"], PROBE_TIMEOUT),
+        None
+    );
+    let slow = probe_output(
+        "sh",
+        &["-c", "sleep 5"],
+        std::time::Duration::from_millis(200),
+    );
+    assert_eq!(slow, None, "a probe past its deadline is a skip");
+    // More than any pipe buffer, so the child would block without the reader.
+    let big = probe_output(
+        "sh",
+        &["-c", "head -c 300000 /dev/zero | tr '\\0' x"],
+        PROBE_TIMEOUT,
+    );
+    assert_eq!(big.map(|s| s.len()), Some(300_000));
 }
 
 /// Whether the *default* buildx builder can write an image archive to a file.

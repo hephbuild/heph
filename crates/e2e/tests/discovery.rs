@@ -7,104 +7,17 @@
 
 mod common;
 
-use futures::future::BoxFuture;
-use hcore::hasync::Cancellable;
 use heph::engine::discovery::Stage;
-use heph::engine::provider::{
-    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
-};
+use heph::engine::fault_provider::{FaultProvider, Faults};
 use heph::engine::{Discovery, Gaps, OutputMatcher, ResultOptions};
-use heph::htaddr::{Addr, parse_addr};
+use heph::htaddr::parse_addr;
 use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use heph::pluginexec;
-use heph::pluginstatictarget::{self, Target};
+use heph::pluginstatictarget::Target;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// The static provider, plus the two ways the go provider makes discovery
-/// fail: `get` of `builds.0` builds `builds.1` first (resolving a package's
-/// targets runs its `_golist`), and every addr in `broken` is listed but fails
-/// to resolve.
-struct Discovering {
-    inner: pluginstatictarget::Provider,
-    builds: Option<(Addr, Addr)>,
-    broken: Vec<Addr>,
-}
-
-impl Provider for Discovering {
-    fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-        self.inner.config(req)
-    }
-    fn list<'a>(
-        &'a self,
-        req: ListRequest,
-        ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
-    {
-        Box::pin(async move {
-            let broken: Vec<_> = self
-                .broken
-                .iter()
-                .filter(|a| a.package == req.package)
-                .map(|a| Ok(ListResponse { addr: a.clone() }))
-                .collect();
-            let listed: Vec<_> = self.inner.list(req, ctoken).await?.collect();
-            Ok(Box::new(broken.into_iter().chain(listed)) as Box<dyn Iterator<Item = _> + Send>)
-        })
-    }
-    fn list_packages<'a>(
-        &'a self,
-        req: ListPackagesRequest,
-        ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<
-        'a,
-        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
-    > {
-        Box::pin(async move {
-            let broken: Vec<_> = self
-                .broken
-                .iter()
-                .map(|a| {
-                    Ok(ListPackageResponse {
-                        pkg: a.package.clone(),
-                    })
-                })
-                .collect();
-            let listed: Vec<_> = self.inner.list_packages(req, ctoken).await?.collect();
-            Ok(Box::new(broken.into_iter().chain(listed)) as Box<dyn Iterator<Item = _> + Send>)
-        })
-    }
-    fn get<'a>(
-        &'a self,
-        req: GetRequest,
-        ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
-        Box::pin(async move {
-            if self.broken.contains(&req.addr) {
-                return Err(GetError::Other(anyhow::anyhow!("go list: exit status 1")));
-            }
-            if let Some((target, through)) = &self.builds
-                && req.addr == *target
-            {
-                req.executor
-                    .result(through)
-                    .await
-                    .map_err(GetError::Other)?;
-            }
-            self.inner.get(req, ctoken).await
-        })
-    }
-    fn probe<'a>(
-        &'a self,
-        req: ProbeRequest,
-        ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
-        self.inner.probe(req, ctoken)
-    }
-}
 
 fn bash(addr: &str, run: &str, deps: &[&str], labels: &[&str]) -> Target {
     Target {
@@ -125,22 +38,27 @@ fn bash(addr: &str, run: &str, deps: &[&str], labels: &[&str]) -> Target {
     }
 }
 
+/// The static targets, plus the two ways the go provider makes discovery fail:
+/// `get` of `builds.0` builds `builds.1` first (resolving a package's targets
+/// runs its `_golist`), and every addr in `broken` is listed but fails to
+/// resolve.
 fn workspace(
     targets: Vec<Target>,
     builds: Option<(&str, &str)>,
     broken: &[&str],
 ) -> anyhow::Result<htestkit::Workspace> {
-    let provider = Discovering {
-        inner: pluginstatictarget::Provider::new(targets)?,
+    let faults = Faults {
         builds: match builds {
-            Some((t, b)) => Some((parse_addr(t)?, parse_addr(b)?)),
-            None => None,
+            Some((t, b)) => vec![(parse_addr(t)?, parse_addr(b)?)],
+            None => vec![],
         },
         broken: broken
             .iter()
             .map(|a| parse_addr(a))
             .collect::<anyhow::Result<_>>()?,
+        ..Default::default()
     };
+    let provider = FaultProvider::new(targets, faults)?;
     htestkit::WorkspaceBuilder::new()?
         .with_provider(move |_| Box::new(provider))
         .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))

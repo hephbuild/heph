@@ -1475,168 +1475,18 @@ mod tests {
     mod keep_going {
         use super::*;
         use crate::engine::discovery::{GapReport, Stage};
-        use crate::engine::provider::{
-            ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-            ListPackagesRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
-        };
-        use futures::future::BoxFuture;
-        use hcore::hasync::Cancellable;
+        use crate::engine::fault_provider::{FaultProvider, Faults};
         use std::time::Duration;
 
-        /// Where a [`Faulty`] provider fails. Packages and addrs are spelled
-        /// without the leading `//`'s package split: `"p"`, `"//p:b"`.
-        #[derive(Default)]
-        struct Faults {
-            get: Vec<&'static str>,
-            probe: Vec<&'static str>,
-            list: Vec<&'static str>,
-            list_packages: bool,
-            panic_list: Vec<&'static str>,
-            slow_list: Option<(&'static str, Duration)>,
-            /// `get` of these addrs builds `//gone:dep` first, which does not
-            /// exist: the candidate is real, its dependency is missing.
-            missing_dep: Vec<&'static str>,
-            /// Signalled when the slow `list` starts; every failing `get` waits
-            /// for it first, so the slow package is provably in flight when the
-            /// walk meets its first error.
-            gate: Option<Arc<tokio::sync::Notify>>,
-            /// At this stage, for this package or addr (ignored for
-            /// `Packages`): signal `started`, wait for the request to be
-            /// cancelled, then fail the way a call with two dependencies in
-            /// flight does — a `MultiError` of two cancellations.
-            cancel_at: Option<(Stage, &'static str, Arc<tokio::sync::Notify>)>,
+        /// `//p:b` and friends, for `Faults`' addr fields.
+        fn addrs(addrs: &[&str]) -> Vec<Addr> {
+            addrs
+                .iter()
+                .map(|a| hmodel::htaddr::parse_addr(a).expect("addr"))
+                .collect()
         }
 
-        impl Faults {
-            /// The cancellation failure, if `cancel_at` names this call.
-            async fn cancelled(
-                &self,
-                stage: Stage,
-                scope: &str,
-                ctoken: &(dyn Cancellable + Send + Sync),
-            ) -> Option<anyhow::Error> {
-                let (at, target, started) = self.cancel_at.as_ref()?;
-                if *at != stage || (stage != Stage::Packages && *target != scope) {
-                    return None;
-                }
-                started.notify_one();
-                ctoken.cancelled().await;
-                Some(
-                    crate::engine::error::MultiError(vec![
-                        anyhow::Error::new(CancelledError),
-                        anyhow::Error::new(CancelledError),
-                    ])
-                    .into(),
-                )
-            }
-        }
-
-        /// The static provider, failing on demand at each stage of discovery.
-        struct Faulty {
-            name: &'static str,
-            inner: pluginstatictarget::Provider,
-            faults: Faults,
-        }
-
-        impl Provider for Faulty {
-            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-                Ok(ConfigResponse {
-                    name: self.name.to_string(),
-                })
-            }
-            fn list<'a>(
-                &'a self,
-                req: ListRequest,
-                ctoken: &'a (dyn Cancellable + Send + Sync),
-            ) -> BoxFuture<
-                'a,
-                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
-            > {
-                Box::pin(async move {
-                    let pkg = req.package.as_str().to_string();
-                    if let Some(e) = self.faults.cancelled(Stage::List, &pkg, ctoken).await {
-                        return Err(e);
-                    }
-                    if let Some((slow, d)) = self.faults.slow_list
-                        && slow == pkg
-                    {
-                        if let Some(gate) = &self.faults.gate {
-                            gate.notify_one();
-                        }
-                        tokio::time::sleep(d).await;
-                    }
-                    if self.faults.panic_list.contains(&pkg.as_str()) {
-                        panic!("list blew up in {pkg}");
-                    }
-                    if self.faults.list.contains(&pkg.as_str()) {
-                        anyhow::bail!("evaluating {pkg}/BUILD: syntax error");
-                    }
-                    self.inner.list(req, ctoken).await
-                })
-            }
-            fn list_packages<'a>(
-                &'a self,
-                req: ListPackagesRequest,
-                ctoken: &'a (dyn Cancellable + Send + Sync),
-            ) -> BoxFuture<
-                'a,
-                anyhow::Result<
-                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
-                >,
-            > {
-                Box::pin(async move {
-                    if let Some(e) = self.faults.cancelled(Stage::Packages, "", ctoken).await {
-                        return Err(e);
-                    }
-                    if self.faults.list_packages {
-                        anyhow::bail!("walking the workspace: EACCES");
-                    }
-                    self.inner.list_packages(req, ctoken).await
-                })
-            }
-            fn get<'a>(
-                &'a self,
-                req: GetRequest,
-                ctoken: &'a (dyn Cancellable + Send + Sync),
-            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
-                Box::pin(async move {
-                    let addr = req.addr.format();
-                    if let Some(e) = self.faults.cancelled(Stage::Spec, &addr, ctoken).await {
-                        return Err(GetError::Other(e));
-                    }
-                    if self.faults.get.contains(&addr.as_str()) {
-                        if let Some(gate) = &self.faults.gate {
-                            gate.notified().await;
-                        }
-                        return Err(GetError::Other(anyhow::anyhow!("go list: exit status 1")));
-                    }
-                    if self.faults.missing_dep.contains(&addr.as_str()) {
-                        let dep =
-                            hmodel::htaddr::parse_addr("//gone:dep").map_err(GetError::Other)?;
-                        req.executor.result(&dep).await.map_err(GetError::Other)?;
-                    }
-                    self.inner.get(req, ctoken).await
-                })
-            }
-            fn probe<'a>(
-                &'a self,
-                req: ProbeRequest,
-                ctoken: &'a (dyn Cancellable + Send + Sync),
-            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
-                Box::pin(async move {
-                    let pkg = req.package.as_str().to_string();
-                    if let Some(e) = self.faults.cancelled(Stage::Probe, &pkg, ctoken).await {
-                        return Err(e);
-                    }
-                    if self.faults.probe.contains(&pkg.as_str()) {
-                        anyhow::bail!("BUILD: syntax error");
-                    }
-                    self.inner.probe(req, ctoken).await
-                })
-            }
-        }
-
-        /// An engine over one [`Faulty`] provider named `faulty`, plus any
+        /// An engine over one [`FaultProvider`] named `faulty`, plus any
         /// healthy static targets registered before it.
         fn faulty_engine(
             healthy: Vec<pluginstatictarget::Target>,
@@ -1658,11 +1508,7 @@ mod tests {
                 let provider = pluginstatictarget::Provider::new(healthy)?;
                 engine.register_provider(move |_| Box::new(provider))?;
             }
-            let provider = Faulty {
-                name: "faulty",
-                inner: pluginstatictarget::Provider::new(targets)?,
-                faults,
-            };
+            let provider = FaultProvider::new(targets, faults)?;
             engine.register_provider(move |_| Box::new(provider))?;
             Ok((Arc::new(engine), root))
         }
@@ -1710,7 +1556,7 @@ mod tests {
                     target("p", "c", &["x"]),
                 ],
                 Faults {
-                    get: vec!["//p:b"],
+                    fail_get: addrs(&["//p:b"]),
                     ..Default::default()
                 },
             )?;
@@ -1734,12 +1580,12 @@ mod tests {
                 vec![],
                 vec![target("p", "b", &["x"]), target("q", "slow", &["x"])],
                 Faults {
-                    get: vec!["//p:b"],
+                    fail_get: addrs(&["//p:b"]),
                     // `//p:b` fails only once `q`'s list has started, so `q` is
                     // in flight when the walk hits the error, however loaded
                     // the machine is.
                     gate: Some(Arc::new(tokio::sync::Notify::new())),
-                    slow_list: Some(("q", Duration::from_millis(300))),
+                    slow_list: Some(("q".to_string(), Duration::from_millis(300))),
                     ..Default::default()
                 },
             )?;
@@ -1767,7 +1613,7 @@ mod tests {
                 vec![target("p", "a", &[])],
                 vec![target("p", "z", &[])],
                 Faults {
-                    list: vec!["p"],
+                    fail_list: vec!["p".to_string()],
                     ..Default::default()
                 },
             )?;
@@ -1788,7 +1634,7 @@ mod tests {
                 vec![],
                 vec![target("p", "a", &[]), target("q", "b", &[])],
                 Faults {
-                    probe: vec!["q"],
+                    fail_probe: vec!["q".to_string()],
                     ..Default::default()
                 },
             )?;
@@ -1809,7 +1655,7 @@ mod tests {
                 vec![target("p", "a", &[])],
                 vec![target("q", "b", &[])],
                 Faults {
-                    list_packages: true,
+                    fail_list_packages: true,
                     ..Default::default()
                 },
             )?;
@@ -1842,7 +1688,7 @@ mod tests {
                     target("p", "c", &[]),
                 ],
                 Faults {
-                    get: vec!["//p:b"],
+                    fail_get: addrs(&["//p:b"]),
                     ..Default::default()
                 },
             )?;
@@ -1881,7 +1727,7 @@ mod tests {
                     vec![],
                     vec![target("p", "a", &["x"]), target("p", "b", &["x"])],
                     Faults {
-                        cancel_at: Some((stage, at, Arc::clone(&started))),
+                        cancel_at: Some((stage, at.to_string(), Arc::clone(&started))),
                         ..Default::default()
                     },
                 )?;
@@ -1949,7 +1795,11 @@ mod tests {
         async fn a_candidate_whose_dependency_is_missing_is_recorded() -> anyhow::Result<()> {
             let targets = || vec![target("p", "a", &["x"]), target("p", "b", &["x"])];
             let faults = || Faults {
-                missing_dep: vec!["//p:b"],
+                // `//p:b`'s `get` builds `//gone:dep`, which does not exist.
+                builds: vec![(
+                    addrs(&["//p:b"])[0].clone(),
+                    addrs(&["//gone:dep"])[0].clone(),
+                )],
                 ..Default::default()
             };
 
@@ -1987,7 +1837,7 @@ mod tests {
                     target("d", "w", &[]),
                 ],
                 Faults {
-                    probe: vec!["a"],
+                    fail_probe: vec!["a".to_string()],
                     ..Default::default()
                 },
             )?;
@@ -2008,7 +1858,7 @@ mod tests {
                 vec![],
                 vec![target("p", "a", &[]), target("q", "b", &[])],
                 Faults {
-                    panic_list: vec!["q"],
+                    panic_list: vec!["q".to_string()],
                     ..Default::default()
                 },
             )?;
@@ -2062,7 +1912,7 @@ mod tests {
                         .map(|i| target("p", &format!("t{i}"), &["x", "y"]))
                         .collect(),
                     Faults {
-                        get: vec!["//p:t3", "//p:t5", "//p:t7"],
+                        fail_get: addrs(&["//p:t3", "//p:t5", "//p:t7"]),
                         ..Default::default()
                     },
                 )?;

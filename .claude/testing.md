@@ -28,6 +28,16 @@ Qualifying seams:
 
 Not qualifying: engine semantics, cache correctness, provider or driver logic, anything about the graph. Those go in `crates/e2e`, where they run in seconds.
 
+## A provider that misbehaves
+
+Reach for `engine::fault_provider::FaultProvider` before writing a `Provider` impl in a test. It
+wraps the static provider and fails on demand at each stage of discovery — a `get` that builds
+another target first, a broken or unlisted target, a failing probe, list or package listing, a
+cancellation at a chosen stage, a slow listing gated against a failing `get` — and counts its
+`list_packages` calls. A new failure mode is one field on `Faults`, not another eighty-line impl
+(the test code had about 33 of those). Engine unit tests get it under `cfg(test)`; `crates/e2e`
+and the root crate's tests through the engine's `test-support` feature.
+
 Fixtures there use the harness in `crates/bin-e2e/tests/common/mod.rs` (`Dist`, `Workspace`, `write_manifest`) — a temp workspace with its own `HOME`, self-update and telemetry disabled. Locate artifacts through `Dist`; never hardcode a path into `target/`.
 
 ## Load harnesses

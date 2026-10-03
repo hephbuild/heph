@@ -22,10 +22,13 @@ this conversation is lost. Write it down now, in the place the next session will
 ## 2. Make the target complete
 
 A **design spec** has every section listed in CLAUDE.md under "Phases and hand-offs": Goal, Non-goals, Decisions, Tests, Files,
-Board, Open. Fill in or correct the ones this session touched. In particular:
+Accepted exemptions, Board, Open. Fill in or correct the ones this session touched. In particular:
 
 - **Tests** names each test and its layer (unit in the crate, `crates/e2e`, or `crates/bin-e2e`),
-  and says what it proves. These tests are the implementation's definition of done.
+  and says what it proves. These tests are the implementation's definition of done. Every case
+  the spec enumerates has a row, and every heuristic has its adversarial inputs listed.
+- **Accepted exemptions** lists each place the change does not hold its own rule, with each
+  design agent's verdict on it.
 - **Decisions** lists the settled decisions, each with the reason it was made, so the next session
   does not reopen them.
 - **Open** lists only real questions, each marked for the user or for implementation.
@@ -42,6 +45,14 @@ When a spec test was dropped or changed, the description says so.
 
 Publish or `gh pr edit` once, after all the edits are made.
 
+**Export a Docs spec to Markdown.** When the spec is a Claude Docs artifact, export it
+(`export`, `format: "markdown"`) to `~/.cache/heph-specs/<slug>.md` — not the session scratchpad,
+which the next session cannot see, and not the repo — and put that path in the next step's prompt
+next to the URL. The implementation session reads it
+by heading with `rg -n '^#'` and `sed -n`, and goes back to Docs only to append its Board rounds.
+Reading the doc itself costs a 34k-character guide plus a 57 KB XML node, and hand-converting
+that XML to text dropped a code block the spec depended on.
+
 ## 3. Save what is worth keeping
 
 A fact about the repo that cost time to find goes in the repo, not in memory. "X looks like a
@@ -53,8 +64,12 @@ next to the code. Memory is for the user's preferences.
 End with exactly one line the user can paste into a new session:
 
 ```
-/goal implement <spec-url>
+/goal implement <spec-url> (spec text: <exported .md path>)
 /goal get PR #<n> green and through review
 ```
+
+A spec with several PRs gets one line per PR, so each is built in its own context — stacked or
+not. Building every layer of a stack in one context is what grows it past 400k (CLAUDE.md, "One
+implementation context per stack layer").
 
 Do not keep working past the phase boundary in this session.
