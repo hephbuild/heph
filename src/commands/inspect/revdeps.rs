@@ -64,8 +64,14 @@ impl App for RevdepsApp {
         // in-scope targets records rich failures in `rs`, which `finalize`
         // prefers over the returned error.
         let out = BufferedStdout::new(&ctx);
+        let gaps = crate::engine::Gaps::new(crate::htquery::format(&scope));
         let res: anyhow::Result<()> = async {
-            let dependents = Arc::clone(&engine).revdeps(rs.clone(), addr, &scope);
+            let dependents = Arc::clone(&engine).revdeps(
+                rs.clone(),
+                addr,
+                &scope,
+                crate::engine::Discovery::keep_going_unless(fail_fast, &gaps),
+            );
             futures::pin_mut!(dependents);
             while let Some(dependent) = dependents.next().await {
                 out.println(dependent?.format());
@@ -75,7 +81,7 @@ impl App for RevdepsApp {
         .await;
         out.close().await;
 
-        crate::commands::errors::finalize!(ctx, rs, res)
+        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
     }
 }
 

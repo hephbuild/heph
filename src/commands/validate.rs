@@ -10,7 +10,7 @@ use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::engine::error::MultiError;
 use crate::engine::query::skip_unresolvable;
-use crate::engine::{Engine, get_cwp, get_root, gitignore};
+use crate::engine::{Discovery, Engine, Gaps, get_cwp, get_root, gitignore};
 use crate::htaddr::Addr;
 use crate::htmatcher::Matcher;
 use crate::htpkg::{self, PkgBuf};
@@ -57,6 +57,11 @@ impl App for ValidateApp {
             fail_fast,
         } = self;
         let rs = engine.new_state_with_events(fail_fast, ctx.event_sender());
+        // One sink for the link and overlap walks: a candidate both skip counts
+        // once. The `.gitignore` check stays complete — a short set would report
+        // a correct file as out of date.
+        let gaps = Gaps::new(crate::htquery::format(&matcher));
+        let discovery = Discovery::keep_going_unless(fail_fast, &gaps);
 
         // Overlap detection scopes to the user matcher when scoped, else uses the
         // codegen-tree selector (same one the gitignore enumeration uses).
@@ -104,7 +109,7 @@ impl App for ValidateApp {
             //    No execution — proves the graph is well-formed.
             let link_res: anyhow::Result<()> = async {
                 let addrs: Vec<Addr> = Arc::clone(&engine)
-                    .query(rs.clone(), &matcher)
+                    .query(rs.clone(), &matcher, discovery.clone())
                     .try_collect()
                     .await?;
                 let futs = addrs.iter().map(|addr| {
@@ -136,7 +141,7 @@ impl App for ValidateApp {
 
             // 2. Detect overlapping `codegen = copy` outputs.
             let overlap_res = Arc::clone(&engine)
-                .codegen_copy_overlaps(rs.clone(), &overlap_matcher)
+                .codegen_copy_overlaps(rs.clone(), &overlap_matcher, discovery.clone())
                 .await;
 
             // 3. Verify `.gitignore` is up to date (whole-workspace runs only).
@@ -198,7 +203,7 @@ impl App for ValidateApp {
         .await;
         out.close().await;
 
-        crate::commands::errors::finalize!(ctx, rs, res)
+        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
     }
 }
 

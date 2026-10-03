@@ -1,5 +1,7 @@
 use crate::engine::Engine;
+use crate::engine::discovery::{Discovery, Gaps, Stage, is_cancellation, provider_of};
 use crate::engine::error::{CancelledError, CycleError, TargetNotFoundError};
+use crate::engine::packages::merge_packages;
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
 use crate::engine::spec::EngineTargetSpec;
@@ -13,20 +15,56 @@ use hmodel::htpkg::PkgBuf;
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
+/// What one package's discovery task found: its candidates, in provider order,
+/// and under [`Discovery::KeepGoing`] whatever it could not resolve.
+#[derive(Default)]
+struct PackageScan {
+    candidates: Vec<Addr>,
+    skipped: Vec<Skip>,
+}
+
+/// One skipped scope, carried from a package task to the consumer, which owns
+/// the sink.
+struct Skip {
+    stage: Stage,
+    provider: String,
+    scope: String,
+    error: anyhow::Error,
+}
+
 impl Engine {
+    /// Every target matching `m`, streamed.
+    ///
+    /// `discovery` decides what a candidate that cannot be resolved costs the
+    /// walk — see [`Discovery`]. Under [`Discovery::KeepGoing`] the six places a
+    /// walk can fail (a provider's package listing, a package's probe, a
+    /// provider's `list`, and a candidate's spec or def where the matcher needs
+    /// them, plus `query_spec`'s spec) record into the sink and the walk
+    /// carries on. Never skipped, in either mode: cancellation, a panicked
+    /// package task, and a candidate that was never there (`TargetNotFound`, a
+    /// cycle back to the caller), which is silently dropped as before.
+    ///
+    /// The nested walk behind query targets
+    /// (`EngineProviderExecutor::query`) is a different function and is never
+    /// parameterized: its output reaches a def hash, so it is always complete.
     pub fn query<'a>(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         m: &'a htmatcher::Matcher,
+        discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         // A whole-graph selector (`//...` — a `PackagePrefix` rooted at the empty
         // package) enumerates every target, so its final match count is the total
         // graph size. Recorded for telemetry only when the stream is driven to
-        // completion: an early-dropped or errored stream never saw the full graph.
-        // Centralized here so every whole-graph caller (query, unscoped validate)
-        // is covered without per-command code.
+        // completion with nothing skipped: an early-dropped, errored or
+        // incomplete stream never saw the full graph. Centralized here so every
+        // whole-graph caller (query, unscoped validate) is covered without
+        // per-command code.
         let whole_graph = matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
         async_stream::try_stream! {
+            let gaps = discovery.gaps().cloned();
+            let keep_going = gaps.is_some();
+            let mut skipped_any = false;
             // Multiple providers can surface the same addr (or the same package
             // from `packages()`), so dedup before yielding.
             let mut seen: FxHashSet<Addr> = FxHashSet::default();
@@ -38,7 +76,14 @@ impl Engine {
             let executor: Arc<dyn hplugin::provider::ProviderExecutor> = Arc::new(
                 crate::engine::result::EngineProviderExecutor::for_list(Arc::downgrade(&self), rs.clone()),
             );
-            let pkgs: Vec<String> = self.packages(m, &rs).await?.collect::<anyhow::Result<_>>()?;
+            let pkgs: Vec<String> = match &gaps {
+                None => self.packages(m, &rs).await?.collect::<anyhow::Result<_>>()?,
+                Some(gaps) => {
+                    let (pkgs, skipped) = self.packages_keep_going(m, &rs, gaps).await?;
+                    skipped_any |= skipped;
+                    pkgs
+                }
+            };
 
             // Set when the walk is abandoning. `Buffered` refills its queue from
             // the underlying iterator on every poll, so a drain still *visits*
@@ -99,14 +144,15 @@ impl Engine {
             // arm needs the speculative cycle check to become shared state
             // first, which is a separate change.
             //
-            // `buffered`, never `buffer_unordered`: the emission order here is a
-            // build input. It carries through `pluginquery`'s `deps` into
-            // `plugingroup`, which folds `deps` in order into its def hash, so
-            // under `buffer_unordered` the def hash of a query group target
-            // would become a function of which BUILD file the OS scheduler
+            // `buffered`, never `buffer_unordered`: the emission order is what
+            // `heph query` prints and the order `Engine::result` admits targets
+            // in, and it must not depend on which BUILD file the OS scheduler
             // finished first. `buffered` yields in submission order, so the
             // sequence — and every candidate's position in it — is exactly the
-            // one the serial loop produced.
+            // one the serial loop produced. (The nested walk in
+            // `EngineProviderExecutor::query` makes the same choice for a
+            // stronger reason: its order carries through `pluginquery`'s `deps`
+            // into `plugingroup`, which folds them in order into a def hash.)
             let per_pkg = futures::stream::iter(pkgs.into_iter()
                 // Ends the source once the walk is abandoning, rather than
                 // letting `Buffered` keep refilling from it. `Buffered` pulls a
@@ -137,21 +183,33 @@ impl Engine {
                     // in `Engine::result`) to a cheap poll per remaining package
                     // instead of a package evaluation per remaining package.
                     //
-                    // `Err`, never `Ok(vec![])`: this sequence becomes
-                    // `pluginquery`'s `deps` and is folded in order into a def
-                    // hash, so returning "no candidates here" would silently
-                    // hash a *truncated* graph whose length depends on when the
-                    // cancel landed. A short answer is not an answer.
+                    // `Err`, never `Ok` with nothing in it: an empty package and a
+                    // package the walk never looked at must not read the same.
+                    // Under `KeepGoing` a package that could not be scanned is
+                    // a recorded skip the command reports; a cancelled one is
+                    // neither, it ends the walk.
                     if rs.ctoken().is_cancelled()
                         || stop.load(std::sync::atomic::Ordering::Relaxed)
                     {
                         return Err(anyhow::Error::new(CancelledError));
                     }
-                    let mut candidates: Vec<Addr> = Vec::new();
-                    let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
+                    let mut scan = PackageScan::default();
+                    let states = match Arc::clone(&engine).probe_segments(&rs, &pkg).await {
+                        Ok(states) => states,
+                        Err(e) if keep_going && !is_cancellation(&rs, &e) => {
+                            scan.skipped.push(Skip {
+                                stage: Stage::Probe,
+                                provider: provider_of(&e).to_string(),
+                                scope: format!("//{pkg}"),
+                                error: e,
+                            });
+                            return Ok(scan);
+                        }
+                        Err(e) => return Err(e),
+                    };
 
                     for provider in &engine.providers {
-                        let it = provider.provider.list(ListRequest {
+                        let listed = provider.provider.list(ListRequest {
                             request_id: rs.request_id().to_string(),
                             package: pkg.clone(),
                             states: states
@@ -160,18 +218,33 @@ impl Engine {
                                 .cloned()
                                 .collect(),
                             executor: Arc::clone(&executor),
-                        }, rs.ctoken()).await?;
-                        // The iterator is not `Send`; drain it before the next await.
-                        let raw: Vec<_> = it.collect::<anyhow::Result<Vec<_>>>()?;
+                        }, rs.ctoken()).await
+                            // Drained before the next await.
+                            .and_then(|it| it.collect::<anyhow::Result<Vec<_>>>());
+                        let raw = match listed {
+                            Ok(raw) => raw,
+                            // The other providers' candidates in this package
+                            // are still good.
+                            Err(e) if keep_going && !is_cancellation(&rs, &e) => {
+                                scan.skipped.push(Skip {
+                                    stage: Stage::List,
+                                    provider: provider.name.clone(),
+                                    scope: format!("//{pkg}"),
+                                    error: e,
+                                });
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
 
                         for item in raw {
                             if item.addr.package == pkg {
-                                candidates.push(item.addr);
+                                scan.candidates.push(item.addr);
                             }
                         }
                     }
 
-                    anyhow::Ok(candidates)
+                    anyhow::Ok(scan)
                 }))
             }))
             // Each package runs as its own task, not merely as a future inside
@@ -222,31 +295,29 @@ impl Engine {
             });
             futures::pin_mut!(per_pkg);
 
-            loop {
-                let candidates = match per_pkg.next().await {
-                    None => break,
-                    Some(Ok(candidates)) => candidates,
-                    // Never `?` straight out: inside `try_stream!` that yields the
-                    // error and *returns*, leaving up to K-1 package tasks running
-                    // with an `Arc<RequestState>` each. They would finish and
-                    // release it — spawning means they are no longer strandable —
-                    // but not before `Engine::result` has returned, so the request
-                    // would deregister late and `drain_bg`, which waits on
-                    // `bg_pending` rather than on detached tasks, would race it.
-                    // Flag the walk as abandoning (which ends the source, so
-                    // nothing further is spawned) and join what is already running
-                    // before propagating.
-                    Some(Err(e)) => {
-                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                        while per_pkg.next().await.is_some() {}
-                        Err(e)?;
-                        // Not reached: `Err(e)?` in a `try_stream!` body yields
-                        // the error and returns. Present because the match arm
-                        // still has to produce a value.
-                        break;
-                    }
+            // Every way out of the walk on an error goes through this one value,
+            // never through `?` straight out: inside `try_stream!` that yields
+            // the error and *returns*, leaving up to K-1 package tasks running
+            // with an `Arc<RequestState>` each. They would finish and release it
+            // — spawning means they are no longer strandable — but not before
+            // `Engine::result` has returned, so the request would deregister
+            // late and `drain_bg`, which waits on `bg_pending` rather than on
+            // detached tasks, would race it. So the walk is flagged as
+            // abandoning (which ends the source, so nothing further is spawned)
+            // and what is already running is joined before propagating.
+            let fatal: Option<anyhow::Error> = 'walk: loop {
+                let scan = match per_pkg.next().await {
+                    None => break 'walk None,
+                    Some(Ok(scan)) => scan,
+                    Some(Err(e)) => break 'walk Some(e),
                 };
-                for addr in candidates {
+                if let Some(gaps) = &gaps {
+                    for skip in scan.skipped {
+                        skipped_any = true;
+                        gaps.record(skip.stage, &skip.provider, skip.scope, &skip.error);
+                    }
+                }
+                for addr in scan.candidates {
                     match m.matches_addr(&addr) {
                         MatchResult::MatchYes => {
                             if seen.insert(addr.clone()) { yield addr; }
@@ -261,11 +332,21 @@ impl Engine {
                             // also records the engine-level exposure across walks.
                             let spec_rs = rs.speculative();
                             let spec = match Arc::clone(&self).get_spec(spec_rs.clone(), &addr).await {
-                                Ok(spec) => Ok(spec),
+                                Ok(spec) => spec,
+                                // A candidate that was never there. (Any not-found in
+                                // the chain reads as this one: `get_spec_no_track`
+                                // rewrites it to the candidate's own addr.)
                                 Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => continue,
                                 Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => continue,
-                                res => res,
-                            }?;
+                                Err(e) => match &gaps {
+                                    Some(gaps) if !is_cancellation(&rs, &e) => {
+                                        skipped_any = true;
+                                        gaps.record(Stage::Spec, provider_of(&e), addr.format(), &e);
+                                        continue;
+                                    }
+                                    _ => break 'walk Some(e),
+                                },
+                            };
 
                             match crate::engine::matcher_spec::match_spec(m, &spec) {
                                 MatchResult::MatchYes => {
@@ -278,7 +359,14 @@ impl Engine {
                                         // Cycle means this candidate transitively depends on the
                                         // query caller — it cannot be a result. Skip it.
                                         Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => continue,
-                                        Err(e) => Err(e)?,
+                                        Err(e) => match &gaps {
+                                            Some(gaps) if !is_cancellation(&rs, &e) => {
+                                                skipped_any = true;
+                                                gaps.record(Stage::Def, &spec.provider, addr.format(), &e);
+                                                continue;
+                                            }
+                                            _ => break 'walk Some(e),
+                                        },
                                     };
 
                                     if crate::engine::matcher_target::match_target(
@@ -294,12 +382,52 @@ impl Engine {
                         }
                     }
                 }
+            };
+
+            if let Some(e) = fatal {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                while per_pkg.next().await.is_some() {}
+                Err(e)?;
             }
 
-            if whole_graph {
+            if whole_graph && !skipped_any {
                 htelemetry::telemetry::record_graph_size(seen.len() as u64);
             }
         }
+    }
+
+    /// [`Engine::packages`] for a keep-going walk: every provider whose listing
+    /// succeeded, merged the same way, with each failed listing recorded in
+    /// `gaps`. The `bool` is whether anything was recorded.
+    ///
+    /// Reads the same memoized per-provider cells and never writes a short list
+    /// into them, so `states_under` — which reaches a def hash — still sees the
+    /// failure as an `Err`.
+    async fn packages_keep_going(
+        &self,
+        m: &htmatcher::Matcher,
+        rs: &Arc<RequestState>,
+        gaps: &Gaps,
+    ) -> anyhow::Result<(Vec<String>, bool)> {
+        let mut listed = Vec::with_capacity(self.providers.len());
+        let mut skipped = false;
+        let lists = self.provider_packages(m, rs).await;
+        for (provider, res) in self.providers.iter().zip(lists) {
+            match res {
+                Ok(pkgs) => listed.push(pkgs),
+                Err(e) if is_cancellation(rs, &e) => return Err(e),
+                Err(e) => {
+                    skipped = true;
+                    gaps.record(
+                        Stage::Packages,
+                        &provider.name,
+                        "all packages".to_string(),
+                        &e,
+                    );
+                }
+            }
+        }
+        Ok((merge_packages(m, &listed), skipped))
     }
 
     /// [`Engine::query`] one tier up: the **spec** of every target matching `m`,
@@ -314,10 +442,14 @@ impl Engine {
     /// Specs are resolved off the addr stream with a bounded in-flight set and
     /// yielded in completion order, so nothing is materialized in bulk: a
     /// whole-graph selector can be many thousands of addrs.
+    ///
+    /// Under [`Discovery::KeepGoing`] a matched candidate whose spec fails is
+    /// recorded and dropped like any other skip, rather than ending the stream.
     pub fn query_spec<'a>(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         m: &'a htmatcher::Matcher,
+        discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Arc<EngineTargetSpec>>> + 'a {
         // Cap in-flight spec resolutions; the engine's own semaphores gate the
         // real work, this just bounds the orchestration set held off the stream.
@@ -325,12 +457,22 @@ impl Engine {
             .map(|n| n.get())
             .unwrap_or(1)
             .saturating_mul(2);
+        let gaps = discovery.gaps().cloned();
 
         Arc::clone(&self)
-            .query(rs.clone(), m)
+            .query(rs.clone(), m, discovery)
             .map_ok(move |addr| {
-                enclose!((self => engine, rs) async move {
-                    skip_unresolvable(&addr, engine.get_spec(rs, &addr).await)
+                enclose!((self => engine, rs, gaps) async move {
+                    match skip_unresolvable(&addr, engine.get_spec(rs.clone(), &addr).await) {
+                        Err(e) => match &gaps {
+                            Some(gaps) if !is_cancellation(&rs, &e) => {
+                                gaps.record(Stage::Spec, provider_of(&e), addr.format(), &e);
+                                Ok(None)
+                            }
+                            _ => Err(e),
+                        },
+                        res => res,
+                    }
                 })
             })
             .try_buffer_unordered(concurrency)
@@ -504,7 +646,11 @@ mod tests {
 
         let rs = engine.new_state();
         let specs: Vec<Arc<EngineTargetSpec>> = engine
-            .query_spec(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .query_spec(
+                rs,
+                &Matcher::PackagePrefix(PkgBuf::from("")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
 
@@ -618,7 +764,11 @@ mod tests {
 
         let rs = engine.new_state();
         let addrs: Vec<Addr> = engine
-            .query(rs, &Matcher::Package(PkgBuf::from("foo")))
+            .query(
+                rs,
+                &Matcher::Package(PkgBuf::from("foo")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
 
@@ -637,7 +787,11 @@ mod tests {
 
         let rs = engine.new_state();
         let addrs: Vec<Addr> = engine
-            .query(rs, &Matcher::Package(PkgBuf::from("foo/bar")))
+            .query(
+                rs,
+                &Matcher::Package(PkgBuf::from("foo/bar")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
 
@@ -657,7 +811,11 @@ mod tests {
 
         let rs = engine.new_state();
         let addrs: Vec<Addr> = engine
-            .query(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .query(
+                rs,
+                &Matcher::PackagePrefix(PkgBuf::from("")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
         assert_eq!(addrs.len(), 3);
@@ -679,7 +837,7 @@ mod tests {
         let rs = engine.new_state();
         let target_addr = Addr::new(PkgBuf::from("foo"), "a".to_string(), Default::default());
         let addrs: Vec<Addr> = engine
-            .query(rs, &Matcher::Addr(target_addr))
+            .query(rs, &Matcher::Addr(target_addr), Discovery::Complete)
             .try_collect()
             .await?;
 
@@ -694,7 +852,7 @@ mod tests {
 
         let rs = engine.new_state();
         let addrs: Vec<Addr> = engine
-            .query(rs, &Matcher::Label("lint".to_string()))
+            .query(rs, &Matcher::Label("lint".to_string()), Discovery::Complete)
             .try_collect()
             .await?;
 
@@ -801,7 +959,11 @@ mod tests {
         let rs = engine.new_state();
 
         let _: Vec<Addr> = engine
-            .query(rs, &Matcher::Package(PkgBuf::from("a/b/c")))
+            .query(
+                rs,
+                &Matcher::Package(PkgBuf::from("a/b/c")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
 
@@ -938,7 +1100,10 @@ mod tests {
         let engine = Arc::new(engine);
         let rs = engine.new_state();
 
-        let _: Vec<Addr> = engine.query(rs, &m).try_collect().await?;
+        let _: Vec<Addr> = engine
+            .query(rs, &m, Discovery::Complete)
+            .try_collect()
+            .await?;
 
         let mut out = listed.lock().unwrap().clone();
         out.sort();
@@ -1164,7 +1329,11 @@ mod tests {
         let rs = engine.new_state();
         let start = std::time::Instant::now();
         let addrs: Vec<Addr> = Arc::clone(&engine)
-            .query(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .query(
+                rs,
+                &Matcher::PackagePrefix(PkgBuf::from("")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
         let elapsed = start.elapsed();
@@ -1220,7 +1389,11 @@ mod tests {
 
         let rs = engine.new_state();
         let addrs: Vec<Addr> = Arc::clone(&engine)
-            .query(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .query(
+                rs,
+                &Matcher::PackagePrefix(PkgBuf::from("")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
 
@@ -1259,7 +1432,11 @@ mod tests {
 
         let rs = engine.new_state();
         let addrs: Vec<Addr> = Arc::clone(&engine)
-            .query(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .query(
+                rs,
+                &Matcher::PackagePrefix(PkgBuf::from("")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
 
@@ -1281,11 +1458,640 @@ mod tests {
 
         let rs = engine.new_state();
         let addrs: Vec<Addr> = engine
-            .query(rs, &Matcher::Package(PkgBuf::from("nonexistent")))
+            .query(
+                rs,
+                &Matcher::Package(PkgBuf::from("nonexistent")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
 
         assert!(addrs.is_empty());
         Ok(())
+    }
+
+    // ─── Keep-going discovery ────────────────────────────────────────────────
+
+    mod keep_going {
+        use super::*;
+        use crate::engine::discovery::{GapReport, Stage};
+        use crate::engine::provider::{
+            ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+            ListPackagesRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
+        };
+        use futures::future::BoxFuture;
+        use hcore::hasync::Cancellable;
+        use std::time::Duration;
+
+        /// Where a [`Faulty`] provider fails. Packages and addrs are spelled
+        /// without the leading `//`'s package split: `"p"`, `"//p:b"`.
+        #[derive(Default)]
+        struct Faults {
+            get: Vec<&'static str>,
+            probe: Vec<&'static str>,
+            list: Vec<&'static str>,
+            list_packages: bool,
+            panic_list: Vec<&'static str>,
+            slow_list: Option<(&'static str, Duration)>,
+            /// `get` of these addrs builds `//gone:dep` first, which does not
+            /// exist: the candidate is real, its dependency is missing.
+            missing_dep: Vec<&'static str>,
+            /// Signalled when the slow `list` starts; every failing `get` waits
+            /// for it first, so the slow package is provably in flight when the
+            /// walk meets its first error.
+            gate: Option<Arc<tokio::sync::Notify>>,
+            /// At this stage, for this package or addr (ignored for
+            /// `Packages`): signal `started`, wait for the request to be
+            /// cancelled, then fail the way a call with two dependencies in
+            /// flight does — a `MultiError` of two cancellations.
+            cancel_at: Option<(Stage, &'static str, Arc<tokio::sync::Notify>)>,
+        }
+
+        impl Faults {
+            /// The cancellation failure, if `cancel_at` names this call.
+            async fn cancelled(
+                &self,
+                stage: Stage,
+                scope: &str,
+                ctoken: &(dyn Cancellable + Send + Sync),
+            ) -> Option<anyhow::Error> {
+                let (at, target, started) = self.cancel_at.as_ref()?;
+                if *at != stage || (stage != Stage::Packages && *target != scope) {
+                    return None;
+                }
+                started.notify_one();
+                ctoken.cancelled().await;
+                Some(
+                    crate::engine::error::MultiError(vec![
+                        anyhow::Error::new(CancelledError),
+                        anyhow::Error::new(CancelledError),
+                    ])
+                    .into(),
+                )
+            }
+        }
+
+        /// The static provider, failing on demand at each stage of discovery.
+        struct Faulty {
+            name: &'static str,
+            inner: pluginstatictarget::Provider,
+            faults: Faults,
+        }
+
+        impl Provider for Faulty {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: self.name.to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                req: ListRequest,
+                ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async move {
+                    let pkg = req.package.as_str().to_string();
+                    if let Some(e) = self.faults.cancelled(Stage::List, &pkg, ctoken).await {
+                        return Err(e);
+                    }
+                    if let Some((slow, d)) = self.faults.slow_list
+                        && slow == pkg
+                    {
+                        if let Some(gate) = &self.faults.gate {
+                            gate.notify_one();
+                        }
+                        tokio::time::sleep(d).await;
+                    }
+                    if self.faults.panic_list.contains(&pkg.as_str()) {
+                        panic!("list blew up in {pkg}");
+                    }
+                    if self.faults.list.contains(&pkg.as_str()) {
+                        anyhow::bail!("evaluating {pkg}/BUILD: syntax error");
+                    }
+                    self.inner.list(req, ctoken).await
+                })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                req: ListPackagesRequest,
+                ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                Box::pin(async move {
+                    if let Some(e) = self.faults.cancelled(Stage::Packages, "", ctoken).await {
+                        return Err(e);
+                    }
+                    if self.faults.list_packages {
+                        anyhow::bail!("walking the workspace: EACCES");
+                    }
+                    self.inner.list_packages(req, ctoken).await
+                })
+            }
+            fn get<'a>(
+                &'a self,
+                req: GetRequest,
+                ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async move {
+                    let addr = req.addr.format();
+                    if let Some(e) = self.faults.cancelled(Stage::Spec, &addr, ctoken).await {
+                        return Err(GetError::Other(e));
+                    }
+                    if self.faults.get.contains(&addr.as_str()) {
+                        if let Some(gate) = &self.faults.gate {
+                            gate.notified().await;
+                        }
+                        return Err(GetError::Other(anyhow::anyhow!("go list: exit status 1")));
+                    }
+                    if self.faults.missing_dep.contains(&addr.as_str()) {
+                        let dep =
+                            hmodel::htaddr::parse_addr("//gone:dep").map_err(GetError::Other)?;
+                        req.executor.result(&dep).await.map_err(GetError::Other)?;
+                    }
+                    self.inner.get(req, ctoken).await
+                })
+            }
+            fn probe<'a>(
+                &'a self,
+                req: ProbeRequest,
+                ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                Box::pin(async move {
+                    let pkg = req.package.as_str().to_string();
+                    if let Some(e) = self.faults.cancelled(Stage::Probe, &pkg, ctoken).await {
+                        return Err(e);
+                    }
+                    if self.faults.probe.contains(&pkg.as_str()) {
+                        anyhow::bail!("BUILD: syntax error");
+                    }
+                    self.inner.probe(req, ctoken).await
+                })
+            }
+        }
+
+        /// An engine over one [`Faulty`] provider named `faulty`, plus any
+        /// healthy static targets registered before it.
+        fn faulty_engine(
+            healthy: Vec<pluginstatictarget::Target>,
+            targets: Vec<pluginstatictarget::Target>,
+            faults: Faults,
+        ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+            let root = tempdir()?;
+            let mut engine = Engine::new(Config {
+                root: root.path().to_path_buf(),
+                home_dir: std::path::PathBuf::new(),
+                parallelism: None,
+                ..Default::default()
+            })?;
+            // For the def stage: a target naming any other driver fails `parse`.
+            engine.register_managed_driver(|_| {
+                Box::new(hplugin_exec::pluginexec::Driver::new_exec())
+            })?;
+            if !healthy.is_empty() {
+                let provider = pluginstatictarget::Provider::new(healthy)?;
+                engine.register_provider(move |_| Box::new(provider))?;
+            }
+            let provider = Faulty {
+                name: "faulty",
+                inner: pluginstatictarget::Provider::new(targets)?,
+                faults,
+            };
+            engine.register_provider(move |_| Box::new(provider))?;
+            Ok((Arc::new(engine), root))
+        }
+
+        async fn walk(
+            engine: &Arc<Engine>,
+            m: &Matcher,
+            discovery: Discovery,
+        ) -> anyhow::Result<Vec<String>> {
+            let rs = engine.new_state();
+            Arc::clone(engine)
+                .query(rs, m, discovery)
+                .map_ok(|a| a.format())
+                .try_collect()
+                .await
+        }
+
+        fn label(l: &str) -> Matcher {
+            Matcher::Label(l.to_string())
+        }
+
+        /// (stage, provider, count, example scopes) per group.
+        fn groups(report: &GapReport) -> Vec<(Stage, &str, usize, Vec<&str>)> {
+            report
+                .groups
+                .iter()
+                .map(|g| {
+                    (
+                        g.stage,
+                        g.provider.as_str(),
+                        g.count,
+                        g.examples.iter().map(|e| e.scope.as_str()).collect(),
+                    )
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn keep_going_skips_a_candidate_whose_spec_fails() -> anyhow::Result<()> {
+            let (engine, _root) = faulty_engine(
+                vec![],
+                vec![
+                    target("p", "a", &["x"]),
+                    target("p", "b", &["x"]),
+                    target("p", "c", &["x"]),
+                ],
+                Faults {
+                    get: vec!["//p:b"],
+                    ..Default::default()
+                },
+            )?;
+            let gaps = Gaps::new("label(x)");
+            let got = walk(&engine, &label("x"), Discovery::KeepGoing(gaps.clone())).await?;
+            assert_eq!(got, ["//p:a", "//p:c"]);
+            let report = gaps.report();
+            assert_eq!(report.skipped, 1);
+            assert_eq!(groups(&report), [(Stage::Spec, "faulty", 1, vec!["//p:b"])]);
+            assert_eq!(report.groups[0].examples[0].cause, "go list: exit status 1");
+            Ok(())
+        }
+
+        /// `Complete` keeps today's answer — the first error fails the walk —
+        /// and, from the label-check arm too, joins the package tasks already
+        /// running before it returns, so none outlives the walk holding the
+        /// request.
+        #[tokio::test]
+        async fn complete_mode_fails_on_the_first_error_and_drains() -> anyhow::Result<()> {
+            let (engine, _root) = faulty_engine(
+                vec![],
+                vec![target("p", "b", &["x"]), target("q", "slow", &["x"])],
+                Faults {
+                    get: vec!["//p:b"],
+                    // `//p:b` fails only once `q`'s list has started, so `q` is
+                    // in flight when the walk hits the error, however loaded
+                    // the machine is.
+                    gate: Some(Arc::new(tokio::sync::Notify::new())),
+                    slow_list: Some(("q", Duration::from_millis(300))),
+                    ..Default::default()
+                },
+            )?;
+            let rs = engine.new_state();
+            let res: anyhow::Result<Vec<Addr>> = Arc::clone(&engine)
+                .query(rs.clone(), &label("x"), Discovery::Complete)
+                .try_collect()
+                .await;
+            let err = res.expect_err("the first failure fails a complete walk");
+            assert!(
+                format!("{err:#}").contains("go list: exit status 1"),
+                "{err:#}"
+            );
+            assert_eq!(
+                Arc::strong_count(&rs),
+                1,
+                "a package task was still running, holding the request"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn keep_going_keeps_other_providers_when_one_list_fails() -> anyhow::Result<()> {
+            let (engine, _root) = faulty_engine(
+                vec![target("p", "a", &[])],
+                vec![target("p", "z", &[])],
+                Faults {
+                    list: vec!["p"],
+                    ..Default::default()
+                },
+            )?;
+            let gaps = Gaps::new("//p");
+            let m = Matcher::Package(PkgBuf::from("p"));
+            let got = walk(&engine, &m, Discovery::KeepGoing(gaps.clone())).await?;
+            assert_eq!(got, ["//p:a"]);
+            assert_eq!(
+                groups(&gaps.report()),
+                [(Stage::List, "faulty", 1, vec!["//p"])]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn keep_going_skips_a_package_whose_probe_fails() -> anyhow::Result<()> {
+            let (engine, _root) = faulty_engine(
+                vec![],
+                vec![target("p", "a", &[]), target("q", "b", &[])],
+                Faults {
+                    probe: vec!["q"],
+                    ..Default::default()
+                },
+            )?;
+            let gaps = Gaps::new("//...");
+            let m = Matcher::PackagePrefix(PkgBuf::from(""));
+            let got = walk(&engine, &m, Discovery::KeepGoing(gaps.clone())).await?;
+            assert_eq!(got, ["//p:a"]);
+            assert_eq!(
+                groups(&gaps.report()),
+                [(Stage::Probe, "faulty", 1, vec!["//q"])]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn keep_going_survives_a_provider_whose_list_packages_fails() -> anyhow::Result<()> {
+            let (engine, _root) = faulty_engine(
+                vec![target("p", "a", &[])],
+                vec![target("q", "b", &[])],
+                Faults {
+                    list_packages: true,
+                    ..Default::default()
+                },
+            )?;
+            let gaps = Gaps::new("//...");
+            let m = Matcher::PackagePrefix(PkgBuf::from(""));
+            let got = walk(&engine, &m, Discovery::KeepGoing(gaps.clone())).await?;
+            assert_eq!(got, ["//p:a"]);
+            assert_eq!(
+                groups(&gaps.report()),
+                [(Stage::Packages, "faulty", 1, vec!["all packages"])]
+            );
+            // `Engine::packages` itself never answers short: it reads the same
+            // memoized cell and still fails, so `states_under` cannot hash a
+            // partial package set.
+            let rs = engine.new_state();
+            assert!(engine.packages(&m, &rs).await.is_err());
+            Ok(())
+        }
+
+        /// Point 6: `//...` decides every candidate from its address, so the
+        /// walk itself resolves no spec — `query_spec` does, after the match.
+        #[tokio::test]
+        async fn query_spec_keeps_going_past_a_matched_candidate_whose_spec_fails()
+        -> anyhow::Result<()> {
+            let (engine, _root) = faulty_engine(
+                vec![],
+                vec![
+                    target("p", "a", &[]),
+                    target("p", "b", &[]),
+                    target("p", "c", &[]),
+                ],
+                Faults {
+                    get: vec!["//p:b"],
+                    ..Default::default()
+                },
+            )?;
+            let gaps = Gaps::new("//...");
+            let rs = engine.new_state();
+            let m = Matcher::PackagePrefix(PkgBuf::from(""));
+            let mut got: Vec<String> = Arc::clone(&engine)
+                .query_spec(rs, &m, Discovery::KeepGoing(gaps.clone()))
+                .map_ok(|s| s.addr.format())
+                .try_collect()
+                .await?;
+            got.sort();
+            assert_eq!(got, ["//p:a", "//p:c"]);
+            assert_eq!(
+                groups(&gaps.report()),
+                [(Stage::Spec, "faulty", 1, vec!["//p:b"])]
+            );
+            Ok(())
+        }
+
+        /// A call cancelled with two dependencies in flight fails with a
+        /// `MultiError` the typed downcast does not look inside; the request
+        /// token says what it is. At every stage that can record a skip, it
+        /// ends the walk instead, unrecorded — otherwise Ctrl-C would turn into
+        /// thousands of skips and an "incomplete selection".
+        #[tokio::test]
+        async fn cancellation_is_never_recorded() -> anyhow::Result<()> {
+            for (stage, at) in [
+                (Stage::Packages, ""),
+                (Stage::Probe, "p"),
+                (Stage::List, "p"),
+                (Stage::Spec, "//p:b"),
+            ] {
+                let started = Arc::new(tokio::sync::Notify::new());
+                let (engine, _root) = faulty_engine(
+                    vec![],
+                    vec![target("p", "a", &["x"]), target("p", "b", &["x"])],
+                    Faults {
+                        cancel_at: Some((stage, at, Arc::clone(&started))),
+                        ..Default::default()
+                    },
+                )?;
+                let gaps = Gaps::new("label(x)");
+                let rs = engine.new_state();
+                let walk = tokio::spawn({
+                    let (engine, rs, gaps) = (Arc::clone(&engine), Arc::clone(&rs), gaps.clone());
+                    async move {
+                        let m = label("x");
+                        engine
+                            .query(rs, &m, Discovery::KeepGoing(gaps))
+                            .try_collect::<Vec<Addr>>()
+                            .await
+                    }
+                });
+                started.notified().await;
+                rs.ctoken().cancel();
+                let res = tokio::time::timeout(Duration::from_secs(10), walk).await??;
+                assert!(
+                    res.is_err(),
+                    "{stage:?}: a cancelled walk is not a complete one"
+                );
+                assert!(gaps.is_empty(), "{stage:?}: {:?}", gaps.report());
+            }
+            Ok(())
+        }
+
+        /// The sixth point: a candidate whose spec resolves but whose def does
+        /// not, under a matcher that needs the def (`tree_output()`). Grouped
+        /// under the provider that produced the spec.
+        #[tokio::test]
+        async fn keep_going_skips_a_candidate_whose_def_fails() -> anyhow::Result<()> {
+            let codegen = |name: &str, driver: &str| pluginstatictarget::Target {
+                addr: format!("//p:{name}"),
+                driver: driver.to_string(),
+                run: Some("true".to_string()),
+                out: HashMap::from([(String::new(), vec![format!("{name}.go")])]),
+                codegen: Some("copy".to_string()),
+                ..Default::default()
+            };
+            let targets = || vec![codegen("a", "exec"), codegen("b", "no-such-driver")];
+            let m = Matcher::TreeOutputTo(PkgBuf::from(""));
+
+            let (engine, _root) = faulty_engine(vec![], targets(), Faults::default())?;
+            let gaps = Gaps::new("tree_output()");
+            let got = walk(&engine, &m, Discovery::KeepGoing(gaps.clone())).await?;
+            assert_eq!(got, ["//p:a"]);
+            assert_eq!(
+                groups(&gaps.report()),
+                [(Stage::Def, "faulty", 1, vec!["//p:b"])]
+            );
+
+            let (engine, _root) = faulty_engine(vec![], targets(), Faults::default())?;
+            assert!(
+                walk(&engine, &m, Discovery::Complete).await.is_err(),
+                "a complete walk still fails on it"
+            );
+            Ok(())
+        }
+
+        /// A candidate whose `get` builds a dependency that does not exist (a
+        /// `_golist` whose input is gone) is a real candidate that could not be
+        /// checked: recorded, with the missing addr in its cause.
+        #[tokio::test]
+        async fn a_candidate_whose_dependency_is_missing_is_recorded() -> anyhow::Result<()> {
+            let targets = || vec![target("p", "a", &["x"]), target("p", "b", &["x"])];
+            let faults = || Faults {
+                missing_dep: vec!["//p:b"],
+                ..Default::default()
+            };
+
+            let (engine, _root) = faulty_engine(vec![], targets(), faults())?;
+            let gaps = Gaps::new("label(x)");
+            let got = walk(&engine, &label("x"), Discovery::KeepGoing(gaps.clone())).await?;
+            assert_eq!(got, ["//p:a"]);
+            let report = gaps.report();
+            assert_eq!(groups(&report), [(Stage::Spec, "faulty", 1, vec!["//p:b"])]);
+            assert!(
+                report.groups[0].examples[0].cause.contains("//gone:dep"),
+                "{report:?}"
+            );
+
+            let (engine, _root) = faulty_engine(vec![], targets(), faults())?;
+            assert!(
+                walk(&engine, &label("x"), Discovery::Complete)
+                    .await
+                    .is_err(),
+                "a complete walk fails on it"
+            );
+            Ok(())
+        }
+
+        /// `probe_segments` probes a package's ancestors, so one broken
+        /// `a/BUILD` takes every package under `a` with it — each counted once.
+        #[tokio::test]
+        async fn an_ancestor_probe_failure_skips_every_package_under_it() -> anyhow::Result<()> {
+            let (engine, _root) = faulty_engine(
+                vec![],
+                vec![
+                    target("a", "x", &[]),
+                    target("a/b", "y", &[]),
+                    target("a/b/c", "z", &[]),
+                    target("d", "w", &[]),
+                ],
+                Faults {
+                    probe: vec!["a"],
+                    ..Default::default()
+                },
+            )?;
+            let gaps = Gaps::new("//...");
+            let m = Matcher::PackagePrefix(PkgBuf::from(""));
+            let got = walk(&engine, &m, Discovery::KeepGoing(gaps.clone())).await?;
+            assert_eq!(got, ["//d:w"]);
+            assert_eq!(
+                groups(&gaps.report()),
+                [(Stage::Probe, "faulty", 3, vec!["//a", "//a/b", "//a/b/c"])]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn panicked_package_task_stays_fatal_in_keep_going() -> anyhow::Result<()> {
+            let (engine, _root) = faulty_engine(
+                vec![],
+                vec![target("p", "a", &[]), target("q", "b", &[])],
+                Faults {
+                    panic_list: vec!["q"],
+                    ..Default::default()
+                },
+            )?;
+            let gaps = Gaps::new("//...");
+            let m = Matcher::PackagePrefix(PkgBuf::from(""));
+            let err = walk(&engine, &m, Discovery::KeepGoing(gaps.clone()))
+                .await
+                .expect_err("a panic is a bug, not a gap");
+            assert!(format!("{err:#}").contains("panicked"), "{err:#}");
+            assert!(gaps.is_empty());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn healthy_walk_output_is_byte_identical_under_keep_going() -> anyhow::Result<()> {
+            let targets = || {
+                vec![
+                    target("a", "one", &["x"]),
+                    target("a", "two", &[]),
+                    target("a/b", "three", &["x"]),
+                    target("c", "four", &["x"]),
+                    target("c", "five", &["y"]),
+                ]
+            };
+            for m in [
+                label("x"),
+                Matcher::PackagePrefix(PkgBuf::from("")),
+                Matcher::And(vec![label("x"), Matcher::PackagePrefix(PkgBuf::from("a"))]),
+            ] {
+                let (engine, _root) = faulty_engine(vec![], targets(), Faults::default())?;
+                let complete = walk(&engine, &m, Discovery::Complete).await?;
+                let (engine, _root) = faulty_engine(vec![], targets(), Faults::default())?;
+                let gaps = Gaps::new("");
+                let kept = walk(&engine, &m, Discovery::KeepGoing(gaps.clone())).await?;
+                assert_eq!(complete, kept);
+                assert!(gaps.is_empty());
+            }
+            Ok(())
+        }
+
+        /// `heph validate` runs several walks on one request into one sink: a
+        /// candidate every walk fails on counts once, and the report is the
+        /// same however the runs went.
+        #[tokio::test]
+        async fn three_walks_report_each_skip_once_and_deterministically() -> anyhow::Result<()> {
+            let mut reports = Vec::new();
+            for reversed in [false, true] {
+                let (engine, _root) = faulty_engine(
+                    vec![],
+                    (0..8)
+                        .map(|i| target("p", &format!("t{i}"), &["x", "y"]))
+                        .collect(),
+                    Faults {
+                        get: vec!["//p:t3", "//p:t5", "//p:t7"],
+                        ..Default::default()
+                    },
+                )?;
+                let gaps = Gaps::new("validate");
+                let rs = engine.new_state();
+                let mut matchers = vec![
+                    label("x"),
+                    label("y"),
+                    Matcher::And(vec![label("x"), Matcher::PackagePrefix(PkgBuf::from(""))]),
+                ];
+                // The second engine runs the walks in the other order.
+                if reversed {
+                    matchers.reverse();
+                }
+                for m in matchers {
+                    let _: Vec<Addr> = Arc::clone(&engine)
+                        .query(rs.clone(), &m, Discovery::KeepGoing(gaps.clone()))
+                        .try_collect()
+                        .await?;
+                }
+                reports.push(gaps.report());
+            }
+            assert_eq!(reports[0], reports[1]);
+            assert_eq!(reports[0].skipped, 3);
+            assert_eq!(
+                groups(&reports[0]),
+                [(Stage::Spec, "faulty", 3, vec!["//p:t3", "//p:t5", "//p:t7"])]
+            );
+            Ok(())
+        }
     }
 }

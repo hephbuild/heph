@@ -188,7 +188,12 @@ async fn targets_in(
     pkg: &PkgBuf,
 ) -> anyhow::Result<Vec<String>> {
     let m = Matcher::Package(pkg.clone());
-    let stream = engine.clone().query(rs.clone(), &m);
+    // A shell completion offers what it found and never fails a keystroke; the
+    // sink is dropped and nothing is printed.
+    let gaps = crate::engine::Gaps::new(String::new());
+    let stream = engine
+        .clone()
+        .query(rs.clone(), &m, crate::engine::Discovery::KeepGoing(gaps));
     tokio::pin!(stream);
 
     let mut names = Vec::new();

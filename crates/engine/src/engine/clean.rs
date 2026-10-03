@@ -41,6 +41,7 @@
 //! concurrent reader or builder in this or another process.
 
 use crate::engine::Engine;
+use crate::engine::discovery::Discovery;
 use crate::engine::request_state::RequestState;
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
@@ -128,10 +129,16 @@ impl Engine {
     /// Per-target failures are logged and counted in
     /// [`CleanStats::errored`] — the run never aborts partway and leaves the user
     /// wondering which half of their cache is gone.
+    ///
+    /// `discovery` applies to the graph path only. Under
+    /// [`Discovery::KeepGoing`] its skips land in the caller's sink, not in the
+    /// private request the walk runs on, so the command can report the clean as
+    /// partial after that request is gone.
     pub async fn clean(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         matcher: &Matcher,
+        discovery: Discovery,
     ) -> Result<CleanStats> {
         let mut run = CleanRun {
             set: JoinSet::new(),
@@ -175,7 +182,10 @@ impl Engine {
             // has to finish before a single delete starts. See
             // `resolve_selection`: the walk holds read locks that the deletes
             // would deadlock against.
-            for addr in Arc::clone(&self).resolve_selection(&rs, matcher).await? {
+            for addr in Arc::clone(&self)
+                .resolve_selection(&rs, matcher, discovery)
+                .await?
+            {
                 Arc::clone(&self).submit(&mut run, &rs, addr).await;
             }
         }
@@ -209,14 +219,17 @@ impl Engine {
     /// fire when it drops — concurrently with the write locks the deletes are
     /// taking.
     ///
-    /// An error propagates instead of cleaning the prefix that resolved. A
-    /// half-walked selection can only *under*-delete, which is safe but silent —
-    /// and "I ran clean and it kept some entries" is a far worse thing to debug
-    /// than a run that says it failed.
+    /// Under [`Discovery::Complete`] an error propagates instead of cleaning the
+    /// prefix that resolved. A half-walked selection can only *under*-delete,
+    /// which is safe but silent — and "I ran clean and it kept some entries" is a
+    /// far worse thing to debug than a run that says it failed. Under
+    /// [`Discovery::KeepGoing`] it is no longer silent: what the walk skipped is
+    /// in the caller's sink, and the command reports the clean as partial.
     async fn resolve_selection(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
         matcher: &Matcher,
+        discovery: Discovery,
     ) -> Result<Vec<Addr>> {
         let resolve_rs = self.new_state_full(
             false,
@@ -232,7 +245,7 @@ impl Engine {
             // Scoped so the stream — which holds its own `resolve_rs` handle —
             // is dropped before the explicit release below, rather than at the
             // end of the function.
-            let stream = Arc::clone(&self).query(resolve_rs.clone(), matcher);
+            let stream = Arc::clone(&self).query(resolve_rs.clone(), matcher, discovery);
             tokio::pin!(stream);
             while let Some(addr) = stream
                 .try_next()
@@ -390,7 +403,7 @@ mod tests {
 
         let rs = engine.new_state();
         let stats = Arc::clone(&engine)
-            .clean(rs, &Matcher::Addr(a.clone()))
+            .clean(rs, &Matcher::Addr(a.clone()), Discovery::Complete)
             .await
             .expect("clean");
 
@@ -421,7 +434,7 @@ mod tests {
 
         let rs = engine.new_state();
         let stats = Arc::clone(&engine)
-            .clean(rs, &Matcher::Addr(victim.clone()))
+            .clean(rs, &Matcher::Addr(victim.clone()), Discovery::Complete)
             .await
             .expect("clean");
 
@@ -443,7 +456,11 @@ mod tests {
 
         let rs = engine.new_state();
         let stats = Arc::clone(&engine)
-            .clean(rs, &Matcher::PackagePrefix(PkgBuf::from("cmd")))
+            .clean(
+                rs,
+                &Matcher::PackagePrefix(PkgBuf::from("cmd")),
+                Discovery::Complete,
+            )
             .await
             .expect("clean");
 
@@ -477,7 +494,7 @@ mod tests {
 
         let rs = engine.new_state();
         let stats = Arc::clone(&engine)
-            .clean(rs, &Matcher::Addr(plain.clone()))
+            .clean(rs, &Matcher::Addr(plain.clone()), Discovery::Complete)
             .await
             .expect("clean");
 
@@ -491,7 +508,11 @@ mod tests {
         // …and the package matcher does take both.
         let rs = engine.new_state();
         let stats = Arc::clone(&engine)
-            .clean(rs, &Matcher::Package(PkgBuf::from("pkg")))
+            .clean(
+                rs,
+                &Matcher::Package(PkgBuf::from("pkg")),
+                Discovery::Complete,
+            )
             .await
             .expect("clean");
         assert_eq!(stats.revisions_removed, 1, "only the variant was left");
@@ -509,7 +530,7 @@ mod tests {
 
         let rs = engine.new_state();
         let stats = Arc::clone(&engine)
-            .clean(rs, &everything())
+            .clean(rs, &everything(), Discovery::Complete)
             .await
             .expect("clean");
 
@@ -531,12 +552,12 @@ mod tests {
 
         let rs = engine.new_state();
         Arc::clone(&engine)
-            .clean(rs, &everything())
+            .clean(rs, &everything(), Discovery::Complete)
             .await
             .expect("first clean");
         let rs = engine.new_state();
         let stats = Arc::clone(&engine)
-            .clean(rs, &everything())
+            .clean(rs, &everything(), Discovery::Complete)
             .await
             .expect("second clean");
 
@@ -554,7 +575,11 @@ mod tests {
 
         let rs = engine.new_state();
         let stats = Arc::clone(&engine)
-            .clean(rs, &Matcher::Package(PkgBuf::from("nowhere")))
+            .clean(
+                rs,
+                &Matcher::Package(PkgBuf::from("nowhere")),
+                Discovery::Complete,
+            )
             .await
             .expect("clean");
 
@@ -598,7 +623,7 @@ mod tests {
 
         let rs = engine.new_state();
         let by_label = Arc::clone(&engine)
-            .clean(rs, &Matcher::Label("test".to_string()))
+            .clean(rs, &Matcher::Label("test".to_string()), Discovery::Complete)
             .await
             .expect("clean by label");
         assert_eq!(by_label, CleanStats::default(), "{by_label:?}");
@@ -606,11 +631,67 @@ mod tests {
 
         let rs = engine.new_state();
         let by_pkg = Arc::clone(&engine)
-            .clean(rs, &Matcher::Package(PkgBuf::from("pkg")))
+            .clean(
+                rs,
+                &Matcher::Package(PkgBuf::from("pkg")),
+                Discovery::Complete,
+            )
             .await
             .expect("clean by package");
         assert_eq!(by_pkg.revisions_removed, 1, "{by_pkg:?}");
         assert!(!present(&engine, &a, "h1"));
+    }
+
+    /// `clean` resolves a graph selection on a private request that is gone by
+    /// the time it returns. What that walk could not resolve lands in the
+    /// caller's sink instead, and what did resolve is still cleaned.
+    #[tokio::test]
+    async fn clean_forwards_skips_to_the_callers_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })
+        .expect("engine");
+        let good = addr("good");
+        let provider = hbuiltins::pluginstatictarget::Provider::new(vec![
+            hbuiltins::pluginstatictarget::Target {
+                addr: good.format(),
+                driver: "exec".to_string(),
+                labels: vec!["x".to_string()],
+                ..Default::default()
+            },
+        ])
+        .expect("provider");
+        engine
+            .register_provider(move |_| Box::new(provider))
+            .expect("register");
+        engine
+            .register_provider(|_| {
+                Box::new(crate::engine::discovery::test_support::Unresolvable {
+                    addrs: vec![addr("bad")],
+                })
+            })
+            .expect("register");
+        let engine = Arc::new(engine);
+        write_revision(&engine, &good, "h1", 100, &["out.tar"]);
+
+        let gaps = crate::engine::Gaps::new("label(x)");
+        let stats = Arc::clone(&engine)
+            .clean(
+                engine.new_state(),
+                &Matcher::Label("x".to_string()),
+                Discovery::KeepGoing(gaps.clone()),
+            )
+            .await
+            .expect("a partial selection still cleans what matched");
+        assert_eq!(stats.revisions_removed, 1, "{stats:?}");
+        assert!(!present(&engine, &good, "h1"));
+        let report = gaps.report();
+        assert_eq!(report.skipped, 1, "{report:?}");
+        assert_eq!(report.groups[0].examples[0].scope, "//pkg:bad");
     }
 
     #[tokio::test]
@@ -628,7 +709,10 @@ mod tests {
             Matcher::Not(Box::new(Matcher::PackagePrefix(PkgBuf::from("vendor")))),
         ]);
         let rs = engine.new_state();
-        let stats = Arc::clone(&engine).clean(rs, &m).await.expect("clean");
+        let stats = Arc::clone(&engine)
+            .clean(rs, &m, Discovery::Complete)
+            .await
+            .expect("clean");
 
         assert_eq!(stats.revisions_removed, 1);
         assert!(present(&engine, &keep, "h1"));
@@ -699,7 +783,7 @@ mod tests {
 
         let rs = engine.new_state();
         let stats = Arc::clone(&engine)
-            .clean(rs, &everything())
+            .clean(rs, &everything(), Discovery::Complete)
             .await
             .expect("clean");
         assert_eq!(stats.targets_cleaned, 12, "{stats:?}");
@@ -732,7 +816,7 @@ mod tests {
         let cleaner = tokio::spawn({
             let engine = Arc::clone(&engine);
             let m = Matcher::Addr(a.clone());
-            async move { engine.clean(rs, &m).await }
+            async move { engine.clean(rs, &m, Discovery::Complete).await }
         });
 
         // While the lock is held the revision must survive. A sleep is the only

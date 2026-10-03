@@ -25,7 +25,11 @@ async fn test_labels_over_a_module_with_no_go_files() -> anyhow::Result<()> {
     let labels = ws
         .engine
         .clone()
-        .labels(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+        .labels(
+            rs,
+            &Matcher::PackagePrefix(PkgBuf::from("")),
+            heph::engine::Discovery::Complete,
+        )
         .await?;
 
     // Not vacuous: the walk really did resolve specs. `go-build` comes from the

@@ -10,7 +10,9 @@ use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
 use crate::commands::utils::resolve_matcher;
-use crate::engine::{Engine, InteractiveWrapper, OutputMatcher, ResultOptions, get_cwp};
+use crate::engine::{
+    Discovery, Engine, Gaps, InteractiveWrapper, OutputMatcher, ResultOptions, get_cwp,
+};
 use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, LogSink};
 
@@ -200,6 +202,10 @@ impl App for RunApp {
             None
         };
 
+        // What the selector walk could not resolve. The run builds what it did
+        // resolve, then reports the rest and exits non-zero; `--fail-fast` keeps
+        // today's all-or-nothing walk instead.
+        let gaps = Gaps::new(crate::htquery::format(&self.matcher));
         let opts = ResultOptions {
             // `--no-scratch` implies `--force`; the engine applies that from
             // `no_scratch` below, so it is not repeated here.
@@ -208,6 +214,7 @@ impl App for RunApp {
             interactive,
             frozen: self.args.frozen,
             no_scratch: self.scratch_off,
+            discovery: Discovery::keep_going_unless(self.fail_fast, &gaps),
         };
         // In the interactive TUI the prompt renders on the live view and `y`/`n`
         // resolve it; otherwise the notice prints to stderr and the decision is
@@ -257,13 +264,24 @@ impl App for RunApp {
                 // registry didn't record exits 0 in silence. See `fold_batch`.
                 .and_then(crate::commands::errors::fold_batch)
                 // A selector that chose nothing is a failed run, not a
-                // successful empty one — see `require_non_empty`.
-                .and_then(crate::commands::errors::require_non_empty),
+                // successful empty one — see `require_non_empty`. Unless the
+                // walk skipped something: then the skips are the answer, not
+                // "check your selector".
+                .and_then(|results| {
+                    crate::commands::errors::require_non_empty_unless_incomplete(results, &gaps)
+                }),
         };
 
         // On success print `--cat-out` / `--list-out`; failures/cancellation are
         // rendered and turned into the right exit by the macro.
-        crate::commands::errors::finalize!(ctx, rs, res, result => {
+        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps, result => {
+            // Outputs are handed over only for a complete selection, exactly
+            // as for one where a target failed: `--copy-out` into a directory
+            // holding an earlier complete run would otherwise leave the
+            // skipped targets' old outputs next to the new ones. (Not a
+            // `return`: this block runs inside `finalize!`, which still has
+            // to turn the skips into the exit.)
+            let result = if gaps.is_empty() { result } else { Vec::new() };
             if self.args.cat_out {
                 for r in &result {
                     for a in &r.artifacts {

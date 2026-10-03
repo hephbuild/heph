@@ -110,10 +110,10 @@ pub enum ScratchCommands {
 }
 
 impl ScratchArgs {
-    pub fn execute(&self, _sink: LogSink) -> anyhow::Result<()> {
+    pub fn execute(&self, _sink: LogSink, fail_fast: bool) -> anyhow::Result<()> {
         match &self.command {
             ScratchCommands::Ls => bootstrap::block_on(ls())?,
-            ScratchCommands::Head { addr } => bootstrap::block_on(head(addr))?,
+            ScratchCommands::Head { addr } => bootstrap::block_on(head(addr, fail_fast))?,
             ScratchCommands::Path { addr } => bootstrap::block_on(path(addr))?,
             ScratchCommands::Rm { addr, all } => bootstrap::block_on(rm(addr.as_deref(), *all))?,
             ScratchCommands::Push {
@@ -123,7 +123,7 @@ impl ScratchArgs {
                 producer,
             } => bootstrap::block_on(push(addr.as_deref(), *all, *force, producer.clone()))?,
             ScratchCommands::Pull { addr, all } => {
-                bootstrap::block_on(pull(addr.as_deref(), *all))?
+                bootstrap::block_on(pull(addr.as_deref(), *all, fail_fast))?
             }
         }
     }
@@ -245,18 +245,22 @@ fn local_trace(
     out
 }
 
-async fn head(addr: &str) -> anyhow::Result<()> {
+async fn head(addr: &str, fail_fast: bool) -> anyhow::Result<()> {
     let (engine, _shutdown) = bootstrap::new_engine()?;
-    let (found_addr, def) = declared_scratches(&engine)
+    let gaps = crate::engine::Gaps::new("//...");
+    let discovery = crate::engine::Discovery::keep_going_unless(fail_fast, &gaps);
+    let found = declared_scratches(&engine, discovery)
         .await?
         .into_iter()
-        .find(|(a, _)| a.format() == addr)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no `scratch` target named {addr}. `heph query -e '//...'` lists what the \
-                 workspace declares"
-            )
-        })?;
+        .find(|(a, _)| a.format() == addr);
+    let Some((found_addr, def)) = found else {
+        // It may be behind what the walk could not resolve.
+        crate::commands::errors::require_complete_selection(&gaps)?;
+        anyhow::bail!(
+            "no `scratch` target named {addr}. `heph query -e '//...'` lists what the \
+             workspace declares"
+        );
+    };
 
     let slot = crate::engine::scratch::ResolvedScratch {
         addr: found_addr.clone(),
@@ -493,23 +497,26 @@ async fn push(addr: Option<&str>, all: bool, force: bool, producer: String) -> a
 /// would make the command useless in its only real use case. Costs a spec
 /// resolution per target, which is why this is a rare explicit command and not
 /// something a build does.
+///
+/// Keeps going past what will not resolve, into `gaps`: one broken package must
+/// not make the whole workspace unwarmable, and the caller reports what was
+/// skipped once it has acted on the rest.
 async fn declared_scratches(
     engine: &std::sync::Arc<crate::engine::Engine>,
+    discovery: crate::engine::Discovery,
 ) -> anyhow::Result<Vec<(crate::htaddr::Addr, hbuiltins::pluginscratch::ScratchDef)>> {
-    use futures::StreamExt as _;
+    use futures::TryStreamExt as _;
 
     // Every package: the workspace-wide selector `clean` and the gitignore walk
     // already use.
     let matcher = crate::htmatcher::Matcher::PackagePrefix(crate::htpkg::PkgBuf::from(""));
+    // `new_state()` defaults to fail-fast, which says nothing about whether
+    // this walk may come up short: the caller decides that, from `--fail-fast`.
     let rs = engine.new_state();
-    let mut stream = Box::pin(std::sync::Arc::clone(engine).query_spec(rs, &matcher));
+    let mut stream = Box::pin(std::sync::Arc::clone(engine).query_spec(rs, &matcher, discovery));
 
     let mut out = Vec::new();
-    while let Some(spec) = stream.next().await {
-        // A target whose spec will not resolve is not this command's problem — it
-        // is reported by anything that actually builds it. Skipping keeps one
-        // broken package from making the whole workspace unwarmable.
-        let Ok(spec) = spec else { continue };
+    while let Some(spec) = stream.try_next().await? {
         if spec.driver != hbuiltins::pluginscratch::DRIVER_NAME {
             continue;
         }
@@ -521,13 +528,15 @@ async fn declared_scratches(
     Ok(out)
 }
 
-async fn pull(addr: Option<&str>, all: bool) -> anyhow::Result<()> {
+async fn pull(addr: Option<&str>, all: bool, fail_fast: bool) -> anyhow::Result<()> {
     if all == addr.is_some() {
         anyhow::bail!("pass either an address or --all, not both or neither");
     }
     let (engine, _shutdown) = bootstrap::new_engine()?;
+    let gaps = crate::engine::Gaps::new("//...");
+    let discovery = crate::engine::Discovery::keep_going_unless(fail_fast, &gaps);
 
-    let selected: Vec<_> = declared_scratches(&engine)
+    let selected: Vec<_> = declared_scratches(&engine, discovery)
         .await?
         .into_iter()
         .filter(|(a, def)| match addr {
@@ -541,6 +550,8 @@ async fn pull(addr: Option<&str>, all: bool) -> anyhow::Result<()> {
         .collect();
 
     if selected.is_empty() {
+        // Nothing found may only mean it was behind what could not resolve.
+        crate::commands::errors::require_complete_selection(&gaps)?;
         match addr {
             Some(want) => anyhow::bail!(
                 "no `scratch` target named {want}. `heph query -e '//...'` lists what the \
@@ -599,7 +610,8 @@ async fn pull(addr: Option<&str>, all: bool) -> anyhow::Result<()> {
             Err(err) => println!("{addr}: FAILED — {err:#}"),
         }
     }
-    Ok(())
+    // What resolved was fetched; what did not is reported, and fails the run.
+    crate::commands::errors::require_complete_selection(&gaps)
 }
 
 #[cfg(test)]
@@ -813,5 +825,134 @@ mod tests {
         let (name, _) = describe(&entry(None));
         assert!(name.contains("abc123"), "{name}");
         assert!(name.contains("unknown"), "{name}");
+    }
+
+    /// Lists `//broken:x` and cannot resolve it.
+    struct BrokenLister;
+
+    impl crate::engine::provider::Provider for BrokenLister {
+        fn config(
+            &self,
+            _req: crate::engine::provider::ConfigRequest,
+        ) -> anyhow::Result<crate::engine::provider::ConfigResponse> {
+            Ok(crate::engine::provider::ConfigResponse {
+                name: "broken".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            req: crate::engine::provider::ListRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<
+                Box<
+                    dyn Iterator<Item = anyhow::Result<crate::engine::provider::ListResponse>>
+                        + Send,
+                >,
+            >,
+        > {
+            let items: Vec<_> = (req.package.as_str() == "broken")
+                .then(|| {
+                    Ok(crate::engine::provider::ListResponse {
+                        addr: crate::htaddr::parse_addr("//broken:x").expect("addr"),
+                    })
+                })
+                .into_iter()
+                .collect();
+            Box::pin(async move {
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: crate::engine::provider::ListPackagesRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<
+                Box<
+                    dyn Iterator<
+                            Item = anyhow::Result<crate::engine::provider::ListPackageResponse>,
+                        > + Send,
+                >,
+            >,
+        > {
+            Box::pin(async {
+                let pkgs = vec![Ok(crate::engine::provider::ListPackageResponse {
+                    pkg: crate::htpkg::PkgBuf::from("broken"),
+                })];
+                Ok(Box::new(pkgs.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            req: crate::engine::provider::GetRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<crate::engine::provider::GetResponse, crate::engine::provider::GetError>,
+        > {
+            let broken = req.addr.format() == "//broken:x";
+            Box::pin(async move {
+                if broken {
+                    Err(crate::engine::provider::GetError::Other(anyhow::anyhow!(
+                        "go list: exit status 1"
+                    )))
+                } else {
+                    Err(crate::engine::provider::GetError::NotFound)
+                }
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: crate::engine::provider::ProbeRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<crate::engine::provider::ProbeResponse>>
+        {
+            Box::pin(async { Ok(crate::engine::provider::ProbeResponse { states: vec![] }) })
+        }
+    }
+
+    /// `declared_scratches` walks on `Engine::new_state()`, whose request is
+    /// fail-fast. Keep-going is decided at the call site, not read from that
+    /// flag, so one broken package still leaves the rest of the workspace
+    /// warmable — and is reported rather than silently dropped.
+    #[tokio::test]
+    async fn scratch_keeps_going_under_the_default_request_state() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = crate::engine::Engine::new(crate::engine::Config {
+            root: root.path().to_path_buf(),
+            home_dir: root.path().join(".heph3"),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let provider = hbuiltins::pluginstatictarget::Provider::new(vec![
+            hbuiltins::pluginstatictarget::Target {
+                addr: "//cache:go".to_string(),
+                driver: hbuiltins::pluginscratch::DRIVER_NAME.to_string(),
+                ..Default::default()
+            },
+        ])?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        engine.register_provider(|_| Box::new(BrokenLister))?;
+        let engine = std::sync::Arc::new(engine);
+        assert!(engine.new_state().fail_fast());
+
+        let gaps = crate::engine::Gaps::new("//...");
+        let found = declared_scratches(
+            &engine,
+            crate::engine::Discovery::keep_going_unless(false, &gaps),
+        )
+        .await?;
+        let addrs: Vec<String> = found.iter().map(|(a, _)| a.format()).collect();
+        assert_eq!(addrs, ["//cache:go"]);
+        let report = gaps.report();
+        assert_eq!(report.skipped, 1, "{report:?}");
+        assert!(
+            crate::commands::errors::require_complete_selection(&gaps).is_err(),
+            "the command exits non-zero on what it skipped"
+        );
+        Ok(())
     }
 }

@@ -238,7 +238,12 @@ async fn test_query_by_label_finds_codegen_target_go_first() -> anyhow::Result<(
         Matcher::Package(PkgBuf::from("")),
     ]);
     let rs = ws.engine.new_state();
-    let addrs: Vec<heph::htaddr::Addr> = ws.engine.clone().query(rs, &m).try_collect().await?;
+    let addrs: Vec<heph::htaddr::Addr> = ws
+        .engine
+        .clone()
+        .query(rs, &m, heph::engine::Discovery::Complete)
+        .try_collect()
+        .await?;
 
     let formatted: Vec<String> = addrs.iter().map(|a| a.format()).collect();
     assert!(

@@ -1,4 +1,5 @@
 use crate::engine::Engine;
+use crate::engine::discovery::{Discovery, InProvider};
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{
@@ -199,26 +200,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                                 {
                                     return Err(anyhow::Error::new(CancelledError));
                                 }
-                                rs.data
-                                    .mem_probe_inner
-                                    .once(
-                                        (provider.name.clone(), pkg.clone()),
-                                        enclose!((provider, rs, pkg) move || async move {
-                                            let res = provider
-                                                .provider
-                                                .probe(
-                                                    ProbeRequest {
-                                                        request_id: rs.request_id().to_string(),
-                                                        package: pkg,
-                                                    },
-                                                    rs.ctoken(),
-                                                )
-                                                .await?;
-                                            Ok(Arc::new(res.states))
-                                        }),
-                                    )
-                                    .await
-                                    .map_err(unwrap_arc_err)
+                                Engine::probe_one(&rs, &provider, &pkg).await
                             })
                         })
                         .buffered(crate::engine::fanout::discovery_concurrency());
@@ -927,6 +909,12 @@ pub struct ResultOptions {
     /// key: scratch never reaches `hashin`, so a divergence surfaces as a
     /// rebuilt-`hashout` mismatch rather than as two unrelated entries.
     pub no_scratch: bool,
+    /// What [`Engine::result`]'s selector walk does with a candidate it cannot
+    /// resolve. Read by `Engine::result` alone; a single-addr resolution has no
+    /// walk. Defaults to [`Discovery::Complete`], today's all-or-nothing walk,
+    /// so an API caller that does not ask for keep-going does not get a
+    /// silently partial batch.
+    pub discovery: Discovery,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1743,8 +1731,9 @@ impl Engine {
         let walk =
             hcore::hmemoizer::spawn_with_cycle_ctx(enclose!((self => engine, rs, owns_matched) {
                 let matcher = matcher.clone();
+                let discovery = opts.discovery.clone();
                 async move {
-                    let stream = engine.query(rs.clone(), &matcher);
+                    let stream = engine.query(rs.clone(), &matcher, discovery);
                     tokio::pin!(stream);
                     loop {
                         match stream.try_next().await {
@@ -3968,6 +3957,47 @@ impl Engine {
     /// Outer memoize per `pkg` (so repeat callers within a request share the result),
     /// inner memoize per `(provider_name, probe_pkg)` so a given provider is probed at
     /// most once per package per request.
+    /// One provider's probe of one package, memoized per request.
+    ///
+    /// The only place a `mem_probe_inner` cell is filled — `probe_segments` and
+    /// `states_under` both come through here — so a cell's value, and the
+    /// error a keep-going walk groups by provider, never depend on which
+    /// caller got there first.
+    pub(crate) async fn probe_one(
+        rs: &Arc<RequestState>,
+        provider: &Arc<crate::engine::engine::Provider>,
+        pkg: &PkgBuf,
+    ) -> anyhow::Result<Arc<Vec<State>>> {
+        rs.data
+            .mem_probe_inner
+            .once(
+                (provider.name.clone(), pkg.clone()),
+                enclose!((provider, rs, pkg) move || async move {
+                    let res = provider
+                        .provider
+                        .probe(
+                            ProbeRequest {
+                                request_id: rs.request_id().to_string(),
+                                package: pkg.clone(),
+                            },
+                            rs.ctoken(),
+                        )
+                        .await
+                        // Built on failure only: a healthy walk probes every
+                        // (provider, package) pair.
+                        .map_err(|e| {
+                            e.context(InProvider {
+                                provider: provider.name.clone(),
+                                what: format!("probing package `//{pkg}`"),
+                            })
+                        })?;
+                    Ok(Arc::new(res.states))
+                }),
+            )
+            .await
+            .map_err(unwrap_arc_err)
+    }
+
     pub async fn probe_segments(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
@@ -3984,27 +4014,7 @@ impl Engine {
                     let mut acc: Vec<State> = Vec::new();
                     for probe_pkg in pkg.parent_packages() {
                         for provider in engine.providers.iter() {
-                            let inner = rs
-                                .data
-                                .mem_probe_inner
-                                .once(
-                                    (provider.name.clone(), probe_pkg.clone()),
-                                    enclose!((provider, rs, probe_pkg) move || async move {
-                                        let res = provider
-                                            .provider
-                                            .probe(
-                                                ProbeRequest {
-                                                    request_id: rs.request_id().to_string(),
-                                                    package: probe_pkg,
-                                                },
-                                                rs.ctoken(),
-                                            )
-                                            .await?;
-                                        Ok(Arc::new(res.states))
-                                    }),
-                                )
-                                .await
-                                .map_err(unwrap_arc_err)?;
+                            let inner = Self::probe_one(&rs, provider, &probe_pkg).await?;
                             acc.extend(inner.iter().cloned());
                         }
                     }
@@ -4064,8 +4074,13 @@ impl Engine {
                     // Attach the target so the failure is traceable even in
                     // non-tui output, where the addr isn't otherwise shown. The
                     // context wraps but preserves the chain, so downstream typed
-                    // downcasts still work.
-                    return Err(e.context(format!("resolving target `{addr}`")));
+                    // downcasts still work. Typed, so a keep-going walk can say
+                    // which provider's `get` failed: past the plugin boundary
+                    // the cause itself is a flattened string.
+                    return Err(e.context(InProvider {
+                        provider: provider.name.clone(),
+                        what: format!("resolving target `{addr}`"),
+                    }));
                 }
             };
 
@@ -5123,7 +5138,11 @@ mod tests {
         let rs = engine.new_state();
 
         let addrs: Vec<Addr> = SArc::clone(&engine)
-            .query(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .query(
+                rs,
+                &Matcher::PackagePrefix(PkgBuf::from("")),
+                Discovery::Complete,
+            )
             .try_collect()
             .await?;
 
@@ -7306,7 +7325,7 @@ mod tests {
 
         let matcher = Matcher::TreeOutputTo(PkgBuf::from("gen/dst"));
         let addrs: Vec<Addr> = SArc::clone(&engine)
-            .query(rs, &matcher)
+            .query(rs, &matcher, Discovery::Complete)
             .try_collect()
             .await?;
 
@@ -7474,7 +7493,7 @@ mod tests {
         // consumer awaits `get_spec` — and therefore a permit — between batches.
         let matcher = Matcher::Label("nope".to_string());
         let walk = SArc::clone(&engine)
-            .query(rs, &matcher)
+            .query(rs, &matcher, Discovery::Complete)
             .try_collect::<Vec<Addr>>();
 
         let addrs = tokio::time::timeout(Duration::from_secs(20), walk)
@@ -7616,7 +7635,7 @@ mod tests {
 
         let matcher = Matcher::PackagePrefix(PkgBuf::from(""));
         let err = SArc::clone(&engine)
-            .query(rs, &matcher)
+            .query(rs, &matcher, Discovery::Complete)
             .try_collect::<Vec<Addr>>()
             .await
             .expect_err(
@@ -7724,7 +7743,7 @@ mod tests {
 
         let matcher = Matcher::PackagePrefix(PkgBuf::from(""));
         let err = SArc::clone(&engine)
-            .query(rs, &matcher)
+            .query(rs, &matcher, Discovery::Complete)
             .try_collect::<Vec<Addr>>()
             .await
             .expect_err(
@@ -7840,7 +7859,7 @@ mod tests {
 
         let rs = engine.new_state();
         let matcher = Matcher::PackagePrefix(PkgBuf::from(""));
-        let stream = SArc::clone(&engine).query(rs.clone(), &matcher);
+        let stream = SArc::clone(&engine).query(rs.clone(), &matcher, Discovery::Complete);
         tokio::pin!(stream);
 
         // Let one buffer-load get under way, then cancel and keep draining.
@@ -11802,11 +11821,11 @@ mod tests {
 
         /// How [`shaped_engine`] reshapes the static provider. See [`Shaped`].
         #[derive(Default)]
-        struct Shape<'a> {
-            hidden: &'a [&'a str],
-            unlisted: &'a [&'a str],
-            builds: Option<(&'a str, &'a str)>,
-            fail_listing: bool,
+        pub(super) struct Shape<'a> {
+            pub(super) hidden: &'a [&'a str],
+            pub(super) unlisted: &'a [&'a str],
+            pub(super) builds: Option<(&'a str, &'a str)>,
+            pub(super) fail_listing: bool,
         }
 
         impl crate::engine::provider::Provider for Shaped {
@@ -11890,7 +11909,7 @@ mod tests {
 
         /// Engine over a [`Shaped`] provider and the bash driver, plus the
         /// provider's `list_packages` counter. Hold the `TempDir` for the test.
-        fn shaped_engine(
+        pub(super) fn shaped_engine(
             targets: Vec<pluginstatictarget::Target>,
             shape: Shape<'_>,
         ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, SArc<AtomicUsize>)> {
@@ -11930,7 +11949,11 @@ mod tests {
 
         /// An output-writing bash target carrying `labels`, so a dependent's
         /// `hashin` reads its `hashout`.
-        fn labelled(addr: &str, labels: &[&str], deps: &[&str]) -> pluginstatictarget::Target {
+        pub(super) fn labelled(
+            addr: &str,
+            labels: &[&str],
+            deps: &[&str],
+        ) -> pluginstatictarget::Target {
             pluginstatictarget::Target {
                 labels: labels.iter().map(|s| (*s).to_string()).collect(),
                 ..out_target_with_deps(addr, deps)
@@ -12416,7 +12439,7 @@ mod tests {
                 let rs = engine.new_state();
                 engine.install_selection(&rs, m, &forced()).await;
                 let walked: std::collections::BTreeSet<String> = Arc::clone(&engine)
-                    .query(rs.clone(), m)
+                    .query(rs.clone(), m, Discovery::Complete)
                     .map_ok(|a| a.format())
                     .try_collect()
                     .await?;
@@ -12452,6 +12475,77 @@ mod tests {
             let (res, _) = run_selection(&engine, &m, &forced()).await;
             assert!(res?.errors.is_empty());
             assert_eq!(calls.load(Ordering::SeqCst), 1);
+            Ok(())
+        }
+    }
+
+    // ─── Keep-going discovery: what stays complete ───────────────────────────
+
+    mod keep_going {
+        use super::forced_selection::{Shape, labelled, shaped_engine};
+        use super::*;
+
+        /// The nested walk behind query targets has no keep-going mode, by
+        /// type: its output becomes `pluginquery`'s deps and reaches a def hash.
+        /// A top-level walk on the same request skips the candidate; the nested
+        /// one still fails on it.
+        #[tokio::test]
+        async fn provider_executor_query_stays_complete() -> anyhow::Result<()> {
+            let engine = engine_with_failing(
+                "//pkg:bad",
+                FailKind::Typed,
+                vec![
+                    static_target("//pkg:bad", &["x"], &[]),
+                    static_target("//pkg:good", &["x"], &[]),
+                ],
+            )?;
+            let rs = engine.new_state();
+            let x = Matcher::Label("x".to_string());
+
+            let gaps = crate::engine::Gaps::new("label(x)");
+            let top: Vec<String> = SArc::clone(&engine)
+                .query(rs.clone(), &x, Discovery::KeepGoing(gaps.clone()))
+                .map_ok(|a| a.format())
+                .try_collect()
+                .await?;
+            assert_eq!(top, ["//pkg:good"]);
+            assert!(!gaps.is_empty());
+
+            let executor = EngineProviderExecutor::new(SArc::downgrade(&engine), SArc::clone(&rs));
+            let nested = executor.query(&x, &[]).await;
+            assert!(
+                nested.is_err(),
+                "a query target must never hash a partial set"
+            );
+            Ok(())
+        }
+
+        /// A provider whose package listing fails is skipped by a keep-going
+        /// walk, and is still an `Err` for `states_under` on the same request:
+        /// the walk never writes a short list into the memoized cells, and go's
+        /// `list` reaches a def hash through what `states_under` returns.
+        #[tokio::test]
+        async fn states_under_stays_complete_under_a_keep_going_walk() -> anyhow::Result<()> {
+            let (engine, _root, _) = shaped_engine(
+                vec![labelled("//a:a", &[], &[])],
+                Shape {
+                    fail_listing: true,
+                    ..Default::default()
+                },
+            )?;
+            let rs = engine.new_state();
+            let all = Matcher::PackagePrefix(PkgBuf::from(""));
+            let gaps = crate::engine::Gaps::new("//...");
+            let _: Vec<Addr> = SArc::clone(&engine)
+                .query(rs.clone(), &all, Discovery::KeepGoing(gaps.clone()))
+                .try_collect()
+                .await?;
+            assert!(!gaps.is_empty(), "the walk recorded the failed listing");
+
+            let states = states_under_of(&engine, &rs)
+                .states_under(&PkgBuf::from(""))
+                .await;
+            assert!(states.is_err(), "states_under answered with a partial set");
             Ok(())
         }
     }

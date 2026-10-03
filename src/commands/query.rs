@@ -9,7 +9,7 @@ use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
 use crate::commands::run::QUERY_LANG_HELP;
 use crate::commands::utils::resolve_matcher;
-use crate::engine::{Engine, get_cwp};
+use crate::engine::{Discovery, Engine, Gaps, get_cwp};
 use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
@@ -67,7 +67,14 @@ impl App for QueryApp {
         let rs = self
             .engine
             .new_state_with_events(self.fail_fast, ctx.event_sender());
-        let stream = self.engine.query(rs.clone(), &self.matcher);
+        // What matched goes to stdout as it is found; what the walk could not
+        // resolve is reported on stderr at the end, and fails the command.
+        let gaps = Gaps::new(crate::htquery::format(&self.matcher));
+        let stream = self.engine.query(
+            rs.clone(),
+            &self.matcher,
+            Discovery::keep_going_unless(self.fail_fast, &gaps),
+        );
         tokio::pin!(stream);
 
         // Output is incremental, so addrs are printed before `finalize` runs; a
@@ -84,7 +91,7 @@ impl App for QueryApp {
         .await;
         out.close().await;
 
-        crate::commands::errors::finalize!(ctx, rs, res)
+        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
     }
 }
 

@@ -44,11 +44,16 @@ impl App for LabelsApp {
         // print until the full set is known; resolving targets records rich
         // failures in `rs`, which `finalize` prefers over the returned error.
         let out = BufferedStdout::new(&ctx);
+        let gaps = crate::engine::Gaps::new(crate::htquery::format(&self.matcher));
         let res: anyhow::Result<()> = async {
             for label in self
                 .engine
                 .clone()
-                .labels(rs.clone(), &self.matcher)
+                .labels(
+                    rs.clone(),
+                    &self.matcher,
+                    crate::engine::Discovery::keep_going_unless(self.fail_fast, &gaps),
+                )
                 .await?
             {
                 out.println(label);
@@ -58,7 +63,7 @@ impl App for LabelsApp {
         .await;
         out.close().await;
 
-        crate::commands::errors::finalize!(ctx, rs, res)
+        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
     }
 }
 

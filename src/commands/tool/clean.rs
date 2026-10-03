@@ -98,10 +98,22 @@ impl App for CleanApp {
         let rs = self
             .engine
             .new_state_with_events(self.fail_fast, ctx.event_sender());
-        let res = self.engine.clone().clean(rs.clone(), &self.matcher).await;
         let selection = htquery::format(&self.matcher);
+        // A partial clean is a clean of what matched, and says so: the walk's
+        // skips ride in this sink rather than in the private request `clean`
+        // resolves on, which is gone by the time the command ends.
+        let gaps = crate::engine::Gaps::new(selection.clone());
+        let res = self
+            .engine
+            .clone()
+            .clean(
+                rs.clone(),
+                &self.matcher,
+                crate::engine::Discovery::keep_going_unless(self.fail_fast, &gaps),
+            )
+            .await;
 
-        crate::commands::errors::finalize!(ctx, rs, res, stats => {
+        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps, stats => {
             print_summary(&stats, &selection);
             Ok(())
         })
