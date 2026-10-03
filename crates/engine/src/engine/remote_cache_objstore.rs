@@ -28,7 +28,7 @@
 //! skips ADC parsing entirely. Every other scheme and credential type is left on
 //! object_store's native path.
 
-use crate::engine::remote_cache::RemoteCacheBackend;
+use crate::engine::remote_cache::{AuthError, RemoteCacheBackend};
 use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
@@ -485,7 +485,15 @@ impl ObjStoreBackend {
                     Arc::new(ExternalAccountCredentialProvider::new(source));
                 builder = builder.with_credentials(provider);
             }
+            // Built twice: the first build resolves the credential provider the
+            // builder would pick, the second runs it behind
+            // [`AuthClassifying`]. Neither build touches the network.
+            let resolved = builder
+                .clone()
+                .build()
+                .with_context(|| format!("build GCS store for {uri}"))?;
             let store = builder
+                .with_credentials(auth_classifying(resolved.credentials()))
                 .build()
                 .with_context(|| format!("build GCS store for {uri}"))?;
             // The builder consumes only the bucket from the URL; derive the key
@@ -542,8 +550,14 @@ impl ObjStoreBackend {
                     if let Some(region) = opts_override.region {
                         builder = builder.with_region(region);
                     }
+                    // Built twice, as for GCS: see [`AuthClassifying`].
+                    let resolved = builder
+                        .clone()
+                        .build()
+                        .with_context(|| format!("build S3 store for {uri}"))?;
                     Box::new(
                         builder
+                            .with_credentials(auth_classifying(resolved.credentials()))
                             .build()
                             .with_context(|| format!("build S3 store for {uri}"))?,
                     )
@@ -555,9 +569,16 @@ impl ObjStoreBackend {
                         env,
                     )?
                     .opts(url.scheme());
+                    let builder = build_with_opts!(MicrosoftAzureBuilder, uri, opts)
+                        .with_retry(retry_config());
+                    // Built twice, as for GCS: see [`AuthClassifying`].
+                    let resolved = builder
+                        .clone()
+                        .build()
+                        .with_context(|| format!("build Azure store for {uri}"))?;
                     Box::new(
-                        build_with_opts!(MicrosoftAzureBuilder, uri, opts)
-                            .with_retry(retry_config())
+                        builder
+                            .with_credentials(auth_classifying(resolved.credentials()))
                             .build()
                             .with_context(|| format!("build Azure store for {uri}"))?,
                     )
@@ -848,6 +869,75 @@ impl CredentialProvider for ExternalAccountCredentialProvider {
     }
 }
 
+/// Wraps a store's credential provider so a credential that cannot be obtained
+/// is reported as an [`AuthError`] the breaker can act on.
+///
+/// A store's own 401/403 already arrives typed (`Unauthenticated` /
+/// `PermissionDenied`), but a failure to *get* a credential does not: an
+/// expired gcloud login is a 400 from the token endpoint, wrapped by
+/// object_store as an opaque `Generic` error whose status is unreachable from
+/// outside the crate. Without this the breaker treats it as an outage and
+/// re-probes it on a backoff for the whole run. The seam is the same
+/// `CredentialProvider` for GCS, S3 and Azure, so one wrapper covers all three.
+#[derive(Debug)]
+struct AuthClassifying<T>(Arc<dyn CredentialProvider<Credential = T>>);
+
+#[async_trait]
+impl<T: std::fmt::Debug + Send + Sync + 'static> CredentialProvider for AuthClassifying<T> {
+    type Credential = T;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<T>> {
+        self.0
+            .get_credential()
+            .await
+            .map_err(classify_credential_error)
+    }
+}
+
+/// Wrap `provider` in [`AuthClassifying`].
+fn auth_classifying<T: std::fmt::Debug + Send + Sync + 'static>(
+    provider: &Arc<dyn CredentialProvider<Credential = T>>,
+) -> Arc<dyn CredentialProvider<Credential = T>> {
+    Arc::new(AuthClassifying(Arc::clone(provider)))
+}
+
+/// Mark a credential failure as an [`AuthError`] unless it is transient. Keeps
+/// a `Generic` error's store name so the message reads as it did.
+fn classify_credential_error(e: object_store::Error) -> object_store::Error {
+    if credential_error_is_transient(&e) {
+        return e;
+    }
+    match e {
+        object_store::Error::Generic { store, source } => object_store::Error::Generic {
+            store,
+            source: Box::new(AuthError(source)),
+        },
+        e => object_store::Error::Generic {
+            store: "remote-cache",
+            source: Box::new(AuthError(Box::new(e))),
+        },
+    }
+}
+
+/// Whether a credential failure may heal on its own: the token endpoint was
+/// unreachable (object_store's `HttpError` — connect, timeout, reset), or
+/// `google-cloud-auth` says so. Anything else is the endpoint *answering* with a
+/// refusal, or a credential that cannot be read or parsed — neither heals
+/// within a run.
+fn credential_error_is_transient(e: &object_store::Error) -> bool {
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = link {
+        if err.is::<object_store::client::HttpError>() {
+            return true;
+        }
+        if let Some(gcp) = err.downcast_ref::<google_cloud_auth::errors::CredentialsError>() {
+            return gcp.is_transient();
+        }
+        link = err.source();
+    }
+    false
+}
+
 /// Wrap any error as an object_store GCS error.
 fn gcs_error(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> object_store::Error {
     object_store::Error::Generic {
@@ -1093,6 +1183,108 @@ mod tests {
             1,
             "one blob slot must never expand into several store requests",
         );
+    }
+
+    /// Credential provider that always fails with `err`.
+    #[derive(Debug)]
+    struct FailingCredentials(fn() -> object_store::Error);
+
+    #[async_trait]
+    impl CredentialProvider for FailingCredentials {
+        type Credential = GcpCredential;
+        async fn get_credential(&self) -> object_store::Result<Arc<GcpCredential>> {
+            Err((self.0)())
+        }
+    }
+
+    /// A GCS backend whose credential provider fails with `err`, behind
+    /// [`AuthClassifying`] as `from_uri` builds it. The credential is fetched
+    /// before any request is sent, so this never reaches the network.
+    fn gcs_backend_failing_with(err: fn() -> object_store::Error) -> ObjStoreBackend {
+        let creds: GcpCredentialProvider = Arc::new(FailingCredentials(err));
+        let store = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("bucket")
+            .with_credentials(auth_classifying(&creds))
+            .with_retry(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .build()
+            .expect("build GCS store");
+        ObjStoreBackend {
+            store: Arc::new(store),
+            prefix: ObjPath::from("repo"),
+        }
+    }
+
+    /// The reported failure: an expired gcloud login is a 400 from the token
+    /// endpoint, which object_store hands back as an opaque `Generic` error. It
+    /// must reach the breaker as an auth failure, through every backend op.
+    #[tokio::test]
+    async fn a_refused_credential_is_an_auth_failure() {
+        let backend = gcs_backend_failing_with(|| {
+            gcs_error(anyhow::anyhow!(
+                "Error performing token request: 400 Bad Request: invalid_grant (invalid_rapt)"
+            ))
+        });
+        let e = backend.exists("k").await.expect_err("credential fails");
+        assert!(
+            crate::engine::remote_cache::is_auth_failure(&e),
+            "exists: {e:#}"
+        );
+        assert!(
+            format!("{e:#}").contains("invalid_rapt"),
+            "cause kept: {e:#}"
+        );
+        let e = backend
+            .open_read("k")
+            .await
+            .err()
+            .expect("credential fails");
+        assert!(
+            crate::engine::remote_cache::is_auth_failure(&e),
+            "open_read: {e:#}"
+        );
+        let e = backend.list_names("k").await.expect_err("credential fails");
+        assert!(
+            crate::engine::remote_cache::is_auth_failure(&e),
+            "list: {e:#}"
+        );
+    }
+
+    /// A token endpoint that could not be reached is an outage, not a refusal:
+    /// it stays on the breaker's backoff.
+    #[tokio::test]
+    async fn an_unreachable_token_endpoint_is_not_an_auth_failure() {
+        let backend = gcs_backend_failing_with(|| {
+            gcs_error(object_store::client::HttpError::new(
+                object_store::client::HttpErrorKind::Connect,
+                std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            ))
+        });
+        let e = backend.exists("k").await.expect_err("credential fails");
+        assert!(!crate::engine::remote_cache::is_auth_failure(&e), "{e:#}");
+    }
+
+    /// `google-cloud-auth` (the `external_account` path) says itself whether a
+    /// failure is transient; that verdict is taken as-is.
+    #[test]
+    fn google_cloud_auth_transience_is_respected() {
+        use google_cloud_auth::errors::CredentialsError;
+        let transient = classify_credential_error(gcs_error(CredentialsError::from_msg(
+            true,
+            "sts unavailable",
+        )));
+        assert!(!crate::engine::remote_cache::is_auth_failure(
+            &anyhow::Error::new(transient)
+        ));
+        let permanent = classify_credential_error(gcs_error(CredentialsError::from_msg(
+            false,
+            "invalid_grant",
+        )));
+        assert!(crate::engine::remote_cache::is_auth_failure(
+            &anyhow::Error::new(permanent)
+        ));
     }
 
     #[tokio::test]
