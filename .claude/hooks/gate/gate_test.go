@@ -40,6 +40,23 @@ func TestBlocks(t *testing.T) {
 		// Backticks in double quotes are a command substitution: this
 		// really runs tst, which is the shell's reading and so the gate's.
 		"git commit -m \"the `tst` suite\"",
+		// `tst`'s body spelled out is the same full suite.
+		"cargo test --locked --workspace --exclude bin-e2e --no-fail-fast",
+		"(cargo test --workspace; echo done) > log 2>&1",
+		"cargo +stable test --all",
+		"cargo t --workspace",
+		"cargo nextest run --workspace",
+		"cargo test --workspace some_filter",
+		// A global option's value is not the subcommand.
+		"cargo --config k=v test --workspace",
+		"cargo -C crates test --workspace",
+		"cargo --color always test --workspace",
+		"cargo -Z unstable-options test --workspace",
+		// Through every wrapper `tst` itself is caught behind.
+		"timeout 900 cargo test --workspace",
+		"env X=1 cargo test --workspace",
+		"devenv shell -- cargo test --workspace",
+		"bash -c 'cargo test --workspace'",
 	} {
 		if check(cmd, gate{}) == "" {
 			t.Errorf("should block %q", cmd)
@@ -55,6 +72,16 @@ func TestAllows(t *testing.T) {
 		"cd x && HEPH_FULL_SUITE=1 timeout 900 e2e",
 		"cargo test -p e2e some_test",
 		"cargo test --test tst",
+		"HEPH_FULL_SUITE=1 cargo test --workspace --no-fail-fast",
+		"env HEPH_FULL_SUITE=1 cargo test --workspace",
+		"cargo clippy --workspace --all-targets",
+		"cargo test -p engine -- --workspace",
+		// Compiles the suite, runs nothing.
+		"cargo test --workspace --no-run",
+		"cargo nextest list --workspace",
+		// Looks the name up; runs nothing.
+		"command -v tst",
+		"command -V e2e",
 		"ls crates/bin-e2e",
 		"echo tst",
 		"git commit -m 'make tst faster; e2e too'",

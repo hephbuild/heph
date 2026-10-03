@@ -20,6 +20,10 @@ const tstReason = "Blocked: `tst` is the full suite, and CI runs it on every pus
 	"Only a large blast-radius change (engine core, provider/driver traits, caching) runs it locally, before opening the PR — " +
 	"if that is this change, re-run as `HEPH_FULL_SUITE=1 tst`. See CLAUDE.md \"Workflow\"."
 
+const cargoTestReason = "Blocked: `cargo test` over the whole workspace is the full suite — what `tst` runs — and CI runs it on every push.\n" +
+	"Run the tests for what you changed: `cargo test -p <crate> <name>`.\n" +
+	"If this change does need the full suite locally (engine core, provider/driver traits, caching), prefix this same command with `HEPH_FULL_SUITE=1`. See CLAUDE.md \"Workflow\"."
+
 const e2eReason = "Blocked: `e2e` does a full --release build, and the bin_e2e CI job runs it on all three platforms on every push.\n" +
 	"Run it locally only when changing what it covers — the plugin loader, the TUI, CLI exit codes, or the e2e script itself.\n" +
 	"If that is this change, re-run as `HEPH_FULL_SUITE=1 e2e ...` (and check the `running N tests` count). See CLAUDE.md \"e2e\"."
@@ -93,6 +97,12 @@ func checkCall(call *syntax.CallExpr, g gate) string {
 		if !optIns[optIn] {
 			return tstReason
 		}
+	case "cargo":
+		// `tst` spelled out: its body run by hand is the same full suite, and
+		// must not be the way around the opt-in.
+		if wholeWorkspaceTest(args) && !optIns[optIn] {
+			return cargoTestReason
+		}
 	case "e2e":
 		if !optIns[optIn] {
 			return e2eReason
@@ -148,11 +158,60 @@ func pushes(args []string) bool {
 	return false
 }
 
+// cargoValueFlags are cargo's global options whose value is the next argument.
+var cargoValueFlags = map[string]bool{"--color": true, "--config": true, "-C": true, "-Z": true}
+
+// wholeWorkspaceTest reports whether a cargo command line runs the tests of the
+// whole workspace (`--workspace`, or its old spelling `--all`) — what `tst`
+// runs — through `cargo test`, its alias `cargo t`, or `cargo nextest run`.
+// `cargo test -p <crate>` is the ordinary narrow loop and passes, and so does
+// `--no-run`, which compiles and runs nothing.
+func wholeWorkspaceTest(args []string) bool {
+	i := 1
+	// `cargo +nightly test`, `cargo --locked test`, `cargo -C dir test`: skip
+	// the toolchain and the global options, and the value of those that take
+	// one.
+	for i < len(args) && (strings.HasPrefix(args[i], "+") || strings.HasPrefix(args[i], "-")) {
+		if cargoValueFlags[args[i]] {
+			i++
+		}
+		i++
+	}
+	if i >= len(args) {
+		return false
+	}
+	switch {
+	case args[i] == "test" || args[i] == "t":
+		i++
+	case args[i] == "nextest" && i+1 < len(args) && args[i+1] == "run":
+		i += 2
+	default:
+		return false
+	}
+	workspace := false
+	for _, a := range args[i:] {
+		if a == "--" {
+			break
+		}
+		if a == "--no-run" {
+			return false
+		}
+		if a == "--workspace" || a == "--all" {
+			workspace = true
+		}
+	}
+	return workspace
+}
+
 // unwrap strips wrappers that still run the command after them — `timeout
 // 600 tst`, `env X=1 tst`, `devenv shell -- e2e` — collecting opt-in
 // assignments given to env on the way.
 func unwrap(args []string, optIns map[string]bool) []string {
 	for len(args) > 0 {
+		// `command -v tst` / `command -V tst` only look the name up.
+		if args[0] == "command" && len(args) > 1 && (args[1] == "-v" || args[1] == "-V") {
+			return nil
+		}
 		if n, ok := wrappers[args[0]]; ok {
 			args = args[1:]
 			for len(args) > 0 && strings.HasPrefix(args[0], "-") {

@@ -325,7 +325,23 @@ in
   # serving (plugin-sdk `stabby` — the SDK is transport-agnostic by default).
   # `bin-e2e` is excluded on purpose: it drives *shipped artifacts*, not this
   # source tree, and has no meaning without a staged dist. Run it with `e2e`.
-  scripts.tst.exec = "cargo test --locked --workspace --exclude bin-e2e && cargo test --locked -p plugin-stabby --features host && cargo test --locked -p plugin-sdk --features stabby";
+  #
+  # Every pass runs and every failure is reported: `--no-fail-fast` inside each
+  # pass, and no `&&` between them, with the script exiting non-zero if any pass
+  # failed. One red test binary used to stop the rest of the workspace from
+  # running at all, so a single unrelated failure (a Docker test on a machine
+  # with the daemon down) hid everything after it and cost a second full run.
+  # Extra args pass through to every pass, so only a test-name filter and `--
+  # <libtest args>` make sense (`--test x` or `-p x` would fail the passes that
+  # have no such target). `tests/tst_script.rs` runs this text against a stub
+  # cargo. `rc`, not `status`: that name is read-only in zsh.
+  scripts.tst.exec = ''
+    rc=0
+    cargo test --locked --no-fail-fast --workspace --exclude bin-e2e "$@" || rc=$?
+    cargo test --locked --no-fail-fast -p plugin-stabby --features host "$@" || rc=$?
+    cargo test --locked --no-fail-fast -p plugin-sdk --features stabby "$@" || rc=$?
+    exit "$rc"
+  '';
 
   # Binary end-to-end suite: black-box tests against the artifacts CI publishes
   # (the `heph` binary + the go/gha plugin cdylibs). ONE entrypoint, identical

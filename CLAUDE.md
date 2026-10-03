@@ -49,6 +49,8 @@ gen                                  # regenerate protobuf bindings (runs buf ge
 
 The `gen` script is a devenv-provided alias, assume its present. It must be run at the beginning of all sessions, or after any `.proto` file changes before building.
 
+`tst` runs every pass with `--no-fail-fast` and exits non-zero if any failed, so one red test binary no longer hides the rest; extra args pass through to every pass. Its body spelled out as `cargo test --workspace` is the same suite, and the gate holds it to the same `HEPH_FULL_SUITE=1` opt-in.
+
 `lint`, `fix`, `tst` and `e2e` are devenv scripts, and their text is **baked into the shell when it starts**. After editing `devenv.nix`, the running shell still has the old scripts. For example, a new crate added to `qualityCrates` is not format-checked, so `lint` is green locally and red in CI. Start a new `devenv shell` before trusting them.
 
 `fix` can fail with "output file … is not writeable": kache restores `target/` as read-only reflinks. `cargo fmt --all` is the reliable way to format.
@@ -135,6 +137,8 @@ Don't run the full test suite locally — CI runs `tst` on every push, so runnin
 
 The same applies to subsequent pushes on an open PR: push the fix and let CI run the suite.
 
+**With a review board running, sequence the fixes.** Fix a finding straight away only in code no pending reviewer covers; hold the rest until the slowest reviewer reports, then fix them together. Run `lint`, then (when the change calls for it) the full suite **once**, on the SHA you push. A suite run before the board, or before its last report, is invalidated by every later fix: one session ran `tst` twice and still pushed a commit neither run covered, and rewrote one function three times for three reviewers.
+
 Run the full `tst` suite locally only for a large blast radius change — one touching the engine core, provider/driver traits, or caching, where a break is likely to be wide rather than local. Run it before opening the PR: the cost of a broken PR there is higher than the wait.
 
 A `PreToolUse` hook (`.claude/hooks/gate`, a Go program run with `go run`; tests are `go test` there) enforces this for agents:
@@ -164,6 +168,8 @@ gh stack link <pr-url> <pr-url>         # register already-open PRs as a stack, 
 
 Plain `gh stack submit` opens an editor for PR titles — pass `--auto` from a script or an agent. `gh stack sync` aborts instead of prompting when the local and remote stacks have diverged and there is no tty; that is the safe outcome, not a failure.
 
+- **Fix a lower layer from the top branch; don't switch branches.** `git commit --fixup=<lower-layer-sha>`, then `git rebase --autosquash --update-refs <base>` (no `-i` needed; `--update-refs` moves the layer branches along). Checking out a lower branch to amend it meant a WIP commit, an amend and a rebase per detour — one replayed the old commit and had to be redone with `--onto` — and it switched the tree under review agents and a running suite that were reading it.
+- **In a worktree, local `master` is stale.** It is checked out in the main checkout and cannot be fast-forwarded here, so `master...HEAD` in a worktree compares against whatever it was when that checkout last pulled (83 commits behind, once). Use `origin/master` after a `git fetch`, or the lower layer's SHA for a stacked PR.
 - **Merge bottom-up, and sync after each merge.** GitHub retargets a child PR at `master` on its own when the base merges, but the branch still carries the base's commits — run `gh stack sync` (or `gh stack rebase`) once the base lands so the PR's diff is its own change again. `master` is squash-only, so the base's commits have no counterpart in trunk after the merge: expect that rebase to conflict, and resolve it under the rule below.
 - **A red check on a stacked PR is not necessarily its own.** Before debugging, check the base: `gh pr checks <base-pr>`. Same job red there → not your bug; say so on your PR and fix it in the base, not in yours. This has already cost real time — a stacked PR reddened on a flake inherited from its base, and the fix for it lived in a third PR entirely.
 - **Don't fold a fix for the base into your stack.** It muddies the revert line — the fix disappears if your PR is reverted, and it lands bundled with an unrelated change. Fix the base in the base, or in its own PR.
@@ -191,13 +197,20 @@ The next session starts from the hand-off's link, never from the conversation th
 - **Goal / Non-goals**: one paragraph each.
 - **Decisions**: each settled decision with its reason. The implementation session does not reopen these.
 - **Tests**: each test that defines done, with its layer (unit, `crates/e2e` or `crates/bin-e2e`; see `.claude/testing.md`) and what it proves. Implementation is done when these pass and `lint` exits 0. A test that is dropped or changed is recorded in the PR description.
+  - When the spec enumerates cases ("six failure points", "three commands"), Tests maps **each case to a named test** in a table. A case with no row is how a whole stage shipped untested and came back as a review BLOCKER.
+  - A heuristic (a parser, a text trimmer, a matcher) gets a table of **adversarial inputs** in Tests before it is written: the near-miss name (`//p:a` vs `//p:ab`), multi-line and empty input, input that went through a wrapper (a memoizer flattens error chains), non-ASCII and control bytes, input over any length cap. One heuristic was rewritten five times as reviewers found these one by one.
+- **Accepted exemptions**: every place the change deliberately does *not* hold its own rule (a lock it does not take, a partial result it does write), each with a verdict from each design agent. An exemption written into Files as a side note was waved through at design and became a hermeticity BLOCKER at review.
 - **Files**: the files and seams the change touches, and so which board triggers fire.
 - **Board**: the verdicts from `/board`, one line per agent and round.
 - **Open**: the real remaining questions, each marked for the user or for implementation.
 
+**One implementation context per stack layer.** A stack built and review-fixed in one context grows it past 400k, and every call re-sends all of it: one two-layer session ran 299 calls to a 736k context and 136M input tokens, 67% of it above 150k. Build each layer in its own context — a `general-purpose` agent with `isolation: "worktree"` per layer, continued with `SendMessage` for that layer's review fixes, or end the turn at the layer boundary and `/compact`. The cost is each layer re-reading its own code, which at a small context is a fraction of carrying the other layer.
+
 **Independent changes run in parallel.** One design session can produce several specs. Each gets its own implementation session in its own workspace or worktree, branched off `master`. Stack only when a change can't compile or be reviewed without the one below it (see "Stacked PRs"). Wall-clock time is then the slowest PR, not the sum of all of them.
 
-**Match the model to the job.** Lookups and triage don't need the strongest model: `Explore`, `/ci-triage` (which runs forked on Sonnet), and the design-stage `product-vision` and `feature-quality` consults use `model: "sonnet"`. Review-stage consults (`code-quality`, `hermeticity`, `compatibility`) and the implementation itself inherit the session model.
+**Match the model to the job.** Lookups and triage don't need the strongest model: `Explore`, `/ci-triage` (which runs forked on Sonnet), and the `product-vision` and `feature-quality` consults at both stages use `model: "sonnet"`. `code-quality`, `hermeticity` and `compatibility` and the implementation itself inherit the session model.
+
+**Match the effort to the phase, too.** `/effort xhigh` saved during design carries into implementation, and thinking is re-sent on every later call: one implementation session carried ~210k thinking tokens, ~35M input. Use `xhigh` for design and for review agents, `high` (or lower) for implementation, and raise it for the stretch that needs it — concurrency, locking, cache keys.
 
 **Knowledge goes in the repo, not in memory.** Memory reaches one user's sessions, and only when it happens to be recalled. A trap about this repo belongs in the repo:
 - a CI failure signature goes in `/ci-triage`;
@@ -211,6 +224,7 @@ Memory is for the user's preferences.
 Every turn re-sends the whole context, so a long session pays for its history on every call — and a turn over 400k tokens is slower as well as dearer. Across ten recent sessions, the four that ran past 300 turns took 92% of the tokens, at a median context of 300–470k; 64% of all input was context beyond the first 150k. The biggest saving is the phase split above.
 - **Read narrowly.** `rg -n` to locate, then `sed -n 'A,Bp'` for the range — not `cat` of a whole source file or a whole `docs/*.md`. A 20KB dump is paid again on every later turn. A sweep across many files goes to an `Explore` agent, which returns the conclusion rather than the files.
 - **Edit files with Edit/Write, not scripts.** A `python3 - <<EOF … s.replace(…)`, `sed -i` or `perl -pi` edit hides the diff from the user, leaves the harness's view of the file stale (every later touch re-sends it as "changed on disk"), and a heredoc of markdown mentioning `tst` trips the command gate. Several changes are several Edit calls in one message. Bash is for running things.
+  - **One exception: a signature change the compiler verifies.** When adding an argument breaks N call sites and `cargo` lists every one, a `sed -i` limited to those `file:line`s is allowed — the compiler is the oracle, not the script. Follow it with `git diff --stat` and `git diff -U0` (so the user sees every change) and a `cargo clippy --keep-going` pass. Propagating one new argument through 48 test sites by hand took 47 Edits and 10.4M input tokens.
 - **Send long output to a file.** Redirect build and test output into the scratchpad and grep what you need from the file, instead of letting a whole run into context. Judge the run by its exit code, not by the grep: rustfmt prints `Diff in`, not `error`, and `| tail` hides the status.
 - **Don't poll.** CI: `/ci-triage` waits on the run and classifies each failure: a known flake (it reruns it), a failure inherited from a stacked base, or a real break. It reads the failed logs from a file, not into context. The primitive underneath is `gh run watch <run-id> --exit-status` with `run_in_background`. `gh pr checks` right after a push prints "no checks reported", which is not a pass. A local process: `run_in_background`, or Monitor with an until-loop.
 - **Artifacts: one publish per round of feedback.** Collect the changes, edit the local file with `Edit`, publish once. Don't read back the published page — the local file is the source.

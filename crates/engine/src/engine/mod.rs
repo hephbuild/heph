@@ -31,6 +31,8 @@ mod cwd;
 pub mod deferred;
 pub mod discovery;
 pub use discovery::{Discovery, Gaps};
+#[cfg(any(test, feature = "test-support"))]
+pub mod fault_provider;
 mod result;
 pub use credential::{Acquired, CredentialTeardown, ResolvedCredential, WalkStep};
 pub use credential_store::{CredentialStore, Material};

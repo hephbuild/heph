@@ -200,6 +200,8 @@ mach2 = "0.6"
 [dev-dependencies]
 serde-jsonlines = "0.7.0"
 tempfile = "3"
+# `engine::fault_provider` for the command tests.
+hengine = { package = "engine", path = "crates/engine", features = ["test-support"] }
 
 # Fork exposing `event::raw_input` (EventSource/UnixInternalEventSource/
 # InternalEvent) so the TUI can own a single tty reader and demux cursor-position

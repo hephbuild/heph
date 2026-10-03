@@ -827,93 +827,6 @@ mod tests {
         assert!(name.contains("unknown"), "{name}");
     }
 
-    /// Lists `//broken:x` and cannot resolve it.
-    struct BrokenLister;
-
-    impl crate::engine::provider::Provider for BrokenLister {
-        fn config(
-            &self,
-            _req: crate::engine::provider::ConfigRequest,
-        ) -> anyhow::Result<crate::engine::provider::ConfigResponse> {
-            Ok(crate::engine::provider::ConfigResponse {
-                name: "broken".to_string(),
-            })
-        }
-        fn list<'a>(
-            &'a self,
-            req: crate::engine::provider::ListRequest,
-            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-        ) -> futures::future::BoxFuture<
-            'a,
-            anyhow::Result<
-                Box<
-                    dyn Iterator<Item = anyhow::Result<crate::engine::provider::ListResponse>>
-                        + Send,
-                >,
-            >,
-        > {
-            let items: Vec<_> = (req.package.as_str() == "broken")
-                .then(|| {
-                    Ok(crate::engine::provider::ListResponse {
-                        addr: crate::htaddr::parse_addr("//broken:x").expect("addr"),
-                    })
-                })
-                .into_iter()
-                .collect();
-            Box::pin(async move {
-                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
-            })
-        }
-        fn list_packages<'a>(
-            &'a self,
-            _req: crate::engine::provider::ListPackagesRequest,
-            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-        ) -> futures::future::BoxFuture<
-            'a,
-            anyhow::Result<
-                Box<
-                    dyn Iterator<
-                            Item = anyhow::Result<crate::engine::provider::ListPackageResponse>,
-                        > + Send,
-                >,
-            >,
-        > {
-            Box::pin(async {
-                let pkgs = vec![Ok(crate::engine::provider::ListPackageResponse {
-                    pkg: crate::htpkg::PkgBuf::from("broken"),
-                })];
-                Ok(Box::new(pkgs.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
-            })
-        }
-        fn get<'a>(
-            &'a self,
-            req: crate::engine::provider::GetRequest,
-            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-        ) -> futures::future::BoxFuture<
-            'a,
-            Result<crate::engine::provider::GetResponse, crate::engine::provider::GetError>,
-        > {
-            let broken = req.addr.format() == "//broken:x";
-            Box::pin(async move {
-                if broken {
-                    Err(crate::engine::provider::GetError::Other(anyhow::anyhow!(
-                        "go list: exit status 1"
-                    )))
-                } else {
-                    Err(crate::engine::provider::GetError::NotFound)
-                }
-            })
-        }
-        fn probe<'a>(
-            &'a self,
-            _req: crate::engine::provider::ProbeRequest,
-            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<crate::engine::provider::ProbeResponse>>
-        {
-            Box::pin(async { Ok(crate::engine::provider::ProbeResponse { states: vec![] }) })
-        }
-    }
-
     /// `declared_scratches` walks on `Engine::new_state()`, whose request is
     /// fail-fast. Keep-going is decided at the call site, not read from that
     /// flag, so one broken package still leaves the rest of the workspace
@@ -935,7 +848,14 @@ mod tests {
             },
         ])?;
         engine.register_provider(move |_| Box::new(provider))?;
-        engine.register_provider(|_| Box::new(BrokenLister))?;
+        engine.register_provider(|_| {
+            Box::new(
+                crate::engine::fault_provider::FaultProvider::unresolvable(vec![
+                    crate::htaddr::parse_addr("//broken:x").expect("addr"),
+                ])
+                .expect("fault provider"),
+            )
+        })?;
         let engine = std::sync::Arc::new(engine);
         assert!(engine.new_state().fail_fast());
 

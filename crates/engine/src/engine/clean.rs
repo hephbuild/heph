@@ -670,9 +670,10 @@ mod tests {
             .expect("register");
         engine
             .register_provider(|_| {
-                Box::new(crate::engine::discovery::test_support::Unresolvable {
-                    addrs: vec![addr("bad")],
-                })
+                Box::new(
+                    crate::engine::fault_provider::FaultProvider::unresolvable(vec![addr("bad")])
+                        .expect("fault provider"),
+                )
             })
             .expect("register");
         let engine = Arc::new(engine);

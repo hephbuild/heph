@@ -11803,23 +11803,12 @@ mod tests {
     mod forced_selection {
         use super::*;
 
-        /// The static provider, reshaped the ways a real provider can be:
-        /// packages it resolves but never lists (`hidden`, a get-only package),
-        /// targets it resolves but never lists inside a listed package
-        /// (`unlisted`, go's `_lint-analyze`), a `get` that builds another
-        /// target through the executor first (`builds`, the go provider's
-        /// `_golist` shape), a package listing that fails (`fail_listing`), and
-        /// a count of its `list_packages` walks.
-        struct Shaped {
-            inner: pluginstatictarget::Provider,
-            hidden: Vec<String>,
-            unlisted: Vec<Addr>,
-            builds: Option<(Addr, Addr)>,
-            fail_listing: bool,
-            list_packages_calls: SArc<AtomicUsize>,
-        }
-
-        /// How [`shaped_engine`] reshapes the static provider. See [`Shaped`].
+        /// How [`shaped_engine`] reshapes the static provider, spelled as
+        /// strings: packages it resolves but never lists (`hidden`), targets it
+        /// resolves but never lists inside a listed package (`unlisted`), a
+        /// `get` that builds another target first (`builds`), and a package
+        /// listing that fails (`fail_listing`). See
+        /// [`Faults`](crate::engine::fault_provider::Faults).
         #[derive(Default)]
         pub(super) struct Shape<'a> {
             pub(super) hidden: &'a [&'a str],
@@ -11828,87 +11817,9 @@ mod tests {
             pub(super) fail_listing: bool,
         }
 
-        impl crate::engine::provider::Provider for Shaped {
-            fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-                self.inner.config(req)
-            }
-            fn list<'a>(
-                &'a self,
-                req: ListRequest,
-                ctoken: &'a (dyn Cancellable + Send + Sync),
-            ) -> BoxFuture<
-                'a,
-                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
-            > {
-                if self.hidden.iter().any(|h| h == req.package.as_str()) {
-                    return Box::pin(async {
-                        Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
-                    });
-                }
-                Box::pin(async move {
-                    let listed: Vec<_> = self
-                        .inner
-                        .list(req, ctoken)
-                        .await?
-                        .filter(|res| !matches!(res, Ok(t) if self.unlisted.contains(&t.addr)))
-                        .collect();
-                    Ok(Box::new(listed.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
-                })
-            }
-            fn list_packages<'a>(
-                &'a self,
-                req: ListPackagesRequest,
-                ctoken: &'a (dyn Cancellable + Send + Sync),
-            ) -> BoxFuture<
-                'a,
-                anyhow::Result<
-                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
-                >,
-            > {
-                self.list_packages_calls.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async move {
-                    if self.fail_listing {
-                        anyhow::bail!("walking the workspace: permission denied");
-                    }
-                    let listed: Vec<_> = self
-                        .inner
-                        .list_packages(req, ctoken)
-                        .await?
-                        .filter(|res| {
-                            !matches!(res, Ok(p) if self.hidden.iter().any(|h| h == p.pkg.as_str()))
-                        })
-                        .collect();
-                    Ok(Box::new(listed.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
-                })
-            }
-            fn get<'a>(
-                &'a self,
-                req: GetRequest,
-                ctoken: &'a (dyn Cancellable + Send + Sync),
-            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
-                Box::pin(async move {
-                    if let Some((target, through)) = &self.builds
-                        && req.addr == *target
-                    {
-                        req.executor
-                            .result(through)
-                            .await
-                            .map_err(GetError::Other)?;
-                    }
-                    self.inner.get(req, ctoken).await
-                })
-            }
-            fn probe<'a>(
-                &'a self,
-                req: ProbeRequest,
-                ctoken: &'a (dyn Cancellable + Send + Sync),
-            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
-                self.inner.probe(req, ctoken)
-            }
-        }
-
-        /// Engine over a [`Shaped`] provider and the bash driver, plus the
-        /// provider's `list_packages` counter. Hold the `TempDir` for the test.
+        /// Engine over a [`FaultProvider`](crate::engine::fault_provider::FaultProvider)
+        /// shaped by `shape` and the bash driver, plus the provider's
+        /// `list_packages` counter. Hold the `TempDir` for the test.
         pub(super) fn shaped_engine(
             targets: Vec<pluginstatictarget::Target>,
             shape: Shape<'_>,
@@ -11924,25 +11835,25 @@ mod tests {
                 Box::new(hplugin_exec::pluginexec::Driver::new_bash())
             })?;
             let builds = match shape.builds {
-                Some((target, through)) => Some((
+                Some((target, through)) => vec![(
                     hmodel::htaddr::parse_addr(target)?,
                     hmodel::htaddr::parse_addr(through)?,
-                )),
-                None => None,
+                )],
+                None => vec![],
             };
-            let calls = SArc::new(AtomicUsize::new(0));
-            let provider = Shaped {
-                inner: pluginstatictarget::Provider::new(targets)?,
-                hidden: shape.hidden.iter().map(|s| (*s).to_string()).collect(),
+            let faults = crate::engine::fault_provider::Faults {
+                hidden_packages: shape.hidden.iter().map(|s| (*s).to_string()).collect(),
                 unlisted: shape
                     .unlisted
                     .iter()
                     .map(|a| hmodel::htaddr::parse_addr(a))
                     .collect::<anyhow::Result<_>>()?,
                 builds,
-                fail_listing: shape.fail_listing,
-                list_packages_calls: SArc::clone(&calls),
+                fail_list_packages: shape.fail_listing,
+                ..Default::default()
             };
+            let provider = crate::engine::fault_provider::FaultProvider::new(targets, faults)?;
+            let calls = provider.list_packages_calls();
             engine.register_provider(move |_| Box::new(provider))?;
             Ok((Arc::new(engine), root, calls))
         }

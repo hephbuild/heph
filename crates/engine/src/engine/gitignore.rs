@@ -616,9 +616,12 @@ mod tests {
             ..Default::default()
         })?;
         engine.register_provider(|_| {
-            Box::new(crate::engine::discovery::test_support::Unresolvable {
-                addrs: vec![parse_addr("//gen:bad").expect("addr")],
-            })
+            Box::new(
+                crate::engine::fault_provider::FaultProvider::unresolvable(vec![
+                    parse_addr("//gen:bad").expect("addr"),
+                ])
+                .expect("fault provider"),
+            )
         })?;
         let engine = Arc::new(engine);
         let rs = engine.new_state();

@@ -7,74 +7,14 @@
 
 mod common;
 
-use futures::future::BoxFuture;
-use hcore::hasync::Cancellable;
 use heph::engine::ResultOptions;
-use heph::engine::provider::{
-    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
-};
-use heph::htaddr::{Addr, parse_addr};
+use heph::engine::fault_provider::{FaultProvider, Faults};
+use heph::htaddr::parse_addr;
 use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use heph::pluginexec;
-use heph::pluginstatictarget::{self, Target};
+use heph::pluginstatictarget::Target;
 use std::collections::HashMap;
-
-/// The static provider, except that `get` of `target` builds `through` first:
-/// the go provider's shape, where resolving a package's targets runs that
-/// package's `_golist`.
-struct BuildsThrough {
-    inner: pluginstatictarget::Provider,
-    target: Addr,
-    through: Addr,
-}
-
-impl Provider for BuildsThrough {
-    fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-        self.inner.config(req)
-    }
-    fn list<'a>(
-        &'a self,
-        req: ListRequest,
-        ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
-    {
-        self.inner.list(req, ctoken)
-    }
-    fn list_packages<'a>(
-        &'a self,
-        req: ListPackagesRequest,
-        ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<
-        'a,
-        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
-    > {
-        self.inner.list_packages(req, ctoken)
-    }
-    fn get<'a>(
-        &'a self,
-        req: GetRequest,
-        ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
-        Box::pin(async move {
-            if req.addr == self.target {
-                req.executor
-                    .result(&self.through)
-                    .await
-                    .map_err(GetError::Other)?;
-            }
-            self.inner.get(req, ctoken).await
-        })
-    }
-    fn probe<'a>(
-        &'a self,
-        req: ProbeRequest,
-        ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
-        self.inner.probe(req, ctoken)
-    }
-}
 
 fn bash(addr: &str, run: &str, deps: &[(&str, &str)], labels: &[&str]) -> Target {
     Target {
@@ -105,8 +45,10 @@ async fn forced_selector_repairs_a_stale_target_that_discovery_depends_on() -> a
     let state_file = state.path().join("state");
     std::fs::write(&state_file, "stale")?;
 
-    let provider = BuildsThrough {
-        inner: pluginstatictarget::Provider::new(vec![
+    // Resolving `//a:t3` builds `//b:t2` first: the go provider's shape, where
+    // resolving a package's targets runs that package's `_golist`.
+    let provider = FaultProvider::new(
+        vec![
             bash(
                 "//nix:t1",
                 &format!("cat '{}' > $OUT", state_file.display()),
@@ -120,10 +62,12 @@ async fn forced_selector_repairs_a_stale_target_that_discovery_depends_on() -> a
                 &[],
             ),
             bash("//a:t3", "echo t3 > $OUT", &[], &[]),
-        ])?,
-        target: parse_addr("//a:t3")?,
-        through: parse_addr("//b:t2")?,
-    };
+        ],
+        Faults {
+            builds: vec![(parse_addr("//a:t3")?, parse_addr("//b:t2")?)],
+            ..Default::default()
+        },
+    )?;
     let ws = htestkit::WorkspaceBuilder::new()?
         .with_provider(move |_| Box::new(provider))
         .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
