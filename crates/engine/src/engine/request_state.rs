@@ -1,7 +1,8 @@
 use crate::engine::Engine;
+use crate::engine::driver::targetdef::TargetDef;
 use crate::engine::error::{CycleError, TargetFailure};
 use crate::engine::meta::ResultMeta;
-use crate::engine::provider::State;
+use crate::engine::provider::{State, TargetSpec};
 use crate::engine::result::{
     ArtifactMeta, ExtendedTargetDef, LockedResolution, OutputMatcher, ResultArtifact,
 };
@@ -386,6 +387,13 @@ pub struct RequestStateData {
     /// `resolve_locked_inner`'s `skip_lock`) still execute normally — re-reading
     /// the tree is the entire point of these requests.
     pub hash_only: bool,
+    /// What `--force` / `--no-scratch` on a selector run reach. Set at most once,
+    /// by `Engine::result` before its walk starts; see [`Selection`].
+    ///
+    /// Per `RequestStateData`, so every `with_parent` / speculative child of the
+    /// request sees it, and a [`hash_only`](Self::hash_only) request — which is
+    /// a separate `RequestStateData` — never does.
+    selection: std::sync::OnceLock<Selection>,
     /// Post-write `cache.history` trims held back until this request's cache
     /// read guards are gone.
     ///
@@ -571,6 +579,122 @@ struct Crumb {
     parent: Option<Arc<Crumb>>,
 }
 
+/// The targets `--force` / `--no-scratch` reach on a selector run: every target
+/// the run's selector matches, in a package the run's walk enumerates.
+///
+/// Force is a property of the request and the target, not of the call path. The
+/// lock-and-execute step is single-flighted per addr and keeps whichever `force`
+/// its first caller passed, and a dependency is always asked for unforced. So
+/// when the walk — a provider's `get` building through a target to answer a
+/// label check, say — or another selected target reaches a selected target as a
+/// dependency first, a per-caller flag would serve it from cache and the
+/// top-level forced call would find the cell already settled. Asking this
+/// instead, wherever the target is first resolved, gives every caller of one
+/// addr the same answer.
+///
+/// Deciding at first touch is the only sound place: an unforced cache hit keeps
+/// a read lock on the target for the rest of the request, so forcing it later
+/// would deadlock on its own write lock.
+///
+/// Only packages the walk can enumerate count. `//...` matches every address by
+/// prefix, including targets the walk never lists (the go stdlib and third-party
+/// modules under `@heph/go/...`): without the guard, `--force //...` would
+/// rebuild the Go standard library and re-download every module.
+///
+/// The guard is per package, not per listed target, and that is deliberate:
+/// inside a package the walk enumerates, a target the selector matches is
+/// selected even when the provider resolves it without listing it — go's
+/// `_lint-analyze@…` and `_go_mod`, reached as dependencies. Narrowing to listed
+/// targets would make this check async and fallible (a memoized `list` per
+/// package), which is exactly what installing the selection up front avoids. The
+/// cost is rebuild time on a forced package selector, never a wrong result.
+///
+/// Not covered: members of a forced transparent group, which inherit `force`
+/// through the call path as before.
+#[derive(Debug)]
+pub(crate) struct Selection {
+    matcher: hmodel::htmatcher::Matcher,
+    /// Each provider's package list for the walk, as
+    /// `Engine::provider_packages` returns them: sorted byte-lexicographically,
+    /// so membership is a binary search. A provider whose listing failed has no
+    /// entry; the walk reports that failure itself.
+    packages: Vec<Arc<Vec<String>>>,
+    force: bool,
+    no_scratch: bool,
+}
+
+impl Selection {
+    pub(crate) fn new(
+        matcher: hmodel::htmatcher::Matcher,
+        packages: Vec<Arc<Vec<String>>>,
+        force: bool,
+        no_scratch: bool,
+    ) -> Self {
+        Self {
+            matcher,
+            packages,
+            force,
+            no_scratch,
+        }
+    }
+
+    /// Whether the selector picks this target. The walk's own ladder — address,
+    /// then spec, then def — on values the caller already holds, so it costs no
+    /// resolution and cannot fail.
+    pub(crate) fn selects(&self, addr: &Addr, spec: &TargetSpec, def: &TargetDef) -> bool {
+        use hmodel::htmatcher::MatchResult;
+        // The address alone rejects most dependencies of a scoped selector, so
+        // it goes before the package search.
+        let by_addr = self.matcher.matches_addr(addr);
+        if by_addr == MatchResult::MatchNo {
+            return false;
+        }
+        let pkg = addr.package.as_str();
+        let enumerated = self
+            .packages
+            .iter()
+            .any(|pkgs| pkgs.binary_search_by(|p| p.as_str().cmp(pkg)).is_ok());
+        if !enumerated {
+            return false;
+        }
+        if by_addr == MatchResult::MatchYes {
+            return true;
+        }
+        match crate::engine::matcher_spec::match_spec(&self.matcher, spec) {
+            MatchResult::MatchYes => true,
+            MatchResult::MatchNo => false,
+            MatchResult::MatchShrug => {
+                crate::engine::matcher_target::match_target(&self.matcher, def)
+                    == MatchResult::MatchYes
+            }
+        }
+    }
+
+    /// The `(force, no_scratch)` a target is resolved with, given what its
+    /// caller asked for. Only consults the selector when it would change the
+    /// answer, so an unforced run, or a caller already forcing, pays nothing.
+    pub(crate) fn effective(
+        &self,
+        force: bool,
+        no_scratch: bool,
+        addr: &Addr,
+        spec: &TargetSpec,
+        def: &TargetDef,
+    ) -> (bool, bool) {
+        let adds = (self.force && !force) || (self.no_scratch && !no_scratch);
+        if !adds || !self.selects(addr, spec, def) {
+            return (force, no_scratch);
+        }
+        tracing::debug!(
+            %addr,
+            force = self.force,
+            no_scratch = self.no_scratch,
+            "target is in the forced selection"
+        );
+        (force || self.force, no_scratch || self.no_scratch)
+    }
+}
+
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
 pub struct RequestState {
     pub data: Arc<RequestStateData>,
@@ -687,6 +811,31 @@ impl RequestState {
     /// exclusive per-addr result lock. See [`RequestStateData::hash_only`].
     pub fn hash_only(&self) -> bool {
         self.data.hash_only
+    }
+
+    /// The selector a forced selector run applies to, if one is installed. See
+    /// [`Selection`].
+    pub(crate) fn selection(&self) -> Option<&Selection> {
+        self.data.selection.get()
+    }
+
+    /// Install the request's [`Selection`]. The first install wins: a nested
+    /// `Engine::result` sharing this request must not re-scope a run that is
+    /// already resolving targets under the first one. Refused on a
+    /// [`hash_only`](Self::hash_only) request, where the force branch would
+    /// re-execute a dependency and rewrite its blobs after dependents had
+    /// already hashed its first output.
+    pub(crate) fn install_selection(&self, selection: Selection) {
+        if self.hash_only() {
+            return;
+        }
+        if let Err(ignored) = self.data.selection.set(selection) {
+            tracing::debug!(
+                kept = %self.selection().map_or_else(String::new, |s| hmodel::htquery::format(&s.matcher)),
+                ignored = %hmodel::htquery::format(&ignored.matcher),
+                "request already carries a selection; keeping the first"
+            );
+        }
     }
 
     /// Records a genuinely-failing target's rich diagnostic. First-writer-wins:
@@ -1061,6 +1210,7 @@ impl Engine {
             failures: Mutex::new(indexmap::IndexMap::new()),
             approval,
             hash_only,
+            selection: std::sync::OnceLock::new(),
             deferred_trims: DeferredTrims {
                 engine: Arc::downgrade(self),
                 bg_pending,

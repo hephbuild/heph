@@ -192,11 +192,20 @@ impl Workspace {
         &self,
         matcher: &heph::htmatcher::Matcher,
     ) -> anyhow::Result<Vec<Arc<EResult>>> {
+        self.run_matcher_with(matcher, &ResultOptions::default())
+            .await
+    }
+
+    /// [`run_matcher`](Self::run_matcher) with explicit options — `heph r
+    /// <selector> --force` is `force: true` here.
+    pub async fn run_matcher_with(
+        &self,
+        matcher: &heph::htmatcher::Matcher,
+        opts: &ResultOptions,
+    ) -> anyhow::Result<Vec<Arc<EResult>>> {
         let e = self.engine.clone();
         let rs = e.new_state();
-        let batch = e
-            .result(rs, matcher, OutputMatcher::All, &ResultOptions::default())
-            .await?;
+        let batch = e.result(rs, matcher, OutputMatcher::All, opts).await?;
         if !batch.errors.is_empty() {
             let mut msg = String::new();
             for (addr, err) in &batch.errors {

@@ -70,6 +70,10 @@ pub struct RunArgs {
     )]
     pub expr: Option<String>,
     /// Force execution, ignoring any cached result
+    ///
+    /// Applies to every target the selector matches, wherever the run first
+    /// reaches it, including targets of a matched package that a listing does
+    /// not show. Other dependencies still come from cache.
     #[arg(long = "force")]
     pub force: bool,
     /// Drop into an interactive shell in the target's sandbox instead of running it

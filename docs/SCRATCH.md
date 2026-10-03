@@ -287,7 +287,11 @@ ordinary one. It **implies a rebuild**, and the engine applies that implication
 from the flag itself rather than each command pairing it with `--force`: a
 command that forgot would produce a vacuous audit that passes by replaying the
 answer it was supposed to re-derive. The throwaway directory is per run, so two
-audits in one process do not inherit each other's writes. The stored cache is not
+audits in one process do not inherit each other's writes. On a selector run
+(`heph r <selector> --no-scratch`) it reaches exactly the targets `--force`
+would: every target the selector matches in a package the walk lists, even when
+the request first reaches it as another target's dependency. Dependencies the
+selector does not match keep their stored cache. The stored cache is not
 touched, read or emptied — the run is pointed at a throwaway directory, which is
 discarded afterwards, and a later ordinary build finds its cache exactly as it
 left it.
