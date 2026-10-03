@@ -579,7 +579,6 @@ dependencies = [
  "walk",
  "wax",
  "which",
- "xattr",
  "xxhash-rust",
 ]
 
@@ -1614,7 +1613,6 @@ dependencies = [
  "walk",
  "wax",
  "which",
- "xattr",
  "xxhash-rust",
 ]
 
@@ -2328,7 +2326,6 @@ dependencies = [
  "walkdir",
  "wax",
  "which",
- "xattr",
  "xstarlark-fmt",
  "xxhash-rust",
 ]
