@@ -9,6 +9,7 @@ use crate::abi::{
 };
 use crate::seam::panic_text;
 use crate::vtable::dynify;
+use anyhow::Context;
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
@@ -374,7 +375,18 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                     .map(|(k, v)| (k, convert::value_from_pb(v)))
                     .collect(),
             };
-            match rf.func.call(&ctx, args).await {
+            // A plugin called this host function over the ABI, which carries the
+            // return value alone: declarations fail loudly rather than being
+            // dropped on the way back to the plugin.
+            let res = rf.func.call(&ctx, args).await.and_then(|o| {
+                o.into_value_only().with_context(|| {
+                    format!(
+                        "host function `{}.{}` called from a plugin",
+                        req.provider, req.name
+                    )
+                })
+            });
+            match res {
                 Ok(v) => unary(Body::CallFunctionResp(pb::CallFunctionResponse {
                     value: Some(convert::value_to_pb(&v)),
                 })),

@@ -33,9 +33,9 @@ use hcore::htvalue::{Value, parse_map_string_strings, parse_strings};
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::{PkgBuf, join_rel_checked_pkg};
 use hplugin::provider::{
-    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
-    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
-    ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
+    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest,
+    GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse,
+    Provider as ProviderTrait, ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
 };
 use hwalk::{CachedWalker, EntryKind, Ignore};
 use parking_lot::RwLock;
@@ -794,7 +794,7 @@ impl GocacheAddrFn {
 
 #[async_trait]
 impl ProviderFn for GocacheAddrFn {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let goos = Self::str_named(&args, "goos", hcore::htplatform::os())?;
         let goarch = Self::str_named(&args, "goarch", hcore::htplatform::arch())?;
         let gotool = Self::str_named(&args, "gotool", &self.default_gotool)?;
@@ -827,13 +827,13 @@ impl ProviderFn for GocacheAddrFn {
             goarch,
             variant: factors.variant_id(),
         };
-        Ok(Value::String(key.addr().format()))
+        Ok(Value::String(key.addr().format()).into())
     }
 }
 
 #[async_trait]
 impl ProviderFn for BuildAddrFn {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let pkg = Self::arg_str(&args, 0, "pkg")?;
         let v = Self::opt_arg_str(&args, 1, "variant")?.unwrap_or("");
 
@@ -855,7 +855,7 @@ impl ProviderFn for BuildAddrFn {
             BTreeMap::from([("v".to_string(), v.to_string())])
         };
         let addr = Addr::new(PkgBuf::from(pkg), "build".to_string(), addr_args);
-        Ok(Value::String(addr.format()))
+        Ok(Value::String(addr.format()).into())
     }
 }
 
@@ -4115,6 +4115,7 @@ mod tests {
             )
             .await
             .expect("gocache_addr")
+            .value
         {
             Value::String(s) => s,
             other => panic!("expected a string, got {other:?}"),
@@ -4173,7 +4174,11 @@ mod tests {
             ],
             named: HashMap::new(),
         };
-        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        let v = BuildAddrFn
+            .call(&build_addr_ctx(), args)
+            .await
+            .unwrap()
+            .value;
         assert_eq!(v, Value::String("//mylib:build@v=release".into()));
     }
 
@@ -4186,7 +4191,11 @@ mod tests {
             positional: vec![],
             named,
         };
-        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        let v = BuildAddrFn
+            .call(&build_addr_ctx(), args)
+            .await
+            .unwrap()
+            .value;
         assert_eq!(v, Value::String("//mylib:build@v=release".into()));
     }
 
@@ -4198,7 +4207,11 @@ mod tests {
             positional: vec![Value::String("mylib".into())],
             named: HashMap::new(),
         };
-        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        let v = BuildAddrFn
+            .call(&build_addr_ctx(), args)
+            .await
+            .unwrap()
+            .value;
         assert_eq!(v, Value::String("//mylib:build".into()));
     }
 
@@ -4209,7 +4222,11 @@ mod tests {
             positional: vec![Value::String("mylib".into()), Value::String("".into())],
             named: HashMap::new(),
         };
-        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        let v = BuildAddrFn
+            .call(&build_addr_ctx(), args)
+            .await
+            .unwrap()
+            .value;
         assert_eq!(v, Value::String("//mylib:build".into()));
     }
 
@@ -4223,7 +4240,7 @@ mod tests {
             positional: vec![Value::String("./cmd".into())],
             named: HashMap::new(),
         };
-        let v = BuildAddrFn.call(&ctx, args).await.unwrap();
+        let v = BuildAddrFn.call(&ctx, args).await.unwrap().value;
         assert_eq!(v, Value::String("//foo/cmd:build".into()));
     }
 
@@ -4237,7 +4254,7 @@ mod tests {
             positional: vec![Value::String("../cmd".into())],
             named: HashMap::new(),
         };
-        let v = BuildAddrFn.call(&ctx, args).await.unwrap();
+        let v = BuildAddrFn.call(&ctx, args).await.unwrap().value;
         assert_eq!(v, Value::String("//foo/cmd:build".into()));
     }
 
