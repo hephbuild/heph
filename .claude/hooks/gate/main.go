@@ -11,6 +11,14 @@
 //     Lint job is a whole CI round-trip to learn what `lint` says locally.
 //     HEPH_PUSH_UNLINTED=1 is the opt-out. See lintstamp.go for how a
 //     passing `lint` is recorded.
+//   - sed -i, perl -i, a python read-replace-write: the prose rule "use Edit"
+//     was broken 390 times in one session, and line-number `sed -i` chains
+//     edited the wrong lines in another. HEPH_SCRIPTED_EDIT=1 is the opt-in
+//     for the compiler-verified exception (edits.go).
+//
+// It also allows every command while telling the model, once per 100k step
+// above 300k, how large its context has grown (context.go): on 2026-10-04
+// two sessions made 209 calls above 300k, with the rule already in CLAUDE.md.
 //
 // The command is parsed with mvdan.cc/sh (shfmt's parser), so quoting,
 // heredocs, command substitution and `bash -c` are read the way the shell
@@ -32,8 +40,11 @@ import (
 )
 
 type hookInput struct {
-	Cwd       string         `json:"cwd"`
-	ToolInput map[string]any `json:"tool_input"`
+	Cwd            string         `json:"cwd"`
+	SessionID      string         `json:"session_id"`
+	TranscriptPath string         `json:"transcript_path"`
+	AgentID        string         `json:"agent_id"`
+	ToolInput      map[string]any `json:"tool_input"`
 }
 
 func main() {
@@ -59,16 +70,21 @@ func main() {
 		return
 	}
 
-	// `go run -C` put this process in the gate's own directory.
-	gateDir, err := os.Getwd()
-	if err != nil {
-		return
+	// No permissionDecision below: the command still goes through the normal
+	// permission flow, exactly as the original would have.
+	out := map[string]any{}
+	if notice := contextNotice(in.TranscriptPath, in.SessionID, in.AgentID, os.TempDir()); notice != "" {
+		out["additionalContext"] = notice
 	}
-	if rewritten := stampLint(command, lintWrapper(gateDir)); rewritten != "" {
-		in.ToolInput["command"] = rewritten
-		// No permissionDecision: the rewritten command still goes through the
-		// normal permission flow, exactly as the original would have.
-		respond(map[string]any{"updatedInput": in.ToolInput})
+	// `go run -C` put this process in the gate's own directory.
+	if gateDir, err := os.Getwd(); err == nil {
+		if rewritten := stampLint(command, lintWrapper(gateDir)); rewritten != "" {
+			in.ToolInput["command"] = rewritten
+			out["updatedInput"] = in.ToolInput
+		}
+	}
+	if len(out) > 0 {
+		respond(out)
 	}
 }
 

@@ -30,6 +30,10 @@ Design-stage checks, each a finding if missing (CLAUDE.md, "Phases and hand-offs
 - every heuristic has its adversarial inputs listed;
 - every **accepted exemption** gets an explicit verdict from each agent — not a nod in passing.
   An exemption that rode through design as a side note became a review BLOCKER.
+- every lifetime and every new cross-component contract appears under **Invariants and trust**,
+  with who checks it and the alternatives. `product-vision` judges whether the spec's choice is the
+  one a user would make. A spec that checked provider labels on every resolved spec got no design
+  board, and the user reversed it after the PR was open.
 
 ## 2. Who is consulted
 
@@ -54,6 +58,12 @@ git diff --name-only <base-sha>..<head-sha>
 
 For design, match the files the spec says it will touch. The table is the floor: add an agent the
 change obviously concerns, never drop one whose row matched. Say which rows fired and why.
+
+`perf-measurement` is the one exception to "never drop". Brief it with the scenario to time and the
+command that times it: a `cargo test --release` instrument, a `heph` invocation on a corpus, or
+`/perf-test`. If no such scenario exists, record `perf-measurement: NOT MEASURED — <why>` in Board
+and do not consult it. On 2026-10-04 one consult came back with a verdict "from reading the code",
+which is `feature-quality`'s job and costs a consult to prove nothing.
 
 ## 3. The brief
 

@@ -168,6 +168,8 @@ A `PreToolUse` hook (`.claude/hooks/gate`, a Go program run with `go run`; tests
   - The hook rewrites each `lint` in an agent's command into a call back to itself. That call records the working tree, runs the real `lint`, and writes `<git-dir>/heph-lint-ok` only when `lint` exits 0.
   - Nothing is added to `lint` itself, which CI runs.
   - Any edit or commit after the run means running `lint` again. `HEPH_PUSH_UNLINTED=1` pushes anyway.
+- A scripted edit is refused: `sed -i`, `perl -i`, or a python script that reads, replaces and writes. `HEPH_SCRIPTED_EDIT=1` is the opt-in, only for the compiler-verified exception under "Session economy".
+- Nothing else is refused, but the model is told its context size once it passes 300k, and again at each further 100k (not inside a subagent).
 
 The hook needs `go` on `PATH` (devenv provides it) and lets everything through without it.
 
@@ -214,16 +216,25 @@ The next session starts from the hand-off's link, never from the conversation th
 **The spec is the contract.** A plan that only describes the change leaves the implementation session to work the details out again, and gives the reviewer nothing to check the code against. The spec has these sections:
 
 - **Goal / Non-goals**: one paragraph each.
+- **Invariants and trust**: the rules the change rests on, stated as rules and **confirmed by the user** before any code. Cover every lifetime ("this lock is held for the request / for one use / until exit") and every new cross-component contract ("the provider reports X; who checks it: the engine at runtime, `heph validate`, or nobody?"). Give the alternatives and what each costs. On 2026-10-04, two PRs were half rebuilt because these were never asked. One built a per-revision lock rekey before hearing that locks must not outlive their use. In the other, the spec decided provider labels were "checked on every resolved spec", and the user reversed it after the PR was open: trust the provider and enforce with `heph validate`. A user's "lets do option 1" picks a mechanism. It does not confirm the invariant.
 - **Decisions**: each settled decision with its reason. The implementation session does not reopen these.
 - **Tests**: each test that defines done, with its layer (unit, `crates/e2e` or `crates/bin-e2e`; see `.claude/testing.md`) and what it proves. Implementation is done when these pass and `lint` exits 0. A test that is dropped or changed is recorded in the PR description.
   - When the spec enumerates cases ("six failure points", "three commands"), Tests maps **each case to a named test** in a table. A case with no row is how a whole stage shipped untested and came back as a review BLOCKER.
   - A heuristic (a parser, a text trimmer, a matcher) gets a table of **adversarial inputs** in Tests before it is written: the near-miss name (`//p:a` vs `//p:ab`), multi-line and empty input, input that went through a wrapper (a memoizer flattens error chains), non-ASCII and control bytes, input over any length cap. One heuristic was rewritten five times as reviewers found these one by one.
 - **Accepted exemptions**: every place the change deliberately does *not* hold its own rule (a lock it does not take, a partial result it does write), each with a verdict from each design agent. An exemption written into Files as a side note was waved through at design and became a hermeticity BLOCKER at review.
 - **Files**: the files and seams the change touches, and so which board triggers fire.
-- **Board**: the verdicts from `/board`, one line per agent and round.
+- **Board**: the verdicts from `/board`, one line per agent and round. A design is not done until it has a design-stage verdict from every agent it triggers. A list of agent names is not a verdict. `/handoff` refuses to close the design phase without them: the label spec above went to implementation unreviewed, although it named its own triggered agents.
 - **Open**: the real remaining questions, each marked for the user or for implementation.
 
 **One implementation context per stack layer.** A stack built and review-fixed in one context grows it past 400k, and every call re-sends all of it: one two-layer session ran 299 calls to a 736k context and 136M input tokens, 67% of it above 150k. Build each layer in its own context — a `general-purpose` agent with `isolation: "worktree"` per layer, continued with `SendMessage` for that layer's review fixes, or end the turn at the layer boundary and `/compact`. The cost is each layer re-reading its own code, which at a small context is a fraction of carrying the other layer.
+
+**Rework goes to a fresh context too.** Two cases count as rework:
+- a review-fix round after the first board;
+- a redesign the user asks for once code exists.
+
+Brief a fresh agent with the diff range, the finding or the user's words, and the decisions that still hold. Don't do the work in a context that carries the whole history. On 2026-10-04 two sessions made 209 calls above 300k, and both of them were doing this kind of work. One delegated its last fix to a fresh agent and that worked, about 80 calls later than it should have. The gate hook says when context passes 300k.
+
+**An unrelated request is a new session.** Once the PR is pushed, a request that is not about it (another bug, a second small PR) starts a new session. Carried in the old one, it pays for the old one's history on every call.
 
 **Independent changes run in parallel.** One design session can produce several specs. Each gets its own implementation session in its own workspace or worktree, branched off `master`. Stack only when a change can't compile or be reviewed without the one below it (see "Stacked PRs"). Wall-clock time is then the slowest PR, not the sum of all of them.
 
@@ -242,8 +253,9 @@ Memory is for the user's preferences.
 
 Every turn re-sends the whole context, so a long session pays for its history on every call — and a turn over 400k tokens is slower as well as dearer. Across ten recent sessions, the four that ran past 300 turns took 92% of the tokens, at a median context of 300–470k; 64% of all input was context beyond the first 150k. The biggest saving is the phase split above.
 - **Read narrowly.** `rg -n` to locate, then `sed -n 'A,Bp'` for the range — not `cat` of a whole source file or a whole `docs/*.md`. A 20KB dump is paid again on every later turn. A sweep across many files goes to an `Explore` agent, which returns the conclusion rather than the files.
-- **Edit files with Edit/Write, not scripts.** A `python3 - <<EOF … s.replace(…)`, `sed -i` or `perl -pi` edit hides the diff from the user, leaves the harness's view of the file stale (every later touch re-sends it as "changed on disk"), and a heredoc of markdown mentioning `tst` trips the command gate. Several changes are several Edit calls in one message. Bash is for running things.
-  - **One exception: a signature change the compiler verifies.** When adding an argument breaks N call sites and `cargo` lists every one, a `sed -i` limited to those `file:line`s is allowed — the compiler is the oracle, not the script. Follow it with `git diff --stat` and `git diff -U0` (so the user sees every change) and a `cargo clippy --keep-going` pass. Propagating one new argument through 48 test sites by hand took 47 Edits and 10.4M input tokens.
+- **Edit files with Edit/Write, not scripts.** A `python3 - <<EOF … s.replace(…)`, `sed -i` or `perl -pi` edit hides the diff from the user, leaves the harness's view of the file stale (every later touch re-sends it as "changed on disk"), and a heredoc of markdown mentioning `tst` trips the command gate. Several changes are several Edit calls in one message. Bash is for running things. The gate hook refuses these. The prose rule alone was broken 390 times in one session.
+  - **One exception: a signature change the compiler verifies.** When adding an argument breaks N call sites and `cargo` lists every one, a `HEPH_SCRIPTED_EDIT=1 sed -i` limited to those `file:line`s is allowed — the compiler is the oracle, not the script. Do it as **one** command over the line numbers cargo printed. A second line-number `sed -i` after an edit that inserted lines hits the wrong lines.
+  - Before you write a call site N times, ask whether it needs changing. Often the old signature can stay as a thin wrapper over a new `fn foo_with(.., X)`, and no caller changes. Follow it with `git diff --stat` and `git diff -U0` (so the user sees every change) and a `cargo clippy --keep-going` pass. Propagating one new argument through 48 test sites by hand took 47 Edits and 10.4M input tokens.
 - **Send long output to a file.** Redirect build and test output into the scratchpad and grep what you need from the file, instead of letting a whole run into context. Judge the run by its exit code, not by the grep: rustfmt prints `Diff in`, not `error`, and `| tail` hides the status.
 - **Don't poll.** CI: `/ci-triage` waits on the run and classifies each failure: a known flake (it reruns it), a failure inherited from a stacked base, or a real break. It reads the failed logs from a file, not into context. The primitive underneath is `gh run watch <run-id> --exit-status` with `run_in_background`. `gh pr checks` right after a push prints "no checks reported", which is not a pass. A local process: `run_in_background`, or Monitor with an until-loop.
 - **Artifacts: one publish per round of feedback.** Collect the changes, edit the local file with `Edit`, publish once. Don't read back the published page — the local file is the source.

@@ -13,7 +13,12 @@ import (
 const (
 	optIn         = "HEPH_FULL_SUITE"
 	unlintedOptIn = "HEPH_PUSH_UNLINTED"
+	editOptIn     = "HEPH_SCRIPTED_EDIT"
 )
+
+const editReason = "Blocked: a scripted edit (`sed -i`, `perl -i`, or a python read-replace-write). Use the Edit tool — several changes are several Edit calls in one message.\n" +
+	"A script hides the diff from the user and leaves the harness's view of the file stale; chained line-number `sed -i` edits also land on the wrong lines once an earlier one inserts.\n" +
+	"The one exception is a signature change whose every call site cargo lists: prefix this command with `HEPH_SCRIPTED_EDIT=1`, limit it to those file:lines, and follow it with `git diff -U0`. See CLAUDE.md \"Session economy\"."
 
 const tstReason = "Blocked: `tst` is the full suite, and CI runs it on every push.\n" +
 	"Run the tests for what you changed: `cargo test -p <crate> <name>`, then push.\n" +
@@ -71,15 +76,19 @@ func check(cmd string, g gate) string {
 		if reason != "" {
 			return false
 		}
-		if call, ok := node.(*syntax.CallExpr); ok {
-			reason = checkCall(call, g)
+		// Every command sits in a Stmt, which also holds its redirections —
+		// where a `python3 - <<'PY'` script lives.
+		if stmt, ok := node.(*syntax.Stmt); ok {
+			if call, ok := stmt.Cmd.(*syntax.CallExpr); ok {
+				reason = checkCall(call, stmt.Redirs, g)
+			}
 		}
 		return true
 	})
 	return reason
 }
 
-func checkCall(call *syntax.CallExpr, g gate) string {
+func checkCall(call *syntax.CallExpr, redirs []*syntax.Redirect, g gate) string {
 	optIns := map[string]bool{}
 	for _, a := range call.Assigns {
 		if a.Name != nil && literal(a.Value) == "1" {
@@ -116,6 +125,10 @@ func checkCall(call *syntax.CallExpr, g gate) string {
 	case "git", "gh":
 		if pushes(args) && !optIns[unlintedOptIn] && g.unlinted != nil {
 			return g.unlinted()
+		}
+	case "sed", "perl", "python", "python3":
+		if scriptedEdit(args, redirs) && !optIns[editOptIn] {
+			return editReason
 		}
 	case "bash", "sh", "zsh":
 		// `bash -c '<script>'` runs the script: check it as a command line.
