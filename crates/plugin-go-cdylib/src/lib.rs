@@ -98,10 +98,22 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let go_runner = hplugin_go::plugingo::runner::read_runner_option(&options)?;
 
     let walker = Arc::new(hwalk::CachedWalker::open(&walk_db));
+    // Which workspace paths a `codegen = "copy"` target owns, so package
+    // discovery never sources a generated `.go` file. Reads the same ledger the
+    // host does, under the `home` handed in through `CreateConfig`; nothing here
+    // is discovered from the environment.
+    //
+    // Its own handle rather than one passed across the ABI: the set is re-read
+    // when the ledger changes, so a claim the host registers mid-run reaches this
+    // copy too, with no ABI surface to keep in sync.
+    let codegen_claims = Arc::new(hwalk::CodegenClaims::open(
+        home.join("cache").join("codegen-claims.db"),
+    )?);
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(Provider::from_options(
         root,
         &[],
         &[],
+        codegen_claims,
         &options,
         walker,
         plugin_sdk::stabby::cdylib_runtime_handle(),
