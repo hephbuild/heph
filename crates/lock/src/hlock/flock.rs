@@ -491,6 +491,35 @@ impl FRWLock {
             state: FLockState::new(path.as_ref().to_path_buf()),
         }
     }
+
+    /// Whether *some* open file description holds `path` in **either** mode —
+    /// a writer, or one or more readers. The counterpart of
+    /// [`FLock::is_path_held`], which by design cannot see shared holders: its
+    /// `LOCK_SH` probe coexists with them. This one probes with
+    /// `LOCK_EX | LOCK_NB`, which any holder refuses.
+    ///
+    /// Same contract otherwise: probe-only, never creates the file, a missing
+    /// file is "not held", a snapshot rather than an admission decision. The
+    /// transient `LOCK_EX` on success can make a concurrent non-blocking acquire
+    /// report busy once, costing it one backoff round.
+    pub fn is_path_locked(path: impl AsRef<Path>) -> Result<bool> {
+        let path = path.as_ref();
+        let f = match OpenOptions::new().read(true).open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("opening lock file {} to probe", path.display()));
+            }
+        };
+        let locked = !flock_nb(f.as_raw_fd(), libc::LOCK_EX)
+            .with_context(|| format!("probing lock file {}", path.display()))?;
+        if !locked {
+            // SAFETY: `f` owns a valid open fd for the duration of this call.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+        Ok(locked)
+    }
 }
 
 /// Shared read guard; releases the read lock on drop.
@@ -995,6 +1024,25 @@ mod tests {
         let r = rw.read(&ct()).await.unwrap();
         assert!(!FLock::is_path_held(&path).unwrap());
         drop(r);
+    }
+
+    /// The counterpart that *does* see readers, and leaves nothing behind: a
+    /// writer acquires normally right after a probe that found the path free.
+    #[tokio::test]
+    async fn is_path_locked_sees_a_shared_reader_and_a_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let rw = FRWLock::new(&path);
+        assert!(!FRWLock::is_path_locked(&path).unwrap(), "missing file");
+
+        let r = rw.read(&ct()).await.unwrap();
+        assert!(FRWLock::is_path_locked(&path).unwrap(), "shared reader");
+        drop(r);
+        assert!(!FRWLock::is_path_locked(&path).unwrap(), "released");
+
+        let w = rw.try_write().unwrap().expect("probe left no lock behind");
+        assert!(FRWLock::is_path_locked(&path).unwrap(), "writer");
+        drop(w);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

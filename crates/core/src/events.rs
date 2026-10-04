@@ -178,13 +178,18 @@ pub enum BuildEventKind {
     /// Acquiring the per-addr result lock has been blocked past the notice
     /// threshold. `holder_pid` is a process that stamped the lock and still held
     /// it when it was probed — a snapshot, and `None` whenever the holder cannot
-    /// be named (including the common case of waiting on readers to drain, which
-    /// nothing stamps). Paired one-to-one with
+    /// be named. Paired one-to-one with
     /// `ResultLockWaitEnd` (which fires on acquire **or** cancellation), so a
     /// consumer can show the notice for exactly the duration of the wait.
     ResultLockWaitStart {
         addr: String,
         holder_pid: Option<u32>,
+        /// With no `holder_pid`: the wait is on *readers* of the cached revision
+        /// being rebuilt or deleted — another command still using that output,
+        /// which releases it when it exits. Readers are not stamped, so they can
+        /// be detected but not named. `false` from a host that predates it.
+        #[serde(default)]
+        in_use_by_readers: bool,
     },
     /// The execute-lock wait ended (lock acquired or the wait was cancelled).
     ResultLockWaitEnd {
@@ -407,6 +412,26 @@ mod tests {
                 assert_eq!(upstream_of, None);
                 assert_eq!(exit_status, None);
                 assert_eq!(log_tail, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `ResultLockWaitStart` from a host predating `in_use_by_readers` decodes,
+    /// and reads as "not known to be readers" — the only thing it could say.
+    #[test]
+    fn an_old_lock_wait_defaults_to_not_readers() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"ResultLockWaitStart","addr":"//a:x",
+            "holder_pid":null}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
+        match ev.kind {
+            BuildEventKind::ResultLockWaitStart {
+                holder_pid,
+                in_use_by_readers,
+                ..
+            } => {
+                assert_eq!(holder_pid, None);
+                assert!(!in_use_by_readers);
             }
             other => panic!("wrong variant: {other:?}"),
         }

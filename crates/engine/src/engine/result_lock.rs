@@ -14,19 +14,43 @@
 //!   ([`ResultWriteGuard`]); [`downgrade`](ResultWriteGuard::downgrade)s back to an
 //!   upgradable read.
 //!
-//! Built from [`hlock::hlock`]'s keyed transformable locks, which lazily create
-//! and self-evict a per-key lock instance. The default filesystem backend
-//! serializes writers across *processes* via two `flock(2)` lock files per addr
-//! under `<home>/lock/` (an outer "gateway" and an inner reader/writer file);
-//! the in-memory backend serializes only within this process.
+//! ## Two scopes: the target, and the revision
+//!
+//! The lock is a [`TBridge`] of two halves keyed at different granularities:
+//!
+//! - the **gateway** (outer, exclusive) is per *target* — one per [`Addr`]. Every
+//!   writer and upgradable reader takes it first, so at most one request in any
+//!   process is building a given target at a time, whichever revision it is
+//!   building. Plain readers never touch it.
+//! - the **revision** lock (inner, reader/writer) is per *revision* —
+//!   `(addr, hashin)`, the same key the cache stores an entry under. It is what
+//!   a riding read holds, and what a writer must drain before replacing or
+//!   deleting that entry.
+//!
+//! Keying the riding read by revision is the point. A request holds a read on
+//! every revision it resolved until the request ends, and a long-running
+//! command (`heph run //app:serve`) can be a very long request. With the inner
+//! lock per addr, a second `heph` that needed to build a *new* revision of any
+//! of those targets — one whose input changed — parked behind readers of the
+//! *old* one until the first command exited, though the two entries share no
+//! bytes. Now it waits only for a concurrent *build* of the same target (the
+//! gateway) and, for a rebuild of the very same revision (`--force`), for that
+//! revision's readers.
+//!
+//! The halves share one instance per key across every bridge composed over
+//! them ([`KeyedHandle`]), so exclusion holds in-process as well as across
+//! processes. The default filesystem backend serializes across *processes* via
+//! `flock(2)` lock files under `<home>/lock/` — `<addr>.outer.lock` and
+//! `<addr>.<revision>.inner.lock`; the in-memory backend serializes only within
+//! this process.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hlock::hlock::{
-    Ctoken, FLock, FRWLock, FWriteGuard, KeyedGuard, KeyedTLock, Lock, MemLock, MemRWLock, TBridge,
-    TBridgeReadGuard, TBridgeUpgradableGuard, TBridgeWriteGuard, TUpgradableReadGuard, TWriteGuard,
-    mem_tlock,
+    Ctoken, FLock, FRWLock, FReadGuard, FWriteGuard, KeyedGuard, KeyedHandle, KeyedLock,
+    KeyedRWLock, Lock, MemGuard, MemLock, MemRWLock, MemReadGuard, MemWriteGuard, RWLock, TBridge,
+    TBridgeUpgradableGuard, TBridgeWriteGuard, TLock, TUpgradableReadGuard, TWriteGuard,
 };
 use hmodel::htaddr::Addr;
 use std::io::Read as _;
@@ -43,8 +67,17 @@ pub enum LockBackend {
     Mem,
 }
 
-type FsBridge = TBridge<GatewayLock, FRWLock>;
-type MemBridge = TBridge<MemLock, MemRWLock>;
+/// One revision of a target: the key of its cache entry, and of its inner lock.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RevisionKey {
+    addr: Addr,
+    hashin: String,
+}
+
+type FsGateway = KeyedHandle<Addr, GatewayLock>;
+type FsRevision = KeyedHandle<RevisionKey, FRWLock>;
+type MemGateway = KeyedHandle<Addr, MemLock>;
+type MemRevision = KeyedHandle<RevisionKey, MemRWLock>;
 
 /// The per-addr gateway lock: an [`FLock`] plus one policy — **acquiring it
 /// empties the lock file.**
@@ -112,20 +145,51 @@ impl Lock for GatewayLock {
     }
 }
 
-type FsReadGuard = KeyedGuard<Addr, FsBridge, TBridgeReadGuard<FRWLock>>;
-type MemReadGuard = KeyedGuard<Addr, MemBridge, TBridgeReadGuard<MemRWLock>>;
-type FsUpgradableGuard = KeyedGuard<Addr, FsBridge, TBridgeUpgradableGuard<GatewayLock, FRWLock>>;
-type MemUpgradableGuard = KeyedGuard<Addr, MemBridge, TBridgeUpgradableGuard<MemLock, MemRWLock>>;
-type FsWriteGuard = KeyedGuard<Addr, FsBridge, TBridgeWriteGuard<GatewayLock, FRWLock>>;
-type MemWriteGuard = KeyedGuard<Addr, MemBridge, TBridgeWriteGuard<MemLock, MemRWLock>>;
+type FsReadGuard = KeyedGuard<RevisionKey, FRWLock, FReadGuard>;
+type MemRevReadGuard = KeyedGuard<RevisionKey, MemRWLock, MemReadGuard>;
+type FsUpgradableGuard = TBridgeUpgradableGuard<FsGateway, FsRevision>;
+type MemUpgradableGuard = TBridgeUpgradableGuard<MemGateway, MemRevision>;
+type FsWriteGuard = TBridgeWriteGuard<FsGateway, FsRevision>;
+type MemBridgeWriteGuard = TBridgeWriteGuard<MemGateway, MemRevision>;
 
-/// Plain shared read guard on a target's cache entry. Held for as long as the
-/// artifacts are in use; the lock releases on drop. `Send + Sync` so it can ride
-/// inside an `Arc<dyn Content>` shared across tasks.
+/// Plain shared read guard on one revision's cache entry. Held for as long as
+/// the artifacts are in use; the lock releases on drop. `Send + Sync` so it can
+/// ride inside an `Arc<dyn Content>` shared across tasks.
+///
+/// Holds the revision lock only — never the target's gateway — so it blocks a
+/// writer of *this* revision and nothing else.
 #[derive(Debug)]
 pub enum ResultReadGuard {
     Fs(FsReadGuard),
-    Mem(MemReadGuard),
+    Mem(MemRevReadGuard),
+}
+
+/// The target-scoped gateway alone: "nobody else is building this target".
+///
+/// For the callers that act on a target as a whole rather than on one
+/// revision — GC, which enumerates and deletes revisions under it, and the
+/// credential path, which needs only the per-target execute exclusion. A
+/// revision is deleted through [`ResultLock::try_write_revision`], which
+/// demands this guard as proof that no build can race the delete.
+#[derive(Debug)]
+pub enum TargetGuard {
+    Fs(KeyedGuard<Addr, GatewayLock, FWriteGuard>),
+    Mem(KeyedGuard<Addr, MemLock, MemGuard>),
+}
+
+/// A run of the target in progress. See [`ResultLock::lock_execute`].
+#[derive(Debug)]
+pub enum ExecuteGuard {
+    Fs(KeyedGuard<Addr, FLock, FWriteGuard>),
+    Mem(KeyedGuard<Addr, MemLock, MemGuard>),
+}
+
+/// Exclusive hold on one revision, taken under a [`TargetGuard`]. Its readers
+/// have drained, and none can start until it drops.
+#[derive(Debug)]
+pub enum RevisionWriteGuard {
+    Fs(KeyedGuard<RevisionKey, FRWLock, FWriteGuard>),
+    Mem(KeyedGuard<RevisionKey, MemRWLock, MemWriteGuard>),
 }
 
 /// Upgradable read guard: the optimistic gateway holder. At most one per addr,
@@ -141,7 +205,7 @@ pub enum ResultUpgradableGuard {
 #[derive(Debug)]
 pub enum ResultWriteGuard {
     Fs(FsWriteGuard),
-    Mem(MemWriteGuard),
+    Mem(MemBridgeWriteGuard),
 }
 
 impl ResultUpgradableGuard {
@@ -173,11 +237,60 @@ impl ResultWriteGuard {
     }
 }
 
-/// Keyed transformable lock. Both backends are keyed by the target [`Addr`]; the
-/// filesystem backend names its two lock files after the addr's content hash
-/// (filesystem-safe), the in-memory backend keys async locks directly. The same
-/// addr maps to the same lock across requests and — for the filesystem backend —
-/// across processes.
+/// The two registries a backend draws its locks from: one gateway per target,
+/// one reader/writer lock per revision. See the module doc.
+pub struct Registries<G, R, E> {
+    gateways: KeyedLock<Addr, G>,
+    revisions: KeyedRWLock<RevisionKey, R>,
+    /// One per target, held across a run of it — see
+    /// [`ResultLock::lock_execute`].
+    executes: KeyedLock<Addr, E>,
+}
+
+impl<G, R, E> Registries<G, R, E>
+where
+    G: Lock + 'static,
+    R: RWLock + 'static,
+    E: Lock + 'static,
+{
+    fn new(
+        gateway: impl Fn(&Addr) -> G + Send + Sync + 'static,
+        revision: impl Fn(&RevisionKey) -> R + Send + Sync + 'static,
+        execute: impl Fn(&Addr) -> E + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            gateways: KeyedLock::new(gateway),
+            revisions: KeyedRWLock::new(revision),
+            executes: KeyedLock::new(execute),
+        }
+    }
+
+    /// The transformable lock over one revision: this target's gateway, that
+    /// revision's reader/writer lock.
+    fn bridge(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+    ) -> TBridge<KeyedHandle<Addr, G>, KeyedHandle<RevisionKey, R>> {
+        TBridge::new(
+            self.gateways.handle(addr.clone()),
+            self.revisions.handle(revision_key(addr, hashin)),
+        )
+    }
+}
+
+fn revision_key(addr: &Addr, hashin: &str) -> RevisionKey {
+    RevisionKey {
+        addr: addr.clone(),
+        hashin: hashin.to_owned(),
+    }
+}
+
+/// Keyed transformable lock: a per-target gateway over per-revision
+/// reader/writer locks (see the module doc). The filesystem backend names its
+/// lock files after content hashes (filesystem-safe), the in-memory backend
+/// keys async locks directly. The same key maps to the same lock across
+/// requests and — for the filesystem backend — across processes.
 pub enum ResultLock {
     Fs {
         /// Directory holding the per-key lock files. Kept so [`holder_pid`] can
@@ -185,9 +298,9 @@ pub enum ResultLock {
         ///
         /// [`holder_pid`]: ResultLock::holder_pid
         dir: PathBuf,
-        lock: KeyedTLock<Addr, FsBridge>,
+        locks: Registries<GatewayLock, FRWLock, FLock>,
     },
-    Mem(KeyedTLock<Addr, MemBridge>),
+    Mem(Registries<MemLock, MemRWLock, MemLock>),
 }
 
 impl ResultLock {
@@ -197,88 +310,257 @@ impl ResultLock {
         match backend {
             LockBackend::Fs => ResultLock::Fs {
                 dir: dir.clone(),
-                lock: KeyedTLock::new(move |addr: &Addr| {
-                    TBridge::new(
-                        GatewayLock::new(outer_lock_path(&dir, addr)),
-                        FRWLock::new(inner_lock_path(&dir, addr)),
-                    )
-                }),
+                locks: Registries::new(
+                    enclose::enclose!((dir) move |addr: &Addr| {
+                        GatewayLock::new(outer_lock_path(&dir, addr))
+                    }),
+                    enclose::enclose!((dir) move |rev: &RevisionKey| {
+                        FRWLock::new(inner_lock_path(&dir, &rev.addr, &rev.hashin))
+                    }),
+                    move |addr: &Addr| FLock::new(execute_lock_path(&dir, addr)),
+                ),
             },
-            LockBackend::Mem => ResultLock::Mem(KeyedTLock::new(|_| mem_tlock())),
-        }
-    }
-
-    /// Acquire a plain shared read guard for `addr`. Cheap and fully concurrent —
-    /// the hot-path guard taken optimistically before a cache lookup and attached
-    /// to the returned artifacts.
-    pub async fn read(
-        &self,
-        addr: &Addr,
-        ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> Result<ResultReadGuard> {
-        match self {
-            ResultLock::Fs { lock, .. } => {
-                Ok(ResultReadGuard::Fs(lock.read(addr.clone(), ctoken).await?))
-            }
-            ResultLock::Mem(kl) => Ok(ResultReadGuard::Mem(kl.read(addr.clone(), ctoken).await?)),
-        }
-    }
-
-    /// Acquire the upgradable read guard for `addr` (the gateway), waiting until
-    /// free or `ctoken` is cancelled. Taken on the cold path when a build may be
-    /// needed. On the filesystem backend the holder stamps its pid into the
-    /// gateway lock file so a *different* process blocked on the same addr can
-    /// name the holder via [`holder_pid`](ResultLock::holder_pid). Best-effort:
-    /// a write failure never fails the acquire.
-    pub async fn upgradable_read(
-        &self,
-        addr: &Addr,
-        ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> Result<ResultUpgradableGuard> {
-        match self {
-            ResultLock::Fs { lock, .. } => {
-                let guard = lock.upgradable_read(addr.clone(), ctoken).await?;
-                stamp_pid(guard.outer_guard());
-                Ok(ResultUpgradableGuard::Fs(guard))
-            }
-            ResultLock::Mem(kl) => Ok(ResultUpgradableGuard::Mem(
-                kl.upgradable_read(addr.clone(), ctoken).await?,
+            LockBackend::Mem => ResultLock::Mem(Registries::new(
+                |_| MemLock::default(),
+                |_| MemRWLock::default(),
+                |_| MemLock::default(),
             )),
         }
     }
 
-    /// Acquire the exclusive write guard for `addr`. Used by the non-cacheable
-    /// (force/shell) path that executes without a long-lived read lock. Stamps
-    /// pid like [`upgradable_read`](ResultLock::upgradable_read).
-    pub async fn write(
+    /// Acquire `addr`'s execute lock: exclusive across every run of the target,
+    /// in any process, from just before its sandbox is claimed until its outputs
+    /// are cached. The sandbox directory is per addr, so two runs of one target
+    /// at once would tear down each other's tree.
+    ///
+    /// Separate from the gateway because one run happens *without* it: a cache
+    /// hit whose blobs turn out to be unavailable rebuilds under its riding read
+    /// of the revision, and waiting on the gateway there would deadlock against
+    /// a `--force` or `clean` of that same revision — which holds the gateway
+    /// and waits for that read. So this lock is a leaf: it is taken after every
+    /// result lock a run needs and after the run's deps have resolved, and
+    /// nothing is acquired while it is held — so it cannot take part in a cycle.
+    pub async fn lock_execute(
         &self,
         addr: &Addr,
         ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> Result<ResultWriteGuard> {
+    ) -> Result<ExecuteGuard> {
         match self {
-            ResultLock::Fs { lock, .. } => {
-                let guard = lock.write(addr.clone(), ctoken).await?;
-                stamp_pid(guard.outer_guard());
-                Ok(ResultWriteGuard::Fs(guard))
-            }
-            ResultLock::Mem(kl) => Ok(ResultWriteGuard::Mem(kl.write(addr.clone(), ctoken).await?)),
+            ResultLock::Fs { locks, .. } => Ok(ExecuteGuard::Fs(
+                locks.executes.lock(addr.clone(), ctoken).await?,
+            )),
+            ResultLock::Mem(locks) => Ok(ExecuteGuard::Mem(
+                locks.executes.lock(addr.clone(), ctoken).await?,
+            )),
         }
     }
 
-    /// Non-blocking exclusive write acquire for `addr`. Returns `Ok(None)` when
-    /// the addr is currently contended (any reader/writer holds it) instead of
-    /// waiting. Used by the post-write GC trim, which must never block the hot
-    /// path. Stamps pid on success like [`write`](ResultLock::write).
-    pub fn try_write(&self, addr: &Addr) -> Result<Option<ResultWriteGuard>> {
+    /// Acquire a plain shared read guard on revision `(addr, hashin)`. Cheap and
+    /// fully concurrent — the hot-path guard taken optimistically before a cache
+    /// lookup and attached to the returned artifacts. Takes the revision lock
+    /// only, never the target's gateway.
+    pub async fn read(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> Result<ResultReadGuard> {
+        let key = revision_key(addr, hashin);
         match self {
-            ResultLock::Fs { lock, .. } => match lock.try_write(addr.clone())? {
+            ResultLock::Fs { locks, .. } => Ok(ResultReadGuard::Fs(
+                locks.revisions.read(key, ctoken).await?,
+            )),
+            ResultLock::Mem(locks) => Ok(ResultReadGuard::Mem(
+                locks.revisions.read(key, ctoken).await?,
+            )),
+        }
+    }
+
+    /// Acquire the upgradable read guard on revision `(addr, hashin)` — the
+    /// target's gateway plus a read on the revision — waiting until free or
+    /// `ctoken` is cancelled. On the filesystem backend the holder stamps its pid
+    /// into the gateway lock file so a *different* process blocked on the same
+    /// target can name the holder via [`holder_pid`](ResultLock::holder_pid).
+    /// Best-effort: a write failure never fails the acquire.
+    pub async fn upgradable_read(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> Result<ResultUpgradableGuard> {
+        match self {
+            ResultLock::Fs { locks, .. } => {
+                let guard = locks.bridge(addr, hashin).upgradable_read(ctoken).await?;
+                stamp_pid(guard.outer_guard().map(|g| g.get()));
+                Ok(ResultUpgradableGuard::Fs(guard))
+            }
+            ResultLock::Mem(locks) => Ok(ResultUpgradableGuard::Mem(
+                locks.bridge(addr, hashin).upgradable_read(ctoken).await?,
+            )),
+        }
+    }
+
+    /// Acquire the exclusive write guard on revision `(addr, hashin)`: the
+    /// target's gateway (no other build of this target, of any revision), then
+    /// the revision's write lock (its readers drained). Held across execute +
+    /// cache. Stamps pid like [`upgradable_read`](ResultLock::upgradable_read).
+    pub async fn write(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> Result<ResultWriteGuard> {
+        match self {
+            ResultLock::Fs { locks, .. } => {
+                let guard = locks.bridge(addr, hashin).write(ctoken).await?;
+                stamp_pid(guard.outer_guard().map(|g| g.get()));
+                Ok(ResultWriteGuard::Fs(guard))
+            }
+            ResultLock::Mem(locks) => Ok(ResultWriteGuard::Mem(
+                locks.bridge(addr, hashin).write(ctoken).await?,
+            )),
+        }
+    }
+
+    /// Non-blocking [`write`](ResultLock::write). `Ok(None)` when the target is
+    /// being built or the revision is in use.
+    pub fn try_write(&self, addr: &Addr, hashin: &str) -> Result<Option<ResultWriteGuard>> {
+        match self {
+            ResultLock::Fs { locks, .. } => match locks.bridge(addr, hashin).try_write()? {
                 Some(guard) => {
-                    stamp_pid(guard.outer_guard());
+                    stamp_pid(guard.outer_guard().map(|g| g.get()));
                     Ok(Some(ResultWriteGuard::Fs(guard)))
                 }
                 None => Ok(None),
             },
-            ResultLock::Mem(kl) => Ok(kl.try_write(addr.clone())?.map(ResultWriteGuard::Mem)),
+            ResultLock::Mem(locks) => Ok(locks
+                .bridge(addr, hashin)
+                .try_write()?
+                .map(ResultWriteGuard::Mem)),
+        }
+    }
+
+    /// Acquire the target's gateway alone — exclusive against every build of
+    /// `addr`, in any process, and against nothing else. Stamps pid.
+    pub async fn lock_target(
+        &self,
+        addr: &Addr,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> Result<TargetGuard> {
+        match self {
+            ResultLock::Fs { locks, .. } => {
+                let guard = locks.gateways.lock(addr.clone(), ctoken).await?;
+                stamp_pid(Some(guard.get()));
+                Ok(TargetGuard::Fs(guard))
+            }
+            ResultLock::Mem(locks) => Ok(TargetGuard::Mem(
+                locks.gateways.lock(addr.clone(), ctoken).await?,
+            )),
+        }
+    }
+
+    /// Non-blocking [`lock_target`](ResultLock::lock_target). `Ok(None)` while
+    /// any request is building `addr`.
+    pub fn try_lock_target(&self, addr: &Addr) -> Result<Option<TargetGuard>> {
+        match self {
+            ResultLock::Fs { locks, .. } => match locks.gateways.try_lock(addr.clone())? {
+                Some(guard) => {
+                    stamp_pid(Some(guard.get()));
+                    Ok(Some(TargetGuard::Fs(guard)))
+                }
+                None => Ok(None),
+            },
+            ResultLock::Mem(locks) => {
+                Ok(locks.gateways.try_lock(addr.clone())?.map(TargetGuard::Mem))
+            }
+        }
+    }
+
+    /// Non-blocking exclusive hold on revision `(addr, hashin)`, for deleting it.
+    /// `Ok(None)` while anything reads it — a request riding its artifacts.
+    ///
+    /// `_target` is the proof that the caller holds `addr`'s gateway: every
+    /// writer takes the gateway before the revision lock, so holding it is what
+    /// rules out a build re-creating the revision mid-delete, and what keeps this
+    /// acquire in the same order as every other writer's.
+    pub fn try_write_revision(
+        &self,
+        _target: &TargetGuard,
+        addr: &Addr,
+        hashin: &str,
+    ) -> Result<Option<RevisionWriteGuard>> {
+        let key = revision_key(addr, hashin);
+        match self {
+            ResultLock::Fs { locks, .. } => {
+                Ok(locks.revisions.try_write(key)?.map(RevisionWriteGuard::Fs))
+            }
+            ResultLock::Mem(locks) => {
+                Ok(locks.revisions.try_write(key)?.map(RevisionWriteGuard::Mem))
+            }
+        }
+    }
+
+    /// Blocking [`try_write_revision`](ResultLock::try_write_revision): waits for
+    /// the revision's readers to drain. Only for an explicit, user-requested
+    /// delete (`heph clean`); the background GC paths must not park behind a
+    /// reader that may be a command running for hours.
+    pub async fn write_revision(
+        &self,
+        _target: &TargetGuard,
+        addr: &Addr,
+        hashin: &str,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> Result<RevisionWriteGuard> {
+        let key = revision_key(addr, hashin);
+        match self {
+            ResultLock::Fs { locks, .. } => Ok(RevisionWriteGuard::Fs(
+                locks.revisions.write(key, ctoken).await?,
+            )),
+            ResultLock::Mem(locks) => Ok(RevisionWriteGuard::Mem(
+                locks.revisions.write(key, ctoken).await?,
+            )),
+        }
+    }
+
+    /// Who a waiter on `addr` — on revision `hashin`, when the wait is for one —
+    /// is waiting for, as `(holder_pid, in_use_by_readers)`. Best-effort, for the
+    /// lock-wait notice.
+    ///
+    /// This process's own stamp never names the holder (on the filesystem
+    /// backend, where a pid means another process). A waiter that already holds
+    /// the gateway — `heph clean` waiting on one revision's readers — stamped its
+    /// own pid there, and reporting that named the waiter itself. With no other
+    /// pid to name, the revision's readers are reported when they hold it.
+    pub fn wait_holder(&self, addr: &Addr, hashin: Option<&str>) -> (Option<u32>, bool) {
+        let pid = self
+            .holder_pid(addr)
+            .filter(|pid| *pid != std::process::id() || matches!(self, ResultLock::Mem(_)));
+        if pid.is_none() && hashin.is_some_and(|hashin| self.revision_in_use(addr, hashin)) {
+            return (None, true);
+        }
+        (pid, false)
+    }
+
+    /// Whether some guard — typically a riding read in another process — holds
+    /// revision `(addr, hashin)` right now. A snapshot for diagnostics, like
+    /// [`holder_pid`](ResultLock::holder_pid): it names *why* a writer waits when
+    /// the gateway cannot name a pid, and is never an admission decision.
+    pub fn revision_in_use(&self, addr: &Addr, hashin: &str) -> bool {
+        match self {
+            ResultLock::Fs { dir, .. } => {
+                match FRWLock::is_path_locked(inner_lock_path(dir, addr, hashin)) {
+                    Ok(locked) => locked,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "probing revision lock");
+                        false
+                    }
+                }
+            }
+            ResultLock::Mem(locks) => locks
+                .revisions
+                .try_write(revision_key(addr, hashin))
+                .ok()
+                .is_some_and(|g| g.is_none()),
         }
     }
 
@@ -352,9 +634,26 @@ fn outer_lock_path(dir: &Path, addr: &Addr) -> PathBuf {
     dir.join(format!("{}.outer.lock", addr.hash_str()))
 }
 
-/// Path of the per-addr inner reader/writer lock file.
-fn inner_lock_path(dir: &Path, addr: &Addr) -> PathBuf {
-    dir.join(format!("{}.inner.lock", addr.hash_str()))
+/// Path of the per-addr execute lock file. See [`ResultLock::lock_execute`].
+fn execute_lock_path(dir: &Path, addr: &Addr) -> PathBuf {
+    dir.join(format!("{}.execute.lock", addr.hash_str()))
+}
+
+/// Path of the per-revision inner reader/writer lock file.
+///
+/// The `hashin` is hashed rather than spliced in: it is opaque to this module,
+/// and only a fixed-width hex digest is known to be a safe, bounded file-name
+/// component. Prefixed by the addr's hash so a target's files sort together.
+///
+/// A revision's file is unlinked by its last *write* release — which a GC delete
+/// is — and survives plain read releases (see `hlock::flock`). So the directory
+/// holds about one file per retained revision, not one per revision ever read.
+fn inner_lock_path(dir: &Path, addr: &Addr, hashin: &str) -> PathBuf {
+    dir.join(format!(
+        "{}.{:x}.inner.lock",
+        addr.hash_str(),
+        xxhash_rust::xxh3::xxh3_64(hashin.as_bytes())
+    ))
 }
 
 /// Best-effort stamp of this process's pid into the gateway lock file, for
@@ -488,11 +787,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let lock = fs(&dir);
 
-        let _r1 = lock.read(&addr("a"), &ct()).await.expect("r1");
-        let _r2 = lock.read(&addr("a"), &ct()).await.expect("r2");
+        let _r1 = lock.read(&addr("a"), "h", &ct()).await.expect("r1");
+        let _r2 = lock.read(&addr("a"), "h", &ct()).await.expect("r2");
         // The optimistic gateway coexists with the plain readers.
         let _u = lock
-            .upgradable_read(&addr("a"), &ct())
+            .upgradable_read(&addr("a"), "h", &ct())
             .await
             .expect("upgradable");
     }
@@ -503,14 +802,17 @@ mod tests {
         let lock = Arc::new(fs(&dir));
 
         let held = lock
-            .upgradable_read(&addr("a"), &ct())
+            .upgradable_read(&addr("a"), "h", &ct())
             .await
             .expect("first");
 
         let lock2 = Arc::clone(&lock);
         let handle = tokio::spawn(async move {
             let tok = StdCancellationToken::new();
-            lock2.upgradable_read(&addr("a"), &tok).await.map(|_| ())
+            lock2
+                .upgradable_read(&addr("a"), "h", &tok)
+                .await
+                .map(|_| ())
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -533,7 +835,7 @@ mod tests {
         let lock = Arc::new(fs(&dir));
 
         let w = lock
-            .upgradable_read(&addr("a"), &ct())
+            .upgradable_read(&addr("a"), "h", &ct())
             .await
             .expect("upgradable")
             .upgrade(&ct())
@@ -543,7 +845,7 @@ mod tests {
         let lock2 = Arc::clone(&lock);
         let handle = tokio::spawn(async move {
             let tok = StdCancellationToken::new();
-            lock2.read(&addr("a"), &tok).await.map(|_| ())
+            lock2.read(&addr("a"), "h", &tok).await.map(|_| ())
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -567,22 +869,22 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let lock = fs(&dir);
 
-        let w = lock.write(&addr("a"), &ct()).await.expect("write");
+        let w = lock.write(&addr("a"), "h", &ct()).await.expect("write");
         let up = w.downgrade(&ct()).await.expect("downgrade");
         let read = lock
-            .read(&addr("a"), &ct())
+            .read(&addr("a"), "h", &ct())
             .await
             .expect("plain read coexists");
         drop(up);
 
         // A writer cannot proceed while the plain read is held...
         assert!(
-            lock.write(&addr("a"), &cancelled_ct()).await.is_err(),
+            lock.write(&addr("a"), "h", &cancelled_ct()).await.is_err(),
             "writer blocked while shared read held (cancelled wait)"
         );
         drop(read);
         // ...but succeeds once it drains.
-        lock.write(&addr("a"), &ct())
+        lock.write(&addr("a"), "h", &ct())
             .await
             .expect("writer after read drains");
     }
@@ -594,13 +896,15 @@ mod tests {
 
         // Free → acquires.
         let g = lock
-            .try_write(&addr("a"))
+            .try_write(&addr("a"), "h")
             .expect("try_write ok")
             .expect("free addr acquires");
 
         // Held → non-blocking, returns None rather than waiting.
         assert!(
-            lock.try_write(&addr("a")).expect("try_write ok").is_none(),
+            lock.try_write(&addr("a"), "h")
+                .expect("try_write ok")
+                .is_none(),
             "must not acquire while a write guard is held"
         );
 
@@ -608,7 +912,9 @@ mod tests {
 
         // Released → acquires again.
         assert!(
-            lock.try_write(&addr("a")).expect("try_write ok").is_some(),
+            lock.try_write(&addr("a"), "h")
+                .expect("try_write ok")
+                .is_some(),
             "must acquire once the prior guard drops"
         );
     }
@@ -617,9 +923,11 @@ mod tests {
     async fn try_write_none_while_plain_read_held() {
         let dir = tempfile::tempdir().expect("tempdir");
         let lock = fs(&dir);
-        let _r = lock.read(&addr("a"), &ct()).await.expect("read");
+        let _r = lock.read(&addr("a"), "h", &ct()).await.expect("read");
         assert!(
-            lock.try_write(&addr("a")).expect("try_write ok").is_none(),
+            lock.try_write(&addr("a"), "h")
+                .expect("try_write ok")
+                .is_none(),
             "writer must not acquire while a shared read is held"
         );
     }
@@ -628,9 +936,200 @@ mod tests {
     async fn distinct_addrs_independent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let lock = fs(&dir);
-        let _w = lock.write(&addr("a"), &ct()).await.expect("a");
+        let _w = lock.write(&addr("a"), "h", &ct()).await.expect("a");
         // A different addr is independent — it acquires without blocking on `a`.
-        let _b = lock.write(&addr("b"), &ct()).await.expect("b");
+        let _b = lock.write(&addr("b"), "h", &ct()).await.expect("b");
+    }
+
+    /// An acquire that must not wait. Not a cancelled token: the filesystem
+    /// backend checks cancellation before its first attempt, so that would fail
+    /// even an uncontended acquire. Generous, since the failure it catches is a
+    /// wait that never ends.
+    async fn promptly<T>(fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout(Duration::from_secs(5), fut)
+            .await
+            .map_err(|_elapsed| anyhow::anyhow!("blocked"))?
+    }
+
+    /// Both backends, so every revision-scope test below runs against the
+    /// in-process one too: it is the backend where sharing the gateway instance
+    /// across revisions is the *only* thing providing exclusion.
+    fn both(dir: &tempfile::TempDir) -> [ResultLock; 2] {
+        [
+            fs(dir),
+            ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()),
+        ]
+    }
+
+    /// **The bug this scope split fixes.** A command riding a read on one
+    /// revision — `heph run` of a long-lived target holds one on every dep for
+    /// its whole life — must not block another command from building a *new*
+    /// revision of the same target. The two entries share no bytes.
+    #[tokio::test]
+    async fn a_reader_of_one_revision_does_not_block_a_build_of_another() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for lock in both(&dir) {
+            let _riding = lock.read(&addr("a"), "old", &ct()).await.expect("read");
+            let w = promptly(lock.write(&addr("a"), "new", &ct()))
+                .await
+                .expect("a build of another revision must not wait on old readers");
+            // And the hand-off to its own riding read is just as free.
+            let up = w.downgrade(&ct()).await.expect("downgrade");
+            let _read = lock.read(&addr("a"), "new", &ct()).await.expect("read");
+            drop(up);
+            assert!(lock.try_write(&addr("a"), "old").expect("try").is_none());
+        }
+    }
+
+    /// One build of a target at a time, whichever revision each is building:
+    /// the gateway is per target. Two builds of one addr also share its sandbox
+    /// directory, so this is correctness, not only policy.
+    #[tokio::test]
+    async fn builds_of_two_revisions_of_one_target_still_serialize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for lock in both(&dir) {
+            let w = lock.write(&addr("a"), "h1", &ct()).await.expect("first");
+            assert!(
+                lock.write(&addr("a"), "h2", &cancelled_ct()).await.is_err(),
+                "a second build of the target must wait (cancelled wait)"
+            );
+            assert!(lock.try_write(&addr("a"), "h2").expect("try").is_none());
+            assert!(lock.try_lock_target(&addr("a")).expect("try").is_none());
+            drop(w);
+            lock.write(&addr("a"), "h2", &ct())
+                .await
+                .expect("acquires once the first build releases");
+        }
+    }
+
+    /// A rebuild of the *same* revision (`--force`) still waits for its readers:
+    /// it rewrites the entry they are reading.
+    #[tokio::test]
+    async fn a_rebuild_of_the_same_revision_waits_for_its_readers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for lock in both(&dir) {
+            let r = lock.read(&addr("a"), "h", &ct()).await.expect("read");
+            assert!(lock.write(&addr("a"), "h", &cancelled_ct()).await.is_err());
+            drop(r);
+            lock.write(&addr("a"), "h", &ct())
+                .await
+                .expect("after drain");
+        }
+    }
+
+    /// GC's shape: the target lock, then each revision without waiting. A read
+    /// revision is refused; an unread one is granted; and the target lock
+    /// itself shuts out builds but not readers.
+    #[tokio::test]
+    async fn revision_writes_under_the_target_lock_skip_only_read_revisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for lock in both(&dir) {
+            let _riding = lock.read(&addr("a"), "read", &ct()).await.expect("read");
+            let target = lock.lock_target(&addr("a"), &ct()).await.expect("target");
+            assert!(
+                lock.try_write_revision(&target, &addr("a"), "read")
+                    .expect("try")
+                    .is_none(),
+                "a revision being read is not deletable"
+            );
+            assert!(
+                lock.try_write_revision(&target, &addr("a"), "idle")
+                    .expect("try")
+                    .is_some()
+            );
+            assert!(
+                lock.write(&addr("a"), "other", &cancelled_ct())
+                    .await
+                    .is_err(),
+                "no build while the target lock is held"
+            );
+            promptly(lock.read(&addr("a"), "other", &ct()))
+                .await
+                .expect("readers never take the target lock");
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_holder_does_not_name_the_waiter_itself() {
+        // `heph clean`'s shape: it holds (and stamped) the target lock, then
+        // waits on one revision's readers. Two `ResultLock`s over one dir are
+        // two processes as far as `flock` is concerned.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cleaner, other) = (fs(&dir), fs(&dir));
+        let _target = cleaner
+            .lock_target(&addr("a"), &ct())
+            .await
+            .expect("target");
+        let _riding = other.read(&addr("a"), "h", &ct()).await.expect("read");
+        assert_eq!(
+            cleaner.wait_holder(&addr("a"), Some("h")),
+            (None, true),
+            "the readers are the blocker, not our own stamp"
+        );
+        assert_eq!(cleaner.wait_holder(&addr("a"), Some("idle")), (None, false));
+    }
+
+    #[tokio::test]
+    async fn wait_holder_names_another_processs_gateway() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = fs(&dir);
+        let a = addr("a");
+        let held = hold_raw_gateway(&dir, &a).await;
+        held.write_contents(b"4242\n").expect("stamp");
+        let _riding = lock.read(&a, "h", &ct()).await.expect("read");
+        assert_eq!(
+            lock.wait_holder(&a, Some("h")),
+            (Some(4242), false),
+            "a live foreign holder is named even when readers are present"
+        );
+        drop(held);
+        assert_eq!(lock.wait_holder(&a, None), (None, false));
+    }
+
+    /// The execute lock is the leaf every run takes: one run per target, and
+    /// independent of the result locks — taken while holding a riding read (the
+    /// rebuild path) or the target lock (a build) without waiting on either.
+    #[tokio::test]
+    async fn the_execute_lock_serializes_runs_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for lock in both(&dir) {
+            let _riding = lock.read(&addr("a"), "h", &ct()).await.expect("read");
+            let _target = lock.lock_target(&addr("a"), &ct()).await.expect("target");
+            let run = promptly(lock.lock_execute(&addr("a"), &ct()))
+                .await
+                .expect("not blocked by result locks");
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    lock.lock_execute(&addr("a"), &ct())
+                )
+                .await
+                .is_err(),
+                "a second run of the target waits"
+            );
+            promptly(lock.lock_execute(&addr("b"), &ct()))
+                .await
+                .expect("other targets are independent");
+            drop(run);
+            promptly(lock.lock_execute(&addr("a"), &ct()))
+                .await
+                .expect("free after the run");
+        }
+    }
+
+    /// What turns "holder unknown" into "in use by another command": the probe
+    /// sees shared holders, which [`FLock::is_path_held`] cannot.
+    #[tokio::test]
+    async fn revision_in_use_sees_a_reader_and_only_that_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for lock in both(&dir) {
+            assert!(!lock.revision_in_use(&addr("a"), "h"), "never locked");
+            let r = lock.read(&addr("a"), "h", &ct()).await.expect("read");
+            assert!(lock.revision_in_use(&addr("a"), "h"));
+            assert!(!lock.revision_in_use(&addr("a"), "other"));
+            drop(r);
+            assert!(!lock.revision_in_use(&addr("a"), "h"), "released");
+        }
     }
 
     #[tokio::test]
@@ -643,7 +1142,7 @@ mod tests {
 
         // While the gateway is held, it carries this process's pid.
         let held = lock
-            .upgradable_read(&addr("a"), &ct())
+            .upgradable_read(&addr("a"), "h", &ct())
             .await
             .expect("acquire");
         assert_eq!(lock.holder_pid(&addr("a")), Some(std::process::id()));
@@ -662,7 +1161,7 @@ mod tests {
 
         assert_eq!(lock.holder_pid(&addr("a")), None, "no holder yet");
 
-        let held = lock.write(&addr("a"), &ct()).await.expect("write");
+        let held = lock.write(&addr("a"), "h", &ct()).await.expect("write");
         assert_eq!(lock.holder_pid(&addr("a")), Some(std::process::id()));
 
         // Releasing the write unlinks the gateway file, so the holder is
@@ -679,7 +1178,7 @@ mod tests {
         assert_eq!(lock.holder_pid(&addr("a")), None, "no holder yet");
 
         let held = lock
-            .try_write(&addr("a"))
+            .try_write(&addr("a"), "h")
             .expect("try_write ok")
             .expect("free addr acquires");
         assert_eq!(lock.holder_pid(&addr("a")), Some(std::process::id()));
@@ -823,12 +1322,12 @@ mod tests {
 
         // Another process still has the artifacts open, so the inner write
         // cannot be taken yet.
-        let reading = watcher.read(&a, &ct()).await.expect("plain read");
+        let reading = watcher.read(&a, "h", &ct()).await.expect("plain read");
 
         let b = Arc::clone(&builder);
         let handle = tokio::spawn(async move {
             let tok = StdCancellationToken::new();
-            b.write(&addr("a"), &tok).await
+            b.write(&addr("a"), "h", &tok).await
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;

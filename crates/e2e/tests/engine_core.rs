@@ -209,6 +209,66 @@ async fn test_output_selection_unknown_name_errors() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A command that is still running must not stop another from rebuilding.
+///
+/// A request keeps a riding read on every target it resolved until the request
+/// ends, and a long-running `heph run` is a request that lasts as long as its
+/// process. The read used to cover the whole addr, so a second `heph` needing a
+/// *new* revision of one of those targets — an input changed in between —
+/// parked behind it until the first command exited, reporting
+/// `(locked, holder unknown)`. Readers now hold only the revision they read.
+///
+/// Two engines over one root are two `heph` processes as far as the `flock`
+/// backend is concerned: the kernel arbitrates per open file description.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_command_does_not_block_a_rebuild_of_a_new_revision() -> anyhow::Result<()> {
+    use heph::engine::{OutputMatcher, ResultOptions};
+    use heph::htaddr::parse_addr;
+
+    let ws = Workspace::new();
+    let addr = parse_addr("//held:t")?;
+    let build = |v: &str| {
+        format!(
+            r#"target(name = "t", driver = "bash", run = "printf '{v}' > $OUT", out = "out.txt")"#
+        )
+    };
+
+    ws.write_build_file("held", &build("v1"));
+    let running = ws.reopen()?;
+    let running_rs = running.new_state();
+    let held = running
+        .clone()
+        .result_addr(
+            running_rs.clone(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(common::artifact_string(&held), "v1");
+
+    ws.write_build_file("held", &build("v2"));
+    let other = ws.reopen()?;
+    let other_rs = other.new_state();
+    let rebuilt = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        other.clone().result_addr(
+            other_rs.clone(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        ),
+    )
+    .await
+    .expect("the rebuild waited on the running command's read of the old revision")?;
+    assert_eq!(common::artifact_string(&rebuilt), "v2");
+
+    // The running command's artifacts are untouched by the other's build.
+    assert_eq!(common::artifact_string(&held), "v1");
+    drop((rebuilt, other_rs, held, running_rs));
+    Ok(())
+}
+
 /// `cache.history` must be enforced *by the run that broke the budget*, not
 /// left for the next `heph gc`.
 ///

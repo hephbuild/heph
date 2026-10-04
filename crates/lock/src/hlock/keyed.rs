@@ -157,6 +157,89 @@ where
     }
 }
 
+/// One key's lock, borrowed out of a keyed registry so it can be composed into
+/// another lock (e.g. as one half of a [`TBridge`](crate::hlock::TBridge)) while
+/// still being *the* registry's instance for that key.
+///
+/// Composition is why this exists. A bridge built over a fresh lock per call
+/// would get a fresh in-process lock state per call: correct across processes
+/// for `flock` (the kernel arbitrates between fds), but no exclusion at all for
+/// the in-memory backend. Going through the registry gives every composer of
+/// `key` the same instance.
+///
+/// A handle keeps its key resident while it lives, and so does every guard
+/// acquired through it — guards are [`KeyedGuard`]s carrying the cell, so a
+/// guard that outlives its handle still pins the instance it locked.
+pub struct KeyedHandle<K: Eq + Hash, L> {
+    cell: Arc<LockCell<K, L>>,
+}
+
+impl<K: Eq + Hash, L> Clone for KeyedHandle<K, L> {
+    fn clone(&self) -> Self {
+        Self {
+            cell: Arc::clone(&self.cell),
+        }
+    }
+}
+
+impl<K: Eq + Hash, L> std::fmt::Debug for KeyedHandle<K, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyedHandle").finish_non_exhaustive()
+    }
+}
+
+impl<K: Eq + Hash, L> KeyedHandle<K, L> {
+    fn guard<G>(&self, inner: G) -> KeyedGuard<K, L, G> {
+        KeyedGuard {
+            _cell: Arc::clone(&self.cell),
+            inner,
+        }
+    }
+}
+
+#[async_trait]
+impl<K, L> Lock for KeyedHandle<K, L>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    L: Lock + 'static,
+{
+    type Guard = KeyedGuard<K, L, L::Guard>;
+
+    async fn lock(&self, ctoken: Ctoken<'_>) -> Result<Self::Guard> {
+        Ok(self.guard(self.cell.lock.lock(ctoken).await?))
+    }
+
+    fn try_lock(&self) -> Result<Option<Self::Guard>> {
+        Ok(self.cell.lock.try_lock()?.map(|g| self.guard(g)))
+    }
+}
+
+#[async_trait]
+impl<K, L> RWLock for KeyedHandle<K, L>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    L: RWLock + 'static,
+{
+    type ReadGuard = KeyedGuard<K, L, L::ReadGuard>;
+    type WriteGuard = KeyedGuard<K, L, L::WriteGuard>;
+
+    async fn read(&self, ctoken: Ctoken<'_>) -> Result<Self::ReadGuard> {
+        Ok(self.guard(self.cell.lock.read(ctoken).await?))
+    }
+
+    async fn write(&self, ctoken: Ctoken<'_>) -> Result<Self::WriteGuard> {
+        Ok(self.guard(self.cell.lock.write(ctoken).await?))
+    }
+
+    fn try_read(&self) -> Result<Option<Self::ReadGuard>> {
+        Ok(self.cell.lock.try_read()?.map(|g| self.guard(g)))
+    }
+
+    fn try_write(&self) -> Result<Option<Self::WriteGuard>> {
+        Ok(self.cell.lock.try_write()?.map(|g| self.guard(g)))
+    }
+}
+
 /// Keyed exclusive lock.
 pub struct KeyedLock<K: Eq + Hash, L> {
     reg: Registry<K, L>,
@@ -179,6 +262,13 @@ where
         let cell = self.reg.cell(key);
         let inner = cell.lock.lock(ctoken).await?;
         Ok(KeyedGuard { _cell: cell, inner })
+    }
+
+    /// This registry's lock for `key`, as a composable [`KeyedHandle`].
+    pub fn handle(&self, key: K) -> KeyedHandle<K, L> {
+        KeyedHandle {
+            cell: self.reg.cell(key),
+        }
     }
 
     /// Try to acquire the exclusive lock for `key` without waiting.
@@ -229,6 +319,13 @@ where
         let cell = self.reg.cell(key);
         let inner = cell.lock.write(ctoken).await?;
         Ok(KeyedGuard { _cell: cell, inner })
+    }
+
+    /// This registry's lock for `key`, as a composable [`KeyedHandle`].
+    pub fn handle(&self, key: K) -> KeyedHandle<K, L> {
+        KeyedHandle {
+            cell: self.reg.cell(key),
+        }
     }
 
     /// Try to acquire a shared read lock for `key`.
@@ -382,6 +479,32 @@ mod tests {
             "same key blocks"
         );
         drop(g);
+        assert!(kl.try_lock("a".to_string()).unwrap().is_some());
+    }
+
+    /// A handle is the registry's own instance, not a copy: a bridge composed
+    /// over two handles of one key excludes a direct acquire of that key — the
+    /// in-memory backend has nothing else to provide that exclusion — and a
+    /// guard pins the instance after its handle is gone.
+    #[tokio::test]
+    async fn a_handle_is_the_registrys_instance() {
+        let kl: KeyedLock<String, MemLock> = KeyedLock::new(|_| MemLock::new());
+        let rw: KeyedRWLock<String, MemRWLock> = KeyedRWLock::new(|_| MemRWLock::new());
+
+        let bridge = TBridge::new(kl.handle("a".to_string()), rw.handle("r".to_string()));
+        let w = bridge.write(&ct()).await.unwrap();
+        drop(bridge);
+        assert!(
+            kl.try_lock("a".to_string()).unwrap().is_none(),
+            "gateway shared"
+        );
+        assert!(
+            rw.try_read("r".to_string()).unwrap().is_none(),
+            "inner shared"
+        );
+
+        drop(w);
+        assert_eq!(kl.len(), 0, "the last guard out evicts the key");
         assert!(kl.try_lock("a".to_string()).unwrap().is_some());
     }
 

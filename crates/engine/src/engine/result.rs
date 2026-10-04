@@ -2087,10 +2087,16 @@ impl Engine {
     /// Acquire a lock guard, surfacing a "waiting on lock" notice (with the
     /// holder's pid) if the wait outlasts [`RESULT_LOCK_NOTICE`]. The notice is
     /// purely informational; the wait continues until acquired or cancelled.
+    ///
+    /// `hashin` names the revision the guard covers, when it covers one. With
+    /// no pid to name, it lets the notice say the wait is on *readers* of that
+    /// revision — another command still using its output — rather than on an
+    /// unknown holder.
     pub(crate) async fn acquire_with_notice<G>(
         &self,
         rs: &Arc<RequestState>,
         addr: &Addr,
+        hashin: Option<&str>,
         lock_fut: impl Future<Output = anyhow::Result<G>>,
     ) -> anyhow::Result<G> {
         tokio::pin!(lock_fut);
@@ -2098,12 +2104,13 @@ impl Engine {
             Ok(res) => res.with_context(|| format!("acquiring result lock for {addr}")),
             Err(_elapsed) => {
                 let addr_str = addr.format();
-                let holder_pid = self.result_lock().holder_pid(addr);
+                let (holder_pid, in_use_by_readers) = self.result_lock().wait_holder(addr, hashin);
                 crate::engine::event::emit_scope(
                     rs,
                     crate::engine::event::BuildEventKind::ResultLockWaitStart {
                         addr: addr_str.clone(),
                         holder_pid,
+                        in_use_by_readers,
                     },
                     move |_| crate::engine::event::BuildEventKind::ResultLockWaitEnd {
                         addr: addr_str,
@@ -2227,9 +2234,13 @@ impl Engine {
                     // reclaiming an old revision mid-build is ordinary, and the
                     // rebuild is the correct response.
                     //
-                    // This executes under the riding *read* lock rather than the
-                    // write lock the miss path holds, and that is a real, accepted
-                    // exemption rather than a proof of safety:
+                    // This executes under the riding *read* lock of the revision
+                    // rather than the gateway + write lock the miss path holds.
+                    // The *run* itself is still exclusive per addr: `execute`
+                    // takes the target's execute lock, so it cannot share the
+                    // per-addr sandbox with any other build of this target. What
+                    // remains open is the cache entry, a real, accepted exemption
+                    // rather than a proof of safety:
                     //
                     // - In-process, the execute memoizer collapses concurrent
                     //   callers to one run, and `reconcile_rebuilt_hashouts` below
@@ -2605,6 +2616,7 @@ impl Engine {
         let can_cache = !opts.force && !opts.no_scratch && def.target.cache.enabled && !opts.shell;
         let addr = &def.target.addr;
         let ctoken = rs.ctoken();
+        let hashin = opts.hashin.as_str();
 
         // Non-cacheable (force/shell): execute under an exclusive write lock —
         // serializing per addr across requests/processes.
@@ -2646,8 +2658,13 @@ impl Engine {
                 // toolchain reached through `//@heph/bin:*` — hostbin is
                 // cache-off), failing `r lint //...` on already-linted trees.
                 Some(
-                    self.acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
-                        .await?,
+                    self.acquire_with_notice(
+                        &rs,
+                        addr,
+                        Some(hashin),
+                        self.result_lock().write(addr, hashin, ctoken),
+                    )
+                    .await?,
                 )
             };
             let (cached, meta) = self
@@ -2661,7 +2678,7 @@ impl Engine {
                         .downgrade(ctoken)
                         .await
                         .with_context(|| format!("downgrading result lock for {addr}"))?;
-                    let read = self.result_lock().read(addr, ctoken).await?;
+                    let read = self.result_lock().read(addr, hashin, ctoken).await?;
                     drop(up);
                     Some(Arc::new(read))
                 }
@@ -2679,7 +2696,12 @@ impl Engine {
         //    the manifest level (see the doc comment). The read rides with every
         //    caller's artifacts, protecting the entry while in use.
         let read = self
-            .acquire_with_notice(&rs, addr, self.result_lock().read(addr, ctoken))
+            .acquire_with_notice(
+                &rs,
+                addr,
+                Some(hashin),
+                self.result_lock().read(addr, hashin, ctoken),
+            )
             .await?;
         if let Some(manifest) = self.probe_cache_manifest(&rs, def, opts).await? {
             // A. Hit — share this read; each caller reads its own outputs under
@@ -2711,7 +2733,12 @@ impl Engine {
         }
         drop(read);
         let write = self
-            .acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
+            .acquire_with_notice(
+                &rs,
+                addr,
+                Some(hashin),
+                self.result_lock().write(addr, hashin, ctoken),
+            )
             .await?;
 
         // Re-check (manifest level) under the write lock: covers the drop window
@@ -2822,7 +2849,7 @@ impl Engine {
             .downgrade(ctoken)
             .await
             .with_context(|| format!("downgrading result lock for {addr}"))?;
-        let read = self.result_lock().read(addr, ctoken).await?;
+        let read = self.result_lock().read(addr, hashin, ctoken).await?;
         drop(up);
         Ok(Arc::new(LockedResolution {
             guard: Some(Arc::new(read)),
@@ -3186,7 +3213,9 @@ impl Engine {
                         .await
                         .with_context(|| format!("approval {addr}"))?;
                     hcore::hmemoizer::set_phase("execute_cache:engine_execute");
-                    let (artifacts, sandbox_teardown, sandbox_guards) = engine
+                    // `_execute_guard` is held to the end of this closure, past
+                    // `cache_locally`, which reads the outputs out of the sandbox.
+                    let (artifacts, sandbox_teardown, sandbox_guards, _execute_guard) = engine
                         .clone()
                         .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false)
                         .await
@@ -4403,7 +4432,7 @@ mod tests {
         let lock = SArc::new(ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()));
         let addr = Addr::new(PkgBuf::from("pkg"), "x".to_string(), BTreeMap::new());
         let read = lock
-            .read(&addr, &StdCancellationToken::new())
+            .read(&addr, "h", &StdCancellationToken::new())
             .await
             .expect("read");
 
@@ -4444,7 +4473,7 @@ mod tests {
         let addr = Addr::new(PkgBuf::from("pkg"), "x".to_string(), BTreeMap::new());
 
         let read = lock
-            .read(&addr, &StdCancellationToken::new())
+            .read(&addr, "h", &StdCancellationToken::new())
             .await
             .expect("read");
         let guarded: Arc<dyn Content> = Arc::new(GuardedArtifact {
@@ -4454,12 +4483,12 @@ mod tests {
         // A dependent clones the artifact handle into its own structures.
         let cloned = Arc::clone(&guarded);
 
-        // A writer for the same addr blocks while any handle is alive.
+        // A writer for the same revision blocks while any handle is alive.
         let lock2 = SArc::clone(&lock);
         let addr2 = addr.clone();
         let writer = tokio::spawn(async move {
             let tok = StdCancellationToken::new();
-            lock2.write(&addr2, &tok).await.map(|_| ())
+            lock2.write(&addr2, "h", &tok).await.map(|_| ())
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!writer.is_finished(), "writer blocked while artifact alive");
@@ -12176,8 +12205,9 @@ mod tests {
                 .await?;
             assert_eq!(batch.ok.len(), 1);
             let d = hmodel::htaddr::parse_addr("//x:d")?;
+            let hashin = Arc::clone(&engine).meta(rs.clone(), &d).await?.hashin;
             assert!(
-                engine.result_lock().try_write(&d)?.is_none(),
+                engine.result_lock().try_write(&d, &hashin)?.is_none(),
                 "a forced target was released with no riding read"
             );
             Ok(())

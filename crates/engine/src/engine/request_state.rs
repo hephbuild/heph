@@ -1378,8 +1378,8 @@ mod tests {
         // is guaranteed to reach — and finish — its one delay.
         let _held = engine
             .result_lock()
-            .try_write(&a)
-            .expect("try_write")
+            .try_lock_target(&a)
+            .expect("try_lock_target")
             .expect("lock free");
 
         let delay = Duration::from_millis(500);
