@@ -149,9 +149,9 @@ pub enum Lane {
 /// blocking pool, the cleaner thread), never tokio workers. Lock order is
 /// `walk` then `generation`, and nothing takes them in the other order.
 ///
-/// Executes for one addr are serialized (in-process by the per-addr result
-/// lock, cross-process by the flock), so the generation cannot advance under a
-/// *live* run — only past a cancelled or completed one.
+/// Executes for one addr are serialized (in-process and cross-process by the
+/// per-addr execute lock, `ResultLock::lock_execute`), so the generation cannot
+/// advance under a *live* run — only past a cancelled or completed one.
 ///
 /// Not covered: a straggler from *another process*. The flock serializes the
 /// executes themselves but not their detached jobs, and this registry is

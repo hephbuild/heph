@@ -750,10 +750,10 @@ pub struct BuildState {
     /// Server timestamp of the first event seen — the run's start anchor for the
     /// header's elapsed clock. `None` until any event lands.
     started_at_ms: Option<u64>,
-    /// Addrs blocked on the result lock past the notice threshold, mapped to the
-    /// holder's pid (`None` if unknown). Added on `ResultLockWaitStart`, removed
-    /// on `ResultLockWaitEnd`, so it reflects only currently-blocked waits.
-    lock_waits: HashMap<String, Option<u32>>,
+    /// Addrs blocked on the result lock past the notice threshold, mapped to
+    /// what is known of the holder. Added on `ResultLockWaitStart`, removed on
+    /// `ResultLockWaitEnd`, so it reflects only currently-blocked waits.
+    lock_waits: HashMap<String, LockHolder>,
     /// Consumers blocked on a scratch slot, keyed by the *consumer* addr so a
     /// wait can be removed when its own `ScratchLockWaitEnd` lands.
     ///
@@ -994,8 +994,15 @@ impl BuildState {
                 self.note_cache_hit(addr, CacheHitKind::Remote);
             }
             BuildEventKind::RemoteCacheMiss { .. } => self.remote_misses += 1,
-            BuildEventKind::ResultLockWaitStart { addr, holder_pid } => {
-                self.lock_waits.insert(addr.clone(), *holder_pid);
+            BuildEventKind::ResultLockWaitStart {
+                addr,
+                holder_pid,
+                in_use_by_readers,
+            } => {
+                self.lock_waits.insert(
+                    addr.clone(),
+                    LockHolder::of(*holder_pid, *in_use_by_readers),
+                );
             }
             BuildEventKind::ResultLockWaitEnd { addr } => {
                 self.lock_waits.remove(addr);
@@ -1497,18 +1504,20 @@ impl BuildState {
 
     /// Rows for addrs currently blocked on the result lock past the notice
     /// threshold, rendered like the slow-target rows but flagged locked:
-    /// `🔒 <addr> (locked by pid N)`, or `(locked, holder unknown)` when the pid
-    /// could not be determined. Sorted by addr so the order is stable across
-    /// frames. Empty when nothing is blocked.
+    /// `🔒 <addr> (locked by pid N)`, `(locked, in use)` when readers are
+    /// holding the revision, or `(locked, holder unknown)`.
+    /// Sorted by addr so the order is stable across frames. Empty when nothing
+    /// is blocked.
     pub fn lock_wait_lines(&self) -> Vec<Line<'static>> {
-        let mut waits: Vec<(&String, &Option<u32>)> = self.lock_waits.iter().collect();
+        let mut waits: Vec<(&String, &LockHolder)> = self.lock_waits.iter().collect();
         waits.sort_by(|a, b| a.0.cmp(b.0));
         waits
             .into_iter()
-            .map(|(addr, pid)| {
-                let holder = match pid {
-                    Some(pid) => format!("locked by pid {pid}"),
-                    None => "locked, holder unknown".to_string(),
+            .map(|(addr, holder)| {
+                let holder = match holder {
+                    LockHolder::Pid(pid) => format!("locked by pid {pid}"),
+                    LockHolder::Readers => "locked, in use".to_string(),
+                    LockHolder::Unknown => "locked, holder unknown".to_string(),
                 };
                 Line::from(Span::styled(
                     format!("  🔒 {addr} ({holder})"),
@@ -1516,6 +1525,26 @@ impl BuildState {
                 ))
             })
             .collect()
+    }
+}
+
+/// What a `ResultLockWaitStart` could say about who is in the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockHolder {
+    /// A stamped, live holder of the target's gateway.
+    Pid(u32),
+    /// Readers of the revision — unstamped, so detectable but not nameable.
+    Readers,
+    Unknown,
+}
+
+impl LockHolder {
+    fn of(holder_pid: Option<u32>, in_use_by_readers: bool) -> Self {
+        match holder_pid {
+            Some(pid) => Self::Pid(pid),
+            None if in_use_by_readers => Self::Readers,
+            None => Self::Unknown,
+        }
     }
 }
 
@@ -2447,10 +2476,15 @@ impl CIAppView for CiProgressView {
             } => {
                 tracing::info!("running {addr} [{driver}]");
             }
-            BuildEventKind::ResultLockWaitStart { addr, holder_pid } => {
-                let holder = match holder_pid {
-                    Some(pid) => format!("held by pid {pid}"),
-                    None => "holder unknown".to_string(),
+            BuildEventKind::ResultLockWaitStart {
+                addr,
+                holder_pid,
+                in_use_by_readers,
+            } => {
+                let holder = match LockHolder::of(*holder_pid, *in_use_by_readers) {
+                    LockHolder::Pid(pid) => format!("held by pid {pid}"),
+                    LockHolder::Readers => "in use".to_string(),
+                    LockHolder::Unknown => "holder unknown".to_string(),
                 };
                 tracing::info!("waiting on result lock for {addr} ({holder})");
             }
@@ -2569,6 +2603,7 @@ mod tests {
             BuildEventKind::ResultLockWaitStart {
                 addr: "//pkg:a".into(),
                 holder_pid: Some(4242),
+                in_use_by_readers: false,
             },
         ));
         let lines = s.lock_wait_lines();
@@ -2599,6 +2634,7 @@ mod tests {
             BuildEventKind::ResultLockWaitStart {
                 addr: "//pkg:a".into(),
                 holder_pid: None,
+                in_use_by_readers: false,
             },
         ));
         let text = s.lock_wait_lines()[0]
@@ -2607,6 +2643,29 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect::<String>();
         assert!(text.contains("holder unknown"), "{text}");
+    }
+
+    /// The wait the old message could not explain: a rebuild or delete parked
+    /// behind another command's riding reads. Readers are unstamped, so there
+    /// is no pid — but "holder unknown" sent people looking for a stuck lock.
+    #[test]
+    fn lock_wait_on_readers_says_another_command_is_using_it() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::ResultLockWaitStart {
+                addr: "//pkg:a".into(),
+                holder_pid: None,
+                in_use_by_readers: true,
+            },
+        ));
+        let text = s.lock_wait_lines()[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("(locked, in use)"), "{text}");
+        assert!(!text.contains("unknown"), "{text}");
     }
 
     fn result_start(addr: &str) -> BuildEventKind {
@@ -4007,6 +4066,7 @@ mod tests {
         BuildEventKind::ResultLockWaitStart {
             addr: addr.into(),
             holder_pid: Some(pid),
+            in_use_by_readers: false,
         }
     }
 

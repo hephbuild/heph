@@ -35,6 +35,7 @@ impl Engine {
         Vec<OutputArtifact>,
         crate::engine::sandbox_cleaner::SandboxTeardown,
         Vec<hplugin::driver::SandboxGuard>,
+        crate::engine::result_lock::ExecuteGuard,
     )> {
         let driver = self
             .drivers_by_name
@@ -95,6 +96,21 @@ impl Engine {
             .resolve_credentials(&rs, addr, &def.target.inputs)
             .await
             .with_context(|| format!("resolve credentials for {addr}"))?;
+
+        // One run of this target at a time, in any process: its sandbox is per
+        // addr. After deps (holding it across a dep's build could deadlock with
+        // a forced rebuild of that dep), before the worker permit (a target
+        // parked here holds no worker). Returned to the caller, which holds it
+        // until the outputs are cached. See `ResultLock::lock_execute`.
+        hcore::hmemoizer::set_phase("execute:execute_lock");
+        let execute_guard = self
+            .acquire_with_notice(
+                &rs,
+                addr,
+                None,
+                self.result_lock().lock_execute(addr, rs.ctoken()),
+            )
+            .await?;
 
         // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
         // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
@@ -294,7 +310,7 @@ impl Engine {
         )
         .await;
         htelemetry::telemetry::record_execute_ms(exec_started.elapsed().as_millis() as u64);
-        res
+        res.map(|(artifacts, teardown, guards)| (artifacts, teardown, guards, execute_guard))
     }
 
     async fn inputs_result_exec(

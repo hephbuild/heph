@@ -65,6 +65,37 @@ impl fmt::Display for HashUnknownError {
 
 impl std::error::Error for HashUnknownError {}
 
+/// A revision this request had already resolved changed or disappeared while
+/// nothing in the request was holding it.
+///
+/// A request keeps a revision's read lock only while artifacts of it are alive.
+/// Between two uses the read can lapse, and another `heph` may then `clean` the
+/// revision or `--force` a rebuild of it. When the request needs the revision
+/// again it re-acquires the read and checks the on-disk manifest still carries
+/// the hashouts it already handed out (and that dependents may already have
+/// folded into their own keys). If it does not, handing the memoized artifacts
+/// out would mean dangling blobs or bytes that disagree with those hashouts, so
+/// the resolution fails with this instead. Re-running resolves afresh.
+#[derive(Debug, Clone)]
+pub struct RevisionChangedError {
+    pub addr: Addr,
+    pub hashin: String,
+}
+
+impl fmt::Display for RevisionChangedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: its cached output (revision {}) changed or was removed by another heph \
+             process while this build was using it; re-run",
+            self.addr.format(),
+            self.hashin
+        )
+    }
+}
+
+impl std::error::Error for RevisionChangedError {}
+
 /// How many group members the `--shell` diagnostic lists before eliding.
 const SHELL_MEMBERS_SHOWN: usize = 5;
 

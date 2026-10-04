@@ -420,7 +420,9 @@ impl Tally {
                 self.counters.miss_remote = self.counters.miss_remote.saturating_add(1);
             }
 
-            BuildEventKind::ResultLockWaitStart { addr, holder_pid } => {
+            BuildEventKind::ResultLockWaitStart {
+                addr, holder_pid, ..
+            } => {
                 self.lock_waits.insert(
                     addr.as_str().into(),
                     LockWait {
@@ -1331,6 +1333,7 @@ mod tests {
             BuildEventKind::ResultLockWaitStart {
                 addr: "//a:x".into(),
                 holder_pid: Some(4412),
+                in_use_by_readers: false,
             },
         ));
         let (waits, total) = t.lock_waits(60_000, 30_000, 5);

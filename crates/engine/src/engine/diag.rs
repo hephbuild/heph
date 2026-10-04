@@ -968,7 +968,9 @@ impl hplugin::hook::Hook for DiagHook {
             BuildEventKind::RemoteCacheWriteEnd { addr, .. } => {
                 s.op_end(Op::RemoteCacheWrite, addr, now);
             }
-            BuildEventKind::ResultLockWaitStart { addr, holder_pid } => {
+            BuildEventKind::ResultLockWaitStart {
+                addr, holder_pid, ..
+            } => {
                 s.lock_wait_start(addr, *holder_pid, now);
             }
             BuildEventKind::ResultLockWaitEnd { addr } => s.lock_wait_end(addr, now),
@@ -1961,6 +1963,7 @@ mod tests {
         hook.on_event(&ev(BuildEventKind::ResultLockWaitStart {
             addr: "//a:b".into(),
             holder_pid: Some(4242),
+            in_use_by_readers: false,
         }));
         s.op_start(Op::Result, "//a:b", 0);
 
@@ -2155,6 +2158,7 @@ mod tests {
         hook.on_event(&ev(BuildEventKind::ResultLockWaitStart {
             addr: "//a:b".into(),
             holder_pid: Some(99),
+            in_use_by_readers: false,
         }));
         let mut r = s.evaluate(61_000, T).expect("stalled");
         r.delta = Some(StallDelta {

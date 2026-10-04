@@ -10,7 +10,7 @@ use crate::engine::local_cache::{
     MANIFEST_V1, Manifest, ManifestArtifact, ManifestArtifactContentType, ManifestArtifactEncoding,
     ManifestArtifactType,
 };
-use crate::engine::result_lock::ResultWriteGuard;
+use crate::engine::result_lock::TargetGuard;
 use crate::engine::{Config, Engine};
 use hcore::hasync::StdCancellationToken;
 use hmodel::htaddr::Addr;
@@ -102,11 +102,11 @@ pub(crate) fn present(engine: &Engine, addr: &Addr, hashin: &str) -> bool {
         .expect("exists")
 }
 
-/// Take `addr`'s write lock, blocking until it is free.
-pub(crate) async fn wlock(engine: &Engine, addr: &Addr) -> ResultWriteGuard {
+/// Take `addr`'s target lock — as a build of it would — blocking until free.
+pub(crate) async fn wlock(engine: &Engine, addr: &Addr) -> TargetGuard {
     engine
         .result_lock()
-        .write(addr, &StdCancellationToken::new())
+        .lock_target(addr, &StdCancellationToken::new())
         .await
         .expect("write lock")
 }

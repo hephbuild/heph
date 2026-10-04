@@ -1183,6 +1183,7 @@ mod tests {
             BuildEventKind::ResultLockWaitStart {
                 addr: "//a:x".into(),
                 holder_pid: Some(4412),
+                in_use_by_readers: false,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);

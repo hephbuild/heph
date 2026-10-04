@@ -299,8 +299,16 @@ impl Engine {
             return Ok(TargetOutcome::default());
         }
 
-        let guard = self
-            .acquire_with_notice(&rs, addr, self.result_lock().write(addr, rs.ctoken()))
+        // The target's gateway first: no build of it can start, so the listing
+        // below stays authoritative. Then each revision's write lock, waiting
+        // for its readers — an explicit clean deletes what it was asked to.
+        let target = self
+            .acquire_with_notice(
+                &rs,
+                addr,
+                None,
+                self.result_lock().lock_target(addr, rs.ctoken()),
+            )
             .await?;
 
         let hashins = self
@@ -308,27 +316,37 @@ impl Engine {
             .list_target_entries(addr)
             .with_context(|| format!("clean: list entries for {addr}"))?;
         let removed = hashins.len();
-
-        // `LocalCache::delete` parks the calling thread until the sqlite writer
-        // commits its batch, and `limit` of these run at once — parking that many
-        // runtime workers would take the reactor, the timer wheel and the TUI with
-        // them. Onto the blocking pool, with the write guard moved in so the lock
-        // spans every delete it covers.
-        let engine = Arc::clone(&self);
-        let addr_owned = addr.clone();
-        let bytes = hcore::blocking::run(move || {
-            let _guard = guard;
-            let mut bytes = 0u64;
-            for hashin in &hashins {
-                bytes = bytes.saturating_add(
-                    engine
-                        .gc_entry(&addr_owned, hashin)
-                        .with_context(|| format!("clean: drop revision of {addr_owned}"))?,
-                );
-            }
-            anyhow::Ok(bytes)
-        })
-        .await?;
+        let mut bytes = 0u64;
+        // Each revision is deleted as soon as its lock is held, so one revision
+        // a long-running command is still reading does not keep the idle ones
+        // write-locked — blocking their cache hits — while clean waits on it.
+        for hashin in hashins {
+            let revision = self
+                .acquire_with_notice(
+                    &rs,
+                    addr,
+                    Some(&hashin),
+                    self.result_lock()
+                        .write_revision(&target, addr, &hashin, rs.ctoken()),
+                )
+                .await?;
+            // `LocalCache::delete` parks the calling thread until the sqlite
+            // writer commits its batch, and `limit` of these run at once —
+            // parking that many runtime workers would take the reactor, the timer
+            // wheel and the TUI with them. Onto the blocking pool, with the guard
+            // moved in so the lock spans the delete.
+            let engine = Arc::clone(&self);
+            let addr_owned = addr.clone();
+            let freed = hcore::blocking::run(move || {
+                let _revision = revision;
+                engine
+                    .gc_entry(&addr_owned, &hashin)
+                    .with_context(|| format!("clean: drop revision of {addr_owned}"))
+            })
+            .await?;
+            bytes = bytes.saturating_add(freed);
+        }
+        drop(target);
 
         Ok(TargetOutcome { removed, bytes })
     }
@@ -834,5 +852,48 @@ mod tests {
         let stats = cleaner.await.expect("join").expect("clean");
         assert_eq!(stats.revisions_removed, 1);
         assert!(!present(&engine, &a, "h1"));
+    }
+
+    /// A revision another command is reading — a long `heph run` riding it —
+    /// makes clean wait for that revision, and only that one: the idle revision
+    /// goes at once rather than staying write-locked behind the reader, and
+    /// both are gone once the reader lets go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_waits_for_a_read_revision_and_deletes_the_rest_meanwhile() {
+        let (engine, _dir) = test_engine();
+        let a = addr("t");
+        write_revision(&engine, &a, "read", 100, &["out.tar"]);
+        write_revision(&engine, &a, "idle", 200, &["out.tar"]);
+
+        let riding = engine
+            .result_lock()
+            .read(&a, "read", &hcore::hasync::StdCancellationToken::new())
+            .await
+            .expect("read");
+        let rs = engine.new_state();
+        let cleaner = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let m = Matcher::Addr(a.clone());
+            async move { engine.clean(rs, &m, Discovery::Complete).await }
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while present(&engine, &a, "idle") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "idle revision never cleaned"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(present(&engine, &a, "read"), "deleted under its reader");
+        assert!(
+            !cleaner.is_finished(),
+            "clean must still be waiting on the reader"
+        );
+
+        drop(riding);
+        let stats = cleaner.await.expect("join").expect("clean");
+        assert_eq!(stats.revisions_removed, 2);
+        assert!(!present(&engine, &a, "read"));
     }
 }

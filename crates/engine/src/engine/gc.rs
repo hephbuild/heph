@@ -11,9 +11,10 @@
 //! - [`Engine::try_trim_after_write`] — the post-write trim. Non-blocking: it
 //!   trims the just-written target only if its lock is free, and never deletes
 //!   the revision that was just written. Deferred to the end of the request
-//!   that wrote the revision (see `RequestState::defer_trim`) — a request holds
-//!   a read on every addr it resolved, so a trim run inline could never take
-//!   the write lock. The whole request's batch is drained by
+//!   that wrote the revision (see `RequestState::defer_trim`) — inline, the
+//!   writing request still holds the target lock it would need. Revisions some
+//!   request is still reading are skipped, not waited on. The whole request's
+//!   batch is drained by
 //!   [`Engine::run_trim_batch_with_delay`], which retries the contended subset.
 //!
 //! Revision recency comes from each group's `manifest-v1.borsh`
@@ -24,7 +25,7 @@ use crate::engine::Engine;
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::local_cache::{Existence, MANIFEST_V1};
 use crate::engine::request_state::RequestState;
-use crate::engine::result_lock::ResultWriteGuard;
+use crate::engine::result_lock::TargetGuard;
 use anyhow::{Context, Result};
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::{Addr, parse_addr};
@@ -38,14 +39,15 @@ use tokio::task::JoinSet;
 /// **This is a hedge, not a synchronization edge, and it is best-effort.** The
 /// batch is submitted by `RequestStateData`'s drop, and the read guards its
 /// trims contend with are released by whatever still owns them letting go.
-/// Chiefly that is the task-backed memoizer's abort cascade tearing down the
-/// request's abandoned chains — one chain's `mem_locked_result` value *is* the
-/// addr's riding cache read — which lands when the runtime processes the
-/// aborts, unordered with respect to the `try_write` this batch is about to
-/// attempt. Any other live owner — an in-flight remote upload, a task mid-poll
-/// on a runtime worker — keeps the read alive until it finishes. A trim can
-/// still be lost, and a lost trim leaves a revision on disk until the next
-/// write's trim or the next `heph gc`.
+/// No memoized value owns one: a read lives as long as the artifacts that carry
+/// it (and a remote upload holds its own while it reads the revision, released
+/// before that task lets go of the request). So what remains is artifacts still
+/// alive somewhere — chiefly the task-backed memoizer's abort cascade tearing
+/// down the request's abandoned chains, whose in-flight futures may still hold
+/// them, which lands when the runtime processes the aborts, unordered with
+/// respect to the `try_write` this batch is about to attempt — or a task
+/// mid-poll on a runtime worker. A trim can still be lost, and a lost trim
+/// leaves a revision on disk until the next write's trim or the next `heph gc`.
 ///
 /// (This used to be where the blocking pool's backstop registry got flushed:
 /// a registered `Waker`'s `Arc` chain could own the riding read past its
@@ -73,12 +75,12 @@ pub(crate) enum TrimOutcome {
     /// Nothing further is owed for this target: either it was already within
     /// budget (no lock taken) or the lock was free and the trim ran.
     Settled { removed: usize, bytes: u64 },
-    /// `try_write` reported the lock held by another request or process. The
+    /// `try_lock_target` reported the target lock held by another request or process. The
     /// **only** outcome worth retrying — a holder exists, and it may let go.
     Contended,
     /// Something else went wrong and was logged at the site: without the lock,
     /// the pre-count or the `existence` probe that corrects it; an `Err` from
-    /// `try_write` itself (a vanished or unwritable lock dir, `EMFILE`,
+    /// `try_lock_target` itself (a vanished or unwritable lock dir, `EMFILE`,
     /// `ENOLCK`); or, with the lock held, the barrier, the enumerate, or the
     /// trim.
     ///
@@ -176,8 +178,9 @@ impl Engine {
     /// case of a partial write; reports 0 bytes).
     ///
     /// Shared with [`Engine::clean`]: both commands delete revisions, and only
-    /// the *choice* of which ones differs. Callers must hold the addr's write
-    /// lock.
+    /// the *choice* of which ones differs. Callers must hold the addr's target
+    /// lock and this revision's write lock (`ResultLock::try_write_revision` /
+    /// `write_revision`).
     pub(crate) fn gc_entry(&self, addr: &Addr, hashin: &str) -> Result<u64> {
         let mut bytes = 0u64;
         if let Some(manifest) = self.read_manifest(addr, hashin)? {
@@ -215,32 +218,42 @@ impl Engine {
     /// deleting the rest. `protect` is never deleted regardless of age. Returns
     /// `(removed, kept, bytes_freed)`.
     ///
-    /// Takes `_guard` as proof the caller holds `addr`'s write lock: deleting a
-    /// revision out from under a concurrent reader/builder would corrupt its
-    /// result. The guard is held by the caller (not acquired here) so the lock
-    /// also covers the `get_spec`/enumerate that decided what to trim — closing
-    /// the window where a racing build could write a fresh revision between the
-    /// decision and the delete.
+    /// Takes `target` as proof the caller holds `addr`'s gateway: no build of
+    /// the target can run, so none can write a fresh revision between the
+    /// enumerate that decided what to trim and the delete. The guard is held by
+    /// the caller (not acquired here) so it also covers that enumerate.
+    ///
+    /// Each deletion additionally takes that revision's write lock, without
+    /// waiting. A revision something is still reading — a request riding its
+    /// artifacts, possibly a command that runs for hours — is not garbage yet:
+    /// it is skipped and counted as kept, and the next trim or `heph gc` takes
+    /// it once released.
     fn trim_addr_history(
         &self,
-        _guard: &ResultWriteGuard,
+        target: &TargetGuard,
         addr: &Addr,
         hashins: &[String],
         keep: u32,
         protect: Option<&str>,
     ) -> Result<(usize, usize, u64)> {
         let mut with_ts: Vec<(&str, i64)> = Vec::with_capacity(hashins.len());
-        for hashin in hashins {
-            // A revision whose manifest is unreadable sorts oldest (ts 0) so it
-            // is the first to be reclaimed.
-            let ts = self
-                .read_manifest(addr, hashin)?
-                .map(|m| m.created_at_nanos)
-                .unwrap_or(0);
-            with_ts.push((hashin.as_str(), ts));
+        if keep == 0 && protect.is_none() {
+            // Every revision goes: their order is irrelevant, so skip reading
+            // each manifest just to sort them (`gc_entry` reads it anyway).
+            with_ts.extend(hashins.iter().map(|h| (h.as_str(), 0)));
+        } else {
+            for hashin in hashins {
+                // A revision whose manifest is unreadable sorts oldest (ts 0) so
+                // it is the first to be reclaimed.
+                let ts = self
+                    .read_manifest(addr, hashin)?
+                    .map(|m| m.created_at_nanos)
+                    .unwrap_or(0);
+                with_ts.push((hashin.as_str(), ts));
+            }
+            // Newest first.
+            with_ts.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
         }
-        // Newest first.
-        with_ts.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
 
         let keep = keep as usize;
         let mut removed = 0;
@@ -251,13 +264,32 @@ impl Engine {
                 kept += 1;
                 continue;
             }
-            bytes = bytes.saturating_add(
-                self.gc_entry(addr, hashin)
-                    .with_context(|| format!("trim revision {hashin} of {addr}"))?,
-            );
-            removed += 1;
+            match self.gc_revision(target, addr, hashin)? {
+                Some(freed) => {
+                    bytes = bytes.saturating_add(freed);
+                    removed += 1;
+                }
+                None => kept += 1,
+            }
         }
         Ok((removed, kept, bytes))
+    }
+
+    /// Delete one revision under its own write lock, taken without waiting.
+    /// `Ok(None)` when it is in use and was left alone. See
+    /// [`trim_addr_history`](Self::trim_addr_history).
+    fn gc_revision(&self, target: &TargetGuard, addr: &Addr, hashin: &str) -> Result<Option<u64>> {
+        let Some(_revision) = self
+            .result_lock()
+            .try_write_revision(target, addr, hashin)
+            .with_context(|| format!("locking revision {hashin} of {addr}"))?
+        else {
+            tracing::debug!(%addr, hashin, "gc: revision in use, kept");
+            return Ok(None);
+        };
+        self.gc_entry(addr, hashin)
+            .with_context(|| format!("drop revision {hashin} of {addr}"))
+            .map(Some)
     }
 
     /// The target's cached revisions, logged under `stage` when the read fails.
@@ -321,7 +353,7 @@ impl Engine {
     /// where it has always been, inside the lock branch, where the enumeration
     /// that actually chooses what to delete has to be ordered against our write.
     ///
-    /// Deliberately `try_write` and not a blocking `write`: the lock is a
+    /// Deliberately `try_lock_target` and not a blocking `lock_target`: the lock is a
     /// cross-process `flock`, so a blocking acquire can wait on another `heph`
     /// arbitrarily long — on the single FIFO cleaner thread that also owes every
     /// sandbox rmdir, on the path that gates exit, and with no runtime to await
@@ -376,7 +408,7 @@ impl Engine {
             return TrimOutcome::SETTLED_NOTHING;
         }
 
-        match self.result_lock().try_write(addr) {
+        match self.result_lock().try_lock_target(addr) {
             Ok(Some(guard)) => {
                 // Barrier, here and not above: the enumeration that decides *what
                 // to delete* must observe our write, and this is the one path that
@@ -415,7 +447,7 @@ impl Engine {
                 TrimOutcome::Contended
             }
             Err(e) => {
-                tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc try_write");
+                tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc try_lock_target");
                 TrimOutcome::Failed
             }
         }
@@ -563,7 +595,7 @@ impl Engine {
     /// The read guards resolution takes live in that request state and are
     /// released when it drops at the end of phase 1.
     ///
-    /// **Phase 2 (apply)** acquires each target's write lock and trims/deletes.
+    /// **Phase 2 (apply)** acquires each target's target lock and trims/deletes revisions not being read.
     /// It does *no* resolution and holds no request state, so a per-addr write
     /// lock can never invert against a read lock the sweep still holds (the
     /// deadlock that a one-state sweep would hit). Targets are independent
@@ -758,7 +790,12 @@ impl Engine {
         }
 
         let guard = self
-            .acquire_with_notice(&rs, addr, self.result_lock().write(addr, rs.ctoken()))
+            .acquire_with_notice(
+                &rs,
+                addr,
+                None,
+                self.result_lock().lock_target(addr, rs.ctoken()),
+            )
             .await?;
 
         let hashins = self
@@ -777,28 +814,20 @@ impl Engine {
         let addr_owned = addr.clone();
         match decision {
             Decision::Orphan => {
-                let removed = hashins.len();
-                let bytes = hcore::blocking::run(move || {
-                    // Moves the write lock into the job so it spans every delete
-                    // below; without the binding the closure would not capture it
-                    // and `gc_apply`'s frame would release it early.
-                    let _guard = guard;
-                    let mut bytes = 0u64;
-                    for hashin in &hashins {
-                        bytes = bytes.saturating_add(
-                            engine
-                                .gc_entry(&addr_owned, hashin)
-                                .with_context(|| format!("gc: drop orphan {addr_owned}"))?,
-                        );
-                    }
-                    anyhow::Ok(bytes)
+                // Every revision goes — except one still being read, which
+                // `trim_addr_history` keeps (see there). The target counts as an
+                // orphan removed only once nothing of it is left.
+                let (removed, kept, bytes) = hcore::blocking::run(move || {
+                    engine
+                        .trim_addr_history(&guard, &addr_owned, &hashins, 0, None)
+                        .with_context(|| format!("gc: drop orphan {addr_owned}"))
                 })
                 .await?;
                 Ok(TargetOutcome {
                     removed,
-                    kept: 0,
+                    kept,
                     bytes,
-                    orphan: true,
+                    orphan: kept == 0,
                 })
             }
             Decision::Trim(history) => {
@@ -1176,6 +1205,38 @@ mod tests {
         assert!(present(&engine, &a, "old"), "protected revision survives");
     }
 
+    /// A revision something is still reading — another command riding its
+    /// artifacts — is not garbage yet: the trim keeps it and takes the rest,
+    /// instead of either deleting it from under the reader or giving up on the
+    /// whole target.
+    #[tokio::test]
+    async fn trim_keeps_a_revision_that_is_being_read() {
+        let (engine, _dir) = test_engine();
+        let a = addr("t");
+        write_revision(&engine, &a, "h1", 100, &["o.tar"]);
+        write_revision(&engine, &a, "h2", 200, &["o.tar"]);
+        write_revision(&engine, &a, "h3", 300, &["o.tar"]);
+
+        let _riding = engine
+            .result_lock()
+            .read(&a, "h1", &StdCancellationToken::new())
+            .await
+            .expect("read");
+        let guard = wlock(&engine, &a).await;
+        let hashins = engine.local_cache.list_target_entries(&a).expect("hashins");
+        let (removed, kept, _bytes) = engine
+            .trim_addr_history(&guard, &a, &hashins, 1, None)
+            .expect("trim");
+
+        assert_eq!((removed, kept), (1, 2));
+        assert!(
+            present(&engine, &a, "h1"),
+            "the revision being read survives"
+        );
+        assert!(!present(&engine, &a, "h2"), "the idle stale revision goes");
+        assert!(present(&engine, &a, "h3"));
+    }
+
     #[tokio::test]
     async fn try_trim_after_write_trims_when_lock_free() {
         let (engine, _dir) = test_engine();
@@ -1203,11 +1264,11 @@ mod tests {
         write_revision(&engine, &a, "h1", 100, &["o.tar"]);
         write_revision(&engine, &a, "h2", 200, &["o.tar"]);
 
-        // Hold the addr's write lock; the non-blocking trim must skip.
+        // Hold the target lock, as a build would; the non-blocking trim must skip.
         let ctoken = StdCancellationToken::new();
         let _held = engine
             .result_lock()
-            .write(&a, &ctoken)
+            .lock_target(&a, &ctoken)
             .await
             .expect("write lock");
 
@@ -1425,14 +1486,14 @@ mod tests {
         assert!(present(&engine, &a, "h1"));
     }
 
-    /// Take `addr`'s write lock synchronously, the way the trim itself asks for
+    /// Take `addr`'s target lock synchronously, the way the trim itself asks for
     /// it. Synchronous on purpose: these tests model the cleaner thread, which
     /// has no tokio runtime.
-    fn hold_write(engine: &Engine, addr: &Addr) -> ResultWriteGuard {
+    fn hold_write(engine: &Engine, addr: &Addr) -> TargetGuard {
         engine
             .result_lock()
-            .try_write(addr)
-            .expect("try_write")
+            .try_lock_target(addr)
+            .expect("try_lock_target")
             .expect("lock must be free")
     }
 
@@ -1900,6 +1961,39 @@ mod tests {
         assert_eq!(stats.bytes_removed, 8);
         assert!(!present(&engine, &a, "h1"));
         assert!(!present(&engine, &a, "h2"));
+    }
+
+    /// An orphan revision something is still reading survives the sweep — `heph
+    /// gc` neither deletes it from under the reader nor waits on it — and the
+    /// target is not counted as removed until a later sweep takes the rest.
+    #[tokio::test]
+    async fn gc_all_keeps_a_read_orphan_revision_until_released() {
+        let (engine, _dir) = test_engine();
+        let a = addr("ghost");
+        write_revision(&engine, &a, "read", 100, &["o.tar"]);
+        write_revision(&engine, &a, "idle", 200, &["o.tar"]);
+
+        let riding = engine
+            .result_lock()
+            .read(&a, "read", &StdCancellationToken::new())
+            .await
+            .expect("read");
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all");
+        assert_eq!(stats.orphan_targets_removed, 0, "something of it is left");
+        assert_eq!((stats.revisions_removed, stats.revisions_kept), (1, 1));
+        assert!(present(&engine, &a, "read"));
+        assert!(!present(&engine, &a, "idle"));
+
+        drop(riding);
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all");
+        assert_eq!(stats.orphan_targets_removed, 1);
+        assert!(!present(&engine, &a, "read"));
     }
 
     #[tokio::test]

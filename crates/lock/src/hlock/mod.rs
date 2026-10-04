@@ -20,7 +20,7 @@ mod tests;
 
 pub use bridge::{TBridge, TBridgeReadGuard, TBridgeUpgradableGuard, TBridgeWriteGuard, mem_tlock};
 pub use flock::{FLock, FRWLock, FReadGuard, FWriteGuard};
-pub use keyed::{KeyedGuard, KeyedLock, KeyedRWLock, KeyedTLock, KeyedTRWLock};
+pub use keyed::{KeyedGuard, KeyedHandle, KeyedLock, KeyedRWLock, KeyedTLock, KeyedTRWLock};
 pub use mem::{MemGuard, MemLock, MemRWLock, MemReadGuard, MemWriteGuard};
 pub use traits::{
     Ctoken, Lock, RWLock, TLock, TRWLock, TReadGuard, TUpgradableReadGuard, TWriteGuard,

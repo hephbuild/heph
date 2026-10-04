@@ -965,7 +965,12 @@ impl Engine {
         // `remove_stale` deletes the first's live tree. `credential_lock` does not
         // cover this: it is keyed on a resolution key, not on an address.
         let _w = self
-            .acquire_with_notice(rs, target, self.result_lock().write(target, rs.ctoken()))
+            .acquire_with_notice(
+                rs,
+                target,
+                None,
+                self.result_lock().lock_target(target, rs.ctoken()),
+            )
             .await?;
 
         let run = Arc::clone(self)
@@ -984,7 +989,7 @@ impl Engine {
             )
             .await;
 
-        let (artifacts, teardown, guards) = match run {
+        let (artifacts, teardown, guards, _execute_guard) = match run {
             Ok(v) => v,
             Err(e) => {
                 return Err(e).with_context(|| format!("run credential source {target}"));
