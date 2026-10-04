@@ -170,7 +170,7 @@ impl fmt::Display for ListedLabelsMismatch {
         }
         write!(
             f,
-            ". This is a bug in provider `{}`, not in your BUILD files: its `list` must report exactly the labels its `get` returns. Selecting the target by address (`heph run {addr}`) does not use the listing",
+            ". Provider `{}` must list exactly the labels its `get` returns",
             self.listed_by,
         )
     }

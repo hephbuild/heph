@@ -153,7 +153,7 @@ async fn label_lie_is_an_error_naming_the_provider() -> anyhow::Result<()> {
     let assert_names_everything = |e: &anyhow::Error| {
         let msg = format!("{e:#}");
         for want in [
-            "bug in provider `liar`",
+            "Provider `liar` must list exactly the labels its `get` returns",
             "//a:t",
             "listed but not in the spec: x",
             "in the spec but not listed: y",
@@ -360,7 +360,7 @@ async fn label_lie_is_caught_when_the_spec_resolved_first() -> anyhow::Result<()
         .err()
         .expect("the earlier resolve must not exempt the spec");
     assert!(
-        format!("{err:#}").contains("bug in provider `liar`"),
+        format!("{err:#}").contains("Provider `liar` must list"),
         "{err:#}"
     );
     Ok(())
