@@ -513,7 +513,7 @@ mod tests {
                 Default::default(),
             );
             Box::pin(async move {
-                let items = vec![Ok(ListResponse { addr })];
+                let items = vec![Ok(ListResponse::addr_only(addr))];
                 Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
             })
         }

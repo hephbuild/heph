@@ -551,9 +551,9 @@ mod tests {
             Box::pin(async move {
                 let items: Vec<anyhow::Result<crate::engine::provider::ListResponse>> =
                     if pkg.as_str() == "virt" {
-                        vec![Ok(crate::engine::provider::ListResponse {
-                            addr: Addr::new(pkg, "build".to_string(), Default::default()),
-                        })]
+                        vec![Ok(crate::engine::provider::ListResponse::addr_only(
+                            Addr::new(pkg, "build".to_string(), Default::default()),
+                        ))]
                     } else {
                         vec![]
                     };

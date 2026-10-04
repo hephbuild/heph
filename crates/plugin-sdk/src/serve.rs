@@ -497,6 +497,12 @@ async fn provider_list_stream(
         Ok(iter) => make_item_stream(frame_iter(iter, |lr| {
             pb::ListResponse {
                 addr: Some(convert::addr_to_pb(&lr.addr)),
+                labels_known: lr.labels.is_some(),
+                labels: lr
+                    .labels
+                    .as_deref()
+                    .map(<[String]>::to_vec)
+                    .unwrap_or_default(),
             }
             .encode_to_vec()
         })),
@@ -1848,13 +1854,11 @@ mod tests {
                 .items
                 .iter()
                 .map(|it| match it {
-                    Ok(name) => Ok(ListResponse {
-                        addr: convert::addr_from_pb(pb::Addr {
-                            package: "p".into(),
-                            name: (*name).into(),
-                            args: Default::default(),
-                        }),
-                    }),
+                    Ok(name) => Ok(ListResponse::addr_only(convert::addr_from_pb(pb::Addr {
+                        package: "p".into(),
+                        name: (*name).into(),
+                        args: Default::default(),
+                    }))),
                     Err(msg) => Err(anyhow::anyhow!("{msg}")),
                 })
                 .collect();

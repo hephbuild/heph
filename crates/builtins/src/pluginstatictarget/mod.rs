@@ -116,10 +116,12 @@ impl EProvider for Provider {
                 .targets
                 .iter()
                 .filter(|t| t.addr.package == req.package)
+                // The spec is right here, so the labels are known.
                 .map(|t| {
-                    Ok(ListResponse {
-                        addr: t.addr.clone(),
-                    })
+                    Ok(ListResponse::with_labels(
+                        t.addr.clone(),
+                        t.labels.as_slice(),
+                    ))
                 })
                 .collect();
             Ok(Box::new(items.into_iter())

@@ -39,6 +39,11 @@ message ListRequest {
 }
 message ListResponse {
   Addr addr = 1;
+  // The labels `get` will give this target, when the provider knows them at
+  // list time. Meaningful only when `labels_known`: an old plugin sends
+  // neither field, which must read as "unknown", never as "no labels".
+  repeated string labels = 2;
+  bool labels_known = 3;
 }
 
 message ListPackagesRequest {

@@ -7,6 +7,7 @@ use crate::plugingo::errors::NoGoFilesError;
 use crate::plugingo::factors::{self, Factors, VariantRef, current_goarch, current_goos};
 use crate::plugingo::gocache;
 use crate::plugingo::govet;
+use crate::plugingo::labels;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
     is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires, parse_go_sum_modules,
@@ -1060,9 +1061,27 @@ impl ProviderInner {
                 }
             }
 
+            // Labels come from the same table the spec builders use, so a label
+            // selector decides from here without a `_golist` per candidate. A
+            // handful of distinct sets across every name and variant: build each
+            // once and share it.
+            let mut sets: Vec<(&'static [&'static str], Arc<[String]>)> = Vec::new();
             let responses: Vec<anyhow::Result<ListResponse>> = addrs
                 .into_iter()
-                .map(|addr| Ok(ListResponse { addr }))
+                .map(|addr| {
+                    let Some(set) = labels::listed(&addr.name) else {
+                        return Ok(ListResponse::addr_only(addr));
+                    };
+                    let shared = match sets.iter().find(|(s, _)| *s == set) {
+                        Some((_, shared)) => Arc::clone(shared),
+                        None => {
+                            let shared: Arc<[String]> = labels::owned(set).into();
+                            sets.push((set, Arc::clone(&shared)));
+                            shared
+                        }
+                    };
+                    Ok(ListResponse::with_labels(addr, shared))
+                })
                 .collect();
             Ok(Box::new(responses.into_iter())
                 as Box<

@@ -64,6 +64,18 @@ pub struct Faults {
     /// cancelled, then fail the way a call with two dependencies in flight
     /// does — a `MultiError` of two cancellations.
     pub cancel_at: Option<(Stage, String, Arc<tokio::sync::Notify>)>,
+    /// `list` reports no labels, like a plugin built before ABI 0.11, so a
+    /// label selector resolves every candidate's spec to decide.
+    pub labels_unknown: bool,
+    /// Labels its `list` reports for these static targets instead of their
+    /// real ones: a listing that lies about what `get` will return.
+    pub listed_labels: Vec<(Addr, Vec<String>)>,
+    /// Targets it lists with these labels and that `get` says do not exist:
+    /// go listing `test` in a package that turns out to have no tests.
+    pub vanished: Vec<(Addr, Vec<String>)>,
+    /// Every `get` sleeps this long first, so overlapping calls are visible
+    /// in [`FaultProvider::max_concurrent_gets`].
+    pub slow_get: Option<Duration>,
 }
 
 /// The static provider, misbehaving as [`Faults`] says.
@@ -71,6 +83,45 @@ pub struct FaultProvider {
     inner: pluginstatictarget::Provider,
     faults: Faults,
     list_packages_calls: Arc<AtomicUsize>,
+    gets: Arc<GetLog>,
+}
+
+/// What reached `get`, readable after the provider is handed to the engine.
+#[derive(Debug, Default)]
+pub struct GetLog {
+    addrs: parking_lot::Mutex<Vec<Addr>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl GetLog {
+    /// Every addr `get` was called for, in call order.
+    pub fn addrs(&self) -> Vec<Addr> {
+        self.addrs.lock().clone()
+    }
+
+    /// The most `get`s that were ever in flight at once.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+}
+
+/// Decrements `in_flight` however the `get` ends.
+struct InFlight<'a>(&'a GetLog);
+
+impl<'a> InFlight<'a> {
+    fn enter(log: &'a GetLog, addr: &Addr) -> Self {
+        log.addrs.lock().push(addr.clone());
+        let now = log.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        log.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        Self(log)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FaultProvider {
@@ -79,7 +130,14 @@ impl FaultProvider {
             inner: pluginstatictarget::Provider::new(targets)?,
             faults,
             list_packages_calls: Arc::new(AtomicUsize::new(0)),
+            gets: Arc::default(),
         })
+    }
+
+    /// What reached `get`, readable after the provider has been handed to
+    /// the engine.
+    pub fn gets(&self) -> Arc<GetLog> {
+        Arc::clone(&self.gets)
     }
 
     /// A provider named `broken` that lists `addrs` and fails to resolve every
@@ -172,15 +230,32 @@ impl Provider for FaultProvider {
                 .broken
                 .iter()
                 .filter(|a| a.package == req.package)
-                .map(|a| Ok(ListResponse { addr: a.clone() }))
+                .map(|a| Ok(ListResponse::addr_only(a.clone())))
+                .collect();
+            let vanished: Vec<_> = self
+                .faults
+                .vanished
+                .iter()
+                .filter(|(a, _)| a.package == req.package)
+                .map(|(a, labels)| Ok(ListResponse::with_labels(a.clone(), labels.as_slice())))
                 .collect();
             let listed: Vec<_> = self
                 .inner
                 .list(req, ctoken)
                 .await?
                 .filter(|res| !matches!(res, Ok(t) if self.faults.unlisted.contains(&t.addr)))
+                .map(|res| {
+                    res.map(|t| {
+                        match self.faults.listed_labels.iter().find(|(a, _)| *a == t.addr) {
+                            Some((_, lie)) => ListResponse::with_labels(t.addr, lie.as_slice()),
+                            None if self.faults.labels_unknown => ListResponse::addr_only(t.addr),
+                            None => t,
+                        }
+                    })
+                })
                 .collect();
-            Ok(Box::new(broken.into_iter().chain(listed)) as Box<dyn Iterator<Item = _> + Send>)
+            Ok(Box::new(broken.into_iter().chain(vanished).chain(listed))
+                as Box<dyn Iterator<Item = _> + Send>)
         })
     }
 
@@ -204,6 +279,7 @@ impl Provider for FaultProvider {
                 .faults
                 .broken
                 .iter()
+                .chain(self.faults.vanished.iter().map(|(a, _)| a))
                 .map(|a| {
                     Ok(ListPackageResponse {
                         pkg: a.package.clone(),
@@ -226,11 +302,18 @@ impl Provider for FaultProvider {
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         Box::pin(async move {
+            let _in_flight = InFlight::enter(&self.gets, &req.addr);
+            if let Some(d) = self.faults.slow_get {
+                tokio::time::sleep(d).await;
+            }
             if let Some(e) = self
                 .cancelled(Stage::Spec, &req.addr.format(), ctoken)
                 .await
             {
                 return Err(GetError::Other(e));
+            }
+            if self.faults.vanished.iter().any(|(a, _)| *a == req.addr) {
+                return Err(GetError::NotFound);
             }
             if self.faults.broken.contains(&req.addr) || self.faults.fail_get.contains(&req.addr) {
                 if let Some(gate) = &self.faults.gate {
@@ -436,6 +519,8 @@ mod tests {
     #[tokio::test]
     async fn a_gate_releases_every_failing_get() -> anyhow::Result<()> {
         let (engine, _root, _) = faulty_engine(Faults {
+            // So the label walk has to `get` each candidate.
+            labels_unknown: true,
             fail_get: vec![addr("//a:ok"), addr("//a:other")],
             gate: Some(Arc::new(tokio::sync::Notify::new())),
             slow_list: Some(("b".to_string(), Duration::from_millis(50))),

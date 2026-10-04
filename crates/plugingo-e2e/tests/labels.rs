@@ -6,8 +6,131 @@
 mod common;
 
 use common::{fixture, make_workspace, require_go};
+use futures::TryStreamExt;
+use heph::htaddr::Addr;
 use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
+use std::collections::BTreeSet;
+
+// The go provider reports each target's labels from `list`, and a label
+// selector trusts that listing without resolving the spec. So every listed
+// label set must be exactly what `get` returns — which is `heph validate`'s
+// label check, run here over fixtures that between them carry lint/format (a
+// golangci config), a binary, internal tests and external (`_test` package)
+// tests, so every name in the go provider's label table is compared.
+#[tokio::test]
+async fn go_list_labels_equal_spec_labels() -> anyhow::Result<()> {
+    require_go!();
+    let all = Matcher::PackagePrefix(PkgBuf::from(""));
+    let mut names = BTreeSet::new();
+    for name in ["with_dep", "race", "xtest"] {
+        let ws = make_workspace(fixture(name)?)?;
+        let mismatches = ws
+            .engine
+            .clone()
+            .listed_label_mismatches(
+                ws.engine.new_state(),
+                &all,
+                heph::engine::Discovery::Complete,
+            )
+            .await?;
+        assert!(mismatches.is_empty(), "{name}: {mismatches:#?}");
+
+        // Not vacuous: collect the names that really resolve, which are the
+        // ones the check compared.
+        let addrs: Vec<Addr> = ws
+            .engine
+            .clone()
+            .query(
+                ws.engine.new_state(),
+                &all,
+                heph::engine::Discovery::Complete,
+            )
+            .try_collect()
+            .await?;
+        let rs = ws.engine.new_state();
+        for addr in addrs {
+            let spec = ws.engine.clone().get_spec(rs.clone(), &addr).await;
+            if heph::engine::query::skip_unresolvable(&addr, spec)?.is_some() {
+                names.insert(addr.name.clone());
+            }
+        }
+    }
+
+    // Not vacuous: every family the go provider lists was resolved and checked.
+    for want in [
+        "_golist",
+        "build_lib",
+        "build",
+        "lint",
+        "lint-check",
+        "format",
+        "format-check",
+        "build_test",
+        "test",
+        "test_race",
+        "build_xtest",
+        "xtest",
+        "xtest_race",
+    ] {
+        assert!(names.contains(want), "{want} never resolved: {names:?}");
+    }
+    Ok(())
+}
+
+// Go lists a bare `build` in every package and declines it in a library, where
+// a BUILD file may define its own. Registered first, go's empty label set must
+// not stand in for the BUILD target's: the walk treats an addr two providers
+// list differently as unknown and lets the spec decide.
+#[tokio::test]
+async fn buildfile_target_shadowing_a_go_listing_is_selected_by_its_own_labels()
+-> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_dep")?;
+    std::fs::write(
+        dir.path().join("lib").join("BUILD"),
+        r#"target(name = "build", driver = "bash", run = "echo hi > $OUT", out = "o.txt", labels = ["ci"])"#,
+    )?;
+    let ws = common::make_workspace_go_first(dir, true)?;
+
+    let addrs: Vec<Addr> = ws
+        .engine
+        .clone()
+        .query(
+            ws.engine.new_state(),
+            &Matcher::Label("ci".to_string()),
+            heph::engine::Discovery::Complete,
+        )
+        .try_collect()
+        .await?;
+    let formatted: Vec<String> = addrs.iter().map(Addr::format).collect();
+    assert_eq!(formatted, vec!["//lib:build"]);
+
+    let batch = ws
+        .engine
+        .clone()
+        .result(
+            ws.engine.new_state(),
+            &Matcher::Label("ci".to_string()),
+            heph::engine::OutputMatcher::All,
+            &heph::engine::ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(batch.ok.len(), 1, "{:?}", batch.errors);
+
+    // Nor is go's listing a lie for validate to report: the walk never trusted it.
+    let mismatches = ws
+        .engine
+        .clone()
+        .listed_label_mismatches(
+            ws.engine.new_state(),
+            &Matcher::PackagePrefix(PkgBuf::from("")),
+            heph::engine::Discovery::Complete,
+        )
+        .await?;
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
+}
 
 // `heph i labels` resolves the *spec* of every addr the providers list, so a
 // listed addr that no provider can `get` used to abort the whole walk with

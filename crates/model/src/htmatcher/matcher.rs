@@ -114,6 +114,16 @@ impl Matcher {
     }
 
     pub fn matches_addr(&self, addr: &Addr) -> MatchResult {
+        self.matches_listed(addr, None)
+    }
+
+    /// [`matches_addr`](Self::matches_addr), plus the labels the provider's
+    /// `list` reported for the target, when it knew them.
+    ///
+    /// With `Some(labels)`, `Label` decides instead of shrugging — the listing
+    /// is the provider's promise of what `get` will return. With `None` it is
+    /// exactly `matches_addr`.
+    pub fn matches_listed(&self, addr: &Addr, labels: Option<&[String]>) -> MatchResult {
         match self {
             Matcher::Addr(a) => {
                 if a == addr {
@@ -122,7 +132,11 @@ impl Matcher {
                     MatchResult::MatchNo
                 }
             }
-            Matcher::Label(_) => MatchResult::MatchShrug,
+            Matcher::Label(l) => match labels {
+                Some(labels) if labels.contains(l) => MatchResult::MatchYes,
+                Some(_) => MatchResult::MatchNo,
+                None => MatchResult::MatchShrug,
+            },
             Matcher::TreeOutputTo(matcher_pkg) => {
                 // Cheap addr-only reject: the codegen tree of a target at pkg
                 // `def_pkg` lands under `def_pkg`, so the matcher's package
@@ -152,7 +166,7 @@ impl Matcher {
             Matcher::Or(matchers) => {
                 let mut shrug = false;
                 for m in matchers {
-                    match m.matches_addr(addr) {
+                    match m.matches_listed(addr, labels) {
                         MatchResult::MatchYes => return MatchResult::MatchYes,
                         MatchResult::MatchShrug => shrug = true,
                         MatchResult::MatchNo => {}
@@ -167,7 +181,7 @@ impl Matcher {
             Matcher::And(matchers) => {
                 let mut shrug = false;
                 for m in matchers {
-                    match m.matches_addr(addr) {
+                    match m.matches_listed(addr, labels) {
                         MatchResult::MatchNo => return MatchResult::MatchNo,
                         MatchResult::MatchShrug => shrug = true,
                         MatchResult::MatchYes => {}
@@ -179,7 +193,7 @@ impl Matcher {
                     MatchResult::MatchYes
                 }
             }
-            Matcher::Not(m) => match m.matches_addr(addr) {
+            Matcher::Not(m) => match m.matches_listed(addr, labels) {
                 MatchResult::MatchYes => MatchResult::MatchNo,
                 MatchResult::MatchNo => MatchResult::MatchYes,
                 MatchResult::MatchShrug => MatchResult::MatchShrug,
@@ -220,6 +234,62 @@ mod tests {
             Matcher::Label("my_label".to_string()).matches_addr(&a),
             MatchResult::MatchShrug
         );
+    }
+
+    /// Listed labels decide `Label` and every combinator over it; without them
+    /// each case shrugs exactly as `matches_addr` does.
+    #[test]
+    fn label_matcher_decides_from_listed_labels() {
+        use MatchResult::{MatchNo as No, MatchShrug as Shrug, MatchYes as Yes};
+        let a = addr("foo/bar", "baz");
+        let label = |l: &str| Matcher::Label(l.to_string());
+        let tree = Matcher::TreeOutputTo(PkgBuf::from("foo"));
+        let listed = ["test".to_string(), "go-test".to_string()];
+        let empty: [String; 0] = [];
+
+        let cases = [
+            (label("test"), Yes, Shrug),
+            (label("lint"), No, Shrug),
+            // Exact label, not a prefix or substring of one.
+            (label("tes"), No, Shrug),
+            (label("go-test-race"), No, Shrug),
+            (
+                Matcher::And(vec![label("test"), label("go-test")]),
+                Yes,
+                Shrug,
+            ),
+            (Matcher::And(vec![label("test"), label("lint")]), No, Shrug),
+            (
+                Matcher::Or(vec![label("lint"), label("go-test")]),
+                Yes,
+                Shrug,
+            ),
+            (Matcher::Or(vec![label("lint"), label("fix")]), No, Shrug),
+            (Matcher::Not(Box::new(label("test"))), No, Shrug),
+            (Matcher::Not(Box::new(label("lint"))), Yes, Shrug),
+            // A def-level predicate still shrugs; the label half only decides
+            // when it settles the combinator alone.
+            (
+                Matcher::And(vec![label("test"), tree.clone()]),
+                Shrug,
+                Shrug,
+            ),
+            (Matcher::And(vec![label("lint"), tree.clone()]), No, Shrug),
+            (Matcher::Or(vec![label("test"), tree]), Yes, Shrug),
+            // The addr half still decides on its own.
+            (
+                Matcher::And(vec![label("test"), Matcher::Package(PkgBuf::from("x"))]),
+                No,
+                No,
+            ),
+        ];
+        for (m, with, without) in cases {
+            assert_eq!(m.matches_listed(&a, Some(&listed)), with, "{m:?} listed");
+            assert_eq!(m.matches_listed(&a, None), without, "{m:?} unlisted");
+            assert_eq!(m.matches_addr(&a), without, "{m:?} addr-only");
+        }
+        // Known and empty is a decision, not a shrug.
+        assert_eq!(label("test").matches_listed(&a, Some(&empty)), No);
     }
 
     #[test]

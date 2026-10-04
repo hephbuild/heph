@@ -11,6 +11,7 @@ mod factors;
 mod gen_testmain;
 pub mod gocache;
 mod govet;
+mod labels;
 mod pkg_analysis;
 mod provider;
 mod target_bin;

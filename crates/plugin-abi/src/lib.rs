@@ -21,6 +21,18 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.11.0: `ListResponse` gained `repeated string labels` and `bool
+/// labels_known` — the labels `get` will give the target, so a label selector
+/// decides membership from the listing instead of resolving every candidate's
+/// spec. Additive and cold-path (prost wire fields, no vtable change), so an
+/// old plugin still loads.
+///
+/// prost decodes an old plugin's absent `labels_known` as `false`, which the
+/// host reads as "unknown" and resolves the spec exactly as before — never as
+/// "this target has no labels", which would silently drop it from every label
+/// selection. Minor, therefore: no plugin *must* be rebuilt, but one must be
+/// to make label selection fast.
+///
 /// 0.10.0: deferred values. `RunRequest`/`ManagedRunRequest` gained
 /// `map<string, string> deferred` — option values the host resolved from another
 /// target's output — and `Schema` gained `bool accepts_deferred`. Additive and
@@ -84,7 +96,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.10.0";
+pub const ABI_SEMVER: &str = "0.11.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

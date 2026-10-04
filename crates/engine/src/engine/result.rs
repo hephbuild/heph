@@ -1732,8 +1732,36 @@ impl Engine {
             hcore::hmemoizer::spawn_with_cycle_ctx(enclose!((self => engine, rs, owns_matched) {
                 let matcher = matcher.clone();
                 let discovery = opts.discovery.clone();
+                let confirm_limit = Self::top_level_spawn_limit(engine.max_workers);
                 async move {
-                    let stream = engine.query(rs.clone(), &matcher, discovery);
+                    let gaps = discovery.gaps().cloned();
+                    // A match selected on its listed labels comes out of the walk
+                    // unresolved. It is resolved here, many at once, on the real
+                    // request state — exactly as an addr-selected run
+                    // (`heph r //a //b`) resolves its targets, since every
+                    // survivor is a top-level target this request builds anyway.
+                    // What the walk's speculative state guards against is a
+                    // *rejected* candidate leaving edges in the shared graph,
+                    // and a listed reject is never resolved.
+                    //
+                    // Confirmed *before* it is announced or admitted: a provider
+                    // may list a target it cannot resolve (go lists `test` in
+                    // every package and only `go list` knows whether there are
+                    // tests), and such a phantom must neither inflate the
+                    // matched denominator nor fail the run. `try_buffered`, so
+                    // the admission order is still the walk's order.
+                    let stream = Arc::clone(&engine)
+                        .query(rs.clone(), &matcher, discovery)
+                        .map_ok(|addr| {
+                            Arc::clone(&engine).confirm_match(
+                                rs.clone(),
+                                gaps.clone(),
+                                &matcher,
+                                addr,
+                            )
+                        })
+                        .try_buffered(confirm_limit)
+                        .try_filter_map(futures::future::ok);
                     tokio::pin!(stream);
                     loop {
                         match stream.try_next().await {
@@ -7383,9 +7411,9 @@ mod tests {
                 return Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) });
             }
             Box::pin(async move {
-                let items: Vec<anyhow::Result<ListResponse>> = vec![Ok(ListResponse {
-                    addr: Addr::new(pkg, "t".to_string(), Default::default()),
-                })];
+                let items: Vec<anyhow::Result<ListResponse>> = vec![Ok(ListResponse::addr_only(
+                    Addr::new(pkg, "t".to_string(), Default::default()),
+                ))];
                 Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
             })
         }
@@ -11041,11 +11069,7 @@ mod tests {
                 .targets
                 .iter()
                 .filter(|t| t.addr.package == req.package)
-                .map(|t| {
-                    Ok(ListResponse {
-                        addr: t.addr.clone(),
-                    })
-                })
+                .map(|t| Ok(ListResponse::addr_only(t.addr.clone())))
                 .collect();
             Box::pin(async move {
                 Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
@@ -11848,6 +11872,10 @@ mod tests {
                     .iter()
                     .map(|a| hmodel::htaddr::parse_addr(a))
                     .collect::<anyhow::Result<_>>()?,
+                // A `get` that builds first is go resolving through `_golist`,
+                // and these tests are about what that resolve touches. A label
+                // walk only reaches it when the listing leaves labels unknown.
+                labels_unknown: shape.builds.is_some(),
                 builds,
                 fail_list_packages: shape.fail_listing,
                 ..Default::default()
@@ -12413,10 +12441,13 @@ mod tests {
             let rs = engine.new_state();
             let x = Matcher::Label("x".to_string());
 
+            // `query_spec`, not `query`: the listing carries labels, so `query`
+            // trusts it and never resolves `bad`; `query_spec` resolves each
+            // match, and that is where a top-level walk skips it.
             let gaps = crate::engine::Gaps::new("label(x)");
             let top: Vec<String> = SArc::clone(&engine)
-                .query(rs.clone(), &x, Discovery::KeepGoing(gaps.clone()))
-                .map_ok(|a| a.format())
+                .query_spec(rs.clone(), &x, Discovery::KeepGoing(gaps.clone()))
+                .map_ok(|s| s.spec.addr.format())
                 .try_collect()
                 .await?;
             assert_eq!(top, ["//pkg:good"]);
