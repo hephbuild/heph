@@ -329,11 +329,11 @@ mod tests {
         > {
             let specs = self.specs.clone();
             Box::pin(async move {
-                Ok(Box::new(specs.into_iter().map(|s| {
-                    Ok(ListResponse {
-                        addr: s.addr.clone(),
-                    })
-                })) as Box<dyn Iterator<Item = _> + Send>)
+                Ok(Box::new(
+                    specs
+                        .into_iter()
+                        .map(|s| Ok(ListResponse::addr_only(s.addr.clone()))),
+                ) as Box<dyn Iterator<Item = _> + Send>)
             })
         }
         fn list_packages<'a>(

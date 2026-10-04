@@ -528,10 +528,13 @@ impl EProvider for Provider {
             let items: Vec<anyhow::Result<ListResponse>> = res
                 .targets
                 .iter()
+                // The package is already evaluated, so the labels `get` will
+                // return (`p.labels`, below) cost nothing to report here.
                 .map(|p| {
-                    Ok(ListResponse {
-                        addr: Addr::new(req.package.clone(), p.name.clone(), Default::default()),
-                    })
+                    Ok(ListResponse::with_labels(
+                        Addr::new(req.package.clone(), p.name.clone(), Default::default()),
+                        p.labels.as_slice(),
+                    ))
                 })
                 .collect();
 

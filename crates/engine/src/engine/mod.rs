@@ -45,6 +45,7 @@ pub use hplugin::error;
 pub use hplugin::hook;
 pub mod event;
 mod labels;
+pub mod listed;
 mod local_cache;
 mod local_cache_fs;
 mod local_cache_mem;

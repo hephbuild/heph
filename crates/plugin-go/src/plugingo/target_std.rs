@@ -3,6 +3,7 @@ use crate::plugingo::addr_util::{
 };
 use crate::plugingo::cc_toolchain;
 use crate::plugingo::factors::{Factors, VariantRef};
+use crate::plugingo::labels;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
@@ -215,7 +216,7 @@ pub fn build_spec(
         addr,
         driver: "bash".to_string(),
         config,
-        labels: vec!["go-build".to_string()],
+        labels: labels::owned(labels::BUILD),
         ..Default::default()
     }
 }

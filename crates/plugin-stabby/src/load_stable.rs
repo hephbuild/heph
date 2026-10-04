@@ -243,8 +243,14 @@ impl<T> Iterator for ItemStreamIter<T> {
 
 fn decode_list_item(b: &[u8]) -> anyhow::Result<ListResponse> {
     let lr = pb::ListResponse::decode(b)?;
-    Ok(ListResponse {
-        addr: convert::addr_from_pb(lr.addr.unwrap_or_default()),
+    let addr = convert::addr_from_pb(lr.addr.unwrap_or_default());
+    // A plugin older than ABI 0.11 sends neither field; prost reads that as
+    // `labels_known == false`, which must stay "unknown" — an empty `Some`
+    // would drop the target from every label selection.
+    Ok(if lr.labels_known {
+        ListResponse::with_labels(addr, lr.labels)
+    } else {
+        ListResponse::addr_only(addr)
     })
 }
 
@@ -997,5 +1003,49 @@ fn managed_input_to_pb(mi: &ManagedRunInput) -> pb::ManagedRunInput {
             .list_path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encoded(labels: &[&str], labels_known: bool) -> Vec<u8> {
+        pb::ListResponse {
+            addr: Some(pb::Addr {
+                package: "p".into(),
+                name: "t".into(),
+                args: Default::default(),
+            }),
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            labels_known,
+        }
+        .encode_to_vec()
+    }
+
+    /// A plugin built before ABI 0.11 never sets `labels_known`: its listing
+    /// must decode as "labels unknown", not as "no labels", or every label
+    /// selection would silently skip its targets.
+    #[test]
+    fn old_plugin_without_labels_shrugs() {
+        let decode = |b: &[u8]| decode_list_item(b).expect("decoding a ListResponse");
+        let old = pb::ListResponse {
+            addr: Some(pb::Addr {
+                package: "p".into(),
+                name: "t".into(),
+                args: Default::default(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(decode(&old.encode_to_vec()).labels, None);
+
+        let none = decode(&encoded(&[], true));
+        assert_eq!(none.labels.as_deref(), Some(&[][..]));
+
+        let some = decode(&encoded(&["a", "b"], true));
+        assert_eq!(
+            some.labels.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
     }
 }

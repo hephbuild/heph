@@ -394,6 +394,11 @@ pub struct RequestStateData {
     /// request sees it, and a [`hash_only`](Self::hash_only) request — which is
     /// a separate `RequestStateData` — never does.
     selection: std::sync::OnceLock<Selection>,
+    /// The labels each provider's `list` reported, which every spec resolved
+    /// for a listed addr is checked against. See [`ListedLabels`].
+    ///
+    /// [`ListedLabels`]: crate::engine::listed::ListedLabels
+    pub(crate) listed_labels: crate::engine::listed::ListedLabels,
     /// Post-write `cache.history` trims held back until this request's cache
     /// read guards are gone.
     ///
@@ -1211,6 +1216,7 @@ impl Engine {
             approval,
             hash_only,
             selection: std::sync::OnceLock::new(),
+            listed_labels: Default::default(),
             deferred_trims: DeferredTrims {
                 engine: Arc::downgrade(self),
                 bg_pending,

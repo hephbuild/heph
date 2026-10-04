@@ -4,6 +4,7 @@ use crate::plugingo::addr_util::{
 };
 use crate::plugingo::driver_compile::{CompileParams, build_compile_spec};
 use crate::plugingo::factors::Factors;
+use crate::plugingo::labels;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hplugin::provider::TargetSpec;
@@ -352,11 +353,11 @@ pub fn test_spec(
     // `heph run 'label(test)'` (and CI built on it) must keep meaning the
     // ordinary suite; opting in is `label(test-race)`. Both are still reachable
     // together as `label(test) || label(test-race)`.
-    let labels = if race {
-        vec!["test-race".to_string(), "go-test-race".to_string()]
+    let labels = labels::owned(if race {
+        labels::TEST_RACE
     } else {
-        vec!["test".to_string(), "go-test".to_string()]
-    };
+        labels::TEST
+    });
 
     TargetSpec {
         addr,

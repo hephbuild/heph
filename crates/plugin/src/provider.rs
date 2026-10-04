@@ -29,8 +29,32 @@ pub struct ListRequest {
     /// pass [`NoopExecutor`].
     pub executor: Arc<dyn ProviderExecutor>,
 }
+/// Built with [`ListResponse::addr_only`] or [`ListResponse::with_labels`];
+/// non-exhaustive so the next field is not another source break for every
+/// provider.
+#[non_exhaustive]
 pub struct ListResponse {
     pub addr: Addr,
+    /// The labels `get` will give this target, if the provider knows them
+    /// without resolving it. `None` is "unknown": a label matcher then resolves
+    /// the spec to decide, as it always did. `Some` is a contract — the engine
+    /// fails the run if the resolved spec's labels differ.
+    pub labels: Option<Arc<[String]>>,
+}
+
+impl ListResponse {
+    /// A listing that says nothing about labels.
+    pub fn addr_only(addr: Addr) -> Self {
+        Self { addr, labels: None }
+    }
+
+    /// A listing whose labels are known: exactly what `get` will return.
+    pub fn with_labels(addr: Addr, labels: impl Into<Arc<[String]>>) -> Self {
+        Self {
+            addr,
+            labels: Some(labels.into()),
+        }
+    }
 }
 
 pub struct ListPackagesRequest {

@@ -1732,8 +1732,37 @@ impl Engine {
             hcore::hmemoizer::spawn_with_cycle_ctx(enclose!((self => engine, rs, owns_matched) {
                 let matcher = matcher.clone();
                 let discovery = opts.discovery.clone();
+                let confirm_limit = Self::top_level_spawn_limit(engine.max_workers);
                 async move {
-                    let stream = engine.query(rs.clone(), &matcher, discovery);
+                    let gaps = discovery.gaps().cloned();
+                    // `ListedMatch::Trust`: a candidate whose listed labels match
+                    // comes back unresolved instead of being resolved one at a
+                    // time on the walk's serial arm. Its spec is resolved here,
+                    // many at once, on the real request state — exactly as an
+                    // addr-selected run (`heph r //a //b`) resolves its targets,
+                    // since every survivor is a top-level target this request
+                    // builds anyway. What the serial arm's speculative state
+                    // guards against is a *rejected* candidate leaving edges in
+                    // the shared graph, and a listed reject is never resolved.
+                    //
+                    // Confirmed *before* it is announced or admitted: a provider
+                    // may list a target it cannot resolve (go lists `test` in
+                    // every package and only `go list` knows whether there are
+                    // tests), and such a phantom must neither inflate the
+                    // matched denominator nor fail the run. `try_buffered`, so
+                    // the admission order is still the walk's order.
+                    let stream = Arc::clone(&engine)
+                        .select(
+                            rs.clone(),
+                            &matcher,
+                            discovery,
+                            crate::engine::query::ListedMatch::Trust,
+                        )
+                        .map_ok(|selected| {
+                            Arc::clone(&engine).confirm_selected(rs.clone(), gaps.clone(), selected)
+                        })
+                        .try_buffered(confirm_limit)
+                        .try_filter_map(futures::future::ok);
                     tokio::pin!(stream);
                     loop {
                         match stream.try_next().await {
@@ -3928,7 +3957,8 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<EngineTargetSpec>> {
-        rs.data
+        let spec = rs
+            .data
             .mem_spec
             .once(
                 AddrKey(addr.clone()),
@@ -3948,7 +3978,29 @@ impl Engine {
                 } else {
                     unwrap_arc_err(arc)
                 }
-            })
+            })?;
+        // On every read, not inside the memoized resolve: the spec may have been
+        // resolved before its listing was recorded (as a dependency of a target
+        // already building), and a selection that acted on the listing must
+        // still be held to it. See `listed.rs`.
+        if let Some((listed_by, listed)) = rs.data.listed_labels.contradiction(addr, &spec.labels) {
+            let listed_by = self
+                .providers
+                .get(listed_by)
+                .map_or_else(String::new, |p| p.name.clone());
+            let mut resolved = spec.labels.clone();
+            resolved.sort_unstable();
+            resolved.dedup();
+            return Err(crate::engine::listed::ListedLabelsMismatch {
+                addr: addr.clone(),
+                resolved_by: (listed_by != spec.provider).then(|| spec.provider.clone()),
+                listed_by,
+                listed: listed.to_vec(),
+                resolved,
+            }
+            .into());
+        }
+        Ok(spec)
     }
 
     /// Probe every registered provider for every parent package of `pkg`, accumulating
@@ -7383,9 +7435,9 @@ mod tests {
                 return Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) });
             }
             Box::pin(async move {
-                let items: Vec<anyhow::Result<ListResponse>> = vec![Ok(ListResponse {
-                    addr: Addr::new(pkg, "t".to_string(), Default::default()),
-                })];
+                let items: Vec<anyhow::Result<ListResponse>> = vec![Ok(ListResponse::addr_only(
+                    Addr::new(pkg, "t".to_string(), Default::default()),
+                ))];
                 Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
             })
         }
@@ -11041,11 +11093,7 @@ mod tests {
                 .targets
                 .iter()
                 .filter(|t| t.addr.package == req.package)
-                .map(|t| {
-                    Ok(ListResponse {
-                        addr: t.addr.clone(),
-                    })
-                })
+                .map(|t| Ok(ListResponse::addr_only(t.addr.clone())))
                 .collect();
             Box::pin(async move {
                 Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
@@ -11848,6 +11896,10 @@ mod tests {
                     .iter()
                     .map(|a| hmodel::htaddr::parse_addr(a))
                     .collect::<anyhow::Result<_>>()?,
+                // A `get` that builds first is go resolving through `_golist`,
+                // and these tests are about what that resolve touches. A label
+                // walk only reaches it when the listing leaves labels unknown.
+                labels_unknown: shape.builds.is_some(),
                 builds,
                 fail_list_packages: shape.fail_listing,
                 ..Default::default()

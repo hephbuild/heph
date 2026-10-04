@@ -1,6 +1,7 @@
 use crate::engine::Engine;
 use crate::engine::discovery::{Discovery, Gaps, Stage, is_cancellation, provider_of};
 use crate::engine::error::{CancelledError, CycleError, TargetNotFoundError};
+use crate::engine::listed::ListedLabelsMismatch;
 use crate::engine::packages::merge_packages;
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
@@ -12,15 +13,86 @@ use hmodel::htaddr::Addr;
 use hmodel::htmatcher;
 use hmodel::htmatcher::MatchResult;
 use hmodel::htpkg::PkgBuf;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 /// What one package's discovery task found: its candidates, in provider order,
 /// and under [`Discovery::KeepGoing`] whatever it could not resolve.
 #[derive(Default)]
 struct PackageScan {
-    candidates: Vec<Addr>,
+    candidates: Vec<Candidate>,
     skipped: Vec<Skip>,
+}
+
+/// One listed target, with what its provider said about its labels.
+struct Candidate {
+    addr: Addr,
+    /// Index of the listing provider in `Engine::providers`.
+    provider: usize,
+    labels: Option<Arc<[String]>>,
+}
+
+/// A target the walk selected.
+#[derive(Debug)]
+pub(crate) struct Selected {
+    pub(crate) addr: Addr,
+    /// Selected on its listed labels alone: nothing has resolved its spec, so
+    /// it may not exist (a provider can list more than it can resolve). Only a
+    /// [`ListedMatch::Trust`] walk yields one.
+    pub(crate) unconfirmed: bool,
+}
+
+/// What a walk does with a candidate whose listed labels match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListedMatch {
+    /// Resolve it on the walk's serial arm before yielding it, so every
+    /// yielded addr exists.
+    Confirm,
+    /// Yield it unresolved, as [`Selected::unconfirmed`]; the caller resolves
+    /// it. See [`Engine::select`].
+    Trust,
+}
+
+/// The labels the walk matches a listed addr against: one set when every
+/// provider that listed it agrees, `None` (unknown — the spec decides) when
+/// they differ or any of them does not know.
+///
+/// Two providers can list one addr and only one of them resolve it: go lists
+/// a bare `build` in every package and declines it in a library, where a BUILD
+/// file may define its own. First-listing-wins would match against go's set
+/// and silently miss the BUILD target's labels.
+fn merge_listings(candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut at: FxHashMap<Addr, usize> = FxHashMap::default();
+    let mut merged: Vec<Candidate> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        match at.get(&c.addr) {
+            Some(&i) => {
+                if let Some(first) = merged.get_mut(i)
+                    && first.labels.as_deref() != c.labels.as_deref()
+                {
+                    first.labels = None;
+                }
+            }
+            None => {
+                at.insert(c.addr.clone(), merged.len());
+                merged.push(c);
+            }
+        }
+    }
+    merged
+}
+
+/// Whether evaluating `m` can read a target's labels at all. Listings are only
+/// worth recording — an `Addr` clone and a map entry per candidate — for a
+/// walk that will act on them.
+fn mentions_label(m: &htmatcher::Matcher) -> bool {
+    use htmatcher::Matcher as M;
+    match m {
+        M::Label(_) => true,
+        M::Or(ms) | M::And(ms) => ms.iter().any(mentions_label),
+        M::Not(m) => mentions_label(m),
+        M::Addr(_) | M::Package(_) | M::PackagePrefix(_) | M::TreeOutputTo(_) => false,
+    }
 }
 
 /// One skipped scope, carried from a package task to the consumer, which owns
@@ -53,6 +125,30 @@ impl Engine {
         m: &'a htmatcher::Matcher,
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+        self.select(rs, m, discovery, ListedMatch::Confirm)
+            .map_ok(|selected| selected.addr)
+    }
+
+    /// [`query`](Self::query), optionally yielding candidates whose listed
+    /// labels match without resolving them first.
+    ///
+    /// Listed labels always *reject* without a resolve: a candidate the
+    /// listing says cannot match never reaches `get`. `listed` decides what
+    /// happens to a listed *match*. [`ListedMatch::Confirm`] resolves it on the
+    /// serial arm below like any shrug, so every addr `query` yields still
+    /// exists. [`ListedMatch::Trust`] yields it as [`Selected::unconfirmed`]
+    /// and the caller resolves it — which is what lets `Engine::result` resolve
+    /// matches in parallel rather than one at a time here. A caller that trusts
+    /// owns two things: dropping an unconfirmed addr that turns out not to
+    /// exist, and never announcing one before it has resolved.
+    pub(crate) fn select<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        discovery: Discovery,
+        listed: ListedMatch,
+    ) -> impl Stream<Item = anyhow::Result<Selected>> + 'a {
+        let uses_labels = mentions_label(m);
         // A whole-graph selector (`//...` — a `PackagePrefix` rooted at the empty
         // package) enumerates every target, so its final match count is the total
         // graph size. Recorded for telemetry only when the stream is driven to
@@ -129,7 +225,9 @@ impl Engine {
             // of the fan-out, inside this one linear generator body, so while it
             // awaits `get_spec`/`get_def` the stream below is not polled at all.
             // (Do not weaken this to "the shrug arm is rare". It is not —
-            // `Matcher::Label` shrugs from `matches_addr` unconditionally, and
+            // `Matcher::Label` shrugs for every candidate whose provider did
+            // not list its labels, and every listed match comes through here
+            // too unless the caller passed `ListedMatch::Trust`; and
             // `Matcher::TreeOutputTo` shrugs at both the addr and the spec
             // level, so `heph validate`, `heph tool gen-gitignore` and
             // `heph query 'tree_output()'` drive `get_spec` *and* `get_def` for
@@ -208,7 +306,7 @@ impl Engine {
                         Err(e) => return Err(e),
                     };
 
-                    for provider in &engine.providers {
+                    for (provider_idx, provider) in engine.providers.iter().enumerate() {
                         let listed = provider.provider.list(ListRequest {
                             request_id: rs.request_id().to_string(),
                             package: pkg.clone(),
@@ -239,7 +337,11 @@ impl Engine {
 
                         for item in raw {
                             if item.addr.package == pkg {
-                                scan.candidates.push(item.addr);
+                                scan.candidates.push(Candidate {
+                                    addr: item.addr,
+                                    provider: provider_idx,
+                                    labels: item.labels,
+                                });
                             }
                         }
                     }
@@ -317,10 +419,38 @@ impl Engine {
                         gaps.record(skip.stage, &skip.provider, skip.scope, &skip.error);
                     }
                 }
-                for addr in scan.candidates {
-                    match m.matches_addr(&addr) {
+                // Every provider's listing of a package is in this one scan, so
+                // this is where they are reconciled. Not worth an `Addr` clone
+                // per candidate when the matcher never reads a label.
+                let candidates = if uses_labels {
+                    merge_listings(scan.candidates)
+                } else {
+                    scan.candidates
+                };
+                for Candidate { addr, provider, labels } in candidates {
+                    // Recorded before matching, so every later read of this
+                    // addr's spec — here, in the caller, or as some other
+                    // target's dep — is checked against the set the matcher used.
+                    let labels = match labels {
+                        Some(labels) if uses_labels => {
+                            Some(rs.data.listed_labels.record(&addr, provider, &labels))
+                        }
+                        _ => None,
+                    };
+                    let mut verdict = m.matches_listed(&addr, labels.as_deref());
+                    // A yes the addr alone would not have given: it rests on
+                    // the listing, and nothing has shown the target exists.
+                    let by_listing = verdict == MatchResult::MatchYes
+                        && labels.is_some()
+                        && m.matches_addr(&addr) != MatchResult::MatchYes;
+                    if by_listing && listed == ListedMatch::Confirm {
+                        verdict = MatchResult::MatchShrug;
+                    }
+                    match verdict {
                         MatchResult::MatchYes => {
-                            if seen.insert(addr.clone()) { yield addr; }
+                            if seen.insert(addr.clone()) {
+                                yield Selected { addr, unconfirmed: by_listing };
+                            }
                         }
                         MatchResult::MatchNo => {}
                         MatchResult::MatchShrug => {
@@ -338,6 +468,17 @@ impl Engine {
                                 // rewrites it to the candidate's own addr.)
                                 Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => continue,
                                 Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => continue,
+                                // Not a gap to carry on past: the selection
+                                // already acted on the listing it contradicts.
+                                // (One raised under a plugin's own `get`, while
+                                // it resolves a listed dependency through the
+                                // executor, crosses the seam as a string and
+                                // reads as an ordinary spec failure. Accepted:
+                                // it still fails a complete walk, and the top
+                                // level reads that same spec directly.)
+                                Err(e) if downcast_chain_ref::<ListedLabelsMismatch>(&e).is_some() => {
+                                    break 'walk Some(e)
+                                }
                                 Err(e) => match &gaps {
                                     Some(gaps) if !is_cancellation(&rs, &e) => {
                                         skipped_any = true;
@@ -350,7 +491,9 @@ impl Engine {
 
                             match crate::engine::matcher_spec::match_spec(m, &spec) {
                                 MatchResult::MatchYes => {
-                                    if seen.insert(addr.clone()) { yield addr; }
+                                    if seen.insert(addr.clone()) {
+                                        yield Selected { addr, unconfirmed: false };
+                                    }
                                 }
                                 MatchResult::MatchNo => {}
                                 MatchResult::MatchShrug => {
@@ -375,7 +518,7 @@ impl Engine {
                                     ) == MatchResult::MatchYes
                                         && seen.insert(addr.clone())
                                     {
-                                        yield addr;
+                                        yield Selected { addr, unconfirmed: false };
                                     }
                                 }
                             }
@@ -477,6 +620,51 @@ impl Engine {
             })
             .try_buffer_unordered(concurrency)
             .try_filter_map(|spec| std::future::ready(Ok(spec)))
+    }
+}
+
+impl Engine {
+    /// Resolve the spec of a [`Selected::unconfirmed`] addr, so the caller of
+    /// a [`ListedMatch::Trust`] walk learns whether it exists: `Some(addr)` if
+    /// it does, `None` for a candidate the provider listed but cannot resolve.
+    /// A confirmed selection passes straight through.
+    ///
+    /// Drops what the walk's serial arm drops — a cycle back through the addr,
+    /// and under [`Discovery::KeepGoing`] a spec failure, recorded as a skip —
+    /// with one deliberate difference: only a not-found naming *this* addr
+    /// (see [`skip_unresolvable`]). One naming a dependency is a real missing
+    /// dependency and fails. A [`ListedLabelsMismatch`] is never dropped: the
+    /// selection acted on the listing it contradicts.
+    pub(crate) async fn confirm_selected(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        gaps: Option<Arc<Gaps>>,
+        selected: Selected,
+    ) -> anyhow::Result<Option<Addr>> {
+        if !selected.unconfirmed {
+            return Ok(Some(selected.addr));
+        }
+        let addr = selected.addr;
+        match skip_unresolvable(&addr, self.get_spec(rs.clone(), &addr).await) {
+            Ok(Some(_)) => Ok(Some(addr)),
+            Ok(None) => {
+                // Silent to the user by design; here for "why wasn't X selected?".
+                tracing::debug!(
+                    addr = %addr.format(),
+                    "listed label match did not resolve; dropped from the selection"
+                );
+                Ok(None)
+            }
+            Err(e) if downcast_chain_ref::<ListedLabelsMismatch>(&e).is_some() => Err(e),
+            Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => Ok(None),
+            Err(e) => match &gaps {
+                Some(gaps) if !is_cancellation(&rs, &e) => {
+                    gaps.record(Stage::Spec, provider_of(&e), addr.format(), &e);
+                    Ok(None)
+                }
+                _ => Err(e),
+            },
+        }
     }
 }
 
@@ -583,7 +771,7 @@ mod tests {
                 Default::default(),
             );
             Box::pin(async move {
-                let items = vec![Ok(crate::engine::provider::ListResponse { addr })];
+                let items = vec![Ok(crate::engine::provider::ListResponse::addr_only(addr))];
                 Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
             })
         }
@@ -687,13 +875,11 @@ mod tests {
             > {
                 Box::pin(async {
                     let mk = || {
-                        Ok(ListResponse {
-                            addr: Addr::new(
-                                PkgBuf::from("foo"),
-                                "a".to_string(),
-                                Default::default(),
-                            ),
-                        })
+                        Ok(ListResponse::addr_only(Addr::new(
+                            PkgBuf::from("foo"),
+                            "a".to_string(),
+                            Default::default(),
+                        )))
                     };
                     let items: Vec<anyhow::Result<ListResponse>> = vec![mk(), mk()];
                     Ok(Box::new(items.into_iter())
@@ -1017,9 +1203,9 @@ mod tests {
             Box::pin(async move {
                 listed.lock().unwrap().push(pkg.as_str().to_string());
                 let items: Vec<anyhow::Result<crate::engine::provider::ListResponse>> =
-                    vec![Ok(crate::engine::provider::ListResponse {
-                        addr: Addr::new(pkg, "t".to_string(), Default::default()),
-                    })];
+                    vec![Ok(crate::engine::provider::ListResponse::addr_only(
+                        Addr::new(pkg, "t".to_string(), Default::default()),
+                    ))];
                 Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
             })
         }
@@ -1213,9 +1399,9 @@ mod tests {
                 tokio::time::sleep(d).await;
                 inflight.fetch_sub(1, SeqCst);
                 let items: Vec<anyhow::Result<crate::engine::provider::ListResponse>> =
-                    vec![Ok(crate::engine::provider::ListResponse {
-                        addr: Addr::new(pkg, "t".to_string(), Default::default()),
-                    })];
+                    vec![Ok(crate::engine::provider::ListResponse::addr_only(
+                        Addr::new(pkg, "t".to_string(), Default::default()),
+                    ))];
                 Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
             })
         }
