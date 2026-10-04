@@ -269,6 +269,72 @@ async fn a_running_command_does_not_block_a_rebuild_of_a_new_revision() -> anyho
     Ok(())
 }
 
+/// A read lock lasts as long as the artifacts are in use — not as long as the
+/// request, and so not as long as the process.
+///
+/// An LSP or a daemon keeps a request (or the engine) alive indefinitely. If
+/// the per-request memoizers kept a resolved target's read lock, every target
+/// it ever resolved would stay locked machine-wide: no `--force` rebuild, no
+/// GC, from any other `heph`. Here the first engine resolves a target, drops
+/// the result but keeps the request, and a second engine force-rebuilds that
+/// very revision — which needs every reader of it gone.
+///
+/// And the request still works afterwards: resolving the target again in the
+/// same request re-acquires the read rather than relying on one it let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_request_holds_no_lock_on_results_it_no_longer_uses() -> anyhow::Result<()> {
+    use heph::engine::{OutputMatcher, ResultOptions};
+    use heph::htaddr::parse_addr;
+
+    let ws = Workspace::new();
+    let addr = parse_addr("//idle:t")?;
+    ws.write_build_file(
+        "idle",
+        r#"target(name = "t", driver = "bash", run = "printf 'v' > $OUT", out = "out.txt")"#,
+    );
+
+    let resident = ws.reopen()?;
+    let resident_rs = resident.new_state();
+    let first = resident
+        .clone()
+        .result_addr(
+            resident_rs.clone(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    drop(first);
+
+    let other = ws.reopen()?;
+    let forced = ResultOptions {
+        force: true,
+        ..ResultOptions::default()
+    };
+    let rebuilt = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        other
+            .clone()
+            .result_addr(other.new_state(), &addr, OutputMatcher::All, &forced),
+    )
+    .await
+    .expect("the forced rebuild waited on a read lock the live request no longer uses")?;
+    assert_eq!(common::artifact_string(&rebuilt), "v");
+    drop(rebuilt);
+
+    let again = resident
+        .clone()
+        .result_addr(
+            resident_rs.clone(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(common::artifact_string(&again), "v");
+    Ok(())
+}
+
 /// `cache.history` must be enforced *by the run that broke the budget*, not
 /// left for the next `heph gc`.
 ///

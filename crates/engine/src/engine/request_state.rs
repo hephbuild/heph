@@ -275,9 +275,9 @@ pub struct RequestStateData {
     // Key includes `is_top`: top-level vs dependency resolution of the same
     // (addr, outputs) must not share a cell, because only the top-level frame
     // writes a codegen target's tree back / stores its fixpoint.
-    pub mem_result: Memoizer<
+    pub(crate) mem_result: Memoizer<
         (AddrKey, OutputMatcher, bool),
-        Result<Arc<crate::engine::result::EResult>, ArcErr>,
+        Result<Arc<crate::engine::result::MemoResult>, ArcErr>,
     >,
     pub mem_execute_cache: Memoizer<(AddrKey, String), ExecuteCacheResult>,
     /// Single-flights the per-addr result-LOCK + cache-fetch/execute, keyed by
@@ -593,7 +593,7 @@ struct Crumb {
 /// addr the same answer.
 ///
 /// Deciding at first touch is the only sound place: an unforced cache hit keeps
-/// a read lock on the target for the rest of the request, so forcing it later
+/// a read lock on the target while its artifacts are in use, so forcing it later
 /// would deadlock on its own write lock.
 ///
 /// Only packages the walk can enumerate count. `//...` matches every address by

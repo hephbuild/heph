@@ -1504,8 +1504,8 @@ impl BuildState {
 
     /// Rows for addrs currently blocked on the result lock past the notice
     /// threshold, rendered like the slow-target rows but flagged locked:
-    /// `🔒 <addr> (locked by pid N)`, `(locked, in use by another heph command until it exits)`
-    /// when readers are holding the revision, or `(locked, holder unknown)`.
+    /// `🔒 <addr> (locked by pid N)`, `(locked, in use)` when readers are
+    /// holding the revision, or `(locked, holder unknown)`.
     /// Sorted by addr so the order is stable across frames. Empty when nothing
     /// is blocked.
     pub fn lock_wait_lines(&self) -> Vec<Line<'static>> {
@@ -1516,9 +1516,7 @@ impl BuildState {
             .map(|(addr, holder)| {
                 let holder = match holder {
                     LockHolder::Pid(pid) => format!("locked by pid {pid}"),
-                    LockHolder::Readers => {
-                        "locked, in use by another heph command until it exits".to_string()
-                    }
+                    LockHolder::Readers => "locked, in use".to_string(),
                     LockHolder::Unknown => "locked, holder unknown".to_string(),
                 };
                 Line::from(Span::styled(
@@ -2485,9 +2483,7 @@ impl CIAppView for CiProgressView {
             } => {
                 let holder = match LockHolder::of(*holder_pid, *in_use_by_readers) {
                     LockHolder::Pid(pid) => format!("held by pid {pid}"),
-                    LockHolder::Readers => {
-                        "in use by another heph command; released when it exits".to_string()
-                    }
+                    LockHolder::Readers => "in use".to_string(),
                     LockHolder::Unknown => "holder unknown".to_string(),
                 };
                 tracing::info!("waiting on result lock for {addr} ({holder})");
@@ -2668,7 +2664,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>();
-        assert!(text.contains("in use by another heph command"), "{text}");
+        assert!(text.contains("(locked, in use)"), "{text}");
         assert!(!text.contains("unknown"), "{text}");
     }
 

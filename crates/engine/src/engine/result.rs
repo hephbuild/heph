@@ -512,9 +512,9 @@ pub use hplugin::eresult::{ArtifactMeta, EResult};
 /// omission survived two `Content` methods being added.
 ///
 /// [`file_path`](Content::file_path) is safe to forward for the same reason it
-/// needs the guard: cache GC deletes a revision only under the per-addr *write*
-/// lock (`Engine::gc_apply`, `Engine::try_trim_after_write`), which cannot be
-/// taken while this read guard is alive — so the path stays valid for exactly as
+/// needs the guard: cache GC deletes a revision only under that revision's
+/// *write* lock (`Engine::gc_apply`, `Engine::try_trim_after_write`), which
+/// cannot be taken while this read guard is alive — so the path stays valid for exactly as
 /// long as this artifact does, which is the contract `Content::file_path`
 /// states. Handing the bare `PathBuf` further out than the artifact would break
 /// that; the one consumer (`HostArtifactContent::path`) opens it while still
@@ -801,25 +801,13 @@ fn in_place_fs_addrs(
 }
 
 /// Build an [`EResult`] from produced artifacts, filtering by output group and
-/// type, and attaching `guard` (the read lock for this target's cache entry) to
-/// each kept artifact. `guard` is `None` only for a shell run or a cache-off
-/// target, whose artifacts are ephemeral and need no long-lived lock.
+/// type. The artifacts are **unguarded**: this is the memoized form, and
+/// [`guard_eresult`] attaches the read lock per caller (see [`GuardSlot`]).
 fn build_eresult(
     produced: Vec<ResultArtifact>,
     artifacts_meta: Vec<ArtifactMeta>,
     outputs: &[String],
-    guard: Option<Arc<ResultReadGuard>>,
 ) -> EResult {
-    let wrap = |content: Arc<dyn Content>| -> Arc<dyn Content> {
-        match &guard {
-            Some(lock) => Arc::new(GuardedArtifact {
-                inner: content,
-                _lock: Arc::clone(lock),
-            }),
-            None => content,
-        }
-    };
-
     // Support files are gated by the same rule the cached read path uses, so a
     // caller is handed the same set whether this revision was just built or read
     // back from the cache. Left ungated, a freshly-executed target would stage
@@ -835,11 +823,9 @@ fn build_eresult(
     let mut support_artifacts: Vec<Arc<dyn Content>> = Vec::new();
     for a in produced {
         match a.r#type {
-            ManifestArtifactType::Output if outputs.contains(&a.group) => {
-                artifacts.push(wrap(a.content))
-            }
+            ManifestArtifactType::Output if outputs.contains(&a.group) => artifacts.push(a.content),
             ManifestArtifactType::SupportFile if support_needed => {
-                support_artifacts.push(wrap(a.content))
+                support_artifacts.push(a.content)
             }
             _ => {}
         }
@@ -848,6 +834,22 @@ fn build_eresult(
         artifacts,
         support_artifacts,
         artifacts_meta,
+    }
+}
+
+/// A caller's copy of a memoized `eresult`, every artifact carrying `read` —
+/// the read lock on the revision — for as long as that artifact is alive.
+fn guard_eresult(eresult: &EResult, read: &Arc<ResultReadGuard>) -> EResult {
+    let wrap = |content: &Arc<dyn Content>| -> Arc<dyn Content> {
+        Arc::new(GuardedArtifact {
+            inner: Arc::clone(content),
+            _lock: Arc::clone(read),
+        })
+    };
+    EResult {
+        artifacts: eresult.artifacts.iter().map(wrap).collect(),
+        support_artifacts: eresult.support_artifacts.iter().map(wrap).collect(),
+        artifacts_meta: eresult.artifacts_meta.clone(),
     }
 }
 
@@ -948,11 +950,12 @@ struct ExecuteOptions<'a> {
 /// read, so two sibling computations can never both contend the non-reentrant
 /// per-addr result lock — the self-deadlock this prevents.
 pub(crate) struct LockedResolution {
-    /// The single riding read shared by all callers, pinning the cache entry for
-    /// the request lifetime. `None` only for a shell run or a cache-off target
+    /// The riding read on this revision, shared by all callers — held only
+    /// while some caller's artifacts are alive (see [`GuardSlot`]), never for
+    /// the request's lifetime. `None` only for a shell run or a cache-off target
     /// (ephemeral artifacts, no long-lived read); a forced run of a cacheable
     /// target rewrote the durable entry and rides a read like any other.
-    guard: Option<Arc<ResultReadGuard>>,
+    guard: Option<Arc<GuardSlot>>,
     /// `Some(full set)` when THIS cell produced the artifacts (cacheable execute,
     /// or the force/shell branch); [`build_eresult`] filters it to each caller's
     /// outputs. `None` on a pre-existing cache hit — callers then read only THEIR
@@ -989,6 +992,90 @@ pub(crate) struct LockedResolution {
     /// revision ("where can its bytes be fetched from"), never of what one caller
     /// asked for — see [`Engine::locate_remote_revision`].
     remote: RemoteCell,
+}
+
+/// One revision's riding read, as the per-request memoizers keep it: **weakly**.
+///
+/// A read guard protects a revision while its artifacts are in use, and only
+/// then. The memoizers holding a resolution live as long as the request, and a
+/// request can live as long as its process — a `heph run` of a server, an LSP,
+/// a daemon. A strong guard in a memoized value would pin the revision for all
+/// of that, blocking every `--force` rebuild and GC of it machine-wide long
+/// after the last artifact was dropped. So the memoized side keeps a `Weak`,
+/// and the strong guard lives only in the artifacts handed out
+/// ([`GuardedArtifact`]): the read is released when the last one drops.
+///
+/// `pin` carries the guard acquired by the resolution across the hand-off to
+/// its first holder, so there is no window between "resolved under this read"
+/// and "a caller holds it". After that, a caller finding the read released
+/// re-acquires it ([`hold`](Self::hold)) — the same shared read on the same
+/// revision. Should the revision have been deleted while nobody held it, the
+/// read finds its blobs missing, which the hit path already treats as a
+/// rebuild (reconciled against the hashouts the request already handed out).
+pub(crate) struct GuardSlot {
+    addr: Addr,
+    hashin: String,
+    pin: parking_lot::Mutex<Option<Arc<ResultReadGuard>>>,
+    weak: parking_lot::Mutex<std::sync::Weak<ResultReadGuard>>,
+}
+
+impl GuardSlot {
+    fn new(addr: &Addr, hashin: &str, read: ResultReadGuard) -> Arc<Self> {
+        let read = Arc::new(read);
+        Arc::new(Self {
+            addr: addr.clone(),
+            hashin: hashin.to_owned(),
+            weak: parking_lot::Mutex::new(Arc::downgrade(&read)),
+            pin: parking_lot::Mutex::new(Some(read)),
+        })
+    }
+
+    /// A strong read on the revision: the pinned one (taken, so the slot stops
+    /// owning it), else one some caller still holds, else a fresh acquire.
+    async fn hold(
+        &self,
+        lock: &crate::engine::result_lock::ResultLock,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<Arc<ResultReadGuard>> {
+        if let Some(read) = self.pin.lock().take() {
+            return Ok(read);
+        }
+        if let Some(read) = self.weak.lock().upgrade() {
+            return Ok(read);
+        }
+        let read = Arc::new(
+            lock.read(&self.addr, &self.hashin, ctoken)
+                .await
+                .with_context(|| format!("re-acquiring read lock for {}", self.addr))?,
+        );
+        *self.weak.lock() = Arc::downgrade(&read);
+        Ok(read)
+    }
+}
+
+/// The value a `mem_result` cell keeps: the caller-filtered result with its
+/// artifacts **unguarded**, plus how to guard them. [`claim`](Self::claim)
+/// hands each caller an [`EResult`] whose artifacts carry a strong read — so
+/// the cell itself never keeps the revision locked. See [`GuardSlot`].
+pub(crate) struct MemoResult {
+    eresult: EResult,
+    slot: Option<Arc<GuardSlot>>,
+    /// The read the computation ran under, carried to the first claimer.
+    pin: parking_lot::Mutex<Option<Arc<ResultReadGuard>>>,
+}
+
+impl MemoResult {
+    async fn claim(&self, engine: &Engine, rs: &RequestState) -> anyhow::Result<Arc<EResult>> {
+        let Some(slot) = &self.slot else {
+            return Ok(Arc::new(self.eresult.clone()));
+        };
+        let pinned = self.pin.lock().take();
+        let read = match pinned {
+            Some(read) => read,
+            None => slot.hold(engine.result_lock(), rs.ctoken()).await?,
+        };
+        Ok(Arc::new(guard_eresult(&self.eresult, &read)))
+    }
 }
 
 /// Lazily-resolved home of a hit's blobs: `Some(rev)` if a remote can still serve
@@ -1509,7 +1596,12 @@ impl Engine {
             .map_err(unwrap_arc_err);
 
         match res {
-            Ok(v) => Ok(v),
+            // The cell keeps the result unguarded; this caller's copy carries
+            // the read for as long as its artifacts live. See `GuardSlot`.
+            Ok(v) => v
+                .claim(&self, &rs)
+                .await
+                .map_err(|e| surface_top(is_top, &rs, e)),
             Err(e) => Err(surface_top(is_top, &rs, e)),
         }
     }
@@ -1544,7 +1636,7 @@ impl Engine {
     /// This does **not** make request memory `O(limit)`. `query`'s `seen` set,
     /// the `ok` batch, the `mem_result` cells and the recursive dep fan-out are
     /// all structurally `O(matched)` — and so is the peak flock-fd count, since
-    /// a read guard rides on the artifact and lives as long as the request holds
+    /// a read guard rides on the artifact and lives as long as anything holds
     /// it, so this bounds the rate of acquisition and not the count. What it
     /// bounds is live *task* state, blocking-queue depth, and waker churn.
     fn top_level_spawn_limit(max_workers: usize) -> usize {
@@ -1978,7 +2070,7 @@ impl Engine {
         outputs: OutputMatcher,
         opts: &ResultOptions,
         is_top: bool,
-    ) -> anyhow::Result<EResult> {
+    ) -> anyhow::Result<MemoResult> {
         let addr_str = addr.format();
         crate::engine::event::emit_scope(
             &rs,
@@ -2072,11 +2164,15 @@ impl Engine {
                 // Counts every resolved target across the process; the opt-out
                 // only gates whether the snapshot is sent.
                 let sizes: Vec<u64> = result
+                    .eresult
                     .artifacts
                     .iter()
                     .filter_map(|a| a.byte_size())
                     .collect();
-                htelemetry::telemetry::record_artifacts(result.artifacts.len() as u64, &sizes);
+                htelemetry::telemetry::record_artifacts(
+                    result.eresult.artifacts.len() as u64,
+                    &sizes,
+                );
 
                 Ok(result)
             },
@@ -2144,8 +2240,15 @@ impl Engine {
         def: &LinkedTargetDef,
         outputs: Vec<String>,
         opts: &ExecuteOptions<'_>,
-    ) -> anyhow::Result<EResult> {
+    ) -> anyhow::Result<MemoResult> {
         let locked = self.clone().resolve_locked(rs.clone(), def, opts).await?;
+        // This caller's riding read, held across everything below (output
+        // reads, codegen write-back) and handed to the first claimer of the
+        // result — never kept by the memoized value itself.
+        let riding = match &locked.guard {
+            Some(slot) => Some(slot.hold(self.result_lock(), rs.ctoken()).await?),
+            None => None,
+        };
         let (cached, meta): (Vec<ResultArtifact>, Vec<ArtifactMeta>) = match &locked.executed {
             // This cell produced the artifacts; filter the full set to `outputs`.
             // Already `ResultArtifact`s (cache-backed or passthrough).
@@ -2353,7 +2456,11 @@ impl Engine {
             self.clone().maybe_store_fixpoint(&rs, opts).await?;
         }
 
-        Ok(build_eresult(cached, meta, &outputs, locked.guard.clone()))
+        Ok(MemoResult {
+            eresult: build_eresult(cached, meta, &outputs),
+            slot: locked.guard.clone(),
+            pin: parking_lot::Mutex::new(riding),
+        })
     }
 
     /// Make every blob this caller reads local, and touch nothing else.
@@ -2680,7 +2787,7 @@ impl Engine {
                         .with_context(|| format!("downgrading result lock for {addr}"))?;
                     let read = self.result_lock().read(addr, hashin, ctoken).await?;
                     drop(up);
-                    Some(Arc::new(read))
+                    Some(GuardSlot::new(addr, hashin, read))
                 }
                 _ => None,
             };
@@ -2712,7 +2819,7 @@ impl Engine {
             // and hasn't got them forces the cell, and one that only needs
             // hashouts never does.
             return Ok(Arc::new(LockedResolution {
-                guard: Some(Arc::new(read)),
+                guard: Some(GuardSlot::new(addr, hashin, read)),
                 executed: None,
                 manifest: Some(manifest),
                 remote: RemoteCell::new(),
@@ -2852,7 +2959,7 @@ impl Engine {
         let read = self.result_lock().read(addr, hashin, ctoken).await?;
         drop(up);
         Ok(Arc::new(LockedResolution {
-            guard: Some(Arc::new(read)),
+            guard: Some(GuardSlot::new(addr, hashin, read)),
             executed,
             manifest,
             remote,
@@ -3323,15 +3430,12 @@ impl Engine {
                     // are due a trim, skipping uncacheable/tmp entries which are
                     // ephemeral and would be dropped anyway.
                     //
-                    // Recorded, not run: the trim needs the addr's write lock,
-                    // and this request is holding a read on it — the riding read
-                    // in `mem_locked_result`, plus a clone in every artifact
-                    // handed out — until the request state drops. Running it
-                    // here means its `try_write` can never succeed, which is
-                    // exactly how `cache.history` came to be unenforced during a
-                    // run. `RequestState::defer_trim` submits it once the guards
-                    // are gone, onto the bookkeeping lane and still
-                    // fire-and-forget.
+                    // Recorded, not run: the trim needs the target lock, and
+                    // this request is the builder holding it right here, so its
+                    // `try_lock_target` could never succeed — exactly how
+                    // `cache.history` came to be unenforced during a run.
+                    // `RequestState::defer_trim` submits it later, onto the
+                    // bookkeeping lane and still fire-and-forget.
                     if out.is_ok() && !use_tmp_cache {
                         rs.defer_trim(&addr, def.target.cache.history, hashin);
                     }

@@ -186,7 +186,7 @@ pub enum BuildEventKind {
         holder_pid: Option<u32>,
         /// With no `holder_pid`: the wait is on *readers* of the cached revision
         /// being rebuilt or deleted — another command still using that output,
-        /// which releases it when it exits. Readers are not stamped, so they can
+        /// which releases it once done with it. Readers are not stamped, so they can
         /// be detected but not named. `false` from a host that predates it.
         #[serde(default)]
         in_use_by_readers: bool,
