@@ -424,9 +424,10 @@ async fn logout() -> anyhow::Result<()> {
 
 /// Every `credential` target in the workspace (or under `matcher`).
 ///
-/// Resolves each spec, which is what makes this a preflight rather than something
-/// on a build's path. There is no "by driver" matcher in the query language and
-/// adding one for this would be a lot of surface for one command.
+/// Resolves only the specs that can be credentials: a provider that lists its
+/// targets' drivers (the buildfile and go providers do) settles every other
+/// target from the listing, so this never resolves a Go target — which would
+/// run its `_golist` — and a broken target of another driver cannot fail it.
 ///
 /// Unless `--fail-fast`, keeps going past a candidate that cannot be resolved:
 /// a broken package elsewhere in the workspace must not hide the credentials
@@ -458,15 +459,12 @@ async fn credentials_matching(
     discovery: crate::engine::Discovery,
 ) -> anyhow::Result<Vec<(Addr, CredentialDef)>> {
     use futures::TryStreamExt as _;
-    // `query_spec`, not `query` + `get_spec`: a listed candidate may not resolve
-    // standalone (go's per-platform variants), and that is not a broken target.
-    let stream = Arc::clone(engine).query_spec(rs.clone(), m, discovery);
+    // Not `query` + `get_spec`: a listed candidate may not resolve standalone
+    // (go's per-platform variants), and that is not a broken target.
+    let stream = Arc::clone(engine).query_driver(rs.clone(), m, DRIVER_NAME, discovery);
     tokio::pin!(stream);
     let mut out = Vec::new();
     while let Some(spec) = stream.try_next().await? {
-        if spec.driver != DRIVER_NAME {
-            continue;
-        }
         let addr = spec.addr.clone();
         let def = parse_declaration(&spec).with_context(|| format!("credential {addr}"))?;
         out.push((addr, def));
@@ -545,21 +543,10 @@ mod tests {
         }
     }
 
-    /// `heph auth login` walks the whole workspace for credentials, so one
-    /// listed-but-unresolvable candidate anywhere used to fail it with
-    /// `target not found`.
-    #[tokio::test]
-    async fn an_unresolvable_candidate_does_not_fail_the_credential_walk() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: root.path().join(".heph3"),
-            parallelism: None,
-            ..Default::default()
-        })?;
+    fn env_credential(addr: &str) -> pluginstatictarget::Target {
         let s = |v: &str| Value::String(v.to_string());
-        let credential = pluginstatictarget::Target {
-            addr: "//auth:token".to_string(),
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
             driver: DRIVER_NAME.to_string(),
             raw_config: [
                 (
@@ -585,28 +572,162 @@ mod tests {
             ]
             .into(),
             ..Default::default()
-        };
-        let provider = pluginstatictarget::Provider::new(vec![credential])?;
+        }
+    }
+
+    fn engine_in(root: &tempfile::TempDir) -> anyhow::Result<Engine> {
+        Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: root.path().join(".heph3"),
+            parallelism: None,
+            ..Default::default()
+        })
+    }
+
+    async fn walk(
+        engine: &Arc<Engine>,
+        gaps: &Arc<crate::engine::Gaps>,
+    ) -> anyhow::Result<Vec<String>> {
+        let creds = credentials_matching(
+            engine,
+            &engine.new_state(),
+            &Matcher::PackagePrefix(PkgBuf::from("")),
+            crate::engine::Discovery::KeepGoing(Arc::clone(gaps)),
+        )
+        .await?;
+        Ok(creds.iter().map(|(a, _)| a.format()).collect())
+    }
+
+    /// `heph auth login` walks the whole workspace for credentials, so one
+    /// listed-but-unresolvable candidate anywhere used to fail it with
+    /// `target not found`.
+    #[tokio::test]
+    async fn an_unresolvable_candidate_does_not_fail_the_credential_walk() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = engine_in(&root)?;
+        let provider = pluginstatictarget::Provider::new(vec![env_credential("//auth:token")])?;
         engine.register_provider(move |_| Box::new(provider))?;
         engine.register_provider(|_| Box::new(PhantomLister))?;
         let engine = Arc::new(engine);
 
-        let rs = engine.new_state();
         let gaps = crate::engine::Gaps::new("//...");
-        let creds = credentials_matching(
-            &engine,
-            &rs,
-            &Matcher::PackagePrefix(PkgBuf::from("")),
-            crate::engine::Discovery::KeepGoing(Arc::clone(&gaps)),
-        )
-        .await?;
-
-        let addrs: Vec<String> = creds.iter().map(|(a, _)| a.format()).collect();
-        assert_eq!(addrs, vec!["//auth:token".to_string()]);
+        assert_eq!(walk(&engine, &gaps).await?, vec!["//auth:token"]);
         assert!(
             gaps.is_empty(),
             "a candidate that was never there is not an incomplete selection"
         );
+        Ok(())
+    }
+
+    fn other_targets() -> anyhow::Result<(Vec<pluginstatictarget::Target>, Vec<Addr>)> {
+        let other = |addr: &str| pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "exec".to_string(),
+            ..Default::default()
+        };
+        let targets = vec![
+            env_credential("//auth:token"),
+            other("//app:broken"),
+            other("//app:fine"),
+        ];
+        let broken = vec![hmodel::htaddr::parse_addr("//app:broken")?];
+        Ok((targets, broken))
+    }
+
+    /// `heph auth status` used to resolve the spec of every target in the
+    /// workspace — for a Go workspace, a `_golist` per package and variant —
+    /// to find the few credentials. A target listed with another driver is
+    /// settled from the listing: never resolved, so it costs nothing and a
+    /// broken one is not a gap.
+    #[tokio::test]
+    async fn the_credential_walk_resolves_only_credentials() -> anyhow::Result<()> {
+        use crate::engine::fault_provider::{FaultProvider, Faults};
+        let root = tempfile::tempdir()?;
+        let mut engine = engine_in(&root)?;
+        let (targets, broken) = other_targets()?;
+        let provider = FaultProvider::new(
+            targets,
+            Faults {
+                fail_get: broken,
+                ..Default::default()
+            },
+        )?;
+        let gets = provider.gets();
+        engine.register_provider(move |_| Box::new(provider))?;
+        let engine = Arc::new(engine);
+
+        let gaps = crate::engine::Gaps::new("//...");
+        assert_eq!(walk(&engine, &gaps).await?, vec!["//auth:token"]);
+        assert!(gaps.is_empty(), "nothing was skipped");
+        let resolved: Vec<String> = gets.addrs().iter().map(Addr::format).collect();
+        assert_eq!(resolved, vec!["//auth:token"]);
+        Ok(())
+    }
+
+    /// Under `--fail-fast` a broken target fails the walk only if the walk has
+    /// to resolve it to know whether it is a credential.
+    #[tokio::test]
+    async fn fail_fast_fails_only_on_a_target_it_had_to_resolve() -> anyhow::Result<()> {
+        use crate::engine::fault_provider::{FaultProvider, Faults};
+        for drivers_unknown in [false, true] {
+            let root = tempfile::tempdir()?;
+            let mut engine = engine_in(&root)?;
+            let (targets, broken) = other_targets()?;
+            let provider = FaultProvider::new(
+                targets,
+                Faults {
+                    fail_get: broken,
+                    drivers_unknown,
+                    ..Default::default()
+                },
+            )?;
+            engine.register_provider(move |_| Box::new(provider))?;
+            let engine = Arc::new(engine);
+
+            let res = credentials_matching(
+                &engine,
+                &engine.new_state(),
+                &Matcher::PackagePrefix(PkgBuf::from("")),
+                crate::engine::Discovery::Complete,
+            )
+            .await;
+            assert_eq!(
+                res.is_err(),
+                drivers_unknown,
+                "drivers_unknown = {drivers_unknown}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A provider that does not list drivers (a plugin built before ABI 0.12)
+    /// is resolved candidate by candidate, as before: its credentials are still
+    /// found, and a broken target is a reported gap rather than a silent drop.
+    #[tokio::test]
+    async fn an_unlisted_driver_is_resolved_to_decide() -> anyhow::Result<()> {
+        use crate::engine::fault_provider::{FaultProvider, Faults};
+        let root = tempfile::tempdir()?;
+        let mut engine = engine_in(&root)?;
+        let (targets, broken) = other_targets()?;
+        let provider = FaultProvider::new(
+            targets,
+            Faults {
+                fail_get: broken,
+                drivers_unknown: true,
+                ..Default::default()
+            },
+        )?;
+        let gets = provider.gets();
+        engine.register_provider(move |_| Box::new(provider))?;
+        let engine = Arc::new(engine);
+
+        let gaps = crate::engine::Gaps::new("//...");
+        assert_eq!(walk(&engine, &gaps).await?, vec!["//auth:token"]);
+        assert!(!gaps.is_empty(), "the broken target is reported");
+        let mut resolved: Vec<String> = gets.addrs().iter().map(Addr::format).collect();
+        resolved.sort();
+        resolved.dedup();
+        assert_eq!(resolved, vec!["//app:broken", "//app:fine", "//auth:token"]);
         Ok(())
     }
 

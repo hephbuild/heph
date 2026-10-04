@@ -1394,7 +1394,7 @@ pub fn build_lint_gate_spec(
 
     TargetSpec {
         addr,
-        driver: "go_lint_gate".to_string(),
+        driver: crate::plugingo::drivers::LINT_GATE.to_string(),
         config,
         // The read-only checker (`lint-check`): `go-lint-check` selects it among go
         // targets, `lint-check` selects every language's checker at once
@@ -1457,7 +1457,7 @@ pub fn build_lint_fix_spec(
 
     TargetSpec {
         addr,
-        driver: "go_lint_fix".to_string(),
+        driver: crate::plugingo::drivers::LINT_FIX.to_string(),
         config,
         // The plain `lint` target is the FIXER, so it owns the plain labels:
         // `go-lint` (this language's) and `lint` (every language's), plus `fix` for

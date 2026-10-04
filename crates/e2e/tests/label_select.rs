@@ -138,7 +138,7 @@ async fn listed_labels_decide_without_resolving() -> anyhow::Result<()> {
 
 async fn mismatches(ws: &htestkit::Workspace) -> anyhow::Result<Vec<String>> {
     Ok(Arc::clone(&ws.engine)
-        .listed_label_mismatches(
+        .listing_mismatches(
             ws.engine.new_state(),
             &Matcher::PackagePrefix(heph::htpkg::PkgBuf::from("")),
             Discovery::Complete,
@@ -177,6 +177,32 @@ async fn label_lie_is_trusted_by_the_run_and_reported_by_validate() -> anyhow::R
     ] {
         assert!(found[0].contains(want), "{want} missing from: {}", found[0]);
     }
+    Ok(())
+}
+
+/// A walk for one driver's targets trusts a listed driver the way a label
+/// selector trusts listed labels, so `heph validate` reports a provider whose
+/// listed driver differs from its spec's, naming both.
+#[tokio::test]
+async fn driver_lie_is_reported_by_validate() -> anyhow::Result<()> {
+    let (ws, _) = workspace(
+        vec![bash("//a:t", &[]), bash("//a:honest", &[])],
+        Faults {
+            name: Some("liar"),
+            listed_drivers: vec![(parse_addr("//a:t")?, "credential".to_string())],
+            ..Default::default()
+        },
+    )?;
+
+    let found = mismatches(&ws).await?;
+    assert_eq!(
+        found,
+        vec![
+            "provider `liar` lists //a:t with driver `credential`, but its spec has `bash`. \
+             Provider `liar` must list exactly the driver its `get` returns"
+                .to_string()
+        ]
+    );
     Ok(())
 }
 

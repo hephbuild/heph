@@ -44,6 +44,10 @@ message ListResponse {
   // neither field, which must read as "unknown", never as "no labels".
   repeated string labels = 2;
   bool labels_known = 3;
+  // The driver `get` will give this target, when the provider knows it at list
+  // time. Empty is "unknown" — no driver is named "" — which is also what an
+  // old plugin that never sets it sends.
+  string driver = 4;
 }
 
 message ListPackagesRequest {

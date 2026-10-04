@@ -21,6 +21,13 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.12.0: `ListResponse` gained `string driver` — the driver `get` will give
+/// the target, so a walk that wants one driver's targets (`heph auth status`
+/// finding the `credential`s) drops every other candidate unresolved instead
+/// of resolving the whole workspace. Additive and cold-path like 0.11: an old
+/// plugin's absent field decodes as `""`, which the host reads as "unknown"
+/// and resolves the spec exactly as before.
+///
 /// 0.11.0: `ListResponse` gained `repeated string labels` and `bool
 /// labels_known` — the labels `get` will give the target, so a label selector
 /// decides membership from the listing instead of resolving every candidate's
@@ -96,7 +103,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.11.0";
+pub const ABI_SEMVER: &str = "0.12.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

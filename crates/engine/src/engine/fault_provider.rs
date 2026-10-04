@@ -70,6 +70,12 @@ pub struct Faults {
     /// Labels its `list` reports for these static targets instead of their
     /// real ones: a listing that lies about what `get` will return.
     pub listed_labels: Vec<(Addr, Vec<String>)>,
+    /// `list` reports no driver, like a plugin built before ABI 0.12, so a
+    /// walk for one driver resolves every candidate's spec to decide.
+    pub drivers_unknown: bool,
+    /// The driver its `list` reports for these static targets instead of
+    /// their real one.
+    pub listed_drivers: Vec<(Addr, String)>,
     /// Targets it lists with these labels and that `get` says do not exist:
     /// go listing `test` in a package that turns out to have no tests.
     pub vanished: Vec<(Addr, Vec<String>)>,
@@ -246,11 +252,26 @@ impl Provider for FaultProvider {
                 .filter(|res| !matches!(res, Ok(t) if self.faults.unlisted.contains(&t.addr)))
                 .map(|res| {
                     res.map(|t| {
-                        match self.faults.listed_labels.iter().find(|(a, _)| *a == t.addr) {
-                            Some((_, lie)) => ListResponse::with_labels(t.addr, lie.as_slice()),
-                            None if self.faults.labels_unknown => ListResponse::addr_only(t.addr),
-                            None => t,
-                        }
+                        let driver = match self
+                            .faults
+                            .listed_drivers
+                            .iter()
+                            .find(|(a, _)| *a == t.addr)
+                        {
+                            Some((_, lie)) => Some(Arc::from(lie.as_str())),
+                            None if self.faults.drivers_unknown => None,
+                            None => t.driver.clone(),
+                        };
+                        let mut listed =
+                            match self.faults.listed_labels.iter().find(|(a, _)| *a == t.addr) {
+                                Some((_, lie)) => ListResponse::with_labels(t.addr, lie.as_slice()),
+                                None if self.faults.labels_unknown => {
+                                    ListResponse::addr_only(t.addr)
+                                }
+                                None => t,
+                            };
+                        listed.driver = driver;
+                        listed
                     })
                 })
                 .collect();

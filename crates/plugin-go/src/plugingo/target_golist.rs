@@ -198,7 +198,7 @@ fn build_spec_inner(
 
     Ok(TargetSpec {
         addr,
-        driver: "go_golist".to_string(),
+        driver: crate::plugingo::drivers::GOLIST.to_string(),
         config,
         ..Default::default()
     })

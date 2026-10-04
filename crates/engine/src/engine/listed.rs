@@ -1,11 +1,13 @@
-//! `heph validate`'s check that every provider lists the labels its specs
-//! carry.
+//! `heph validate`'s check that every provider lists the labels and driver its
+//! specs carry.
 //!
 //! A label selector trusts a provider's listing: it decides membership from
 //! the labels `list` reported and never resolves a candidate to second-guess
 //! them. So a provider that lists labels `get` does not return selects the
-//! wrong targets, silently. Nothing on the build path checks — that is the
-//! point of trusting the listing — so this is where it is held to its specs.
+//! wrong targets, silently. A walk for one driver's targets (`heph auth`
+//! finding the `credential`s) trusts a listed driver the same way. Nothing on
+//! the build path checks — that is the point of trusting the listing — so this
+//! is where it is held to its specs.
 
 use crate::engine::Engine;
 use crate::engine::discovery::{Discovery, Stage, is_cancellation, provider_of};
@@ -68,6 +70,51 @@ impl fmt::Display for ListedLabelsMismatch {
 
 impl std::error::Error for ListedLabelsMismatch {}
 
+/// A provider listed a target with a driver its resolved spec does not have.
+#[derive(Debug, Clone)]
+pub struct ListedDriverMismatch {
+    pub addr: Addr,
+    /// The provider whose `list` made the claim, and whose `get` resolved it.
+    pub listed_by: String,
+    pub listed: String,
+    pub resolved: String,
+}
+
+impl fmt::Display for ListedDriverMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "provider `{}` lists {} with driver `{}`, but its spec has `{}`. \
+             Provider `{}` must list exactly the driver its `get` returns",
+            self.listed_by,
+            self.addr.format(),
+            self.listed,
+            self.resolved,
+            self.listed_by,
+        )
+    }
+}
+
+impl std::error::Error for ListedDriverMismatch {}
+
+/// What a provider's listing claimed that its spec contradicts.
+#[derive(Debug, Clone)]
+pub enum ListingMismatch {
+    Labels(ListedLabelsMismatch),
+    Driver(ListedDriverMismatch),
+}
+
+impl fmt::Display for ListingMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Labels(m) => m.fmt(f),
+            Self::Driver(m) => m.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ListingMismatch {}
+
 /// Labels in `a` and not in `b`. Both are short.
 fn difference<'a>(a: &'a [String], b: &[String]) -> Vec<&'a str> {
     a.iter()
@@ -84,20 +131,20 @@ fn normalized(labels: &[String]) -> Vec<String> {
 }
 
 impl Engine {
-    /// Every target in scope of `m` whose provider listed labels that differ
-    /// from its resolved spec's.
+    /// Every target in scope of `m` whose provider listed labels or a driver
+    /// that differ from its resolved spec's.
     ///
     /// Lists each package `m` can reach, as the selector walk does, and
-    /// resolves the spec of every candidate listed with labels. A candidate
-    /// the lister's own `get` declines is not its target and has no labels to
-    /// get wrong. Under [`Discovery::KeepGoing`] a package or candidate that
+    /// resolves the spec of every candidate listed with labels or a driver. A
+    /// candidate the lister's own `get` declines is not its target and has
+    /// nothing to get wrong. Under [`Discovery::KeepGoing`] a package or candidate that
     /// cannot be read is recorded and skipped, like the other checks' walks.
-    pub async fn listed_label_mismatches(
+    pub async fn listing_mismatches(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         m: &Matcher,
         discovery: Discovery,
-    ) -> anyhow::Result<Vec<ListedLabelsMismatch>> {
+    ) -> anyhow::Result<Vec<ListingMismatch>> {
         let gaps = discovery.gaps().cloned();
         let pkgs: Vec<String> = self
             .packages(m, &rs)
@@ -135,7 +182,7 @@ impl Engine {
         rs: &Arc<RequestState>,
         m: &Matcher,
         pkg: &PkgBuf,
-    ) -> anyhow::Result<Vec<ListedLabelsMismatch>> {
+    ) -> anyhow::Result<Vec<ListingMismatch>> {
         let states = Arc::clone(&self).probe_segments(rs, pkg).await?;
         let executor: Arc<dyn hplugin::provider::ProviderExecutor> =
             Arc::new(crate::engine::result::EngineProviderExecutor::for_list(
@@ -179,13 +226,21 @@ impl Engine {
                 candidates.push(Candidate {
                     addr: item.addr,
                     labels: item.labels,
+                    driver: item.driver,
                 });
             }
         }
 
         let mut out = Vec::new();
-        for Candidate { addr, labels } in merge_listings(candidates) {
-            let Some(labels) = labels else { continue };
+        for Candidate {
+            addr,
+            labels,
+            driver,
+        } in merge_listings(candidates)
+        {
+            if labels.is_none() && driver.is_none() {
+                continue;
+            }
             let spec = Arc::clone(&self).get_spec(Arc::clone(rs), &addr).await;
             let Some(spec) = skip_unresolvable(&addr, spec)? else {
                 continue;
@@ -200,15 +255,27 @@ impl Engine {
             if spec.provider != listed_by {
                 continue;
             }
-            let listed = normalized(&labels);
-            let resolved = normalized(&spec.labels);
-            if resolved != listed {
-                out.push(ListedLabelsMismatch {
+            if let Some(listed) = driver
+                && *listed != *spec.driver
+            {
+                out.push(ListingMismatch::Driver(ListedDriverMismatch {
                     listed_by: listed_by.to_string(),
-                    addr,
-                    listed,
-                    resolved,
-                });
+                    addr: addr.clone(),
+                    listed: listed.to_string(),
+                    resolved: spec.driver.clone(),
+                }));
+            }
+            if let Some(labels) = labels {
+                let listed = normalized(&labels);
+                let resolved = normalized(&spec.labels);
+                if resolved != listed {
+                    out.push(ListingMismatch::Labels(ListedLabelsMismatch {
+                        listed_by: listed_by.to_string(),
+                        addr,
+                        listed,
+                        resolved,
+                    }));
+                }
             }
         }
         Ok(out)

@@ -3,6 +3,7 @@ use crate::plugingo::addr_util::{
     encode_thirdparty_download,
 };
 use crate::plugingo::cc_toolchain;
+use crate::plugingo::drivers;
 use crate::plugingo::errors::NoGoFilesError;
 use crate::plugingo::factors::{self, Factors, VariantRef, current_goarch, current_goos};
 use crate::plugingo::gocache;
@@ -1066,21 +1067,49 @@ impl ProviderInner {
             // handful of distinct sets across every name and variant: build each
             // once and share it.
             let mut sets: Vec<(&'static [&'static str], Arc<[String]>)> = Vec::new();
+            // Drivers likewise, so a walk for one driver's targets (`heph auth`
+            // finding the `credential`s) drops every Go target unresolved.
+            // First-party only — see `drivers::listed`. The test runner's driver
+            // follows the package's `pre_run`, read from the same states `get`
+            // reads it from.
+            let first_party = matches!(&*kind, GoPackageKind::FirstParty { .. });
+            let test_pre_run = (first_party
+                && addrs.iter().any(|a| drivers::is_test_runner(&a.name)))
+            .then(|| pick_test_env(&req.states, req.package.as_str()).ok())
+            .flatten()
+            .map(|env| !env.pre_run.is_empty());
+            // A handful of distinct drivers across every name: one `Arc` each.
+            let mut driver_arcs: Vec<(&'static str, Arc<str>)> = Vec::new();
             let responses: Vec<anyhow::Result<ListResponse>> = addrs
                 .into_iter()
                 .map(|addr| {
-                    let Some(set) = labels::listed(&addr.name) else {
-                        return Ok(ListResponse::addr_only(addr));
-                    };
-                    let shared = match sets.iter().find(|(s, _)| *s == set) {
-                        Some((_, shared)) => Arc::clone(shared),
-                        None => {
-                            let shared: Arc<[String]> = labels::owned(set).into();
-                            sets.push((set, Arc::clone(&shared)));
-                            shared
+                    let driver = first_party
+                        .then(|| drivers::listed(&addr, test_pre_run))
+                        .flatten()
+                        .map(|d| match driver_arcs.iter().find(|(s, _)| *s == d) {
+                            Some((_, shared)) => Arc::clone(shared),
+                            None => {
+                                let shared: Arc<str> = Arc::from(d);
+                                driver_arcs.push((d, Arc::clone(&shared)));
+                                shared
+                            }
+                        });
+                    let mut listed = match labels::listed(&addr.name) {
+                        None => ListResponse::addr_only(addr),
+                        Some(set) => {
+                            let shared = match sets.iter().find(|(s, _)| *s == set) {
+                                Some((_, shared)) => Arc::clone(shared),
+                                None => {
+                                    let shared: Arc<[String]> = labels::owned(set).into();
+                                    sets.push((set, Arc::clone(&shared)));
+                                    shared
+                                }
+                            };
+                            ListResponse::with_labels(addr, shared)
                         }
                     };
-                    Ok(ListResponse::with_labels(addr, shared))
+                    listed.driver = driver;
+                    Ok(listed)
                 })
                 .collect();
             Ok(Box::new(responses.into_iter())
@@ -1310,7 +1339,7 @@ fn magic_build_group_spec(addr: Addr, target: &Addr) -> hplugin::provider::Targe
     )]);
     hplugin::provider::TargetSpec {
         addr,
-        driver: hbuiltins::plugingroup::DRIVER_NAME.to_string(),
+        driver: crate::plugingo::drivers::HOST_BUILD.to_string(),
         config,
         ..Default::default()
     }

@@ -23,30 +23,34 @@ struct PackageScan {
     skipped: Vec<Skip>,
 }
 
-/// One listed target, with what its provider said about its labels.
+/// One listed target, with what its provider said about its labels and driver.
 pub(crate) struct Candidate {
     pub(crate) addr: Addr,
     pub(crate) labels: Option<Arc<[String]>>,
+    pub(crate) driver: Option<Arc<str>>,
 }
 
-/// The labels the walk matches a listed addr against: one set when every
-/// provider that listed it agrees, `None` (unknown — the spec decides) when
-/// they differ or any of them does not know.
+/// The labels and driver the walk matches a listed addr against: each one
+/// value when every provider that listed it agrees, `None` (unknown — the spec
+/// decides) when they differ or any of them does not know.
 ///
 /// Two providers can list one addr and only one of them resolve it: go lists
 /// a bare `build` in every package and declines it in a library, where a BUILD
 /// file may define its own. First-listing-wins would match against go's set
-/// and silently miss the BUILD target's labels.
+/// and silently miss the BUILD target's labels, or drop it for go's driver.
 pub(crate) fn merge_listings(candidates: Vec<Candidate>) -> Vec<Candidate> {
     let mut at: FxHashMap<Addr, usize> = FxHashMap::default();
     let mut merged: Vec<Candidate> = Vec::with_capacity(candidates.len());
     for c in candidates {
         match at.get(&c.addr) {
             Some(&i) => {
-                if let Some(first) = merged.get_mut(i)
-                    && first.labels.as_deref() != c.labels.as_deref()
-                {
-                    first.labels = None;
+                if let Some(first) = merged.get_mut(i) {
+                    if first.labels.as_deref() != c.labels.as_deref() {
+                        first.labels = None;
+                    }
+                    if first.driver != c.driver {
+                        first.driver = None;
+                    }
                 }
             }
             None => {
@@ -108,6 +112,21 @@ impl Engine {
         m: &'a htmatcher::Matcher,
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+        self.query_listed(rs, m, None, discovery)
+    }
+
+    /// [`Engine::query`], and with `driver` also dropping every candidate a
+    /// provider listed with another driver — unresolved, the way a listed
+    /// label decides. A candidate listed with no driver is still yielded: the
+    /// caller resolves it and checks, which is what [`Engine::query_driver`]
+    /// does.
+    fn query_listed<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        driver: Option<&'a str>,
+        discovery: Discovery,
+    ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         let uses_labels = mentions_label(m);
         // A whole-graph selector (`//...` — a `PackagePrefix` rooted at the empty
         // package) enumerates every target, so its final match count is the total
@@ -116,7 +135,9 @@ impl Engine {
         // incomplete stream never saw the full graph. Centralized here so every
         // whole-graph caller (query, unscoped validate) is covered without
         // per-command code.
-        let whole_graph = matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
+        // A driver-filtered walk sees one driver's targets, not the graph.
+        let whole_graph =
+            driver.is_none() && matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
         async_stream::try_stream! {
             let gaps = discovery.gaps().cloned();
             let keep_going = gaps.is_some();
@@ -299,6 +320,7 @@ impl Engine {
                                 scan.candidates.push(Candidate {
                                     addr: item.addr,
                                     labels: item.labels,
+                                    driver: item.driver,
                                 });
                             }
                         }
@@ -379,13 +401,20 @@ impl Engine {
                 }
                 // Every provider's listing of a package is in this one scan, so
                 // this is where they are reconciled. Not worth an `Addr` clone
-                // per candidate when the matcher never reads a label.
-                let candidates = if uses_labels {
+                // per candidate when the walk never reads a label or driver.
+                let candidates = if uses_labels || driver.is_some() {
                     merge_listings(scan.candidates)
                 } else {
                     scan.candidates
                 };
-                for Candidate { addr, labels } in candidates {
+                for Candidate { addr, labels, driver: listed_driver } in candidates {
+                    // Trusted like a listed label: a candidate listed with
+                    // another driver is never resolved to second-guess it.
+                    if let (Some(want), Some(listed)) = (driver, listed_driver.as_deref())
+                        && want != listed
+                    {
+                        continue;
+                    }
                     // The provider's listing is trusted: a listed label decides
                     // here, and the spec is never resolved to second-guess it.
                     let labels = labels.filter(|_| uses_labels);
@@ -522,6 +551,36 @@ impl Engine {
         m: &'a htmatcher::Matcher,
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Arc<EngineTargetSpec>>> + 'a {
+        self.query_spec_listed(rs, m, None, discovery)
+    }
+
+    /// The spec of every target matching `m` whose driver is `driver`.
+    ///
+    /// Only the candidates that could be one are resolved: a provider that
+    /// lists a candidate's driver (`ListResponse::driver`) settles it from the
+    /// listing, so a walk for the workspace's few `credential`s never resolves
+    /// — never runs `_golist` for — the thousands of go targets beside them,
+    /// and a broken target of any other driver cannot fail it. A candidate
+    /// listed without a driver is resolved and checked, as before. `heph
+    /// validate` holds a provider's listed drivers to its specs.
+    pub fn query_driver<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        driver: &'a str,
+        discovery: Discovery,
+    ) -> impl Stream<Item = anyhow::Result<Arc<EngineTargetSpec>>> + 'a {
+        self.query_spec_listed(rs, m, Some(driver), discovery)
+            .try_filter(move |spec| std::future::ready(spec.driver == driver))
+    }
+
+    fn query_spec_listed<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        driver: Option<&'a str>,
+        discovery: Discovery,
+    ) -> impl Stream<Item = anyhow::Result<Arc<EngineTargetSpec>>> + 'a {
         // Cap in-flight spec resolutions; the engine's own semaphores gate the
         // real work, this just bounds the orchestration set held off the stream.
         let concurrency = std::thread::available_parallelism()
@@ -531,7 +590,7 @@ impl Engine {
         let gaps = discovery.gaps().cloned();
 
         Arc::clone(&self)
-            .query(rs.clone(), m, discovery)
+            .query_listed(rs.clone(), m, driver, discovery)
             .map_ok(move |addr| {
                 enclose!((self => engine, rs, gaps) async move {
                     match skip_unresolvable(&addr, engine.get_spec(rs.clone(), &addr).await) {
@@ -776,6 +835,34 @@ mod tests {
         let addrs: Vec<String> = specs.iter().map(|s| s.addr.format()).collect();
         assert_eq!(addrs, vec!["//foo:a".to_string()]);
         Ok(())
+    }
+
+    /// An addr's driver is decided from its listings only when every provider
+    /// that listed it names the same one. Any disagreement or "unknown" makes it
+    /// unknown, and a later agreeing listing does not bring it back — otherwise
+    /// go's `build` (`group`) would decide a BUILD file's `build` of another
+    /// driver, and a walk for that driver would drop it unresolved.
+    #[test]
+    fn merge_listings_keeps_a_driver_only_when_every_listing_agrees() {
+        let a = Addr::new(PkgBuf::from("p"), "t".to_string(), Default::default());
+        let listing = |driver: Option<&str>| Candidate {
+            addr: a.clone(),
+            labels: None,
+            driver: driver.map(Arc::from),
+        };
+        let cases: [(&[Option<&str>], Option<&str>); 6] = [
+            (&[Some("bash")], Some("bash")),
+            (&[Some("bash"), Some("bash")], Some("bash")),
+            (&[Some("bash"), Some("group")], None),
+            (&[Some("bash"), None], None),
+            (&[None, Some("bash")], None),
+            (&[Some("bash"), Some("group"), Some("bash")], None),
+        ];
+        for (listings, want) in cases {
+            let merged = merge_listings(listings.iter().map(|d| listing(*d)).collect());
+            assert_eq!(merged.len(), 1, "{listings:?}");
+            assert_eq!(merged[0].driver.as_deref(), want, "{listings:?}");
+        }
     }
 
     #[tokio::test]

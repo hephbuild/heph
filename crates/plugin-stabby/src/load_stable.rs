@@ -247,11 +247,15 @@ fn decode_list_item(b: &[u8]) -> anyhow::Result<ListResponse> {
     // A plugin older than ABI 0.11 sends neither field; prost reads that as
     // `labels_known == false`, which must stay "unknown" — an empty `Some`
     // would drop the target from every label selection.
-    Ok(if lr.labels_known {
+    let listed = if lr.labels_known {
         ListResponse::with_labels(addr, lr.labels)
     } else {
         ListResponse::addr_only(addr)
-    })
+    };
+    // Likewise a plugin older than 0.12 sends no driver, which prost reads as
+    // `""` — "unknown" (`with_driver` keeps an empty name unset), never a
+    // driver no target has.
+    Ok(listed.with_driver(lr.driver))
 }
 
 fn decode_list_package_item(b: &[u8]) -> anyhow::Result<ListPackageResponse> {
@@ -1019,8 +1023,33 @@ mod tests {
             }),
             labels: labels.iter().map(|l| (*l).to_string()).collect(),
             labels_known,
+            driver: String::new(),
         }
         .encode_to_vec()
+    }
+
+    /// A plugin built before ABI 0.12 never sets `driver`: its listing must
+    /// decode as "driver unknown", or a walk selecting by driver would drop
+    /// every one of its targets unresolved.
+    #[test]
+    fn old_plugin_without_driver_shrugs() {
+        let decode = |b: &[u8]| decode_list_item(b).expect("decoding a ListResponse");
+        let with = |driver: &str| pb::ListResponse {
+            addr: Some(pb::Addr {
+                package: "p".into(),
+                name: "t".into(),
+                args: Default::default(),
+            }),
+            driver: driver.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(decode(&with("").encode_to_vec()).driver, None);
+        assert_eq!(
+            decode(&with("credential").encode_to_vec())
+                .driver
+                .as_deref(),
+            Some("credential")
+        );
     }
 
     /// A plugin built before ABI 0.11 never sets `labels_known`: its listing

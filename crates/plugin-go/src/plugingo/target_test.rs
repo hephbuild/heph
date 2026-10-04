@@ -261,7 +261,7 @@ pub fn build_test_spec(
 
     TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: crate::plugingo::drivers::LINK.to_string(),
         config,
         ..Default::default()
     }
@@ -290,19 +290,19 @@ pub fn test_spec(
     // (engine/driver_managed_os.rs:78). The `test` target is a sibling of
     // `build_test` in the same package, so its `test_binary` output lands next
     // to us and `./test_binary` resolves regardless of package depth.
-    let (driver, run) = if test_env.pre_run.is_empty() {
+    let driver = crate::plugingo::drivers::test_runner(!test_env.pre_run.is_empty());
+    let run = if test_env.pre_run.is_empty() {
         // exec driver passes argv literally — no shell expansion.
-        let run = Value::List(vec![
+        Value::List(vec![
             Value::String("./test_binary".to_string()),
             Value::String("-test.v".to_string()),
-        ]);
-        ("exec", run)
+        ])
     } else {
         // bash driver: each list element is one shell line, joined with `\n`.
         // Run the user's `pre_run` lines first, then the test binary.
         let mut lines: Vec<String> = test_env.pre_run.clone();
         lines.push("./test_binary -test.v".to_string());
-        ("bash", to_run_value(lines))
+        to_run_value(lines)
     };
 
     let deps_map: HashMap<String, Value> = HashMap::from([

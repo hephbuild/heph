@@ -233,6 +233,17 @@ impl Default for Provider {
 }
 
 impl Provider {
+    /// The driver a target declaring `declared` resolves to: its own, else the
+    /// provider's `defaultDriver`. One function, because `list` reports it and
+    /// a walk for one driver trusts that report over `get`.
+    fn driver_of<'a>(&'a self, declared: &'a str) -> Option<&'a str> {
+        if declared.is_empty() {
+            self.default_driver.as_deref()
+        } else {
+            Some(declared)
+        }
+    }
+
     pub fn new(root: std::path::PathBuf, runtime: tokio::runtime::Handle) -> Self {
         Self {
             root,
@@ -525,16 +536,32 @@ impl EProvider for Provider {
             }
             let res = self.run_pkg(req.package.as_str()).await?;
 
+            // A package names a few drivers across all its targets: one `Arc`
+            // each.
+            let mut driver_arcs: Vec<(&str, Arc<str>)> = Vec::new();
             let items: Vec<anyhow::Result<ListResponse>> = res
                 .targets
                 .iter()
-                // The package is already evaluated, so the labels `get` will
-                // return (`p.labels`, below) cost nothing to report here.
+                // The package is already evaluated, so the labels and driver
+                // `get` will return cost nothing to report here.
                 .map(|p| {
-                    Ok(ListResponse::with_labels(
+                    let mut listed = ListResponse::with_labels(
                         Addr::new(req.package.clone(), p.name.clone(), Default::default()),
                         p.labels.as_slice(),
-                    ))
+                    );
+                    // With no driver to name, `get` fails, so the driver stays
+                    // unknown and the walk resolves it to report that.
+                    listed.driver = self.driver_of(&p.driver).map(|d| {
+                        match driver_arcs.iter().find(|(s, _)| *s == d) {
+                            Some((_, shared)) => Arc::clone(shared),
+                            None => {
+                                let shared: Arc<str> = Arc::from(d);
+                                driver_arcs.push((d, Arc::clone(&shared)));
+                                shared
+                            }
+                        }
+                    });
+                    Ok(listed)
                 })
                 .collect();
 
@@ -604,16 +631,15 @@ impl EProvider for Provider {
 
             for p in res.targets.iter() {
                 if p.name == req.addr.name {
-                    let driver = if p.driver.is_empty() {
-                        self.default_driver.clone().ok_or_else(|| {
+                    let driver = self
+                        .driver_of(&p.driver)
+                        .ok_or_else(|| {
                             GetError::Other(anyhow::anyhow!(
                                 "target {} has no driver and no defaultDriver is configured for the buildfile provider",
                                 req.addr.format()
                             ))
                         })?
-                    } else {
-                        p.driver.clone()
-                    };
+                        .to_string();
                     return Ok(GetResponse {
                         target_spec: TargetSpec {
                             addr: req.addr.clone(),
@@ -1112,6 +1138,66 @@ mod tests {
             .expect("must error");
         let msg = format!("{err:?}");
         assert!(msg.contains("no driver"), "{msg}");
+    }
+
+    /// `list` reports the driver `get` resolves — a target's own, else
+    /// `defaultDriver` — and nothing when `get` has none to give, so a walk for
+    /// one driver resolves that target and reports the error instead of
+    /// dropping it.
+    #[tokio::test]
+    async fn list_reports_the_driver_get_resolves() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_path = tmp_dir.path().join("p");
+        fs::create_dir_all(&pkg_path).unwrap();
+        fs::write(
+            pkg_path.join("BUILD"),
+            r#"
+target(name = "own", driver = "bash")
+target(name = "defaulted")
+"#,
+        )
+        .unwrap();
+        let ctoken = StdCancellationToken::new();
+
+        for default_driver in [Some("exec"), None] {
+            let provider = Provider {
+                root: tmp_dir.path().to_path_buf(),
+                default_driver: default_driver.map(str::to_string),
+                ..Provider::default()
+            };
+            let listed: Vec<(String, Option<String>)> = provider
+                .list(
+                    ListRequest {
+                        request_id: "test".to_string(),
+                        package: PkgBuf::from("p"),
+                        states: vec![],
+                        executor: Arc::new(NoopExecutor),
+                    },
+                    &ctoken,
+                )
+                .await
+                .expect("list")
+                .map(|r| {
+                    let r = r.expect("listed");
+                    (r.addr.name.clone(), r.driver.as_deref().map(str::to_string))
+                })
+                .collect();
+            assert_eq!(
+                listed,
+                vec![
+                    ("own".to_string(), Some("bash".to_string())),
+                    ("defaulted".to_string(), default_driver.map(str::to_string)),
+                ],
+                "defaultDriver = {default_driver:?}"
+            );
+            for (name, driver) in listed {
+                let got = provider.get(get_req("p", &name), &ctoken).await;
+                match driver {
+                    Some(d) => assert_eq!(got.expect("get").target_spec.driver, d),
+                    None => assert!(got.is_err(), "{name}: listed no driver, so `get` fails"),
+                }
+            }
+        }
     }
 
     #[tokio::test]

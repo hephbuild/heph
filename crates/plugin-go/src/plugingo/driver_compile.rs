@@ -1066,7 +1066,7 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
 
     TargetSpec {
         addr: p.addr,
-        driver: "go_compile".to_string(),
+        driver: crate::plugingo::drivers::COMPILE.to_string(),
         config,
         labels: labels::owned(labels::BUILD),
         ..Default::default()

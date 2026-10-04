@@ -5,6 +5,7 @@ mod driver_format;
 mod driver_golist;
 mod driver_lint;
 mod driver_testmain;
+mod drivers;
 mod embed;
 pub(crate) mod errors;
 mod factors;

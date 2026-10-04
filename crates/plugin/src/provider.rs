@@ -40,12 +40,21 @@ pub struct ListResponse {
     /// the spec to decide, as it always did. `Some` is a contract — the engine
     /// fails the run if the resolved spec's labels differ.
     pub labels: Option<Arc<[String]>>,
+    /// The driver `get` will give this target, if the provider knows it
+    /// without resolving it. Same contract as `labels`: `None` is "unknown",
+    /// `Some` is exactly the resolved spec's driver — a walk selecting by
+    /// driver drops a candidate listed with another one unresolved.
+    pub driver: Option<Arc<str>>,
 }
 
 impl ListResponse {
-    /// A listing that says nothing about labels.
+    /// A listing that says nothing about labels or driver.
     pub fn addr_only(addr: Addr) -> Self {
-        Self { addr, labels: None }
+        Self {
+            addr,
+            labels: None,
+            driver: None,
+        }
     }
 
     /// A listing whose labels are known: exactly what `get` will return.
@@ -53,7 +62,18 @@ impl ListResponse {
         Self {
             addr,
             labels: Some(labels.into()),
+            driver: None,
         }
+    }
+
+    /// This listing, with the driver `get` will return. An empty name is no
+    /// driver, so it stays "unknown" — as it reads once it crosses the plugin
+    /// ABI, where `""` is the absent field.
+    #[must_use]
+    pub fn with_driver(mut self, driver: impl Into<Arc<str>>) -> Self {
+        let driver = driver.into();
+        self.driver = (!driver.is_empty()).then_some(driver);
+        self
     }
 }
 

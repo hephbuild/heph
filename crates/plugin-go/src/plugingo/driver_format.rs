@@ -530,7 +530,7 @@ pub fn build_format_spec(p: FormatParams) -> TargetSpec {
     );
     TargetSpec {
         addr: p.addr,
-        driver: "go_format".to_string(),
+        driver: crate::plugingo::drivers::FORMAT.to_string(),
         config,
         // The plain `format` target is the FIXER (it rewrites sources), so it owns
         // the plain labels — `go-format` + `format` — plus `fix`. Checking without
@@ -548,7 +548,7 @@ pub fn build_format_check_spec(p: FormatParams) -> TargetSpec {
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     TargetSpec {
         addr: p.addr,
-        driver: "go_format_check".to_string(),
+        driver: crate::plugingo::drivers::FORMAT_CHECK.to_string(),
         config,
         // The read-only checker (`format-check`): `go-format-check` among go
         // targets, `format-check` across every language.

@@ -21,7 +21,7 @@ use hplugin::driver::{
 use hplugin::hook::Hook;
 use hplugin::provider::{
     ConfigRequest, FnArgs, FnCallContext, GetError, GetRequest, ListPackagesRequest, ListRequest,
-    ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
+    ListResponse, ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
     ProviderFunctionRegistry,
 };
 use hplugin_stabby::abi::{
@@ -494,19 +494,25 @@ async fn provider_list_stream(
         executor,
     };
     match provider.list(lreq, &tok).await {
-        Ok(iter) => make_item_stream(frame_iter(iter, |lr| {
-            pb::ListResponse {
-                addr: Some(convert::addr_to_pb(&lr.addr)),
-                labels_known: lr.labels.is_some(),
-                labels: lr
-                    .labels
-                    .as_deref()
-                    .map(<[String]>::to_vec)
-                    .unwrap_or_default(),
-            }
-            .encode_to_vec()
-        })),
+        Ok(iter) => make_item_stream(frame_iter(iter, |lr| list_item_to_pb(&lr).encode_to_vec())),
         Err(e) => error_item_stream(err_message(&e)),
+    }
+}
+
+/// One listed target on the wire. What the host learns here is all it can
+/// settle a candidate from without resolving it: drop the labels or driver and
+/// every selection on them falls back to resolving each spec — correct, and
+/// as slow as it was before they were listed.
+fn list_item_to_pb(lr: &ListResponse) -> pb::ListResponse {
+    pb::ListResponse {
+        addr: Some(convert::addr_to_pb(&lr.addr)),
+        labels_known: lr.labels.is_some(),
+        labels: lr
+            .labels
+            .as_deref()
+            .map(<[String]>::to_vec)
+            .unwrap_or_default(),
+        driver: lr.driver.as_deref().unwrap_or_default().to_string(),
     }
 }
 
@@ -1570,6 +1576,35 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::io::Write as _;
+
+    /// A listing's driver and labels reach the wire, and "unknown" stays
+    /// distinguishable from known-and-empty. Lose the driver here and `heph
+    /// auth` silently resolves every spec in the workspace again — slow, but
+    /// with every other test still green.
+    #[test]
+    fn a_listing_carries_its_driver_and_labels_onto_the_wire() {
+        let addr = || {
+            convert::addr_from_pb(pb::Addr {
+                package: "p".into(),
+                name: "t".into(),
+                args: Default::default(),
+            })
+        };
+
+        let unknown = list_item_to_pb(&ListResponse::addr_only(addr()));
+        assert_eq!(unknown.driver, "");
+        assert!(!unknown.labels_known);
+
+        let known = list_item_to_pb(
+            &ListResponse::with_labels(addr(), vec!["a".to_string()]).with_driver("credential"),
+        );
+        assert_eq!(known.driver, "credential");
+        assert!(known.labels_known);
+        assert_eq!(known.labels, vec!["a".to_string()]);
+
+        let no_labels = list_item_to_pb(&ListResponse::with_labels(addr(), Vec::<String>::new()));
+        assert!(no_labels.labels_known, "known and empty is not unknown");
+    }
 
     // A managed input's content is readable from the files the host materialized
     // under unpack_root, scoped to this input's files via the list file.

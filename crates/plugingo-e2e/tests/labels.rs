@@ -12,23 +12,40 @@ use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use std::collections::BTreeSet;
 
-// The go provider reports each target's labels from `list`, and a label
-// selector trusts that listing without resolving the spec. So every listed
-// label set must be exactly what `get` returns — which is `heph validate`'s
-// label check, run here over fixtures that between them carry lint/format (a
-// golangci config), a binary, internal tests and external (`_test` package)
-// tests, so every name in the go provider's label table is compared.
+// The go provider reports each target's labels and driver from `list`, and a
+// label selector (or `heph auth`'s walk for `credential`s) trusts that listing
+// without resolving the spec. So every listed label set and driver must be
+// exactly what `get` returns — which is `heph validate`'s listing check, run
+// here over fixtures that between them carry lint/format (a golangci config), a
+// binary, internal tests and external (`_test` package) tests, and a package
+// whose tests have `pre_run` lines (a `bash` runner rather than `exec`), so
+// every name in the go provider's label and driver tables is compared.
 #[tokio::test]
-async fn go_list_labels_equal_spec_labels() -> anyhow::Result<()> {
+async fn go_list_labels_and_drivers_equal_spec() -> anyhow::Result<()> {
     require_go!();
     let all = Matcher::PackagePrefix(PkgBuf::from(""));
     let mut names = BTreeSet::new();
-    for name in ["with_dep", "race", "xtest"] {
-        let ws = make_workspace(fixture(name)?)?;
+    let mut drivers = BTreeSet::new();
+    // The second field is the package, if any, whose tests get `pre_run` lines.
+    for (name, pre_run) in [
+        ("with_dep", None),
+        ("race", None),
+        ("race", Some("racy")),
+        ("xtest", None),
+        ("xtest", Some("lib")),
+    ] {
+        let dir = fixture(name)?;
+        if let Some(pkg) = pre_run {
+            std::fs::write(
+                dir.path().join(pkg).join("BUILD"),
+                r#"provider_state(provider = "go", test = {"pre_run": ["true"]})"#,
+            )?;
+        }
+        let ws = make_workspace(dir)?;
         let mismatches = ws
             .engine
             .clone()
-            .listed_label_mismatches(
+            .listing_mismatches(
                 ws.engine.new_state(),
                 &all,
                 heph::engine::Discovery::Complete,
@@ -51,10 +68,28 @@ async fn go_list_labels_equal_spec_labels() -> anyhow::Result<()> {
         let rs = ws.engine.new_state();
         for addr in addrs {
             let spec = ws.engine.clone().get_spec(rs.clone(), &addr).await;
-            if heph::engine::query::skip_unresolvable(&addr, spec)?.is_some() {
+            if let Some(spec) = heph::engine::query::skip_unresolvable(&addr, spec)? {
                 names.insert(addr.name.clone());
+                drivers.insert((addr.name.clone(), spec.driver.clone()));
             }
         }
+    }
+
+    // Not vacuous: each driver that depends on more than the name — the bare
+    // host `build` vs a variant's link, and `pre_run` turning the test runner
+    // from `exec` into `bash` — was resolved both ways.
+    for (name, driver) in [
+        ("build", "group"),
+        ("build", "bash"),
+        ("xtest", "exec"),
+        ("xtest", "bash"),
+        ("test_race", "exec"),
+        ("test_race", "bash"),
+    ] {
+        assert!(
+            drivers.contains(&(name.to_string(), driver.to_string())),
+            "{name} never resolved to `{driver}`: {drivers:?}"
+        );
     }
 
     // Not vacuous: every family the go provider lists was resolved and checked.
@@ -122,13 +157,30 @@ async fn buildfile_target_shadowing_a_go_listing_is_selected_by_its_own_labels()
     let mismatches = ws
         .engine
         .clone()
-        .listed_label_mismatches(
+        .listing_mismatches(
             ws.engine.new_state(),
             &Matcher::PackagePrefix(PkgBuf::from("")),
             heph::engine::Discovery::Complete,
         )
         .await?;
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+
+    // Same for the driver: go lists the bare `build` as its host `group`, the
+    // BUILD file's is `bash`. A walk for `bash` targets must not take go's word
+    // for it and drop the BUILD target unresolved.
+    let bash: Vec<String> = ws
+        .engine
+        .clone()
+        .query_driver(
+            ws.engine.new_state(),
+            &Matcher::PackagePrefix(PkgBuf::from("lib")),
+            "bash",
+            heph::engine::Discovery::Complete,
+        )
+        .map_ok(|s| s.addr.format())
+        .try_collect()
+        .await?;
+    assert!(bash.contains(&"//lib:build".to_string()), "{bash:?}");
     Ok(())
 }
 

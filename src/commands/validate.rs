@@ -166,10 +166,11 @@ impl App for ValidateApp {
             }
             .await;
 
-            // 4. Every provider lists the labels its specs carry. A label
-            //    selector trusts the listing and never checks it; this does.
-            let labels_res = Arc::clone(&engine)
-                .listed_label_mismatches(rs.clone(), &matcher, discovery.clone())
+            // 4. Every provider lists the labels and driver its specs carry. A
+            //    label or driver selection trusts the listing and never checks
+            //    it; this does.
+            let listing_res = Arc::clone(&engine)
+                .listing_mismatches(rs.clone(), &matcher, discovery.clone())
                 .await
                 .map(|mismatches| mismatches.iter().map(ToString::to_string).collect());
 
@@ -199,7 +200,7 @@ impl App for ValidateApp {
                 link_res.map(|()| Vec::new()),
                 overlap_res,
                 gitignore_res,
-                labels_res,
+                listing_res,
             ])?;
 
             // Success prints nothing; only the scoped-skip warning is emitted.
