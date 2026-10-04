@@ -131,21 +131,34 @@ in one direction and a permanent full-miss in the other.
 
 **Never run the whole test suite locally — not `tst`, not `cargo test --workspace`, whatever the change.** CI runs it on every push, on all three platforms; a local run only delays the push. That holds for engine-core, trait and caching changes too: a wide break shows up in CI.
 
-Spot-run the tests of the crates you touched instead — each crate the diff changes, plus the `crates/e2e` / `crates/plugingo-e2e` test files that exercise the change:
+Spot-run the tests of the crates the change touched, and of the crates it could have broken:
+
+- **Touched:** every crate the diff changes.
+- **Could have broken:** the crates that depend on a touched crate *and* rely on what changed — its public API, a trait's contract, a type's semantics, a default. A change that only moves code inside a function breaks nothing downstream; a changed `Provider`/`Driver` contract can break every provider and driver crate. List the direct dependents, then keep the ones that use the changed item:
+
+  ```bash
+  cargo tree --workspace -i <crate> -e normal,dev --depth 1 --prefix none   # who depends on <crate>
+  rg -l '<changed_item>' crates src                                       # which of them use it
+  ```
+
+  Compile breakage in a dependent already shows in `lint` (clippy over the whole workspace, every target). The test run is for *behavior*: a dependent that still compiles but now does the wrong thing.
+- **The end-to-end layer:** the `crates/e2e` / `crates/plugingo-e2e` test files that exercise the change. An engine-semantics change is covered there, not in the crate.
+
+When that set is most of the workspace — a change in `core` or `model` reaches nearly every crate — keep the dependents that exercise the changed behavior and leave the rest to CI. That is still never the whole suite.
 
 ```bash
-cargo test -p <crate>                     # a touched crate
+cargo test -p <crate> -p <dependent>      # touched and possibly-broken crates
 cargo test -p e2e --test <file>           # the e2e file covering the change
 cargo test -p <crate> <test_name>         # one test while iterating
 ```
 
 1. Make the change, with tests.
-2. Run `lint` and the touched crates' tests.
+2. Run `lint` and the tests of the touched and possibly-broken crates.
 3. Commit, push, open the PR — if the change depends on an unmerged PR, stack it (see below). CI takes it from there.
 
 The same applies to subsequent pushes on an open PR: push the fix and let CI run the suite.
 
-**With a review board running, sequence the fixes.** Fix a finding straight away only in code no pending reviewer covers; hold the rest until the slowest reviewer reports, then fix them together. Run `lint` and the touched crates' tests **once**, on the SHA you push. A run before the board, or before its last report, is invalidated by every later fix: one session ran the tests twice and still pushed a commit neither run covered, and rewrote one function three times for three reviewers.
+**With a review board running, sequence the fixes.** Fix a finding straight away only in code no pending reviewer covers; hold the rest until the slowest reviewer reports, then fix them together. Run `lint` and the tests of the touched and possibly-broken crates **once**, on the SHA you push. A run before the board, or before its last report, is invalidated by every later fix: one session ran the tests twice and still pushed a commit neither run covered, and rewrote one function three times for three reviewers.
 
 A `PreToolUse` hook (`.claude/hooks/gate`, a Go program run with `go run`; tests are `go test` there) enforces this for agents:
 - `tst` or `e2e` anywhere in a command is refused. `HEPH_FULL_SUITE=1` lifts the refusal. An agent uses it only for a spot run of `crates/bin-e2e` scoped to one file (`HEPH_FULL_SUITE=1 e2e --test <file>`) when the change touches what it covers (see `e2e` above) — never on `tst`, and never on a bare `e2e`.
