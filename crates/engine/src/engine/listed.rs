@@ -1,159 +1,49 @@
-//! What each provider's `list` said about a target's labels, held per request
-//! so the spec it later resolves to can be checked against it.
+//! `heph validate`'s check that every provider lists the labels its specs
+//! carry.
 //!
-//! A label selector decides membership from these listings without resolving
-//! the candidates. That makes a listing a promise: a provider that lists
-//! labels `get` does not return would silently select the wrong targets.
-//!
-//! The check runs on every *read* of a listed addr's spec
-//! (`Engine::get_spec_no_track`), not once inside the memoized resolve: a spec
-//! resolved before its listing was recorded — as the dependency of a target
-//! already building — is still compared the next time anything reads it,
-//! which includes the walk confirming a listed match. So a listed "yes" that
-//! is wrong always fails the run, whatever the scheduling.
-//!
-//! Accepted exemption: a listed "no" that is wrong is never resolved by the
-//! selection, so it is caught only if something else reads that spec in the
-//! same request. That is the whole point of the listing — not resolving the
-//! rejects — and `go_list_labels_equal_spec_labels` holds the go provider to
-//! its table instead.
-//!
-//! Only what the walk actually matched against is recorded: when providers
-//! list the same addr with different sets, or one of them does not know, the
-//! walk treats its labels as unknown and resolves it (see `Engine::select`),
-//! and nothing is recorded for it.
+//! A label selector trusts a provider's listing: it decides membership from
+//! the labels `list` reported and never resolves a candidate to second-guess
+//! them. So a provider that lists labels `get` does not return selects the
+//! wrong targets, silently. Nothing on the build path checks — that is the
+//! point of trusting the listing — so this is where it is held to its specs.
 
+use crate::engine::Engine;
+use crate::engine::discovery::{Discovery, Stage, is_cancellation, provider_of};
+use crate::engine::provider::ListRequest;
+use crate::engine::query::{Candidate, merge_listings, skip_unresolvable};
+use crate::engine::request_state::RequestState;
+use futures::StreamExt;
 use hmodel::htaddr::Addr;
-use parking_lot::Mutex;
-use rustc_hash::{FxHashMap, FxHashSet};
+use hmodel::htmatcher::{MatchResult, Matcher};
+use hmodel::htpkg::PkgBuf;
+use rustc_hash::FxHashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// One provider's listing of one addr.
-#[derive(Debug, Clone)]
-struct Listing {
-    /// Index into the engine's provider list — the name is only needed to
-    /// report a mismatch.
-    provider: usize,
-    /// Sorted and deduplicated, so the check compares sets.
-    labels: Arc<[String]>,
-}
-
-#[derive(Debug, Default)]
-struct Inner {
-    by_addr: FxHashMap<Addr, Listing>,
-    /// Every distinct label set seen this request. A Go workspace lists ~10
-    /// targets per package over a handful of distinct sets; one copy each.
-    interned: FxHashSet<Arc<[String]>>,
-}
-
-/// Per-request record of listed labels. See the module docs.
-#[derive(Debug, Default)]
-pub(crate) struct ListedLabels {
-    /// Set once anything is recorded. Every spec read checks it first, so a
-    /// request that never selected by label — `//...`, a single addr — pays an
-    /// atomic load per read and never the lock.
-    any: AtomicBool,
-    inner: Mutex<Inner>,
-}
-
-impl ListedLabels {
-    /// Record that `provider` listed `addr` with `labels`, and return the
-    /// normalized set the walk should match against.
-    ///
-    /// The walk merges every provider's listing of an addr before calling
-    /// this, so one addr is recorded with one set. Should another walk on the
-    /// same request record it again, the first set stands — the same package
-    /// lists the same way within a request.
-    pub(crate) fn record(&self, addr: &Addr, provider: usize, labels: &[String]) -> Arc<[String]> {
-        // Before the entry, so any read ordered after this call returns sees
-        // the flag set and takes the lock that publishes the entry. A read
-        // racing the call may miss both, and needs neither: nothing selected
-        // on this listing yet.
-        self.any.store(true, Ordering::Release);
-        let mut inner = self.inner.lock();
-        if let Some(listing) = inner.by_addr.get(addr) {
-            return Arc::clone(&listing.labels);
-        }
-        let labels = intern(&mut inner.interned, labels);
-        inner.by_addr.insert(
-            addr.clone(),
-            Listing {
-                provider,
-                labels: Arc::clone(&labels),
-            },
-        );
-        labels
-    }
-
-    /// The listing `spec_labels` must agree with, if `addr` was listed with
-    /// labels and they differ: `(listing provider index, listed set)`.
-    pub(crate) fn contradiction(
-        &self,
-        addr: &Addr,
-        spec_labels: &[String],
-    ) -> Option<(usize, Arc<[String]>)> {
-        if !self.any.load(Ordering::Acquire) {
-            return None;
-        }
-        let inner = self.inner.lock();
-        let listing = inner.by_addr.get(addr)?;
-        let resolved = normalized(spec_labels);
-        (*listing.labels != *resolved).then(|| (listing.provider, Arc::clone(&listing.labels)))
-    }
-}
-
-fn normalized(labels: &[String]) -> std::borrow::Cow<'_, [String]> {
-    if labels.is_sorted_by(|a, b| a < b) {
-        return std::borrow::Cow::Borrowed(labels);
-    }
-    let mut owned = labels.to_vec();
-    owned.sort_unstable();
-    owned.dedup();
-    std::borrow::Cow::Owned(owned)
-}
-
-fn intern(set: &mut FxHashSet<Arc<[String]>>, labels: &[String]) -> Arc<[String]> {
-    let labels = normalized(labels);
-    if let Some(shared) = set.get(&*labels) {
-        return Arc::clone(shared);
-    }
-    let shared: Arc<[String]> = labels.into_owned().into();
-    set.insert(Arc::clone(&shared));
-    shared
-}
 
 /// A provider listed a target with labels its resolved spec does not carry.
-///
-/// Fatal rather than a warning: a label selection already acted on the
-/// listing, so the selected set is wrong in a way no later step corrects.
 #[derive(Debug, Clone)]
 pub struct ListedLabelsMismatch {
     pub addr: Addr,
-    /// The provider whose `list` made the claim.
+    /// The provider whose `list` made the claim, and whose `get` resolved it.
     pub listed_by: String,
-    /// The provider whose `get` produced the spec, when it is a different one.
-    pub resolved_by: Option<String>,
+    /// Sorted, deduplicated.
     pub listed: Vec<String>,
+    /// Sorted, deduplicated.
     pub resolved: Vec<String>,
 }
 
 impl fmt::Display for ListedLabelsMismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let addr = self.addr.format();
         write!(
             f,
-            "label selection is unreliable for {addr}: provider `{}` listed it with labels [{}], but its spec",
+            "provider `{}` lists {} with labels [{}], but its spec has [{}]",
             self.listed_by,
+            self.addr.format(),
             self.listed.join(", "),
+            self.resolved.join(", "),
         )?;
-        if let Some(other) = &self.resolved_by {
-            write!(f, " (from provider `{other}`)")?;
-        }
-        write!(f, " has [{}]", self.resolved.join(", "))?;
-        let only_listed: Vec<&str> = difference(&self.listed, &self.resolved);
-        let only_resolved: Vec<&str> = difference(&self.resolved, &self.listed);
+        let only_listed = difference(&self.listed, &self.resolved);
+        let only_resolved = difference(&self.resolved, &self.listed);
         if !only_listed.is_empty() {
             write!(
                 f,
@@ -176,7 +66,9 @@ impl fmt::Display for ListedLabelsMismatch {
     }
 }
 
-/// Labels in `a` and not in `b`. Both are short and sorted.
+impl std::error::Error for ListedLabelsMismatch {}
+
+/// Labels in `a` and not in `b`. Both are short.
 fn difference<'a>(a: &'a [String], b: &[String]) -> Vec<&'a str> {
     a.iter()
         .filter(|l| !b.contains(l))
@@ -184,36 +76,141 @@ fn difference<'a>(a: &'a [String], b: &[String]) -> Vec<&'a str> {
         .collect()
 }
 
-impl std::error::Error for ListedLabelsMismatch {}
+fn normalized(labels: &[String]) -> Vec<String> {
+    let mut out = labels.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hmodel::htpkg::PkgBuf;
+impl Engine {
+    /// Every target in scope of `m` whose provider listed labels that differ
+    /// from its resolved spec's.
+    ///
+    /// Lists each package `m` can reach, as the selector walk does, and
+    /// resolves the spec of every candidate listed with labels. A candidate
+    /// the lister's own `get` declines is not its target and has no labels to
+    /// get wrong. Under [`Discovery::KeepGoing`] a package or candidate that
+    /// cannot be read is recorded and skipped, like the other checks' walks.
+    pub async fn listed_label_mismatches(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &Matcher,
+        discovery: Discovery,
+    ) -> anyhow::Result<Vec<ListedLabelsMismatch>> {
+        let gaps = discovery.gaps().cloned();
+        let pkgs: Vec<String> = self
+            .packages(m, &rs)
+            .await?
+            .collect::<anyhow::Result<_>>()?;
+        let per_pkg = futures::stream::iter(pkgs)
+            .map(|pkg| {
+                let engine = Arc::clone(&self);
+                let rs = Arc::clone(&rs);
+                let gaps = gaps.clone();
+                async move {
+                    let pkg = PkgBuf::from(pkg);
+                    let res = Arc::clone(&engine).package_mismatches(&rs, m, &pkg).await;
+                    match (res, &gaps) {
+                        (Err(e), Some(gaps)) if !is_cancellation(&rs, &e) => {
+                            gaps.record(Stage::List, provider_of(&e), format!("//{pkg}"), &e);
+                            Ok(Vec::new())
+                        }
+                        (res, _) => res,
+                    }
+                }
+            })
+            .buffered(crate::engine::fanout::discovery_concurrency());
+        futures::pin_mut!(per_pkg);
 
-    fn s(v: &[&str]) -> Vec<String> {
-        v.iter().map(|l| (*l).to_string()).collect()
+        let mut out = Vec::new();
+        while let Some(found) = per_pkg.next().await {
+            out.extend(found?);
+        }
+        Ok(out)
     }
 
-    #[test]
-    fn listed_labels_compare_as_sets_and_intern() {
-        let listed = ListedLabels::default();
-        let a = Addr::new(PkgBuf::from("p"), "a".into(), Default::default());
-        let b = Addr::new(PkgBuf::from("p"), "b".into(), Default::default());
+    async fn package_mismatches(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        m: &Matcher,
+        pkg: &PkgBuf,
+    ) -> anyhow::Result<Vec<ListedLabelsMismatch>> {
+        let states = Arc::clone(&self).probe_segments(rs, pkg).await?;
+        let executor: Arc<dyn hplugin::provider::ProviderExecutor> =
+            Arc::new(crate::engine::result::EngineProviderExecutor::for_list(
+                Arc::downgrade(&self),
+                Arc::clone(rs),
+            ));
 
-        let la = listed.record(&a, 0, &s(&["y", "x", "x"]));
-        let lb = listed.record(&b, 0, &s(&["x", "y"]));
-        assert_eq!(&*la, &s(&["x", "y"])[..]);
-        assert!(Arc::ptr_eq(&la, &lb), "one copy per distinct set");
+        // Every listing in the package, in provider order, then reconciled the
+        // way the selector walk does (`merge_listings`): only an addr whose
+        // listings all carry the same set is decided from it — anything else is
+        // resolved by the walk, so it has no listing to hold to its spec. Go's
+        // bare `build`, listed in a library where a BUILD file defines its own,
+        // is one: two providers, two sets, the spec decides.
+        let mut candidates: Vec<Candidate> = Vec::new();
+        let mut listed_by: FxHashMap<Addr, &str> = FxHashMap::default();
+        for provider in &self.providers {
+            let items = provider
+                .provider
+                .list(
+                    ListRequest {
+                        request_id: rs.request_id().to_string(),
+                        package: pkg.clone(),
+                        states: states
+                            .iter()
+                            .filter(|s| s.provider == provider.name)
+                            .cloned()
+                            .collect(),
+                        executor: Arc::clone(&executor),
+                    },
+                    rs.ctoken(),
+                )
+                .await?;
+            for item in items {
+                let item = item?;
+                if item.addr.package != *pkg || m.matches_addr(&item.addr) == MatchResult::MatchNo {
+                    continue;
+                }
+                listed_by
+                    .entry(item.addr.clone())
+                    .or_insert(provider.name.as_str());
+                candidates.push(Candidate {
+                    addr: item.addr,
+                    labels: item.labels,
+                });
+            }
+        }
 
-        assert!(listed.contradiction(&a, &s(&["y", "x"])).is_none());
-        assert!(listed.contradiction(&a, &s(&["x"])).is_some());
-        assert!(listed.contradiction(&a, &s(&["x", "y", "z"])).is_some());
-        // An unlisted addr is never contradicted.
-        let c = Addr::new(PkgBuf::from("p"), "c".into(), Default::default());
-        assert!(listed.contradiction(&c, &s(&["anything"])).is_none());
-        // The first listing wins.
-        listed.record(&a, 1, &s(&["z"]));
-        assert!(listed.contradiction(&a, &s(&["x", "y"])).is_none());
+        let mut out = Vec::new();
+        for Candidate { addr, labels } in merge_listings(candidates) {
+            let Some(labels) = labels else { continue };
+            let spec = Arc::clone(&self).get_spec(Arc::clone(rs), &addr).await;
+            let Some(spec) = skip_unresolvable(&addr, spec)? else {
+                continue;
+            };
+            // A listing is a claim about the lister's own target. One its own
+            // `get` declines is a candidate that is not there, from its side —
+            // like go's `test` in a package with no tests — even when another
+            // provider resolves the same addr (the buildfile provider matches a
+            // target name whatever its args, so it answers go's `build@v=host`
+            // in a library with the BUILD file's `build`).
+            let listed_by = listed_by.get(&addr).copied().unwrap_or_default();
+            if spec.provider != listed_by {
+                continue;
+            }
+            let listed = normalized(&labels);
+            let resolved = normalized(&spec.labels);
+            if resolved != listed {
+                out.push(ListedLabelsMismatch {
+                    listed_by: listed_by.to_string(),
+                    addr,
+                    listed,
+                    resolved,
+                });
+            }
+        }
+        Ok(out)
     }
 }

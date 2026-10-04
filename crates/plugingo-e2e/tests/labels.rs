@@ -13,36 +13,48 @@ use heph::htpkg::PkgBuf;
 use std::collections::BTreeSet;
 
 // The go provider reports each target's labels from `list`, and a label
-// selector trusts that listing to decide membership without resolving the
-// spec. So every listed label set must be exactly what `get` returns.
-//
-// `label(x) || !label(x)` matches every candidate on its listing, and a `query`
-// still resolves each listed match — where the engine compares the listed set
-// against the resolved spec and fails the walk on any difference. Between them
-// the fixtures carry lint/format (a golangci config), a binary, internal tests
-// and external (`_test` package) tests, so every name in the go provider's
-// label table is covered.
+// selector trusts that listing without resolving the spec. So every listed
+// label set must be exactly what `get` returns — which is `heph validate`'s
+// label check, run here over fixtures that between them carry lint/format (a
+// golangci config), a binary, internal tests and external (`_test` package)
+// tests, so every name in the go provider's label table is compared.
 #[tokio::test]
 async fn go_list_labels_equal_spec_labels() -> anyhow::Result<()> {
     require_go!();
-    let any = Matcher::Or(vec![
-        Matcher::Label("go-build".to_string()),
-        Matcher::Not(Box::new(Matcher::Label("go-build".to_string()))),
-    ]);
+    let all = Matcher::PackagePrefix(PkgBuf::from(""));
     let mut names = BTreeSet::new();
     for name in ["with_dep", "race", "xtest"] {
         let ws = make_workspace(fixture(name)?)?;
+        let mismatches = ws
+            .engine
+            .clone()
+            .listed_label_mismatches(
+                ws.engine.new_state(),
+                &all,
+                heph::engine::Discovery::Complete,
+            )
+            .await?;
+        assert!(mismatches.is_empty(), "{name}: {mismatches:#?}");
+
+        // Not vacuous: collect the names that really resolve, which are the
+        // ones the check compared.
         let addrs: Vec<Addr> = ws
             .engine
             .clone()
             .query(
                 ws.engine.new_state(),
-                &any,
+                &all,
                 heph::engine::Discovery::Complete,
             )
             .try_collect()
             .await?;
-        names.extend(addrs.iter().map(|a| a.name.clone()));
+        let rs = ws.engine.new_state();
+        for addr in addrs {
+            let spec = ws.engine.clone().get_spec(rs.clone(), &addr).await;
+            if heph::engine::query::skip_unresolvable(&addr, spec)?.is_some() {
+                names.insert(addr.name.clone());
+            }
+        }
     }
 
     // Not vacuous: every family the go provider lists was resolved and checked.
@@ -105,6 +117,18 @@ async fn buildfile_target_shadowing_a_go_listing_is_selected_by_its_own_labels()
         )
         .await?;
     assert_eq!(batch.ok.len(), 1, "{:?}", batch.errors);
+
+    // Nor is go's listing a lie for validate to report: the walk never trusted it.
+    let mismatches = ws
+        .engine
+        .clone()
+        .listed_label_mismatches(
+            ws.engine.new_state(),
+            &Matcher::PackagePrefix(PkgBuf::from("")),
+            heph::engine::Discovery::Complete,
+        )
+        .await?;
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
     Ok(())
 }
 

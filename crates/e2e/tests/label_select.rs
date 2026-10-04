@@ -102,9 +102,8 @@ fn got(gets: &GetLog) -> Vec<String> {
     gets.addrs().iter().map(Addr::format).collect()
 }
 
-/// Candidates whose listed labels cannot match never reach `get`, through
-/// either walk: `query` (which still resolves a listed match, to keep its
-/// every-addr-exists contract) and `result`.
+/// The listing decides: `query` resolves no candidate at all, and `result`
+/// resolves only the match it is about to build.
 #[tokio::test]
 async fn listed_label_query_resolves_no_spec_for_non_matches() -> anyhow::Result<()> {
     let (ws, gets) = workspace(
@@ -123,7 +122,7 @@ async fn listed_label_query_resolves_no_spec_for_non_matches() -> anyhow::Result
         .try_collect()
         .await?;
     assert_eq!(addrs, vec![parse_addr("//a:yes")?]);
-    assert_eq!(got(&gets), vec!["//a:yes"], "only the match was resolved");
+    assert!(got(&gets).is_empty(), "query resolved {:?}", got(&gets));
 
     let (res, events) = run(&ws, &label("x"), &ResultOptions::default()).await;
     res?;
@@ -136,60 +135,68 @@ async fn listed_label_query_resolves_no_spec_for_non_matches() -> anyhow::Result
     Ok(())
 }
 
-/// A listing that claims labels its spec does not have fails the run, naming
-/// the provider, the target and both sets — in `result` (where the match is
-/// confirmed in parallel), in `query` (on the serial arm), and under
-/// keep-going, where it is not a skip to carry on past.
+async fn mismatches(ws: &htestkit::Workspace) -> anyhow::Result<Vec<String>> {
+    Ok(Arc::clone(&ws.engine)
+        .listed_label_mismatches(
+            ws.engine.new_state(),
+            &Matcher::PackagePrefix(heph::htpkg::PkgBuf::from("")),
+            Discovery::Complete,
+        )
+        .await?
+        .iter()
+        .map(ToString::to_string)
+        .collect())
+}
+
+/// The run trusts a provider's listing, wrong or not; `heph validate`'s check
+/// is what reports a listing that differs from its spec, naming the provider,
+/// the target and the labels that differ.
 #[tokio::test]
-async fn label_lie_is_an_error_naming_the_provider() -> anyhow::Result<()> {
-    let faults = || -> anyhow::Result<Faults> {
-        Ok(Faults {
+async fn label_lie_is_trusted_by_the_run_and_reported_by_validate() -> anyhow::Result<()> {
+    let (ws, _) = workspace(
+        vec![bash("//a:t", &["y"]), bash("//a:honest", &["x"])],
+        Faults {
             name: Some("liar"),
             listed_labels: vec![(parse_addr("//a:t")?, strings(&["x"]))],
             ..Default::default()
-        })
-    };
-    let targets = || vec![bash("//a:t", &["y"]), bash("//a:honest", &["x"])];
-    let assert_names_everything = |e: &anyhow::Error| {
-        let msg = format!("{e:#}");
-        for want in [
-            "Provider `liar` must list exactly the labels its `get` returns",
-            "//a:t",
-            "listed but not in the spec: x",
-            "in the spec but not listed: y",
-        ] {
-            assert!(msg.contains(want), "{want} missing from: {msg}");
-        }
-    };
+        },
+    )?;
 
-    let (ws, _) = workspace(targets(), faults()?)?;
-    let (res, _) = run(&ws, &label("x"), &ResultOptions::default()).await;
-    let err = res.err().expect("a lying listing must fail the run");
-    assert_names_everything(&err);
+    let (res, events) = run(&ws, &label("x"), &ResultOptions::default()).await;
+    res?;
+    assert_eq!(built(&events), vec!["//a:honest", "//a:t"]);
 
-    let (ws, _) = workspace(targets(), faults()?)?;
-    let err = Arc::clone(&ws.engine)
-        .query(ws.engine.new_state(), &label("x"), Discovery::Complete)
-        .try_collect::<Vec<Addr>>()
-        .await
-        .expect_err("query too");
-    assert_names_everything(&err);
-
-    let (ws, _) = workspace(targets(), faults()?)?;
-    let gaps = Gaps::new("label(x)");
-    let opts = ResultOptions {
-        discovery: Discovery::KeepGoing(gaps.clone()),
-        ..Default::default()
-    };
-    let (res, _) = run(&ws, &label("x"), &opts).await;
-    let err = res.err().expect("keep-going does not skip a lie");
-    assert_names_everything(&err);
+    let found = mismatches(&ws).await?;
+    assert_eq!(found.len(), 1, "{found:?}");
+    for want in [
+        "provider `liar` lists //a:t with labels [x], but its spec has [y]",
+        "listed but not in the spec: x",
+        "in the spec but not listed: y",
+        "Provider `liar` must list exactly the labels its `get` returns",
+    ] {
+        assert!(found[0].contains(want), "{want} missing from: {}", found[0]);
+    }
     Ok(())
 }
 
-/// A provider may list a target it cannot resolve. Selected on its listed
-/// labels, it is dropped: not built, not an error, and never announced, so
-/// the matched denominator counts only what will run.
+/// Honest listings, phantoms included, report nothing: a candidate that does
+/// not resolve has no labels to get wrong.
+#[tokio::test]
+async fn honest_listings_report_no_mismatch() -> anyhow::Result<()> {
+    let (ws, _) = workspace(
+        vec![bash("//a:x", &["x"]), bash("//a:none", &[])],
+        Faults {
+            vanished: vec![(parse_addr("//a:ghost")?, strings(&["x"]))],
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(mismatches(&ws).await?, Vec::<String>::new());
+    Ok(())
+}
+
+/// A provider may list a target it cannot resolve. `query` trusts the listing
+/// and yields it, like any candidate; `result` drops it before announcing it:
+/// not built, not an error, and not in the matched denominator.
 #[tokio::test]
 async fn listed_match_not_found_is_dropped() -> anyhow::Result<()> {
     let (ws, _) = workspace(
@@ -210,7 +217,10 @@ async fn listed_match_not_found_is_dropped() -> anyhow::Result<()> {
         .query(ws.engine.new_state(), &label("x"), Discovery::Complete)
         .try_collect()
         .await?;
-    assert_eq!(addrs, vec![parse_addr("//a:real")?]);
+    assert_eq!(
+        addrs,
+        vec![parse_addr("//a:ghost")?, parse_addr("//a:real")?]
+    );
     Ok(())
 }
 
@@ -331,45 +341,11 @@ async fn negated_label_drops_phantoms() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A spec resolved before its listing was recorded — here, read directly on
-/// the same request, as a dependency of a target already building would be —
-/// is still held to the listing when the selection reads it.
-#[tokio::test]
-async fn label_lie_is_caught_when_the_spec_resolved_first() -> anyhow::Result<()> {
-    let liar = parse_addr("//a:t")?;
-    let (ws, _) = workspace(
-        vec![bash("//a:t", &["y"])],
-        Faults {
-            name: Some("liar"),
-            listed_labels: vec![(liar.clone(), strings(&["x"]))],
-            ..Default::default()
-        },
-    )?;
-    let rs = ws.engine.new_state_with_fail_fast(false);
-    Arc::clone(&ws.engine).get_spec(rs.clone(), &liar).await?;
-
-    let res = Arc::clone(&ws.engine)
-        .result(
-            rs,
-            &label("x"),
-            OutputMatcher::All,
-            &ResultOptions::default(),
-        )
-        .await;
-    let err = res
-        .err()
-        .expect("the earlier resolve must not exempt the spec");
-    assert!(
-        format!("{err:#}").contains("Provider `liar` must list"),
-        "{err:#}"
-    );
-    Ok(())
-}
-
 /// Two providers list one addr, and only the second resolves it. Their sets
 /// differ, so the walk does not trust either and the spec decides: the target
-/// is selected by its real labels. One provider listing a set and another
-/// resolving the addr with a different one is a lie, and the error names both.
+/// is selected by its real labels. Validate holds a listing only to its own
+/// provider's spec, so neither shape is a mismatch: the first provider's
+/// candidate is one its own `get` declines.
 #[tokio::test]
 async fn providers_listing_one_addr_differently_let_the_spec_decide() -> anyhow::Result<()> {
     let x = parse_addr("//p:x")?;
@@ -408,12 +384,9 @@ async fn providers_listing_one_addr_differently_let_the_spec_decide() -> anyhow:
     let (res, events) = run(&ws, &label("a"), &ResultOptions::default()).await;
     res?;
     assert!(built(&events).is_empty(), "{events:?}");
+    assert_eq!(mismatches(&ws).await?, Vec::<String>::new());
 
     let ws = two(false)?;
-    let (res, _) = run(&ws, &label("a"), &ResultOptions::default()).await;
-    let msg = format!("{:#}", res.err().expect("only `first` listed it"));
-    for want in ["provider `first` listed it", "(from provider `second`)"] {
-        assert!(msg.contains(want), "{want} missing from: {msg}");
-    }
+    assert_eq!(mismatches(&ws).await?, Vec::<String>::new());
     Ok(())
 }

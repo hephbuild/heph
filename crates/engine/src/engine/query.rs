@@ -1,7 +1,6 @@
 use crate::engine::Engine;
 use crate::engine::discovery::{Discovery, Gaps, Stage, is_cancellation, provider_of};
 use crate::engine::error::{CancelledError, CycleError, TargetNotFoundError};
-use crate::engine::listed::ListedLabelsMismatch;
 use crate::engine::packages::merge_packages;
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
@@ -25,32 +24,9 @@ struct PackageScan {
 }
 
 /// One listed target, with what its provider said about its labels.
-struct Candidate {
-    addr: Addr,
-    /// Index of the listing provider in `Engine::providers`.
-    provider: usize,
-    labels: Option<Arc<[String]>>,
-}
-
-/// A target the walk selected.
-#[derive(Debug)]
-pub(crate) struct Selected {
+pub(crate) struct Candidate {
     pub(crate) addr: Addr,
-    /// Selected on its listed labels alone: nothing has resolved its spec, so
-    /// it may not exist (a provider can list more than it can resolve). Only a
-    /// [`ListedMatch::Trust`] walk yields one.
-    pub(crate) unconfirmed: bool,
-}
-
-/// What a walk does with a candidate whose listed labels match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ListedMatch {
-    /// Resolve it on the walk's serial arm before yielding it, so every
-    /// yielded addr exists.
-    Confirm,
-    /// Yield it unresolved, as [`Selected::unconfirmed`]; the caller resolves
-    /// it. See [`Engine::select`].
-    Trust,
+    pub(crate) labels: Option<Arc<[String]>>,
 }
 
 /// The labels the walk matches a listed addr against: one set when every
@@ -61,7 +37,7 @@ pub(crate) enum ListedMatch {
 /// a bare `build` in every package and declines it in a library, where a BUILD
 /// file may define its own. First-listing-wins would match against go's set
 /// and silently miss the BUILD target's labels.
-fn merge_listings(candidates: Vec<Candidate>) -> Vec<Candidate> {
+pub(crate) fn merge_listings(candidates: Vec<Candidate>) -> Vec<Candidate> {
     let mut at: FxHashMap<Addr, usize> = FxHashMap::default();
     let mut merged: Vec<Candidate> = Vec::with_capacity(candidates.len());
     for c in candidates {
@@ -83,8 +59,8 @@ fn merge_listings(candidates: Vec<Candidate>) -> Vec<Candidate> {
 }
 
 /// Whether evaluating `m` can read a target's labels at all. Listings are only
-/// worth recording — an `Addr` clone and a map entry per candidate — for a
-/// walk that will act on them.
+/// worth merging — an `Addr` clone and a map entry per candidate — for a walk
+/// that will act on them.
 fn mentions_label(m: &htmatcher::Matcher) -> bool {
     use htmatcher::Matcher as M;
     match m {
@@ -119,35 +95,19 @@ impl Engine {
     /// The nested walk behind query targets
     /// (`EngineProviderExecutor::query`) is a different function and is never
     /// parameterized: its output reaches a def hash, so it is always complete.
+    ///
+    /// A provider that reports a candidate's labels from `list` is trusted:
+    /// the label matcher decides from the listing, and the candidate's spec is
+    /// never resolved to check it — a match is yielded, a non-match dropped.
+    /// Like every addr a selector yields, a match may turn out not to exist (a
+    /// listing is a candidate set; see [`skip_unresolvable`]). `heph validate`
+    /// holds a provider's listed labels to its specs.
     pub fn query<'a>(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         m: &'a htmatcher::Matcher,
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
-        self.select(rs, m, discovery, ListedMatch::Confirm)
-            .map_ok(|selected| selected.addr)
-    }
-
-    /// [`query`](Self::query), optionally yielding candidates whose listed
-    /// labels match without resolving them first.
-    ///
-    /// Listed labels always *reject* without a resolve: a candidate the
-    /// listing says cannot match never reaches `get`. `listed` decides what
-    /// happens to a listed *match*. [`ListedMatch::Confirm`] resolves it on the
-    /// serial arm below like any shrug, so every addr `query` yields still
-    /// exists. [`ListedMatch::Trust`] yields it as [`Selected::unconfirmed`]
-    /// and the caller resolves it — which is what lets `Engine::result` resolve
-    /// matches in parallel rather than one at a time here. A caller that trusts
-    /// owns two things: dropping an unconfirmed addr that turns out not to
-    /// exist, and never announcing one before it has resolved.
-    pub(crate) fn select<'a>(
-        self: Arc<Self>,
-        rs: Arc<RequestState>,
-        m: &'a htmatcher::Matcher,
-        discovery: Discovery,
-        listed: ListedMatch,
-    ) -> impl Stream<Item = anyhow::Result<Selected>> + 'a {
         let uses_labels = mentions_label(m);
         // A whole-graph selector (`//...` — a `PackagePrefix` rooted at the empty
         // package) enumerates every target, so its final match count is the total
@@ -226,8 +186,7 @@ impl Engine {
             // awaits `get_spec`/`get_def` the stream below is not polled at all.
             // (Do not weaken this to "the shrug arm is rare". It is not —
             // `Matcher::Label` shrugs for every candidate whose provider did
-            // not list its labels, and every listed match comes through here
-            // too unless the caller passed `ListedMatch::Trust`; and
+            // not list its labels, or whose providers listed it differently; and
             // `Matcher::TreeOutputTo` shrugs at both the addr and the spec
             // level, so `heph validate`, `heph tool gen-gitignore` and
             // `heph query 'tree_output()'` drive `get_spec` *and* `get_def` for
@@ -306,7 +265,7 @@ impl Engine {
                         Err(e) => return Err(e),
                     };
 
-                    for (provider_idx, provider) in engine.providers.iter().enumerate() {
+                    for provider in &engine.providers {
                         let listed = provider.provider.list(ListRequest {
                             request_id: rs.request_id().to_string(),
                             package: pkg.clone(),
@@ -339,7 +298,6 @@ impl Engine {
                             if item.addr.package == pkg {
                                 scan.candidates.push(Candidate {
                                     addr: item.addr,
-                                    provider: provider_idx,
                                     labels: item.labels,
                                 });
                             }
@@ -427,30 +385,13 @@ impl Engine {
                 } else {
                     scan.candidates
                 };
-                for Candidate { addr, provider, labels } in candidates {
-                    // Recorded before matching, so every later read of this
-                    // addr's spec — here, in the caller, or as some other
-                    // target's dep — is checked against the set the matcher used.
-                    let labels = match labels {
-                        Some(labels) if uses_labels => {
-                            Some(rs.data.listed_labels.record(&addr, provider, &labels))
-                        }
-                        _ => None,
-                    };
-                    let mut verdict = m.matches_listed(&addr, labels.as_deref());
-                    // A yes the addr alone would not have given: it rests on
-                    // the listing, and nothing has shown the target exists.
-                    let by_listing = verdict == MatchResult::MatchYes
-                        && labels.is_some()
-                        && m.matches_addr(&addr) != MatchResult::MatchYes;
-                    if by_listing && listed == ListedMatch::Confirm {
-                        verdict = MatchResult::MatchShrug;
-                    }
-                    match verdict {
+                for Candidate { addr, labels } in candidates {
+                    // The provider's listing is trusted: a listed label decides
+                    // here, and the spec is never resolved to second-guess it.
+                    let labels = labels.filter(|_| uses_labels);
+                    match m.matches_listed(&addr, labels.as_deref()) {
                         MatchResult::MatchYes => {
-                            if seen.insert(addr.clone()) {
-                                yield Selected { addr, unconfirmed: by_listing };
-                            }
+                            if seen.insert(addr.clone()) { yield addr; }
                         }
                         MatchResult::MatchNo => {}
                         MatchResult::MatchShrug => {
@@ -468,17 +409,6 @@ impl Engine {
                                 // rewrites it to the candidate's own addr.)
                                 Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => continue,
                                 Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => continue,
-                                // Not a gap to carry on past: the selection
-                                // already acted on the listing it contradicts.
-                                // (One raised under a plugin's own `get`, while
-                                // it resolves a listed dependency through the
-                                // executor, crosses the seam as a string and
-                                // reads as an ordinary spec failure. Accepted:
-                                // it still fails a complete walk, and the top
-                                // level reads that same spec directly.)
-                                Err(e) if downcast_chain_ref::<ListedLabelsMismatch>(&e).is_some() => {
-                                    break 'walk Some(e)
-                                }
                                 Err(e) => match &gaps {
                                     Some(gaps) if !is_cancellation(&rs, &e) => {
                                         skipped_any = true;
@@ -491,9 +421,7 @@ impl Engine {
 
                             match crate::engine::matcher_spec::match_spec(m, &spec) {
                                 MatchResult::MatchYes => {
-                                    if seen.insert(addr.clone()) {
-                                        yield Selected { addr, unconfirmed: false };
-                                    }
+                                    if seen.insert(addr.clone()) { yield addr; }
                                 }
                                 MatchResult::MatchNo => {}
                                 MatchResult::MatchShrug => {
@@ -518,7 +446,7 @@ impl Engine {
                                     ) == MatchResult::MatchYes
                                         && seen.insert(addr.clone())
                                     {
-                                        yield Selected { addr, unconfirmed: false };
+                                        yield addr;
                                     }
                                 }
                             }
@@ -624,38 +552,41 @@ impl Engine {
 }
 
 impl Engine {
-    /// Resolve the spec of a [`Selected::unconfirmed`] addr, so the caller of
-    /// a [`ListedMatch::Trust`] walk learns whether it exists: `Some(addr)` if
-    /// it does, `None` for a candidate the provider listed but cannot resolve.
-    /// A confirmed selection passes straight through.
+    /// Whether an addr `query` yielded for `m` exists, for a caller that must
+    /// not act on one that does not: `Some(addr)` if it does, `None` to drop it.
     ///
-    /// Drops what the walk's serial arm drops — a cycle back through the addr,
-    /// and under [`Discovery::KeepGoing`] a spec failure, recorded as a skip —
-    /// with one deliberate difference: only a not-found naming *this* addr
-    /// (see [`skip_unresolvable`]). One naming a dependency is a real missing
-    /// dependency and fails. A [`ListedLabelsMismatch`] is never dropped: the
-    /// selection acted on the listing it contradicts.
-    pub(crate) async fn confirm_selected(
+    /// Only a match the addr alone does not decide is resolved — one selected
+    /// on its labels. A provider may list a candidate `get` declines (go lists
+    /// `test` in every package; only `go list` knows whether there are tests),
+    /// and a label selection must not fail on it. A match the addr decides
+    /// (`//a:x`, `//pkg/...`) passes through untouched, so a missing target
+    /// named outright still errors where it always did.
+    ///
+    /// Drops what the walk's serial arm drops for the same candidate — a cycle
+    /// back through it, and under [`Discovery::KeepGoing`] a spec failure,
+    /// recorded as a skip — but only a not-found naming *this* addr (see
+    /// [`skip_unresolvable`]): one naming a dependency is a real missing
+    /// dependency and fails.
+    pub(crate) async fn confirm_match(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         gaps: Option<Arc<Gaps>>,
-        selected: Selected,
+        m: &htmatcher::Matcher,
+        addr: Addr,
     ) -> anyhow::Result<Option<Addr>> {
-        if !selected.unconfirmed {
-            return Ok(Some(selected.addr));
+        if m.matches_addr(&addr) == MatchResult::MatchYes {
+            return Ok(Some(addr));
         }
-        let addr = selected.addr;
         match skip_unresolvable(&addr, self.get_spec(rs.clone(), &addr).await) {
             Ok(Some(_)) => Ok(Some(addr)),
             Ok(None) => {
                 // Silent to the user by design; here for "why wasn't X selected?".
                 tracing::debug!(
                     addr = %addr.format(),
-                    "listed label match did not resolve; dropped from the selection"
+                    "selected candidate did not resolve; dropped from the selection"
                 );
                 Ok(None)
             }
-            Err(e) if downcast_chain_ref::<ListedLabelsMismatch>(&e).is_some() => Err(e),
             Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => Ok(None),
             Err(e) => match &gaps {
                 Some(gaps) if !is_cancellation(&rs, &e) => {
@@ -1694,6 +1625,13 @@ mod tests {
                 let provider = pluginstatictarget::Provider::new(healthy)?;
                 engine.register_provider(move |_| Box::new(provider))?;
             }
+            // These tests are about the walk's resolving arm — a candidate whose
+            // spec or def fails while the matcher needs it. A label decides from
+            // the listing without resolving, so the faulty provider lists none.
+            let faults = Faults {
+                labels_unknown: true,
+                ..faults
+            };
             let provider = FaultProvider::new(targets, faults)?;
             engine.register_provider(move |_| Box::new(provider))?;
             Ok((Arc::new(engine), root))
