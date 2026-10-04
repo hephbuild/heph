@@ -203,10 +203,13 @@ tempfile = "3"
 # `engine::fault_provider` for the command tests.
 hengine = { package = "engine", path = "crates/engine", features = ["test-support"] }
 
-# Fork exposing `event::raw_input` (EventSource/UnixInternalEventSource/
-# InternalEvent) so the TUI can own a single tty reader and demux cursor-position
-# replies from key events — see crates/tui/src/tui/input.rs. Avoids the
-# DSR-query / EventStream two-reader race.
+# Fork with three fixes the TUI depends on:
+# - `cursor::position_to(writer)`: send the `ESC[6n` query to stderr, so a piped
+#   stdout is never corrupted (crates/tui/src/tui/stderr_backend.rs).
+# - an `EventStream` reader no longer loses a wake to input in the same poll batch.
+# - a stale wake left by `EventStream::drop` no longer ends the cursor-position
+#   wait early. It used to, and the unread reply reached the shell after exit as
+#   `^[[35;1R`.
 [patch.crates-io]
 crossterm = { git = "https://github.com/hephbuild/crossterm.git", branch = "fix-eventstream-wake-loss" }
 
