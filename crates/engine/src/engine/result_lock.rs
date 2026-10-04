@@ -28,8 +28,8 @@
 //!   deleting that entry.
 //!
 //! Keying the riding read by revision is the point. A request holds a read on
-//! every revision it resolved until the request ends, and a long-running
-//! command (`heph run //app:serve`) can be a very long request. With the inner
+//! every revision whose artifacts it is still using, and a long-running
+//! command (`heph run //app:serve`) can use them for a very long time. With the inner
 //! lock per addr, a second `heph` that needed to build a *new* revision of any
 //! of those targets — one whose input changed — parked behind readers of the
 //! *old* one until the first command exited, though the two entries share no

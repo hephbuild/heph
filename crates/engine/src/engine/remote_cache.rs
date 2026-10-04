@@ -1748,6 +1748,10 @@ impl Engine {
     /// on the network. The upload is bracketed by `RemoteCacheWrite{Start,End}`
     /// events so a long push surfaces in the TUI's slow-target breakdown.
     ///
+    /// The task takes its own read lock on the revision while it reads it, and
+    /// releases it before letting go of the request: the build's read lasts only
+    /// as long as the build's artifacts, which can be gone before the push starts.
+    ///
     /// **The task must always finish.** Both exit paths spin until `bg_pending`
     /// hits zero (`tui/backend/ci.rs`, `tui/backend/interactive.rs`) with no
     /// timeout of their own, and the CI backend has no `q` escape — so a push
@@ -1797,10 +1801,30 @@ impl Engine {
             // deadline, so this task can never be what keeps the process alive.
             let ctoken = rs.ctoken().clone_arc();
             let push = async {
-                match UPLOAD_SLOTS.acquire().await {
-                    Ok(_permit) => engine.upload_to_remote(&addr, &hashin).await,
-                    Err(e) => warn!(error = ?e, %addr, "remote cache upload slot unavailable"),
-                }
+                let _permit = match UPLOAD_SLOTS.acquire().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        warn!(error = ?e, %addr, "remote cache upload slot unavailable");
+                        return;
+                    }
+                };
+                // The upload reads the revision's manifest and blobs, so it
+                // holds its own read on the revision for exactly that long —
+                // the build's read lives only as long as the build's artifacts,
+                // and without one a `clean` or a `--force` rebuild in another
+                // process could delete or replace the bytes mid-push. Taken
+                // after the slot, so a queued push pins nothing. It may wait
+                // for the builder to downgrade its write, which it does right
+                // after this task is spawned; the builder never waits on us.
+                let read = match engine.result_lock().read(&addr, &hashin, rs.ctoken()).await {
+                    Ok(read) => read,
+                    Err(e) => {
+                        warn!(error = ?e, %addr, "remote cache upload could not lock the revision");
+                        return;
+                    }
+                };
+                engine.upload_to_remote(&addr, &hashin).await;
+                drop(read);
             };
             tokio::select! {
                 biased;

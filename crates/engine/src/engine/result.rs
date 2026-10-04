@@ -3,7 +3,7 @@ use crate::engine::discovery::{Discovery, InProvider};
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{
-    CancelledError, CycleError, HashUnknownError, MultiError, ProcessFailed,
+    CancelledError, CycleError, HashUnknownError, MultiError, ProcessFailed, RevisionChangedError,
     ShellNeedsSingleTarget, TargetFailure, TargetNotFoundError, UpstreamFailed,
 };
 use crate::engine::provider::{
@@ -1005,51 +1005,154 @@ pub(crate) struct LockedResolution {
 /// and the strong guard lives only in the artifacts handed out
 /// ([`GuardedArtifact`]): the read is released when the last one drops.
 ///
-/// `pin` carries the guard acquired by the resolution across the hand-off to
-/// its first holder, so there is no window between "resolved under this read"
-/// and "a caller holds it". After that, a caller finding the read released
-/// re-acquires it ([`hold`](Self::hold)) — the same shared read on the same
-/// revision. Should the revision have been deleted while nobody held it, the
-/// read finds its blobs missing, which the hit path already treats as a
-/// rebuild (reconciled against the hashouts the request already handed out).
+/// **No memoized value holds a strong guard, not even briefly.** A strong guard
+/// parked in a cell "until its first claimer takes it" is a pin for the
+/// request's lifetime whenever that claimer never comes — a fail-fast sibling
+/// dropped mid-flight, a `mem_result` task aborted between its resolution and
+/// its claim. Instead the strong guard leaves the memoizer *beside* the value,
+/// through a [`Handoff`] owned by the caller that created the cell: the
+/// computation stores the guard it ran under, and that caller takes it the
+/// moment `once` returns. Nobody else can see it, and if that caller is gone
+/// the hand-off is dropped with the finished computation. So the common path —
+/// one caller resolves, then uses the result — never releases the read between
+/// "resolved under it" and "artifacts carry it", and costs nothing extra.
+///
+/// Every other caller (one that joined an existing cell, or came back to it
+/// later in the request) goes through [`hold`](Self::hold): it upgrades the
+/// `Weak` when some guard from this slot is still alive — then the revision has
+/// been read-locked continuously since it was validated, and nothing can have
+/// changed it — and otherwise **re-acquires and revalidates**. While no read
+/// was held, another process may have `clean`ed the revision (its blobs are
+/// gone) or `--force`-rebuilt it (blobs are keyed by inputs, not content, so a
+/// non-reproducible target leaves new bytes under the old key). Either would
+/// make the memoized artifacts wrong, so the re-acquired read checks the
+/// on-disk manifest still carries exactly the hashouts this request handed
+/// out, and fails with [`RevisionChangedError`] when it does not. Hashouts, not
+/// `created_at_nanos`: a reproducible rebuild wrote the same bytes and must
+/// pass. Blob presence is not required — a matching manifest names the same
+/// bytes, and a partial / remote-backed cache pulls them lazily as before.
+///
+/// The cost of that choice: a caller that finds the read lapsed pays a `flock`
+/// plus one manifest read. That is the joiner whose creator already let go, and
+/// the request that comes back to a target after dropping it — not the
+/// resolve-then-use path, and never a meta-only edge (see
+/// [`MemoResult::claim`]).
 pub(crate) struct GuardSlot {
     addr: Addr,
     hashin: String,
-    pin: parking_lot::Mutex<Option<Arc<ResultReadGuard>>>,
-    weak: parking_lot::Mutex<std::sync::Weak<ResultReadGuard>>,
+    /// What the revision looked like when this request resolved it.
+    resolved: Resolved,
+    weak: parking_lot::Mutex<Weak<ResultReadGuard>>,
+}
+
+/// A strong read guard on its way out of a memoizer cell to the caller that
+/// created the cell, outside the memoized value. See [`GuardSlot`].
+type Handoff = Arc<parking_lot::Mutex<Option<Arc<ResultReadGuard>>>>;
+
+/// The revision as this request resolved it, kept as the `Arc` the resolution
+/// already holds — recording it costs nothing, and its hashouts are only
+/// computed on the rare re-acquire ([`GuardSlot::hold`]).
+enum Resolved {
+    /// A pre-existing cache hit: the manifest the probe parsed.
+    Hit(Arc<Manifest>),
+    /// This request built it: what it produced.
+    Executed(Arc<ExecutedArtifacts>),
+}
+
+impl Resolved {
+    /// The hashouts handed out — every Output and SupportFile — sorted. The
+    /// same set `artifacts_meta` carries, in either case.
+    fn hashouts(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = match self {
+            Resolved::Hit(manifest) => return manifest_hashouts(manifest),
+            Resolved::Executed(ex) => ex.meta.iter().map(|m| m.hashout.as_str()).collect(),
+        };
+        out.sort_unstable();
+        out
+    }
+}
+
+/// A manifest's Output and SupportFile hashouts, sorted — what a dependent can
+/// have folded into its key. Logs are excluded, as `artifacts_meta` excludes
+/// them.
+fn manifest_hashouts(manifest: &Manifest) -> Vec<&str> {
+    let mut out: Vec<&str> = manifest
+        .artifacts
+        .iter()
+        .filter(|a| {
+            matches!(
+                a.r#type,
+                ManifestArtifactType::Output | ManifestArtifactType::SupportFile
+            )
+        })
+        .map(|a| a.hashout.as_str())
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 impl GuardSlot {
-    fn new(addr: &Addr, hashin: &str, read: ResultReadGuard) -> Arc<Self> {
+    /// The slot, and the strong guard to hand to the cell's creator.
+    fn new(
+        addr: &Addr,
+        hashin: &str,
+        resolved: Resolved,
+        read: ResultReadGuard,
+    ) -> (Arc<Self>, Arc<ResultReadGuard>) {
         let read = Arc::new(read);
-        Arc::new(Self {
+        let slot = Arc::new(Self {
             addr: addr.clone(),
             hashin: hashin.to_owned(),
+            resolved,
             weak: parking_lot::Mutex::new(Arc::downgrade(&read)),
-            pin: parking_lot::Mutex::new(Some(read)),
-        })
+        });
+        (slot, read)
     }
 
-    /// A strong read on the revision: the pinned one (taken, so the slot stops
-    /// owning it), else one some caller still holds, else a fresh acquire.
+    /// A strong read on the revision: one some caller still holds, else a fresh
+    /// acquire, validated against what this request already handed out.
     async fn hold(
         &self,
-        lock: &crate::engine::result_lock::ResultLock,
-        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        engine: &Engine,
+        rs: &Arc<RequestState>,
     ) -> anyhow::Result<Arc<ResultReadGuard>> {
-        if let Some(read) = self.pin.lock().take() {
-            return Ok(read);
-        }
         if let Some(read) = self.weak.lock().upgrade() {
             return Ok(read);
         }
-        let read = Arc::new(
-            lock.read(&self.addr, &self.hashin, ctoken)
-                .await
-                .with_context(|| format!("re-acquiring read lock for {}", self.addr))?,
-        );
+        let read = engine
+            .acquire_with_notice(
+                rs,
+                &self.addr,
+                Some(&self.hashin),
+                engine
+                    .result_lock()
+                    .read(&self.addr, &self.hashin, rs.ctoken()),
+            )
+            .await
+            .with_context(|| format!("re-acquiring read lock for {}", self.addr))?;
+        // Under the new read: nothing can change the revision from here on, so
+        // one check settles it for as long as this guard lives.
+        self.validate(engine, rs).await?;
+        let read = Arc::new(read);
         *self.weak.lock() = Arc::downgrade(&read);
         Ok(read)
+    }
+
+    /// Whether the revision on disk is still the one this request resolved.
+    async fn validate(&self, engine: &Engine, rs: &RequestState) -> anyhow::Result<()> {
+        let manifest = engine
+            .read_manifest_blocking(rs.ctoken(), &self.addr, &self.hashin)
+            .await
+            .with_context(|| format!("revalidating {} {}", self.addr, self.hashin))?;
+        let unchanged = manifest.is_some_and(|m| manifest_hashouts(&m) == self.resolved.hashouts());
+        if unchanged {
+            return Ok(());
+        }
+        Err(RevisionChangedError {
+            addr: self.addr.clone(),
+            hashin: self.hashin.clone(),
+        }
+        .into())
     }
 }
 
@@ -1058,21 +1161,36 @@ impl GuardSlot {
 /// hands each caller an [`EResult`] whose artifacts carry a strong read — so
 /// the cell itself never keeps the revision locked. See [`GuardSlot`].
 pub(crate) struct MemoResult {
-    eresult: EResult,
+    eresult: Arc<EResult>,
     slot: Option<Arc<GuardSlot>>,
-    /// The read the computation ran under, carried to the first claimer.
-    pin: parking_lot::Mutex<Option<Arc<ResultReadGuard>>>,
 }
 
 impl MemoResult {
-    async fn claim(&self, engine: &Engine, rs: &RequestState) -> anyhow::Result<Arc<EResult>> {
-        let Some(slot) = &self.slot else {
-            return Ok(Arc::new(self.eresult.clone()));
+    /// This caller's copy of the result. `handed` is the read the computation
+    /// ran under, when this caller created the cell (see [`Handoff`]).
+    ///
+    /// A result with no artifacts — a meta edge (`OutputMatcher::None`), which
+    /// wants only the hashouts — has nothing for a read to protect, so it takes
+    /// no lock at all and shares the memoized value as is. That is most edges
+    /// of a build, so it must stay free.
+    async fn claim(
+        &self,
+        engine: &Engine,
+        rs: &Arc<RequestState>,
+        handed: Option<Arc<ResultReadGuard>>,
+    ) -> anyhow::Result<Arc<EResult>> {
+        let slot = match &self.slot {
+            Some(slot)
+                if !self.eresult.artifacts.is_empty()
+                    || !self.eresult.support_artifacts.is_empty() =>
+            {
+                slot
+            }
+            _ => return Ok(Arc::clone(&self.eresult)),
         };
-        let pinned = self.pin.lock().take();
-        let read = match pinned {
+        let read = match handed {
             Some(read) => read,
-            None => slot.hold(engine.result_lock(), rs.ctoken()).await?,
+            None => slot.hold(engine, rs).await?,
         };
         Ok(Arc::new(guard_eresult(&self.eresult, &read)))
     }
@@ -1580,14 +1698,20 @@ impl Engine {
         let key = (AddrKey(addr.clone()), key_outputs, is_top);
         let opts = opts.clone();
         let interactive = opts.interactive.is_some();
+        // Filled only if this call creates the cell: the read the computation
+        // ran under, passed beside the memoized value rather than inside it.
+        let handoff = Handoff::default();
         let res = rs
             .data
             .mem_result
             .once(
                 key,
-                enclose!((self => engine, rs, addr, outputs) move || async move {
+                enclose!((self => engine, rs, addr, outputs, handoff) move || async move {
                     match engine.inner_result_addr(rs.clone(), &addr, outputs, &opts, is_top).await {
-                        Ok(v) => Ok(Arc::new(v)),
+                        Ok((v, read)) => {
+                            *handoff.lock() = read;
+                            Ok(Arc::new(v))
+                        }
                         Err(e) => Err(classify_failure(&rs, &addr, interactive, e)),
                     }
                 }),
@@ -1598,10 +1722,15 @@ impl Engine {
         match res {
             // The cell keeps the result unguarded; this caller's copy carries
             // the read for as long as its artifacts live. See `GuardSlot`.
-            Ok(v) => v
-                .claim(&self, &rs)
-                .await
-                .map_err(|e| surface_top(is_top, &rs, e)),
+            Ok(v) => {
+                let handed = handoff.lock().take();
+                v.claim(&self, &rs, handed).await.map_err(|e| {
+                    // A failed claim (the revision changed under a lapsed read,
+                    // a cancelled re-acquire) is this addr's failure, classified
+                    // like the computation's own.
+                    surface_top(is_top, &rs, classify_failure(&rs, addr, interactive, e))
+                })
+            }
             Err(e) => Err(surface_top(is_top, &rs, e)),
         }
     }
@@ -2070,7 +2199,7 @@ impl Engine {
         outputs: OutputMatcher,
         opts: &ResultOptions,
         is_top: bool,
-    ) -> anyhow::Result<MemoResult> {
+    ) -> anyhow::Result<(MemoResult, Option<Arc<ResultReadGuard>>)> {
         let addr_str = addr.format();
         crate::engine::event::emit_scope(
             &rs,
@@ -2164,13 +2293,14 @@ impl Engine {
                 // Counts every resolved target across the process; the opt-out
                 // only gates whether the snapshot is sent.
                 let sizes: Vec<u64> = result
+                    .0
                     .eresult
                     .artifacts
                     .iter()
                     .filter_map(|a| a.byte_size())
                     .collect();
                 htelemetry::telemetry::record_artifacts(
-                    result.eresult.artifacts.len() as u64,
+                    result.0.eresult.artifacts.len() as u64,
                     &sizes,
                 );
 
@@ -2240,14 +2370,20 @@ impl Engine {
         def: &LinkedTargetDef,
         outputs: Vec<String>,
         opts: &ExecuteOptions<'_>,
-    ) -> anyhow::Result<MemoResult> {
-        let locked = self.clone().resolve_locked(rs.clone(), def, opts).await?;
+    ) -> anyhow::Result<(MemoResult, Option<Arc<ResultReadGuard>>)> {
+        let (locked, handed) = self.clone().resolve_locked(rs.clone(), def, opts).await?;
         // This caller's riding read, held across everything below (output
-        // reads, codegen write-back) and handed to the first claimer of the
-        // result — never kept by the memoized value itself.
-        let riding = match &locked.guard {
-            Some(slot) => Some(slot.hold(self.result_lock(), rs.ctoken()).await?),
-            None => None,
+        // reads, codegen write-back) and handed on beside the result to the
+        // caller that created this cell — never kept by the memoized value.
+        //
+        // A caller asking for no output group reads no bytes below, so it needs
+        // no read: the hashouts it gets are the ones the resolution already
+        // validated. Taking one anyway would cost a meta edge a `flock` and a
+        // manifest read whenever the resolution's read had lapsed.
+        let riding = match (&locked.guard, handed) {
+            (Some(_), Some(read)) => Some(read),
+            (Some(slot), None) if !outputs.is_empty() => Some(slot.hold(&self, &rs).await?),
+            _ => None,
         };
         let (cached, meta): (Vec<ResultArtifact>, Vec<ArtifactMeta>) = match &locked.executed {
             // This cell produced the artifacts; filter the full set to `outputs`.
@@ -2456,11 +2592,13 @@ impl Engine {
             self.clone().maybe_store_fixpoint(&rs, opts).await?;
         }
 
-        Ok(MemoResult {
-            eresult: build_eresult(cached, meta, &outputs),
-            slot: locked.guard.clone(),
-            pin: parking_lot::Mutex::new(riding),
-        })
+        Ok((
+            MemoResult {
+                eresult: Arc::new(build_eresult(cached, meta, &outputs)),
+                slot: locked.guard.clone(),
+            },
+            riding,
+        ))
     }
 
     /// Make every blob this caller reads local, and touch nothing else.
@@ -2627,15 +2765,23 @@ impl Engine {
     /// Invariants preserved: cross-process serialization (still exactly one real
     /// flock acquire here; other processes have their own `mem_locked_result`),
     /// cross-request contention (the cell is per-`RequestStateData`), and
-    /// read-pinning (the riding read is a real flock read — `try_write` still
-    /// fails while it's alive). Only the *duplicate* same-addr acquire is removed.
+    /// read-pinning while in use (the riding read is a real flock read —
+    /// `try_write` fails while any artifact carrying it is alive, and succeeds
+    /// once the last one drops, even though the cell lives on; see
+    /// [`GuardSlot`]). Only the *duplicate* same-addr acquire is removed.
+    ///
+    /// The cell's read is returned beside the resolution — never inside it — to
+    /// the caller that created the cell; every other caller gets `None` and
+    /// goes through [`GuardSlot::hold`].
     async fn resolve_locked(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         def: &LinkedTargetDef,
         opts: &ExecuteOptions<'_>,
-    ) -> anyhow::Result<Arc<LockedResolution>> {
+    ) -> anyhow::Result<(Arc<LockedResolution>, Option<Arc<ResultReadGuard>>)> {
         let addr = def.target.addr.clone();
+        // Filled only if this call creates the cell. See `GuardSlot`.
+        let handoff = Handoff::default();
         // Owned copies so the memoizer closure is `'static`.
         let def_owned = opts.def.clone();
         let hashin = opts.hashin.clone();
@@ -2654,11 +2800,12 @@ impl Engine {
         let interactive = opts.interactive.clone();
         let no_scratch = opts.no_scratch;
 
-        rs.data
+        let resolution = rs
+            .data
             .mem_locked_result
             .once(
                 AddrKey(addr),
-                enclose!((self => engine, rs) move || async move {
+                enclose!((self => engine, rs, handoff) move || async move {
                     // is_top/frozen are deliberately fixed here: the shared cell
                     // is addr-keyed and output/is_top-agnostic. It never runs
                     // codegen write-back or fixpoint storage (those are per-caller,
@@ -2675,11 +2822,15 @@ impl Engine {
                         no_scratch,
                         is_top: false,
                     };
-                    engine.resolve_locked_inner(rs, &opts).await
+                    let (resolution, read) = engine.resolve_locked_inner(rs, &opts).await?;
+                    *handoff.lock() = read;
+                    anyhow::Ok(resolution)
                 }),
             )
             .await
-            .map_err(unwrap_arc_err)
+            .map_err(unwrap_arc_err)?;
+        let handed = handoff.lock().take();
+        Ok((resolution, handed))
     }
 
     /// Body of the per-addr lock dance: the optimistic read → miss → drop →
@@ -2718,7 +2869,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         opts: &ExecuteOptions<'_>,
-    ) -> anyhow::Result<Arc<LockedResolution>> {
+    ) -> anyhow::Result<(Arc<LockedResolution>, Option<Arc<ResultReadGuard>>)> {
         let def = opts.def;
         let can_cache = !opts.force && !opts.no_scratch && def.target.cache.enabled && !opts.shell;
         let addr = &def.target.addr;
@@ -2740,6 +2891,14 @@ impl Engine {
         // content), and the dependent would be cached under a key that names
         // the first output while built from the second. So it downgrades to a
         // riding read exactly as the miss path below does.
+        //
+        // That read covers the bytes while artifacts carrying it are alive, not
+        // the whole request: between the meta edge that folded the hashout and
+        // the exec edge that stages the bytes, it can lapse. The exec edge then
+        // re-acquires it and checks the manifest still carries the hashouts
+        // this run produced ([`GuardSlot::hold`]); a non-reproducible rebuild by
+        // another process in between fails the resolution with
+        // `RevisionChangedError` rather than staging bytes the key never named.
         if !can_cache {
             let durable = def.target.cache.enabled && !opts.shell && !rs.hash_only();
             // pluginfs targets are pure, ephemeral filesystem reads (cache off):
@@ -2778,7 +2937,8 @@ impl Engine {
                 .clone()
                 .execute_and_cache_inner(rs.clone(), opts)
                 .await?;
-            let guard = match write {
+            let executed = Arc::new(ExecutedArtifacts { cached, meta });
+            let (guard, handed) = match write {
                 Some(write) if durable => {
                     // Same gap-free hand-off as the miss path below.
                     let up = write
@@ -2787,16 +2947,25 @@ impl Engine {
                         .with_context(|| format!("downgrading result lock for {addr}"))?;
                     let read = self.result_lock().read(addr, hashin, ctoken).await?;
                     drop(up);
-                    Some(GuardSlot::new(addr, hashin, read))
+                    let (slot, read) = GuardSlot::new(
+                        addr,
+                        hashin,
+                        Resolved::Executed(Arc::clone(&executed)),
+                        read,
+                    );
+                    (Some(slot), Some(read))
                 }
-                _ => None,
+                _ => (None, None),
             };
-            return Ok(Arc::new(LockedResolution {
-                guard,
-                executed: Some(Arc::new(ExecutedArtifacts { cached, meta })),
-                manifest: None,
-                remote: known_remote(None),
-            }));
+            return Ok((
+                Arc::new(LockedResolution {
+                    guard,
+                    executed: Some(executed),
+                    manifest: None,
+                    remote: known_remote(None),
+                }),
+                handed,
+            ));
         }
 
         // 1. Optimistically take a plain shared read lock and probe the cache at
@@ -2818,12 +2987,17 @@ impl Engine {
             // Where its blobs live is left unresolved: a caller that needs bytes
             // and hasn't got them forces the cell, and one that only needs
             // hashouts never does.
-            return Ok(Arc::new(LockedResolution {
-                guard: Some(GuardSlot::new(addr, hashin, read)),
-                executed: None,
-                manifest: Some(manifest),
-                remote: RemoteCell::new(),
-            }));
+            let (slot, read) =
+                GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
+            return Ok((
+                Arc::new(LockedResolution {
+                    guard: Some(slot),
+                    executed: None,
+                    manifest: Some(manifest),
+                    remote: RemoteCell::new(),
+                }),
+                Some(read),
+            ));
         }
 
         // B. Miss: a plain read cannot upgrade. Drop it and take the exclusive
@@ -2958,12 +3132,23 @@ impl Engine {
             .with_context(|| format!("downgrading result lock for {addr}"))?;
         let read = self.result_lock().read(addr, hashin, ctoken).await?;
         drop(up);
-        Ok(Arc::new(LockedResolution {
-            guard: Some(GuardSlot::new(addr, hashin, read)),
-            executed,
-            manifest,
-            remote,
-        }))
+        // Exactly one of the two is `Some`: the re-check hit, the remote hit,
+        // or this cell executed.
+        let resolved = match (&executed, &manifest) {
+            (Some(ex), _) => Resolved::Executed(Arc::clone(ex)),
+            (None, Some(m)) => Resolved::Hit(Arc::clone(m)),
+            (None, None) => anyhow::bail!("{addr}: resolved with neither a manifest nor outputs"),
+        };
+        let (slot, read) = GuardSlot::new(addr, hashin, resolved, read);
+        Ok((
+            Arc::new(LockedResolution {
+                guard: Some(slot),
+                executed,
+                manifest,
+                remote,
+            }),
+            Some(read),
+        ))
     }
 
     /// Materialize the codegen output tree for a freshly-resolved target.
@@ -12294,11 +12479,13 @@ mod tests {
 
         /// A forced run of a cacheable dependency rewrites its durable entry,
         /// and its dependents fold that output's hashout into their own keys.
-        /// It keeps a riding read for the rest of the request, like any cache
-        /// hit, so another process forcing the same addr cannot rename
-        /// different bytes over the ones the dependents are reading.
+        /// It keeps a riding read for as long as its artifacts live, like any
+        /// cache hit, so another process forcing the same addr cannot rename
+        /// different bytes over the ones the dependents are reading — and lets
+        /// it go when they drop, though the request lives on.
         #[tokio::test]
-        async fn a_forced_target_keeps_a_read_lock_while_the_request_lives() -> anyhow::Result<()> {
+        async fn a_forced_target_keeps_a_read_lock_while_its_artifacts_live() -> anyhow::Result<()>
+        {
             let (engine, _root, _) =
                 shaped_engine(vec![labelled("//x:d", &["x"], &[])], Shape::default())?;
             warm(&engine, "//x:d").await?;
@@ -12314,6 +12501,60 @@ mod tests {
                 engine.result_lock().try_write(&d, &hashin)?.is_none(),
                 "a forced target was released with no riding read"
             );
+            drop(batch);
+            assert!(
+                engine.result_lock().try_write(&d, &hashin)?.is_some(),
+                "the request kept the read after the artifacts were dropped"
+            );
+            drop(rs);
+            Ok(())
+        }
+
+        /// A `mem_result` computation that completes but is never claimed — a
+        /// fail-fast sibling dropped between its resolution and its claim —
+        /// must not pin the revision for the rest of the request. The memoized
+        /// value carries no strong read (neither does the `mem_locked_result`
+        /// cell behind it): only the hand-off beside it does, and that dies
+        /// with the caller. A later claim re-acquires, revalidates, and serves.
+        #[tokio::test]
+        async fn an_unclaimed_result_holds_no_read_lock() -> anyhow::Result<()> {
+            let (engine, _root, _) =
+                shaped_engine(vec![labelled("//x:d", &["x"], &[])], Shape::default())?;
+            warm(&engine, "//x:d").await?;
+
+            let rs = engine.new_state();
+            let d = hmodel::htaddr::parse_addr("//x:d")?;
+            let hashin = Arc::clone(&engine).meta(rs.clone(), &d).await?.hashin;
+            let (memo, handed) = Arc::clone(&engine)
+                .inner_result_addr(
+                    rs.clone(),
+                    &d,
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                    true,
+                )
+                .await?;
+            assert!(handed.is_some(), "the creator must be handed the read");
+            assert!(
+                engine.result_lock().try_write(&d, &hashin)?.is_none(),
+                "the hand-off must keep the revision read-locked"
+            );
+
+            drop(handed);
+            assert!(
+                engine.result_lock().try_write(&d, &hashin)?.is_some(),
+                "an unclaimed memoized result pinned the revision"
+            );
+
+            let claimed = memo.claim(&engine, &rs, None).await?;
+            assert!(!claimed.artifacts.is_empty());
+            assert!(
+                engine.result_lock().try_write(&d, &hashin)?.is_none(),
+                "a late claim must re-acquire the read"
+            );
+            drop(claimed);
+            assert!(engine.result_lock().try_write(&d, &hashin)?.is_some());
+            drop((memo, rs));
             Ok(())
         }
 

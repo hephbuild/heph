@@ -1454,6 +1454,76 @@ mod tests {
         );
     }
 
+    /// The background upload reads the revision under its own read lock: the
+    /// build's read lasts only as long as the build's artifacts, so without one
+    /// a `clean` or `--force` rebuild elsewhere could delete or replace the
+    /// bytes mid-push. Observed as the upload waiting out a held write on the
+    /// revision, and landing once it is released.
+    #[tokio::test]
+    async fn spawn_remote_upload_reads_under_a_read_lock() {
+        use std::sync::atomic::Ordering;
+
+        let remote = tempfile::tempdir().expect("remote dir");
+        let remote_uri = format!("file://{}", remote.path().display());
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let (engine, _e) = engine_with_remote(&remote_uri);
+        engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHLOCK",
+                vec![raw_artifact("a", b"locked payload")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+
+        let write = engine
+            .result_lock()
+            .write(&addr, "HASHLOCK", &ctoken)
+            .await
+            .expect("write lock");
+        let rs = engine.new_state();
+        let bg = rs.bg_pending();
+        engine.spawn_remote_upload(&rs, addr.clone(), "HASHLOCK".to_string());
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            bg.load(Ordering::Acquire),
+            1,
+            "the upload must wait for the revision's write lock to go"
+        );
+        let (engine2, _e2) = engine_with_remote(&remote_uri);
+        assert!(
+            engine2
+                .probe_remote_revision(&ctoken, &addr, "HASHLOCK", &["out".to_string()])
+                .await
+                .expect("probe")
+                .is_none(),
+            "the upload read the revision while a writer held it"
+        );
+
+        drop(write);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while bg.load(Ordering::Acquire) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bg_pending never drained"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            engine2
+                .probe_remote_revision(&ctoken, &addr, "HASHLOCK", &["out".to_string()])
+                .await
+                .expect("probe")
+                .is_some(),
+            "the upload must land once the write is released"
+        );
+    }
+
     /// A missing remote entry yields `None` (→ execute), not an error.
     #[tokio::test]
     async fn remote_download_miss_is_none() {

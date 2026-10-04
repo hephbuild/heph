@@ -282,8 +282,10 @@ pub struct RequestStateData {
     pub mem_execute_cache: Memoizer<(AddrKey, String), ExecuteCacheResult>,
     /// Single-flights the per-addr result-LOCK + cache-fetch/execute, keyed by
     /// `Addr` ALONE (not `is_top`/`outputs`). The `(outputs, is_top)`
-    /// `mem_result` cells all await this, share its one riding read guard, then
-    /// filter outputs on top. Keyed addr-only so two sibling computations of one
+    /// `mem_result` cells all await this, share its one riding read guard (held
+    /// only weakly here — the read lives as long as the artifacts carrying it;
+    /// see `result::GuardSlot`), then filter outputs on top. Keyed addr-only so
+    /// two sibling computations of one
     /// addr can never both hold the non-reentrant per-addr lock — the
     /// self-deadlock this prevents.
     pub(crate) mem_locked_result: Memoizer<AddrKey, Result<Arc<LockedResolution>, ArcErr>>,
@@ -487,14 +489,14 @@ impl Drop for DeferredTrims {
             );
             return;
         };
-        // The read guards the batch's trims contend with are unpinned by this
-        // request's own teardown: `deferred_trims` is the last field of
-        // `RequestStateData`, so by the time this drop runs, the request's
-        // memoizers are gone and their abort cascades are in flight — each
-        // tears down a chain whose `mem_locked_result` value *is* an addr's
-        // riding cache read. The cascade lands when the runtime processes it,
-        // which is why the batch below probes, re-probes, and retries once
-        // rather than expecting the guards to be gone already. (The blocking
+        // The read guards the batch's trims contend with ride on artifacts, not
+        // on memoized values (see `result::GuardSlot`). `deferred_trims` is the
+        // last field of `RequestStateData`, so by the time this drop runs, the
+        // request's memoizers are gone and their abort cascades are in flight —
+        // an aborted chain may still hold artifacts, and with them a read. The
+        // cascade lands when the runtime processes it, which is why the batch
+        // below probes, re-probes, and retries once rather than expecting the
+        // guards to be gone already. (The blocking
         // pool's backstop registry, which used to be flushed here because it
         // could retain those guards past their wait's end, no longer exists.)
 

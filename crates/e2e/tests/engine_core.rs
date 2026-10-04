@@ -211,9 +211,8 @@ async fn test_output_selection_unknown_name_errors() -> anyhow::Result<()> {
 
 /// A command that is still running must not stop another from rebuilding.
 ///
-/// A request keeps a riding read on every target it resolved until the request
-/// ends, and a long-running `heph run` is a request that lasts as long as its
-/// process. The read used to cover the whole addr, so a second `heph` needing a
+/// A request keeps a riding read on every target whose artifacts it still
+/// uses, and a long-running `heph run` uses them as long as its process lives. The read used to cover the whole addr, so a second `heph` needing a
 /// *new* revision of one of those targets — an input changed in between —
 /// parked behind it until the first command exited, reporting
 /// `(locked, holder unknown)`. Readers now hold only the revision they read.
@@ -332,6 +331,207 @@ async fn a_live_request_holds_no_lock_on_results_it_no_longer_uses() -> anyhow::
         )
         .await?;
     assert_eq!(common::artifact_string(&again), "v");
+    Ok(())
+}
+
+/// Whether `e`'s chain names a revision that changed under a lapsed read.
+fn is_revision_changed(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.is::<heph::engine::error::RevisionChangedError>())
+}
+
+/// Resolve `addr`'s outputs in `rs`, as a request coming back to a target it
+/// already resolved does.
+async fn resolve_all(
+    engine: &std::sync::Arc<heph::engine::Engine>,
+    rs: &std::sync::Arc<heph::engine::request_state::RequestState>,
+    addr: &heph::htaddr::Addr,
+    opts: &heph::engine::ResultOptions,
+) -> anyhow::Result<std::sync::Arc<heph::engine::EResult>> {
+    engine
+        .clone()
+        .result_addr(rs.clone(), addr, heph::engine::OutputMatcher::All, opts)
+        .await
+}
+
+/// A request that comes back to a revision after its read lapsed must not hand
+/// out what it memoized if another `heph` `clean`ed that revision in between:
+/// the blobs those artifacts point at are gone. It re-acquires the read, finds
+/// the manifest missing, and fails with the typed error — never an IO error
+/// on a dangling blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revision_cleaned_while_unused_is_not_served_from_the_request() -> anyhow::Result<()> {
+    use heph::engine::ResultOptions;
+    use heph::htaddr::parse_addr;
+
+    let ws = Workspace::new();
+    let addr = parse_addr("//gone:t")?;
+    ws.write_build_file(
+        "gone",
+        r#"target(name = "t", driver = "bash", run = "printf 'v' > $OUT", out = "out.txt")"#,
+    );
+
+    let resident = ws.reopen()?;
+    let rs = resident.new_state();
+    let opts = ResultOptions::default();
+    drop(resolve_all(&resident, &rs, &addr, &opts).await?);
+
+    let other = ws.reopen()?;
+    let stats = other
+        .clone()
+        .clean(
+            other.new_state(),
+            &heph::htmatcher::Matcher::Addr(addr.clone()),
+            heph::engine::Discovery::Complete,
+        )
+        .await?;
+    assert!(
+        stats.revisions_removed > 0,
+        "the clean removed nothing: {stats:?}"
+    );
+
+    let err = match resolve_all(&resident, &rs, &addr, &opts).await {
+        Ok(r) => panic!(
+            "served memoized artifacts of a cleaned revision: {:?}",
+            common::artifact_paths(&r)
+        ),
+        Err(e) => e,
+    };
+    assert!(is_revision_changed(&err), "got: {err:#}");
+    Ok(())
+}
+
+/// The same for a non-reproducible target `--force`-rebuilt by another `heph`
+/// while the request was not using it: blobs are keyed by inputs, so the new
+/// bytes sit under the old key. Serving them under the hashout this request
+/// already handed out would be a silently wrong build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revision_rebuilt_differently_while_unused_is_not_served() -> anyhow::Result<()> {
+    use heph::engine::ResultOptions;
+    use heph::htaddr::parse_addr;
+
+    let ws = Workspace::new();
+    let addr = parse_addr("//flaky:t")?;
+    ws.write_build_file(
+        "flaky",
+        r#"target(name = "t", driver = "bash", run = "printf '%s-%s' $$ $RANDOM$RANDOM > $OUT", out = "out.txt")"#,
+    );
+
+    let resident = ws.reopen()?;
+    let rs = resident.new_state();
+    let opts = ResultOptions::default();
+    let first = resolve_all(&resident, &rs, &addr, &opts).await?;
+    let first_bytes = common::artifact_string(&first);
+    drop(first);
+
+    let other = ws.reopen()?;
+    let forced = ResultOptions {
+        force: true,
+        ..ResultOptions::default()
+    };
+    let rebuilt = resolve_all(&other, &other.new_state(), &addr, &forced).await?;
+    assert_ne!(
+        common::artifact_string(&rebuilt),
+        first_bytes,
+        "the target must not be reproducible for this test to mean anything"
+    );
+    drop(rebuilt);
+
+    let err = match resolve_all(&resident, &rs, &addr, &opts).await {
+        Ok(r) => panic!(
+            "served the other build's bytes under this request's hashout: {:?}",
+            common::artifact_string(&r)
+        ),
+        Err(e) => e,
+    };
+    assert!(is_revision_changed(&err), "got: {err:#}");
+    Ok(())
+}
+
+/// Revalidation compares hashouts, not timestamps: a reproducible rebuild by
+/// another `heph` wrote the same bytes, so a request coming back to a revision
+/// it first resolved as a cache *hit* is still served. (The executed case is
+/// `a_live_request_holds_no_lock_on_results_it_no_longer_uses`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reproducible_rebuild_while_unused_still_serves_the_request() -> anyhow::Result<()> {
+    use heph::engine::ResultOptions;
+    use heph::htaddr::parse_addr;
+
+    let ws = Workspace::new();
+    let addr = parse_addr("//same:t")?;
+    ws.write_build_file(
+        "same",
+        r#"target(name = "t", driver = "bash", run = "printf 'same' > $OUT", out = "out.txt")"#,
+    );
+    let opts = ResultOptions::default();
+    let warm = ws.reopen()?;
+    drop(resolve_all(&warm, &warm.new_state(), &addr, &opts).await?);
+
+    let resident = ws.reopen()?;
+    let rs = resident.new_state();
+    drop(resolve_all(&resident, &rs, &addr, &opts).await?);
+
+    let other = ws.reopen()?;
+    let forced = ResultOptions {
+        force: true,
+        ..ResultOptions::default()
+    };
+    drop(resolve_all(&other, &other.new_state(), &addr, &forced).await?);
+
+    let again = resolve_all(&resident, &rs, &addr, &opts).await?;
+    assert_eq!(common::artifact_string(&again), "same");
+    Ok(())
+}
+
+/// A meta edge — a dependent folding this target's hashout into its own key —
+/// reads no bytes, so it takes no lock at all: not when it first resolves the
+/// target, and not when the request comes back to it. Observed by another
+/// `heph` holding the revision's write lock: the resolution still answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hashout_only_resolution_takes_no_lock() -> anyhow::Result<()> {
+    use heph::engine::{OutputMatcher, ResultOptions};
+    use heph::htaddr::parse_addr;
+
+    let ws = Workspace::new();
+    let addr = parse_addr("//meta:t")?;
+    ws.write_build_file(
+        "meta",
+        r#"target(name = "t", driver = "bash", run = "printf 'm' > $OUT", out = "out.txt")"#,
+    );
+
+    let resident = ws.reopen()?;
+    let rs = resident.new_state();
+    let opts = ResultOptions::default();
+    let first = resident
+        .clone()
+        .result_addr(rs.clone(), &addr, OutputMatcher::None, &opts)
+        .await?;
+    assert!(first.artifacts.is_empty());
+    assert_eq!(first.artifacts_meta.len(), 1);
+    let hashin = resident.clone().meta(rs.clone(), &addr).await?.hashin;
+
+    let other = ws.reopen()?;
+    let other_rs = other.new_state();
+    let write = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        other.result_lock().write(&addr, &hashin, other_rs.ctoken()),
+    )
+    .await
+    .expect("a hashout-only result kept a read on the revision")?;
+
+    let again = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        resident
+            .clone()
+            .result_addr(rs.clone(), &addr, OutputMatcher::None, &opts),
+    )
+    .await
+    .expect("a hashout-only resolution waited on the revision's lock")?;
+    assert_eq!(
+        again.artifacts_meta[0].hashout,
+        first.artifacts_meta[0].hashout
+    );
+    drop((write, first, again));
     Ok(())
 }
 

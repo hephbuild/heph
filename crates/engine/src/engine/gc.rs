@@ -39,14 +39,15 @@ use tokio::task::JoinSet;
 /// **This is a hedge, not a synchronization edge, and it is best-effort.** The
 /// batch is submitted by `RequestStateData`'s drop, and the read guards its
 /// trims contend with are released by whatever still owns them letting go.
-/// Chiefly that is the task-backed memoizer's abort cascade tearing down the
-/// request's abandoned chains — one chain's `mem_locked_result` value *is* the
-/// addr's riding cache read — which lands when the runtime processes the
-/// aborts, unordered with respect to the `try_write` this batch is about to
-/// attempt. Any other live owner — an in-flight remote upload, a task mid-poll
-/// on a runtime worker — keeps the read alive until it finishes. A trim can
-/// still be lost, and a lost trim leaves a revision on disk until the next
-/// write's trim or the next `heph gc`.
+/// No memoized value owns one: a read lives as long as the artifacts that carry
+/// it (and a remote upload holds its own while it reads the revision, released
+/// before that task lets go of the request). So what remains is artifacts still
+/// alive somewhere — chiefly the task-backed memoizer's abort cascade tearing
+/// down the request's abandoned chains, whose in-flight futures may still hold
+/// them, which lands when the runtime processes the aborts, unordered with
+/// respect to the `try_write` this batch is about to attempt — or a task
+/// mid-poll on a runtime worker. A trim can still be lost, and a lost trim
+/// leaves a revision on disk until the next write's trim or the next `heph gc`.
 ///
 /// (This used to be where the blocking pool's backstop registry got flushed:
 /// a registered `Waker`'s `Arc` chain could own the riding read past its
