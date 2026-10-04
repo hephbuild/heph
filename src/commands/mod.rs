@@ -7,6 +7,7 @@ pub mod errors;
 pub mod gendocs;
 mod global;
 pub mod inspect;
+mod progress_app;
 pub mod query;
 pub mod run;
 pub mod tool;
