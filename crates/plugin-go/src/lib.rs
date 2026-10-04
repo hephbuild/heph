@@ -7,7 +7,6 @@
         clippy::get_unwrap,
         clippy::assertions_on_result_states,
         clippy::unimplemented,
-        clippy::let_underscore_must_use,
         clippy::cloned_ref_to_slice_refs,
         unused_imports,
         reason = "restriction/style lints scoped to production code; tests are exempt"
