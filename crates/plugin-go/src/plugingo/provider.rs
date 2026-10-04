@@ -2091,22 +2091,26 @@ impl ProviderInner {
 
         // Strict addr args: every variant-parameterized go target accepts only `v`
         // (entry), `vp` (library/dep pin) and `race` (race-detector build, threaded
-        // down from a `*_race` entry target). Reject anything else rather than
-        // silently ignoring it — notably a legacy `goos`/`goarch` from a pre-variant
-        // BUILD file, which must surface as an actionable error, not resolve to the
-        // wrong thing. (The host-keyed toolchain/govet targets, which do carry
-        // `goos`/`goarch`, are handled earlier and never reach here.)
+        // down from a `*_race` entry target). Anything else — notably a legacy
+        // `goos`/`goarch` from before variants — names no target, so it is
+        // `NotFound` rather than resolving to the wrong thing. Not-found and not
+        // an error: such addrs live on in caches written before the change, and
+        // `heph tool gc` reclaims an entry only when its addr is not found — an
+        // error makes it skip the entry, keeping it forever. (The host-keyed
+        // toolchain/govet targets, which do carry `goos`/`goarch`, are handled
+        // earlier and never reach here.)
         if let Some(bad) = addr
             .args
             .keys()
             .find(|k| !matches!(k.as_str(), "v" | "vp" | factors::RACE_ARG))
         {
-            return Err(GetError::Other(anyhow::anyhow!(
-                "unknown addr arg `{bad}` on go target `:{}` (allowed: v, vp, race); \
-                 select a build variant with `@v=NAME` — `goos`/`goarch` are no \
-                 longer addr args, declare a variant instead",
-                addr.name,
-            )));
+            tracing::debug!(
+                addr = %addr.format(),
+                arg = %bad,
+                "go target rejects addr arg (allowed: v, vp, race; select a build \
+                 variant with `@v=NAME`): not found",
+            );
+            return Err(GetError::NotFound);
         }
 
         // Decide whether to honor the addr's `vp`:
@@ -3227,16 +3231,17 @@ impl ProviderInner {
             return Ok(None);
         };
 
-        // No variant to select. Reject args rather than ignore them, so a stale
-        // `format@v=NAME` is an actionable error instead of silently doing
-        // something else.
+        // No variant to select. A stale `format@v=NAME` names no target, so it is
+        // not found (`None`) rather than silently formatting something else — and
+        // not an error, so `heph tool gc` can reclaim cache entries written under
+        // it (see the variant-arg check in `get`).
         if let Some(bad) = addr.args.keys().next() {
-            anyhow::bail!(
-                "unknown addr arg `{bad}` on go target `:{}` — formatting is \
-                 syntactic and therefore variant-free; use a bare `:{}`",
-                addr.name,
-                addr.name,
+            tracing::debug!(
+                addr = %addr.format(),
+                arg = %bad,
+                "format target is variant-free and takes no addr args: not found",
             );
+            return Ok(None);
         }
 
         // Format only where the module opts in with a golangci config (the same
@@ -3380,19 +3385,18 @@ impl ProviderInner {
             return Err(GetError::NotFound);
         };
 
-        // No variant to select any more. Reject a stale `@v=`/`@vp=` rather than
-        // ignore it, so a pinned addr surfaces the migration instead of quietly
-        // linting a different (now wider) set of files.
+        // No variant to select any more. A stale `@v=`/`@vp=` names no target, so
+        // it is not found rather than quietly linting a different (now wider) set
+        // of files — and not an error, so `heph tool gc` can reclaim cache entries
+        // written under it (see the variant-arg check in `get`).
         if let Some(bad) = addr.args.keys().next() {
-            return Err(GetError::Other(anyhow::anyhow!(
-                "unknown addr arg `{bad}` on go target `:{}` — lint rules are \
-                 variant-independent, so `:{}` now aggregates every declared \
-                 variant's analysis; use a bare `:{}` (the per-variant unit is \
-                 `:_lint-analyze@v=NAME,vp=PKG`)",
-                addr.name,
-                addr.name,
-                addr.name,
-            )));
+            tracing::debug!(
+                addr = %addr.format(),
+                arg = %bad,
+                "lint target takes no addr args (use a bare name; the per-variant \
+                 unit is `:_lint-analyze@v=NAME,vp=PKG`): not found",
+            );
+            return Err(GetError::NotFound);
         }
 
         // Lint only where the module opts in with a golangci config; attach it as
@@ -5650,7 +5654,8 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     /// A stale `lint@v=NAME` (from when the gate/fixer were variant-selected)
-    /// must fail loudly rather than silently linting a now-wider set of files.
+    /// names no target: not found, rather than silently linting a now-wider set
+    /// of files — and not an error, so GC can reclaim entries cached under it.
     #[tokio::test]
     async fn test_lint_rejects_a_variant_arg() {
         require_go!();
@@ -5659,15 +5664,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
         for name in ["lint", "lint-check"] {
-            let msg = match provider_get(&p, make_addr("cmd", name)).await {
-                Err(GetError::Other(e)) => format!("{e:#}"),
-                Err(other) => panic!("expected a typed error for {name}, got {other:?}"),
+            match provider_get(&p, make_addr("cmd", name)).await {
+                Err(GetError::NotFound) => {}
+                Err(other) => panic!("expected NotFound for {name}, got {other:?}"),
                 Ok(_) => panic!("a variant arg on {name} must be rejected"),
-            };
-            assert!(
-                msg.contains("variant-independent") && msg.contains("_lint-analyze"),
-                "error must explain the aggregation and name the per-variant unit: {msg}"
-            );
+            }
         }
     }
 
@@ -5749,8 +5750,8 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     /// A stale `format@v=NAME` (e.g. carried over from when formatting was
-    /// variant-parameterized) must fail loudly, not silently format something
-    /// else.
+    /// variant-parameterized) names no target: not found, never silently
+    /// formatting something else.
     #[tokio::test]
     async fn test_format_rejects_a_variant_arg() {
         require_go!();
@@ -5758,15 +5759,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         enable_golangci(sandbox.path());
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
-        let msg = match provider_get(&p, make_addr("cmd", "format")).await {
-            Err(GetError::Other(e)) => format!("{e:#}"),
-            Err(other) => panic!("expected a typed error, got {other:?}"),
+        match provider_get(&p, make_addr("cmd", "format")).await {
+            Err(GetError::NotFound) => {}
+            Err(other) => panic!("expected NotFound, got {other:?}"),
             Ok(_) => panic!("a variant arg on format must be rejected"),
-        };
-        assert!(
-            msg.contains("variant-free") && msg.contains("`v`"),
-            "error must explain formatting is variant-free: {msg}"
-        );
+        }
     }
 
     // Lint/format targets exist ONLY for modules that opt in with a golangci
@@ -8066,7 +8063,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
 
     /// Unknown addr args are rejected. A legacy `build@goos=…,goarch=…` (a
     /// pre-variant BUILD dep) must NOT be hijacked by the magic host-default nor
-    /// silently ignored — it errors naming the offending arg, pointing at `@v=`.
+    /// silently ignored — it names no target, so it is `NotFound`. Not an error:
+    /// caches written before variants still hold entries under such addrs, and
+    /// `heph tool gc` reclaims an entry only when its addr is not found.
     #[tokio::test]
     async fn unknown_build_addr_arg_is_rejected() {
         let sandbox = copy_fixture("with_dep");
@@ -8079,17 +8078,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 ("goarch".to_string(), "amd64".to_string()),
             ]),
         );
-        let err = match provider_get(&p, addr).await {
-            Err(GetError::Other(e)) => e,
-            Err(GetError::NotFound) => panic!("expected an unknown-arg error, got NotFound"),
-            Ok(_) => panic!("expected an error, got Ok"),
-        };
-        let msg = format!("{err:#}");
-        // Args iterate sorted, so `goarch` (the first offending key) is named.
-        assert!(
-            msg.contains("unknown addr arg `goarch`") && msg.contains("@v="),
-            "error must name the bad arg and point at @v=: {msg}"
-        );
+        match provider_get(&p, addr).await {
+            Err(GetError::NotFound) => {}
+            Err(GetError::Other(e)) => panic!("expected NotFound, got an error: {e:#}"),
+            Ok(_) => panic!("expected NotFound, got Ok"),
+        }
     }
 
     /// Unknown args are rejected on non-`build` targets too (the check is general,
@@ -8106,17 +8099,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 ("bogus".to_string(), "x".to_string()),
             ]),
         );
-        let err = match provider_get(&p, addr).await {
-            Err(GetError::Other(e)) => e,
-            other => {
-                let _ = other;
-                panic!("expected an unknown-arg error")
-            }
-        };
-        assert!(
-            format!("{err:#}").contains("unknown addr arg `bogus`"),
-            "{err:#}"
-        );
+        match provider_get(&p, addr).await {
+            Err(GetError::NotFound) => {}
+            Err(GetError::Other(e)) => panic!("expected NotFound, got an error: {e:#}"),
+            Ok(_) => panic!("expected NotFound, got Ok"),
+        }
     }
 
     #[tokio::test]
