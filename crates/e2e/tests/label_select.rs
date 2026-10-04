@@ -1,6 +1,7 @@
 //! Label selection from listed labels: a provider that reports a target's
 //! labels from `list` lets a label selector decide membership without
-//! resolving the candidates, and is held to what it reported.
+//! resolving the candidates. The selection trusts the listing; `heph validate`
+//! is what holds it to the specs.
 #![expect(
     clippy::panic_in_result_fn,
     reason = "restriction/style lints scoped to production code; tests are exempt"
@@ -105,7 +106,7 @@ fn got(gets: &GetLog) -> Vec<String> {
 /// The listing decides: `query` resolves no candidate at all, and `result`
 /// resolves only the match it is about to build.
 #[tokio::test]
-async fn listed_label_query_resolves_no_spec_for_non_matches() -> anyhow::Result<()> {
+async fn listed_labels_decide_without_resolving() -> anyhow::Result<()> {
     let (ws, gets) = workspace(
         vec![
             bash("//a:yes", &["x"]),
@@ -224,8 +225,8 @@ async fn listed_match_not_found_is_dropped() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The downgrade is for listed matches only. Asked for by name, the same
-/// phantom is an error.
+/// Only a match the address alone does not decide is dropped when it does not
+/// resolve. Asked for by name, the same phantom is an error.
 #[tokio::test]
 async fn explicit_addr_not_found_still_errors() -> anyhow::Result<()> {
     let ghost = parse_addr("//a:ghost")?;
@@ -255,8 +256,8 @@ async fn explicit_addr_not_found_still_errors() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Listed matches resolve concurrently rather than one at a time on the
-/// walk's serial arm.
+/// `result` confirms label matches concurrently before admitting them, not one
+/// at a time.
 #[tokio::test]
 async fn label_query_is_parallel() -> anyhow::Result<()> {
     let targets: Vec<Target> = (0..8).map(|i| bash(&format!("//p{i}:t"), &["x"])).collect();
@@ -343,50 +344,37 @@ async fn negated_label_drops_phantoms() -> anyhow::Result<()> {
 
 /// Two providers list one addr, and only the second resolves it. Their sets
 /// differ, so the walk does not trust either and the spec decides: the target
-/// is selected by its real labels. Validate holds a listing only to its own
-/// provider's spec, so neither shape is a mismatch: the first provider's
-/// candidate is one its own `get` declines.
+/// is selected by its real labels, and validate has no listing to report.
 #[tokio::test]
 async fn providers_listing_one_addr_differently_let_the_spec_decide() -> anyhow::Result<()> {
     let x = parse_addr("//p:x")?;
-    let two = |second_lists: bool| -> anyhow::Result<htestkit::Workspace> {
-        let first = FaultProvider::new(
-            vec![],
-            Faults {
-                name: Some("first"),
-                vanished: vec![(x.clone(), strings(&["a"]))],
-                ..Default::default()
-            },
-        )?;
-        let second = FaultProvider::new(
-            vec![bash("//p:x", &["b"])],
-            Faults {
-                name: Some("second"),
-                unlisted: if second_lists {
-                    vec![]
-                } else {
-                    vec![x.clone()]
-                },
-                ..Default::default()
-            },
-        )?;
-        htestkit::WorkspaceBuilder::new()?
-            .with_provider(move |_| Box::new(first))
-            .with_provider(move |_| Box::new(second))
-            .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
-            .build()
-    };
+    let first = FaultProvider::new(
+        vec![],
+        Faults {
+            name: Some("first"),
+            vanished: vec![(x.clone(), strings(&["a"]))],
+            ..Default::default()
+        },
+    )?;
+    let second = FaultProvider::new(
+        vec![bash("//p:x", &["b"])],
+        Faults {
+            name: Some("second"),
+            ..Default::default()
+        },
+    )?;
+    let ws = htestkit::WorkspaceBuilder::new()?
+        .with_provider(move |_| Box::new(first))
+        .with_provider(move |_| Box::new(second))
+        .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+        .build()?;
 
-    let ws = two(true)?;
     let (res, events) = run(&ws, &label("b"), &ResultOptions::default()).await;
     res?;
     assert_eq!(built(&events), vec!["//p:x"]);
     let (res, events) = run(&ws, &label("a"), &ResultOptions::default()).await;
     res?;
     assert!(built(&events).is_empty(), "{events:?}");
-    assert_eq!(mismatches(&ws).await?, Vec::<String>::new());
-
-    let ws = two(false)?;
     assert_eq!(mismatches(&ws).await?, Vec::<String>::new());
     Ok(())
 }
