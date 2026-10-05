@@ -166,10 +166,11 @@ impl App for ValidateApp {
             }
             .await;
 
-            // 4. Every provider lists the labels its specs carry. A label
-            //    selector trusts the listing and never checks it; this does.
+            // 4. Every provider lists exactly the facts its targets resolve to,
+            //    and lists only what it resolves. The walks trust a listed No
+            //    and never check it; this does.
             let labels_res = Arc::clone(&engine)
-                .listed_label_mismatches(rs.clone(), &matcher, discovery.clone())
+                .listed_fact_mismatches(rs.clone(), &matcher, discovery.clone())
                 .await
                 .map(|mismatches| mismatches.iter().map(ToString::to_string).collect());
 

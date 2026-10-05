@@ -10,6 +10,7 @@ use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
     TargetSpec,
 };
+use crate::engine::query::{Candidate, reconcile_by_name};
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::spec::EngineTargetSpec;
 use async_recursion::async_recursion;
@@ -336,10 +337,10 @@ impl ProviderExecutor for EngineProviderExecutor {
                         {
                             return Err(anyhow::Error::new(CancelledError));
                         }
-                        let mut candidates: Vec<Addr> = Vec::new();
+                        let mut candidates: Vec<Candidate> = Vec::new();
                         let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
 
-                        for provider in &engine.providers {
+                        for (lister, provider) in engine.providers.iter().enumerate() {
                             if rs.skip_providers.contains(&provider.name)
                                 || extra_skip.iter().any(|n| n == &provider.name)
                             {
@@ -366,7 +367,11 @@ impl ProviderExecutor for EngineProviderExecutor {
 
                             for item in raw {
                                 if item.addr.package == pkg {
-                                    candidates.push(item.addr);
+                                    candidates.push(Candidate {
+                                        addr: item.addr,
+                                        facts: item.facts,
+                                        lister,
+                                    });
                                 }
                             }
                         }
@@ -387,9 +392,18 @@ impl ProviderExecutor for EngineProviderExecutor {
             });
             tokio::pin!(per_pkg);
 
+            // A listed No drops a candidate without `get`; a listed Yes is
+            // confirmed through `get_spec` (existence, `NotFound` and the
+            // `CycleError` skip exactly as for a shrug), so a fact can shape
+            // this dep set only by removing from it. Trust changes verdicts,
+            // never the sequence: the candidates stay package-major,
+            // provider-minor, in list order, duplicates included, because that
+            // sequence is folded in order into the consumer's def hash. No trust
+            // marker joins the hash — the dep list already is in it.
+            let trusted = rs.listed_facts_trust().trusts() && m.reads_listed_facts();
             let mut result = Vec::new();
             loop {
-                let candidates = match per_pkg.next().await {
+                let mut candidates = match per_pkg.next().await {
                     None => break,
                     Some(Ok(candidates)) => candidates,
                     // Never `?` straight out — returning drops `per_pkg` with up
@@ -403,10 +417,32 @@ impl ProviderExecutor for EngineProviderExecutor {
                         return Err(e);
                     }
                 };
-                for addr in candidates {
-                    match m.matches_addr(&addr) {
-                        MatchResult::MatchYes => result.push(addr),
+                if trusted {
+                    reconcile_by_name(&mut candidates);
+                }
+                for Candidate { addr, facts, .. } in candidates {
+                    let by_addr = m.matches_addr(&addr);
+                    let verdict = match by_addr {
+                        MatchResult::MatchShrug if trusted => m.matches_listed(&addr, &facts),
+                        decided => decided,
+                    };
+                    match verdict {
+                        MatchResult::MatchYes if by_addr == MatchResult::MatchYes => {
+                            result.push(addr)
+                        }
                         MatchResult::MatchNo => {}
+                        // A listed Yes: the candidate exists only if `get` says
+                        // so. Same speculative chain and skips as the shrug arm.
+                        MatchResult::MatchYes => {
+                            let spec_rs = rs.speculative();
+                            match Arc::clone(&engine).get_spec(spec_rs, &addr).await {
+                                Ok(_) => result.push(addr),
+                                Err(e)
+                                    if downcast_chain_ref::<TargetNotFoundError>(&e).is_some()
+                                        || downcast_chain_ref::<CycleError>(&e).is_some() => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
                         MatchResult::MatchShrug => {
                             // Resolve the candidate's spec/def only to evaluate the
                             // matcher — a speculative inspection, not a dependency. Use a
@@ -453,6 +489,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                                     };
                                     if crate::engine::matcher_target::match_target(
                                         m,
+                                        &spec,
                                         &def.target_def,
                                     ) == MatchResult::MatchYes
                                     {
@@ -12193,7 +12230,7 @@ mod tests {
                 // A `get` that builds first is go resolving through `_golist`,
                 // and these tests are about what that resolve touches. A label
                 // walk only reaches it when the listing leaves labels unknown.
-                labels_unknown: shape.builds.is_some(),
+                facts_unknown: shape.builds.is_some(),
                 builds,
                 fail_list_packages: shape.fail_listing,
                 ..Default::default()

@@ -26,7 +26,7 @@ pub struct Args {
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
     /// Select targets with a query expression, e.g. -e '//pkg/... && !//vendor/...'.
-    /// Supports &&, ||, !, parentheses, and the label()/tree_output() functions.
+    /// Supports &&, ||, !, parentheses, and the label()/driver()/tree_output() functions.
     /// Mutually exclusive with the positional TARGET arguments.
     #[arg(
         short = 'e',

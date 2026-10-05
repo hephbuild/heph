@@ -322,6 +322,13 @@ pub struct RequestStateData {
     /// diagnostic box (`heph run --log-lines`). The full log is always saved as
     /// the `log.txt` artifact; this only bounds the rendered tail.
     pub log_tail_lines: usize,
+    /// Whether this request's walks act on listed facts — `Engine::query`'s
+    /// and the query-target walk (`EngineProviderExecutor::query`). Never read
+    /// by `states_under`, `Engine::states`, `get_spec` or `Selection::selects`.
+    pub listed_facts_trust: crate::engine::listed::ListedFactsTrust,
+    /// How many candidates `Engine::query` decided from listed facts alone,
+    /// across every walk of this request. For "why did nothing match?".
+    pub listed_decided: std::sync::atomic::AtomicUsize,
     /// Optional one-way build-progress event stream. Lives in the shared
     /// `Arc<RequestStateData>`, so `with_parent` / `with_skip_provider` children
     /// inherit it for free.
@@ -666,7 +673,7 @@ impl Selection {
             MatchResult::MatchYes => true,
             MatchResult::MatchNo => false,
             MatchResult::MatchShrug => {
-                crate::engine::matcher_target::match_target(&self.matcher, def)
+                crate::engine::matcher_target::match_target(&self.matcher, spec, def)
                     == MatchResult::MatchYes
             }
         }
@@ -757,6 +764,18 @@ impl RequestState {
 
     /// Trailing process-log lines to render in a failure box (see
     /// [`RequestStateData::log_tail_lines`]).
+    pub fn listed_facts_trust(&self) -> crate::engine::listed::ListedFactsTrust {
+        self.data.listed_facts_trust
+    }
+
+    /// How many candidates this request's selection walks decided from listed
+    /// facts alone, without resolving them.
+    pub fn listed_decided(&self) -> usize {
+        self.data
+            .listed_decided
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn log_tail_lines(&self) -> usize {
         self.data.log_tail_lines
     }
@@ -1095,6 +1114,15 @@ impl Drop for RequestStateData {
     }
 }
 
+/// How a request built by `Engine::new_state_inner` behaves beyond its
+/// front-end options.
+#[derive(Debug, Clone, Copy)]
+struct RequestMode {
+    /// See [`RequestStateData::hash_only`].
+    hash_only: bool,
+    listed_facts_trust: crate::engine::listed::ListedFactsTrust,
+}
+
 impl Engine {
     pub fn new_state(self: &Arc<Self>) -> Arc<RequestState> {
         self.new_state_with_fail_fast(true)
@@ -1141,7 +1169,29 @@ impl Engine {
             bg_pending,
             log_tail_lines,
             approval,
-            false,
+            RequestMode {
+                hash_only: false,
+                listed_facts_trust: self.cfg.listed_facts_trust,
+            },
+        )
+    }
+
+    /// [`new_state`](Self::new_state) with this request's listed-facts trust
+    /// chosen by the caller rather than taken from the engine's config.
+    pub fn new_state_with_listed_facts_trust(
+        self: &Arc<Self>,
+        trust: crate::engine::listed::ListedFactsTrust,
+    ) -> Arc<RequestState> {
+        self.new_state_inner(
+            true,
+            None,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Self::DEFAULT_LOG_TAIL_LINES,
+            None,
+            RequestMode {
+                hash_only: false,
+                listed_facts_trust: trust,
+            },
         )
     }
 
@@ -1163,7 +1213,10 @@ impl Engine {
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             Self::DEFAULT_LOG_TAIL_LINES,
             None,
-            true,
+            RequestMode {
+                hash_only: true,
+                listed_facts_trust: self.cfg.listed_facts_trust,
+            },
         )
         .with_parent(parent)
     }
@@ -1175,7 +1228,10 @@ impl Engine {
         bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
         log_tail_lines: usize,
         approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
-        hash_only: bool,
+        RequestMode {
+            hash_only,
+            listed_facts_trust,
+        }: RequestMode,
     ) -> Arc<RequestState> {
         // Unique per top-level request. `with_parent`/`with_skip_provider`
         // children share this `RequestStateData` (and thus this id), so a request
@@ -1204,6 +1260,8 @@ impl Engine {
             mem_states_under: Memoizer::with_tag_task("states_under", self.runtime.clone()),
             fail_fast,
             log_tail_lines,
+            listed_facts_trust,
+            listed_decided: std::sync::atomic::AtomicUsize::new(0),
             events,
             hooks: self.hooks(),
             workers_announced: std::sync::atomic::AtomicBool::new(false),

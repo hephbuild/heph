@@ -6,6 +6,11 @@
 //! - bare patterns — `//pkg` ([`Matcher::Package`]), `//pkg/...`
 //!   ([`Matcher::PackagePrefix`]), `//pkg:name` ([`Matcher::Addr`]); relative
 //!   forms (`./x`, `../x`, `.`, `..`) resolve against the base package.
+//! - `driver("name")` ([`Matcher::Driver`]) — the spec's driver, compared whole
+//!   and case-sensitively. Its argument is a string literal with escapes
+//!   (`\\`, `\"`, `\n`, `\r`, `\t`, `\u{HEX}`), or a bare word; `driver()` is
+//!   an error. Escapes apply only there: every other quoted word reads as
+//!   before.
 //! - functions — `label(x)`, `tree_output(pkg)`, plus the explicit
 //!   `addr(x)`, `package(x)`, `package_prefix(x)` forms. `label`'s argument
 //!   must be a well-formed label (`[A-Za-z0-9_-]+`, see [`crate::htlabel`]);
@@ -71,6 +76,13 @@ fn fmt_prec(m: &Matcher, parent_prec: u8, out: &mut String) {
             out.push_str(l);
             out.push(')');
         }
+        // Always quoted: a driver name is arbitrary text, so `parse` reads
+        // back exactly what was rendered.
+        Matcher::Driver(d) => {
+            out.push_str("driver(");
+            quote_string(d, out);
+            out.push(')');
+        }
         Matcher::TreeOutputTo(p) => {
             out.push_str("tree_output(");
             out.push_str(p.as_str());
@@ -123,6 +135,9 @@ enum Tok {
     RParen,
     /// A pattern or function-name token (e.g. `//foo:bar`, `label`).
     Word(String),
+    /// A string literal with its escapes resolved — only ever `driver`'s
+    /// argument.
+    Str(String),
 }
 
 impl Tok {
@@ -134,6 +149,11 @@ impl Tok {
             Tok::LParen => "(".to_string(),
             Tok::RParen => ")".to_string(),
             Tok::Word(w) => w.clone(),
+            Tok::Str(s) => {
+                let mut out = String::new();
+                quote_string(s, &mut out);
+                out
+            }
         }
     }
 }
@@ -178,6 +198,13 @@ fn tokenize(input: &str) -> Result<Vec<Tok>> {
                 }
                 tokens.push(Tok::Or);
             }
+            // `driver("…")`'s argument is a string literal with escapes. Scoped
+            // to that one position, so every other quoted word tokenizes
+            // exactly as it always did — a `\` in one stays a `\`.
+            '"' if tokens.ends_with(&[Tok::Word(DRIVER_FN.to_string()), Tok::LParen]) => {
+                chars.next();
+                tokens.push(Tok::Str(unescape_string(&mut chars)?));
+            }
             '"' => {
                 chars.next();
                 let mut s = String::new();
@@ -208,6 +235,72 @@ fn tokenize(input: &str) -> Result<Vec<Tok>> {
         }
     }
     Ok(tokens)
+}
+
+/// The one function whose argument is a string literal with escapes.
+const DRIVER_FN: &str = "driver";
+
+/// The body of a `"…"` literal after its opening quote, through the closing
+/// one. Escapes: `\\`, `\"`, `\n`, `\r`, `\t` and `\u{HEX}`; anything else
+/// after a `\` is an error rather than a guess.
+fn unescape_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<String> {
+    let mut s = String::new();
+    loop {
+        match chars.next() {
+            None => bail!("unterminated string literal in query"),
+            Some('"') => return Ok(s),
+            Some('\\') => match chars.next() {
+                Some('\\') => s.push('\\'),
+                Some('"') => s.push('"'),
+                Some('n') => s.push('\n'),
+                Some('r') => s.push('\r'),
+                Some('t') => s.push('\t'),
+                Some('u') => {
+                    if chars.next() != Some('{') {
+                        bail!("expected `{{` after `\\u` in string literal");
+                    }
+                    let mut hex = String::new();
+                    loop {
+                        match chars.next() {
+                            Some('}') => break,
+                            Some(c) if c.is_ascii_hexdigit() && hex.len() < 6 => hex.push(c),
+                            _ => bail!("malformed `\\u{{…}}` escape in string literal"),
+                        }
+                    }
+                    let c = u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .with_context(|| format!("`\\u{{{hex}}}` is not a character"))?;
+                    s.push(c);
+                }
+                Some(c) => bail!("unknown escape `\\{c}` in string literal"),
+                None => bail!("unterminated string literal in query"),
+            },
+            Some(c) => s.push(c),
+        }
+    }
+}
+
+/// `s` as a `"…"` literal [`unescape_string`] reads back unchanged. Control
+/// characters are escaped so a rendered query never carries a raw one.
+fn quote_string(s: &str, out: &mut String) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                // Writing to a `String` cannot fail.
+                write!(out, "\\u{{{:x}}}", u32::from(c)).unwrap_or_default();
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// Cap on `!`/`(…)` nesting depth. Each level of nesting descends through
@@ -305,10 +398,10 @@ impl<'a> Parser<'a> {
                     // An empty arg list (`tree_output()`) is allowed: it denotes
                     // the root package for the package-shaped functions.
                     let arg = if matches!(self.peek(), Some(Tok::RParen)) {
-                        String::new()
+                        None
                     } else {
                         match self.bump() {
-                            Some(Tok::Word(a)) => a.clone(),
+                            Some(Tok::Word(a) | Tok::Str(a)) => Some(a.as_str()),
                             Some(other) => {
                                 bail!("expected argument to `{w}()`, found `{}`", other.describe())
                             }
@@ -319,13 +412,20 @@ impl<'a> Parser<'a> {
                         Some(Tok::RParen) => {}
                         Some(other) => {
                             bail!(
-                                "expected `)` after `{w}({arg})`, found `{}`",
+                                "expected `)` after `{w}({})`, found `{}`",
+                                arg.unwrap_or_default(),
                                 other.describe()
                             )
                         }
                         None => bail!("unclosed `(` in `{w}(`"),
                     }
-                    self.func_to_matcher(w, &arg)
+                    if w == DRIVER_FN {
+                        let Some(arg) = arg else {
+                            bail!("`driver()` needs a driver name, e.g. `driver(\"credential\")`");
+                        };
+                        return Ok(Matcher::Driver(arg.to_string()));
+                    }
+                    self.func_to_matcher(w, arg.unwrap_or_default())
                 } else {
                     self.pattern_to_matcher(w)
                 }
@@ -357,7 +457,7 @@ impl<'a> Parser<'a> {
                 })?))
             }
             other => bail!(
-                "unknown query function `{other}` (expected one of: label, tree_output, addr, package, package_prefix)"
+                "unknown query function `{other}` (expected one of: label, tree_output, addr, package, package_prefix, driver)"
             ),
         }
     }
@@ -699,6 +799,87 @@ mod tests {
         assert!(parse("package(../../etc)", &base()).is_err());
         assert!(parse("package_prefix(../../etc)", &base()).is_err());
         assert!(parse("tree_output(../../etc)", &base()).is_err());
+    }
+
+    #[test]
+    fn htquery_driver_roundtrip() {
+        assert_eq!(
+            p("driver(\"credential\")"),
+            Matcher::Driver("credential".to_string())
+        );
+        assert_eq!(p("driver(bash)"), Matcher::Driver("bash".to_string()));
+        assert_eq!(p("driver(\"\")"), Matcher::Driver(String::new()));
+        assert_eq!(format(&p("driver(bash)")), "driver(\"bash\")");
+        let base = base();
+        for name in [
+            "credential",
+            "",
+            "with space",
+            "quote\"inside",
+            "back\\slash",
+            "trailing\\",
+            "caf\u{e9} \u{1F600}",
+            "ctl\u{1}\u{7f}\n\t\r",
+            "(&&||!)",
+            "label(x)",
+        ] {
+            let m = Matcher::And(vec![
+                Matcher::Not(Box::new(Matcher::Driver(name.to_string()))),
+                Matcher::Label("x".to_string()),
+            ]);
+            let rendered = format(&m);
+            assert!(
+                !rendered.chars().any(|c| c.is_control()),
+                "raw control byte in {rendered:?}"
+            );
+            let back = parse(&rendered, &base)
+                .unwrap_or_else(|e| panic!("re-parsing {rendered:?}: {e:#}"));
+            assert_eq!(back, m, "{name:?} -> {rendered:?}");
+        }
+        assert_eq!(
+            p("driver(\"\\u{41}\\\"\\\\\")"),
+            Matcher::Driver("A\"\\".to_string())
+        );
+    }
+
+    #[test]
+    fn driver_without_argument_is_parse_error() {
+        let err = parse("driver()", &base()).expect_err("driver() must not parse");
+        assert!(format!("{err:#}").contains("driver"), "{err:#}");
+        let unknown = parse("drivr(x)", &base()).expect_err("unknown function");
+        assert!(
+            format!("{unknown:#}").contains("package_prefix, driver"),
+            "{unknown:#}"
+        );
+        for bad in [
+            "driver(\"unterminated)",
+            "driver(\"bad \\q escape\")",
+            "driver(\"\\u{zz}\")",
+            "driver(\"\\u{d800}\")",
+            "driver(\"\\u{1234567}\")",
+            "driver(a b)",
+        ] {
+            assert!(parse(bad, &base()).is_err(), "{bad} should not parse");
+        }
+    }
+
+    /// Escapes belong to `driver`'s argument only: every other quoted word
+    /// tokenizes as on `master`, backslash and all.
+    #[test]
+    fn escapes_scoped_to_driver_argument() {
+        // `\` is not an escape here, so the word ends at the first `"`.
+        assert_eq!(p("package(\"a\\\")"), Matcher::Package(PkgBuf::from("a\\")));
+        assert_eq!(
+            p("\"//foo/bar\""),
+            Matcher::Package(PkgBuf::from("foo/bar"))
+        );
+        assert!(parse("label(\"my label\")", &base()).is_err());
+        assert_eq!(p("label(\"foo\")"), Matcher::Label("foo".to_string()));
+        // A `driver` word elsewhere is just a word.
+        assert_eq!(
+            p("package(\"driver\\\")"),
+            Matcher::Package(PkgBuf::from("driver\\"))
+        );
     }
 
     #[test]

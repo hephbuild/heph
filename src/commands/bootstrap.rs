@@ -137,7 +137,16 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // The config file is the all-optional, profile-layered YAML; `resolve`
     // applies every default in one place and yields the engine's runtime config.
     let file = config_yaml::load_from_root(&root)?;
-    let config = file.resolve(&root)?;
+    let mut config = file.resolve(&root)?;
+    // The kill switch for listed facts: every candidate a fact would have
+    // decided is resolved instead. Read here, never by the engine. It is
+    // outside every cache key on purpose: a query target's dep list is already
+    // in its def hash, so a key moves only when trust changed the dep set —
+    // which only a lying listed fact can do — and a trust marker there would
+    // only split keys that are equal.
+    config.listed_facts_trust = engine::listed::ListedFactsTrust::from_kill_switch(
+        std::env::var_os("HEPH_NO_LISTED_FACTS").is_some_and(|v| !v.is_empty() && v != "0"),
+    );
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend

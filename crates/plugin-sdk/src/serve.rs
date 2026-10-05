@@ -497,12 +497,7 @@ async fn provider_list_stream(
         Ok(iter) => make_item_stream(frame_iter(iter, |lr| {
             pb::ListResponse {
                 addr: Some(convert::addr_to_pb(&lr.addr)),
-                labels_known: lr.labels.is_some(),
-                labels: lr
-                    .labels
-                    .as_deref()
-                    .map(<[String]>::to_vec)
-                    .unwrap_or_default(),
+                facts: convert::listed_facts_to_pb(&lr.facts),
             }
             .encode_to_vec()
         })),

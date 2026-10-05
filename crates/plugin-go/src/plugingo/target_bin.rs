@@ -144,7 +144,7 @@ pub fn build_spec(
 
     TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: crate::plugingo::listed::DRIVER_BASH.to_string(),
         config,
         ..Default::default()
     }

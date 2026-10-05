@@ -50,7 +50,7 @@ fn workspace(
     let faults = Faults {
         // Resolving through a build is go's `_golist`; a label walk only
         // reaches it when the listing leaves labels unknown.
-        labels_unknown: builds.is_some(),
+        facts_unknown: builds.is_some(),
         builds: match builds {
             Some((t, b)) => vec![(parse_addr(t)?, parse_addr(b)?)],
             None => vec![],

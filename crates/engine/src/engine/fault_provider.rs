@@ -14,12 +14,14 @@ use crate::engine::discovery::Stage;
 use crate::engine::error::{CancelledError, MultiError};
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
+    ListPackagesRequest, ListRequest, ListResponse, ListedFacts, ProbeRequest, ProbeResponse,
+    Provider, State,
 };
 use futures::future::BoxFuture;
 use hbuiltins::pluginstatictarget;
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;
+use hmodel::htpkg::PkgBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -64,12 +66,22 @@ pub struct Faults {
     /// cancelled, then fail the way a call with two dependencies in flight
     /// does — a `MultiError` of two cancellations.
     pub cancel_at: Option<(Stage, String, Arc<tokio::sync::Notify>)>,
-    /// `list` reports no labels, like a plugin built before ABI 0.11, so a
-    /// label selector resolves every candidate's spec to decide.
-    pub labels_unknown: bool,
+    /// `list` reports no facts, like a plugin built before ABI 0.12, so a
+    /// selector that reads one resolves every candidate's spec to decide.
+    pub facts_unknown: bool,
     /// Labels its `list` reports for these static targets instead of their
     /// real ones: a listing that lies about what `get` will return.
     pub listed_labels: Vec<(Addr, Vec<String>)>,
+    /// The facts `list` reports for an entry, as a function of its addr and
+    /// the states the `list` call received; `None` keeps what it would report
+    /// otherwise. Applied last, to every entry.
+    pub listed_facts: Option<FactsFn>,
+    /// Provider states its probe of each package declares, inherited down the
+    /// tree like `provider_state(...)`: what `list` and `get` receive.
+    pub states: Vec<(
+        String,
+        std::collections::HashMap<String, hcore::htvalue::Value>,
+    )>,
     /// Targets it lists with these labels and that `get` says do not exist:
     /// go listing `test` in a package that turns out to have no tests.
     pub vanished: Vec<(Addr, Vec<String>)>,
@@ -78,11 +90,31 @@ pub struct Faults {
     pub slow_get: Option<Duration>,
 }
 
+/// [`Faults::listed_facts`]: what `list` says about an entry.
+#[derive(Clone)]
+pub struct FactsFn(pub Arc<FactsFnInner>);
+
+/// The function behind a [`FactsFn`].
+pub type FactsFnInner = dyn Fn(&Addr, &[State]) -> Option<ListedFacts> + Send + Sync;
+
+impl FactsFn {
+    pub fn new(f: impl Fn(&Addr, &[State]) -> Option<ListedFacts> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for FactsFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FactsFn(..)")
+    }
+}
+
 /// The static provider, misbehaving as [`Faults`] says.
 pub struct FaultProvider {
     inner: pluginstatictarget::Provider,
     faults: Faults,
     list_packages_calls: Arc<AtomicUsize>,
+    list_calls: Arc<AtomicUsize>,
     gets: Arc<GetLog>,
 }
 
@@ -130,8 +162,15 @@ impl FaultProvider {
             inner: pluginstatictarget::Provider::new(targets)?,
             faults,
             list_packages_calls: Arc::new(AtomicUsize::new(0)),
+            list_calls: Arc::new(AtomicUsize::new(0)),
             gets: Arc::default(),
         })
+    }
+
+    /// How many times `list` was called, readable after the provider has been
+    /// handed to the engine.
+    pub fn list_calls(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.list_calls)
     }
 
     /// What reached `get`, readable after the provider has been handed to
@@ -199,8 +238,10 @@ impl Provider for FaultProvider {
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
     {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             let pkg = req.package.as_str().to_string();
+            let states = req.states.clone();
             if let Some(e) = self.cancelled(Stage::List, &pkg, ctoken).await {
                 return Err(e);
             }
@@ -237,7 +278,12 @@ impl Provider for FaultProvider {
                 .vanished
                 .iter()
                 .filter(|(a, _)| a.package == req.package)
-                .map(|(a, labels)| Ok(ListResponse::with_labels(a.clone(), labels.as_slice())))
+                .map(|(a, labels)| {
+                    Ok(ListResponse::with_facts(
+                        a.clone(),
+                        ListedFacts::default().with_labels(labels.iter().cloned()),
+                    ))
+                })
                 .collect();
             let listed: Vec<_> = self
                 .inner
@@ -247,15 +293,32 @@ impl Provider for FaultProvider {
                 .map(|res| {
                     res.map(|t| {
                         match self.faults.listed_labels.iter().find(|(a, _)| *a == t.addr) {
-                            Some((_, lie)) => ListResponse::with_labels(t.addr, lie.as_slice()),
-                            None if self.faults.labels_unknown => ListResponse::addr_only(t.addr),
+                            Some((_, lie)) => ListResponse::with_facts(
+                                t.addr,
+                                t.facts.with_labels(lie.iter().cloned()),
+                            ),
+                            None if self.faults.facts_unknown => ListResponse::addr_only(t.addr),
                             None => t,
                         }
                     })
                 })
                 .collect();
-            Ok(Box::new(broken.into_iter().chain(vanished).chain(listed))
-                as Box<dyn Iterator<Item = _> + Send>)
+            let facts = self.faults.listed_facts.clone();
+            Ok(
+                Box::new(
+                    broken
+                        .into_iter()
+                        .chain(vanished)
+                        .chain(listed)
+                        .map(move |res| match &facts {
+                            Some(FactsFn(f)) => res.map(|t| match f(&t.addr, &states) {
+                                Some(facts) => ListResponse::with_facts(t.addr, facts),
+                                None => t,
+                            }),
+                            None => res,
+                        }),
+                ) as Box<dyn Iterator<Item = _> + Send>,
+            )
         })
     }
 
@@ -351,7 +414,20 @@ impl Provider for FaultProvider {
             if self.faults.fail_probe.contains(&pkg) {
                 anyhow::bail!("BUILD: syntax error");
             }
-            self.inner.probe(req, ctoken).await
+            let declared: Vec<State> = self
+                .faults
+                .states
+                .iter()
+                .filter(|(p, _)| *p == pkg)
+                .map(|(p, state)| State {
+                    package: PkgBuf::from(p.as_str()),
+                    provider: self.faults.name.unwrap_or("faulty").to_string(),
+                    state: state.clone(),
+                })
+                .collect();
+            let mut res = self.inner.probe(req, ctoken).await?;
+            res.states.extend(declared);
+            Ok(res)
         })
     }
 }
@@ -520,7 +596,7 @@ mod tests {
     async fn a_gate_releases_every_failing_get() -> anyhow::Result<()> {
         let (engine, _root, _) = faulty_engine(Faults {
             // So the label walk has to `get` each candidate.
-            labels_unknown: true,
+            facts_unknown: true,
             fail_get: vec![addr("//a:ok"), addr("//a:other")],
             gate: Some(Arc::new(tokio::sync::Notify::new())),
             slow_list: Some(("b".to_string(), Duration::from_millis(50))),

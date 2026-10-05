@@ -7,7 +7,7 @@ use crate::plugingo::errors::NoGoFilesError;
 use crate::plugingo::factors::{self, Factors, VariantRef, current_goarch, current_goos};
 use crate::plugingo::gocache;
 use crate::plugingo::govet;
-use crate::plugingo::labels;
+use crate::plugingo::listed;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
     is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires, parse_go_sum_modules,
@@ -35,8 +35,8 @@ use hmodel::htaddr::Addr;
 use hmodel::htpkg::{PkgBuf, join_rel_checked_pkg};
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
-    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
-    ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
+    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ListedFacts,
+    Provider as ProviderTrait, ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
 };
 use hwalk::{CachedWalker, EntryKind, Ignore};
 use parking_lot::RwLock;
@@ -1061,26 +1061,29 @@ impl ProviderInner {
                 }
             }
 
-            // Labels come from the same table the spec builders use, so a label
+            // Facts come from the same constants the spec builders use, so a
             // selector decides from here without a `_golist` per candidate. A
-            // handful of distinct sets across every name and variant: build each
-            // once and share it.
-            let mut sets: Vec<(&'static [&'static str], Arc<[String]>)> = Vec::new();
+            // handful of distinct (name, bare) pairs across every variant:
+            // build each once and share its `Arc`s.
+            //
+            let cx = list_context(&kind, &req.states, req.package.as_str());
+            let mut known: Vec<((String, bool), ListedFacts)> = Vec::new();
             let responses: Vec<anyhow::Result<ListResponse>> = addrs
                 .into_iter()
                 .map(|addr| {
-                    let Some(set) = labels::listed(&addr.name) else {
-                        return Ok(ListResponse::addr_only(addr));
-                    };
-                    let shared = match sets.iter().find(|(s, _)| *s == set) {
-                        Some((_, shared)) => Arc::clone(shared),
+                    let bare = addr.args.is_empty();
+                    let facts = match known
+                        .iter()
+                        .find(|((n, b), _)| *b == bare && *n == addr.name)
+                    {
+                        Some((_, facts)) => facts.clone(),
                         None => {
-                            let shared: Arc<[String]> = labels::owned(set).into();
-                            sets.push((set, Arc::clone(&shared)));
-                            shared
+                            let facts = listed::facts(&addr.name, bare, cx);
+                            known.push(((addr.name.clone(), bare), facts.clone()));
+                            facts
                         }
                     };
-                    Ok(ListResponse::with_labels(addr, shared))
+                    Ok(ListResponse::with_facts(addr, facts))
                 })
                 .collect();
             Ok(Box::new(responses.into_iter())
@@ -1515,6 +1518,19 @@ fn applicable_states<'a>(states: &'a [State], addr_pkg: &str, key: &str) -> Vec<
         .collect();
     out.sort_by_key(|s| s.package.as_str().len());
     out
+}
+
+/// What `list` knows about a package's names before `_golist`. The test driver
+/// follows the chain's `pre_run`, read the way `get` reads it; a chain whose
+/// `test` state does not parse leaves it unknown, so `get` reports that error
+/// rather than `list`.
+fn list_context(kind: &GoPackageKind, states: &[State], pkg: &str) -> listed::ListContext {
+    listed::ListContext {
+        stdlib: matches!(kind, GoPackageKind::Stdlib { .. }),
+        test_driver: pick_test_env(states, pkg)
+            .ok()
+            .map(|env| listed::test_driver(!env.pre_run.is_empty())),
+    }
 }
 
 fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test::TestEnv> {
@@ -7518,6 +7534,44 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             )],
         )];
         assert!(pick_test_env(&states, "foo").is_err());
+    }
+
+    /// C25: a `test` state `get` would reject lists the test driver as
+    /// unknown — the entry takes the spec path — and is never a `list` error.
+    /// A good chain lists `bash` under a `pre_run` and `exec` without one.
+    #[test]
+    fn pick_test_env_failure_leaves_driver_unknown() {
+        let kind = GoPackageKind::FirstParty {
+            module_root: PathBuf::from("m"),
+            module_path: "example.com/m".to_string(),
+            import_path: "example.com/m/foo".to_string(),
+            src_dir: PathBuf::from("m/foo"),
+        };
+        let bad = vec![state_with_test_map(
+            "foo",
+            vec![("skip", Value::Bool(true))],
+        )];
+        let cx = list_context(&kind, &bad, "foo");
+        assert_eq!(cx.test_driver, None);
+        assert_eq!(listed::facts("test", false, cx).driver(), None);
+        // The labels are still known: only the driver depended on the state.
+        assert_eq!(
+            listed::facts("test", false, cx).labels(),
+            Some(&["go-test".to_string(), "test".to_string()][..])
+        );
+
+        let pre_run = vec![state_with_test_map(
+            "foo",
+            vec![(
+                "pre_run",
+                Value::List(vec![Value::String("echo hi".to_string())]),
+            )],
+        )];
+        assert_eq!(
+            list_context(&kind, &pre_run, "foo").test_driver,
+            Some("bash")
+        );
+        assert_eq!(list_context(&kind, &[], "foo").test_driver, Some("exec"));
     }
 
     #[test]

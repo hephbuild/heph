@@ -74,6 +74,9 @@ message Matcher {
     List or = 6;
     List and = 7;
     Matcher not = 8;
+    // New in 0.12.0. An old host decodes an unknown arm as an empty `Or`;
+    // from 0.12.0 on, an unknown arm is a decode error.
+    string driver = 9;
   }
 }
 

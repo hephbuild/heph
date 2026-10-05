@@ -35,12 +35,19 @@ Query language (-e / --expr):
   Functions:
     label(x)             targets carrying label x   (e.g. label(go-lint))
     tree_output(pkg)     targets whose codegen tree writes into pkg
+    driver(\"name\")       targets run by that driver, whole name, case-sensitive
+                         (e.g. driver(\"credential\"); escapes: \\\\ \\\" \\n \\t \\u{..})
     addr(//pkg:name)     an explicit target address
     package(//pkg)       an explicit package
     package_prefix(//pkg) every package under //pkg
   Operators (precedence ! > && > ||, group with parentheses):
     a && b               both          a || b   either          !a   negate
   Evaluation follows grouping then left-to-right, bailing as early as possible.
+
+  label(), driver() and tree_output() are decided from what providers list
+  where they can, without resolving each target. So `query` may print a listed
+  target that turns out not to exist (`run` drops it). HEPH_NO_LISTED_FACTS=1
+  resolves every candidate instead; `heph validate` checks the listings.
 
   Examples:
     heph run -e '//some/... && label(foo)'
@@ -62,7 +69,7 @@ pub struct RunArgs {
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
     /// Select targets with a query expression, e.g. -e '//pkg/... && !//vendor/...'.
-    /// Supports &&, ||, !, parentheses, and the label()/tree_output() functions.
+    /// Supports &&, ||, !, parentheses, and the label()/driver()/tree_output() functions.
     /// Mutually exclusive with the positional TARGET arguments.
     #[arg(
         short = 'e',

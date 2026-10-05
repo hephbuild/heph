@@ -34,7 +34,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use crate::plugingo::driver_lint::staged_paths_in_group;
-use crate::plugingo::labels;
+use crate::plugingo::listed;
 
 /// Dep group carrying the `heph-govet` binary (shared with lint; staged read-only).
 const GOVET_TOOL_GROUP: &str = "govet_tool";
@@ -530,12 +530,12 @@ pub fn build_format_spec(p: FormatParams) -> TargetSpec {
     );
     TargetSpec {
         addr: p.addr,
-        driver: "go_format".to_string(),
+        driver: listed::DRIVER_FORMAT.to_string(),
         config,
         // The plain `format` target is the FIXER (it rewrites sources), so it owns
         // the plain labels — `go-format` + `format` — plus `fix`. Checking without
         // rewriting is `format-check`.
-        labels: labels::owned(labels::FORMAT),
+        labels: listed::owned(listed::FORMAT),
         transitive: Default::default(),
         approval: Default::default(),
     }
@@ -548,11 +548,11 @@ pub fn build_format_check_spec(p: FormatParams) -> TargetSpec {
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     TargetSpec {
         addr: p.addr,
-        driver: "go_format_check".to_string(),
+        driver: listed::DRIVER_FORMAT_CHECK.to_string(),
         config,
         // The read-only checker (`format-check`): `go-format-check` among go
         // targets, `format-check` across every language.
-        labels: labels::owned(labels::FORMAT_CHECK),
+        labels: listed::owned(listed::FORMAT_CHECK),
         transitive: Default::default(),
         approval: Default::default(),
     }

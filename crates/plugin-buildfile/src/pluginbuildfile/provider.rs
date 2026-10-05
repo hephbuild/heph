@@ -8,7 +8,7 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::provider::GetError::NotFound;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
+    ListPackagesRequest, ListRequest, ListResponse, ListedFacts, ProbeRequest, ProbeResponse,
     Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
 };
 use hwalk::{CachedWalker, Ignore};
@@ -528,12 +528,26 @@ impl EProvider for Provider {
             let items: Vec<anyhow::Result<ListResponse>> = res
                 .targets
                 .iter()
-                // The package is already evaluated, so the labels `get` will
-                // return (`p.labels`, below) cost nothing to report here.
+                // The package is already evaluated, so the labels and driver
+                // `get` will return cost nothing to report here — the driver
+                // through the same `defaultDriver` fallback `get` applies.
+                // `has_codegen` stays unknown: only the driver's `parse` knows
+                // which outputs are codegen, and a wrong `false` would be a
+                // listed No that drops a codegen dep from a `tree_output`
+                // query.
                 .map(|p| {
-                    Ok(ListResponse::with_labels(
+                    let mut facts = ListedFacts::default().with_labels(p.labels.iter().cloned());
+                    let driver = if p.driver.is_empty() {
+                        self.default_driver.as_deref()
+                    } else {
+                        Some(p.driver.as_str())
+                    };
+                    if let Some(driver) = driver {
+                        facts = facts.with_driver(driver);
+                    }
+                    Ok(ListResponse::with_facts(
                         Addr::new(req.package.clone(), p.name.clone(), Default::default()),
-                        p.labels.as_slice(),
+                        facts,
                     ))
                 })
                 .collect();

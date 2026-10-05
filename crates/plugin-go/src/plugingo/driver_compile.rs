@@ -14,7 +14,7 @@
 
 use crate::plugingo::embed;
 use crate::plugingo::factors::BuildMode;
-use crate::plugingo::labels;
+use crate::plugingo::listed;
 use crate::plugingo::pkg_analysis::decode_go_package;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -1066,9 +1066,9 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
 
     TargetSpec {
         addr: p.addr,
-        driver: "go_compile".to_string(),
+        driver: listed::DRIVER_COMPILE.to_string(),
         config,
-        labels: labels::owned(labels::BUILD),
+        labels: listed::owned(listed::BUILD),
         ..Default::default()
     }
 }

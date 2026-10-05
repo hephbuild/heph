@@ -60,7 +60,18 @@ anything `get_stabbied` would reject:
   to its own version; a mismatch fails `get_stabbied`.
 
 A **removed** or **renumbered** proto field (vs an added one) is wire-breaking →
-also major.
+also major — with one exception, below.
+
+**Removing a field is minor when its absence decodes to the safe default in
+both directions.** That holds when an old peer that still sends the field is
+read by the new side as if it had sent nothing, and the new side's silence is
+read by the old peer as its own "unknown". The removed numbers and names are
+`reserved` so they are never reused. 0.12.0 is the case in point: it removes
+0.11.0's `ListResponse.labels`/`labels_known` (2, 3) in favour of `facts` (4).
+An old plugin's fields 2 and 3 are skipped and `facts` is absent — unknown; a
+pre-0.12 host reads absent `labels_known` as false — unknown. Neither side
+ever reads the other's silence as "no labels". A removal that fails either
+direction is major.
 
 ## What does NOT require a bump
 
