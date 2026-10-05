@@ -126,8 +126,17 @@ async fn deps(
     rs: Arc<RequestState>,
     expr: &str,
 ) -> anyhow::Result<Vec<String>> {
+    deps_of(ws, rs, &query_addr(expr)).await
+}
+
+/// [`deps`] of a query target given by its full addr.
+async fn deps_of(
+    ws: &htestkit::Workspace,
+    rs: Arc<RequestState>,
+    query: &str,
+) -> anyhow::Result<Vec<String>> {
     let spec = Arc::clone(&ws.engine)
-        .get_spec(rs, &parse_addr(&query_addr(expr))?)
+        .get_spec(rs, &parse_addr(query)?)
         .await?;
     match spec.config.get("deps") {
         Some(Value::List(l)) => l
@@ -674,44 +683,61 @@ async fn heph_q_phantom_test_entries_frozen() -> anyhow::Result<()> {
 /// named `test` (driver `bash`), whose provider resolves the name whatever its
 /// args, answers it. Keyed on the full addr, go's facts alone decided and
 /// `driver(exec)` selected the BUILD target. By name, the drivers disagree, the
-/// spec decides, and nothing is selected.
+/// spec decides, and nothing is selected. In either registration order, and
+/// `driver(bash)` still selects the BUILD target.
 #[tokio::test]
 async fn colliding_name_across_providers_merges_by_name() -> anyhow::Result<()> {
     let variant = parse_addr("//p:test@v=1")?;
-    let go = FaultProvider::new(
-        vec![],
-        Faults {
-            name: Some("go"),
-            vanished: vec![(variant.clone(), strings(&["test"]))],
-            listed_facts: facts_fn(|_| {
-                Some(
-                    ListedFacts::default()
-                        .with_labels(["test"])
-                        .with_driver("exec"),
-                )
-            }),
-            ..Default::default()
-        },
-    )?;
-    // Resolves `//p:test` whatever the args, like the buildfile provider.
-    let buildfile = FaultProvider::new(
-        vec![bash("//p:test", &["test"]), bash("//p:test@v=1", &["test"])],
-        Faults {
-            name: Some("buildfile"),
-            unlisted: vec![variant.clone()],
-            ..Default::default()
-        },
-    )?;
-    let ws = builder(vec![go, buildfile])?;
-    assert!(
-        select(&ws, trust(&ws, TRUST), &driver("exec"))
-            .await?
-            .is_empty(),
-        "go's facts must not decide for the BUILD target"
-    );
-    let (res, events) = run(&ws, &driver("exec"), &ResultOptions::default()).await;
-    res?;
-    assert!(built(&events).is_empty(), "ran {:?}", built(&events));
+    for go_first in [true, false] {
+        let go = FaultProvider::new(
+            vec![],
+            Faults {
+                name: Some("go"),
+                vanished: vec![(variant.clone(), strings(&["test"]))],
+                listed_facts: facts_fn(|_| {
+                    Some(
+                        ListedFacts::default()
+                            .with_labels(["test"])
+                            .with_driver("exec"),
+                    )
+                }),
+                ..Default::default()
+            },
+        )?;
+        // Resolves `//p:test` whatever the args, like the buildfile provider.
+        let buildfile = FaultProvider::new(
+            vec![bash("//p:test", &["test"]), bash("//p:test@v=1", &["test"])],
+            Faults {
+                name: Some("buildfile"),
+                unlisted: vec![variant.clone()],
+                ..Default::default()
+            },
+        )?;
+        let ws = builder(if go_first {
+            vec![go, buildfile]
+        } else {
+            vec![buildfile, go]
+        })?;
+        assert!(
+            select(&ws, trust(&ws, TRUST), &driver("exec"))
+                .await?
+                .is_empty(),
+            "go's facts must not decide for the BUILD target (go first: {go_first})"
+        );
+        let by_bash = select(&ws, trust(&ws, TRUST), &driver("bash")).await?;
+        assert!(
+            by_bash.contains(&"//p:test".to_string()),
+            "the bare BUILD `test` is a bash target (go first: {go_first}): {by_bash:?}"
+        );
+        assert_eq!(
+            by_bash,
+            select(&ws, trust(&ws, IGNORE), &driver("bash")).await?,
+            "go first: {go_first}"
+        );
+        let (res, events) = run(&ws, &driver("exec"), &ResultOptions::default()).await;
+        res?;
+        assert!(built(&events).is_empty(), "ran {:?}", built(&events));
+    }
     Ok(())
 }
 
@@ -873,8 +899,9 @@ async fn lying_no_changes_consumer_key() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// C36: a listed Yes that lies on a target that exists is a dep — `get_spec`
-/// checks existence, not the match — and `heph validate` reports it.
+/// C36: a listed Yes that lies on a target that exists is not a dep — on the
+/// query-target walk a listed Yes is only a candidate, and the resolved spec
+/// decides it as for a shrug — and `heph validate` reports the lie.
 #[tokio::test]
 async fn executor_query_lying_yes_is_reported_by_validate() -> anyhow::Result<()> {
     let (ws, gets) = workspace(
@@ -887,7 +914,7 @@ async fn executor_query_lying_yes_is_reported_by_validate() -> anyhow::Result<()
     )?;
     assert_eq!(
         deps(&ws, trust(&ws, TRUST), "label(test)").await?,
-        vec!["//p:lib", "//p:test"]
+        vec!["//p:test"]
     );
     assert_eq!(got(&gets), vec!["//p:lib", "//p:test"]);
     let found = mismatches(&ws).await?;
@@ -897,6 +924,55 @@ async fn executor_query_lying_yes_is_reported_by_validate() -> anyhow::Result<()
         "{}",
         found[0]
     );
+    Ok(())
+}
+
+/// Providers `s` (registered first, so it resolves `//p:x`) and `l`, which
+/// lists `//p:x` but declines it in `get`; each lists it with its own labels.
+fn skipped_resolver(s_labels: &[&str], l_labels: &[&str]) -> anyhow::Result<htestkit::Workspace> {
+    let s = FaultProvider::new(
+        vec![bash("//p:x", s_labels)],
+        Faults {
+            name: Some("s"),
+            ..Default::default()
+        },
+    )?;
+    let l = FaultProvider::new(
+        vec![],
+        Faults {
+            name: Some("l"),
+            vanished: vec![(parse_addr("//p:x")?, strings(l_labels))],
+            ..Default::default()
+        },
+    )?;
+    builder(vec![s, l])
+}
+
+/// Regression (R2, R3): a walk that skips the resolver (`exclude_provider=s`)
+/// still resolves the addr through it. Another lister's Yes must not make the
+/// addr a dep the resolved spec does not match: the dep set is the same under
+/// either trust.
+#[tokio::test]
+async fn executor_query_listed_yes_with_a_skipped_resolver() -> anyhow::Result<()> {
+    let ws = skipped_resolver(&[], &["ci"])?;
+    let q = format!("{},exclude_provider=s", query_addr("label(ci)"));
+    let trusted = deps_of(&ws, trust(&ws, TRUST), &q).await?;
+    let ignored = deps_of(&ws, trust(&ws, IGNORE), &q).await?;
+    assert_eq!(trusted, ignored);
+    assert!(trusted.is_empty(), "{trusted:?}");
+    Ok(())
+}
+
+/// The mirror case: `s` resolves `//p:x` with `ci` and the walk sees only
+/// `l`'s listed No. Trusting the No drops a dep the resolved spec matches.
+#[tokio::test]
+#[ignore = "listed No with a skipped resolver: pending user decision, PR #482"]
+async fn executor_query_listed_no_with_a_skipped_resolver() -> anyhow::Result<()> {
+    let ws = skipped_resolver(&["ci"], &[])?;
+    let q = format!("{},exclude_provider=s", query_addr("label(ci)"));
+    let trusted = deps_of(&ws, trust(&ws, TRUST), &q).await?;
+    let ignored = deps_of(&ws, trust(&ws, IGNORE), &q).await?;
+    assert_eq!(trusted, ignored);
     Ok(())
 }
 
@@ -1005,7 +1081,9 @@ async fn install_selection_honors_listed_facts() -> anyhow::Result<()> {
 }
 
 /// Invariant 1: `Engine::states` never reads listed facts — lying facts give
-/// the same states as honest ones, under either trust.
+/// the same states as honest ones, under either trust. `states_under` is
+/// covered by the engine's `states_under_ignores_listed_facts`: its executor
+/// cannot be built from outside the engine.
 #[tokio::test]
 async fn states_under_ignores_facts() -> anyhow::Result<()> {
     let faults = |lie: bool| Faults {
@@ -1201,10 +1279,11 @@ async fn listed_match_failures_follow_the_walk_rules() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A cancellation while listings are merged ends the walk with every package
-/// task joined: nothing still holds the request.
+/// A cancellation while a package is being listed, on a walk that merges
+/// listings, ends the walk with every package task joined: nothing still holds
+/// the request.
 #[tokio::test]
-async fn cancel_during_merge_joins_tasks() -> anyhow::Result<()> {
+async fn cancel_during_listing_joins_tasks() -> anyhow::Result<()> {
     let started = Arc::new(tokio::sync::Notify::new());
     let mut targets = c1_targets();
     targets.extend((0..16).map(|i| bash(&format!("//q{i}:t"), &["test"])));

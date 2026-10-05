@@ -83,8 +83,15 @@ impl App for QueryApp {
         // query records the total graph size for telemetry inside `Engine::query`.
         let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
+            let mut matched = false;
             while let Some(addr) = stream.try_next().await? {
+                matched = true;
                 out.println(addr.format());
+            }
+            if !matched
+                && let Some(hint) = crate::commands::errors::listed_facts_hint(rs.listed_decided())
+            {
+                tracing::warn!("{hint}");
             }
             Ok(())
         }

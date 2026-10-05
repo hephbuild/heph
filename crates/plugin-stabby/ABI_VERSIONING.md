@@ -62,16 +62,32 @@ anything `get_stabbied` would reject:
 A **removed** or **renumbered** proto field (vs an added one) is wire-breaking →
 also major — with one exception, below.
 
-**Removing a field is minor when its absence decodes to the safe default in
-both directions.** That holds when an old peer that still sends the field is
-read by the new side as if it had sent nothing, and the new side's silence is
-read by the old peer as its own "unknown". The removed numbers and names are
-`reserved` so they are never reused. 0.12.0 is the case in point: it removes
-0.11.0's `ListResponse.labels`/`labels_known` (2, 3) in favour of `facts` (4).
-An old plugin's fields 2 and 3 are skipped and `facts` is absent — unknown; a
-pre-0.12 host reads absent `labels_known` as false — unknown. Neither side
-ever reads the other's silence as "no labels". A removal that fails either
-direction is major.
+**Removing a field is minor only when its absence decodes to a safe
+*meaning* in both directions** — not merely to bytes the other side can
+skip. Skipping is what protobuf always does; the question is what the reader
+then believes. Both must hold:
+
+- the new side, reading an old peer that still sends the field, skips it and
+  reads the rest as "unknown", never as a definite answer;
+- the old peer, reading the new side's silence, takes the field's zero value,
+  and that zero value means "unknown" in the old schema, never "no" or
+  "empty".
+
+The removed numbers and names are `reserved` so they are never reused. 0.12.0
+is the case in point: it removes 0.11.0's `ListResponse.labels`/`labels_known`
+(2, 3) in favour of `facts` (4). An old plugin's fields 2 and 3 are skipped and
+`facts` is absent — unknown; a pre-0.12 host reads absent `labels_known` as
+false — unknown, so it ignores the empty `labels`. Neither side ever reads the
+other's silence as "no labels". A removal whose zero value means anything but
+"unknown" to the old peer — a bare `repeated` read as "none", a `bool` read as
+"no" — is major. `plugin-abi`'s `removed_labels_decode_as_unknown_on_a_0_11_host`
+pins this case.
+
+An **unknown `Matcher` arm** is a decode error on the host (since 0.12.0), not a
+silent `Or[]`: a plugin built against a newer schema fails the call loudly
+instead of matching nothing, or everything under `Not`. An old host still
+reads a new arm as an empty matcher (prost leaves the `oneof` unset); that is
+why a new arm is a minor bump the host must reach before plugins send it.
 
 ## What does NOT require a bump
 

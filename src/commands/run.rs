@@ -36,7 +36,7 @@ Query language (-e / --expr):
     label(x)             targets carrying label x   (e.g. label(go-lint))
     tree_output(pkg)     targets whose codegen tree writes into pkg
     driver(\"name\")       targets run by that driver, whole name, case-sensitive
-                         (e.g. driver(\"credential\"); escapes: \\\\ \\\" \\n \\t \\u{..})
+                         (e.g. driver(\"credential\"); escapes: \\\\ \\\" \\n \\r \\t \\u{..})
     addr(//pkg:name)     an explicit target address
     package(//pkg)       an explicit package
     package_prefix(//pkg) every package under //pkg
@@ -46,8 +46,9 @@ Query language (-e / --expr):
 
   label(), driver() and tree_output() are decided from what providers list
   where they can, without resolving each target. So `query` may print a listed
-  target that turns out not to exist (`run` drops it). HEPH_NO_LISTED_FACTS=1
-  resolves every candidate instead; `heph validate` checks the listings.
+  target that turns out not to exist (`run` drops it). Set
+  HEPH_NO_LISTED_FACTS to 1 to resolve every candidate instead; `heph validate`
+  checks the listings.
 
   Examples:
     heph run -e '//some/... && label(foo)'
@@ -275,7 +276,11 @@ impl App for RunApp {
                 // walk skipped something: then the skips are the answer, not
                 // "check your selector".
                 .and_then(|results| {
-                    crate::commands::errors::require_non_empty_unless_incomplete(results, &gaps)
+                    crate::commands::errors::require_non_empty_unless_incomplete(
+                        results,
+                        &gaps,
+                        rs.listed_decided(),
+                    )
                 }),
         };
 

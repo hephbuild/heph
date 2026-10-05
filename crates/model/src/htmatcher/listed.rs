@@ -45,17 +45,6 @@ impl ListedFacts {
         self.with_label_set(labels.into())
     }
 
-    /// [`with_labels`](Self::with_labels) for a set the caller already shares
-    /// across entries. Normalized only when it is not sorted and deduplicated
-    /// already, so a shared set stays shared.
-    pub fn with_shared_labels(self, labels: Arc<[String]>) -> Self {
-        if labels.iter().zip(labels.iter().skip(1)).all(|(a, b)| a < b) {
-            self.with_label_set(labels)
-        } else {
-            self.with_labels(labels.iter().cloned())
-        }
-    }
-
     fn with_label_set(mut self, labels: Arc<[String]>) -> Self {
         self.labels = Some(labels);
         self
@@ -82,18 +71,8 @@ impl ListedFacts {
         self.labels.as_deref()
     }
 
-    /// The shared label set, when known.
-    pub fn label_set(&self) -> Option<&Arc<[String]>> {
-        self.labels.as_ref()
-    }
-
     pub fn driver(&self) -> Option<&str> {
         self.driver.as_deref()
-    }
-
-    /// The shared driver name, when known.
-    pub fn driver_arc(&self) -> Option<&Arc<str>> {
-        self.driver.as_ref()
     }
 
     pub fn has_codegen(&self) -> Option<bool> {
@@ -119,11 +98,6 @@ impl ListedFacts {
             self.has_codegen = None;
         }
     }
-
-    /// Every field unknown.
-    pub fn forget(&mut self) {
-        *self = Self::UNKNOWN;
-    }
 }
 
 #[cfg(test)]
@@ -136,11 +110,6 @@ mod tests {
         let b = ListedFacts::default().with_labels(["a", "b"]);
         assert_eq!(a, b);
         assert_eq!(a.labels(), Some(&["a".to_string(), "b".to_string()][..]));
-        let shared: Arc<[String]> = vec!["z".to_string(), "a".to_string()].into();
-        assert_eq!(
-            ListedFacts::default().with_shared_labels(shared).labels(),
-            Some(&["a".to_string(), "z".to_string()][..])
-        );
     }
 
     #[test]

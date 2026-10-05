@@ -116,6 +116,11 @@ pub fn listed_differences(
     out
 }
 
+/// How to stop acting on listed facts, for every message that reports one
+/// wrong: the run's shrug-path warning and `heph validate`.
+pub const KILL_SWITCH_HINT: &str =
+    "set HEPH_NO_LISTED_FACTS=1 to resolve every target instead of trusting listed facts";
+
 /// What `heph validate` found wrong with a provider's listing.
 #[derive(Debug, Clone)]
 pub enum ListedFactMismatch {
@@ -129,9 +134,10 @@ pub enum ListedFactMismatch {
         resolved: String,
     },
     /// A listing with a known field, for an addr another provider resolves.
-    /// The walks merge listings by name across providers, so this one's facts
-    /// decide alongside the resolver's — or alone, if the resolver does not
-    /// list the name.
+    /// Every provider that lists the addr's name describes the addr (by its
+    /// listing of that exact addr, else by all of its listings of the name),
+    /// so this one's facts decide alongside the resolver's — or alone, if the
+    /// resolver does not list the name.
     NotResolver {
         addr: Addr,
         provider: String,
@@ -160,7 +166,7 @@ impl fmt::Display for ListedFactMismatch {
                 f,
                 "provider `{provider}` lists {} with {field} {listed}, but it resolves to {field} \
                  {resolved}. Provider `{provider}` must list exactly what its `get` returns, or \
-                 leave the field unknown",
+                 leave the field unknown; {KILL_SWITCH_HINT}",
                 addr.format(),
             ),
             Self::NotResolver {
@@ -170,9 +176,9 @@ impl fmt::Display for ListedFactMismatch {
             } => write!(
                 f,
                 "provider `{provider}` lists {} with listed facts, but provider `{resolved_by}` \
-                 resolves it. Listings merge by name, so `{provider}`'s facts decide for \
-                 `{resolved_by}`'s target: list it with no facts, or have `{resolved_by}` list \
-                 the name",
+                 resolves it. Every lister of a name describes its targets, so `{provider}`'s \
+                 facts decide for `{resolved_by}`'s target: list it with no facts, or with \
+                 facts equal to what `{resolved_by}` resolves; {KILL_SWITCH_HINT}",
                 addr.format(),
             ),
         }
@@ -364,6 +370,26 @@ mod tests {
     use crate::engine::matcher_spec::match_spec;
     use crate::engine::matcher_target::match_target;
     use hmodel::htpkg::PkgBuf;
+
+    /// The whole message `heph validate` prints for a lying field, pinned:
+    /// it is what a user reads to find the provider and the way out.
+    #[test]
+    fn field_mismatch_display() {
+        let m = ListedFactMismatch::Field {
+            addr: Addr::new(PkgBuf::from("p"), "t".to_string(), Default::default()),
+            provider: "go".to_string(),
+            field: ListedField::Driver,
+            listed: "exec".to_string(),
+            resolved: "bash".to_string(),
+        };
+        assert_eq!(
+            m.to_string(),
+            "provider `go` lists //p:t with driver exec, but it resolves to driver bash. \
+             Provider `go` must list exactly what its `get` returns, or leave the field \
+             unknown; set HEPH_NO_LISTED_FACTS=1 to resolve every target instead of trusting \
+             listed facts"
+        );
+    }
 
     fn target(labels: &[&str], driver: &str, codegen: bool) -> (TargetSpec, TargetDef) {
         let addr = Addr::new(PkgBuf::from("p"), "t".to_string(), Default::default());

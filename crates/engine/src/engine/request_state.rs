@@ -762,8 +762,7 @@ impl RequestState {
         self.data.fail_fast
     }
 
-    /// Trailing process-log lines to render in a failure box (see
-    /// [`RequestStateData::log_tail_lines`]).
+    /// Whether this request's query walks trust listed facts.
     pub fn listed_facts_trust(&self) -> crate::engine::listed::ListedFactsTrust {
         self.data.listed_facts_trust
     }
@@ -776,6 +775,8 @@ impl RequestState {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Trailing process-log lines to render in a failure box (see
+    /// [`RequestStateData::log_tail_lines`]).
     pub fn log_tail_lines(&self) -> usize {
         self.data.log_tail_lines
     }
@@ -1206,7 +1207,14 @@ impl Engine {
     /// The returned request is [`hash_only`](RequestStateData::hash_only): it may
     /// not build, so it can never contend the per-addr result lock its own caller
     /// is holding.
-    pub fn new_hash_only_state(self: &Arc<Self>, parent: Addr) -> Arc<RequestState> {
+    ///
+    /// `listed_facts_trust` is the enclosing request's: a query target the
+    /// nested request re-resolves must see the dep set the outer one did.
+    pub fn new_hash_only_state(
+        self: &Arc<Self>,
+        parent: Addr,
+        listed_facts_trust: crate::engine::listed::ListedFactsTrust,
+    ) -> Arc<RequestState> {
         self.new_state_inner(
             true,
             None,
@@ -1215,7 +1223,7 @@ impl Engine {
             None,
             RequestMode {
                 hash_only: true,
-                listed_facts_trust: self.cfg.listed_facts_trust,
+                listed_facts_trust,
             },
         )
         .with_parent(parent)

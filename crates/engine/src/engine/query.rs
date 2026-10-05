@@ -53,8 +53,6 @@ pub(crate) struct Candidate {
 /// drops or dedups a candidate — the query-target walk folds the sequence into
 /// a def hash — and the result is independent of provider and listing order.
 pub(crate) fn reconcile_by_name(candidates: &mut [Candidate]) {
-    // A package's listings of one name are a handful (a name times its
-    // variants, times its listers), so each group is scanned pairwise.
     let mut by_name: FxHashMap<(&str, &str), Vec<usize>> = FxHashMap::default();
     for (i, c) in candidates.iter().enumerate() {
         by_name
@@ -62,30 +60,66 @@ pub(crate) fn reconcile_by_name(candidates: &mut [Candidate]) {
             .or_default()
             .push(i);
     }
-    let merged: Vec<ListedFacts> = candidates
-        .iter()
-        .map(|c| {
-            let group: Vec<&Candidate> = by_name
-                .get(&(c.addr.package.as_str(), c.addr.name.as_str()))
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|&j| candidates.get(j))
-                .collect();
-            let lists_exactly =
-                |lister: usize| group.iter().any(|o| o.lister == lister && o.addr == c.addr);
-            let mut facts = c.facts.clone();
-            for other in &group {
-                if other.addr == c.addr || !lists_exactly(other.lister) {
-                    facts.agree(&other.facts);
+    // A name can have hundreds of listings (go lists `build`, `_golist`… once
+    // per universe variant), so a group is never scanned pairwise: each
+    // lister's listings are folded once, and each addr then costs one lookup
+    // per lister — O(group × listers).
+    let mut merged: Vec<Option<ListedFacts>> = vec![None; candidates.len()];
+    for group in by_name.values() {
+        let mut listers: Vec<ListerView<'_>> = Vec::new();
+        for c in group.iter().filter_map(|&i| candidates.get(i)) {
+            let view = match listers.iter().position(|v| v.lister == c.lister) {
+                Some(at) => listers.get_mut(at),
+                None => {
+                    listers.push(ListerView {
+                        lister: c.lister,
+                        exact: FxHashMap::default(),
+                        whole: c.facts.clone(),
+                    });
+                    listers.last_mut()
                 }
+            };
+            let Some(view) = view else { continue };
+            view.whole.agree(&c.facts);
+            view.exact
+                .entry(&c.addr)
+                .and_modify(|f| f.agree(&c.facts))
+                .or_insert_with(|| c.facts.clone());
+        }
+        let mut by_addr: FxHashMap<&Addr, ListedFacts> = FxHashMap::default();
+        for &i in group {
+            let Some(c) = candidates.get(i) else { continue };
+            let facts = by_addr.entry(&c.addr).or_insert_with(|| {
+                // A lister that lists this exact addr describes it by that
+                // listing; one that lists the name only otherwise, by all of
+                // its listings of the name.
+                let mut described = listers
+                    .iter()
+                    .map(|v| v.exact.get(&c.addr).unwrap_or(&v.whole));
+                let mut acc = described.next().cloned().unwrap_or_default();
+                for f in described {
+                    acc.agree(f);
+                }
+                acc
+            });
+            if let Some(slot) = merged.get_mut(i) {
+                *slot = Some(facts.clone());
             }
-            facts
-        })
-        .collect();
-    for (c, facts) in candidates.iter_mut().zip(merged) {
-        c.facts = facts;
+        }
     }
+    for (c, facts) in candidates.iter_mut().zip(merged) {
+        if let Some(facts) = facts {
+            c.facts = facts;
+        }
+    }
+}
+
+/// One lister's listings of one name, for [`reconcile_by_name`]: per exact
+/// addr, and all of them, each folded with [`ListedFacts::agree`].
+struct ListerView<'a> {
+    lister: usize,
+    exact: FxHashMap<&'a Addr, ListedFacts>,
+    whole: ListedFacts,
 }
 
 /// The selection walk's view of one package's listings: [`reconcile_by_name`],
@@ -116,6 +150,7 @@ fn warn_listed_mismatch(
             %field,
             %listed,
             %resolved,
+            hint = crate::engine::listed::KILL_SWITCH_HINT,
             "listed fact differs from the resolved target; `heph validate` reports it"
         );
     }
@@ -162,8 +197,9 @@ impl Engine {
         m: &'a htmatcher::Matcher,
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
-        // Merging costs an `Addr` clone and a map entry per candidate: only
-        // worth it for a walk that will read a fact.
+        // Merging costs a few map entries and a facts clone (reference-count
+        // bumps) per candidate, plus an `Addr` clone per candidate for the
+        // selection dedup: only worth it for a walk that will read a fact.
         let uses_facts = rs.listed_facts_trust().trusts() && m.reads_listed_facts();
         // A whole-graph selector (`//...` — a `PackagePrefix` rooted at the empty
         // package) enumerates every target, so its final match count is the total
@@ -834,6 +870,74 @@ mod tests {
                     ("//p:same".to_string(), a),
                 ]
             );
+        }
+
+        /// The rule `reconcile_by_name` implements, stated pairwise: a
+        /// candidate agrees with every listing of its name that is either of
+        /// its own addr, or by a lister that does not list its addr exactly.
+        fn reconcile_pairwise(cs: &[Candidate]) -> Vec<ListedFacts> {
+            let exact: FxHashSet<(usize, &Addr)> = cs.iter().map(|c| (c.lister, &c.addr)).collect();
+            cs.iter()
+                .map(|c| {
+                    let mut facts = c.facts.clone();
+                    for o in cs
+                        .iter()
+                        .filter(|o| o.addr.package == c.addr.package && o.addr.name == c.addr.name)
+                    {
+                        if o.addr == c.addr || !exact.contains(&(o.lister, &c.addr)) {
+                            facts.agree(&o.facts);
+                        }
+                    }
+                    facts
+                })
+                .collect()
+        }
+
+        /// One name with 500 variants from each of two providers (go lists
+        /// `build`, `_golist`… once per universe variant) reconciles to the
+        /// same facts as the pairwise rule, without scanning the group
+        /// per candidate.
+        #[test]
+        fn merge_at_scale_matches_the_pairwise_rule() {
+            let fact = |driver: &str| {
+                ListedFacts::default()
+                    .with_labels(["t"])
+                    .with_driver(driver)
+            };
+            let mut cs = Vec::new();
+            for i in 0..500 {
+                cs.push(cand(0, &format!("//p:t@v={i}"), fact("exec")));
+                // Provider 1 lists half the variants exactly, and differently
+                // on a few of them.
+                if i % 2 == 0 {
+                    let driver = if i % 10 == 0 { "bash" } else { "exec" };
+                    cs.push(cand(1, &format!("//p:t@v={i}"), fact(driver)));
+                }
+            }
+            cs.push(cand(1, "//p:t", fact("bash")));
+            for i in 0..500 {
+                cs.push(cand(1, &format!("//p:other@v={i}"), fact("exec")));
+            }
+            let want = reconcile_pairwise(&cs);
+            reconcile_by_name(&mut cs);
+            let got: Vec<ListedFacts> = cs.iter().map(|c| c.facts.clone()).collect();
+            assert_eq!(got, want);
+
+            let facts_of = |addr: &str| {
+                cs.iter()
+                    .find(|c| c.addr.format() == addr)
+                    .map(|c| c.facts.clone())
+            };
+            let labels_only = ListedFacts::default().with_labels(["t"]);
+            // Both list it exactly and agree.
+            assert_eq!(facts_of("//p:t@v=2"), Some(fact("exec")));
+            // Both list it exactly and disagree on the driver.
+            assert_eq!(facts_of("//p:t@v=10"), Some(labels_only.clone()));
+            // Provider 1 lists the name only otherwise: all of its listings count.
+            assert_eq!(facts_of("//p:t@v=1"), Some(labels_only.clone()));
+            assert_eq!(facts_of("//p:t"), Some(labels_only));
+            // Another name is untouched by this one.
+            assert_eq!(facts_of("//p:other@v=7"), Some(fact("exec")));
         }
     }
 
@@ -1917,6 +2021,44 @@ mod tests {
                 format!("{err:#}").contains("go list: exit status 1"),
                 "{err:#}"
             );
+            assert_eq!(
+                Arc::strong_count(&rs),
+                1,
+                "a package task was still running, holding the request"
+            );
+            Ok(())
+        }
+
+        /// The query-target walk (`EngineProviderExecutor::query`) drains the
+        /// same way when a candidate's `get_spec` fails: every package task is
+        /// joined before the error returns.
+        #[tokio::test]
+        async fn executor_query_fails_on_a_spec_error_and_drains() -> anyhow::Result<()> {
+            use hplugin::provider::ProviderExecutor as _;
+            let (engine, _root) = faulty_engine(
+                vec![],
+                vec![target("p", "b", &["x"]), target("q", "slow", &["x"])],
+                Faults {
+                    fail_get: addrs(&["//p:b"]),
+                    gate: Some(Arc::new(tokio::sync::Notify::new())),
+                    slow_list: Some(("q".to_string(), Duration::from_millis(300))),
+                    ..Default::default()
+                },
+            )?;
+            let rs = engine.new_state();
+            let executor = crate::engine::result::EngineProviderExecutor::new(
+                Arc::downgrade(&engine),
+                rs.clone(),
+            );
+            let err = executor
+                .query(&label("x"), &[])
+                .await
+                .expect_err("a failing spec fails the query target");
+            assert!(
+                format!("{err:#}").contains("go list: exit status 1"),
+                "{err:#}"
+            );
+            drop(executor);
             assert_eq!(
                 Arc::strong_count(&rs),
                 1,

@@ -169,7 +169,7 @@ impl App for ValidateApp {
             // 4. Every provider lists exactly the facts its targets resolve to,
             //    and lists only what it resolves. The walks trust a listed No
             //    and never check it; this does.
-            let labels_res = Arc::clone(&engine)
+            let listed_facts_res = Arc::clone(&engine)
                 .listed_fact_mismatches(rs.clone(), &matcher, discovery.clone())
                 .await
                 .map(|mismatches| mismatches.iter().map(ToString::to_string).collect());
@@ -200,7 +200,7 @@ impl App for ValidateApp {
                 link_res.map(|()| Vec::new()),
                 overlap_res,
                 gitignore_res,
-                labels_res,
+                listed_facts_res,
             ])?;
 
             // Success prints nothing; only the scoped-skip warning is emitted.

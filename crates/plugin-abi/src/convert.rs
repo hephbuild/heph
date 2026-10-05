@@ -1167,6 +1167,91 @@ mod tests {
         assert!(format!("{err:#}").contains("no arm"), "{err:#}");
     }
 
+    /// 0.11.0's `ListResponse`, as a pre-0.12 host decodes it
+    /// (`git show 0b6b8758:proto/plugin/v1/provider.proto`).
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ListResponseV011 {
+        #[prost(message, optional, tag = "1")]
+        addr: Option<pb::Addr>,
+        #[prost(string, repeated, tag = "2")]
+        labels: Vec<String>,
+        #[prost(bool, tag = "3")]
+        labels_known: bool,
+    }
+
+    /// D7, `ABI_VERSIONING.md`: a 0.11 host reading a 0.12 plugin's listing —
+    /// facts and all — sees `labels_known = false`, which it reads as
+    /// "unknown", never as "no labels".
+    #[test]
+    fn removed_labels_decode_as_unknown_on_a_0_11_host() {
+        use prost::Message as _;
+        let new = pb::ListResponse {
+            addr: Some(pb::Addr {
+                package: "p".to_string(),
+                name: "t".to_string(),
+                args: Default::default(),
+            }),
+            facts: Some(pb::ListedFacts {
+                labels: Some(pb::StringSet {
+                    values: vec!["test".to_string()],
+                }),
+                driver: Some("exec".to_string()),
+                has_codegen: Some(false),
+            }),
+        };
+        let old = ListResponseV011::decode(new.encode_to_vec().as_slice())
+            .expect("an old host decodes a new listing");
+        assert!(!old.labels_known);
+        assert!(old.labels.is_empty());
+        assert_eq!(old.addr, new.addr);
+    }
+
+    /// 0.11.0's `Matcher`: arms 1–8, no `driver`.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct MatcherV011 {
+        #[prost(oneof = "MatcherV011Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+        kind: Option<MatcherV011Kind>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct MatcherV011List {
+        #[prost(message, repeated, tag = "1")]
+        matchers: Vec<MatcherV011>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    enum MatcherV011Kind {
+        #[prost(message, tag = "1")]
+        Addr(pb::Addr),
+        #[prost(string, tag = "2")]
+        Label(String),
+        #[prost(string, tag = "3")]
+        Package(String),
+        #[prost(string, tag = "4")]
+        PackagePrefix(String),
+        #[prost(string, tag = "5")]
+        TreeOutputTo(String),
+        #[prost(message, tag = "6")]
+        Or(MatcherV011List),
+        #[prost(message, tag = "7")]
+        And(MatcherV011List),
+        #[prost(message, boxed, tag = "8")]
+        Not(Box<MatcherV011>),
+    }
+
+    /// The known old-host misread, pinned: a pre-0.12 host decodes arm 9
+    /// (`driver`) as an empty matcher. That is why a plugin must not send it
+    /// to a host older than 0.12 — and why this host now refuses an arm it
+    /// does not know.
+    #[test]
+    fn driver_arm_is_an_empty_matcher_on_a_0_11_host() {
+        use prost::Message as _;
+        let new = matcher_to_pb(&Matcher::Driver("credential".to_string()));
+        let old = MatcherV011::decode(new.encode_to_vec().as_slice())
+            .expect("prost skips the unknown arm");
+        assert_eq!(old.kind, None);
+    }
+
     fn decode_facts(f: Option<pb::ListedFacts>) -> ListedFacts {
         listed_facts_from_pb(f, &mut |s: String| Arc::from(s))
     }

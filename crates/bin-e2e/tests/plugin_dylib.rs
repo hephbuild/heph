@@ -239,6 +239,95 @@ fn shipped_go_cdylib_list_calls_back_states_under_across_the_seam() {
     );
 }
 
+/// Listed facts cross the REAL cdylib seam: the go plugin's `list` carries
+/// each entry's driver, and the host decides `driver(...)` from it without a
+/// single `get`. `get` of any go target runs `_golist`, which needs `go`; the
+/// only `go` on `PATH` here is a stub that fails, so a run that resolved even
+/// one spec would fail. `driver("nonexistent")` must therefore come back
+/// empty and green, and `driver("go_compile")` must name the lib's compile —
+/// both decided from the listing alone.
+#[cfg(unix)]
+#[test]
+fn shipped_go_cdylib_listed_facts_decide_without_get() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("go");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-go-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash go cdylib");
+    write_manifest(&manifest, "go", &dylib, Some(&sum)).expect("write manifest");
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n    options:\n      gotool: \"host\"\n",
+        manifest.display()
+    ))
+    .expect("write config");
+    ws.write("go.mod", "module example.com/facts\n\ngo 1.21\n")
+        .expect("write go.mod");
+    ws.write(
+        "lib/lib.go",
+        "package lib\n\nfunc Greet() string { return \"hi\" }\n",
+    )
+    .expect("write lib.go");
+    // `gotool: host` lists nothing without a declared variant.
+    ws.write(
+        "cmd/BUILD",
+        "provider_state(\n    provider = \"go\",\n    variants = {\"release\": {\"goos\": \"linux\", \"goarch\": \"amd64\"}},\n)\n",
+    )
+    .expect("write BUILD");
+
+    let stub = tempfile::tempdir().expect("stub dir");
+    let go = stub.path().join("go");
+    std::fs::write(&go, "#!/bin/sh\necho 'stub go: must not run' >&2\nexit 1\n")
+        .expect("write stub go");
+    std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).expect("chmod stub go");
+    let path = match std::env::var_os("PATH") {
+        Some(p) => {
+            let mut dirs = vec![stub.path().to_path_buf()];
+            dirs.extend(std::env::split_paths(&p));
+            std::env::join_paths(dirs).expect("join PATH")
+        }
+        None => stub.path().as_os_str().to_owned(),
+    };
+    let query_with = |expr: &str, kill_switch: &str| {
+        ws.cmd(&dist, &["query", "-e", expr])
+            .env("PATH", &path)
+            .env("HEPH_NO_LISTED_FACTS", kill_switch)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run")
+    };
+    let query = |expr: &str| query_with(expr, "");
+
+    // The control: resolving the specs runs `_golist`, so the stub fails it.
+    let out = query_with(r#"//lib/... && driver("nonexistent")"#, "1");
+    assert!(
+        !out.status.success(),
+        "with listed facts off, the stub `go` must fail the walk: {}",
+        describe(&out)
+    );
+
+    let out = query(r#"//lib/... && driver("nonexistent")"#);
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "{}",
+        describe(&out)
+    );
+
+    let out = query(r#"//lib/... && driver("go_compile")"#);
+    assert!(out.status.success(), "{}", describe(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines == ["//lib:build_lib@v=release,vp=cmd"],
+        "only the lib's compile is a go_compile target: {}",
+        describe(&out)
+    );
+}
+
 /// Regression test for the log-sink-before-`create` ordering bug: if the host
 /// installs its log sink *after* calling the plugin's `create`, a
 /// `tracing::error!` logged during construction failure has no subscriber to

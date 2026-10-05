@@ -111,48 +111,63 @@ pub(crate) fn facts(name: &str, bare: bool, cx: ListContext) -> ListedFacts {
 mod tests {
     use super::*;
 
-    /// Nothing here reads the host: an addr's facts are the same whatever
-    /// `goos`/`goarch` lists it, because no input to [`facts`] is one.
+    /// Each name's facts, pinned. No input to [`facts`] is the host's
+    /// `goos`/`goarch` — only the name, whether it is bare, and the
+    /// [`ListContext`] — so this table is what every host lists.
     #[test]
     fn go_listed_facts_host_independent() {
-        let names = [
-            "_golist",
-            "build_lib",
-            "build",
-            "build_test",
-            "build_xtest",
-            "test",
-            "xtest",
-            "test_race",
-            "xtest_race",
-            "lint",
-            "lint-check",
-            "format",
-            "format-check",
-            "download",
+        type Row = (
+            &'static str,
+            bool,
+            bool,
+            Option<&'static str>,
+            Option<&'static [&'static str]>,
+            Option<&'static str>,
+            Option<bool>,
+        );
+        let none: &'static [&'static str] = &[];
+        #[rustfmt::skip]
+        let table: &[Row] = &[
+            // name, bare, stdlib, test_driver => labels, driver, has_codegen
+            ("_golist", true, false, None, Some(none), Some("go_golist"), Some(false)),
+            ("build_lib", true, false, None, Some(BUILD), Some("go_compile"), Some(false)),
+            ("build_lib", true, true, None, Some(BUILD), Some("bash"), Some(false)),
+            ("build", true, false, None, Some(none), Some("group"), Some(false)),
+            ("build", false, false, None, Some(none), Some("bash"), Some(false)),
+            ("build_test", true, false, None, Some(none), Some("bash"), Some(false)),
+            ("build_xtest", false, false, None, Some(none), Some("bash"), Some(false)),
+            ("test", true, false, Some("exec"), Some(TEST), Some("exec"), Some(false)),
+            ("test", false, false, Some("bash"), Some(TEST), Some("bash"), Some(false)),
+            ("test", true, false, None, Some(TEST), None, Some(false)),
+            ("xtest", true, false, Some("exec"), Some(TEST), Some("exec"), Some(false)),
+            ("test_race", true, false, Some("exec"), Some(TEST_RACE), Some("exec"), Some(false)),
+            ("xtest_race", true, false, Some("bash"), Some(TEST_RACE), Some("bash"), Some(false)),
+            ("lint", true, false, None, Some(LINT), Some("go_lint_fix"), None),
+            ("lint-check", true, false, None, Some(LINT_CHECK), Some("go_lint_gate"), Some(false)),
+            ("format", true, false, None, Some(FORMAT), Some("go_format"), None),
+            ("format-check", true, false, None, Some(FORMAT_CHECK), Some("go_format_check"), Some(false)),
+            ("download", true, false, None, None, None, None),
         ];
-        for stdlib in [false, true] {
-            for test_driver in [None, Some(DRIVER_EXEC), Some(DRIVER_BASH)] {
-                let cx = ListContext {
+        for &(name, bare, stdlib, test_driver, labels, driver, has_codegen) in table {
+            let got = facts(
+                name,
+                bare,
+                ListContext {
                     stdlib,
                     test_driver,
-                };
-                for name in names {
-                    for bare in [false, true] {
-                        // Two evaluations, as two hosts would make them.
-                        assert_eq!(facts(name, bare, cx), facts(name, bare, cx), "{name}");
-                    }
-                }
+                },
+            );
+            let mut want = ListedFacts::default();
+            if let Some(labels) = labels {
+                want = want.with_labels(labels.iter().copied());
             }
+            if let Some(driver) = driver {
+                want = want.with_driver(driver);
+            }
+            if let Some(has_codegen) = has_codegen {
+                want = want.with_has_codegen(has_codegen);
+            }
+            assert_eq!(got, want, "{name} bare={bare} stdlib={stdlib}");
         }
-        let cx = ListContext {
-            stdlib: false,
-            test_driver: Some(DRIVER_EXEC),
-        };
-        assert!(facts("download", true, cx).is_unknown());
-        assert_eq!(facts("format", true, cx).has_codegen(), None);
-        assert_eq!(facts("test", false, cx).driver(), Some("exec"));
-        assert_eq!(facts("build", true, cx).driver(), Some("group"));
-        assert_eq!(facts("build", false, cx).driver(), Some("bash"));
     }
 }

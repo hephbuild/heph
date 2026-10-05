@@ -45,7 +45,10 @@ message StringSet {
 
 // What `get` will give this target, when the provider knows it at list time.
 // Every field is either unknown (absent) or exact for this listed addr, under the
-// state chain `list` received. Zero values decode to unknown, never to a prune.
+// state chain `list` received. Only absence means unknown: a present field is
+// known, including `has_codegen = false` and an empty `labels` set, so a
+// provider leaves a field it does not know unset rather than zero. An empty
+// `driver` is the one present value read as unknown.
 // Verified by `heph validate`; a listed "no" is trusted by the engine's walks.
 message ListedFacts {
   // The spec's labels, compared as a set. Present and empty = no labels.

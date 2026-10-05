@@ -413,10 +413,16 @@ pub trait Provider: Send + Sync {
     ///   driver) or the def's `parse` (`has_codegen`) gives that addr under
     ///   `req.states`, if the addr resolves. Leave a field unknown rather than
     ///   guess; `heph validate` reports every difference.
-    /// - **The provider that resolves an addr also lists its name.** Listings
-    ///   are reconciled by `(package, name)`, ignoring args, so a provider whose
-    ///   `get` answers a name it never listed lets another provider's facts
-    ///   decide for its target. `heph validate` reports that too.
+    /// - **The provider that resolves an addr also lists its name, and agrees
+    ///   with itself.** Every provider that lists an addr's name in the package
+    ///   describes that addr: by its listing of that exact addr if it has one,
+    ///   else by what all of its listings of that name agree on (its `get` may
+    ///   answer the name whatever the args). A field decides only where every
+    ///   such description knows it and they agree. So a provider whose `get`
+    ///   answers a name it never listed lets another provider's facts decide
+    ///   for its target, and an addr it resolves but does not list exactly must
+    ///   agree with all of its listings of that name. `heph validate` reports
+    ///   both.
     fn list<'a>(
         &'a self,
         req: ListRequest,

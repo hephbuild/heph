@@ -163,7 +163,7 @@ async fn root_build_broken_reports_one_group() -> anyhow::Result<()> {
         group.examples[0].cause
     );
     assert!(
-        heph::commands::errors::require_non_empty_unless_incomplete(batch.ok, &gaps).is_ok(),
+        heph::commands::errors::require_non_empty_unless_incomplete(batch.ok, &gaps, 0).is_ok(),
         "an empty match with skips reports the skips, not the selector"
     );
     Ok(())

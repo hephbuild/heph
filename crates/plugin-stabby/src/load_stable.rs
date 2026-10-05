@@ -1104,10 +1104,14 @@ mod tests {
         let b = decode(&with("bash").encode_to_vec()).expect("decode");
         assert_eq!(a.facts.labels(), Some(&[][..]));
         assert_eq!(a.facts.has_codegen(), Some(false));
-        let (Some(da), Some(db)) = (a.facts.driver_arc(), b.facts.driver_arc()) else {
+        let (Some(da), Some(db)) = (a.facts.driver(), b.facts.driver()) else {
             panic!("driver should be known");
         };
-        assert!(Arc::ptr_eq(da, db), "one Arc per driver name per list call");
+        // Both borrow from the same allocation: one `Arc` per driver name.
+        assert!(
+            std::ptr::eq(da.as_ptr(), db.as_ptr()),
+            "one Arc per driver name per list call"
+        );
     }
 
     /// C33: a malformed nested `ListedFacts` fails the item, so the `list`.

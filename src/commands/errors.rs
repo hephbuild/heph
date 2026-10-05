@@ -409,15 +409,30 @@ pub fn fold_batch(
 /// `validate` over an empty scope has nothing to prove.
 pub fn require_non_empty(
     results: Vec<Arc<crate::engine::EResult>>,
+    listed_decided: usize,
 ) -> anyhow::Result<Vec<Arc<crate::engine::EResult>>> {
     if results.is_empty() {
+        let hint = listed_facts_hint(listed_decided)
+            .map(|h| format!("\n{h}"))
+            .unwrap_or_default();
         anyhow::bail!(
             "no targets matched — nothing was run.\n\
              Check the selector with `heph query -e '<expr>'`; a label that no target \
-             carries, or a package matcher outside the workspace, matches nothing."
+             carries, or a package matcher outside the workspace, matches nothing.{hint}"
         );
     }
     Ok(results)
+}
+
+/// The fixed hint, verbatim, for a selection that found nothing after listed
+/// facts decided some of its candidates (`RequestState::listed_decided`).
+pub fn listed_facts_hint(listed_decided: usize) -> Option<String> {
+    (listed_decided > 0).then(|| {
+        format!(
+            "no match; {listed_decided} targets were decided from listed facts. Set \
+             HEPH_NO_LISTED_FACTS=1 to resolve them instead."
+        )
+    })
 }
 
 /// [`require_non_empty`], unless the selector walk skipped something. Then an
@@ -427,9 +442,10 @@ pub fn require_non_empty(
 pub fn require_non_empty_unless_incomplete(
     results: Vec<Arc<crate::engine::EResult>>,
     gaps: &crate::engine::Gaps,
+    listed_decided: usize,
 ) -> anyhow::Result<Vec<Arc<crate::engine::EResult>>> {
     if gaps.is_empty() {
-        require_non_empty(results)
+        require_non_empty(results, listed_decided)
     } else {
         Ok(results)
     }
@@ -893,7 +909,7 @@ mod tests {
         // The bug: a selector matching nothing folded to `Ok(vec![])` and exited
         // 0, so a typo'd label or an out-of-scope matcher "succeeded" having
         // built nothing.
-        let err = require_non_empty(vec![]).err().expect("empty must fail");
+        let err = require_non_empty(vec![], 0).err().expect("empty must fail");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("no targets matched"),
@@ -1059,14 +1075,32 @@ mod tests {
     #[test]
     fn empty_match_with_skips_reports_the_skips() {
         let empty = crate::engine::Gaps::new("//...");
-        let Err(err) = require_non_empty_unless_incomplete(vec![], &empty) else {
+        let Err(err) = require_non_empty_unless_incomplete(vec![], &empty, 0) else {
             panic!("an empty run with nothing skipped must fail");
         };
         assert!(err.to_string().contains("no targets matched"), "{err}");
+        assert!(!err.to_string().contains("listed facts"), "{err}");
         assert!(
-            require_non_empty_unless_incomplete(vec![], &some_gaps()).is_ok(),
+            require_non_empty_unless_incomplete(vec![], &some_gaps(), 3).is_ok(),
             "the skips are the answer; `finalize!` reports them"
         );
+    }
+
+    /// The no-match hint is verbatim and stable, and only when a listed fact
+    /// decided something.
+    #[test]
+    fn empty_match_after_listed_facts_decided_hints_the_kill_switch() {
+        let Err(err) = require_non_empty(vec![], 3) else {
+            panic!("an empty run must fail");
+        };
+        assert!(
+            err.to_string().ends_with(
+                "\nno match; 3 targets were decided from listed facts. Set \
+                 HEPH_NO_LISTED_FACTS=1 to resolve them instead."
+            ),
+            "{err}"
+        );
+        assert_eq!(listed_facts_hint(0), None);
     }
 
     #[tokio::test]

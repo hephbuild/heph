@@ -1065,7 +1065,6 @@ impl ProviderInner {
             // selector decides from here without a `_golist` per candidate. A
             // handful of distinct (name, bare) pairs across every variant:
             // build each once and share its `Arc`s.
-            //
             let cx = list_context(&kind, &req.states, req.package.as_str());
             let mut known: Vec<((String, bool), ListedFacts)> = Vec::new();
             let responses: Vec<anyhow::Result<ListResponse>> = addrs
