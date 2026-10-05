@@ -21,8 +21,20 @@ this conversation is lost. Write it down now, in the place the next session will
 
 ## 2. Make the target complete
 
-A **design spec** has every section listed in CLAUDE.md under "Phases and hand-offs": Goal, Non-goals, Decisions, Tests, Files,
-Accepted exemptions, Board, Open. Fill in or correct the ones this session touched. In particular:
+A **design spec** has every section listed in CLAUDE.md under "Phases and hand-offs": Goal, Non-goals,
+Invariants and trust, Decisions, Tests, Files, Accepted exemptions, Board, Open. Fill in or correct
+the ones this session touched.
+
+**A design hand-off stops here, unprinted, if either of these fails:**
+
+- **Board**: list the agents the spec triggers (the always-consult three plus every row of the
+  `/board` table that its Files match). Each must have a `(design, …)` verdict line in Board. If
+  one is missing, run `/board design` first, or tell the user which agents are missing and ask
+  whether to skip them. A list of agent names is not a verdict.
+- **Invariants and trust**: each one must be marked as confirmed by the user. If one is not, ask
+  now. A decision the spec made by itself is how a PR got half rebuilt after it was opened.
+
+In particular:
 
 - **Tests** names each test and its layer (unit in the crate, `crates/e2e`, or `crates/bin-e2e`),
   and says what it proves. These tests are the implementation's definition of done. Every case

@@ -65,12 +65,13 @@ Then findings, ranked:
   Suggested: <specific change> — expected effect: <estimate, marked as estimate>
 ```
 
-Verdict: **NO REGRESSION**, **REGRESSION** (with the number), or **UNMEASURABLE** (no benchmark covers this path — say what to add).
+Verdict: **NO REGRESSION**, **REGRESSION** (with the number), **UNMEASURABLE** (no benchmark covers this path — say what to add), or **NOT MEASURED** (a scenario exists, but you could not run it — say why).
 
 ## Rules
 
 - Measured beats argued, always — including against your own expectation. If the profile contradicts the theory, the profile wins and you say so plainly.
 - Never invent or extrapolate a number. If you didn't run it, it's an estimate and must be labeled one.
+- **No run, no verdict.** If you could not run a measurement (no scenario in the brief, no corpus, no build), answer **NOT MEASURED** with the reason and the scenario that would measure it, and stop. Do not substitute a code reading: that is `feature-quality`'s lane, and it costs a consult to say nothing measured.
 - Report the noise floor alongside every delta. A finding without a noise floor is not a finding.
 - Don't optimize the code. Measure, locate, suggest — the caller implements and you re-measure.
 - A suggested optimization is a hypothesis until re-measured. Say that when you suggest one.

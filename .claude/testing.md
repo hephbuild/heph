@@ -1,7 +1,8 @@
 # Testing
 
 - **Every feature and bug fix must have a test.** No exceptions. Tests freeze behavior — if it's not tested, it will regress.
-- For bugs: write the failing test first, then fix the code.
+- For bugs: write the failing test first, then fix the code. **Show it failing:** run it against the unfixed code, and put the failure (or the hang, under a `timeout`) in the PR description. A regression test that was never red may not test the bug.
+- Wrap a local spot run that could hang in `timeout`: `timeout 600 cargo test -p <crate> <name>`. An engine deadlock looks the same as a slow test until a timeout gives it an exit code. Twice on 2026-10-04 the user had to ask "tests stuck?".
 - For features: tests define the contract. Write them alongside the implementation, not after.
 - Do not write absurd tests that assert something that was just set before — test business logic.
 - Do not add tests that assert something is not there during refactoring.
