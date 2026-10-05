@@ -398,7 +398,10 @@ impl ProviderExecutor for EngineProviderExecutor {
             // dep set only by removing from it. A Yes is never trusted here:
             // the walk may skip a provider (`skip_providers`,
             // `exclude_provider`) that `get_spec` still asks first, so the
-            // lister need not be the resolver. Trust changes verdicts,
+            // lister need not be the resolver. The same gap holds for a No,
+            // and is an accepted exemption (user, 2026-10-06): a non-resolver's
+            // listed No can drop a dep when the resolver is excluded; `heph
+            // validate`'s `NotResolver` report gates it. Trust changes verdicts,
             // never the sequence: the candidates stay package-major,
             // provider-minor, in list order, duplicates included, because that
             // sequence is folded in order into the consumer's def hash. No trust

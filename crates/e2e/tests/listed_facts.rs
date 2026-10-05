@@ -963,16 +963,28 @@ async fn executor_query_listed_yes_with_a_skipped_resolver() -> anyhow::Result<(
     Ok(())
 }
 
-/// The mirror case: `s` resolves `//p:x` with `ci` and the walk sees only
-/// `l`'s listed No. Trusting the No drops a dep the resolved spec matches.
+/// Accepted exemption (user, 2026-10-06): `s` resolves `//p:x` with `ci`, and
+/// the walk, which excludes `s`, sees only `l`'s listed No. The No is trusted
+/// and drops the dep; `heph validate` reports `l` as a lister that is not the
+/// resolver, which is what gates it.
 #[tokio::test]
-#[ignore = "listed No with a skipped resolver: pending user decision, PR #482"]
-async fn executor_query_listed_no_with_a_skipped_resolver() -> anyhow::Result<()> {
+async fn executor_query_listed_no_with_a_skipped_resolver_is_reported_by_validate()
+-> anyhow::Result<()> {
     let ws = skipped_resolver(&["ci"], &[])?;
     let q = format!("{},exclude_provider=s", query_addr("label(ci)"));
     let trusted = deps_of(&ws, trust(&ws, TRUST), &q).await?;
-    let ignored = deps_of(&ws, trust(&ws, IGNORE), &q).await?;
-    assert_eq!(trusted, ignored);
+    assert!(
+        trusted.is_empty(),
+        "the dropped dep is accepted: {trusted:?}"
+    );
+    let found = mismatches(&ws).await?;
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0]
+            .contains("provider `l` lists //p:x with listed facts, but provider `s` resolves it"),
+        "{}",
+        found[0]
+    );
     Ok(())
 }
 
