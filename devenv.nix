@@ -365,7 +365,7 @@ in
       *)             arch=amd64 ;;
     esac
 
-    target="$(target-dir)"
+    target="$(target-dir .)"
 
     # Stage into a directory unique to THIS run. Worktrees no longer share one
     # target dir, but two `e2e` runs in the *same* worktree — another terminal,
@@ -474,9 +474,16 @@ in
   #
   # `locate-project` rather than a bare `$DEVENV_ROOT/target` so the answer
   # still comes from cargo; it resolves no dependencies, so this is cheap.
+  #
+  # A script that has just run `cargo build` passes `.`: it built the
+  # workspace it was run from, and its artifacts are in *that* target dir. The
+  # shell's `$DEVENV_ROOT` is wherever it was started, which in another
+  # worktree is the wrong checkout — `e2e` there built the worktree, then
+  # staged and tested the main checkout's stale binaries, green.
+  # `tests/target_dir_script.rs` holds every building script to this.
   scripts.target-dir.exec = ''
     set -euo pipefail
-    root="$(cd "$DEVENV_ROOT" && cargo locate-project --workspace --message-format plain)"
+    root="$(cd "''${1:-$DEVENV_ROOT}" && cargo locate-project --workspace --message-format plain)"
     echo "''${root%/Cargo.toml}/target"
   '';
 
@@ -513,7 +520,7 @@ in
   # path = the sibling cdylib) is emitted by tools/pluginmanifest.
   scripts.install-go-plugin.exec = ''
     cargo build --release -p plugin-go-cdylib
-    target="$(target-dir)"
+    target="$(target-dir .)"
     if [ "$(uname -s)" = "Darwin" ]; then
       lib="$target/release/libplugin_go_cdylib.dylib"
       name="heph-go-plugin.dylib"
@@ -540,7 +547,7 @@ in
   # entry (e.g. in a `ci.hephconfig` profile overlay, enabled via HEPH_PROFILES).
   scripts.install-gha-plugin.exec = ''
     cargo build --release -p plugin-gha-cdylib
-    target="$(target-dir)"
+    target="$(target-dir .)"
     if [ "$(uname -s)" = "Darwin" ]; then
       lib="$target/release/libplugin_gha_cdylib.dylib"
       name="heph-gha-plugin.dylib"
@@ -566,7 +573,7 @@ in
   # `path: ~/.heph/plugins/oci/heph-oci-plugin.json` entry.
   scripts.install-oci-plugin.exec = ''
     cargo build --release -p plugin-oci-cdylib
-    target="$(target-dir)"
+    target="$(target-dir .)"
     if [ "$(uname -s)" = "Darwin" ]; then
       lib="$target/release/libplugin_oci_cdylib.dylib"
       name="heph-oci-plugin.dylib"
@@ -586,7 +593,7 @@ in
 
   scripts.install-devenv-plugin.exec = ''
     cargo build --release -p plugin-devenv-cdylib
-    target="$(target-dir)"
+    target="$(target-dir .)"
     if [ "$(uname -s)" = "Darwin" ]; then
       lib="$target/release/libplugin_devenv_cdylib.dylib"
       name="heph-devenv-plugin.dylib"
@@ -633,14 +640,14 @@ in
     mkdir -p $(dirname "${binLocation}")
     # Atomic replace (new inode) — overwriting the binary in place leaves macOS
     # holding the previous code-signature for that path and SIGKILLs the next run.
-    cp "$(target-dir)"/debug/heph "${binLocation}.new"
+    cp "$(target-dir .)"/debug/heph "${binLocation}.new"
     mv -f "${binLocation}.new" "${binLocation}"
     install-go-plugin
   '';
 
   scripts.install-release-build.exec = ''
     cargo build --release
-    bin="$(target-dir)/release/heph"
+    bin="$(target-dir .)/release/heph"
     if [ "$(uname -s)" = "Darwin" ]; then
       # The nix toolchain hard-links libiconv against its /nix/store path, which
       # dyld aborts on once that store path is GC'd ("Killed"). Rewrite to the
