@@ -35,11 +35,13 @@ Query language (-e / --expr):
   Functions:
     label(x)             targets carrying label x   (e.g. label(go-lint))
     tree_output(pkg)     targets whose codegen tree writes into pkg
-    driver(\"name\")       targets run by that driver, whole name, case-sensitive
-                         (e.g. driver(\"credential\"); escapes: \\\\ \\\" \\n \\r \\t \\u{..})
+    driver(name)         targets run by that driver, whole name, case-sensitive
+                         (e.g. driver(credential))
     addr(//pkg:name)     an explicit target address
     package(//pkg)       an explicit package
     package_prefix(//pkg) every package under //pkg
+  Any argument may be bare or quoted, with the same meaning: label(ci) is
+  label(\"ci\"). A quoted argument takes escapes: \\\\ \\\" \\n \\r \\t \\u{..}
   Operators (precedence ! > && > ||, group with parentheses):
     a && b               both          a || b   either          !a   negate
   Evaluation follows grouping then left-to-right, bailing as early as possible.

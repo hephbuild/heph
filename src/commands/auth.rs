@@ -424,7 +424,7 @@ async fn logout() -> anyhow::Result<()> {
 
 /// Every `credential` target in the workspace (or under `matcher`).
 ///
-/// Selects with `driver("credential")`, so a provider that lists each target's
+/// Selects with `driver(credential)`, so a provider that lists each target's
 /// driver (go, buildfile) decides every other target from its listing without
 /// resolving it — no `go list` anywhere. Only a candidate whose driver is
 /// unknown is resolved to decide.
