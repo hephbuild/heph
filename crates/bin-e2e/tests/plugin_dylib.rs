@@ -228,7 +228,11 @@ fn shipped_go_cdylib_list_calls_back_states_under_across_the_seam() {
     )
     .expect("write BUILD");
 
-    let out = ws.run(&dist, &["query", "-e", "//lib/..."]).expect("run");
+    // `--candidates`: the listing is what crosses the seam, and confirming a
+    // match would run `go list`.
+    let out = ws
+        .run(&dist, &["query", "--candidates", "-e", "//lib/..."])
+        .expect("run");
     assert!(out.status.success(), "{}", describe(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -244,7 +248,8 @@ fn shipped_go_cdylib_list_calls_back_states_under_across_the_seam() {
 /// single `get`. `get` of any go target runs `_golist`, which needs `go`; the
 /// only `go` on `PATH` here is a stub that fails, so a run that resolved even
 /// one spec would fail. `driver("nonexistent")` must therefore come back
-/// empty and green, and `driver("go_compile")` must name the lib's compile —
+/// empty and green (a listed No is never resolved), and
+/// `--candidates` with `driver(go_compile)` must name the lib's compile —
 /// both decided from the listing alone.
 #[cfg(unix)]
 #[test]
@@ -291,14 +296,18 @@ fn shipped_go_cdylib_listed_facts_decide_without_get() {
         }
         None => stub.path().as_os_str().to_owned(),
     };
-    let query_with = |expr: &str, kill_switch: &str| {
-        ws.cmd(&dist, &["query", "-e", expr])
+    let query_flags = |flags: &[&str], expr: &str, kill_switch: &str| {
+        let mut args = vec!["query"];
+        args.extend_from_slice(flags);
+        args.extend(["-e", expr]);
+        ws.cmd(&dist, &args)
             .env("PATH", &path)
             .env("HEPH_NO_LISTED_FACTS", kill_switch)
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run")
     };
+    let query_with = |expr: &str, kill_switch: &str| query_flags(&[], expr, kill_switch);
     let query = |expr: &str| query_with(expr, "");
 
     // The control: resolving the specs runs `_golist`, so the stub fails it.
@@ -317,7 +326,9 @@ fn shipped_go_cdylib_listed_facts_decide_without_get() {
         describe(&out)
     );
 
-    let out = query(r#"//lib/... && driver("go_compile")"#);
+    // A listed Yes is confirmed by default, which would run the stub; the
+    // listing alone is `--candidates`.
+    let out = query_flags(&["--candidates"], "//lib/... && driver(go_compile)", "");
     assert!(out.status.success(), "{}", describe(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.lines().collect();

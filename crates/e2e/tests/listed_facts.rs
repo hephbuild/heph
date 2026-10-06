@@ -660,22 +660,79 @@ async fn listed_yes_not_found_dropped_by_run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// C26: `heph q` prints a listed Yes it has not confirmed, as under #474 —
-/// frozen, so a change to that is a deliberate one.
-#[tokio::test]
-async fn heph_q_phantom_test_entries_frozen() -> anyhow::Result<()> {
-    let (ws, gets) = workspace(
+/// What `heph q` prints for `m`: the command's own selection, with or without
+/// `--candidates`.
+async fn heph_q(
+    ws: &htestkit::Workspace,
+    m: &Matcher,
+    candidates: bool,
+) -> anyhow::Result<Vec<String>> {
+    let rs = trust(ws, TRUST);
+    let addrs: Vec<Addr> = heph::commands::query::select(
+        Arc::clone(&ws.engine),
+        rs,
+        m,
+        Discovery::Complete,
+        candidates,
+    )
+    .try_collect()
+    .await?;
+    Ok(addrs.iter().map(Addr::format).collect())
+}
+
+fn phantom_workspace() -> anyhow::Result<(htestkit::Workspace, Arc<GetLog>)> {
+    workspace(
         vec![bash("//p:real", &["test"])],
         Faults {
             vanished: vec![(parse_addr("//p:ghost")?, strings(&["test"]))],
             ..Default::default()
         },
-    )?;
+    )
+}
+
+/// C26: `heph q` confirms every match, so a listed Yes that does not resolve
+/// is not printed — whether its listing or its addr selected it.
+#[tokio::test]
+async fn heph_query_is_exact_by_default() -> anyhow::Result<()> {
+    let (ws, gets) = phantom_workspace()?;
+    assert_eq!(heph_q(&ws, &label("test"), false).await?, vec!["//p:real"]);
+    assert_eq!(got(&gets), vec!["//p:ghost", "//p:real"]);
+
+    let (ws, _) = phantom_workspace()?;
+    assert_eq!(heph_q(&ws, &everything(), false).await?, vec!["//p:real"]);
+    let (ws, _) = phantom_workspace()?;
+    assert!(
+        heph_q(&ws, &Matcher::Addr(parse_addr("//p:ghost")?), false)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// C26: `heph q --candidates` prints the listing as is, phantom included, and
+/// resolves nothing.
+#[tokio::test]
+async fn heph_query_candidates_flag_prints_listing() -> anyhow::Result<()> {
+    let (ws, gets) = phantom_workspace()?;
     assert_eq!(
-        select(&ws, trust(&ws, TRUST), &label("test")).await?,
+        heph_q(&ws, &label("test"), true).await?,
         vec!["//p:ghost", "//p:real"]
     );
-    assert!(got(&gets).is_empty());
+    assert!(got(&gets).is_empty(), "resolved {:?}", got(&gets));
+    Ok(())
+}
+
+/// A listed No is never resolved by `heph q`, in either mode: only the Yes is
+/// confirmed by default, and nothing with `--candidates`.
+#[tokio::test]
+async fn heph_query_listed_no_skips_get() -> anyhow::Result<()> {
+    let (ws, gets) = workspace(c1_targets(), Faults::default())?;
+    assert_eq!(heph_q(&ws, &label("test"), false).await?, vec!["//p:test"]);
+    assert_eq!(got(&gets), vec!["//p:test"], "one get_spec, for the Yes");
+
+    let (ws, gets) = workspace(c1_targets(), Faults::default())?;
+    assert_eq!(heph_q(&ws, &label("test"), true).await?, vec!["//p:test"]);
+    assert!(got(&gets).is_empty(), "resolved {:?}", got(&gets));
     Ok(())
 }
 

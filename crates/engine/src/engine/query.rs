@@ -663,6 +663,29 @@ impl Engine {
             .try_buffer_unordered(concurrency)
             .try_filter_map(|spec| std::future::ready(Ok(spec)))
     }
+
+    /// [`Engine::query`], keeping only the targets that exist: every match is
+    /// resolved, whether a listed fact, the spec or the addr alone selected
+    /// it, and a candidate that does not resolve is dropped as
+    /// [`Engine::confirm_match`] drops one. A candidate the walk rules out is
+    /// never resolved here, so a listed No still costs no `get`.
+    ///
+    /// Yields in the walk's order (`try_buffered`), resolving as many matches
+    /// at once as `heph r` confirms.
+    pub fn query_existing<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        discovery: Discovery,
+    ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+        let gaps = discovery.gaps().cloned();
+        let limit = Self::top_level_spawn_limit(self.max_workers);
+        Arc::clone(&self)
+            .query(rs.clone(), m, discovery)
+            .map_ok(move |addr| Arc::clone(&self).confirm_exists(rs.clone(), gaps.clone(), addr))
+            .try_buffered(limit)
+            .try_filter_map(futures::future::ok)
+    }
 }
 
 impl Engine {
@@ -691,6 +714,17 @@ impl Engine {
         if m.matches_addr(&addr) == MatchResult::MatchYes {
             return Ok(Some(addr));
         }
+        self.confirm_exists(rs, gaps, addr).await
+    }
+
+    /// [`Engine::confirm_match`] without the addr shortcut: every addr is
+    /// resolved, so `Some` means it exists, whatever decided the match.
+    async fn confirm_exists(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        gaps: Option<Arc<Gaps>>,
+        addr: Addr,
+    ) -> anyhow::Result<Option<Addr>> {
         match skip_unresolvable(&addr, self.get_spec(rs.clone(), &addr).await) {
             Ok(Some(_)) => Ok(Some(addr)),
             Ok(None) => {

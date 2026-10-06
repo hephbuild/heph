@@ -1800,7 +1800,7 @@ impl Engine {
     /// a read guard rides on the artifact and lives as long as anything holds
     /// it, so this bounds the rate of acquisition and not the count. What it
     /// bounds is live *task* state, blocking-queue depth, and waker churn.
-    fn top_level_spawn_limit(max_workers: usize) -> usize {
+    pub(crate) fn top_level_spawn_limit(max_workers: usize) -> usize {
         max_workers.saturating_mul(8).clamp(16, 2048)
     }
 

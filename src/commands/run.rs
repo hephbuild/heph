@@ -47,8 +47,9 @@ Query language (-e / --expr):
   Evaluation follows grouping then left-to-right, bailing as early as possible.
 
   label(), driver() and tree_output() are decided from what providers list
-  where they can, without resolving each target. So `query` may print a listed
-  target that turns out not to exist (`run` drops it). Set
+  where they can, without resolving each target they rule out. `query` then
+  resolves each match and prints only targets that exist; `query --candidates`
+  skips that, which is faster but may print a listed target that does not. Set
   HEPH_NO_LISTED_FACTS to 1 to resolve every candidate instead; `heph validate`
   checks the listings.
 
