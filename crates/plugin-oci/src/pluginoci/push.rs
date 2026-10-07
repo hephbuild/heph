@@ -4,6 +4,10 @@
 //! An *action*, not an artifact: it has an external side effect (the upload) and
 //! is therefore **not cached** — it runs every time it is requested.
 //!
+//! Its one output, `<name>.ref`, is the reference it pushed to, resolved: with
+//! `${image_hashout}` or `${read://…}` in `ref`, the BUILD file does not say
+//! which tag that was, and a later target may want to deploy it.
+//!
 //! Speaks the OCI distribution protocol in-process (see [`super::registry`]):
 //! no daemon, no skopeo, and blobs the registry already has are skipped. A
 //! multi-platform archive pushes every instance plus the manifest list that ties
@@ -14,7 +18,8 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, TargetDef};
+use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
+use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
     ParseRequest, ParseResponse, TargetAddr,
@@ -83,7 +88,13 @@ struct OciPushDef {
 
 /// v2: pushed in-process over the distribution protocol; `tool` and `format` are
 /// gone, so neither is in the key any more.
-const OCI_PUSH_FORMAT_VERSION: u32 = 2;
+/// v3: the pushed reference is an output, `<name>.ref`.
+const OCI_PUSH_FORMAT_VERSION: u32 = 3;
+
+/// The output file holding the reference a push went to, in the package dir.
+fn ref_out_name(target_name: &str) -> String {
+    format!("{target_name}.ref")
+}
 
 impl Hash for OciPushDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -252,7 +263,17 @@ impl ManagedDriver for Driver {
                 })
                 .chain(credential_inputs)
                 .collect(),
-                outputs: vec![],
+                outputs: vec![Output {
+                    group: String::new(),
+                    paths: vec![OutPath {
+                        content: Content::FilePath(super::ws_path(
+                            addr.package.as_str(),
+                            &ref_out_name(&addr.name),
+                        )),
+                        codegen_tree: CodegenMode::None,
+                        collect: true,
+                    }],
+                }],
                 support_files: vec![],
                 // An action with an external side effect: never cached, always runs.
                 cache: CacheConfig::off(),
@@ -306,10 +327,14 @@ impl ManagedDriver for Driver {
         let digest = registry::push_layout(&layout, &dest, def.insecure, &creds)
             .await
             .with_context(|| format!("push {dest} ({})", creds.failure_hint()))?;
-        // The only place a resolved `ref` is visible on success: with
-        // `${image_hashout}` or `${read://…}` in it, the BUILD file does not say
-        // which tag was pushed.
-        tracing::info!(target_addr = %req.request.target.addr.format(), reference = %dest, %digest, "pushed");
+        tracing::debug!(target_addr = %req.request.target.addr.format(), reference = %dest, %digest, "pushed");
+
+        let out = req
+            .sandbox_pkg_dir
+            .join(ref_out_name(&req.request.target.addr.name));
+        tokio::fs::write(&out, &dest)
+            .await
+            .with_context(|| format!("write the pushed reference to {out:?}"))?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -351,7 +376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_declares_tar_group_input_and_no_outputs() {
+    async fn parse_declares_tar_group_input_and_the_ref_output() {
         let resp = parse(
             "//app:push",
             cfg(&[
@@ -365,7 +390,19 @@ mod tests {
         // Pinned to the archive group "", not all groups.
         assert_eq!(resp.target_def.inputs[0].r#ref.output.as_deref(), Some(""));
         assert_eq!(resp.target_def.inputs[0].r#ref.r#ref.format(), "//app:img");
-        assert!(resp.target_def.outputs.is_empty());
+        // One output, in the default group: what `${read://app:push}` reads.
+        let [out] = resp.target_def.outputs.as_slice() else {
+            panic!("one output, got {}", resp.target_def.outputs.len());
+        };
+        assert_eq!(out.group, "");
+        let [path] = out.paths.as_slice() else {
+            panic!("one path, got {:?}", out.paths);
+        };
+        assert!(
+            matches!(&path.content, Content::FilePath(p) if p == "app/push.ref"),
+            "{:?}",
+            path.content
+        );
         // An action: never cached.
         assert!(!resp.target_def.cache.enabled);
         assert!(!resp.target_def.cache.remote_enabled);

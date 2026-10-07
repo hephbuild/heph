@@ -1119,7 +1119,7 @@ target(
         ),
     );
 
-    ws.run("//app:push").await?;
+    let pushed = ws.run_addr_outputs("//app:push", &[""]).await?;
 
     let img = ws.run_addr_outputs("//app:img", &[""]).await?;
     let [archive] = img.artifacts.as_slice() else {
@@ -1132,6 +1132,12 @@ target(
     assert!(
         status.starts_with("HTTP/1.1 200"),
         "the push must have tagged the image {hashout}, the registry answered: {status}"
+    );
+    // The output is the reference the push went to, resolved and nothing else,
+    // so `${read://app:push}` hands a later target exactly that.
+    assert_eq!(
+        artifact_file(&pushed, "push.ref"),
+        format!("{}/heph-e2e/tagged:{hashout}", registry.host()),
     );
     Ok(())
 }
