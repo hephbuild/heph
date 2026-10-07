@@ -4,9 +4,10 @@
 //! An *action*, not an artifact: it has an external side effect (the upload) and
 //! is therefore **not cached** — it runs every time it is requested.
 //!
-//! Its one output, `<name>.ref`, is the reference it pushed to, resolved: with
-//! `${image_hashout}` or `${read://…}` in `ref`, the BUILD file does not say
-//! which tag that was, and a later target may want to deploy it.
+//! Its one output, `<name>.ref`, is the reference it pushed to, resolved and in
+//! full — `registry/repository:tag`, with `latest` written out when `ref` gave
+//! no tag: with `${image_hashout}` or `${read://…}` in `ref`, the BUILD file
+//! does not say which tag that was, and a later target may want to deploy it.
 //!
 //! Speaks the OCI distribution protocol in-process (see [`super::registry`]):
 //! no daemon, no skopeo, and blobs the registry already has are skipped. A
@@ -332,7 +333,7 @@ impl ManagedDriver for Driver {
         let out = req
             .sandbox_pkg_dir
             .join(ref_out_name(&req.request.target.addr.name));
-        tokio::fs::write(&out, &dest)
+        tokio::fs::write(&out, registry::full_ref(&dest)?)
             .await
             .with_context(|| format!("write the pushed reference to {out:?}"))?;
 
