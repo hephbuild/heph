@@ -20,42 +20,63 @@ use oci_client::{Client, Reference};
 use super::archive::{Blob, Layout};
 use super::auth::RegistryCredentials;
 
-/// How much of a blob is read at a time on its way to the registry. Bounded so
-/// a layer's size never becomes the driver's peak memory.
-const PUSH_CHUNK: usize = 512 * 1024;
-
-/// A blob as a chunked byte stream, read lazily off disk.
+/// A blob as one request body, without copying a file-backed blob onto the heap.
 ///
-/// `push_blob` takes the whole blob as one `Bytes`; `push_blob_stream` takes
-/// this instead, which is what keeps a multi-gigabyte layer out of memory.
-fn blob_stream(
+/// A file is memory-mapped rather than read: a layer can be gigabytes, and a
+/// mapping is backed by the page cache — pages are faulted in as the request
+/// body is written and can be dropped again under pressure — so a layer's size
+/// does not become the driver's resident heap.
+fn blob_body(blob: &Blob) -> anyhow::Result<bytes::Bytes> {
+    let (path, offset, len) = match blob {
+        // Manifests and configs: kilobytes, already in memory.
+        Blob::Bytes(b) => return Ok(bytes::Bytes::from(b.clone())),
+        Blob::File(path) => (path, 0, blob.len()?),
+        Blob::FileRange { path, offset, len } => (path, *offset, *len),
+    };
+    if len == 0 {
+        return Ok(bytes::Bytes::new());
+    }
+    let file = std::fs::File::open(path).with_context(|| format!("open blob file {path:?}"))?;
+    let len = usize::try_from(len).with_context(|| format!("blob {path:?} is {len} bytes"))?;
+    // SAFETY: a mapping is only sound while nothing truncates or rewrites the
+    // file under it. This file is a content-addressed blob in the sandbox this
+    // driver owns — a layer staged by `oci_image`, a pulled blob renamed into
+    // place once complete, or an `oci-archive` input — and nothing writes to it
+    // for the length of the push.
+    let map = unsafe {
+        memmap2::MmapOptions::new()
+            .offset(offset)
+            .len(len)
+            .map(&file)
+    }
+    .with_context(|| format!("map blob file {path:?} ({len} bytes at {offset})"))?;
+    Ok(bytes::Bytes::from_owner(map))
+}
+
+/// Upload one blob in a single request: POST to open the upload, then one PUT
+/// carrying the whole body.
+///
+/// Not the chunked upload (a PATCH per chunk, then PUT): Google Artifact
+/// Registry answers a PATCH with a `Location` that refuses the next PATCH with
+/// 405, so every blob over one chunk failed to push. A monolithic upload never
+/// sends a second PATCH, and every registry must accept it.
+async fn push_blob(
+    client: &Client,
+    reference: &Reference,
     blob: &Blob,
-) -> anyhow::Result<impl futures::Stream<Item = oci_client::errors::Result<bytes::Bytes>>> {
-    let mut reader = blob.reader()?;
-    Ok(futures::stream::poll_fn(move |_| {
-        let mut buf = vec![0u8; PUSH_CHUNK];
-        let mut filled = 0;
-        // `read` is free to return short; keep going until the chunk is full or
-        // the blob ends, so the registry sees uniform chunks.
-        while let Some(rest) = buf.get_mut(filled..).filter(|r| !r.is_empty()) {
-            match std::io::Read::read(&mut reader, rest) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) => {
-                    return std::task::Poll::Ready(Some(Err(
-                        oci_client::errors::OciDistributionError::GenericError(Some(format!(
-                            "read blob: {e}"
-                        ))),
-                    )));
-                }
-            }
-        }
-        if filled == 0 {
-            return std::task::Poll::Ready(None);
-        }
-        buf.truncate(filled);
-        std::task::Poll::Ready(Some(Ok(bytes::Bytes::from(buf))))
-    }))
+    digest: &str,
+) -> anyhow::Result<()> {
+    let body = blob_body(blob)?;
+    if body.is_empty() {
+        // A monolithic PUT refuses an empty body (`PushNoDataError`). An empty
+        // stream is the same POST and the closing PUT, with no PATCH between.
+        client
+            .push_blob_stream(reference, futures::stream::empty(), digest)
+            .await?;
+    } else {
+        client.push_blob(reference, body, digest).await?;
+    }
+    Ok(())
 }
 
 /// Build a client for `insecure` (plain HTTP / self-signed) or the default TLS.
@@ -67,6 +88,8 @@ fn client(insecure: bool) -> Client {
             ClientProtocol::Https
         },
         accept_invalid_certificates: insecure,
+        // See `push_blob`: `push_blob` with this set is POST + one PUT.
+        use_monolithic_push: true,
         ..Default::default()
     })
 }
@@ -113,11 +136,7 @@ pub(crate) async fn push_layout(
             {
                 continue;
             }
-            // Streamed off disk in chunks, never read whole: a layer is the
-            // largest thing this plugin touches, and `push_blob` would want it
-            // as one `Bytes`.
-            client
-                .push_blob_stream(&reference, blob_stream(layout.blob(&digest)?)?, &digest)
+            push_blob(&client, &reference, layout.blob(&digest)?, &digest)
                 .await
                 .with_context(|| format!("push blob {digest}"))?;
         }
@@ -414,7 +433,6 @@ async fn pull_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt as _;
 
     /// The remedy the warning offers has to be pasteable: a ref the user can
     /// drop straight into `src`, naming the digest the tag pointed at.
@@ -448,37 +466,189 @@ mod tests {
         );
     }
 
-    /// The upload path reads a blob in bounded chunks and reassembles to exactly
-    /// the original bytes.
+    /// One request the mock registry received.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        method: String,
+        target: String,
+        body: Vec<u8>,
+    }
+
+    /// A registry that answers blob uploads the way Google Artifact Registry
+    /// does: the `Location` a PATCH returns is a `/v2/…/pkg/…` URL that refuses
+    /// any further PATCH with 405, though it takes the closing PUT.
     ///
-    /// Only the docker-gated suite drives a real push, so without this the
-    /// chunking — off-by-one on the last partial chunk, a short `read` treated
-    /// as EOF — would be covered by nothing that runs on every push.
+    /// Plain HTTP/1.1 over a std listener, one thread per connection, keep-alive.
+    /// Every request is recorded so a test can say what reached the wire.
+    fn artifact_registry_mock() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Seen>>>) {
+        use std::io::{BufRead as _, Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    let mut out = conn.try_clone().expect("clone stream");
+                    let mut rd = std::io::BufReader::new(conn);
+                    loop {
+                        let mut line = String::new();
+                        if rd.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut parts = line.split_whitespace();
+                        let method = parts.next().unwrap_or_default().to_string();
+                        let target = parts.next().unwrap_or_default().to_string();
+                        let mut len = 0usize;
+                        loop {
+                            let mut h = String::new();
+                            if rd.read_line(&mut h).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let h = h.trim_end();
+                            if h.is_empty() {
+                                break;
+                            }
+                            if let Some((k, v)) = h.split_once(':')
+                                && k.eq_ignore_ascii_case("content-length")
+                            {
+                                len = v.trim().parse().expect("content-length");
+                            }
+                        }
+                        let mut body = vec![0u8; len];
+                        rd.read_exact(&mut body).expect("body");
+
+                        let path = target.split('?').next().unwrap_or_default();
+                        let (status, location) = match method.as_str() {
+                            "GET" if path == "/v2/" => ("200 OK", None),
+                            "POST" if path.ends_with("/blobs/uploads/") => (
+                                "202 Accepted",
+                                Some("/artifacts-uploads/namespaces/p/repositories/r/uploads/ID1"),
+                            ),
+                            "PATCH" if path.starts_with("/artifacts-uploads/") => {
+                                ("202 Accepted", Some("/v2/p/r/pkg/blobs/uploads/ID2"))
+                            }
+                            "PATCH" => ("405 Method Not Allowed", None),
+                            "PUT" if target.contains("?digest=") => {
+                                ("201 Created", Some("/v2/p/r/img/blobs/sha256:stored"))
+                            }
+                            _ => ("404 Not Found", None),
+                        };
+                        log.lock().expect("log").push(Seen {
+                            method,
+                            target,
+                            body,
+                        });
+                        let location = location
+                            .map(|l| format!("Location: {l}\r\n"))
+                            .unwrap_or_default();
+                        let resp =
+                            format!("HTTP/1.1 {status}\r\n{location}Content-Length: 0\r\n\r\n");
+                        if out.write_all(resp.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// A blob larger than one upload chunk reaches a registry whose post-PATCH
+    /// `Location` refuses another PATCH — Artifact Registry, observed with curl.
+    ///
+    /// The chunked upload (POST, a PATCH per 512 KiB, PUT) followed that
+    /// `Location` into a 405 on the second PATCH, so every layer over one chunk
+    /// failed to push. One request carrying the whole body never asks the
+    /// registry for a second.
     #[tokio::test]
-    async fn a_blob_streams_back_in_bounded_chunks() {
-        // Deliberately not a multiple of PUSH_CHUNK: the last chunk is partial,
-        // which is where a length bug shows up.
-        let len = PUSH_CHUNK * 2 + 7;
+    async fn a_blob_larger_than_a_chunk_pushes_in_one_request() {
+        use sha2::Digest as _;
+
+        let (port, seen) = artifact_registry_mock();
+        let client = client(true);
+        let reference: Reference = format!("127.0.0.1:{port}/p/r/img:t").parse().expect("ref");
+
+        // Past two of the old 512 KiB chunks, and not a multiple of one.
+        let len: usize = 1024 * 1024 + 7;
         let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("blob");
         std::fs::write(&path, &data).expect("write");
+        // The same bytes inside a larger file, as an `oci-archive` holds them.
+        let archive = dir.path().join("archive");
+        let mut padded = vec![0xAAu8; 4099];
+        padded.extend_from_slice(&data);
+        padded.extend_from_slice(&[0xBB; 13]);
+        std::fs::write(&archive, &padded).expect("write archive");
 
-        for blob in [Blob::Bytes(data.clone()), Blob::File(path)] {
-            let mut stream = Box::pin(blob_stream(&blob).expect("stream"));
-            let mut chunks = Vec::new();
-            let mut got = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.expect("chunk");
-                chunks.push(chunk.len());
-                got.extend_from_slice(&chunk);
-            }
-            assert_eq!(got, data, "the stream must reassemble to the blob");
+        for blob in [
+            Blob::File(path),
+            Blob::FileRange {
+                path: archive,
+                offset: 4099,
+                len: len as u64,
+            },
+            Blob::Bytes(data.clone()),
+        ] {
+            seen.lock().expect("log").clear();
+            push_blob(&client, &reference, &blob, &digest)
+                .await
+                .unwrap_or_else(|e| panic!("push {blob:?}: {e:#}"));
+
+            let seen = seen.lock().expect("log").clone();
+            let carrying: Vec<_> = seen.iter().filter(|s| !s.body.is_empty()).collect();
             assert_eq!(
-                chunks,
-                vec![PUSH_CHUNK, PUSH_CHUNK, 7],
-                "full chunks, then the remainder — never a chunk past the end"
+                carrying.len(),
+                1,
+                "the whole blob goes in exactly one request, got: {:?}",
+                seen.iter()
+                    .map(|s| format!("{} {} ({} bytes)", s.method, s.target, s.body.len()))
+                    .collect::<Vec<_>>()
             );
+            let only = carrying.first().expect("one request");
+            assert_eq!(only.method, "PUT", "the body rides the closing PUT");
+            assert!(
+                only.target
+                    .contains(&format!("digest={}", digest.replace(':', "%3A"))),
+                "the PUT names the digest: {}",
+                only.target
+            );
+            assert!(only.body == data, "the registry stores exactly the blob");
+        }
+    }
+
+    /// An empty blob still pushes. A monolithic upload refuses an empty body
+    /// (`PushNoDataError`), so this has to take another route — POST then the
+    /// closing PUT, which is what an empty upload is anyway.
+    #[tokio::test]
+    async fn an_empty_blob_pushes() {
+        use sha2::Digest as _;
+
+        let (port, seen) = artifact_registry_mock();
+        let client = client(true);
+        let reference: Reference = format!("127.0.0.1:{port}/p/r/img:t").parse().expect("ref");
+        let digest = format!("sha256:{:x}", sha2::Sha256::digest(b""));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty");
+        std::fs::write(&path, b"").expect("write");
+
+        for blob in [Blob::File(path), Blob::Bytes(Vec::new())] {
+            seen.lock().expect("log").clear();
+            push_blob(&client, &reference, &blob, &digest)
+                .await
+                .unwrap_or_else(|e| panic!("push {blob:?}: {e:#}"));
+            let methods: Vec<_> = seen
+                .lock()
+                .expect("log")
+                .iter()
+                .map(|s| s.method.clone())
+                .collect();
+            assert_eq!(methods, ["POST", "PUT"], "no PATCH for an empty blob");
         }
     }
 }
