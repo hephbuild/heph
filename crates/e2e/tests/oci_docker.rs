@@ -363,6 +363,39 @@ impl Registry {
         false
     }
 
+    /// The status line of a `HEAD` for `repo:reference`'s manifest.
+    ///
+    /// Raw HTTP over a socket: one request to a plain-HTTP registry on loopback
+    /// does not justify an HTTP client dependency.
+    fn manifest_status(&self, repo: &str, reference: &str) -> anyhow::Result<String> {
+        use anyhow::Context as _;
+        use std::io::{BufRead as _, Write as _};
+        let host = self.host();
+        let timeout = std::time::Duration::from_secs(30);
+        let addr: std::net::SocketAddr = host
+            .parse()
+            .with_context(|| format!("registry address {host}"))?;
+        let mut conn = std::net::TcpStream::connect_timeout(&addr, timeout)
+            .with_context(|| format!("connect to the registry at {host}"))?;
+        conn.set_read_timeout(Some(timeout))
+            .context("set the read timeout")?;
+        write!(
+            conn,
+            "HEAD /v2/{repo}/manifests/{reference} HTTP/1.1\r\nHost: {host}\r\n\
+             Accept: application/vnd.oci.image.index.v1+json, \
+             application/vnd.oci.image.manifest.v1+json, \
+             application/vnd.docker.distribution.manifest.list.v2+json, \
+             application/vnd.docker.distribution.manifest.v2+json\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .context("send the manifest request")?;
+        let mut line = String::new();
+        std::io::BufReader::new(conn)
+            .read_line(&mut line)
+            .context("read the registry's status line")?;
+        Ok(line.trim_end().to_string())
+    }
+
     fn host(&self) -> String {
         format!("127.0.0.1:{}", self.port)
     }
@@ -1036,6 +1069,69 @@ target(
     assert!(
         derived.iter().any(|e| e == "index.json"),
         "the derived image must be a real OCI archive, got: {derived:?}"
+    );
+    Ok(())
+}
+
+/// `ref` is resolved, not literal: the repository comes from another target's
+/// output through `${read://…}`, and the tag is `${image_hashout}`, the hashout of
+/// the image's archive. Pulling that exact tag back is what proves both were
+/// substituted. A reference left as text fails to parse before anything is
+/// pushed, and a wrong tag pulls nothing.
+#[tokio::test]
+async fn test_real_push_resolves_a_deferred_ref_and_the_image_hashout() -> anyhow::Result<()> {
+    require_docker!();
+    let builder = require_builder!();
+    let Some(registry) = Registry::start() else {
+        eprintln!("skipping: could not start a local registry:2 (no network, or no daemon)");
+        return Ok(());
+    };
+
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"
+target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
+target(
+    name = "dockerfile",
+    driver = "bash",
+    run = "printf 'FROM scratch\nCOPY app/payload.txt /payload.txt\n' > $OUT",
+    out = "Dockerfile",
+)
+target(
+    name = "img",
+    driver = "docker_build",
+    context = [":dockerfile", ":payload"],
+    {builder}
+)
+target(name = "repo", driver = "bash", run = "echo {host}/heph-e2e/tagged > $OUT", out = "repo.txt")
+target(
+    name = "push",
+    driver = "oci_push",
+    image = ":img",
+    ref = "${{read://app:repo}}:${{image_hashout}}",
+    insecure = True,
+)
+"#,
+            host = registry.host(),
+            builder = builder_attr(&builder),
+        ),
+    );
+
+    ws.run("//app:push").await?;
+
+    let img = ws.run_addr_outputs("//app:img", &[""]).await?;
+    let [archive] = img.artifacts.as_slice() else {
+        panic!("the image has one archive artifact");
+    };
+    let hashout = archive.hashout()?;
+    assert!(!hashout.is_empty(), "the archive must carry a hashout");
+
+    let status = registry.manifest_status("heph-e2e/tagged", &hashout)?;
+    assert!(
+        status.starts_with("HTTP/1.1 200"),
+        "the push must have tagged the image {hashout}, the registry answered: {status}"
     );
     Ok(())
 }

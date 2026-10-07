@@ -1003,12 +1003,54 @@ fn managed_input_to_pb(mi: &ManagedRunInput) -> pb::ManagedRunInput {
             .list_path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
+        // Empty on error rather than failing the run: most drivers never read
+        // it, and one that does must refuse an empty hashout anyway, since an
+        // old host sends none at all.
+        hashout: mi.input.artifact.content.hashout().unwrap_or_default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run input's hashout crosses to the guest. Without it a guest driver
+    /// reading `content.hashout()` sees `""`, which in-process tests never do.
+    #[test]
+    fn a_managed_input_sends_its_hashout() {
+        struct Hashed;
+        impl hcore::hartifactcontent::Content for Hashed {
+            fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+                anyhow::bail!("unused")
+            }
+            fn walk(
+                &self,
+            ) -> anyhow::Result<
+                Box<dyn Iterator<Item = anyhow::Result<hcore::hartifactcontent::WalkEntry>> + '_>,
+            > {
+                anyhow::bail!("unused")
+            }
+            fn hashout(&self) -> anyhow::Result<String> {
+                Ok("abc123".to_string())
+            }
+        }
+        let mi = ManagedRunInput {
+            input: hplugin::driver::RunInput {
+                artifact: inputartifact::InputArtifact {
+                    r#type: inputartifact::Type::Dep,
+                    origin_id: "image".to_string(),
+                    content: Arc::new(Hashed),
+                },
+                origin_id: "image".to_string(),
+                source_addr: hmodel::htaddr::parse_addr("//app:img").expect("addr"),
+                filters: vec![],
+                annotations: Default::default(),
+            },
+            list_path: None,
+            unpack_root: std::path::PathBuf::from("/unused"),
+        };
+        assert_eq!(managed_input_to_pb(&mi).hashout, "abc123");
+    }
 
     fn encoded(labels: &[&str], labels_known: bool) -> Vec<u8> {
         pb::ListResponse {

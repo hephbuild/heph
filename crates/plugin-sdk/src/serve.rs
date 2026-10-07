@@ -1349,6 +1349,7 @@ fn run_input_from_pb(mi: &pb::ManagedRunInput) -> RunInput {
             content: Arc::new(DiskInputContent {
                 unpack_root: PathBuf::from(&mi.unpack_root),
                 list_path: mi.list_path.clone().map(PathBuf::from),
+                hashout: mi.hashout.clone(),
             }),
         },
         origin_id: mi.origin_id.clone(),
@@ -1379,6 +1380,9 @@ fn managed_input_from_pb(mi: pb::ManagedRunInput) -> ManagedRunInput {
 struct DiskInputContent {
     unpack_root: PathBuf,
     list_path: Option<PathBuf>,
+    /// As the host sent it. Not recomputed from the files here: that would hash
+    /// the unpacked bytes, not the artifact the consumer's hashin folded in.
+    hashout: String,
 }
 
 impl DiskInputContent {
@@ -1478,9 +1482,8 @@ impl Content for DiskInputContent {
     }
 
     fn hashout(&self) -> Result<String> {
-        // The hashout isn't carried on the run wire; inputs are addressed by path
-        // here, not by content hash.
-        Ok(String::new())
+        // Empty when the host could not read it, or predates the field.
+        Ok(self.hashout.clone())
     }
 }
 
@@ -1573,6 +1576,18 @@ mod tests {
 
     // A managed input's content is readable from the files the host materialized
     // under unpack_root, scoped to this input's files via the list file.
+    /// A guest driver reads the hashout the host sent, not an empty string:
+    /// `oci_push`'s `${image_hashout}` runs on the far side of this seam.
+    #[test]
+    fn a_run_input_carries_the_hosts_hashout() {
+        let input = run_input_from_pb(&pb::ManagedRunInput {
+            origin_id: "image".to_string(),
+            hashout: "abc123".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(input.artifact.content.hashout().expect("hashout"), "abc123");
+    }
+
     #[test]
     fn disk_input_content_walks_and_tars_listed_files() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1593,6 +1608,7 @@ mod tests {
         let content = DiskInputContent {
             unpack_root: root.clone(),
             list_path: Some(list),
+            hashout: String::new(),
         };
 
         // walk(): exactly the listed files, with their bytes, relative to root.

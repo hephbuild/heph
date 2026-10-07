@@ -919,7 +919,14 @@ jobs:
     # 45 covers that with room for a cold kache. The linux legs sit near 24min,
     # so this is headroom for them too rather than a licence to grow — if a leg
     # starts approaching it, find out what got slower.
-    timeout-minutes: 45
+    #
+    # darwin did approach it, and nothing got slower: master's darwin leg runs
+    # 39–45min and timed out in one of four runs (2026-10-04/05), while the
+    # linux legs finish in ~30min. The macOS runner is just slower at the same
+    # work — the engine unit tests take 265s there against 21s on linux/amd64,
+    # and `plugingo-e2e`'s build.rs ~630s. So darwin gets 60 and linux keeps
+    # the 45 that still bounds it.
+    timeout-minutes: ${{ matrix.os == 'darwin' && 60 || 45 }}
     needs: gen
     strategy:
       fail-fast: false
