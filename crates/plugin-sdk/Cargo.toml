@@ -44,7 +44,11 @@ tokio-util = { version = "0.7", optional = true }
 # unset, so plugin logs would vanish. The SDK installs a subscriber that forwards
 # every event to the host sink over the ABI.
 tracing = { version = "0.1", optional = true }
+# Its default `tracing-log` feature makes `try_init` install the `log` → `tracing`
+# bridge, so deps logging through `log` (reqwest) are forwarded too.
 tracing-subscriber = { version = "0.3", optional = true }
+# `NormalizeEvent`: recover a bridged `log` record's real target.
+tracing-log = { version = "0.2", optional = true }
 
 [features]
 # In-process stable-ABI cdylib transport. Pulls in the stabby guest serving
@@ -63,6 +67,7 @@ stabby = [
     "dep:tokio-util",
     "dep:tracing",
     "dep:tracing-subscriber",
+    "dep:tracing-log",
 ]
 
 [dev-dependencies]
@@ -70,3 +75,5 @@ stabby = [
 hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", features = ["host"] }
 futures = "0.3.32"
 tempfile = "3"
+# Builds a `log::Record` to check a bridged record keeps its target.
+log = "0.4"

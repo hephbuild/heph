@@ -4335,6 +4335,7 @@ dependencies = [
  "driver-support",
  "execrunner",
  "futures",
+ "log",
  "model",
  "plugin",
  "plugin-abi",
@@ -4347,6 +4348,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 
@@ -4370,6 +4372,8 @@ dependencies = [
  "stabby",
  "tokio",
  "tracing",
+ "tracing-core",
+ "tracing-subscriber",
 ]
 
 [[package]]

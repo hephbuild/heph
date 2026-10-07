@@ -103,7 +103,7 @@ impl StableArtifactContent for HostArtifactContent {
 /// subscriber that funnels every event here; this re-emits it on the *host's*
 /// `tracing`, so plugin logs land in the host's output like any other span.
 /// `level` is the `tracing::Level` as `1=ERROR .. 5=TRACE`; `target` carries the
-/// plugin's module path so host filtering still works.
+/// plugin's module path, which the event keeps on the host (see `hostlog`).
 pub struct HostLogSink;
 
 impl HostLogSink {
@@ -115,18 +115,16 @@ impl HostLogSink {
 
 impl StableLogSink for HostLogSink {
     extern "C" fn log(&self, level: u8, target: SString, message: SString) {
-        let target = target.to_string();
-        let message = message.to_string();
-        // Re-emit on the host subscriber. Target is set dynamically so the
-        // plugin's module path is preserved for env-filter matching. The level
-        // is a compile-time constant per arm, matching `tracing`'s macro shape.
-        match level {
-            1 => tracing::error!(target: "heph::plugin", plugin = %target, "{message}"),
-            2 => tracing::warn!(target: "heph::plugin", plugin = %target, "{message}"),
-            3 => tracing::info!(target: "heph::plugin", plugin = %target, "{message}"),
-            4 => tracing::debug!(target: "heph::plugin", plugin = %target, "{message}"),
-            _ => tracing::trace!(target: "heph::plugin", plugin = %target, "{message}"),
-        }
+        let level = match level {
+            1 => tracing::Level::ERROR,
+            2 => tracing::Level::WARN,
+            3 => tracing::Level::INFO,
+            4 => tracing::Level::DEBUG,
+            _ => tracing::Level::TRACE,
+        };
+        // Under the plugin's own target, so `RUST_LOG=<crate>=debug` reaches a
+        // crate linked into the plugin exactly as it would one linked into heph.
+        crate::hostlog::emit(level, target.as_str(), message.as_str());
     }
 }
 

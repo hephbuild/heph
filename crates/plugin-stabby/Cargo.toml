@@ -33,12 +33,16 @@ serde_json = { version = "1", optional = true }
 tokio = { version = "1.52", features = ["rt", "sync", "io-util"], optional = true }
 # Re-emit a loaded plugin's forwarded tracing events on the host subscriber.
 tracing = { version = "0.1", optional = true }
+# Builds a callsite per plugin target at runtime (`hostlog`): tracing-core's
+# documented API for it, which tracing only re-exports as hidden.
+tracing-core = { version = "0.1", optional = true }
 
 [features]
 # host: adapters from the engine's ProviderExecutor onto the stable ABI, plus
 # the libloading-based cdylib loader. The shared ABI contract (`abi`) is always
 # compiled (needs only stabby) so the guest SDK can depend on it feature-free.
-host = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:hdriver-support", "dep:hproc", "dep:hexecrunner", "dep:plugin-abi", "dep:prost", "dep:async-trait", "dep:serde_json", "dep:tokio", "dep:tracing"]
+host = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:hdriver-support", "dep:hproc", "dep:hexecrunner", "dep:plugin-abi", "dep:prost", "dep:async-trait", "dep:serde_json", "dep:tokio", "dep:tracing", "dep:tracing-core"]
 
 [dev-dependencies]
 futures = "0.3.32"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
