@@ -4284,6 +4284,7 @@ dependencies = [
  "driver-support",
  "execrunner",
  "futures",
+ "memmap2",
  "model",
  "oci-client",
  "plugin",
