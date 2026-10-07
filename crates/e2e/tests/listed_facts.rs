@@ -236,7 +236,7 @@ async fn unknown_field_resolves_spec() -> anyhow::Result<()> {
 }
 
 /// C4: a provider that lists no facts — `addr_only`, or a plugin older than
-/// ABI 0.12 — gets exactly the results and `get`s of a walk that ignores
+/// ABI 0.13 — gets exactly the results and `get`s of a walk that ignores
 /// facts.
 #[tokio::test]
 async fn addr_only_listing_behaves_as_today() -> anyhow::Result<()> {

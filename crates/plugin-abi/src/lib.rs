@@ -122,7 +122,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.12.0";
+pub const ABI_SEMVER: &str = "0.13.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

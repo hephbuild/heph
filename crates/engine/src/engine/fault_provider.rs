@@ -66,7 +66,7 @@ pub struct Faults {
     /// cancelled, then fail the way a call with two dependencies in flight
     /// does — a `MultiError` of two cancellations.
     pub cancel_at: Option<(Stage, String, Arc<tokio::sync::Notify>)>,
-    /// `list` reports no facts, like a plugin built before ABI 0.12, so a
+    /// `list` reports no facts, like a plugin built before ABI 0.13, so a
     /// selector that reads one resolves every candidate's spec to decide.
     pub facts_unknown: bool,
     /// Labels its `list` reports for these static targets instead of their

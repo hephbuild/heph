@@ -258,7 +258,7 @@ fn list_item_decoder() -> impl FnMut(&[u8]) -> anyhow::Result<ListResponse> + Se
 
 /// A malformed `ListedFacts` fails the whole item, and so the provider's
 /// `list` — prost decodes nested messages eagerly. An absent one (a plugin
-/// older than ABI 0.12, or `addr_only`) is every fact unknown, never a prune.
+/// older than ABI 0.13, or `addr_only`) is every fact unknown, never a prune.
 fn decode_list_item(
     b: &[u8],
     intern: &mut impl FnMut(String) -> Arc<str>,
@@ -1078,7 +1078,7 @@ mod tests {
         }
     }
 
-    /// A plugin built before ABI 0.12 sends no `facts`: every fact must decode
+    /// A plugin built before ABI 0.13 sends no `facts`: every fact must decode
     /// as unknown, never as "no labels", or every label selection would
     /// silently skip its targets. One driver name decodes to one shared `Arc`
     /// across a `list` call.

@@ -73,17 +73,17 @@ then believes. Both must hold:
   and that zero value means "unknown" in the old schema, never "no" or
   "empty".
 
-The removed numbers and names are `reserved` so they are never reused. 0.12.0
+The removed numbers and names are `reserved` so they are never reused. 0.13.0
 is the case in point: it removes 0.11.0's `ListResponse.labels`/`labels_known`
 (2, 3) in favour of `facts` (4). An old plugin's fields 2 and 3 are skipped and
-`facts` is absent — unknown; a pre-0.12 host reads absent `labels_known` as
+`facts` is absent — unknown; a pre-0.13 host reads absent `labels_known` as
 false — unknown, so it ignores the empty `labels`. Neither side ever reads the
 other's silence as "no labels". A removal whose zero value means anything but
 "unknown" to the old peer — a bare `repeated` read as "none", a `bool` read as
 "no" — is major. `plugin-abi`'s `removed_labels_decode_as_unknown_on_a_0_11_host`
 pins this case.
 
-An **unknown `Matcher` arm** is a decode error on the host (since 0.12.0), not a
+An **unknown `Matcher` arm** is a decode error on the host (since 0.13.0), not a
 silent `Or[]`: a plugin built against a newer schema fails the call loudly
 instead of matching nothing, or everything under `Not`. An old host still
 reads a new arm as an empty matcher (prost leaves the `oneof` unset); that is

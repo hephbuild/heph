@@ -1167,7 +1167,7 @@ mod tests {
         assert!(format!("{err:#}").contains("no arm"), "{err:#}");
     }
 
-    /// 0.11.0's `ListResponse`, as a pre-0.12 host decodes it
+    /// 0.11.0's `ListResponse`, as a pre-0.13 host decodes it
     /// (`git show 0b6b8758:proto/plugin/v1/provider.proto`).
     #[derive(Clone, PartialEq, prost::Message)]
     struct ListResponseV011 {
@@ -1179,7 +1179,7 @@ mod tests {
         labels_known: bool,
     }
 
-    /// D7, `ABI_VERSIONING.md`: a 0.11 host reading a 0.12 plugin's listing —
+    /// D7, `ABI_VERSIONING.md`: a 0.11 or 0.12 host reading a 0.13 plugin's listing —
     /// facts and all — sees `labels_known = false`, which it reads as
     /// "unknown", never as "no labels".
     #[test]
@@ -1239,9 +1239,9 @@ mod tests {
         Not(Box<MatcherV011>),
     }
 
-    /// The known old-host misread, pinned: a pre-0.12 host decodes arm 9
+    /// The known old-host misread, pinned: a pre-0.13 host decodes arm 9
     /// (`driver`) as an empty matcher. That is why a plugin must not send it
-    /// to a host older than 0.12 — and why this host now refuses an arm it
+    /// to a host older than 0.13 — and why this host now refuses an arm it
     /// does not know.
     #[test]
     fn driver_arm_is_an_empty_matcher_on_a_0_11_host() {
