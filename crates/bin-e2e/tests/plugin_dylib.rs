@@ -383,7 +383,7 @@ fn plugin_construction_failure_logs_before_the_abort() {
     );
 }
 
-/// A plugin's log line is selected by `RUST_LOG` under the plugin's own target,
+/// A plugin's log line is selected by `HEPH_LOG` under the plugin's own target,
 /// through the real seam: the host's filter handed to the cdylib
 /// (`heph_plugin_set_log_filter`) and the line coming back over the log sink. The
 /// host used to re-emit every plugin event as `heph::plugin`, so neither
@@ -406,10 +406,12 @@ fn plugin_log_is_filtered_by_its_own_target() {
     ))
     .expect("write config");
 
-    let run = |filter: &str| {
+    let run_with = |var: &str, filter: &str| {
         let out = ws
             .cmd(&dist, &["inspect", "functions"])
-            .env("RUST_LOG", filter)
+            .env_remove("HEPH_LOG")
+            .env_remove("RUST_LOG")
+            .env(var, filter)
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run");
@@ -417,16 +419,20 @@ fn plugin_log_is_filtered_by_its_own_target() {
         (logged, describe(&out))
     };
 
-    let (logged, out) = run("off,plugin_go_cdylib=error");
+    let (logged, out) = run_with("HEPH_LOG", "off,plugin_go_cdylib=error");
     assert!(
         logged,
         "everything off but the plugin's own crate: its line must show: {out}"
     );
-    let (logged, out) = run("error,plugin_go_cdylib=off");
+    let (logged, out) = run_with("HEPH_LOG", "error,plugin_go_cdylib=off");
     assert!(
         !logged,
         "the plugin's own crate turned off: its line must not show: {out}"
     );
+    // heph reads `HEPH_LOG` only: a `RUST_LOG` meant for another tool must not
+    // turn heph's logging off, so the default filter still shows the error.
+    let (logged, out) = run_with("RUST_LOG", "off");
+    assert!(logged, "RUST_LOG must not configure heph: {out}");
 }
 
 /// The checksum in the manifest is the supply-chain guard on a dylib that is

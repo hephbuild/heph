@@ -124,7 +124,7 @@ impl StableLogSink for HostLogSink {
             4 => tracing::Level::DEBUG,
             _ => tracing::Level::TRACE,
         };
-        // Under the plugin's own target, so `RUST_LOG=<crate>=debug` reaches a
+        // Under the plugin's own target, so `HEPH_LOG=<crate>=debug` reaches a
         // crate linked into the plugin exactly as it would one linked into heph.
         crate::hostlog::emit(level, target.as_str(), message.as_str());
     }

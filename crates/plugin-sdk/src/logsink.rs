@@ -439,7 +439,7 @@ mod tests {
     }
 
     /// A dep logging through the `log` crate reaches tracing with target `log`;
-    /// the host must see the record's own target, or `RUST_LOG=reqwest=debug`
+    /// the host must see the record's own target, or `HEPH_LOG=reqwest=debug`
     /// cannot select it.
     #[test]
     fn bridged_log_record_keeps_its_target() {

@@ -4,7 +4,7 @@
 //! `tracing`'s macros take a `'static` target, fixed at the call site, so the host
 //! cannot write `debug!(target: <string from the plugin>, ..)`. Re-emitting under
 //! one fixed target (`heph::plugin`, as this used to) breaks every per-crate
-//! directive: `RUST_LOG=oci_client=debug` never matches an event from the OCI
+//! directive: `HEPH_LOG=oci_client=debug` never matches an event from the OCI
 //! plugin's `oci_client`, and its debug events fall to the default `info` level.
 //!
 //! Instead each distinct `(target, level)` gets a callsite built at runtime and
@@ -420,7 +420,7 @@ mod filter_tests {
             for (target, level) in shown.lock().expect("lock").iter() {
                 assert!(
                     admits(&sent, target, *level),
-                    "RUST_LOG={input:?}: host shows {target} at {level}, plugin filter {sent:?} drops it"
+                    "HEPH_LOG={input:?}: host shows {target} at {level}, plugin filter {sent:?} drops it"
                 );
             }
         }
