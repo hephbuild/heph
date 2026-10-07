@@ -16,8 +16,8 @@ use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, TargetDef};
 use hplugin::driver::{
-    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, TargetAddr,
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
+    ParseRequest, ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
 use std::collections::BTreeMap;
@@ -41,8 +41,14 @@ struct OciPushSpec {
     #[spec(required)]
     image: String,
     /// Destination registry reference, e.g. `registry.io/me/app:1.2`.
+    ///
+    /// Deferrable: `${read://pkg:name}` is the contents of that target's single
+    /// output. `${image_hashout}` is the hashout of `image`'s archive, so
+    /// `registry.io/me/app:${image_hashout}` gives every distinct image its own
+    /// tag. That one costs the cache key nothing: `image` is already a hashed
+    /// input, so the value cannot change without the key changing too.
     #[spec(required, rename = "ref")]
-    dest: String,
+    dest: Deferred<String>,
 
     /// Push to an insecure (HTTP / self-signed) registry: plain HTTP, and
     /// certificate validation off.
@@ -64,7 +70,9 @@ struct OciPushSpec {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciPushDef {
-    dest: String,
+    /// Unresolved: `Deferred` hashes and serializes as the text the BUILD file
+    /// wrote, so the def hash of a literal `ref` is what it was as a `String`.
+    dest: Deferred<String>,
     insecure: bool,
     /// Who the push runs as, not what it pushes: deliberately not hashed.
     ambient_credentials: bool,
@@ -80,6 +88,70 @@ impl Hash for OciPushDef {
         self.dest.hash(state);
         self.insecure.hash(state);
     }
+}
+
+/// The variable `ref` may name besides a deferred reference: the hashout of the
+/// image being pushed.
+const IMAGE_HASHOUT: &str = "image_hashout";
+
+/// Refuse, at parse, any `${…}` in `ref` that nothing would substitute.
+///
+/// A typo such as `${hashout}` would otherwise reach the registry as part of the
+/// tag, or fail at run with a reference-parse error naming neither the field nor
+/// the variables it accepts.
+fn check_ref_template(raw: &str) -> anyhow::Result<()> {
+    for piece in hcore::template::parse(raw).context("parse `ref`")? {
+        let hcore::template::Piece::Ref(r) = piece else {
+            continue;
+        };
+        let known = match r.kind {
+            None => r.arg == IMAGE_HASHOUT,
+            // Resolved by the host before the driver runs.
+            kind => hcore::template::claims(kind, r.arg, hcore::template::DEFERRED_KINDS),
+        };
+        anyhow::ensure!(
+            known,
+            "`ref` holds `{}`, which is not something oci_push substitutes: use \
+             `${{{IMAGE_HASHOUT}}}` for the image's hashout, or `${{read://pkg:name}}` for a \
+             target's output",
+            r.raw
+        );
+    }
+    Ok(())
+}
+
+/// The hashout of the image archive input — the value `${image_hashout}` takes.
+fn image_hashout(req: &ManagedRunRequest<'_, '_>) -> anyhow::Result<String> {
+    req.inputs
+        .iter()
+        .find(|m| m.input.origin_id == IMAGE_ORIGIN)
+        .with_context(|| format!("no dep input {IMAGE_ORIGIN:?} in sandbox"))?
+        .input
+        .artifact
+        .content
+        .hashout()
+        .context("read the image's hashout")
+}
+
+/// `ref` with `${image_hashout}` replaced by `hashout`.
+///
+/// Runs over the value the host already resolved, so a `${read://…}` producer's
+/// output is scanned too. Harmless: an image reference cannot contain `$`, so
+/// such a value is broken either way, and this refuses it by name.
+fn render_ref(resolved: &str, hashout: &str) -> anyhow::Result<String> {
+    hcore::template::render(resolved, |r| {
+        anyhow::ensure!(
+            r.kind.is_none() && r.arg == IMAGE_HASHOUT,
+            "`ref` resolved to {resolved:?}, and `{}` in it is not something oci_push \
+             substitutes",
+            r.raw
+        );
+        anyhow::ensure!(
+            !hashout.is_empty(),
+            "the image carries no hashout to substitute for `${{{IMAGE_HASHOUT}}}`"
+        );
+        Ok(hashout.to_string())
+    })
 }
 
 /// Push a docker-format archive with the docker CLI: load it into the daemon,
@@ -119,6 +191,7 @@ impl ManagedDriver for Driver {
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
         let spec = OciPushSpec::from(&req.target_spec.config).context("parse oci_push config")?;
+        check_ref_template(spec.dest.raw())?;
 
         // Consume only the image archive (group ""), never the digest group.
         let mut image_ref = TargetAddr::parse(&spec.image, &addr.package)
@@ -183,6 +256,8 @@ impl ManagedDriver for Driver {
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<OciPushDef>().clone();
         let path = dep_single_file(&req, IMAGE_ORIGIN)?;
+        let dest = req.request.resolve(&def.dest)?;
+        let dest = render_ref(dest, &image_hashout(&req)?)?;
         let layout =
             Layout::read(&path).with_context(|| format!("read the image to push from {path:?}"))?;
 
@@ -193,9 +268,9 @@ impl ManagedDriver for Driver {
             &req.sandbox_dir,
             ctoken,
         )?;
-        registry::push_layout(&layout, &def.dest, def.insecure, &creds)
+        registry::push_layout(&layout, &dest, def.insecure, &creds)
             .await
-            .with_context(|| format!("push {} ({})", def.dest, creds.failure_hint()))?;
+            .with_context(|| format!("push {dest} ({})", creds.failure_hint()))?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -311,6 +386,93 @@ mod tests {
             .err()
             .expect("both must be refused");
         assert!(format!("{err:#}").contains("exclusive"), "{err:#}");
+    }
+
+    /// `ref` is a `Deferred`, which is what makes the host accept a
+    /// `${read://…}` in it rather than refusing it for the whole driver.
+    #[test]
+    fn the_driver_accepts_deferred_values() {
+        assert!(Driver::new().schema().accepts_deferred);
+    }
+
+    /// A literal `ref` hashes as the `String` it replaced, so retyping the field
+    /// moves no def hash.
+    #[tokio::test]
+    async fn a_literal_ref_hashes_as_the_string_it_was() {
+        let def = |dest: Deferred<String>| OciPushDef {
+            dest,
+            insecure: false,
+            ambient_credentials: false,
+        };
+        let hash = |d: &OciPushDef| {
+            let mut h = Xxh3Default::new();
+            d.hash(&mut h);
+            h.finish()
+        };
+        let mut h = Xxh3Default::new();
+        OCI_PUSH_FORMAT_VERSION.hash(&mut h);
+        "reg.io/app:1".to_string().hash(&mut h);
+        false.hash(&mut h);
+        assert_eq!(hash(&def(Deferred::new("reg.io/app:1"))), h.finish());
+    }
+
+    #[test]
+    fn ref_template_accepts_what_is_substituted() {
+        for ok in [
+            "reg.io/app:1",
+            "reg.io/app:${image_hashout}",
+            "${read://infra:registry}/app:${image_hashout}",
+            "${read://infra:ref}",
+        ] {
+            check_ref_template(ok).unwrap_or_else(|e| panic!("{ok:?}: {e:#}"));
+        }
+    }
+
+    /// Each of these would otherwise reach the registry as text, or fail at run
+    /// with an error that names neither the field nor what it accepts.
+    #[test]
+    fn ref_template_refuses_what_nothing_substitutes() {
+        for bad in [
+            "reg.io/app:${hashout}",
+            "reg.io/app:${image_hashout2}",
+            "reg.io/app:${IMAGE_HASHOUT}",
+            "reg.io/app:${image_hashout }",
+            "reg.io/app:${env:TAG}",
+            // Not an absolute address, so the host leaves it alone.
+            "reg.io/app:${read:tag}",
+            "reg.io/app:${}",
+        ] {
+            let err = check_ref_template(bad).expect_err(bad);
+            assert!(format!("{err:#}").contains("image_hashout"), "{bad:?}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn render_ref_substitutes_every_image_hashout() {
+        assert_eq!(
+            render_ref("reg.io/app-${image_hashout}:${image_hashout}", "abc").expect("render"),
+            "reg.io/app-abc:abc"
+        );
+        assert_eq!(
+            render_ref("reg.io/app:1", "").expect("no variable, no hashout needed"),
+            "reg.io/app:1"
+        );
+    }
+
+    /// An empty hashout would turn `app:${image_hashout}` into `app:`, which
+    /// parses as `app:latest` — a push to the wrong tag rather than an error.
+    #[test]
+    fn render_ref_refuses_an_empty_hashout() {
+        let err = render_ref("reg.io/app:${image_hashout}", "").expect_err("empty");
+        assert!(format!("{err:#}").contains("no hashout"), "{err:#}");
+    }
+
+    /// A `${read://…}` producer's output is scanned too; a variable in it that
+    /// is not ours is refused rather than pushed as text.
+    #[test]
+    fn render_ref_refuses_an_unknown_variable_in_a_resolved_value() {
+        let err = render_ref("reg.io/app:${tag}", "abc").expect_err("unknown");
+        assert!(format!("{err:#}").contains("${tag}"), "{err:#}");
     }
 
     #[tokio::test]

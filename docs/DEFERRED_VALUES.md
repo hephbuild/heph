@@ -336,8 +336,20 @@ store, `RunRequest.deferred`, `Deferred<String>`, the `//`-address claiming rule
 the whole-driver schema gate — and `${src://…}`, whose path is filled in by the
 managed-driver layer, the only place that knows where an artifact landed (under
 FUSE the sandbox root is redirected after the host has set it). Consumers: the
-credential driver's presentation templates, and the `exec` driver's `run` in
-**both exec and bash mode**.
+credential driver's presentation templates, the `exec` driver's `run` in
+**both exec and bash mode**, and `oci_push`'s `ref`.
+
+`oci_push`'s `ref` also takes `${image_hashout}`, which the driver itself replaces
+with the hashout of the image it pushes:
+
+```python
+oci_push(name = "push", image = ":img", ref = "${read://infra:registry}/app:${image_hashout}")
+```
+
+It needs no edge of its own: `image` is already a hashed input, so the value
+cannot change without the push's key changing too. Any other `${…}` in `ref` is
+refused at parse, so a typo such as `${hashout}` does not reach the registry as
+part of a tag.
 
 `${src:}` is refused in a credential declaration: a credential is a document the
 host reads, not a target that runs, so there is no sandbox for a path to point
@@ -359,7 +371,7 @@ different things that happen to overlap.
 
 **Does not ship yet:** `heph.core.read()` as a Starlark function, which is
 discoverability rather than capability; `inspect deps` "via" lines and
-`inspect def --resolved`; and the OCI family's `build_args`, `dest`, `labels`,
+`inspect def --resolved`; and the rest of the OCI family — `build_args`, `labels`,
 `cache_from` — which is where the largest number of genuinely deferrable fields
 live, and is the cheapest to add because none of them sits in a `Hash` impl
 shared with a hot path.
