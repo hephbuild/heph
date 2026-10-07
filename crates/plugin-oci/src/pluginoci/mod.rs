@@ -17,7 +17,7 @@
 //! for reading what a dep materialized into the sandbox.
 
 use anyhow::Context as _;
-use hdriver_support::driver_managed::ManagedRunRequest;
+use hdriver_support::driver_managed::{ManagedRunInput, ManagedRunRequest};
 use hplugin::driver::TargetAddr;
 use std::path::{Path, PathBuf};
 
@@ -281,6 +281,24 @@ pub(crate) fn layout_path(
     )
 }
 
+/// The Dep input with `origin_id`. Support inputs share their producer's
+/// `origin_id`, so the type is checked too: input order is not a contract.
+pub(crate) fn dep_input<'r>(
+    req: &'r ManagedRunRequest<'_, '_>,
+    origin_id: &str,
+) -> anyhow::Result<&'r ManagedRunInput> {
+    req.inputs
+        .iter()
+        .find(|m| {
+            m.input.origin_id == origin_id
+                && matches!(
+                    m.input.artifact.r#type,
+                    hplugin::driver::inputartifact::Type::Dep
+                )
+        })
+        .with_context(|| format!("no dep input {origin_id:?} in sandbox"))
+}
+
 /// Absolute path to the single file a Dep input materialized into the sandbox.
 /// Reads the input's `.list` file (one absolute path per line — see
 /// `driver_managed.rs::list_path_for`). Errors unless exactly one file was
@@ -290,18 +308,7 @@ pub(crate) fn dep_single_file(
     req: &ManagedRunRequest<'_, '_>,
     origin_id: &str,
 ) -> anyhow::Result<PathBuf> {
-    let m = req
-        .inputs
-        .iter()
-        .find(|m| {
-            m.input.origin_id == origin_id
-                && matches!(
-                    m.input.artifact.r#type,
-                    hplugin::driver::inputartifact::Type::Dep
-                )
-        })
-        .with_context(|| format!("no dep input {origin_id:?} in sandbox"))?;
-    let list_path = m.require_list_path()?;
+    let list_path = dep_input(req, origin_id)?.require_list_path()?;
     // The `.list` file holds one absolute materialized path per line.
     let content = std::fs::read_to_string(list_path)
         .with_context(|| format!("read dep list {list_path:?}"))?;

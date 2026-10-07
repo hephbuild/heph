@@ -339,8 +339,9 @@ FUSE the sandbox root is redirected after the host has set it). Consumers: the
 credential driver's presentation templates, the `exec` driver's `run` in
 **both exec and bash mode**, and `oci_push`'s `ref`.
 
-`oci_push`'s `ref` also takes `${image_hashout}`, which the driver itself replaces
-with the hashout of the image it pushes:
+`oci_push`'s `ref` also takes `${image_hashout}`. That one is **not** a deferred
+value: the host does not resolve it, and it adds no edge. It is a driver-local
+variable, and the driver replaces it with the hashout of the image it pushes:
 
 ```python
 oci_push(name = "push", image = ":img", ref = "${read://infra:registry}/app:${image_hashout}")
@@ -350,6 +351,14 @@ It needs no edge of its own: `image` is already a hashed input, so the value
 cannot change without the push's key changing too. Any other `${…}` in `ref` is
 refused at parse, so a typo such as `${hashout}` does not reach the registry as
 part of a tag.
+
+Kind-less `${name}` forms belong to the driver that reads the field; the host
+never claims one. A host-level variable would need a kind.
+
+The hashout is heph's content hash of the image archive, **not** the registry
+digest: it is not what `docker images` or the registry reports, and it moves if
+heph's packing or hash scheme does. The `oci_push` run logs the reference it
+pushed and the registry digest together.
 
 `${src:}` is refused in a credential declaration: a credential is a document the
 host reads, not a target that runs, so there is no sandbox for a path to point

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::auth::RegistryCredentials;
-use super::{archive::Layout, dep_single_file, registry};
+use super::{archive::Layout, dep_input, dep_single_file, registry};
 
 pub const DRIVER_NAME: &str = "oci_push";
 
@@ -43,10 +43,13 @@ struct OciPushSpec {
     /// Destination registry reference, e.g. `registry.io/me/app:1.2`.
     ///
     /// Deferrable: `${read://pkg:name}` is the contents of that target's single
-    /// output. `${image_hashout}` is the hashout of `image`'s archive, so
+    /// output. `${image_hashout}` is the hashout of the `image` input, so
     /// `registry.io/me/app:${image_hashout}` gives every distinct image its own
     /// tag. That one costs the cache key nothing: `image` is already a hashed
     /// input, so the value cannot change without the key changing too.
+    ///
+    /// The hashout is heph's content hash of the archive, not the registry
+    /// digest. Naming the image through a `group` gives the group's hashout.
     #[spec(required, rename = "ref")]
     dest: Deferred<String>,
 
@@ -106,8 +109,9 @@ fn check_ref_template(raw: &str) -> anyhow::Result<()> {
         };
         let known = match r.kind {
             None => r.arg == IMAGE_HASHOUT,
-            // Resolved by the host before the driver runs.
-            kind => hcore::template::claims(kind, r.arg, hcore::template::DEFERRED_KINDS),
+            // Resolved by the host before the driver runs. Only `read`: a
+            // `${src://…}` is a sandbox path, which is never an image reference.
+            kind => hcore::template::claims(kind, r.arg, &[hcore::template::READ_KIND]),
         };
         anyhow::ensure!(
             known,
@@ -120,38 +124,58 @@ fn check_ref_template(raw: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The hashout of the image archive input — the value `${image_hashout}` takes.
-fn image_hashout(req: &ManagedRunRequest<'_, '_>) -> anyhow::Result<String> {
-    req.inputs
-        .iter()
-        .find(|m| m.input.origin_id == IMAGE_ORIGIN)
-        .with_context(|| format!("no dep input {IMAGE_ORIGIN:?} in sandbox"))?
-        .input
-        .artifact
-        .content
-        .hashout()
-        .context("read the image's hashout")
+/// How many pieces of `s` are this driver's own: `${image_hashout}` and `$$`.
+/// `None` when `s` holds any other reference — other than a `${read://…}` when
+/// `reads` is set — or does not parse.
+fn own_pieces(s: &str, reads: bool) -> Option<usize> {
+    use hcore::template::Piece;
+    let mut n = 0;
+    for piece in hcore::template::parse(s).ok()? {
+        match piece {
+            Piece::Text(_) => {}
+            Piece::Escape => n += 1,
+            Piece::Ref(r) if r.kind.is_none() && r.arg == IMAGE_HASHOUT => n += 1,
+            Piece::Ref(r)
+                if reads
+                    && hcore::template::claims(r.kind, r.arg, &[hcore::template::READ_KIND]) => {}
+            Piece::Ref(_) => return None,
+        }
+    }
+    Some(n)
 }
 
-/// `ref` with `${image_hashout}` replaced by `hashout`.
+/// `ref` with `${image_hashout}` replaced by the image's hashout.
 ///
-/// Runs over the value the host already resolved, so a `${read://…}` producer's
-/// output is scanned too. Harmless: an image reference cannot contain `$`, so
-/// such a value is broken either way, and this refuses it by name.
-fn render_ref(resolved: &str, hashout: &str) -> anyhow::Result<String> {
-    hcore::template::render(resolved, |r| {
-        anyhow::ensure!(
-            r.kind.is_none() && r.arg == IMAGE_HASHOUT,
-            "`ref` resolved to {resolved:?}, and `{}` in it is not something oci_push \
-             substitutes",
-            r.raw
-        );
-        anyhow::ensure!(
-            !hashout.is_empty(),
-            "the image carries no hashout to substitute for `${{{IMAGE_HASHOUT}}}`"
-        );
-        Ok(hashout.to_string())
-    })
+/// `raw` is the text the BUILD file wrote and `resolved` is it after the host
+/// substituted every `${read://…}`. The host reproduces `${image_hashout}` and
+/// `$$` byte for byte, so `resolved` holds exactly as many of them as `raw`. Any
+/// more, or any other `${`, came out of a producer's output, and is refused
+/// rather than interpreted: substitution is single-pass, as everywhere else in
+/// heph (`hcore::template`).
+///
+/// `hashout` is only asked for when `ref` uses it, so a literal `ref` never
+/// depends on it.
+fn render_ref(
+    raw: &str,
+    resolved: &str,
+    hashout: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    let want = own_pieces(raw, true).context("`ref` was not checked at parse")?;
+    anyhow::ensure!(
+        own_pieces(resolved, false) == Some(want),
+        "`ref` resolved to {resolved:?}: a `${{read://…}}` value in it contains `$`, which \
+         an image reference cannot. Make the producer emit a plain reference"
+    );
+    if want == 0 {
+        return Ok(resolved.to_string());
+    }
+    let hashout = hashout()?;
+    anyhow::ensure!(
+        !hashout.is_empty(),
+        "the host sent no hashout for the image, so there is nothing to substitute for \
+         `${{{IMAGE_HASHOUT}}}`: it could not read one, or it predates plugin ABI 0.12"
+    );
+    hcore::template::render(resolved, |_| Ok(hashout.clone()))
 }
 
 /// Push a docker-format archive with the docker CLI: load it into the daemon,
@@ -256,8 +280,19 @@ impl ManagedDriver for Driver {
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<OciPushDef>().clone();
         let path = dep_single_file(&req, IMAGE_ORIGIN)?;
-        let dest = req.request.resolve(&def.dest)?;
-        let dest = render_ref(dest, &image_hashout(&req)?)?;
+        let dest = req
+            .request
+            .resolve(&def.dest)
+            .context("resolve oci_push `ref`")?;
+        let dest = render_ref(def.dest.raw(), dest, || {
+            dep_input(&req, IMAGE_ORIGIN)?
+                .input
+                .artifact
+                .content
+                .hashout()
+                .context("read the image's hashout")
+        })
+        .context("substitute oci_push `ref`")?;
         let layout =
             Layout::read(&path).with_context(|| format!("read the image to push from {path:?}"))?;
 
@@ -268,9 +303,13 @@ impl ManagedDriver for Driver {
             &req.sandbox_dir,
             ctoken,
         )?;
-        registry::push_layout(&layout, &dest, def.insecure, &creds)
+        let digest = registry::push_layout(&layout, &dest, def.insecure, &creds)
             .await
             .with_context(|| format!("push {dest} ({})", creds.failure_hint()))?;
+        // The only place a resolved `ref` is visible on success: with
+        // `${image_hashout}` or `${read://…}` in it, the BUILD file does not say
+        // which tag was pushed.
+        tracing::info!(target_addr = %req.request.target.addr.format(), reference = %dest, %digest, "pushed");
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -397,8 +436,8 @@ mod tests {
 
     /// A literal `ref` hashes as the `String` it replaced, so retyping the field
     /// moves no def hash.
-    #[tokio::test]
-    async fn a_literal_ref_hashes_as_the_string_it_was() {
+    #[test]
+    fn a_literal_ref_hashes_as_the_string_it_was() {
         let def = |dest: Deferred<String>| OciPushDef {
             dest,
             insecure: false,
@@ -441,38 +480,111 @@ mod tests {
             // Not an absolute address, so the host leaves it alone.
             "reg.io/app:${read:tag}",
             "reg.io/app:${}",
+            // A sandbox path is never an image reference.
+            "${src://infra:x}/app:1",
         ] {
             let err = check_ref_template(bad).expect_err(bad);
-            assert!(format!("{err:#}").contains("image_hashout"), "{bad:?}: {err:#}");
+            assert!(
+                format!("{err:#}").contains("not something oci_push substitutes"),
+                "{bad:?}: {err:#}"
+            );
         }
+        // Refused by the tokenizer, before the field check.
+        for bad in [
+            "reg.io/app:${image_hashout",
+            "reg.io/app:${FOO:-${image_hashout}}",
+        ] {
+            check_ref_template(bad).expect_err(bad);
+        }
+    }
+
+    fn hashout(v: &str) -> impl FnOnce() -> anyhow::Result<String> + '_ {
+        move || Ok(v.to_string())
     }
 
     #[test]
     fn render_ref_substitutes_every_image_hashout() {
+        let raw = "reg.io/app-${image_hashout}:${image_hashout}";
         assert_eq!(
-            render_ref("reg.io/app-${image_hashout}:${image_hashout}", "abc").expect("render"),
+            render_ref(raw, raw, hashout("abc")).expect("render"),
             "reg.io/app-abc:abc"
         );
+        // A `${read://…}` the host resolved, next to ours.
         assert_eq!(
-            render_ref("reg.io/app:1", "").expect("no variable, no hashout needed"),
+            render_ref(
+                "${read://infra:repo}:${image_hashout}",
+                "reg.io/app:${image_hashout}",
+                hashout("abc")
+            )
+            .expect("render"),
+            "reg.io/app:abc"
+        );
+    }
+
+    /// A literal `ref` never asks for the hashout, so a push that worked before
+    /// `${image_hashout}` existed cannot fail on it.
+    #[test]
+    fn render_ref_asks_for_the_hashout_only_when_used() {
+        let never = || -> anyhow::Result<String> { panic!("hashout must not be read") };
+        assert_eq!(
+            render_ref("reg.io/app:1", "reg.io/app:1", never).expect("literal"),
             "reg.io/app:1"
         );
     }
 
-    /// An empty hashout would turn `app:${image_hashout}` into `app:`, which
-    /// parses as `app:latest` — a push to the wrong tag rather than an error.
+    /// `app:v1-${image_hashout}` with an empty hashout is `app:v1-`, a valid tag:
+    /// a push to the wrong place rather than an error.
     #[test]
     fn render_ref_refuses_an_empty_hashout() {
-        let err = render_ref("reg.io/app:${image_hashout}", "").expect_err("empty");
+        let raw = "reg.io/app:v1-${image_hashout}";
+        let err = render_ref(raw, raw, hashout("")).expect_err("empty");
         assert!(format!("{err:#}").contains("no hashout"), "{err:#}");
     }
 
-    /// A `${read://…}` producer's output is scanned too; a variable in it that
-    /// is not ours is refused rather than pushed as text.
+    /// Substitution is single-pass: whatever a `${read://…}` producer emits is a
+    /// value, never a template. Each of these came out of a producer.
     #[test]
-    fn render_ref_refuses_an_unknown_variable_in_a_resolved_value() {
-        let err = render_ref("reg.io/app:${tag}", "abc").expect_err("unknown");
-        assert!(format!("{err:#}").contains("${tag}"), "{err:#}");
+    fn render_ref_never_interprets_a_producers_output() {
+        let raw = "${read://infra:ref}";
+        for resolved in [
+            "reg.io/app:${image_hashout}",
+            "reg.io/app:${tag}",
+            "reg.io/a$$b:1",
+            "reg.io/app:${",
+        ] {
+            let err = render_ref(raw, resolved, hashout("abc")).expect_err(resolved);
+            assert!(
+                format!("{err:#}").contains("contains `$`"),
+                "{resolved:?}: {err:#}"
+            );
+        }
+    }
+
+    /// The check is wired into `parse`, not only defined: a typo is refused
+    /// before anything runs.
+    #[tokio::test]
+    async fn parse_refuses_an_unknown_ref_variable() {
+        let with_ref = |r: &str| {
+            cfg(&[
+                ("image", Value::String(":img".to_string())),
+                ("ref", Value::String(r.to_string())),
+            ])
+        };
+        let err = Driver::new()
+            .parse(
+                parse_req("//app:push", with_ref("reg.io/app:${hashout}")),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("a typo must be refused");
+        assert!(format!("{err:#}").contains("${hashout}"), "{err:#}");
+
+        parse(
+            "//app:push",
+            with_ref("${read://infra:r}/app:${image_hashout}"),
+        )
+        .await;
     }
 
     #[tokio::test]

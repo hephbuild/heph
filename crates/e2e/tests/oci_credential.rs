@@ -128,6 +128,48 @@ target(name = "push", driver = "oci_push", image = ":img", ref = "quay.io/acme/a
     Ok(())
 }
 
+/// `ref` reaches the push resolved: the repository from a `${read://…}`
+/// producer, the tag from `${image_hashout}`. Docker-free, through the same
+/// offline image as above — the uncovered credential stops it before the
+/// network, and the error names the reference it would have pushed.
+#[tokio::test]
+async fn a_push_resolves_its_ref_before_the_network() -> anyhow::Result<()> {
+    let _guard = EnvVar::set("HEPH_E2E_OCI_PUSH_REF_TOKEN", "oci-push-material");
+    let ws = workspace();
+    ws.write_build_file(
+        "auth",
+        r#"target(name = "ghcr", driver = "credential",
+       sources = [heph.auth.env(["HEPH_E2E_OCI_PUSH_REF_TOKEN"])],
+       present = heph.auth.docker(["ghcr.io"]))"#,
+    );
+    ws.write_build_file(
+        "img",
+        r#"
+target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
+target(name = "etc", driver = "oci_layer", srcs = [":conf"], prefix = "/etc")
+target(name = "img", driver = "oci_image", layers = [":etc"], platforms = ["linux/amd64"])
+target(name = "repo", driver = "bash", run = "echo quay.io/acme/app > $OUT", out = "repo.txt")
+target(name = "push", driver = "oci_push", image = ":img",
+       ref = "${read://img:repo}:${image_hashout}", credentials = ["//auth:ghcr"])
+"#,
+    );
+    let err = match ws.run("//img:push").await {
+        Ok(_) => panic!("an uncovered registry must fail"),
+        Err(e) => format!("{e:#}"),
+    };
+    let img = ws.run_addr_outputs("//img:img", &[""]).await?;
+    let [archive] = img.artifacts.as_slice() else {
+        panic!("the image has one archive artifact");
+    };
+    let hashout = archive.hashout()?;
+    assert!(!hashout.is_empty(), "the archive must carry a hashout");
+    assert!(
+        err.contains(&format!("push quay.io/acme/app:{hashout} ")),
+        "the error must name the resolved reference: {err}"
+    );
+    Ok(())
+}
+
 /// A reference to something that is not a target at all is an ordinary
 /// resolution error at the consumer — not a 401 from the registry much later.
 #[tokio::test]

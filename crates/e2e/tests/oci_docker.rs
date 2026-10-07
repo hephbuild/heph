@@ -371,8 +371,14 @@ impl Registry {
         use anyhow::Context as _;
         use std::io::{BufRead as _, Write as _};
         let host = self.host();
-        let mut conn = std::net::TcpStream::connect(&host)
+        let timeout = std::time::Duration::from_secs(30);
+        let addr: std::net::SocketAddr = host
+            .parse()
+            .with_context(|| format!("registry address {host}"))?;
+        let mut conn = std::net::TcpStream::connect_timeout(&addr, timeout)
             .with_context(|| format!("connect to the registry at {host}"))?;
+        conn.set_read_timeout(Some(timeout))
+            .context("set the read timeout")?;
         write!(
             conn,
             "HEAD /v2/{repo}/manifests/{reference} HTTP/1.1\r\nHost: {host}\r\n\

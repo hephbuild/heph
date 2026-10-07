@@ -21,6 +21,17 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.12.0: `ManagedRunInput` gained `string hashout` — the input artifact's
+/// hashout, the value the consumer's hashin folded in. A guest driver's
+/// `content.hashout()` returned `""` before, so a driver deriving a value from
+/// it (`oci_push`'s `${image_hashout}`) worked in-process and not in the cdylib.
+/// Additive and cold-path (a prost wire field, no vtable change), so an old
+/// plugin still loads.
+///
+/// Skew fails closed in both directions: an old host sends no hashout, and an
+/// old plugin ignores it. A driver that reads it must refuse an empty one, as
+/// `oci_push` does. Minor, therefore.
+///
 /// 0.11.0: `ListResponse` gained `repeated string labels` and `bool
 /// labels_known` — the labels `get` will give the target, so a label selector
 /// decides membership from the listing instead of resolving every candidate's
@@ -96,7 +107,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.11.0";
+pub const ABI_SEMVER: &str = "0.12.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;
