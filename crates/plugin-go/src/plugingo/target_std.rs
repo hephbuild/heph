@@ -3,7 +3,7 @@ use crate::plugingo::addr_util::{
 };
 use crate::plugingo::cc_toolchain;
 use crate::plugingo::factors::{Factors, VariantRef};
-use crate::plugingo::labels;
+use crate::plugingo::listed;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
@@ -214,9 +214,9 @@ pub fn build_spec(
 
     TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: listed::DRIVER_BASH.to_string(),
         config,
-        labels: labels::owned(labels::BUILD),
+        labels: listed::owned(listed::BUILD),
         ..Default::default()
     }
 }

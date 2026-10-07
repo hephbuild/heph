@@ -424,9 +424,10 @@ async fn logout() -> anyhow::Result<()> {
 
 /// Every `credential` target in the workspace (or under `matcher`).
 ///
-/// Resolves each spec, which is what makes this a preflight rather than something
-/// on a build's path. There is no "by driver" matcher in the query language and
-/// adding one for this would be a lot of surface for one command.
+/// Selects with `driver(credential)`, so a provider that lists each target's
+/// driver (go, buildfile) decides every other target from its listing without
+/// resolving it — no `go list` anywhere. Only a candidate whose driver is
+/// unknown is resolved to decide.
 ///
 /// Unless `--fail-fast`, keeps going past a candidate that cannot be resolved:
 /// a broken package elsewhere in the workspace must not hide the credentials
@@ -458,12 +459,14 @@ async fn credentials_matching(
     discovery: crate::engine::Discovery,
 ) -> anyhow::Result<Vec<(Addr, CredentialDef)>> {
     use futures::TryStreamExt as _;
+    let m = Matcher::And(vec![m.clone(), Matcher::Driver(DRIVER_NAME.to_string())]);
     // `query_spec`, not `query` + `get_spec`: a listed candidate may not resolve
     // standalone (go's per-platform variants), and that is not a broken target.
-    let stream = Arc::clone(engine).query_spec(rs.clone(), m, discovery);
+    let stream = Arc::clone(engine).query_spec(rs.clone(), &m, discovery);
     tokio::pin!(stream);
     let mut out = Vec::new();
     while let Some(spec) = stream.try_next().await? {
+        // Defensive: a listed Yes is confirmed to exist, not to be a credential.
         if spec.driver != DRIVER_NAME {
             continue;
         }

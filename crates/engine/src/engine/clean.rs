@@ -93,14 +93,15 @@ struct TargetOutcome {
 /// Whether every node of `m` can be decided from an address alone — i.e. whether
 /// the cache's own keys are enough and the graph need not be walked.
 ///
-/// [`Matcher::Label`] and [`Matcher::TreeOutputTo`] are the two that cannot:
-/// both answer [`MatchResult::MatchShrug`] on an addr, because a label set and a
-/// target's output paths only exist after `Driver::parse`. Decided by node kind
+/// [`Matcher::Label`], [`Matcher::Driver`] and [`Matcher::TreeOutputTo`] are the
+/// ones that cannot: they answer [`MatchResult::MatchShrug`] on an addr, because
+/// a label set, a driver and a target's output paths only exist on its spec or
+/// def. Decided by node kind
 /// on the whole tree, so a composite of allowed kinds (`//a/... && !//b/...`)
 /// still takes the fast path.
 fn is_addr_only(m: &Matcher) -> bool {
     match m {
-        Matcher::Label(_) | Matcher::TreeOutputTo(_) => false,
+        Matcher::Label(_) | Matcher::Driver(_) | Matcher::TreeOutputTo(_) => false,
         Matcher::Or(terms) | Matcher::And(terms) => terms.iter().all(is_addr_only),
         Matcher::Not(inner) => is_addr_only(inner),
         Matcher::Addr(_) | Matcher::Package(_) | Matcher::PackagePrefix(_) => true,
@@ -619,6 +620,7 @@ mod tests {
 
         assert!(!is_addr_only(&Matcher::Label("test".to_string())));
         assert!(!is_addr_only(&Matcher::TreeOutputTo(PkgBuf::from("gen"))));
+        assert!(!is_addr_only(&Matcher::Driver("bash".to_string())));
         // Nested under any combinator, it still forces the graph walk.
         assert!(!is_addr_only(&Matcher::Not(Box::new(Matcher::Label(
             "test".to_string()

@@ -10,6 +10,7 @@ use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
     TargetSpec,
 };
+use crate::engine::query::{Candidate, reconcile_by_name};
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::spec::EngineTargetSpec;
 use async_recursion::async_recursion;
@@ -336,10 +337,10 @@ impl ProviderExecutor for EngineProviderExecutor {
                         {
                             return Err(anyhow::Error::new(CancelledError));
                         }
-                        let mut candidates: Vec<Addr> = Vec::new();
+                        let mut candidates: Vec<Candidate> = Vec::new();
                         let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
 
-                        for provider in &engine.providers {
+                        for (lister, provider) in engine.providers.iter().enumerate() {
                             if rs.skip_providers.contains(&provider.name)
                                 || extra_skip.iter().any(|n| n == &provider.name)
                             {
@@ -366,7 +367,11 @@ impl ProviderExecutor for EngineProviderExecutor {
 
                             for item in raw {
                                 if item.addr.package == pkg {
-                                    candidates.push(item.addr);
+                                    candidates.push(Candidate {
+                                        addr: item.addr,
+                                        facts: item.facts,
+                                        lister,
+                                    });
                                 }
                             }
                         }
@@ -387,9 +392,24 @@ impl ProviderExecutor for EngineProviderExecutor {
             });
             tokio::pin!(per_pkg);
 
+            // A listed No drops a candidate without `get`; a listed Yes takes
+            // exactly the shrug path — `get_spec`, then the matcher on that
+            // spec, then the def if the spec shrugs — so a fact can shape this
+            // dep set only by removing from it. A Yes is never trusted here:
+            // the walk may skip a provider (`skip_providers`,
+            // `exclude_provider`) that `get_spec` still asks first, so the
+            // lister need not be the resolver. The same gap holds for a No,
+            // and is an accepted exemption (user, 2026-10-06): a non-resolver's
+            // listed No can drop a dep when the resolver is excluded; `heph
+            // validate`'s `NotResolver` report gates it. Trust changes verdicts,
+            // never the sequence: the candidates stay package-major,
+            // provider-minor, in list order, duplicates included, because that
+            // sequence is folded in order into the consumer's def hash. No trust
+            // marker joins the hash — the dep list already is in it.
+            let trusted = rs.listed_facts_trust().trusts() && m.reads_listed_facts();
             let mut result = Vec::new();
             loop {
-                let candidates = match per_pkg.next().await {
+                let mut candidates = match per_pkg.next().await {
                     None => break,
                     Some(Ok(candidates)) => candidates,
                     // Never `?` straight out — returning drops `per_pkg` with up
@@ -403,61 +423,31 @@ impl ProviderExecutor for EngineProviderExecutor {
                         return Err(e);
                     }
                 };
-                for addr in candidates {
-                    match m.matches_addr(&addr) {
-                        MatchResult::MatchYes => result.push(addr),
+                if trusted {
+                    reconcile_by_name(&mut candidates);
+                }
+                for Candidate { addr, facts, .. } in candidates {
+                    let by_addr = m.matches_addr(&addr);
+                    let verdict = match by_addr {
+                        MatchResult::MatchShrug if trusted => m.matches_listed(&addr, &facts),
+                        decided => decided,
+                    };
+                    match verdict {
+                        MatchResult::MatchYes if by_addr == MatchResult::MatchYes => {
+                            result.push(addr)
+                        }
                         MatchResult::MatchNo => {}
-                        MatchResult::MatchShrug => {
-                            // Resolve the candidate's spec/def only to evaluate the
-                            // matcher — a speculative inspection, not a dependency. Use a
-                            // speculative rs so a rejected candidate leaves no edge in the
-                            // shared dep DAG (an edge would close a false cycle later).
-                            // One chain at a time *within this walk* — see the note
-                            // above the fan-out.
-                            let spec_rs = rs.speculative();
-                            let spec =
-                                match Arc::clone(&engine).get_spec(spec_rs.clone(), &addr).await {
-                                    Ok(spec) => Ok(spec),
-                                    Err(e)
-                                        if downcast_chain_ref::<TargetNotFoundError>(&e)
-                                            .is_some() =>
-                                    {
-                                        continue;
-                                    }
-                                    // Cycle means this target depends (transitively) on the
-                                    // current query caller. It cannot be a dep of the caller
-                                    // — skip it from the query results rather than error.
-                                    Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => {
-                                        continue;
-                                    }
-                                    res => res,
-                                }?;
-
-                            match crate::engine::matcher_spec::match_spec(m, &spec) {
-                                MatchResult::MatchYes => result.push(addr),
-                                MatchResult::MatchNo => {}
-                                MatchResult::MatchShrug => {
-                                    let def_res =
-                                        Arc::clone(&engine).get_def(spec_rs.clone(), &addr).await;
-                                    let def = match def_res {
-                                        Ok(def) => def,
-                                        // Same as the get_spec branch: cycle means this
-                                        // target transitively depends on the query caller —
-                                        // it can't be a dep of the caller. Skip it.
-                                        Err(e)
-                                            if downcast_chain_ref::<CycleError>(&e).is_some() =>
-                                        {
-                                            continue;
-                                        }
-                                        Err(e) => return Err(e),
-                                    };
-                                    if crate::engine::matcher_target::match_target(
-                                        m,
-                                        &def.target_def,
-                                    ) == MatchResult::MatchYes
-                                    {
-                                        result.push(addr);
-                                    }
+                        // A listed Yes or a shrug: resolve.
+                        MatchResult::MatchYes | MatchResult::MatchShrug => {
+                            match resolved_match(&engine, &rs, m, &addr).await {
+                                Ok(true) => result.push(addr),
+                                Ok(false) => {}
+                                // Same as the `Some(Err(e))` arm above: join
+                                // the package tasks before returning.
+                                Err(e) => {
+                                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    while per_pkg.next().await.is_some() {}
+                                    return Err(e);
                                 }
                             }
                         }
@@ -467,6 +457,48 @@ impl ProviderExecutor for EngineProviderExecutor {
 
             Ok(result)
         })
+    }
+}
+
+/// Whether a query-target candidate that neither its addr nor a listed No
+/// decided matches `m`: by its resolved spec, then by its def if the spec
+/// shrugs. `Ok(false)` for a candidate that was never there or that cycles
+/// back to the query's caller.
+///
+/// Resolving here is a speculative inspection, not a dependency: a
+/// speculative rs means a rejected candidate leaves no edge in the shared dep
+/// DAG (an edge would close a false cycle later). One chain at a time *within
+/// a walk* — see the note above the fan-out in `EngineProviderExecutor::query`.
+async fn resolved_match(
+    engine: &Arc<Engine>,
+    rs: &RequestState,
+    m: &Matcher,
+    addr: &Addr,
+) -> anyhow::Result<bool> {
+    let spec_rs = rs.speculative();
+    let spec = match Arc::clone(engine).get_spec(spec_rs.clone(), addr).await {
+        Ok(spec) => spec,
+        Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => return Ok(false),
+        // Cycle means this target depends (transitively) on the current query
+        // caller. It cannot be a dep of the caller — skip it rather than error.
+        Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match crate::engine::matcher_spec::match_spec(m, &spec) {
+        MatchResult::MatchYes => Ok(true),
+        MatchResult::MatchNo => Ok(false),
+        MatchResult::MatchShrug => {
+            let def = match Arc::clone(engine).get_def(spec_rs, addr).await {
+                Ok(def) => def,
+                // Same as for the spec: a cycle back to the caller is no dep.
+                Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            Ok(
+                crate::engine::matcher_target::match_target(m, &spec, &def.target_def)
+                    == MatchResult::MatchYes,
+            )
+        }
     }
 }
 
@@ -1768,7 +1800,7 @@ impl Engine {
     /// a read guard rides on the artifact and lives as long as anything holds
     /// it, so this bounds the rate of acquisition and not the count. What it
     /// bounds is live *task* state, blocking-queue depth, and waker churn.
-    fn top_level_spawn_limit(max_workers: usize) -> usize {
+    pub(crate) fn top_level_spawn_limit(max_workers: usize) -> usize {
         max_workers.saturating_mul(8).clamp(16, 2048)
     }
 
@@ -3756,7 +3788,7 @@ impl Engine {
         // snapshot: `cached_glob_walk` is keyed by `request_id`, and
         // `CachedWalker::file_hash` revalidates. Nothing else is resolved under
         // it, which is the entire difference from what this used to cost.
-        let fresh = self.new_hash_only_state(addr.clone());
+        let fresh = self.new_hash_only_state(addr.clone(), rs.listed_facts_trust());
         for input_addr in watched {
             let before = Arc::clone(&self)
                 .fs_input_hashout(rs.clone(), &input_addr)
@@ -3864,7 +3896,7 @@ impl Engine {
         let addr = opts.def.target.addr.clone();
         // Fresh request → fs inputs re-stat the post-write-back tree, yielding the
         // exact hashin the NEXT run will compute.
-        let fresh = self.new_hash_only_state(addr.clone());
+        let fresh = self.new_hash_only_state(addr.clone(), rs.listed_facts_trust());
         let fixpoint = match Arc::clone(&self).meta(fresh, &addr).await {
             Ok(m) => m.hashin,
             Err(e) => {
@@ -5072,6 +5104,66 @@ mod tests {
 
     fn states_under_of(engine: &SArc<Engine>, rs: &SArc<RequestState>) -> EngineProviderExecutor {
         EngineProviderExecutor::new(SArc::downgrade(engine), SArc::clone(rs))
+    }
+
+    /// Invariant 1: `states_under` never reads listed facts — lying facts give
+    /// the same states as honest ones, under either trust.
+    #[tokio::test]
+    async fn states_under_ignores_listed_facts() -> anyhow::Result<()> {
+        use crate::engine::fault_provider::{FactsFn, FaultProvider, Faults};
+        use crate::engine::listed::ListedFactsTrust;
+        use hmodel::htmatcher::ListedFacts;
+
+        let mut seen = Vec::new();
+        for (lie, trust) in [
+            (false, ListedFactsTrust::Trust),
+            (true, ListedFactsTrust::Trust),
+            (true, ListedFactsTrust::Ignore),
+        ] {
+            let root = tempdir()?;
+            let mut engine = Engine::new(Config {
+                root: root.path().to_path_buf(),
+                home_dir: std::path::PathBuf::new(),
+                parallelism: None,
+                ..Default::default()
+            })?;
+            let provider = FaultProvider::new(
+                vec![hbuiltins::pluginstatictarget::Target {
+                    addr: "//foo/x:t".to_string(),
+                    driver: "bash".to_string(),
+                    ..Default::default()
+                }],
+                Faults {
+                    states: vec![(
+                        "foo/x".to_string(),
+                        std::collections::HashMap::from([(
+                            "k".to_string(),
+                            hcore::htvalue::Value::Bool(true),
+                        )]),
+                    )],
+                    listed_facts: lie.then(|| {
+                        FactsFn::new(|_, _| Some(ListedFacts::default().with_labels(["lie"])))
+                    }),
+                    ..Default::default()
+                },
+            )?;
+            engine.register_provider(move |_| Box::new(provider))?;
+            let engine = SArc::new(engine);
+            let rs = engine.new_state_with_listed_facts_trust(trust);
+            let states = states_under_of(&engine, &rs)
+                .states_under(&PkgBuf::from(""))
+                .await?;
+            seen.push(
+                states
+                    .iter()
+                    .map(|s| format!("{} {} {:?}", s.package.as_str(), s.provider, s.state))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(seen[0], seen[2]);
+        assert!(!seen[0].is_empty(), "the probe declared a state");
+        Ok(())
     }
 
     /// `states_under`'s output order is a build input, not a display detail:
@@ -10167,7 +10259,10 @@ mod tests {
 
         // Nothing is cached yet, so resolving for real would execute `//pkg:dep`.
         let err = Arc::clone(&engine)
-            .meta(engine.new_hash_only_state(addr.clone()), &addr)
+            .meta(
+                engine.new_hash_only_state(addr.clone(), Default::default()),
+                &addr,
+            )
             .await
             .err()
             .expect("a hash-only request must not build an uncached target");
@@ -10190,7 +10285,10 @@ mod tests {
             .expect("real resolve");
         drop(rs);
         Arc::clone(&engine)
-            .meta(engine.new_hash_only_state(addr.clone()), &addr)
+            .meta(
+                engine.new_hash_only_state(addr.clone(), Default::default()),
+                &addr,
+            )
             .await
             .expect("a cached target is answerable without building");
         Ok(())
@@ -10262,7 +10360,10 @@ mod tests {
         // Hash-only probes hit the cache — and stay silent about it.
         for _ in 0..3 {
             Arc::clone(&engine)
-                .meta(engine.new_hash_only_state(addr.clone()), &addr)
+                .meta(
+                    engine.new_hash_only_state(addr.clone(), Default::default()),
+                    &addr,
+                )
                 .await
                 .expect("cached target answerable without building");
         }
@@ -12193,7 +12294,7 @@ mod tests {
                 // A `get` that builds first is go resolving through `_golist`,
                 // and these tests are about what that resolve touches. A label
                 // walk only reaches it when the listing leaves labels unknown.
-                labels_unknown: shape.builds.is_some(),
+                facts_unknown: shape.builds.is_some(),
                 builds,
                 fail_list_packages: shape.fail_listing,
                 ..Default::default()
@@ -12642,7 +12743,10 @@ mod tests {
             engine.install_selection(&rs, &label("x"), &forced()).await;
             assert!(rs.selection().is_some());
 
-            let nested = engine.new_hash_only_state(hmodel::htaddr::parse_addr("//x:d")?);
+            let nested = engine.new_hash_only_state(
+                hmodel::htaddr::parse_addr("//x:d")?,
+                rs.listed_facts_trust(),
+            );
             assert!(nested.selection().is_none(), "inherited a selection");
             engine
                 .install_selection(&nested, &label("x"), &forced())

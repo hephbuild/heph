@@ -37,13 +37,35 @@ message ListRequest {
   string package = 2;
   repeated State states = 3;
 }
+// A set whose presence carries meaning: absent = unknown, present and empty = known empty.
+// A bare `repeated` field can't tell the two apart.
+message StringSet {
+  repeated string values = 1;
+}
+
+// What `get` will give this target, when the provider knows it at list time.
+// Every field is either unknown (absent) or exact for this listed addr, under the
+// state chain `list` received. Only absence means unknown: a present field is
+// known, including `has_codegen = false` and an empty `labels` set, so a
+// provider leaves a field it does not know unset rather than zero. An empty
+// `driver` is the one present value read as unknown.
+// Verified by `heph validate`; a listed "no" is trusted by the engine's walks.
+message ListedFacts {
+  // The spec's labels, compared as a set. Present and empty = no labels.
+  StringSet labels = 1;
+  // The spec's driver. Absent, "" or over 256 bytes = unknown.
+  optional string driver = 2;
+  // Whether any path in def.outputs has codegen mode != NONE. Absent = unknown.
+  optional bool has_codegen = 3;
+}
+
 message ListResponse {
   Addr addr = 1;
-  // The labels `get` will give this target, when the provider knows them at
-  // list time. Meaningful only when `labels_known`: an old plugin sends
-  // neither field, which must read as "unknown", never as "no labels".
-  repeated string labels = 2;
-  bool labels_known = 3;
+  // 0.11.0's per-target labels, superseded by `facts`. Never reuse.
+  reserved 2, 3;
+  reserved "labels", "labels_known";
+  // Absent = every field unknown (an old plugin, or `addr_only`).
+  ListedFacts facts = 4;
 }
 
 message ListPackagesRequest {

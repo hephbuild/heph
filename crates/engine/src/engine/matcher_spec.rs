@@ -21,6 +21,15 @@ pub fn match_spec(m: &Matcher, spec: &TargetSpec) -> MatchResult {
                 MatchResult::MatchNo
             }
         }
+        // Whole string, case-sensitive. No spec has an empty driver, so
+        // `driver("")` is No here.
+        Matcher::Driver(driver) => {
+            if spec.driver == *driver {
+                MatchResult::MatchYes
+            } else {
+                MatchResult::MatchNo
+            }
+        }
         Matcher::Package(pkg) => {
             if spec.addr.package == *pkg {
                 MatchResult::MatchYes

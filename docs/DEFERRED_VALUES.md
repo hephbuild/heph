@@ -357,8 +357,10 @@ never claims one. A host-level variable would need a kind.
 
 The hashout is heph's content hash of the image archive, **not** the registry
 digest: it is not what `docker images` or the registry reports, and it moves if
-heph's packing or hash scheme does. The `oci_push` run logs the reference it
-pushed and the registry digest together.
+heph's packing or hash scheme does. An `oci_push` target's output is the
+reference it pushed, resolved and in full (`registry/repository:tag`, `latest`
+when `ref` named no tag), in `<name>.ref`: `heph r //app:push` prints its path,
+and `${read://app:push}` hands it to the next target.
 
 `${src:}` is refused in a credential declaration: a credential is a document the
 host reads, not a target that runs, so there is no sandbox for a path to point

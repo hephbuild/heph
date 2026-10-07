@@ -10,7 +10,7 @@ use crate::pb;
 use anyhow::Context as _;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
-use hmodel::htmatcher::Matcher;
+use hmodel::htmatcher::{ListedFacts, Matcher};
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
@@ -548,6 +548,7 @@ pub fn matcher_to_pb(m: &Matcher) -> pb::Matcher {
     let kind = match m {
         Matcher::Addr(a) => Kind::Addr(addr_to_pb(a)),
         Matcher::Label(l) => Kind::Label(l.clone()),
+        Matcher::Driver(d) => Kind::Driver(d.clone()),
         Matcher::Package(p) => Kind::Package(p.as_str().to_string()),
         Matcher::PackagePrefix(p) => Kind::PackagePrefix(p.as_str().to_string()),
         Matcher::TreeOutputTo(p) => Kind::TreeOutputTo(p.as_str().to_string()),
@@ -562,20 +563,70 @@ pub fn matcher_to_pb(m: &Matcher) -> pb::Matcher {
     pb::Matcher { kind: Some(kind) }
 }
 
-pub fn matcher_from_pb(m: pb::Matcher) -> Matcher {
+/// A `Matcher` with no arm this host knows is an error, never a guess. prost
+/// decodes an arm from a newer peer as no arm at all, and reading that as an
+/// empty `Or` matched nothing — or, under a `Not`, everything.
+pub fn matcher_from_pb(m: pb::Matcher) -> anyhow::Result<Matcher> {
     use pb::matcher::Kind;
-    match m.kind {
+    let list = |l: pb::matcher::List| {
+        l.matchers
+            .into_iter()
+            .map(matcher_from_pb)
+            .collect::<anyhow::Result<Vec<_>>>()
+    };
+    Ok(match m.kind {
         Some(Kind::Addr(a)) => Matcher::Addr(addr_from_pb(a)),
         Some(Kind::Label(l)) => Matcher::Label(l),
+        Some(Kind::Driver(d)) => Matcher::Driver(d),
         Some(Kind::Package(p)) => Matcher::Package(PkgBuf::from(p)),
         Some(Kind::PackagePrefix(p)) => Matcher::PackagePrefix(PkgBuf::from(p)),
         Some(Kind::TreeOutputTo(p)) => Matcher::TreeOutputTo(PkgBuf::from(p)),
-        Some(Kind::Or(l)) => Matcher::Or(l.matchers.into_iter().map(matcher_from_pb).collect()),
-        Some(Kind::And(l)) => Matcher::And(l.matchers.into_iter().map(matcher_from_pb).collect()),
-        Some(Kind::Not(inner)) => Matcher::Not(Box::new(matcher_from_pb(*inner))),
-        // An empty matcher matches nothing sensible; default to an empty Or.
-        None => Matcher::Or(vec![]),
+        Some(Kind::Or(l)) => Matcher::Or(list(l)?),
+        Some(Kind::And(l)) => Matcher::And(list(l)?),
+        Some(Kind::Not(inner)) => Matcher::Not(Box::new(matcher_from_pb(*inner)?)),
+        None => anyhow::bail!(
+            "matcher has no arm this host knows (sent by a newer plugin? ABI {})",
+            crate::ABI_SEMVER
+        ),
+    })
+}
+
+// ---- ListedFacts ----
+
+/// `None` when every field is unknown, so `addr_only` sends no message.
+pub fn listed_facts_to_pb(f: &ListedFacts) -> Option<pb::ListedFacts> {
+    if f.is_unknown() {
+        return None;
     }
+    Some(pb::ListedFacts {
+        labels: f.labels().map(|l| pb::StringSet { values: l.to_vec() }),
+        driver: f.driver().map(str::to_string),
+        has_codegen: f.has_codegen(),
+    })
+}
+
+/// Absent anything is unknown; the builders normalize the rest (labels sorted
+/// and deduplicated, an empty or oversized driver unknown). `intern` maps a
+/// driver name to a shared `Arc`, so one `list` call holds each name once.
+pub fn listed_facts_from_pb(
+    f: Option<pb::ListedFacts>,
+    intern: &mut impl FnMut(String) -> Arc<str>,
+) -> ListedFacts {
+    let mut out = ListedFacts::default();
+    let Some(f) = f else { return out };
+    if let Some(labels) = f.labels {
+        out = out.with_labels(labels.values);
+    }
+    if let Some(driver) = f.driver
+        && !driver.is_empty()
+        && driver.len() <= hmodel::htmatcher::MAX_LISTED_DRIVER_LEN
+    {
+        out = out.with_driver(intern(driver));
+    }
+    if let Some(c) = f.has_codegen {
+        out = out.with_has_codegen(c);
+    }
+    out
 }
 
 // ---- TargetDef and its parts (driver path) ----
@@ -1094,8 +1145,195 @@ mod tests {
         let m = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("//a")),
             Matcher::Not(Box::new(Matcher::Label("x".to_string()))),
+            Matcher::Driver("credential".to_string()),
         ]);
-        assert_eq!(matcher_from_pb(matcher_to_pb(&m)), m);
+        assert_eq!(matcher_from_pb(matcher_to_pb(&m)).expect("decode"), m);
+    }
+
+    /// D8: an arm this host does not know — prost leaves `kind` empty — is a
+    /// decode error, at the top and nested, never a silent `Or[]`.
+    #[test]
+    fn unknown_matcher_arm_is_decode_error() {
+        use prost::Message as _;
+        // Field 99 is no arm of `Matcher`: what a newer peer's arm looks like here.
+        let unknown = [0xFA, 0x06, 0x01, b'x'];
+        let decoded = pb::Matcher::decode(&unknown[..]).expect("prost skips unknown fields");
+        assert!(decoded.kind.is_none());
+        matcher_from_pb(decoded.clone()).expect_err("an empty matcher must not decode");
+        let nested = pb::Matcher {
+            kind: Some(pb::matcher::Kind::Not(Box::new(decoded))),
+        };
+        let err = matcher_from_pb(nested).expect_err("nested unknown arm");
+        assert!(format!("{err:#}").contains("no arm"), "{err:#}");
+    }
+
+    /// 0.11.0's `ListResponse`, as a pre-0.13 host decodes it
+    /// (`git show 0b6b8758:proto/plugin/v1/provider.proto`).
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ListResponseV011 {
+        #[prost(message, optional, tag = "1")]
+        addr: Option<pb::Addr>,
+        #[prost(string, repeated, tag = "2")]
+        labels: Vec<String>,
+        #[prost(bool, tag = "3")]
+        labels_known: bool,
+    }
+
+    /// D7, `ABI_VERSIONING.md`: a 0.11 or 0.12 host reading a 0.13 plugin's listing —
+    /// facts and all — sees `labels_known = false`, which it reads as
+    /// "unknown", never as "no labels".
+    #[test]
+    fn removed_labels_decode_as_unknown_on_a_0_11_host() {
+        use prost::Message as _;
+        let new = pb::ListResponse {
+            addr: Some(pb::Addr {
+                package: "p".to_string(),
+                name: "t".to_string(),
+                args: Default::default(),
+            }),
+            facts: Some(pb::ListedFacts {
+                labels: Some(pb::StringSet {
+                    values: vec!["test".to_string()],
+                }),
+                driver: Some("exec".to_string()),
+                has_codegen: Some(false),
+            }),
+        };
+        let old = ListResponseV011::decode(new.encode_to_vec().as_slice())
+            .expect("an old host decodes a new listing");
+        assert!(!old.labels_known);
+        assert!(old.labels.is_empty());
+        assert_eq!(old.addr, new.addr);
+    }
+
+    /// 0.11.0's `Matcher`: arms 1–8, no `driver`.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct MatcherV011 {
+        #[prost(oneof = "MatcherV011Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+        kind: Option<MatcherV011Kind>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct MatcherV011List {
+        #[prost(message, repeated, tag = "1")]
+        matchers: Vec<MatcherV011>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    enum MatcherV011Kind {
+        #[prost(message, tag = "1")]
+        Addr(pb::Addr),
+        #[prost(string, tag = "2")]
+        Label(String),
+        #[prost(string, tag = "3")]
+        Package(String),
+        #[prost(string, tag = "4")]
+        PackagePrefix(String),
+        #[prost(string, tag = "5")]
+        TreeOutputTo(String),
+        #[prost(message, tag = "6")]
+        Or(MatcherV011List),
+        #[prost(message, tag = "7")]
+        And(MatcherV011List),
+        #[prost(message, boxed, tag = "8")]
+        Not(Box<MatcherV011>),
+    }
+
+    /// The known old-host misread, pinned: a pre-0.13 host decodes arm 9
+    /// (`driver`) as an empty matcher. That is why a plugin must not send it
+    /// to a host older than 0.13 — and why this host now refuses an arm it
+    /// does not know.
+    #[test]
+    fn driver_arm_is_an_empty_matcher_on_a_0_11_host() {
+        use prost::Message as _;
+        let new = matcher_to_pb(&Matcher::Driver("credential".to_string()));
+        let old = MatcherV011::decode(new.encode_to_vec().as_slice())
+            .expect("prost skips the unknown arm");
+        assert_eq!(old.kind, None);
+    }
+
+    fn decode_facts(f: Option<pb::ListedFacts>) -> ListedFacts {
+        listed_facts_from_pb(f, &mut |s: String| Arc::from(s))
+    }
+
+    /// Inv. 3: every absent, zero or out-of-range value reads as unknown.
+    #[test]
+    fn zero_value_listed_facts_decode_unknown() {
+        use prost::Message as _;
+        assert_eq!(decode_facts(None), ListedFacts::default());
+        assert_eq!(
+            decode_facts(Some(pb::ListedFacts::default())),
+            ListedFacts::default()
+        );
+        for driver in [
+            String::new(),
+            "x".repeat(hmodel::htmatcher::MAX_LISTED_DRIVER_LEN + 1),
+        ] {
+            let f = decode_facts(Some(pb::ListedFacts {
+                driver: Some(driver),
+                ..Default::default()
+            }));
+            assert_eq!(f.driver(), None);
+        }
+        // An 0.11-era listing: fields 2 and 3 set, no `facts`.
+        let mut old = Vec::new();
+        prost::encoding::message::encode(
+            1,
+            &pb::Addr {
+                package: "p".into(),
+                name: "t".into(),
+                args: Default::default(),
+            },
+            &mut old,
+        );
+        prost::encoding::string::encode(2, &"test".to_string(), &mut old);
+        prost::encoding::bool::encode(3, &true, &mut old);
+        let lr = pb::ListResponse::decode(&old[..]).expect("reserved fields are skipped");
+        assert!(lr.facts.is_none());
+        assert_eq!(decode_facts(lr.facts), ListedFacts::default());
+    }
+
+    /// Inv. 3: a present empty label set is "no labels", never unknown.
+    #[test]
+    fn empty_labels_roundtrip_distinct_from_unknown() {
+        use prost::Message as _;
+        let roundtrip = |f: &ListedFacts| {
+            let wire = pb::ListResponse {
+                addr: None,
+                facts: listed_facts_to_pb(f),
+            }
+            .encode_to_vec();
+            decode_facts(pb::ListResponse::decode(&wire[..]).expect("decode").facts)
+        };
+        let empty = ListedFacts::default().with_labels(Vec::<String>::new());
+        assert_eq!(roundtrip(&empty).labels(), Some(&[][..]));
+        assert_eq!(roundtrip(&ListedFacts::default()).labels(), None);
+        let full = ListedFacts::default()
+            .with_labels(["b", "a"])
+            .with_driver("go_compile")
+            .with_has_codegen(false);
+        assert_eq!(roundtrip(&full), full);
+        assert!(listed_facts_to_pb(&ListedFacts::default()).is_none());
+    }
+
+    /// C33: a malformed nested `ListedFacts` fails the whole `ListResponse`.
+    #[test]
+    fn malformed_listed_facts_fails_list() {
+        use prost::Message as _;
+        let mut wire = Vec::new();
+        prost::encoding::message::encode(
+            1,
+            &pb::Addr {
+                package: "p".into(),
+                name: "t".into(),
+                args: Default::default(),
+            },
+            &mut wire,
+        );
+        // Field 4 (`facts`), two bytes long: `has_codegen`'s tag, then a varint
+        // whose continuation bit runs past the end of the message.
+        wire.extend_from_slice(&[0x22, 0x02, 0x18, 0xFF]);
+        pb::ListResponse::decode(&wire[..]).expect_err("a malformed `facts` must fail the item");
     }
 
     #[test]

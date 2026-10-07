@@ -197,13 +197,13 @@ fn decode_unary(bytes: &[u8]) -> anyhow::Result<Body> {
 /// incrementally and the full set is never buffered. `Send` (the stream handle is
 /// `Send + Sync`, `decode` is a fn pointer) so it satisfies the engine's `Provider`
 /// iterator bound.
-struct ItemStreamIter<T> {
+struct ItemStreamIter<D> {
     stream: DynItemStream,
-    decode: fn(&[u8]) -> anyhow::Result<T>,
+    decode: D,
     done: bool,
 }
 
-impl<T> Iterator for ItemStreamIter<T> {
+impl<T, D: FnMut(&[u8]) -> anyhow::Result<T>> Iterator for ItemStreamIter<D> {
     type Item = anyhow::Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -241,17 +241,35 @@ impl<T> Iterator for ItemStreamIter<T> {
     }
 }
 
-fn decode_list_item(b: &[u8]) -> anyhow::Result<ListResponse> {
-    let lr = pb::ListResponse::decode(b)?;
+/// One `list` call's decoder. Interns driver names for the call, so a package
+/// of a thousand entries holds each driver once rather than once per entry.
+fn list_item_decoder() -> impl FnMut(&[u8]) -> anyhow::Result<ListResponse> + Send {
+    let mut drivers: std::collections::HashMap<String, Arc<str>> = Default::default();
+    move |b| {
+        decode_list_item(b, &mut |d: String| {
+            Arc::clone(
+                drivers
+                    .entry(d)
+                    .or_insert_with_key(|d| Arc::from(d.as_str())),
+            )
+        })
+    }
+}
+
+/// A malformed `ListedFacts` fails the whole item, and so the provider's
+/// `list` — prost decodes nested messages eagerly. An absent one (a plugin
+/// older than ABI 0.13, or `addr_only`) is every fact unknown, never a prune.
+fn decode_list_item(
+    b: &[u8],
+    intern: &mut impl FnMut(String) -> Arc<str>,
+) -> anyhow::Result<ListResponse> {
+    use anyhow::Context as _;
+    let lr = pb::ListResponse::decode(b).context("decoding a listed target")?;
     let addr = convert::addr_from_pb(lr.addr.unwrap_or_default());
-    // A plugin older than ABI 0.11 sends neither field; prost reads that as
-    // `labels_known == false`, which must stay "unknown" — an empty `Some`
-    // would drop the target from every label selection.
-    Ok(if lr.labels_known {
-        ListResponse::with_labels(addr, lr.labels)
-    } else {
-        ListResponse::addr_only(addr)
-    })
+    Ok(ListResponse::with_facts(
+        addr,
+        convert::listed_facts_from_pb(lr.facts, intern),
+    ))
 }
 
 fn decode_list_package_item(b: &[u8]) -> anyhow::Result<ListPackageResponse> {
@@ -416,7 +434,7 @@ impl Provider for StableRemoteProvider {
                 .await;
             Ok(Box::new(ItemStreamIter {
                 stream,
-                decode: decode_list_item,
+                decode: list_item_decoder(),
                 done: false,
             })
                 as Box<
@@ -1052,42 +1070,56 @@ mod tests {
         assert_eq!(managed_input_to_pb(&mi).hashout, "abc123");
     }
 
-    fn encoded(labels: &[&str], labels_known: bool) -> Vec<u8> {
-        pb::ListResponse {
-            addr: Some(pb::Addr {
-                package: "p".into(),
-                name: "t".into(),
-                args: Default::default(),
-            }),
-            labels: labels.iter().map(|l| (*l).to_string()).collect(),
-            labels_known,
+    fn addr() -> pb::Addr {
+        pb::Addr {
+            package: "p".into(),
+            name: "t".into(),
+            args: Default::default(),
         }
-        .encode_to_vec()
     }
 
-    /// A plugin built before ABI 0.11 never sets `labels_known`: its listing
-    /// must decode as "labels unknown", not as "no labels", or every label
-    /// selection would silently skip its targets.
+    /// A plugin built before ABI 0.13 sends no `facts`: every fact must decode
+    /// as unknown, never as "no labels", or every label selection would
+    /// silently skip its targets. One driver name decodes to one shared `Arc`
+    /// across a `list` call.
     #[test]
-    fn old_plugin_without_labels_shrugs() {
-        let decode = |b: &[u8]| decode_list_item(b).expect("decoding a ListResponse");
+    fn old_plugin_listing_decodes_unknown_and_drivers_are_interned() {
+        let mut decode = list_item_decoder();
         let old = pb::ListResponse {
-            addr: Some(pb::Addr {
-                package: "p".into(),
-                name: "t".into(),
-                args: Default::default(),
-            }),
-            ..Default::default()
+            addr: Some(addr()),
+            facts: None,
         };
-        assert_eq!(decode(&old.encode_to_vec()).labels, None);
+        let item = decode(&old.encode_to_vec()).expect("decoding a ListResponse");
+        assert!(item.facts.is_unknown());
 
-        let none = decode(&encoded(&[], true));
-        assert_eq!(none.labels.as_deref(), Some(&[][..]));
-
-        let some = decode(&encoded(&["a", "b"], true));
-        assert_eq!(
-            some.labels.as_deref(),
-            Some(&["a".to_string(), "b".to_string()][..])
+        let with = |driver: &str| pb::ListResponse {
+            addr: Some(addr()),
+            facts: Some(pb::ListedFacts {
+                labels: Some(pb::StringSet { values: vec![] }),
+                driver: Some(driver.to_string()),
+                has_codegen: Some(false),
+            }),
+        };
+        let a = decode(&with("bash").encode_to_vec()).expect("decode");
+        let b = decode(&with("bash").encode_to_vec()).expect("decode");
+        assert_eq!(a.facts.labels(), Some(&[][..]));
+        assert_eq!(a.facts.has_codegen(), Some(false));
+        let (Some(da), Some(db)) = (a.facts.driver(), b.facts.driver()) else {
+            panic!("driver should be known");
+        };
+        // Both borrow from the same allocation: one `Arc` per driver name.
+        assert!(
+            std::ptr::eq(da.as_ptr(), db.as_ptr()),
+            "one Arc per driver name per list call"
         );
+    }
+
+    /// C33: a malformed nested `ListedFacts` fails the item, so the `list`.
+    #[test]
+    fn malformed_listed_facts_fails_the_item() {
+        let mut wire = Vec::new();
+        prost::encoding::message::encode(1, &addr(), &mut wire);
+        wire.extend_from_slice(&[0x22, 0x02, 0x18, 0xFF]);
+        assert!(list_item_decoder()(&wire).is_err());
     }
 }

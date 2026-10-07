@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher;
-use hmodel::htmatcher::MatchResult;
+use hmodel::htmatcher::{ListedFacts, MatchResult};
 use hmodel::htpkg::PkgBuf;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
@@ -21,53 +21,138 @@ use std::sync::Arc;
 struct PackageScan {
     candidates: Vec<Candidate>,
     skipped: Vec<Skip>,
+    /// A provider's `list` of this package failed and was skipped: its
+    /// listings are missing, so no merged fact here can be trusted.
+    listing_gap: bool,
 }
 
-/// One listed target, with what its provider said about its labels.
+/// One listed target, with what its provider said about it.
 pub(crate) struct Candidate {
     pub(crate) addr: Addr,
-    pub(crate) labels: Option<Arc<[String]>>,
+    pub(crate) facts: ListedFacts,
+    /// Which provider listed it: its index in the engine's provider order.
+    pub(crate) lister: usize,
 }
 
-/// The labels the walk matches a listed addr against: one set when every
-/// provider that listed it agrees, `None` (unknown — the spec decides) when
-/// they differ or any of them does not know.
+/// Replace each candidate's facts with what every listing that could describe
+/// its addr's target agrees on: per field, the value when every one of them
+/// knows it and they agree, unknown otherwise.
 ///
-/// Two providers can list one addr and only one of them resolve it: go lists
-/// a bare `build` in every package and declines it in a library, where a BUILD
-/// file may define its own. First-listing-wins would match against go's set
-/// and silently miss the BUILD target's labels.
-pub(crate) fn merge_listings(candidates: Vec<Candidate>) -> Vec<Candidate> {
-    let mut at: FxHashMap<Addr, usize> = FxHashMap::default();
-    let mut merged: Vec<Candidate> = Vec::with_capacity(candidates.len());
-    for c in candidates {
-        match at.get(&c.addr) {
-            Some(&i) => {
-                if let Some(first) = merged.get_mut(i)
-                    && first.labels.as_deref() != c.labels.as_deref()
-                {
-                    first.labels = None;
+/// Any provider that lists the addr's name in the package may be the one that
+/// resolves it, so each one's description counts: a provider that lists the
+/// exact addr describes it with that listing; one that lists the name only
+/// with other args describes it with all of those, because its `get` may
+/// answer the name whatever the args — the buildfile provider resolves go's
+/// `test@<variant>` with the BUILD file's `test` where one is defined. Keyed on
+/// the full addr alone, go's facts would decide for the BUILD target. Keyed on
+/// the name alone, a provider's own differently-argued targets would blur into
+/// one another: go's bare `build` is a `group` and every `build@<variant>` a
+/// `bash` link, and every one of them would read as unknown.
+///
+/// Per addr, so every listing of one addr gets the same facts. Never reorders,
+/// drops or dedups a candidate — the query-target walk folds the sequence into
+/// a def hash — and the result is independent of provider and listing order.
+pub(crate) fn reconcile_by_name(candidates: &mut [Candidate]) {
+    let mut by_name: FxHashMap<(&str, &str), Vec<usize>> = FxHashMap::default();
+    for (i, c) in candidates.iter().enumerate() {
+        by_name
+            .entry((c.addr.package.as_str(), c.addr.name.as_str()))
+            .or_default()
+            .push(i);
+    }
+    // A name can have hundreds of listings (go lists `build`, `_golist`… once
+    // per universe variant), so a group is never scanned pairwise: each
+    // lister's listings are folded once, and each addr then costs one lookup
+    // per lister — O(group × listers).
+    let mut merged: Vec<Option<ListedFacts>> = vec![None; candidates.len()];
+    for group in by_name.values() {
+        let mut listers: Vec<ListerView<'_>> = Vec::new();
+        for c in group.iter().filter_map(|&i| candidates.get(i)) {
+            let view = match listers.iter().position(|v| v.lister == c.lister) {
+                Some(at) => listers.get_mut(at),
+                None => {
+                    listers.push(ListerView {
+                        lister: c.lister,
+                        exact: FxHashMap::default(),
+                        whole: c.facts.clone(),
+                    });
+                    listers.last_mut()
                 }
-            }
-            None => {
-                at.insert(c.addr.clone(), merged.len());
-                merged.push(c);
+            };
+            let Some(view) = view else { continue };
+            view.whole.agree(&c.facts);
+            view.exact
+                .entry(&c.addr)
+                .and_modify(|f| f.agree(&c.facts))
+                .or_insert_with(|| c.facts.clone());
+        }
+        let mut by_addr: FxHashMap<&Addr, ListedFacts> = FxHashMap::default();
+        for &i in group {
+            let Some(c) = candidates.get(i) else { continue };
+            let facts = by_addr.entry(&c.addr).or_insert_with(|| {
+                // A lister that lists this exact addr describes it by that
+                // listing; one that lists the name only otherwise, by all of
+                // its listings of the name.
+                let mut described = listers
+                    .iter()
+                    .map(|v| v.exact.get(&c.addr).unwrap_or(&v.whole));
+                let mut acc = described.next().cloned().unwrap_or_default();
+                for f in described {
+                    acc.agree(f);
+                }
+                acc
+            });
+            if let Some(slot) = merged.get_mut(i) {
+                *slot = Some(facts.clone());
             }
         }
     }
-    merged
+    for (c, facts) in candidates.iter_mut().zip(merged) {
+        if let Some(facts) = facts {
+            c.facts = facts;
+        }
+    }
 }
 
-/// Whether evaluating `m` can read a target's labels at all. Listings are only
-/// worth merging — an `Addr` clone and a map entry per candidate — for a walk
-/// that will act on them.
-fn mentions_label(m: &htmatcher::Matcher) -> bool {
-    use htmatcher::Matcher as M;
-    match m {
-        M::Label(_) => true,
-        M::Or(ms) | M::And(ms) => ms.iter().any(mentions_label),
-        M::Not(m) => mentions_label(m),
-        M::Addr(_) | M::Package(_) | M::PackagePrefix(_) | M::TreeOutputTo(_) => false,
+/// One lister's listings of one name, for [`reconcile_by_name`]: per exact
+/// addr, and all of them, each folded with [`ListedFacts::agree`].
+struct ListerView<'a> {
+    lister: usize,
+    exact: FxHashMap<&'a Addr, ListedFacts>,
+    whole: ListedFacts,
+}
+
+/// The selection walk's view of one package's listings: [`reconcile_by_name`],
+/// then one candidate per addr, in first-listed order.
+pub(crate) fn merge_listings(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+    reconcile_by_name(&mut candidates);
+    let mut seen: FxHashSet<Addr> = FxHashSet::default();
+    candidates.retain(|c| seen.insert(c.addr.clone()));
+    candidates
+}
+
+/// The advisory half of Invariant 6: a candidate whose listed facts did not
+/// decide was resolved anyway, so compare what is known with what it resolved
+/// to. Logs, never fails — `heph validate` is where a mismatch is an error.
+fn warn_listed_mismatch(
+    addr: &Addr,
+    facts: &ListedFacts,
+    spec: &EngineTargetSpec,
+    def: Option<&crate::engine::driver::targetdef::TargetDef>,
+) {
+    if facts.is_unknown() {
+        return;
+    }
+    for (field, listed, resolved) in crate::engine::listed::listed_differences(facts, spec, def) {
+        tracing::warn!(
+            addr = %addr.format(),
+            provider = %spec.provider,
+            %field,
+            %listed,
+            %resolved,
+            hint = crate::engine::listed::KILL_SWITCH_HINT,
+            "listed fact differs from the resolved target; `heph validate` reports it"
+        );
     }
 }
 
@@ -96,19 +181,26 @@ impl Engine {
     /// (`EngineProviderExecutor::query`) is a different function and is never
     /// parameterized: its output reaches a def hash, so it is always complete.
     ///
-    /// A provider that reports a candidate's labels from `list` is trusted:
-    /// the label matcher decides from the listing, and the candidate's spec is
-    /// never resolved to check it — a match is yielded, a non-match dropped.
-    /// Like every addr a selector yields, a match may turn out not to exist (a
-    /// listing is a candidate set; see [`skip_unresolvable`]). `heph validate`
-    /// holds a provider's listed labels to its specs.
+    /// Listed facts decide where they can, under the request's
+    /// [`ListedFactsTrust`](crate::engine::listed::ListedFactsTrust): a
+    /// candidate whose facts — merged across every listing of its name — rule
+    /// it out is dropped without resolving it, and one they rule in is
+    /// yielded. Like every addr a selector yields, that match may turn out not
+    /// to exist (a listing is a candidate set; see [`skip_unresolvable`]); the
+    /// consumers that act on one confirm it. Facts that do not decide leave
+    /// the spec, then the def, to decide, as before. Under KeepGoing, a
+    /// package whose listings are incomplete decides nothing from facts.
+    /// `heph validate` holds every listed fact to its target.
     pub fn query<'a>(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         m: &'a htmatcher::Matcher,
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
-        let uses_labels = mentions_label(m);
+        // Merging costs a few map entries and a facts clone (reference-count
+        // bumps) per candidate, plus an `Addr` clone per candidate for the
+        // selection dedup: only worth it for a walk that will read a fact.
+        let uses_facts = rs.listed_facts_trust().trusts() && m.reads_listed_facts();
         // A whole-graph selector (`//...` — a `PackagePrefix` rooted at the empty
         // package) enumerates every target, so its final match count is the total
         // graph size. Recorded for telemetry only when the stream is driven to
@@ -132,11 +224,17 @@ impl Engine {
             let executor: Arc<dyn hplugin::provider::ProviderExecutor> = Arc::new(
                 crate::engine::result::EngineProviderExecutor::for_list(Arc::downgrade(&self), rs.clone()),
             );
+            // A provider whose package listing failed covers every package this
+            // walk visits (its prefix is the matcher's), so its listings are
+            // missing from all of them: a gap must mean "results missing",
+            // never a fact decided without a co-lister's say.
+            let mut packages_gap = false;
             let pkgs: Vec<String> = match &gaps {
                 None => self.packages(m, &rs).await?.collect::<anyhow::Result<_>>()?,
                 Some(gaps) => {
                     let (pkgs, skipped) = self.packages_keep_going(m, &rs, gaps).await?;
                     skipped_any |= skipped;
+                    packages_gap = skipped;
                     pkgs
                 }
             };
@@ -265,7 +363,7 @@ impl Engine {
                         Err(e) => return Err(e),
                     };
 
-                    for provider in &engine.providers {
+                    for (lister, provider) in engine.providers.iter().enumerate() {
                         let listed = provider.provider.list(ListRequest {
                             request_id: rs.request_id().to_string(),
                             package: pkg.clone(),
@@ -289,6 +387,7 @@ impl Engine {
                                     scope: format!("//{pkg}"),
                                     error: e,
                                 });
+                                scan.listing_gap = true;
                                 continue;
                             }
                             Err(e) => return Err(e),
@@ -298,7 +397,8 @@ impl Engine {
                             if item.addr.package == pkg {
                                 scan.candidates.push(Candidate {
                                     addr: item.addr,
-                                    labels: item.labels,
+                                    facts: item.facts,
+                                    lister,
                                 });
                             }
                         }
@@ -379,17 +479,25 @@ impl Engine {
                 }
                 // Every provider's listing of a package is in this one scan, so
                 // this is where they are reconciled. Not worth an `Addr` clone
-                // per candidate when the matcher never reads a label.
-                let candidates = if uses_labels {
+                // per candidate when the matcher never reads a fact.
+                let facts_usable = uses_facts && !packages_gap && !scan.listing_gap;
+                let candidates = if facts_usable {
                     merge_listings(scan.candidates)
                 } else {
                     scan.candidates
                 };
-                for Candidate { addr, labels } in candidates {
-                    // The provider's listing is trusted: a listed label decides
-                    // here, and the spec is never resolved to second-guess it.
-                    let labels = labels.filter(|_| uses_labels);
-                    match m.matches_listed(&addr, labels.as_deref()) {
+                for Candidate { addr, facts, .. } in candidates {
+                    let facts = if facts_usable { &facts } else { &ListedFacts::UNKNOWN };
+                    let verdict = m.matches_listed(&addr, facts);
+                    if facts_usable
+                        && verdict != MatchResult::MatchShrug
+                        && m.matches_addr(&addr) == MatchResult::MatchShrug
+                    {
+                        rs.data
+                            .listed_decided
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    match verdict {
                         MatchResult::MatchYes => {
                             if seen.insert(addr.clone()) { yield addr; }
                         }
@@ -419,7 +527,11 @@ impl Engine {
                                 },
                             };
 
-                            match crate::engine::matcher_spec::match_spec(m, &spec) {
+                            let by_spec = crate::engine::matcher_spec::match_spec(m, &spec);
+                            if by_spec != MatchResult::MatchShrug {
+                                warn_listed_mismatch(&addr, facts, &spec, None);
+                            }
+                            match by_spec {
                                 MatchResult::MatchYes => {
                                     if seen.insert(addr.clone()) { yield addr; }
                                 }
@@ -440,8 +552,10 @@ impl Engine {
                                         },
                                     };
 
+                                    warn_listed_mismatch(&addr, facts, &spec, Some(&def.target_def));
                                     if crate::engine::matcher_target::match_target(
                                         m,
+                                        &spec,
                                         &def.target_def,
                                     ) == MatchResult::MatchYes
                                         && seen.insert(addr.clone())
@@ -549,6 +663,29 @@ impl Engine {
             .try_buffer_unordered(concurrency)
             .try_filter_map(|spec| std::future::ready(Ok(spec)))
     }
+
+    /// [`Engine::query`], keeping only the targets that exist: every match is
+    /// resolved, whether a listed fact, the spec or the addr alone selected
+    /// it, and a candidate that does not resolve is dropped as
+    /// [`Engine::confirm_match`] drops one. A candidate the walk rules out is
+    /// never resolved here, so a listed No still costs no `get`.
+    ///
+    /// Yields in the walk's order (`try_buffered`), resolving as many matches
+    /// at once as `heph r` confirms.
+    pub fn query_existing<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        discovery: Discovery,
+    ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+        let gaps = discovery.gaps().cloned();
+        let limit = Self::top_level_spawn_limit(self.max_workers);
+        Arc::clone(&self)
+            .query(rs.clone(), m, discovery)
+            .map_ok(move |addr| Arc::clone(&self).confirm_exists(rs.clone(), gaps.clone(), addr))
+            .try_buffered(limit)
+            .try_filter_map(futures::future::ok)
+    }
 }
 
 impl Engine {
@@ -577,6 +714,17 @@ impl Engine {
         if m.matches_addr(&addr) == MatchResult::MatchYes {
             return Ok(Some(addr));
         }
+        self.confirm_exists(rs, gaps, addr).await
+    }
+
+    /// [`Engine::confirm_match`] without the addr shortcut: every addr is
+    /// resolved, so `Some` means it exists, whatever decided the match.
+    async fn confirm_exists(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        gaps: Option<Arc<Gaps>>,
+        addr: Addr,
+    ) -> anyhow::Result<Option<Addr>> {
         match skip_unresolvable(&addr, self.get_spec(rs.clone(), &addr).await) {
             Ok(Some(_)) => Ok(Some(addr)),
             Ok(None) => {
@@ -642,6 +790,190 @@ mod tests {
     use hmodel::htmatcher::Matcher;
     use std::collections::HashMap;
     use tempfile::tempdir;
+
+    mod merge {
+        use super::*;
+
+        fn cand(lister: usize, addr: &str, facts: ListedFacts) -> Candidate {
+            Candidate {
+                addr: hmodel::htaddr::parse_addr(addr).expect("addr"),
+                facts,
+                lister,
+            }
+        }
+
+        fn shown(cs: &[Candidate]) -> Vec<(String, ListedFacts)> {
+            cs.iter()
+                .map(|c| (c.addr.format(), c.facts.clone()))
+                .collect()
+        }
+
+        /// Every permutation of `items`.
+        fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+            if items.len() <= 1 {
+                return vec![items.to_vec()];
+            }
+            let mut out = Vec::new();
+            for i in 0..items.len() {
+                let mut rest = items.to_vec();
+                let head = rest.remove(i);
+                for mut tail in permutations(&rest) {
+                    tail.insert(0, head.clone());
+                    out.push(tail);
+                }
+            }
+            out
+        }
+
+        /// C19–C21: whatever order the providers and their listings come in,
+        /// each addr merges to the same facts — known only where every listing
+        /// that could describe it knows the field and they agree — and
+        /// `reconcile_by_name` neither reorders nor drops a candidate.
+        ///
+        /// Provider 0 is go-like (`test@v=…`, a bare `build` group and a
+        /// `build@v=1` link); provider 1 is BUILD-like (a bare `test` that its
+        /// `get` would answer for any args).
+        #[test]
+        fn merge_is_order_independent() {
+            let fact = |labels: &[&str], driver: &str| {
+                ListedFacts::default()
+                    .with_labels(labels.iter().copied())
+                    .with_driver(driver)
+            };
+            let unknown = ListedFacts::default();
+            let listings = [
+                cand(0, "//p:test@v=1", fact(&["test"], "exec")),
+                cand(1, "//p:test", fact(&["test"], "bash")),
+                cand(0, "//p:test@v=2", fact(&["test"], "exec")),
+                cand(0, "//p:lib", fact(&[], "go_compile")),
+                cand(0, "//p:fmt", unknown.clone()),
+                cand(1, "//p:fmt", fact(&[], "exec")),
+                cand(0, "//p:build", fact(&[], "group")),
+                cand(0, "//p:build@v=1", fact(&[], "bash")),
+            ];
+            let want = |addr: &str| match addr {
+                // Every lister of `test` agrees on the labels; the BUILD
+                // target's driver differs from go's.
+                "//p:test@v=1" | "//p:test@v=2" | "//p:test" => {
+                    ListedFacts::default().with_labels(["test"])
+                }
+                "//p:lib" => fact(&[], "go_compile"),
+                // One provider's own targets do not blur into one another.
+                "//p:build" => fact(&[], "group"),
+                "//p:build@v=1" => fact(&[], "bash"),
+                _ => unknown.clone(),
+            };
+            let indices: Vec<usize> = (0..listings.len()).collect();
+            for order in permutations(&indices) {
+                let mut cs: Vec<Candidate> = order
+                    .iter()
+                    .filter_map(|&i| listings.get(i))
+                    .map(|c| Candidate {
+                        addr: c.addr.clone(),
+                        facts: c.facts.clone(),
+                        lister: c.lister,
+                    })
+                    .collect();
+                let before: Vec<String> = cs.iter().map(|c| c.addr.format()).collect();
+                reconcile_by_name(&mut cs);
+                let after: Vec<String> = cs.iter().map(|c| c.addr.format()).collect();
+                assert_eq!(before, after, "the sequence is untouched");
+                for c in &cs {
+                    assert_eq!(c.facts, want(&c.addr.format()), "{order:?}");
+                }
+            }
+        }
+
+        /// C31: one provider listing one addr twice, differently, is unknown;
+        /// twice the same way is that value. The selection view keeps one
+        /// candidate per addr.
+        #[test]
+        fn duplicate_listing_with_different_facts_is_unknown() {
+            let a = ListedFacts::default().with_labels(["test"]);
+            let b = ListedFacts::default().with_labels(["other"]);
+            let merged = merge_listings(vec![
+                cand(0, "//p:t", a.clone()),
+                cand(0, "//p:t", b),
+                cand(0, "//p:same", a.clone()),
+                cand(0, "//p:same", a.clone()),
+            ]);
+            assert_eq!(
+                shown(&merged),
+                vec![
+                    ("//p:t".to_string(), ListedFacts::default()),
+                    ("//p:same".to_string(), a),
+                ]
+            );
+        }
+
+        /// The rule `reconcile_by_name` implements, stated pairwise: a
+        /// candidate agrees with every listing of its name that is either of
+        /// its own addr, or by a lister that does not list its addr exactly.
+        fn reconcile_pairwise(cs: &[Candidate]) -> Vec<ListedFacts> {
+            let exact: FxHashSet<(usize, &Addr)> = cs.iter().map(|c| (c.lister, &c.addr)).collect();
+            cs.iter()
+                .map(|c| {
+                    let mut facts = c.facts.clone();
+                    for o in cs
+                        .iter()
+                        .filter(|o| o.addr.package == c.addr.package && o.addr.name == c.addr.name)
+                    {
+                        if o.addr == c.addr || !exact.contains(&(o.lister, &c.addr)) {
+                            facts.agree(&o.facts);
+                        }
+                    }
+                    facts
+                })
+                .collect()
+        }
+
+        /// One name with 500 variants from each of two providers (go lists
+        /// `build`, `_golist`… once per universe variant) reconciles to the
+        /// same facts as the pairwise rule, without scanning the group
+        /// per candidate.
+        #[test]
+        fn merge_at_scale_matches_the_pairwise_rule() {
+            let fact = |driver: &str| {
+                ListedFacts::default()
+                    .with_labels(["t"])
+                    .with_driver(driver)
+            };
+            let mut cs = Vec::new();
+            for i in 0..500 {
+                cs.push(cand(0, &format!("//p:t@v={i}"), fact("exec")));
+                // Provider 1 lists half the variants exactly, and differently
+                // on a few of them.
+                if i % 2 == 0 {
+                    let driver = if i % 10 == 0 { "bash" } else { "exec" };
+                    cs.push(cand(1, &format!("//p:t@v={i}"), fact(driver)));
+                }
+            }
+            cs.push(cand(1, "//p:t", fact("bash")));
+            for i in 0..500 {
+                cs.push(cand(1, &format!("//p:other@v={i}"), fact("exec")));
+            }
+            let want = reconcile_pairwise(&cs);
+            reconcile_by_name(&mut cs);
+            let got: Vec<ListedFacts> = cs.iter().map(|c| c.facts.clone()).collect();
+            assert_eq!(got, want);
+
+            let facts_of = |addr: &str| {
+                cs.iter()
+                    .find(|c| c.addr.format() == addr)
+                    .map(|c| c.facts.clone())
+            };
+            let labels_only = ListedFacts::default().with_labels(["t"]);
+            // Both list it exactly and agree.
+            assert_eq!(facts_of("//p:t@v=2"), Some(fact("exec")));
+            // Both list it exactly and disagree on the driver.
+            assert_eq!(facts_of("//p:t@v=10"), Some(labels_only.clone()));
+            // Provider 1 lists the name only otherwise: all of its listings count.
+            assert_eq!(facts_of("//p:t@v=1"), Some(labels_only.clone()));
+            assert_eq!(facts_of("//p:t"), Some(labels_only));
+            // Another name is untouched by this one.
+            assert_eq!(facts_of("//p:other@v=7"), Some(fact("exec")));
+        }
+    }
 
     fn target(pkg: &str, name: &str, labels: &[&str]) -> pluginstatictarget::Target {
         pluginstatictarget::Target {
@@ -1629,7 +1961,7 @@ mod tests {
             // spec or def fails while the matcher needs it. A label decides from
             // the listing without resolving, so the faulty provider lists none.
             let faults = Faults {
-                labels_unknown: true,
+                facts_unknown: true,
                 ..faults
             };
             let provider = FaultProvider::new(targets, faults)?;
@@ -1723,6 +2055,44 @@ mod tests {
                 format!("{err:#}").contains("go list: exit status 1"),
                 "{err:#}"
             );
+            assert_eq!(
+                Arc::strong_count(&rs),
+                1,
+                "a package task was still running, holding the request"
+            );
+            Ok(())
+        }
+
+        /// The query-target walk (`EngineProviderExecutor::query`) drains the
+        /// same way when a candidate's `get_spec` fails: every package task is
+        /// joined before the error returns.
+        #[tokio::test]
+        async fn executor_query_fails_on_a_spec_error_and_drains() -> anyhow::Result<()> {
+            use hplugin::provider::ProviderExecutor as _;
+            let (engine, _root) = faulty_engine(
+                vec![],
+                vec![target("p", "b", &["x"]), target("q", "slow", &["x"])],
+                Faults {
+                    fail_get: addrs(&["//p:b"]),
+                    gate: Some(Arc::new(tokio::sync::Notify::new())),
+                    slow_list: Some(("q".to_string(), Duration::from_millis(300))),
+                    ..Default::default()
+                },
+            )?;
+            let rs = engine.new_state();
+            let executor = crate::engine::result::EngineProviderExecutor::new(
+                Arc::downgrade(&engine),
+                rs.clone(),
+            );
+            let err = executor
+                .query(&label("x"), &[])
+                .await
+                .expect_err("a failing spec fails the query target");
+            assert!(
+                format!("{err:#}").contains("go list: exit status 1"),
+                "{err:#}"
+            );
+            drop(executor);
             assert_eq!(
                 Arc::strong_count(&rs),
                 1,

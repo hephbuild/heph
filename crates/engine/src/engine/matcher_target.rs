@@ -7,6 +7,7 @@
 //! dependency on the driver/target-def types.
 
 use crate::engine::driver::targetdef::TargetDef;
+use crate::engine::provider::TargetSpec;
 use hmodel::htmatcher::{MatchResult, Matcher};
 use hmodel::htpkg::PkgBuf;
 
@@ -55,9 +56,18 @@ fn glob_split(g: &str) -> (&str, &str) {
     (g, "")
 }
 
-/// Resolve a matcher against a parsed target definition.
-pub fn match_target(m: &Matcher, def: &TargetDef) -> MatchResult {
+/// Resolve a matcher against a parsed target definition, and the spec it was
+/// parsed from — `TargetDef` carries no driver, so `Driver` reads the spec.
+/// Every caller resolved the spec on the way to the def.
+pub fn match_target(m: &Matcher, spec: &TargetSpec, def: &TargetDef) -> MatchResult {
     match m {
+        Matcher::Driver(driver) => {
+            if spec.driver == *driver {
+                MatchResult::MatchYes
+            } else {
+                MatchResult::MatchNo
+            }
+        }
         Matcher::Addr(addr) => {
             if def.addr == *addr {
                 MatchResult::MatchYes
@@ -136,7 +146,7 @@ pub fn match_target(m: &Matcher, def: &TargetDef) -> MatchResult {
         Matcher::Or(matchers) => {
             let mut has_shrug = false;
             for m in matchers {
-                match match_target(m, def) {
+                match match_target(m, spec, def) {
                     MatchResult::MatchYes => return MatchResult::MatchYes,
                     MatchResult::MatchShrug => has_shrug = true,
                     MatchResult::MatchNo => {}
@@ -151,7 +161,7 @@ pub fn match_target(m: &Matcher, def: &TargetDef) -> MatchResult {
         Matcher::And(matchers) => {
             let mut has_shrug = false;
             for m in matchers {
-                match match_target(m, def) {
+                match match_target(m, spec, def) {
                     MatchResult::MatchNo => return MatchResult::MatchNo,
                     MatchResult::MatchShrug => has_shrug = true,
                     MatchResult::MatchYes => {}
@@ -163,7 +173,7 @@ pub fn match_target(m: &Matcher, def: &TargetDef) -> MatchResult {
                 MatchResult::MatchYes
             }
         }
-        Matcher::Not(m) => match match_target(m, def) {
+        Matcher::Not(m) => match match_target(m, spec, def) {
             MatchResult::MatchYes => MatchResult::MatchNo,
             MatchResult::MatchNo => MatchResult::MatchYes,
             MatchResult::MatchShrug => MatchResult::MatchShrug,
@@ -181,6 +191,38 @@ mod tests {
 
     fn addr(pkg: &str, name: &str) -> Addr {
         Addr::new(PkgBuf::from(pkg), name.to_string(), BTreeMap::new())
+    }
+
+    /// The def-only cases, against a spec that carries nothing but the addr.
+    fn match_target(m: &Matcher, def: &TargetDef) -> MatchResult {
+        let spec = TargetSpec {
+            addr: def.addr.clone(),
+            ..Default::default()
+        };
+        super::match_target(m, &spec, def)
+    }
+
+    #[test]
+    fn driver_reads_the_spec() {
+        let d = def_with_labels("foo", "bar", &[]);
+        let spec = TargetSpec {
+            addr: d.addr.clone(),
+            driver: "bash".to_string(),
+            ..Default::default()
+        };
+        let driver = |s: &str| Matcher::Driver(s.to_string());
+        assert_eq!(
+            super::match_target(&driver("bash"), &spec, &d),
+            MatchResult::MatchYes
+        );
+        assert_eq!(
+            super::match_target(&driver("Bash"), &spec, &d),
+            MatchResult::MatchNo
+        );
+        assert_eq!(
+            super::match_target(&driver(""), &spec, &d),
+            MatchResult::MatchNo
+        );
     }
 
     fn def_with_labels(pkg: &str, name: &str, labels: &[&str]) -> TargetDef {

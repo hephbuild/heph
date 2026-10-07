@@ -1232,7 +1232,7 @@ impl ManagedDriver for GoLintFixDriver {
 
 use crate::plugingo::addr_util::import_path_to_dep_group;
 use crate::plugingo::factors::Factors;
-use crate::plugingo::labels;
+use crate::plugingo::listed;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hplugin::provider::TargetSpec;
@@ -1394,12 +1394,12 @@ pub fn build_lint_gate_spec(
 
     TargetSpec {
         addr,
-        driver: "go_lint_gate".to_string(),
+        driver: listed::DRIVER_LINT_GATE.to_string(),
         config,
         // The read-only checker (`lint-check`): `go-lint-check` selects it among go
         // targets, `lint-check` selects every language's checker at once
         // (`--label lint-check //...`). The plain `lint` label belongs to the fixer.
-        labels: labels::owned(labels::LINT_CHECK),
+        labels: listed::owned(listed::LINT_CHECK),
         transitive: Default::default(),
         approval: Default::default(),
     }
@@ -1457,12 +1457,12 @@ pub fn build_lint_fix_spec(
 
     TargetSpec {
         addr,
-        driver: "go_lint_fix".to_string(),
+        driver: listed::DRIVER_LINT_FIX.to_string(),
         config,
         // The plain `lint` target is the FIXER, so it owns the plain labels:
         // `go-lint` (this language's) and `lint` (every language's), plus `fix` for
         // a fixers-only sweep. Checking without rewriting is `lint-check`.
-        labels: labels::owned(labels::LINT),
+        labels: listed::owned(listed::LINT),
         transitive: Default::default(),
         approval: Default::default(),
     }

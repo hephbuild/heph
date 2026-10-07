@@ -29,31 +29,32 @@ pub struct ListRequest {
     /// pass [`NoopExecutor`].
     pub executor: Arc<dyn ProviderExecutor>,
 }
-/// Built with [`ListResponse::addr_only`] or [`ListResponse::with_labels`];
+pub use hmodel::htmatcher::ListedFacts;
+
+/// Built with [`ListResponse::addr_only`] or [`ListResponse::with_facts`];
 /// non-exhaustive so the next field is not another source break for every
 /// provider.
 #[non_exhaustive]
 pub struct ListResponse {
     pub addr: Addr,
-    /// The labels `get` will give this target, if the provider knows them
-    /// without resolving it. `None` is "unknown": a label matcher then resolves
-    /// the spec to decide, as it always did. `Some` is a contract — the engine
-    /// fails the run if the resolved spec's labels differ.
-    pub labels: Option<Arc<[String]>>,
+    /// What `get` and `parse` will give this target, if it resolves — each
+    /// field unknown or exact. See [`Provider::list`] for the contract.
+    pub facts: ListedFacts,
 }
 
 impl ListResponse {
-    /// A listing that says nothing about labels.
+    /// A listing that says nothing about the target: every fact unknown, so
+    /// any matcher that reads one resolves the spec, as it always did.
     pub fn addr_only(addr: Addr) -> Self {
-        Self { addr, labels: None }
-    }
-
-    /// A listing whose labels are known: exactly what `get` will return.
-    pub fn with_labels(addr: Addr, labels: impl Into<Arc<[String]>>) -> Self {
         Self {
             addr,
-            labels: Some(labels.into()),
+            facts: ListedFacts::default(),
         }
+    }
+
+    /// A listing with what the provider knows about the target without `get`.
+    pub fn with_facts(addr: Addr, facts: ListedFacts) -> Self {
+        Self { addr, facts }
     }
 }
 
@@ -401,6 +402,27 @@ pub trait Provider: Send + Sync {
     /// copy: the refusal is for the executor instance's lifetime. See that
     /// method's doc for why. Use [`ProviderExecutor::states_under`] for
     /// cross-package state instead.
+    ///
+    /// Each entry may carry [`ListedFacts`], and the engine **trusts a listed
+    /// No**: a candidate whose facts rule it out of a query is dropped without
+    /// `get` — on selection walks and in the dep set of a query target alike. A
+    /// listed Yes is only a candidate; its existence is confirmed as for any
+    /// other entry. Two obligations follow:
+    ///
+    /// - **Exact means exact.** A known field equals what `get` (labels,
+    ///   driver) or the def's `parse` (`has_codegen`) gives that addr under
+    ///   `req.states`, if the addr resolves. Leave a field unknown rather than
+    ///   guess; `heph validate` reports every difference.
+    /// - **The provider that resolves an addr also lists its name, and agrees
+    ///   with itself.** Every provider that lists an addr's name in the package
+    ///   describes that addr: by its listing of that exact addr if it has one,
+    ///   else by what all of its listings of that name agree on (its `get` may
+    ///   answer the name whatever the args). A field decides only where every
+    ///   such description knows it and they agree. So a provider whose `get`
+    ///   answers a name it never listed lets another provider's facts decide
+    ///   for its target, and an addr it resolves but does not list exactly must
+    ///   agree with all of its listings of that name. `heph validate` reports
+    ///   both.
     fn list<'a>(
         &'a self,
         req: ListRequest,

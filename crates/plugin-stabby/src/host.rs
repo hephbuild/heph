@@ -576,8 +576,11 @@ impl StableExecutor for HostExecutor {
     ) -> DynFuture<'a, QueryOutcome> {
         let inner = Arc::clone(&self.inner);
         let fut = async move {
-            let matcher = match plugin_abi::pb::Matcher::decode(&matcher_pb[..]) {
-                Ok(m) => plugin_abi::convert::matcher_from_pb(m),
+            let matcher = match plugin_abi::pb::Matcher::decode(&matcher_pb[..])
+                .map_err(anyhow::Error::from)
+                .and_then(plugin_abi::convert::matcher_from_pb)
+            {
+                Ok(m) => m,
                 Err(e) => {
                     return QueryOutcome {
                         ok: false,

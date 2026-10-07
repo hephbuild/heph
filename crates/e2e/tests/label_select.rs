@@ -138,7 +138,7 @@ async fn listed_labels_decide_without_resolving() -> anyhow::Result<()> {
 
 async fn mismatches(ws: &htestkit::Workspace) -> anyhow::Result<Vec<String>> {
     Ok(Arc::clone(&ws.engine)
-        .listed_label_mismatches(
+        .listed_fact_mismatches(
             ws.engine.new_state(),
             &Matcher::PackagePrefix(heph::htpkg::PkgBuf::from("")),
             Discovery::Complete,
@@ -170,10 +170,8 @@ async fn label_lie_is_trusted_by_the_run_and_reported_by_validate() -> anyhow::R
     let found = mismatches(&ws).await?;
     assert_eq!(found.len(), 1, "{found:?}");
     for want in [
-        "provider `liar` lists //a:t with labels [x], but its spec has [y]",
-        "listed but not in the spec: x",
-        "in the spec but not listed: y",
-        "Provider `liar` must list exactly the labels its `get` returns",
+        "provider `liar` lists //a:t with labels [x], but it resolves to labels [y]",
+        "Provider `liar` must list exactly what its `get` returns",
     ] {
         assert!(found[0].contains(want), "{want} missing from: {}", found[0]);
     }
@@ -344,7 +342,8 @@ async fn negated_label_drops_phantoms() -> anyhow::Result<()> {
 
 /// Two providers list one addr, and only the second resolves it. Their sets
 /// differ, so the walk does not trust either and the spec decides: the target
-/// is selected by its real labels, and validate has no listing to report.
+/// is selected by its real labels. Validate reports the first provider, whose
+/// listing claims facts about a target it does not resolve.
 #[tokio::test]
 async fn providers_listing_one_addr_differently_let_the_spec_decide() -> anyhow::Result<()> {
     let x = parse_addr("//p:x")?;
@@ -375,6 +374,14 @@ async fn providers_listing_one_addr_differently_let_the_spec_decide() -> anyhow:
     let (res, events) = run(&ws, &label("a"), &ResultOptions::default()).await;
     res?;
     assert!(built(&events).is_empty(), "{events:?}");
-    assert_eq!(mismatches(&ws).await?, Vec::<String>::new());
+    let found = mismatches(&ws).await?;
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains(
+            "provider `first` lists //p:x with listed facts, but provider `second` resolves it"
+        ),
+        "{}",
+        found[0]
+    );
     Ok(())
 }

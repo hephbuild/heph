@@ -35,12 +35,23 @@ Query language (-e / --expr):
   Functions:
     label(x)             targets carrying label x   (e.g. label(go-lint))
     tree_output(pkg)     targets whose codegen tree writes into pkg
+    driver(name)         targets run by that driver, whole name, case-sensitive
+                         (e.g. driver(credential))
     addr(//pkg:name)     an explicit target address
     package(//pkg)       an explicit package
     package_prefix(//pkg) every package under //pkg
+  Any argument may be bare or quoted, with the same meaning: label(ci) is
+  label(\"ci\"). A quoted argument takes escapes: \\\\ \\\" \\n \\r \\t \\u{..}
   Operators (precedence ! > && > ||, group with parentheses):
     a && b               both          a || b   either          !a   negate
   Evaluation follows grouping then left-to-right, bailing as early as possible.
+
+  label(), driver() and tree_output() are decided from what providers list
+  where they can, without resolving each target they rule out. `query` then
+  resolves each match and prints only targets that exist; `query --candidates`
+  skips that, which is faster but may print a listed target that does not. Set
+  HEPH_NO_LISTED_FACTS to 1 to resolve every candidate instead; `heph validate`
+  checks the listings.
 
   Examples:
     heph run -e '//some/... && label(foo)'
@@ -62,7 +73,7 @@ pub struct RunArgs {
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
     /// Select targets with a query expression, e.g. -e '//pkg/... && !//vendor/...'.
-    /// Supports &&, ||, !, parentheses, and the label()/tree_output() functions.
+    /// Supports &&, ||, !, parentheses, and the label()/driver()/tree_output() functions.
     /// Mutually exclusive with the positional TARGET arguments.
     #[arg(
         short = 'e',
@@ -268,7 +279,11 @@ impl App for RunApp {
                 // walk skipped something: then the skips are the answer, not
                 // "check your selector".
                 .and_then(|results| {
-                    crate::commands::errors::require_non_empty_unless_incomplete(results, &gaps)
+                    crate::commands::errors::require_non_empty_unless_incomplete(
+                        results,
+                        &gaps,
+                        rs.listed_decided(),
+                    )
                 }),
         };
 

@@ -151,6 +151,9 @@ fn count_matcher(m: &Matcher, c: &mut htelemetry::telemetry::QueryExprCounts) {
     match m {
         Matcher::Addr(_) => c.addr += 1,
         Matcher::Label(_) => c.label += 1,
+        // Not tallied: `QueryExprCounts` has no driver count, and adding one
+        // changes the telemetry payload's shape.
+        Matcher::Driver(_) => {}
         Matcher::Package(_) => c.package += 1,
         Matcher::PackagePrefix(_) => c.package_prefix += 1,
         Matcher::TreeOutputTo(_) => c.tree_output += 1,

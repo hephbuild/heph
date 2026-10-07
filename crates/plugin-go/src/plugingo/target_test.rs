@@ -4,7 +4,7 @@ use crate::plugingo::addr_util::{
 };
 use crate::plugingo::driver_compile::{CompileParams, build_compile_spec};
 use crate::plugingo::factors::Factors;
-use crate::plugingo::labels;
+use crate::plugingo::listed;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hplugin::provider::TargetSpec;
@@ -261,7 +261,7 @@ pub fn build_test_spec(
 
     TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: listed::DRIVER_BASH.to_string(),
         config,
         ..Default::default()
     }
@@ -296,13 +296,13 @@ pub fn test_spec(
             Value::String("./test_binary".to_string()),
             Value::String("-test.v".to_string()),
         ]);
-        ("exec", run)
+        (listed::test_driver(false), run)
     } else {
         // bash driver: each list element is one shell line, joined with `\n`.
         // Run the user's `pre_run` lines first, then the test binary.
         let mut lines: Vec<String> = test_env.pre_run.clone();
         lines.push("./test_binary -test.v".to_string());
-        ("bash", to_run_value(lines))
+        (listed::test_driver(true), to_run_value(lines))
     };
 
     let deps_map: HashMap<String, Value> = HashMap::from([
@@ -353,10 +353,10 @@ pub fn test_spec(
     // `heph run 'label(test)'` (and CI built on it) must keep meaning the
     // ordinary suite; opting in is `label(test-race)`. Both are still reachable
     // together as `label(test) || label(test-race)`.
-    let labels = labels::owned(if race {
-        labels::TEST_RACE
+    let labels = listed::owned(if race {
+        listed::TEST_RACE
     } else {
-        labels::TEST
+        listed::TEST
     });
 
     TargetSpec {

@@ -206,6 +206,16 @@ pub(crate) async fn push_layout(
 /// Built from the *resolved* registry and repository rather than by editing the
 /// user's string: `alpine:3.20` and `docker.io/library/alpine:3.20` name one
 /// image, and only the expanded form is unambiguous to paste back into `src`.
+/// `reference` in full, the way the push addressed it: registry, repository and
+/// tag, with the tag the registry assumed (`latest`) written out when none was
+/// given, Docker Hub shorthand expanded, and a digest kept when there was one.
+pub(crate) fn full_ref(reference: &str) -> anyhow::Result<String> {
+    let reference: Reference = reference
+        .parse()
+        .with_context(|| format!("parse image reference {reference:?}"))?;
+    Ok(reference.whole())
+}
+
 fn pinned_ref(reference: &Reference, digest: &str) -> String {
     // `registry()`, not `resolve_registry()`: the former keeps the spelling the
     // BUILD file used and already normalizes Docker Hub shorthand to
@@ -464,6 +474,36 @@ mod tests {
                 .parse::<Reference>()
                 .is_ok()
         );
+    }
+
+    /// What `oci_push` writes as its output: the reference it pushed to, never
+    /// missing the tag the registry filed it under.
+    #[test]
+    fn full_ref_always_names_registry_repository_and_tag() {
+        let d = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for (given, full) in [
+            ("reg.io/me/app:1.2", "reg.io/me/app:1.2".to_string()),
+            // No tag: the push went to `latest`, so the output says so.
+            ("reg.io/me/app", "reg.io/me/app:latest".to_string()),
+            // A port is not a tag.
+            (
+                "localhost:5000/app",
+                "localhost:5000/app:latest".to_string(),
+            ),
+            ("localhost:5000/app:v1", "localhost:5000/app:v1".to_string()),
+            // Docker Hub shorthand expands to what was actually addressed.
+            ("alpine", "docker.io/library/alpine:latest".to_string()),
+            ("me/app:dev", "docker.io/me/app:dev".to_string()),
+            // A digest is kept, with the tag beside it when there is one.
+            (
+                &format!("reg.io/me/app:1.2@{d}") as &str,
+                format!("reg.io/me/app:1.2@{d}"),
+            ),
+        ] {
+            assert_eq!(full_ref(given).expect("parse"), full, "{given}");
+        }
+        assert!(full_ref("").is_err());
+        assert!(full_ref("Reg.io/UPPER/app").is_err());
     }
 
     /// One request the mock registry received.

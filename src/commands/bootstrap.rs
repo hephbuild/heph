@@ -128,6 +128,20 @@ pub fn register_builtin_factories(e: &mut engine::Engine) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Whether `HEPH_NO_LISTED_FACTS` turns listed facts off: off when unset, empty,
+/// `0`, or (any case) `false`/`no`/`off`; on for anything else, so a value
+/// that is not plainly "off" errs toward resolving every candidate.
+fn listed_facts_kill_switch(v: Option<&std::ffi::OsStr>) -> bool {
+    let Some(v) = v else { return false };
+    let Some(s) = v.to_str() else { return true };
+    let s = s.trim();
+    !(s.is_empty()
+        || s == "0"
+        || ["false", "no", "off"]
+            .iter()
+            .any(|off| s.eq_ignore_ascii_case(off)))
+}
+
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -137,7 +151,16 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // The config file is the all-optional, profile-layered YAML; `resolve`
     // applies every default in one place and yields the engine's runtime config.
     let file = config_yaml::load_from_root(&root)?;
-    let config = file.resolve(&root)?;
+    let mut config = file.resolve(&root)?;
+    // The kill switch for listed facts: every candidate a fact would have
+    // decided is resolved instead. Read here, never by the engine. It is
+    // outside every cache key on purpose: a query target's dep list is already
+    // in its def hash, so a key moves only when trust changed the dep set —
+    // which only a lying listed fact can do — and a trust marker there would
+    // only split keys that are equal.
+    config.listed_facts_trust = engine::listed::ListedFactsTrust::from_kill_switch(
+        listed_facts_kill_switch(std::env::var_os("HEPH_NO_LISTED_FACTS").as_deref()),
+    );
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend
@@ -275,6 +298,26 @@ fn hard_abort(exit: impl FnOnce(i32)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listed_facts_kill_switch_values() {
+        use std::ffi::OsStr;
+        assert!(!listed_facts_kill_switch(None), "unset");
+        for off in ["", "0", "false", "FALSE", "no", "Off"] {
+            assert!(!listed_facts_kill_switch(Some(OsStr::new(off))), "{off:?}");
+        }
+        for on in ["1", "true", "yes"] {
+            assert!(listed_facts_kill_switch(Some(OsStr::new(on))), "{on:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(
+                listed_facts_kill_switch(Some(OsStr::from_bytes(b"\xff"))),
+                "non-UTF-8"
+            );
+        }
+    }
 
     fn build_engine_from_yaml(yaml: &str) -> anyhow::Result<(tempfile::TempDir, engine::Engine)> {
         // Engine::new captures the ambient runtime for its request memoizers;

@@ -1,4 +1,5 @@
 use crate::htaddr::Addr;
+use crate::htmatcher::ListedFacts;
 use crate::htpkg::PkgBuf;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -18,6 +19,8 @@ pub enum MatchResult {
 pub enum Matcher {
     Addr(Addr),
     Label(String),
+    /// The spec's driver, compared whole and case-sensitively.
+    Driver(String),
     Package(PkgBuf),
     PackagePrefix(PkgBuf),
     TreeOutputTo(PkgBuf),
@@ -48,8 +51,8 @@ impl Matcher {
                     MatchResult::MatchNo
                 }
             }
-            // Labels live on the target, not the package.
-            Matcher::Label(_) => MatchResult::MatchShrug,
+            // Labels and drivers live on the target, not the package.
+            Matcher::Label(_) | Matcher::Driver(_) => MatchResult::MatchShrug,
             // Same reasoning as `matches_addr`: a codegen tree rooted at the
             // target's package can only reach packages on the same root path.
             Matcher::TreeOutputTo(matcher_pkg) => {
@@ -114,16 +117,31 @@ impl Matcher {
     }
 
     pub fn matches_addr(&self, addr: &Addr) -> MatchResult {
-        self.matches_listed(addr, None)
+        self.matches_listed(addr, &ListedFacts::UNKNOWN)
     }
 
-    /// [`matches_addr`](Self::matches_addr), plus the labels the provider's
-    /// `list` reported for the target, when it knew them.
+    /// Whether evaluating `self` can read a listed fact. A walk merges listings
+    /// only for a matcher that will act on them — an `Addr` clone and a map
+    /// entry per candidate otherwise bought nothing.
+    pub fn reads_listed_facts(&self) -> bool {
+        match self {
+            Matcher::Label(_) | Matcher::Driver(_) | Matcher::TreeOutputTo(_) => true,
+            Matcher::Or(ms) | Matcher::And(ms) => ms.iter().any(Matcher::reads_listed_facts),
+            Matcher::Not(m) => m.reads_listed_facts(),
+            Matcher::Addr(_) | Matcher::Package(_) | Matcher::PackagePrefix(_) => false,
+        }
+    }
+
+    /// [`matches_addr`](Self::matches_addr), plus the facts the providers'
+    /// `list` reported for the target, merged across every lister of its name.
     ///
-    /// With `Some(labels)`, `Label` decides instead of shrugging — the listing
-    /// is the provider's promise of what `get` will return. With `None` it is
-    /// exactly `matches_addr`.
-    pub fn matches_listed(&self, addr: &Addr, labels: Option<&[String]>) -> MatchResult {
+    /// A known field decides its arm instead of shrugging: `Label` and `Driver`
+    /// decide Yes or No, `TreeOutputTo` decides No from `has_codegen == false`.
+    /// With every field unknown it is exactly `matches_addr`. The facts are
+    /// conditional on the target existing, so a Yes is a candidate and a No is
+    /// final — `Not` needs no special case, since both are exact for this one
+    /// target.
+    pub fn matches_listed(&self, addr: &Addr, facts: &ListedFacts) -> MatchResult {
         match self {
             Matcher::Addr(a) => {
                 if a == addr {
@@ -132,12 +150,23 @@ impl Matcher {
                     MatchResult::MatchNo
                 }
             }
-            Matcher::Label(l) => match labels {
+            Matcher::Label(l) => match facts.labels() {
                 Some(labels) if labels.contains(l) => MatchResult::MatchYes,
                 Some(_) => MatchResult::MatchNo,
                 None => MatchResult::MatchShrug,
             },
+            // Whole string, case-sensitive. A listed driver is never empty, so
+            // `driver("")` is No against every known one.
+            Matcher::Driver(d) => match facts.driver() {
+                Some(driver) if driver == d => MatchResult::MatchYes,
+                Some(_) => MatchResult::MatchNo,
+                None => MatchResult::MatchShrug,
+            },
             Matcher::TreeOutputTo(matcher_pkg) => {
+                // A target with no codegen output writes no tree anywhere.
+                if facts.has_codegen() == Some(false) {
+                    return MatchResult::MatchNo;
+                }
                 // Cheap addr-only reject: the codegen tree of a target at pkg
                 // `def_pkg` lands under `def_pkg`, so the matcher's package
                 // and the target's package must lie on the same root path.
@@ -166,7 +195,7 @@ impl Matcher {
             Matcher::Or(matchers) => {
                 let mut shrug = false;
                 for m in matchers {
-                    match m.matches_listed(addr, labels) {
+                    match m.matches_listed(addr, facts) {
                         MatchResult::MatchYes => return MatchResult::MatchYes,
                         MatchResult::MatchShrug => shrug = true,
                         MatchResult::MatchNo => {}
@@ -181,7 +210,7 @@ impl Matcher {
             Matcher::And(matchers) => {
                 let mut shrug = false;
                 for m in matchers {
-                    match m.matches_listed(addr, labels) {
+                    match m.matches_listed(addr, facts) {
                         MatchResult::MatchNo => return MatchResult::MatchNo,
                         MatchResult::MatchShrug => shrug = true,
                         MatchResult::MatchYes => {}
@@ -193,7 +222,7 @@ impl Matcher {
                     MatchResult::MatchYes
                 }
             }
-            Matcher::Not(m) => match m.matches_listed(addr, labels) {
+            Matcher::Not(m) => match m.matches_listed(addr, facts) {
                 MatchResult::MatchYes => MatchResult::MatchNo,
                 MatchResult::MatchNo => MatchResult::MatchYes,
                 MatchResult::MatchShrug => MatchResult::MatchShrug,
@@ -244,8 +273,9 @@ mod tests {
         let a = addr("foo/bar", "baz");
         let label = |l: &str| Matcher::Label(l.to_string());
         let tree = Matcher::TreeOutputTo(PkgBuf::from("foo"));
-        let listed = ["test".to_string(), "go-test".to_string()];
-        let empty: [String; 0] = [];
+        let listed = ListedFacts::default().with_labels(["test", "go-test"]);
+        let unknown = ListedFacts::default();
+        let empty = ListedFacts::default().with_labels(Vec::<String>::new());
 
         let cases = [
             (label("test"), Yes, Shrug),
@@ -284,12 +314,171 @@ mod tests {
             ),
         ];
         for (m, with, without) in cases {
-            assert_eq!(m.matches_listed(&a, Some(&listed)), with, "{m:?} listed");
-            assert_eq!(m.matches_listed(&a, None), without, "{m:?} unlisted");
+            assert_eq!(m.matches_listed(&a, &listed), with, "{m:?} listed");
+            assert_eq!(m.matches_listed(&a, &unknown), without, "{m:?} unlisted");
             assert_eq!(m.matches_addr(&a), without, "{m:?} addr-only");
         }
         // Known and empty is a decision, not a shrug.
-        assert_eq!(label("test").matches_listed(&a, Some(&empty)), No);
+        assert_eq!(label("test").matches_listed(&a, &empty), No);
+    }
+
+    fn facts(labels: Option<&[&str]>, driver: Option<&str>, codegen: Option<bool>) -> ListedFacts {
+        let mut f = ListedFacts::default();
+        if let Some(l) = labels {
+            f = f.with_labels(l.iter().copied());
+        }
+        if let Some(d) = driver {
+            f = f.with_driver(d);
+        }
+        if let Some(c) = codegen {
+            f = f.with_has_codegen(c);
+        }
+        f
+    }
+
+    fn driver(d: &str) -> Matcher {
+        Matcher::Driver(d.to_string())
+    }
+
+    fn label(l: &str) -> Matcher {
+        Matcher::Label(l.to_string())
+    }
+
+    fn not(m: Matcher) -> Matcher {
+        Matcher::Not(Box::new(m))
+    }
+
+    /// C6 and the adversarial rows: a driver is compared whole and
+    /// case-sensitively, never by prefix.
+    #[test]
+    fn driver_compares_whole_string() {
+        use MatchResult::{MatchNo as No, MatchShrug as Shrug, MatchYes as Yes};
+        let a = addr("pkg", "lib");
+        let f = facts(Some(&[]), Some("go_compile"), Some(false));
+        assert_eq!(driver("go_compile").matches_listed(&a, &f), Yes);
+        assert_eq!(driver("go").matches_listed(&a, &f), No);
+        assert_eq!(driver("GO_COMPILE").matches_listed(&a, &f), No);
+        assert_eq!(driver("go_compile_x").matches_listed(&a, &f), No);
+        let bash = facts(None, Some("bash"), None);
+        assert_eq!(driver("Bash").matches_listed(&a, &bash), No);
+        assert_eq!(
+            driver("bash").matches_listed(&a, &ListedFacts::UNKNOWN),
+            Shrug
+        );
+        // Labels too: `test` is not a prefix match for `test-race`.
+        let race = facts(Some(&["test-race"]), None, None);
+        assert_eq!(label("test").matches_listed(&a, &race), No);
+    }
+
+    /// C34: a listed `""` is unknown, so `driver("")` shrugs there and is No
+    /// against every known driver.
+    #[test]
+    fn driver_empty_matches_nothing() {
+        use MatchResult::{MatchNo as No, MatchShrug as Shrug};
+        let a = addr("pkg", "lib");
+        let listed_empty = ListedFacts::default().with_driver("");
+        assert_eq!(listed_empty.driver(), None);
+        assert_eq!(driver("").matches_listed(&a, &listed_empty), Shrug);
+        assert_eq!(
+            driver("").matches_listed(&a, &facts(None, Some("bash"), None)),
+            No
+        );
+        // `label("")` is an exact compare: a listed `[""]` has it.
+        let empty_label = facts(Some(&[""]), None, None);
+        assert_eq!(
+            label("").matches_listed(&a, &empty_label),
+            MatchResult::MatchYes
+        );
+        assert_eq!(
+            label("").matches_listed(&a, &facts(Some(&[]), None, None)),
+            No
+        );
+    }
+
+    /// C9, C10: `has_codegen == false` is a No; anything else leaves the addr
+    /// check, then the def, to decide. Never a Yes.
+    #[test]
+    fn tree_output_to_reads_has_codegen() {
+        use MatchResult::{MatchNo as No, MatchShrug as Shrug};
+        let a = addr("pkg", "lib");
+        let m = Matcher::TreeOutputTo(PkgBuf::from(""));
+        assert_eq!(m.matches_listed(&a, &facts(None, None, Some(false))), No);
+        assert_eq!(m.matches_listed(&a, &facts(None, None, Some(true))), Shrug);
+        assert_eq!(m.matches_listed(&a, &ListedFacts::UNKNOWN), Shrug);
+        // The addr check still says No on its own.
+        let far = Matcher::TreeOutputTo(PkgBuf::from("other"));
+        assert_eq!(far.matches_listed(&a, &facts(None, None, Some(true))), No);
+    }
+
+    /// C11–C15 and the empty-combinator rows: `And`/`Or`/`Not` fold
+    /// three-valued per entry.
+    #[test]
+    fn boolean_folds_over_listed_facts() {
+        use MatchResult::{MatchNo as No, MatchShrug as Shrug, MatchYes as Yes};
+        let a = addr("pkg", "x");
+        let lib = facts(Some(&[]), Some("go_compile"), Some(false));
+        let test = facts(Some(&["test", "go-test"]), Some("exec"), Some(false));
+        let format = facts(Some(&["format", "fix"]), Some("go_format"), None);
+        let test_labels_unknown = facts(None, Some("exec"), Some(false));
+        let lib_driver_unknown = facts(Some(&[]), None, Some(false));
+
+        let c11 = Matcher::And(vec![label("test"), driver("exec")]);
+        assert_eq!(c11.matches_listed(&a, &test), Yes);
+        assert_eq!(c11.matches_listed(&a, &lib), No);
+        assert_eq!(c11.matches_listed(&a, &format), No);
+        // C12: the driver decides the `And` for the others.
+        assert_eq!(c11.matches_listed(&a, &test_labels_unknown), Shrug);
+        let c13 = Matcher::Or(vec![label("deploy"), driver("credential")]);
+        for f in [&lib, &test, &format] {
+            assert_eq!(c13.matches_listed(&a, f), No);
+        }
+        let c14 = not(label("test"));
+        assert_eq!(c14.matches_listed(&a, &lib), Yes);
+        assert_eq!(c14.matches_listed(&a, &format), Yes);
+        assert_eq!(c14.matches_listed(&a, &test), No);
+        let c15 = not(driver("credential"));
+        assert_eq!(c15.matches_listed(&a, &lib_driver_unknown), Shrug);
+        assert_eq!(c15.matches_listed(&a, &test), Yes);
+
+        assert_eq!(Matcher::And(vec![]).matches_listed(&a, &lib), Yes);
+        assert_eq!(Matcher::Or(vec![]).matches_listed(&a, &lib), No);
+        assert_eq!(not(Matcher::And(vec![])).matches_listed(&a, &lib), No);
+    }
+
+    /// C18: only a matcher with a fact-reading arm makes the walk merge.
+    #[test]
+    fn fact_free_matcher_reads_no_facts() {
+        let a = addr("pkg", "x");
+        for m in [
+            Matcher::PackagePrefix(PkgBuf::from("")),
+            Matcher::Package(PkgBuf::from("pkg")),
+            Matcher::Addr(a.clone()),
+            not(Matcher::And(vec![Matcher::Addr(a.clone())])),
+        ] {
+            assert!(!m.reads_listed_facts(), "{m:?}");
+        }
+        for m in [
+            label("x"),
+            driver("x"),
+            Matcher::TreeOutputTo(PkgBuf::from("")),
+            not(Matcher::Or(vec![Matcher::Addr(a.clone()), driver("x")])),
+        ] {
+            assert!(m.reads_listed_facts(), "{m:?}");
+        }
+    }
+
+    /// The same recursion as `matches_pkg`: a matcher nested 1,000 deep
+    /// evaluates without a special bound.
+    #[test]
+    fn deeply_nested_matcher_evaluates() {
+        let a = addr("pkg", "x");
+        let mut m = label("test");
+        for _ in 0..1_000 {
+            m = not(m);
+        }
+        let f = facts(Some(&["test"]), None, None);
+        assert_eq!(m.matches_listed(&a, &f), MatchResult::MatchYes);
+        assert_eq!(m.matches_pkg(&PkgBuf::from("pkg")), MatchResult::MatchShrug);
     }
 
     #[test]

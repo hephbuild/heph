@@ -6,7 +6,7 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::sandbox::Sandbox;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
+    ListPackagesRequest, ListRequest, ListResponse, ListedFacts, ProbeRequest, ProbeResponse,
     Provider as EProvider, TargetSpec,
 };
 use std::collections::{HashMap, HashSet};
@@ -116,11 +116,14 @@ impl EProvider for Provider {
                 .targets
                 .iter()
                 .filter(|t| t.addr.package == req.package)
-                // The spec is right here, so the labels are known.
+                // The spec is right here, so its labels and driver are known.
+                // `has_codegen` is the driver's `parse` to decide: unknown.
                 .map(|t| {
-                    Ok(ListResponse::with_labels(
+                    Ok(ListResponse::with_facts(
                         t.addr.clone(),
-                        t.labels.as_slice(),
+                        ListedFacts::default()
+                            .with_labels(t.labels.iter().cloned())
+                            .with_driver(t.driver.as_str()),
                     ))
                 })
                 .collect();

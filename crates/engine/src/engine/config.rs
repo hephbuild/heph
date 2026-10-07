@@ -117,6 +117,12 @@ pub struct Config {
     pub remote_caches: Vec<RemoteCacheDef>,
     /// Which scratch lineage this run reads and writes. See [`ScratchOptions`].
     pub scratch: ScratchOptions,
+    /// Whether this engine's requests act on providers' listed facts. Set by
+    /// the front end (the CLI, from `HEPH_NO_LISTED_FACTS`); copied into every
+    /// request. See [`ListedFactsTrust`].
+    ///
+    /// [`ListedFactsTrust`]: crate::engine::listed::ListedFactsTrust
+    pub listed_facts_trust: crate::engine::listed::ListedFactsTrust,
 }
 
 /// Resolved scratch-lineage policy. The config's `${git:branch}` is already
@@ -164,6 +170,7 @@ impl Default for Config {
             telemetry_enabled: true,
             remote_caches: Vec::new(),
             scratch: ScratchOptions::default(),
+            listed_facts_trust: Default::default(),
         }
     }
 }
@@ -248,6 +255,8 @@ impl ConfigYamlExt for ConfigYaml {
                 .unwrap_or(defaults.tmp_cache),
             fuse: self.fuse.unwrap_or(defaults.fuse),
             scratch: resolve_scratch(self.scratch.as_ref(), root),
+            // Not workspace policy: the CLI sets it per invocation.
+            listed_facts_trust: defaults.listed_facts_trust,
             lock_backend: self
                 .lock
                 .and_then(|l| l.backend)

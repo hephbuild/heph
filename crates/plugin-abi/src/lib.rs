@@ -21,6 +21,21 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.13.0: `ListResponse` carries `ListedFacts facts = 4` — per entry, the
+/// labels, driver and `has_codegen` the provider knows without `get`, each
+/// field absent (unknown) or exact — and 0.11.0's `labels`/`labels_known` are
+/// removed (`reserved 2, 3`; 0.11.0 was never released). `Matcher` gained a
+/// `driver` arm (9), and the host now refuses a `Matcher` with no arm it knows
+/// instead of reading it as an empty `Or`.
+///
+/// Both directions read as unknown, never as a prune: an old plugin sends no
+/// `facts`, and a pre-0.13 host reads absent `labels_known` as unknown and
+/// ignores field 4. A malformed `ListedFacts` fails that `ListResponse`, and so
+/// the provider's `list`, loudly. Minor: no plugin must be rebuilt, but one must
+/// be for its listings to decide queries. Caveat: a new plugin that sends a
+/// `driver` matcher through the query callback to a pre-0.13 host is misread
+/// there as an empty `Or`.
+///
 /// 0.12.0: `ManagedRunInput` gained `string hashout` — the input artifact's
 /// hashout, the value the consumer's hashin folded in. A guest driver's
 /// `content.hashout()` returned `""` before, so a driver deriving a value from
@@ -107,7 +122,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.12.0";
+pub const ABI_SEMVER: &str = "0.13.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

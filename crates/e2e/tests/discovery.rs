@@ -50,7 +50,7 @@ fn workspace(
     let faults = Faults {
         // Resolving through a build is go's `_golist`; a label walk only
         // reaches it when the listing leaves labels unknown.
-        labels_unknown: builds.is_some(),
+        facts_unknown: builds.is_some(),
         builds: match builds {
             Some((t, b)) => vec![(parse_addr(t)?, parse_addr(b)?)],
             None => vec![],
@@ -163,7 +163,7 @@ async fn root_build_broken_reports_one_group() -> anyhow::Result<()> {
         group.examples[0].cause
     );
     assert!(
-        heph::commands::errors::require_non_empty_unless_incomplete(batch.ok, &gaps).is_ok(),
+        heph::commands::errors::require_non_empty_unless_incomplete(batch.ok, &gaps, 0).is_ok(),
         "an empty match with skips reports the skips, not the selector"
     );
     Ok(())
