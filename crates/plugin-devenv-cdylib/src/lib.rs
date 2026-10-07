@@ -54,6 +54,13 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);
 }
 
+/// Stable ABI log-filter entry: the host's filter as prost `pb::LogFilter` bytes,
+/// so events it would discard are dropped here instead of forwarded.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
+    plugin_sdk::stabby::install_log_filter(&filter);
+}
+
 /// Stable ABI supervisor entry. This cdylib links its own `proc`, so without it
 /// the `devenv shell` it spawns to capture an environment is unregistered with
 /// the sidecar and orphaned on a hard kill of the host — and a stray nix

@@ -36,7 +36,6 @@ tracing = { version = "0.1", optional = true }
 # Builds a callsite per plugin target at runtime (`hostlog`): tracing-core's
 # documented API for it, which tracing only re-exports as hidden.
 tracing-core = { version = "0.1", optional = true }
-
 [features]
 # host: adapters from the engine's ProviderExecutor onto the stable ABI, plus
 # the libloading-based cdylib loader. The shared ABI contract (`abi`) is always

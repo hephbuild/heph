@@ -383,6 +383,52 @@ fn plugin_construction_failure_logs_before_the_abort() {
     );
 }
 
+/// A plugin's log line is selected by `RUST_LOG` under the plugin's own target,
+/// through the real seam: the host's filter handed to the cdylib
+/// (`heph_plugin_set_log_filter`) and the line coming back over the log sink. The
+/// host used to re-emit every plugin event as `heph::plugin`, so neither
+/// directive below reached it.
+#[test]
+fn plugin_log_is_filtered_by_its_own_target() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("go");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-go-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash go cdylib");
+    write_manifest(&manifest, "go", &dylib, Some(&sum)).expect("write manifest");
+    // The same deterministic construction failure as above: an `error!` from
+    // the cdylib's own crate, `plugin_go_cdylib`.
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n    options:\n      walk_db: [1, 2, 3]\n",
+        manifest.display()
+    ))
+    .expect("write config");
+
+    let run = |filter: &str| {
+        let out = ws
+            .cmd(&dist, &["inspect", "functions"])
+            .env("RUST_LOG", filter)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run");
+        let logged = String::from_utf8_lossy(&out.stderr).contains("plugin construction failed");
+        (logged, describe(&out))
+    };
+
+    let (logged, out) = run("off,plugin_go_cdylib=error");
+    assert!(
+        logged,
+        "everything off but the plugin's own crate: its line must show: {out}"
+    );
+    let (logged, out) = run("error,plugin_go_cdylib=off");
+    assert!(
+        !logged,
+        "the plugin's own crate turned off: its line must not show: {out}"
+    );
+}
+
 /// The checksum in the manifest is the supply-chain guard on a dylib that is
 /// about to be mapped into the process with full privileges. It must reject,
 /// loudly, before loading. Nothing about this path exists in a linked test —

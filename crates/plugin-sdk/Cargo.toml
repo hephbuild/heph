@@ -49,6 +49,9 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 # `NormalizeEvent`: recover a bridged `log` record's real target.
 tracing-log = { version = "0.2", optional = true }
+# `rebuild_interest_cache`: apply a host log filter that arrives after callsites
+# were first hit.
+tracing-core = { version = "0.1", optional = true }
 
 [features]
 # In-process stable-ABI cdylib transport. Pulls in the stabby guest serving
@@ -68,6 +71,7 @@ stabby = [
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:tracing-log",
+    "dep:tracing-core",
 ]
 
 [dev-dependencies]

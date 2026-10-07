@@ -6,9 +6,10 @@
 
 use crate::abi::{
     CREATE_SYMBOL, CreateFn, DynExecutor, DynHook, DynItemStream, DynManagedDriver, DynProvider,
-    SET_LOG_SINK_SYMBOL, SET_RUNNER_HOST_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogSinkFn,
-    SetRunnerHostFn, SetSupervisorFn, StableCancelDyn, StableHookDyn, StableItemStream,
-    StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn, StableProviderDyn,
+    SET_LOG_FILTER_SYMBOL, SET_LOG_SINK_SYMBOL, SET_RUNNER_HOST_SYMBOL, SET_SUPERVISOR_SYMBOL,
+    SetLogFilterFn, SetLogSinkFn, SetRunnerHostFn, SetSupervisorFn, StableCancelDyn, StableHookDyn,
+    StableItemStream, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
+    StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use crate::vtable::dynify;
@@ -111,6 +112,15 @@ pub fn load(
         // `SetLogSinkFn` before returning it.
         if let Ok(set_sink) = unsafe { lib.get_stabbied::<SetLogSinkFn>(SET_LOG_SINK_SYMBOL) } {
             set_sink(crate::host::HostLogSink::wrap());
+        }
+        // Then the host's log filter, so the plugin drops what the host would
+        // discard instead of forwarding every event. Same older-SDK tolerance; a
+        // plugin without it, or a host that set no filter, forwards everything.
+        // SAFETY: get_stabbied checks the symbol's stabby type report against
+        // `SetLogFilterFn` before returning it.
+        let set_filter = unsafe { lib.get_stabbied::<SetLogFilterFn>(SET_LOG_FILTER_SYMBOL) };
+        if let (Ok(set_filter), Some(bytes)) = (set_filter, crate::hostlog::plugin_log_filter()) {
+            set_filter(stabby::vec::Vec::from(bytes.as_slice()));
         }
         // Hand the plugin the host's supervisor client. The plugin's own copy of
         // the `proc` crate has an uninitialised tracker (statics are not shared

@@ -106,6 +106,8 @@ impl StableArtifactContent for HostArtifactContent {
 /// plugin's module path, which the event keeps on the host (see `hostlog`).
 pub struct HostLogSink;
 
+pub use crate::hostlog::set_plugin_log_filter;
+
 impl HostLogSink {
     /// Wrap as an ABI-stable [`DynLogSink`] to pass over the seam.
     pub fn wrap() -> DynLogSink {

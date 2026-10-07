@@ -38,6 +38,13 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);
 }
 
+/// Stable ABI log-filter entry: the host's filter as prost `pb::LogFilter` bytes,
+/// so events it would discard are dropped here instead of forwarded.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
+    plugin_sdk::stabby::install_log_filter(&filter);
+}
+
 /// Stable ABI supervisor entry: the host hands the plugin its process-supervisor
 /// client, so any child this plugin spawns is tracked by the host's sidecar rather
 /// than by this cdylib's own (uninitialised) copy of the `proc` tracker.

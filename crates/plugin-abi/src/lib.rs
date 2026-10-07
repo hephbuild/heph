@@ -21,6 +21,13 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.14.0: new optional `heph_plugin_set_log_filter` entry, taking prost
+/// `pb::LogFilter` bytes: the host's log filter in a shape any language can apply
+/// (an ordered level enum, opaque target strings, longest prefix wins), so a
+/// plugin drops events the host would discard instead of forwarding them all.
+/// Additive like 0.4.0's supervisor entry: the host tolerates a plugin without the
+/// symbol, and that plugin forwards everything, which the host still filters.
+///
 /// 0.13.0: `ListResponse` carries `ListedFacts facts = 4` — per entry, the
 /// labels, driver and `has_codegen` the provider knows without `get`, each
 /// field absent (unknown) or exact — and 0.11.0's `labels`/`labels_known` are
@@ -122,7 +129,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.13.0";
+pub const ABI_SEMVER: &str = "0.14.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

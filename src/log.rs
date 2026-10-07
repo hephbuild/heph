@@ -14,8 +14,14 @@ pub fn init() -> LogSink {
     // metadata server") on every GCS token fetch — cap it at warn! so the
     // noise is silenced but real credential failures surface. Users raise
     // either via `RUST_LOG=fuser=debug` / `RUST_LOG=object_store=info`.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,fuser=error,object_store=warn"));
+    const DEFAULT_FILTER: &str = "info,fuser=error,object_store=warn";
+    let (filter, directives) = match EnvFilter::try_from_default_env() {
+        Ok(filter) => (filter, std::env::var("RUST_LOG").unwrap_or_default()),
+        Err(_) => (EnvFilter::new(DEFAULT_FILTER), DEFAULT_FILTER.to_string()),
+    };
+    // Plugins get the same filter, so they drop what this subscriber would before
+    // paying to forward it across the seam.
+    hplugin_stabby::host::set_plugin_log_filter(&directives, filter.max_level_hint());
 
     // tracing_subscriber defaults ANSI on regardless of where the writer points.
     // Our writer is stderr, so gate color on stderr's capability — otherwise a

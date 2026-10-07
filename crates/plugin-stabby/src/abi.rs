@@ -464,6 +464,18 @@ pub const SET_LOG_SINK_SYMBOL: &[u8] = b"heph_plugin_set_log_sink";
 /// The set-log-sink entry's function-pointer type.
 pub type SetLogSinkFn = extern "C" fn(DynLogSink);
 
+/// Optional cdylib symbol: hand the plugin the host's log filter as prost-encoded
+/// `pb::LogFilter` bytes, so it can drop events the host would discard instead of
+/// forwarding every one over the [`DynLogSink`]. The semantics live in the proto
+/// (`proto/plugin/v1/common.proto`), not in any Rust type, so a plugin in another
+/// language implements the same contract. The host calls it right after the log
+/// sink if present, and may call it again (latest wins); a plugin that does not
+/// export it forwards everything, which the host still filters.
+pub const SET_LOG_FILTER_SYMBOL: &[u8] = b"heph_plugin_set_log_filter";
+
+/// The set-log-filter entry's function-pointer type.
+pub type SetLogFilterFn = extern "C" fn(stabby::vec::Vec<u8>);
+
 /// Optional cdylib symbol: install a host [`DynSupervisor`] so children the plugin
 /// spawns are tracked by the host's supervisor sidecar. The host calls it right
 /// after load if present; a plugin built against an older SDK does not export it
