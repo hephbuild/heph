@@ -46,6 +46,14 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);
 }
 
+/// Stable ABI log-filter entry: the host's filter as prost `pb::LogFilter` bytes,
+/// so events it would discard — reqwest/hyper's chatter under every pull — are
+/// dropped here instead of forwarded.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
+    plugin_sdk::stabby::install_log_filter(&filter);
+}
+
 /// Stable ABI supervisor entry: the host hands the plugin its process-supervisor
 /// client. This cdylib links its own `proc`, whose tracker the host's startup
 /// `init` never reached — without this, every `docker buildx` this

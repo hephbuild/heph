@@ -53,8 +53,16 @@ anything `get_stabbied` would reject:
   to load. It is frozen with this contract for exactly that reason.
 - Rename or retype `CREATE_SYMBOL` or `CreateFn` — the entry point.
 - Rename or retype an optional load-time symbol: `SET_LOG_SINK_SYMBOL`,
-  `SET_SUPERVISOR_SYMBOL`, `SET_RUNNER_HOST_SYMBOL`. *Adding* one is additive —
-  the host tolerates its absence — but changing one that exists is not.
+  `SET_SUPERVISOR_SYMBOL`, `SET_RUNNER_HOST_SYMBOL`, `SET_LOG_FILTER_SYMBOL`.
+  *Adding* one is additive — the host tolerates its absence — but changing one
+  that exists is not.
+- Change the meaning of `pb::LogFilter` (its level order, the longest-prefix
+  match, or the forward-on-doubt rules in `common.proto`): it is bytes in, so
+  like the `hexecrunner::wire` shape above nothing rejects a mismatch — a plugin
+  would silently drop events the host wants. The same holds for the host's
+  translation of its own filter into one: it must never send a narrower filter
+  than it applies (`hostlog::plain_directives`, and the test beside it that
+  checks it against `EnvFilter`).
 - Change the `stabby` dependency version in any crate that links the boundary
   (`plugin-stabby`, `plugin-sdk`, `plugin-go-cdylib`). stabby keys its type reports
   to its own version; a mismatch fails `get_stabbied`.
@@ -88,6 +96,15 @@ silent `Or[]`: a plugin built against a newer schema fails the call loudly
 instead of matching nothing, or everything under `Not`. An old host still
 reads a new arm as an empty matcher (prost leaves the `oneof` unset); that is
 why a new arm is a minor bump the host must reach before plugins send it.
+
+## A new optional load-time symbol: a minor bump
+
+Adding a `SET_*_SYMBOL` (0.4.0 the supervisor, 0.14.0 the log filter) edits
+`abi.rs`, so `scripts/abi-check.sh` wants `ABI_SEMVER` to move — but a **minor**
+is enough, because each pairing still works: a new host skips a symbol an old
+plugin lacks (`get_stabbied` errs, the call is skipped), an old host never
+looks for a new plugin's extra export, and the plugin must behave sensibly
+without the call (the log filter: forward everything).
 
 ## What does NOT require a bump
 

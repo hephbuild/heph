@@ -35,6 +35,14 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// How often `wait_for` re-checks the accumulated output.
 const POLL: Duration = Duration::from_millis(20);
 
+/// The prompt [`ShellSession::ready`] installs, as `wait_for` looks for it.
+const PROMPT: &str = "shellpty#";
+
+/// The line that installs [`PROMPT`]. Typed so that it does not contain the
+/// prompt itself — bash folds the `''` away, the echo keeps it. See `ready` for
+/// why that is load-bearing.
+const SET_PROMPT: &str = "PS1='shell''pty# '";
+
 /// One poll's outcome in [`scan_once`].
 #[derive(Debug, PartialEq, Eq)]
 enum Scan {
@@ -260,10 +268,9 @@ impl ShellSession {
     ///
     /// This deliberately does not scan the whole history: `captured` only
     /// ever grows, so once a needle has appeared once it stays "found"
-    /// forever — a fixed marker like the `shellpty#` prompt (baked into the
-    /// `PS1='shellpty# '` line whose own PTY echo already contains the
-    /// literal substring) matches on the very first check and then every
-    /// later `wait_for("shellpty#", ..)` in the file would return instantly
+    /// forever — a fixed marker like the `shellpty#` prompt matches on the
+    /// first prompt and then every
+    /// later `wait_for(PROMPT, ..)` in the file would return instantly
     /// without ever having observed a *new* prompt. That silently drops the
     /// synchronization callers rely on ("are we really back at a prompt
     /// now?") and lets the test race ahead on nothing but luck. Tracking a
@@ -334,14 +341,31 @@ impl ShellSession {
         }
     }
 
-    /// Wait for `init.sh`'s banner (proof the interactive bash session came
-    /// up and is reading commands), then override its fixed `PS1='$ '` with
+    /// Wait for `init.sh`'s banner, then override its fixed `PS1='$ '` with
     /// a unique marker so later `wait_for` calls can't collide with shell
-    /// furniture or command output that happens to contain "$ ".
+    /// furniture or command output that happens to contain "$ ", and return
+    /// once bash has **shown** that prompt.
+    ///
+    /// The banner is printed while `init.sh` is still running, before bash's
+    /// readline has prepared the terminal, so the `PS1` line usually lands
+    /// while the session's pty is still canonical — the kernel echoes it. That
+    /// echo must not end this wait, which is why [`SET_PROMPT`] does not
+    /// contain [`PROMPT`]: when it did, `ready` returned on the echo, and a
+    /// caller's next keystroke could reach bash before readline was reading.
+    /// For a Ctrl-D that is fatal on Linux only. A canonical-mode EOF is
+    /// stored by the line discipline as a NUL, so once readline switches the
+    /// terminal to non-canonical it reads `\0` (`set-mark`, silent) instead of
+    /// `\x04`, bash sits at its new prompt, and heph never exits. macOS keeps
+    /// the `\x04`. That was `ctrl_d_ends_the_session_like_exit` failing ~1% of
+    /// the time on `linux/*` with nothing after the prompt.
+    ///
+    /// The prompt itself is safe to sync on: readline prepares the terminal
+    /// (non-canonical, and bracketed paste — the `\x1b[?2004h` before it)
+    /// *before* it draws the prompt.
     fn ready(&mut self) {
         self.wait_for("Shell mode, to exit", DEADLINE);
-        self.send_str("PS1='shellpty# '\n");
-        self.wait_for("shellpty#", Duration::from_secs(10));
+        self.send_str(&format!("{SET_PROMPT}\n"));
+        self.wait_for(PROMPT, Duration::from_secs(10));
     }
 }
 
@@ -368,7 +392,7 @@ fn shell_echoes_typed_input_and_exits_promptly() {
         let (cmd, marker) = echo_marker("marco-", &format!("{i}-polo"));
         session.send_str(&format!("{cmd}\n"));
         session.wait_for(&marker, Duration::from_secs(10));
-        session.wait_for("shellpty#", Duration::from_secs(10));
+        session.wait_for(PROMPT, Duration::from_secs(10));
     }
 
     let before_exit = Instant::now();
@@ -501,7 +525,7 @@ fn ctrl_c_interrupts_foreground_child_not_the_session() {
     session.send(b"\x03"); // Ctrl-C
 
     // Back at the prompt well under the sleep's duration.
-    session.wait_for("shellpty#", Duration::from_secs(10));
+    session.wait_for(PROMPT, Duration::from_secs(10));
     let recovered = interrupted_at.elapsed();
     assert!(
         recovered < Duration::from_secs(10),
@@ -574,7 +598,7 @@ fn exit_is_prompt_after_chatty_and_large_output() {
         "for i in $(seq 1 200); do echo err-$i >&2; done; {batch_cmd}\n"
     ));
     session.wait_for(&batch_marker, DEADLINE);
-    session.wait_for("shellpty#", DEADLINE);
+    session.wait_for(PROMPT, DEADLINE);
 
     // Comfortably past the 512 KiB drain bound plus the 64 KiB pipe.
     let (large_cmd, large_marker) = echo_marker("large-output", "-done");
@@ -588,7 +612,7 @@ fn exit_is_prompt_after_chatty_and_large_output() {
         "head -c 900000 /dev/zero | tr '\\0' 'x' | fold -w 256; {large_cmd}\n"
     ));
     session.wait_for(&large_marker, DEADLINE);
-    session.wait_for("shellpty#", DEADLINE);
+    session.wait_for(PROMPT, DEADLINE);
 
     let before_exit = Instant::now();
     session.send_str("exit\n");
@@ -643,5 +667,37 @@ fn echo_marker_prints_the_marker_without_typing_it() {
         String::from_utf8_lossy(&out.stdout).trim(),
         marker,
         "bash must still print the marker whole"
+    );
+}
+
+/// [`SET_PROMPT`]'s contract, in both directions — the same two halves as
+/// `echo_marker_prints_the_marker_without_typing_it`, for the line `ready`
+/// syncs on.
+///
+/// The first half is the regression guard. When the typed line contained the
+/// prompt, `ready` returned on the terminal's echo of it, and a Ctrl-D sent
+/// next could reach bash before readline had taken its terminal out of
+/// canonical mode; on Linux that EOF is then read back as a NUL byte and bash
+/// never exits (see `ready`). Nothing about that is deterministic in a pty
+/// run — it failed ~1% of the time, Linux only — but the precondition is, and
+/// this pins it.
+#[test]
+fn set_prompt_installs_the_prompt_without_typing_it() {
+    assert!(
+        !SET_PROMPT.contains(PROMPT),
+        "{SET_PROMPT:?} contains the prompt it installs, so the terminal's echo \
+         of it would satisfy wait_for({PROMPT:?}) before bash has shown a prompt"
+    );
+
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("{SET_PROMPT}; printf %s \"$PS1\""))
+        .output()
+        .expect("run bash");
+    assert!(out.status.success(), "bash rejected {SET_PROMPT:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with(PROMPT),
+        "bash must still install the prompt whole, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }

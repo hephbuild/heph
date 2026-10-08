@@ -39,6 +39,56 @@ message CreateConfig {
   map<string, Value> options = 3;
 }
 
+// The host's log filter, handed to a plugin (`heph_plugin_set_log_filter`) so it
+// can drop events the host would discard before paying to forward them.
+//
+// A conservative pre-filter, not the host's filter: the host still applies its
+// own exact filter to every event it receives, so a plugin that ignores this
+// message stays correct, only slower. A host filter this shape cannot express is
+// sent as `default_level` = its overall maximum, with no directives. Sent once at
+// load, after the log sink; may be sent again, and the latest wins. Until one
+// arrives a plugin forwards everything.
+//
+// Matching, in terms any language can implement: an event with level L and
+// target T (an opaque string — a module path, a package import path, ...) is
+// forwarded when L is at or below the level of the directive with the longest
+// `target_prefix` that is a string prefix of T, or of `default_level` when no
+// directive matches.
+//   - The prefix test is byte-wise and case-sensitive on UTF-8, and NOT
+//     segment-aware: `oci` matches `oci_client`. Do not substitute a dotted
+//     logger hierarchy.
+//   - An empty `target_prefix` matches every target, and like any directive
+//     outranks `default_level`.
+//   - Directive order carries no meaning. A prefix that appears more than once
+//     takes its most verbose level.
+//
+// Evolution: every rule above errs towards forwarding, and so must any field
+// added later — an old plugin ignores fields it does not know, so a field that
+// narrows what is forwarded would make it drop events. A host that cannot
+// express a condition sends a wider filter instead.
+message LogFilter {
+  // A level admits itself and everything less verbose (INFO admits ERROR, WARN
+  // and INFO). The order is the one declared below, OFF through TRACE — not the
+  // numeric values. A reader treats a value it does not know, and UNSPECIFIED,
+  // as TRACE (admit everything), so a missing or newer level never drops an
+  // event; a sender must not rely on an old reader understanding a new level.
+  enum Level {
+    LEVEL_UNSPECIFIED = 0;
+    LEVEL_OFF = 1;
+    LEVEL_ERROR = 2;
+    LEVEL_WARN = 3;
+    LEVEL_INFO = 4;
+    LEVEL_DEBUG = 5;
+    LEVEL_TRACE = 6;
+  }
+  message Directive {
+    string target_prefix = 1;
+    Level level = 2;
+  }
+  Level default_level = 1;
+  repeated Directive directives = 2;
+}
+
 // Target address. Mirrors hmodel::Addr (package //pkg : name @args).
 message Addr {
   string package = 1;

@@ -37,7 +37,7 @@ pub mod stabby {
     pub use hplugin_stabby::abi;
 
     pub use crate::guest::GuestExecutor;
-    pub use crate::logsink::install_log_sink;
+    pub use crate::logsink::{install_log_filter, install_log_sink};
     pub use crate::runnerhost::{install_runner_host, make_dyn_runner};
     pub use crate::serve::{
         cdylib_runtime_handle, make_dyn_hook, make_dyn_managed_driver, make_dyn_provider,
