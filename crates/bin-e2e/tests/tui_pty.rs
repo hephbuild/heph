@@ -106,6 +106,96 @@ fn tui_renders_the_run_and_restores_the_terminal() {
     );
 }
 
+/// `heph auth status` probes credentials, and a probe under a `runner` builds
+/// that runner — so it runs under the same TUI as `run`. Under a terminal that
+/// TUI must engage, must not swallow the table (it is printed in a pause, onto
+/// the terminal, after the probes), and must hand the cursor back.
+#[test]
+fn auth_status_prints_its_table_and_restores_the_terminal() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "auth/BUILD",
+        r#"target(name = "ok", driver = "credential",
+       sources = [heph.auth.exec(["sh", "-c", "printf 'v'"])],
+       present = {"env": {"OK": "${value}"}})"#,
+    )
+    .expect("write BUILD");
+
+    let session = run_in_pty(&dist, ws.root(), &["auth", "status", "//auth/..."]);
+
+    assert!(session.status_success, "{}", session.report());
+    assert!(
+        contains(&session.raw, DSR_CURSOR),
+        "auth status never engaged the TUI with a tty attached\n{}",
+        session.report()
+    );
+    assert!(
+        session.rendered.contains("//auth:ok") && session.rendered.contains("exec(sh)"),
+        "the status table never reached the terminal\n{}",
+        session.report()
+    );
+    assert_cursor_restored(&session);
+}
+
+/// `heph auth login` hands the terminal to each vendor sign-in command and takes
+/// it back afterwards. Two stale credentials, so the TUI goes down, comes back
+/// up between them, and goes down again: a resume that wedged (the crossterm
+/// `EventStream` rebuild has, before) shows here as a child that never exits.
+#[test]
+fn auth_login_lends_the_terminal_to_each_sign_in_and_restores_it() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "auth/BUILD",
+        r#"
+target(name = "a", driver = "credential",
+       sources = [heph.auth.exec(["heph-e2e-no-such-tool"],
+                                 login = [["sh", "-c", "echo e2e-login-a"]])],
+       present = {"env": {"A": "${value}"}})
+target(name = "b", driver = "credential",
+       sources = [heph.auth.exec(["heph-e2e-no-such-tool"],
+                                 login = [["sh", "-c", "echo e2e-login-b"]])],
+       present = {"env": {"B": "${value}"}})
+"#,
+    )
+    .expect("write BUILD");
+
+    let session = run_in_pty(&dist, ws.root(), &["auth", "login"]);
+
+    assert!(session.status_success, "{}", session.report());
+    assert!(
+        contains(&session.raw, DSR_CURSOR),
+        "auth login never engaged the TUI with a tty attached\n{}",
+        session.report()
+    );
+    for marker in ["e2e-login-a", "e2e-login-b"] {
+        assert!(
+            session.rendered.contains(marker),
+            "the sign-in command's output ({marker}) never reached the terminal\n{}",
+            session.report()
+        );
+    }
+    assert_cursor_restored(&session);
+}
+
+/// The last thing the TUI does with the cursor is show it again. A crash or a
+/// missing teardown leaves the final hide unmatched and the user typing blind.
+fn assert_cursor_restored(session: &Session) {
+    let hid = last_index(&session.raw, CURSOR_HIDE);
+    let shown = last_index(&session.raw, CURSOR_SHOW);
+    assert!(
+        hid.is_some(),
+        "TUI never hid the cursor\n{}",
+        session.report()
+    );
+    assert!(
+        shown > hid,
+        "exited with the cursor still hidden\n{}",
+        session.report()
+    );
+}
+
 /// A run prints its results in a last pause, and nothing is drawn after it, so
 /// the resume that follows must not rebuild the viewport. Rebuilding costs a
 /// cursor query, and the run is over before a slow terminal (a remote box)

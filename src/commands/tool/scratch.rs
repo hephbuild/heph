@@ -8,9 +8,14 @@
 //! keeps working when the targets that produced a slot have been deleted or
 //! renamed — the same property `heph tool clean` has for addr-only selections.
 
-use crate::commands::bootstrap;
+use std::sync::Arc;
+
+use crate::commands::progress_app::{request_state, run_with_progress};
+use crate::commands::{GlobalOptions, bootstrap};
+use crate::engine::Engine;
+use crate::engine::request_state::RequestState;
 use crate::engine::scratch_store::{SlotEntry, store_root};
-use crate::tui::LogSink;
+use crate::tui::{BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct ScratchArgs {
@@ -109,11 +114,25 @@ pub enum ScratchCommands {
     },
 }
 
+/// `println!` into a [`BufferedStdout`], so a line printed mid-walk never lands
+/// inside a live TUI frame.
+macro_rules! outln {
+    ($out:expr, $($fmt:tt)*) => {
+        $out.println(format!($($fmt)*))
+    };
+}
+
 impl ScratchArgs {
-    pub fn execute(&self, _sink: LogSink, fail_fast: bool) -> anyhow::Result<()> {
+    /// `head` and `pull` resolve every spec in the workspace to find the
+    /// declarations, and a provider may run a target to answer that — so they
+    /// run under the TUI like `run` does. The rest read the store, or the remote,
+    /// and build nothing.
+    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match &self.command {
             ScratchCommands::Ls => bootstrap::block_on(ls())?,
-            ScratchCommands::Head { addr } => bootstrap::block_on(head(addr, fail_fast))?,
+            ScratchCommands::Head { addr } => {
+                bootstrap::block_on(head(addr.clone(), sink, global.clone()))?
+            }
             ScratchCommands::Path { addr } => bootstrap::block_on(path(addr))?,
             ScratchCommands::Rm { addr, all } => bootstrap::block_on(rm(addr.as_deref(), *all))?,
             ScratchCommands::Push {
@@ -123,7 +142,10 @@ impl ScratchArgs {
                 producer,
             } => bootstrap::block_on(push(addr.as_deref(), *all, *force, producer.clone()))?,
             ScratchCommands::Pull { addr, all } => {
-                bootstrap::block_on(pull(addr.as_deref(), *all, fail_fast))?
+                if *all == addr.is_some() {
+                    anyhow::bail!("pass either an address or --all, not both or neither");
+                }
+                bootstrap::block_on(pull(addr.clone(), sink, global.clone()))?
             }
         }
     }
@@ -245,11 +267,35 @@ fn local_trace(
     out
 }
 
-async fn head(addr: &str, fail_fast: bool) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine()?;
+async fn head(addr: String, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+    let (engine, shutdown) = bootstrap::new_engine()?;
+    let label = format!("Resolving scratch {addr}");
+    run_with_progress(
+        label,
+        sink,
+        global.no_tui,
+        shutdown,
+        move |ctx| async move {
+            let rs = request_state(&engine, &ctx);
+            let out = BufferedStdout::new(&ctx);
+            let res = head_trace(&engine, rs, &addr, global.fail_fast, &out).await;
+            out.close().await;
+            res
+        },
+    )
+    .await
+}
+
+async fn head_trace(
+    engine: &Arc<Engine>,
+    rs: Arc<RequestState>,
+    addr: &str,
+    fail_fast: bool,
+    out: &BufferedStdout,
+) -> anyhow::Result<()> {
     let gaps = crate::engine::Gaps::new("//...");
     let discovery = crate::engine::Discovery::keep_going_unless(fail_fast, &gaps);
-    let found = declared_scratches(&engine, discovery)
+    let found = declared_scratches(engine, rs, discovery, |l| out.println(l))
         .await?
         .into_iter()
         .find(|(a, _)| a.format() == addr);
@@ -270,7 +316,7 @@ async fn head(addr: &str, fail_fast: bool) -> anyhow::Result<()> {
     let scope = engine.scratch_scope().to_string();
     let fallbacks = engine.scratch_restore_scopes().to_vec();
 
-    println!("{found_addr}  (slot {slot})");
+    outln!(out, "{found_addr}  (slot {slot})");
 
     // Local first, and with its *own* fallbacks — a build seeds a cold lineage
     // from a warm sibling before it ever looks at the remote, so a trace that
@@ -291,11 +337,17 @@ async fn head(addr: &str, fail_fast: bool) -> anyhow::Result<()> {
     for (sc, is_warm) in &trace {
         let dir = head_of(sc);
         if !is_warm {
-            println!("    local {}: cold", describe_scope(sc));
+            outln!(out, "    local {}: cold", describe_scope(sc));
         } else if *sc == scope {
-            println!("  * local {}: warm — {}", describe_scope(sc), dir.display());
+            outln!(
+                out,
+                "  * local {}: warm — {}",
+                describe_scope(sc),
+                dir.display()
+            );
         } else {
-            println!(
+            outln!(
+                out,
                 "  * local {}: warm — seeds {} from {}",
                 describe_scope(sc),
                 describe_scope(&scope),
@@ -307,15 +359,21 @@ async fn head(addr: &str, fail_fast: bool) -> anyhow::Result<()> {
         // Resolution stops here; everything below is printed for context, not as
         // a prediction. Saying so beats letting the remote section imply a fetch
         // that will not happen.
-        println!("  (warm locally — a build here does not consult the remote)");
+        outln!(
+            out,
+            "  (warm locally — a build here does not consult the remote)"
+        );
     }
 
     if !def.remote {
-        println!("  remote: not consulted (this cache declares `remote = False`)");
+        outln!(
+            out,
+            "  remote: not consulted (this cache declares `remote = False`)"
+        );
         return Ok(());
     }
     if engine.remote_caches().is_empty() {
-        println!("  remote: no remote cache is configured");
+        outln!(out, "  remote: no remote cache is configured");
         return Ok(());
     }
 
@@ -344,7 +402,7 @@ async fn head(addr: &str, fail_fast: bool) -> anyhow::Result<()> {
                     line.push_str(&format!(", producer {}", h.meta.producer));
                 }
                 line.push(')');
-                println!("{line}");
+                outln!(out, "{line}");
                 // Only for the entry that would actually be restored — the
                 // others are never unpacked, so where they were produced says
                 // nothing about this machine.
@@ -356,7 +414,8 @@ async fn head(addr: &str, fail_fast: bool) -> anyhow::Result<()> {
                 // whose contents embed absolute paths.
                 let native = head_of(&h.meta.scope);
                 if wins && h.meta.produced_at != native.to_string_lossy() {
-                    println!(
+                    outln!(
+                        out,
                         "      produced under {}, restores under {} — a cache whose \
                          contents embed absolute paths will restore but be inert",
                         h.meta.produced_at,
@@ -364,7 +423,11 @@ async fn head(addr: &str, fail_fast: bool) -> anyhow::Result<()> {
                     );
                 }
             }
-            None => println!("    remote {}: nothing published", describe_scope(scope)),
+            None => outln!(
+                out,
+                "    remote {}: nothing published",
+                describe_scope(scope)
+            ),
         }
     }
     if !winner_shown && !warm {
@@ -372,12 +435,16 @@ async fn head(addr: &str, fail_fast: bool) -> anyhow::Result<()> {
         // remote *because* local missed, so an empty remote with a warm local is
         // a perfectly good build.
         if warm {
-            println!(
+            outln!(
+                out,
                 "  nothing published in any candidate lineage; the local head is warm, so a \
                  build here uses it"
             );
         } else {
-            println!("  nothing published in any candidate lineage — a build here starts cold");
+            outln!(
+                out,
+                "  nothing published in any candidate lineage — a build here starts cold"
+            );
         }
     }
     Ok(())
@@ -500,20 +567,24 @@ async fn push(addr: Option<&str>, all: bool, force: bool, producer: String) -> a
 ///
 /// Keeps going past what will not resolve, into `gaps`: one broken package must
 /// not make the whole workspace unwarmable, and the caller reports what was
-/// skipped once it has acted on the rest.
+/// skipped once it has acted on the rest. A declaration that does not parse is
+/// handed to `report_skip` as a line for stdout.
+///
+/// `rs` decides fail-fast for anything the walk builds, which says nothing
+/// about whether this walk may come up short: `discovery` decides that, from
+/// `--fail-fast`.
 async fn declared_scratches(
-    engine: &std::sync::Arc<crate::engine::Engine>,
+    engine: &Arc<Engine>,
+    rs: Arc<RequestState>,
     discovery: crate::engine::Discovery,
+    report_skip: impl Fn(String),
 ) -> anyhow::Result<Vec<(crate::htaddr::Addr, hbuiltins::pluginscratch::ScratchDef)>> {
     use futures::TryStreamExt as _;
 
     // Every package: the workspace-wide selector `clean` and the gitignore walk
     // already use.
     let matcher = crate::htmatcher::Matcher::PackagePrefix(crate::htpkg::PkgBuf::from(""));
-    // `new_state()` defaults to fail-fast, which says nothing about whether
-    // this walk may come up short: the caller decides that, from `--fail-fast`.
-    let rs = engine.new_state();
-    let mut stream = Box::pin(std::sync::Arc::clone(engine).query_spec(rs, &matcher, discovery));
+    let mut stream = Box::pin(Arc::clone(engine).query_spec(rs, &matcher, discovery));
 
     let mut out = Vec::new();
     while let Some(spec) = stream.try_next().await? {
@@ -522,21 +593,46 @@ async fn declared_scratches(
         }
         match hbuiltins::pluginscratch::parse_declaration(&spec) {
             Ok(def) => out.push((spec.addr.clone(), def)),
-            Err(err) => println!("{}: skipped — {err:#}", spec.addr),
+            Err(err) => report_skip(format!("{}: skipped — {err:#}", spec.addr)),
         }
     }
     Ok(out)
 }
 
-async fn pull(addr: Option<&str>, all: bool, fail_fast: bool) -> anyhow::Result<()> {
-    if all == addr.is_some() {
-        anyhow::bail!("pass either an address or --all, not both or neither");
-    }
-    let (engine, _shutdown) = bootstrap::new_engine()?;
+/// The caller has checked that exactly one of `addr` and `--all` was given.
+async fn pull(addr: Option<String>, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+    let (engine, shutdown) = bootstrap::new_engine()?;
+    let label = match &addr {
+        Some(a) => format!("Fetching scratch {a}"),
+        None => "Fetching scratch caches".to_string(),
+    };
+    run_with_progress(
+        label,
+        sink,
+        global.no_tui,
+        shutdown,
+        move |ctx| async move {
+            let rs = request_state(&engine, &ctx);
+            let out = BufferedStdout::new(&ctx);
+            let res = pull_selected(&engine, rs, addr.as_deref(), global.fail_fast, &out).await;
+            out.close().await;
+            res
+        },
+    )
+    .await
+}
+
+async fn pull_selected(
+    engine: &Arc<Engine>,
+    rs: Arc<RequestState>,
+    addr: Option<&str>,
+    fail_fast: bool,
+    out: &BufferedStdout,
+) -> anyhow::Result<()> {
     let gaps = crate::engine::Gaps::new("//...");
     let discovery = crate::engine::Discovery::keep_going_unless(fail_fast, &gaps);
 
-    let selected: Vec<_> = declared_scratches(&engine, discovery)
+    let selected: Vec<_> = declared_scratches(engine, rs, discovery, |l| out.println(l))
         .await?
         .into_iter()
         .filter(|(a, def)| match addr {
@@ -557,7 +653,10 @@ async fn pull(addr: Option<&str>, all: bool, fail_fast: bool) -> anyhow::Result<
                 "no `scratch` target named {want}. `heph query -e '//...'` lists what the \
                  workspace declares"
             ),
-            None => println!("No scratch cache declares `remote = True`; nothing to fetch."),
+            None => outln!(
+                out,
+                "No scratch cache declares `remote = True`; nothing to fetch."
+            ),
         }
         return Ok(());
     }
@@ -571,7 +670,7 @@ async fn pull(addr: Option<&str>, all: bool, fail_fast: bool) -> anyhow::Result<
         }
         .slot();
         let Some(head) = engine.scratch_remote_head(&slot, &scope, &fallbacks).await else {
-            println!("{addr}: nothing published for this branch");
+            outln!(out, "{addr}: nothing published for this branch");
             continue;
         };
         let dir = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, &scope);
@@ -601,13 +700,14 @@ async fn pull(addr: Option<&str>, all: bool, fail_fast: bool) -> anyhow::Result<
                         remote: def.remote,
                     },
                 );
-                println!(
+                outln!(
+                    out,
                     "{addr}: fetched generation {} from {} ({bytes} bytes)",
                     head.meta.generation,
                     describe_scope(&head.meta.scope),
                 );
             }
-            Err(err) => println!("{addr}: FAILED — {err:#}"),
+            Err(err) => outln!(out, "{addr}: FAILED — {err:#}"),
         }
     }
     // What resolved was fetched; what did not is reported, and fails the run.
@@ -827,6 +927,85 @@ mod tests {
         assert!(name.contains("unknown"), "{name}");
     }
 
+    fn one_scratch_engine(root: &std::path::Path) -> anyhow::Result<Arc<Engine>> {
+        let mut engine = Engine::new(crate::engine::Config {
+            root: root.to_path_buf(),
+            home_dir: root.join(".heph3"),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let provider = hbuiltins::pluginstatictarget::Provider::new(vec![
+            hbuiltins::pluginstatictarget::Target {
+                addr: "//cache:go".to_string(),
+                driver: hbuiltins::pluginscratch::DRIVER_NAME.to_string(),
+                ..Default::default()
+            },
+        ])?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok(Arc::new(engine))
+    }
+
+    /// `head` and `pull` under the line backend an agent gets: the exit is the
+    /// one they had before they moved behind the progress app.
+    #[tokio::test]
+    async fn head_and_pull_keep_their_exits_under_the_progress_app() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = one_scratch_engine(root.path())?;
+        let head = |addr: &'static str| {
+            let engine = Arc::clone(&engine);
+            let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
+            run_with_progress(
+                "t",
+                LogSink::new_direct(),
+                true,
+                shutdown,
+                move |ctx| async move {
+                    let rs = request_state(&engine, &ctx);
+                    let out = BufferedStdout::new(&ctx);
+                    let res = head_trace(&engine, rs, addr, false, &out).await;
+                    out.close().await;
+                    res
+                },
+            )
+        };
+        // A local-only cache: traced, and the remote is not consulted.
+        head("//cache:go").await?;
+        let err = head("//cache:nope").await.expect_err("no such scratch");
+        assert!(
+            err.to_string().contains("no `scratch` target named"),
+            "{err:#}"
+        );
+
+        let pull = |addr: Option<&'static str>| {
+            let engine = Arc::clone(&engine);
+            let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
+            run_with_progress(
+                "t",
+                LogSink::new_direct(),
+                true,
+                shutdown,
+                move |ctx| async move {
+                    let rs = request_state(&engine, &ctx);
+                    let out = BufferedStdout::new(&ctx);
+                    let res = pull_selected(&engine, rs, addr, false, &out).await;
+                    out.close().await;
+                    res
+                },
+            )
+        };
+        // `--all` with nothing declared `remote`: nothing to fetch is not a
+        // failure.
+        pull(None).await?;
+        let err = pull(Some("//cache:nope"))
+            .await
+            .expect_err("no such scratch");
+        assert!(
+            err.to_string().contains("no `scratch` target named"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
     /// `declared_scratches` walks on `Engine::new_state()`, whose request is
     /// fail-fast. Keep-going is decided at the call site, not read from that
     /// flag, so one broken package still leaves the rest of the workspace
@@ -862,7 +1041,9 @@ mod tests {
         let gaps = crate::engine::Gaps::new("//...");
         let found = declared_scratches(
             &engine,
+            engine.new_state(),
             crate::engine::Discovery::keep_going_unless(false, &gaps),
+            |_| {},
         )
         .await?;
         let addrs: Vec<String> = found.iter().map(|(a, _)| a.format()).collect();

@@ -23,9 +23,10 @@
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::progress_app::{request_state, run_with_progress};
 use crate::engine::credential::source_login;
 use crate::engine::{Engine, get_cwp};
-use crate::tui::LogSink;
+use crate::tui::{self, AppContext, LogSink};
 use anyhow::Context as _;
 use clap::{Args, Subcommand};
 use hbuiltins::plugincredential::{CredentialDef, DRIVER_NAME, parse_declaration};
@@ -112,11 +113,19 @@ pub struct LoginArgs {
 }
 
 impl AuthArgs {
-    pub fn execute(&self, _sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    /// `status`, `explain` and `login` can build targets — a source's `runner`
+    /// is one, and probing under it builds it — so they run under the TUI like
+    /// `run` does, rather than sitting silent for as long as a devenv shell
+    /// takes to build. `logout` touches only the credential store.
+    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match &self.command {
-            AuthCommands::Status(a) => bootstrap::block_on(status(a.clone(), global.clone()))?,
-            AuthCommands::Explain(a) => bootstrap::block_on(explain(a.clone(), global.clone()))?,
-            AuthCommands::Login(a) => bootstrap::block_on(login(a.clone(), global.clone()))?,
+            AuthCommands::Status(a) => {
+                bootstrap::block_on(status(a.clone(), sink, global.clone()))?
+            }
+            AuthCommands::Explain(a) => {
+                bootstrap::block_on(explain(a.clone(), sink, global.clone()))?
+            }
+            AuthCommands::Login(a) => bootstrap::block_on(login(a.clone(), sink, global.clone()))?,
             AuthCommands::Logout => bootstrap::block_on(logout())?,
         }
     }
@@ -165,51 +174,91 @@ struct Row {
     login: Vec<Vec<String>>,
 }
 
-async fn status(args: StatusArgs, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine()?;
-    let rs = engine.new_state();
+async fn status(args: StatusArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+    let m = credential_matcher(args.matcher.as_deref())?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
+    let label = format!(
+        "Checking credentials in {}",
+        args.matcher.as_deref().unwrap_or("//...")
+    );
+    run_with_progress(label, sink, global.no_tui, shutdown, move |ctx| {
+        status_body(engine, args, m, global.fail_fast, ctx)
+    })
+    .await
+}
+
+async fn status_body(
+    engine: Arc<Engine>,
+    args: StatusArgs,
+    m: Matcher,
+    fail_fast: bool,
+    ctx: AppContext,
+) -> anyhow::Result<()> {
+    let rs = request_state(&engine, &ctx);
     let gaps = crate::engine::Gaps::new(args.matcher.as_deref().unwrap_or("//..."));
-    let discovery = crate::engine::Discovery::keep_going_unless(global.fail_fast, &gaps);
-    let creds = find_credentials(&engine, &rs, args.matcher.as_deref(), discovery).await?;
+    let discovery = crate::engine::Discovery::keep_going_unless(fail_fast, &gaps);
+    let creds = credentials_matching(&engine, &rs, &m, discovery).await?;
 
     let mut rows = Vec::with_capacity(creds.len());
     for (addr, def) in &creds {
         rows.push(row_for(&engine, &rs, addr, def).await);
     }
 
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&rows).context("render --json")?
-        );
-    } else if rows.is_empty() {
-        // "None here" would be a claim the walk cannot make if it skipped
-        // part of the workspace; the incomplete block below says that instead.
-        if gaps.is_empty() {
-            println!("no `credential` targets in this workspace");
-        }
-    } else {
-        let widest = rows.iter().map(|r| r.addr.len()).max().unwrap_or(0);
-        for r in &rows {
-            let tail = match (&r.expires_at, r.login.first()) {
-                (Some(at), _) => format!("expires {at}"),
-                (None, Some(_)) => format!("run: heph auth login {}", r.addr),
-                (None, None) => String::new(),
-            };
-            println!(
-                "{:<widest$}  {:<14} {:<24} {tail}",
-                r.addr,
-                r.state.label(),
-                r.source
-            );
-        }
+    // Rendered whole, then printed with the TUI paused: the table must not land
+    // inside a live frame.
+    let out = render_status(&rows, gaps.is_empty(), args.json)?;
+    if !out.is_empty() {
+        tui::paused!(ctx, { print!("{out}") });
     }
 
     // A credential the walk could not reach is not in the table at all, which
     // is worse than one that is not ok.
     crate::commands::errors::require_complete_selection(&gaps)?;
-    // Non-zero unless every row is ok, so a caller can branch on the exit status
-    // and only then parse to learn what to run.
+    status_verdict(&rows)
+}
+
+/// What `status` prints on stdout. `complete` is whether the walk reached the
+/// whole selection.
+fn render_status(rows: &[Row], complete: bool, json: bool) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+
+    if json {
+        let mut s = serde_json::to_string_pretty(rows).context("render --json")?;
+        s.push('\n');
+        return Ok(s);
+    }
+    if rows.is_empty() {
+        // "None here" would be a claim the walk cannot make if it skipped
+        // part of the workspace; the incomplete block says that instead.
+        return Ok(if complete {
+            "no `credential` targets in this workspace\n".to_string()
+        } else {
+            String::new()
+        });
+    }
+    let mut out = String::new();
+    let widest = rows.iter().map(|r| r.addr.len()).max().unwrap_or(0);
+    for r in rows {
+        let tail = match (&r.expires_at, r.login.first()) {
+            (Some(at), _) => format!("expires {at}"),
+            (None, Some(_)) => format!("run: heph auth login {}", r.addr),
+            (None, None) => String::new(),
+        };
+        writeln!(
+            out,
+            "{:<widest$}  {:<14} {:<24} {tail}",
+            r.addr,
+            r.state.label(),
+            r.source
+        )
+        .context("render the status table")?;
+    }
+    Ok(out)
+}
+
+/// The exit of `status`: non-zero unless every row is ok, so a caller can
+/// branch on the exit status and only then parse to learn what to run.
+fn status_verdict(rows: &[Row]) -> anyhow::Result<()> {
     if rows.iter().any(|r| r.state != State::Ok) {
         anyhow::bail!(
             "{} of {} credentials are not available here — `heph auth explain <addr>` says why",
@@ -301,11 +350,24 @@ struct ExplainStep {
     hint: String,
 }
 
-async fn explain(args: ExplainArgs, _global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine()?;
-    let rs = engine.new_state();
+async fn explain(args: ExplainArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
     let addr = hmodel::htaddr::parse_addr_with_base(&args.addr, &cwp)?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
+    let label = format!("Explaining {addr}");
+    run_with_progress(label, sink, global.no_tui, shutdown, move |ctx| {
+        explain_body(engine, addr, args.json, ctx)
+    })
+    .await
+}
+
+async fn explain_body(
+    engine: Arc<Engine>,
+    addr: Addr,
+    json: bool,
+    ctx: AppContext,
+) -> anyhow::Result<()> {
+    let rs = request_state(&engine, &ctx);
     let spec = Arc::clone(&engine).get_spec(rs.clone(), &addr).await?;
     if spec.driver != DRIVER_NAME {
         anyhow::bail!(
@@ -327,54 +389,103 @@ async fn explain(args: ExplainArgs, _global: GlobalOptions) -> anyhow::Result<()
         })
         .collect();
 
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "addr": addr.format(),
-                "sources": steps,
-            }))
-            .context("render --json")?
-        );
-        return Ok(());
-    }
-
-    println!("{addr}");
-    for s in &steps {
-        match &s.skipped {
-            None => println!("  {}. {:<24} applies here", s.index + 1, s.source),
-            Some(reason) => {
-                println!("  {}. {:<24} skipped: {reason}", s.index + 1, s.source);
-                println!("{:28}→ {}", "", s.hint);
-            }
-        }
-    }
-    if !steps.iter().any(|s| s.chosen) {
+    let out = render_explain(&addr, &steps, json)?;
+    tui::paused!(ctx, { print!("{out}") });
+    // `--json` reports the walk and exits 0 either way: whether a source was
+    // chosen is in the document.
+    if !json && !steps.iter().any(|s| s.chosen) {
         anyhow::bail!("no source applies here");
     }
     Ok(())
 }
 
-async fn login(args: LoginArgs, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine()?;
-    let rs = engine.new_state();
+/// What `explain` prints on stdout.
+fn render_explain(addr: &Addr, steps: &[ExplainStep], json: bool) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+
+    if json {
+        let mut s = serde_json::to_string_pretty(&serde_json::json!({
+            "addr": addr.format(),
+            "sources": steps,
+        }))
+        .context("render --json")?;
+        s.push('\n');
+        return Ok(s);
+    }
+    let mut out = String::new();
+    let mut line = |s: std::fmt::Arguments<'_>| {
+        out.write_fmt(s)
+            .and_then(|()| out.write_char('\n'))
+            .context("render the source chain")
+    };
+    line(format_args!("{addr}"))?;
+    for s in steps {
+        match &s.skipped {
+            None => line(format_args!(
+                "  {}. {:<24} applies here",
+                s.index + 1,
+                s.source
+            ))?,
+            Some(reason) => {
+                line(format_args!(
+                    "  {}. {:<24} skipped: {reason}",
+                    s.index + 1,
+                    s.source
+                ))?;
+                line(format_args!("{:28}→ {}", "", s.hint))?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn login(args: LoginArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+    let (engine, shutdown) = bootstrap::new_engine()?;
+    let label = match &args.addr {
+        Some(a) => format!("Signing in to {a}"),
+        None => "Signing in".to_string(),
+    };
+    let wanted = match &args.addr {
+        Some(raw) => Wanted::One(hmodel::htaddr::parse_addr_with_base(raw, &get_cwp()?)?),
+        None => Wanted::All(credential_matcher(None)?),
+    };
+    run_with_progress(label, sink, global.no_tui, shutdown, move |ctx| {
+        login_body(engine, wanted, global.fail_fast, ctx)
+    })
+    .await
+}
+
+/// What `login` signs in to.
+enum Wanted {
+    /// The one credential named on the command line.
+    One(Addr),
+    /// Every credential under the matcher that has gone stale.
+    All(Matcher),
+}
+
+async fn login_body(
+    engine: Arc<Engine>,
+    wanted: Wanted,
+    fail_fast: bool,
+    ctx: AppContext,
+) -> anyhow::Result<()> {
+    let rs = request_state(&engine, &ctx);
     let gaps = crate::engine::Gaps::new("//...");
-    let creds = match &args.addr {
-        Some(raw) => {
-            let cwp = get_cwp()?;
-            let addr = hmodel::htaddr::parse_addr_with_base(raw, &cwp)?;
+    let creds = match wanted {
+        Wanted::One(addr) => {
             let spec = Arc::clone(&engine).get_spec(rs.clone(), &addr).await?;
             if spec.driver != DRIVER_NAME {
                 anyhow::bail!("{addr} is a `{}` target, not a credential", spec.driver);
             }
             vec![(addr, parse_declaration(&spec)?)]
         }
-        None => {
-            let discovery = crate::engine::Discovery::keep_going_unless(global.fail_fast, &gaps);
-            find_credentials(&engine, &rs, None, discovery).await?
+        Wanted::All(m) => {
+            let discovery = crate::engine::Discovery::keep_going_unless(fail_fast, &gaps);
+            credentials_matching(&engine, &rs, &m, discovery).await?
         }
     };
 
+    let pauser = ctx.pauser();
     let mut ran = 0usize;
     for (addr, def) in &creds {
         let walk = engine.walk_chain(&rs, addr, def).await;
@@ -390,13 +501,24 @@ async fn login(args: LoginArgs, global: GlobalOptions) -> anyhow::Result<()> {
                 if argv.is_empty() {
                     continue;
                 }
-                println!("{addr}: {}", argv.join(" "));
-                // Through the engine's exec-runner seam, so a source whose tool
-                // lives in a devenv shell signs in *there* — the same place its
-                // probe looked. Stdio is inherited: a browser flow needs the
-                // terminal when there is one, and an agent needs to see the URL
-                // and code on its own output when there is not.
-                let status = engine.run_login(&rs, addr, src, argv).await?;
+                // The vendor command gets the terminal for as long as it runs:
+                // the TUI steps aside — cooked mode, and its key reader torn
+                // down so it cannot eat the keystrokes a device-code prompt
+                // reads — and comes back when the command exits. `Input`, not
+                // `Output`: the user is typing at the vendor CLI, so their Ctrl-C
+                // is for it; it dies of the SIGINT and the failure below ends the
+                // command. A no-op on the line backend.
+                let status = {
+                    let _terminal = pauser.pause_for(tui::PauseFor::Input).await;
+                    println!("{addr}: {}", argv.join(" "));
+                    // Through the engine's exec-runner seam, so a source whose
+                    // tool lives in a devenv shell signs in *there* — the same
+                    // place its probe looked. Stdio is inherited: a browser flow
+                    // needs the terminal when there is one, and an agent needs
+                    // to see the URL and code on its own output when there is
+                    // not.
+                    engine.run_login(&rs, addr, src, argv).await?
+                };
                 if !status.success() {
                     anyhow::bail!("{addr}: `{}` exited with {status}", argv.join(" "));
                 }
@@ -405,7 +527,9 @@ async fn login(args: LoginArgs, global: GlobalOptions) -> anyhow::Result<()> {
         }
     }
     if ran == 0 && gaps.is_empty() {
-        println!("nothing to sign in to — every declared credential already applies here");
+        tui::paused!(ctx, {
+            println!("nothing to sign in to — every declared credential already applies here")
+        });
     }
     crate::commands::errors::require_complete_selection(&gaps)
 }
@@ -422,7 +546,21 @@ async fn logout() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Every `credential` target in the workspace (or under `matcher`).
+/// The selection `credentials_matching` walks: the workspace, or `matcher`.
+fn credential_matcher(matcher: Option<&str>) -> anyhow::Result<Matcher> {
+    let cwp = get_cwp()?;
+    // Through the expression slot, not the positional one: the single-positional
+    // form takes an *address*, and the selection here is a package matcher.
+    crate::commands::utils::resolve_matcher(
+        &Some(matcher.unwrap_or("//...").to_string()),
+        &None,
+        &None,
+        &cwp,
+        true,
+    )
+}
+
+/// Every `credential` target under `m`.
 ///
 /// Selects with `driver(credential)`, so a provider that lists each target's
 /// driver (go, buildfile) decides every other target from its listing without
@@ -433,25 +571,6 @@ async fn logout() -> anyhow::Result<()> {
 /// a broken package elsewhere in the workspace must not hide the credentials
 /// that do resolve. The caller reports the skips once it has shown what it
 /// found.
-async fn find_credentials(
-    engine: &Arc<Engine>,
-    rs: &Arc<crate::engine::request_state::RequestState>,
-    matcher: Option<&str>,
-    discovery: crate::engine::Discovery,
-) -> anyhow::Result<Vec<(Addr, CredentialDef)>> {
-    let cwp = get_cwp()?;
-    // Through the expression slot, not the positional one: the single-positional
-    // form takes an *address*, and the selection here is a package matcher.
-    let m = crate::commands::utils::resolve_matcher(
-        &Some(matcher.unwrap_or("//...").to_string()),
-        &None,
-        &None,
-        &cwp,
-        true,
-    )?;
-    credentials_matching(engine, rs, &m, discovery).await
-}
-
 async fn credentials_matching(
     engine: &Arc<Engine>,
     rs: &Arc<crate::engine::request_state::RequestState>,
@@ -610,6 +729,265 @@ mod tests {
             gaps.is_empty(),
             "a candidate that was never there is not an incomplete selection"
         );
+        Ok(())
+    }
+
+    fn s(v: &str) -> Value {
+        Value::String(v.to_string())
+    }
+
+    fn env_source(name: &str) -> Value {
+        Value::Map(
+            [
+                ("kind".to_string(), s("env")),
+                ("names".to_string(), Value::List(vec![s(name)])),
+            ]
+            .into(),
+        )
+    }
+
+    /// An `exec` source whose tool is nowhere on PATH, so the probe finds it
+    /// stale and `login` runs `login_argv`.
+    fn stale_exec_source(login_argv: &str) -> Value {
+        Value::Map(
+            [
+                ("kind".to_string(), s("exec")),
+                (
+                    "run".to_string(),
+                    Value::List(vec![s("heph-auth-test-no-such-tool")]),
+                ),
+                ("login".to_string(), Value::List(vec![s(login_argv)])),
+            ]
+            .into(),
+        )
+    }
+
+    /// An engine whose only target is `//auth:token`, a credential with
+    /// `sources`.
+    fn credential_engine(
+        root: &std::path::Path,
+        sources: Vec<Value>,
+    ) -> anyhow::Result<Arc<Engine>> {
+        let mut engine = Engine::new(Config {
+            root: root.to_path_buf(),
+            home_dir: root.join(".heph3"),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let credential = pluginstatictarget::Target {
+            addr: "//auth:token".to_string(),
+            driver: DRIVER_NAME.to_string(),
+            raw_config: [
+                ("sources".to_string(), Value::List(sources)),
+                (
+                    "present".to_string(),
+                    Value::Map(
+                        [(
+                            "env".to_string(),
+                            Value::Map([("TOKEN".to_string(), s("${token}"))].into()),
+                        )]
+                        .into(),
+                    ),
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let provider = pluginstatictarget::Provider::new(vec![credential])?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok(Arc::new(engine))
+    }
+
+    fn token() -> Addr {
+        hmodel::htaddr::parse_addr("//auth:token").expect("addr")
+    }
+
+    /// The status body under the line backend an agent gets — the path the
+    /// command takes with no tty.
+    async fn run_status(engine: Arc<Engine>, json: bool) -> anyhow::Result<()> {
+        let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
+        let args = StatusArgs {
+            matcher: None,
+            json,
+        };
+        run_with_progress("t", LogSink::new_direct(), true, shutdown, move |ctx| {
+            status_body(
+                engine,
+                args,
+                Matcher::PackagePrefix(PkgBuf::from("")),
+                false,
+                ctx,
+            )
+        })
+        .await
+    }
+
+    /// Moving `status` under the progress app must not move its exit: zero when
+    /// every row is ok, non-zero — with the count — when one is not, `--json`
+    /// or not.
+    #[tokio::test]
+    async fn status_exits_non_zero_unless_every_row_is_ok() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        // PATH is set wherever a test runs.
+        let ok = credential_engine(root.path(), vec![env_source("PATH")])?;
+        run_status(Arc::clone(&ok), false).await?;
+        run_status(ok, true).await?;
+
+        let root = tempfile::tempdir()?;
+        let unset = || env_source("HEPH_AUTH_TEST_CERTAINLY_UNSET_TOKEN");
+        for json in [false, true] {
+            let missing = credential_engine(root.path(), vec![unset()])?;
+            let err = run_status(missing, json)
+                .await
+                .expect_err("an unavailable credential fails the preflight");
+            assert!(
+                err.to_string().contains("1 of 1 credentials"),
+                "json={json}: {err:#}"
+            );
+        }
+        Ok(())
+    }
+
+    async fn run_explain(engine: Arc<Engine>, json: bool) -> anyhow::Result<()> {
+        let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
+        run_with_progress("t", LogSink::new_direct(), true, shutdown, move |ctx| {
+            explain_body(engine, token(), json, ctx)
+        })
+        .await
+    }
+
+    /// `explain` fails when nothing applies — except under `--json`, where
+    /// whether a source was chosen is in the document.
+    #[tokio::test]
+    async fn explain_fails_when_no_source_applies_unless_json() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let ok = credential_engine(root.path(), vec![env_source("PATH")])?;
+        run_explain(ok, false).await?;
+
+        let root = tempfile::tempdir()?;
+        let unset = || env_source("HEPH_AUTH_TEST_CERTAINLY_UNSET_TOKEN");
+        let err = run_explain(credential_engine(root.path(), vec![unset()])?, false)
+            .await
+            .expect_err("nothing applies");
+        assert!(err.to_string().contains("no source applies"), "{err:#}");
+        run_explain(credential_engine(root.path(), vec![unset()])?, true).await?;
+        Ok(())
+    }
+
+    async fn run_login(engine: Arc<Engine>) -> anyhow::Result<()> {
+        let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
+        run_with_progress("t", LogSink::new_direct(), true, shutdown, move |ctx| {
+            login_body(engine, Wanted::One(token()), false, ctx)
+        })
+        .await
+    }
+
+    /// `login` runs a stale source's sign-in command with the terminal handed
+    /// over (a no-op pause on the line backend) and takes its exit: a failed
+    /// sign-in fails the command.
+    #[tokio::test]
+    async fn login_runs_the_stale_sign_in_and_takes_its_exit() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        run_login(credential_engine(
+            root.path(),
+            vec![stale_exec_source("true")],
+        )?)
+        .await?;
+
+        let root = tempfile::tempdir()?;
+        let err = run_login(credential_engine(
+            root.path(),
+            vec![stale_exec_source("false")],
+        )?)
+        .await
+        .expect_err("a failed sign-in fails the command");
+        assert!(err.to_string().contains("`false` exited with"), "{err:#}");
+
+        // Nothing stale: nothing runs, and that is a success.
+        let root = tempfile::tempdir()?;
+        run_login(credential_engine(root.path(), vec![env_source("PATH")])?).await?;
+        Ok(())
+    }
+
+    fn row(addr: &str, state: State, source: &str) -> Row {
+        Row {
+            addr: addr.to_string(),
+            state,
+            source: source.to_string(),
+            expires_at: None,
+            login: vec![],
+        }
+    }
+
+    /// The table is what it was before it moved behind the TUI, byte for byte.
+    #[test]
+    fn the_status_table_renders_unchanged() -> anyhow::Result<()> {
+        let mut aws = row("//auth:aws", State::NeedsSignIn, "exec(aws)");
+        aws.login = vec![vec![
+            "aws".to_string(),
+            "sso".to_string(),
+            "login".to_string(),
+        ]];
+        let mut gh = row("//auth:gh", State::Ok, "env(GH_TOKEN)");
+        gh.expires_at = Some("2026-09-08T15:41:00+00:00".to_string());
+        let ci = row("//ci:x", State::Unavailable, "oidc(github_actions)");
+        let rows = [aws, gh, ci];
+
+        assert_eq!(
+            render_status(&rows, true, false)?,
+            "//auth:aws  needs sign-in  exec(aws)                run: heph auth login //auth:aws\n\
+             //auth:gh   ok             env(GH_TOKEN)            expires 2026-09-08T15:41:00+00:00\n\
+             //ci:x      unavailable    oidc(github_actions)     \n"
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&render_status(&rows, true, true)?)?;
+        assert_eq!(json.as_array().map(Vec::len), Some(3));
+        assert_eq!(json[0]["state"], "needs_sign_in");
+        Ok(())
+    }
+
+    /// An empty table says "none here" only when the walk reached everything;
+    /// otherwise the incomplete-selection block is the answer.
+    #[test]
+    fn an_empty_status_claims_none_only_for_a_complete_walk() -> anyhow::Result<()> {
+        assert_eq!(
+            render_status(&[], true, false)?,
+            "no `credential` targets in this workspace\n"
+        );
+        assert_eq!(render_status(&[], false, false)?, "");
+        assert_eq!(render_status(&[], false, true)?, "[]\n");
+        Ok(())
+    }
+
+    #[test]
+    fn the_explain_chain_renders_unchanged() -> anyhow::Result<()> {
+        let steps = [
+            ExplainStep {
+                index: 0,
+                source: "env(TOKEN)".to_string(),
+                chosen: false,
+                skipped: Some("TOKEN unset".to_string()),
+                hint: "export TOKEN".to_string(),
+            },
+            ExplainStep {
+                index: 1,
+                source: "exec(gh)".to_string(),
+                chosen: true,
+                skipped: None,
+                hint: String::new(),
+            },
+        ];
+        assert_eq!(
+            render_explain(&token(), &steps, false)?,
+            "//auth:token\n  \
+             1. env(TOKEN)               skipped: TOKEN unset\n                            \
+             → export TOKEN\n  \
+             2. exec(gh)                 applies here\n"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render_explain(&token(), &steps, true)?)?;
+        assert_eq!(json["addr"], "//auth:token");
+        assert_eq!(json["sources"][1]["chosen"], true);
         Ok(())
     }
 
