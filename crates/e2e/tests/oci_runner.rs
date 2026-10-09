@@ -341,6 +341,64 @@ target(
     Ok(())
 }
 
+/// A tool the target declares must be findable inside the container, and the
+/// image's own directories must still be there behind it.
+///
+/// The regression this pins: a runner that carries the environment out of band
+/// — `oci` turns it into `docker exec -e KEY=VALUE` and hands back the *docker
+/// client's* environment — used to have the `PATH` prefix composed onto it
+/// after `prepare`, i.e. onto the client. The target inside the container got
+/// neither its declared tools nor heph's builtins, and silently: the container
+/// fell back to the image's own tools, so a recipe kept working with a
+/// different binary than its cache key names.
+#[tokio::test]
+async fn a_declared_tool_is_on_the_path_inside_the_container() -> anyhow::Result<()> {
+    skip_unless_docker!();
+    if !build_marker_image() {
+        eprintln!("skipping: could not build the fixture image");
+        return Ok(());
+    }
+
+    let ws = workspace();
+    ws.write_build_file(
+        "svc",
+        &format!(
+            r#"
+target(
+    name = "runner",
+    driver = "oci_runner",
+    image = "{MARKER_IMAGE}",
+)
+target(
+    name = "tool",
+    driver = "bash",
+    run = "printf '#!/bin/sh\necho from-the-declared-tool\n' > $OUT && chmod +x $OUT",
+    out = "heph-e2e-tool",
+)
+target(
+    name = "inside",
+    driver = "bash",
+    runner = ":runner",
+    tools = [":tool"],
+    run = "{{ heph-e2e-tool; command -v cat; }} > $OUT",
+    out = "where.txt",
+)
+"#
+        ),
+    );
+
+    let got = common::artifact_string(&*ws.run("//svc:inside").await?);
+    assert!(
+        got.contains("from-the-declared-tool"),
+        "a declared tool must be on PATH inside the container; got {got:?}"
+    );
+    assert!(
+        got.contains("/bin/cat"),
+        "the image's own directories must still be on PATH behind the target's; got {got:?}"
+    );
+    Ok(())
+}
+
 /// An image the daemon has never seen must fail by name, pointing at the
 /// `oci_load` that would put it there — not fail somewhere later with a digest
 /// nobody can explain.
