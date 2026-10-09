@@ -91,6 +91,28 @@ other's silence as "no labels". A removal whose zero value means anything but
 "no" — is major. `plugin-abi`'s `removed_labels_decode_as_unknown_on_a_0_11_host`
 pins this case.
 
+## A new capability the *caller* must offer: a flag, pointed so zero means "no"
+
+A field added to a reply is skipped by a reader that predates it — silently, and
+with nothing to notice. That is harmless for a value the old reader never needed
+(0.12.0's `hashout`) and wrong for one it was supposed to act on: 0.15.0's
+`declared_targets`/`declared_states`, a declaring provider function's targets,
+would have been dropped by an old host and the build configured as if the author
+had declared nothing, hashed as if intended.
+
+So the capability is advertised by the **caller**, on the request
+(`accepts_declarations`), and the producing side tests the flag rather than a
+version. Point the flag so the proto3 zero value is the *refusal*: absent means
+"I cannot carry these", which is exactly what an older caller means by not
+sending it. The callee then fails loudly instead of answering with a reply the
+caller would misread. The mirror image — a flag whose zero means "yes, go ahead"
+— reintroduces the silent drop, and is wrong however it reads in the field name.
+`plugin-abi`'s `a_declaration_crosses_whole_or_not_at_all` and
+`an_absent_accepts_declarations_reads_as_refusal` pin both halves.
+
+Minor, not major: nothing frozen moved and no old pairing breaks, but a callee
+must reach the version before it can declare.
+
 An **unknown `Matcher` arm** is a decode error on the host (since 0.13.0), not a
 silent `Or[]`: a plugin built against a newer schema fails the call loudly
 instead of matching nothing, or everything under `Not`. An old host still

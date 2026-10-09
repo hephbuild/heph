@@ -258,11 +258,216 @@ pub enum GetError {
 
 /// A function a provider exposes to BUILD files, surfaced as the Starlark symbol
 /// `heph.<provider name>.<function name>`. Args and the return value are the loose
-/// dynamic [`Value`] type so calls can cross provider boundaries (in-process now,
-/// out-of-process plugins later).
+/// dynamic [`Value`] type so calls can cross provider boundaries — in-process,
+/// out to a cdylib plugin, and from one plugin into another provider's function.
+///
+/// A function may also *declare* targets and provider-state as a side effect of
+/// being called — see [`FnOutcome`]. This is what turns a provider function into a
+/// "build-file plugin": a convenience wrapper that a BUILD file calls to emit fully
+/// configured `target(...)`/`provider_state(...)` declarations, instead of the
+/// author writing a provider or driver of their own. The host (the buildfile
+/// provider) merges the declared targets into the calling package exactly as if
+/// the BUILD file had written them, wherever the function ran.
 #[async_trait]
 pub trait ProviderFn: Send + Sync {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value>;
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome>;
+}
+
+/// A target a provider function declares when called from a BUILD file. Mirrors the
+/// arguments of the `target()` builtin; the host merges each declaration into the
+/// caller's package ([`FnCallContext::pkg`]) as if the BUILD file had written the
+/// `target(...)` call itself. An empty `driver` falls back to the declaring
+/// package's provider default, same as `target()`.
+#[derive(Debug, PartialEq)]
+pub struct DeclaredTarget {
+    pub name: String,
+    pub driver: String,
+    pub labels: Vec<String>,
+    /// The same map `target(transitive = {...})` takes (`deps`, `env`, …), or
+    /// `Null` for none. Deliberately untyped: the host parses it exactly as it
+    /// parses the builtin's argument — resolving relative addresses against the
+    /// calling package, hashing every dep, assigning deterministic ids — so a
+    /// declared target cannot carry a transitive sandbox a BUILD file could not.
+    pub transitive: Value,
+    pub approval: Approval,
+    /// Driver options. The keys `target()` consumes itself (`name`, `driver`,
+    /// `labels`, `transitive`, `approval`) are rejected here — they have fields.
+    pub config: HashMap<String, Value>,
+}
+
+impl Default for DeclaredTarget {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            driver: String::new(),
+            labels: Vec::new(),
+            transitive: Value::Null(),
+            approval: Approval::default(),
+            config: HashMap::new(),
+        }
+    }
+}
+
+/// Package-level provider state a provider function declares, mirroring the
+/// `provider_state(provider=…, **args)` builtin.
+#[derive(Debug, Default, PartialEq)]
+pub struct DeclaredState {
+    pub provider: String,
+    pub args: HashMap<String, Value>,
+}
+
+/// What a [`ProviderFn`] returns: the [`Value`] substituted at the call site, plus
+/// any targets and provider-state the call declared. Value-only functions (the
+/// common case — `glob`, `join`, …) build this with `Value::into`; a wrapper function that stands up a target also pushes
+/// [`DeclaredTarget`]s / [`DeclaredState`]s.
+///
+/// Declarations cross the out-of-process plugin ABI, so a cdylib provider
+/// function can stand up a target too (`CallFunctionRequest.accepts_declarations`,
+/// ABI 0.15.0). A caller that predates the capability does not advertise it, and
+/// then a declaring function **fails the call** rather than answering with its
+/// value alone — a dropped declaration would otherwise configure the build
+/// differently from what the author wrote, and hash as if that were intended.
+///
+/// A function that calls **another** provider function (a plugin reaching into
+/// another plugin's rule) is the one hop the host cannot police: the inner
+/// outcome's declarations reach the package only if the outer function passes
+/// them on. That is why the fields are private and [`absorb`](FnOutcome::absorb)
+/// is the consuming path that keeps them. It is not airtight — reading
+/// [`value`](FnOutcome::value) and dropping the rest still discards them — so
+/// relaying remains something an author does on purpose.
+///
+/// Know which half of that has a safety net. Losing a relayed **target** fails
+/// loudly: the value names a target nobody created, and the build stops at
+/// "target not found". Losing a relayed **state** is silent — the package keeps
+/// building, every target in it parses with provider defaults, and the def hash
+/// records that as if the author had asked for it. Relay with `absorb`.
+///
+/// What a declaring function owes, since it runs unsandboxed while BUILD files
+/// are evaluated:
+/// - **Order does not matter, and ambiguity is refused.** The host sorts
+///   declared targets by name and states by provider before merging, because
+///   package order reaches downstream def hashes — iterating a `HashMap` must
+///   not flap cache keys. One call declaring the same target name, or two states
+///   for one provider, is an error rather than a coin flip: state is read
+///   last-wins, so the winner would be whichever the function happened to yield
+///   first. Declare the state once, with the values it should have.
+/// - **No host-specific values.** [`FnCallContext::root`] is an absolute path;
+///   putting it (or anything derived from the machine) into a declaration puts
+///   it into the def hash, and the cache is never shared across machines.
+/// - **Whatever it reads is captured only through what it declares.** Package
+///   evaluation is not cached beyond one invocation, so that is enough today; a
+///   long-lived engine would have to track what these functions read.
+#[derive(Debug)]
+#[must_use = "a provider function's outcome carries what it declared; dropping it drops them"]
+pub struct FnOutcome {
+    value: Value,
+    targets: Vec<DeclaredTarget>,
+    states: Vec<DeclaredState>,
+}
+
+impl FnOutcome {
+    /// Declare a target, which the host merges into the package being evaluated.
+    pub fn declare_target(&mut self, target: DeclaredTarget) -> &mut Self {
+        self.targets.push(target);
+        self
+    }
+
+    /// Declare package-level provider state.
+    pub fn declare_state(&mut self, state: DeclaredState) -> &mut Self {
+        self.states.push(state);
+        self
+    }
+
+    /// The value substituted at the call site.
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// Set the value substituted at the call site — for a function that decides
+    /// it only after relaying another call (see [`absorb`](Self::absorb)).
+    pub fn set_value(&mut self, value: Value) -> &mut Self {
+        self.value = value;
+        self
+    }
+
+    pub fn targets(&self) -> &[DeclaredTarget] {
+        &self.targets
+    }
+
+    pub fn states(&self) -> &[DeclaredState] {
+        &self.states
+    }
+
+    /// Split into value and declarations, for the host merging them into a
+    /// package and for the codec putting them on the wire. A provider function
+    /// relaying another function's outcome wants [`absorb`](Self::absorb): this
+    /// hands over the declarations and leaves honoring them to the caller.
+    pub fn into_parts(self) -> (Value, Vec<DeclaredTarget>, Vec<DeclaredState>) {
+        (self.value, self.targets, self.states)
+    }
+
+    /// Rebuild from parts — the decoding half of [`into_parts`](Self::into_parts).
+    pub fn from_parts(
+        value: Value,
+        targets: Vec<DeclaredTarget>,
+        states: Vec<DeclaredState>,
+    ) -> Self {
+        Self {
+            value,
+            targets,
+            states,
+        }
+    }
+
+    /// The return value alone, for a caller that cannot carry declarations.
+    /// Errors when the call declared anything, since answering with the value
+    /// would drop them where no one could notice.
+    ///
+    /// Two kinds of caller: a wire handler whose peer did not advertise the
+    /// capability — it adds which side is old and what to do about it — and a
+    /// value-only call site asserting that the function it called declares
+    /// nothing. So the message stays about the outcome, not the ABI.
+    pub fn into_value_only(self) -> anyhow::Result<Value> {
+        if !self.targets.is_empty() || !self.states.is_empty() {
+            anyhow::bail!(
+                "declared {} target(s) and {} provider_state(s), but this caller \
+                 cannot carry declarations",
+                self.targets.len(),
+                self.states.len()
+            );
+        }
+        Ok(self.value)
+    }
+
+    /// Take `inner`'s declarations into this outcome and return its value — how
+    /// a provider function reads the outcome of **another** provider function it
+    /// called, so declarations made down the chain reach the host instead of
+    /// stopping at this hop.
+    ///
+    /// The only *consuming* path that keeps declarations. Private fields put
+    /// this one first, but they do not make it the only one: `value()` and then
+    /// a drop, or [`into_parts`](Self::into_parts) ignoring two bindings, still
+    /// discard them — silently, for a state (see the type's docs).
+    ///
+    /// ```ignore
+    /// let mut out = FnOutcome::from(Value::Null());
+    /// let inner_addr = out.absorb(other_fn.call(ctx, args).await?);
+    /// ```
+    pub fn absorb(&mut self, inner: FnOutcome) -> Value {
+        self.targets.extend(inner.targets);
+        self.states.extend(inner.states);
+        inner.value
+    }
+}
+
+impl From<Value> for FnOutcome {
+    fn from(value: Value) -> Self {
+        Self {
+            value,
+            targets: Vec::new(),
+            states: Vec::new(),
+        }
+    }
 }
 
 /// One exposed function: its bare name (no `heph.<provider>.` prefix), its
@@ -486,4 +691,75 @@ pub trait Provider: Send + Sync {
     /// Called once by the engine before the first dispatch. Default: no-op —
     /// only consumers (the buildfile provider) override it.
     fn set_function_registry(&self, _reg: Arc<ProviderFunctionRegistry>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn declaring(name: &str) -> FnOutcome {
+        FnOutcome {
+            value: Value::String(format!("//p:{name}")),
+            targets: vec![DeclaredTarget {
+                name: name.to_string(),
+                ..Default::default()
+            }],
+            states: vec![DeclaredState {
+                provider: "p".to_string(),
+                args: HashMap::new(),
+            }],
+        }
+    }
+
+    /// What a provider function must do with another provider function's
+    /// outcome: keep its declarations, use its value. Reading `.value` instead
+    /// is the one way declarations are still lost, and no guard can see it.
+    #[test]
+    fn absorb_keeps_the_inner_declarations_and_yields_its_value() {
+        let mut outer = FnOutcome::from(Value::Null());
+        let value = outer.absorb(declaring("inner"));
+
+        assert_eq!(value, Value::String("//p:inner".to_string()));
+        assert_eq!(
+            outer.value,
+            Value::Null(),
+            "the inner value is returned, not adopted"
+        );
+        assert_eq!(
+            outer
+                .targets
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["inner"]
+        );
+        assert_eq!(outer.states.len(), 1);
+
+        // Absorbing twice accumulates, so a function may relay several calls.
+        outer.absorb(declaring("second"));
+        assert_eq!(
+            outer
+                .targets
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["inner", "second"]
+        );
+    }
+
+    /// A caller that cannot carry declarations gets an error, never the value
+    /// with the declarations quietly missing. The message says what was about to
+    /// be lost; which peer is old, and the remedy, is the wire handler's to add.
+    #[test]
+    fn into_value_only_refuses_to_drop_declarations() {
+        let err = declaring("t").into_value_only().expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("declared 1 target(s)"), "{msg}");
+        assert!(msg.contains("1 provider_state(s)"), "{msg}");
+
+        let v = FnOutcome::from(Value::Bool(true))
+            .into_value_only()
+            .expect("a value-only outcome passes");
+        assert_eq!(v, Value::Bool(true));
+    }
 }

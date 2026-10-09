@@ -145,6 +145,14 @@ pub struct Provider {
     /// pkg in a typical run), and dedupes concurrent in-flight parses on the same
     /// pkg. Caches errors too — a failed parse stays failed for the lifetime of
     /// the provider (BUILD file contents don't change mid-session).
+    ///
+    /// Every cache here lives for one invocation, and that is load-bearing: an
+    /// evaluated package can contain targets a *provider function* declared
+    /// (`heph.<provider>.<fn>(…)`), so its content depends on the code of that
+    /// provider — a plugin that may be upgraded — and not only on the BUILD
+    /// files. Persist a package result across invocations and the declaring
+    /// plugin's identity becomes part of that entry's key; keyed on BUILD
+    /// content alone, an upgraded plugin's new declarations would never be seen.
     pub(crate) pkg_cache: Memoizer<String, Result<Arc<RunResult>, Arc<anyhow::Error>>>,
     /// The sorted workspace package list, walked once. Shared with every
     /// [`BuildFileLoader`] so `heph.core.packages()` reads the same list from any

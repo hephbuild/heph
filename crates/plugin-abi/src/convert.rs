@@ -15,7 +15,7 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::targetdef::{RawDef, RawDefBytes};
-use hplugin::provider::{Approval, State, TargetSpec};
+use hplugin::provider::{Approval, DeclaredState, DeclaredTarget, FnOutcome, State, TargetSpec};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -541,6 +541,107 @@ fn approval_from_pb(a: pb::Approval) -> Approval {
     }
 }
 
+// ---- Declarations (what a provider function declared) ----
+//
+// `transitive` crosses as the unparsed `htvalue::Value` the BUILD file writes,
+// not a `Sandbox`: the host parses it with the same code as the `target()`
+// builtin's argument, so a declaration cannot carry a sandbox a BUILD file
+// could not express. `Value::Null()` is "none", which is also what an absent
+// field decodes to.
+
+pub fn declared_target_to_pb(t: &DeclaredTarget) -> pb::DeclaredTarget {
+    pb::DeclaredTarget {
+        name: t.name.clone(),
+        driver: t.driver.clone(),
+        labels: t.labels.clone(),
+        transitive: Some(value_to_pb(&t.transitive)),
+        approval: Some(approval_to_pb(&t.approval)),
+        config: t
+            .config
+            .iter()
+            .map(|(k, v)| (k.clone(), value_to_pb(v)))
+            .collect(),
+    }
+}
+
+pub fn declared_target_from_pb(t: pb::DeclaredTarget) -> DeclaredTarget {
+    DeclaredTarget {
+        name: t.name,
+        driver: t.driver,
+        labels: t.labels,
+        transitive: t.transitive.map_or_else(Value::Null, value_from_pb),
+        approval: approval_from_pb(t.approval.unwrap_or_default()),
+        config: t
+            .config
+            .into_iter()
+            .map(|(k, v)| (k, value_from_pb(v)))
+            .collect(),
+    }
+}
+
+pub fn declared_state_to_pb(s: &DeclaredState) -> pb::DeclaredState {
+    pb::DeclaredState {
+        provider: s.provider.clone(),
+        args: s
+            .args
+            .iter()
+            .map(|(k, v)| (k.clone(), value_to_pb(v)))
+            .collect(),
+    }
+}
+
+pub fn declared_state_from_pb(s: pb::DeclaredState) -> DeclaredState {
+    DeclaredState {
+        provider: s.provider,
+        args: s
+            .args
+            .into_iter()
+            .map(|(k, v)| (k, value_from_pb(v)))
+            .collect(),
+    }
+}
+
+/// Encode a provider function's outcome as a `CallFunction` reply.
+///
+/// `accepts_declarations` is what the *caller* said it can carry. False (an
+/// older peer, which never sends the field) plus a declaring function is an
+/// error: prost would skip the fields and the caller would read a plain value,
+/// building something other than what the author declared.
+pub fn call_function_response(
+    outcome: FnOutcome,
+    accepts_declarations: bool,
+) -> anyhow::Result<pb::CallFunctionResponse> {
+    if !accepts_declarations {
+        return Ok(pb::CallFunctionResponse {
+            value: Some(value_to_pb(&outcome.into_value_only()?)),
+            declared_targets: Vec::new(),
+            declared_states: Vec::new(),
+        });
+    }
+    let (value, targets, states) = outcome.into_parts();
+    Ok(pb::CallFunctionResponse {
+        value: Some(value_to_pb(&value)),
+        declared_targets: targets.iter().map(declared_target_to_pb).collect(),
+        declared_states: states.iter().map(declared_state_to_pb).collect(),
+    })
+}
+
+/// Decode a `CallFunction` reply. An older peer sends no declaration fields,
+/// which decode to none — the same as a function that declared nothing.
+pub fn fn_outcome_from_pb(r: pb::CallFunctionResponse) -> FnOutcome {
+    FnOutcome::from_parts(
+        value_from_pb(r.value.unwrap_or_default()),
+        r.declared_targets
+            .into_iter()
+            .map(declared_target_from_pb)
+            .collect(),
+        r.declared_states
+            .into_iter()
+            .map(declared_state_from_pb)
+            .collect(),
+    )
+}
+
 // ---- Matcher ----
 
 pub fn matcher_to_pb(m: &Matcher) -> pb::Matcher {
@@ -998,6 +1099,158 @@ pub fn raw_def_from_blob(blob: &pb::RawDefBlob) -> anyhow::Result<Arc<dyn RawDef
 
 #[cfg(test)]
 mod tests {
+
+    /// Every field of a declaration survives the wire, and an old caller's
+    /// absent `accepts_declarations` is read as "cannot carry them" rather than
+    /// as permission to answer with the value alone.
+    #[test]
+    fn a_declaration_crosses_whole_or_not_at_all() {
+        // Several keys per map, deliberately: a one-key map would survive even a
+        // codec that dropped every key but the first, and `HashMap`'s iteration
+        // (and so its `Debug`) differs between two instances of equal content,
+        // which is why this compares structurally rather than by `Debug`.
+        let target = || DeclaredTarget {
+            name: "t".to_string(),
+            driver: "exec".to_string(),
+            labels: vec!["gen".to_string(), "codegen".to_string()],
+            transitive: Value::Map(
+                [
+                    (
+                        "deps".to_string(),
+                        Value::List(vec![
+                            Value::String(":s".to_string()),
+                            Value::String("//other:t".to_string()),
+                        ]),
+                    ),
+                    (
+                        "env".to_string(),
+                        Value::Map([("K".to_string(), Value::String("v".to_string()))].into()),
+                    ),
+                ]
+                .into(),
+            ),
+            approval: Approval {
+                required: true,
+                notice: vec!["sec".to_string()],
+            },
+            config: [
+                ("run".to_string(), Value::String("gen".to_string())),
+                ("out".to_string(), Value::List(vec![Value::Int(1)])),
+                ("n".to_string(), Value::Uint(7)),
+            ]
+            .into(),
+        };
+        let state = || DeclaredState {
+            provider: "codegen".to_string(),
+            args: [
+                ("v".to_string(), Value::Int(1)),
+                ("on".to_string(), Value::Bool(true)),
+            ]
+            .into(),
+        };
+
+        let mut outcome = FnOutcome::from(Value::String("//p:t".to_string()));
+        outcome.declare_target(target()).declare_state(state());
+
+        let resp = call_function_response(outcome, true).expect("a willing caller");
+        let (value, targets, states) = fn_outcome_from_pb(resp).into_parts();
+        assert_eq!(value, Value::String("//p:t".to_string()));
+        assert_eq!(targets, vec![target()], "round trip is lossless");
+        assert_eq!(states, vec![state()]);
+
+        // An old caller (no flag) plus a declaring function: an error.
+        let mut declaring = FnOutcome::from(Value::Null());
+        declaring.declare_target(DeclaredTarget::default());
+        let err = call_function_response(declaring, false)
+            .expect_err("must not answer with the value alone");
+        // Which side is old, and the remedy, belong to the wire handlers that
+        // know it — this layer only reports what was about to be lost.
+        let msg = format!("{err:#}");
+        assert!(msg.contains("declared 1 target(s)"), "{msg}");
+        assert!(msg.contains("cannot carry declarations"), "{msg}");
+
+        // An old caller plus a value-only function: unaffected, and it sends no
+        // declaration fields, which an old peer would skip anyway.
+        let resp = call_function_response(FnOutcome::from(Value::Bool(true)), false)
+            .expect("value-only crosses to any caller");
+        assert!(resp.declared_targets.is_empty() && resp.declared_states.is_empty());
+        assert_eq!(
+            fn_outcome_from_pb(resp)
+                .into_value_only()
+                .expect("decodes as a value-only outcome"),
+            Value::Bool(true)
+        );
+    }
+
+    /// The flag is pointed so that an older caller — which cannot send it —
+    /// means "I cannot carry declarations". Pinned on the bytes, the way
+    /// `removed_labels_decode_as_unknown_on_a_0_11_host` pins its case: a
+    /// request a pre-0.15.0 peer produced has no field 6, and that must read as
+    /// a refusal rather than as permission.
+    #[test]
+    fn an_absent_accepts_declarations_reads_as_refusal() {
+        use prost::Message;
+
+        // The schemas as they were before the flag existed, so what is encoded
+        // here is genuinely what an older peer puts on the wire — rather than
+        // the current schema with the field set to false, which proves only that
+        // prost round-trips a bool.
+        #[derive(prost::Message)]
+        struct CallFunctionRequestV014 {
+            #[prost(string, tag = "1")]
+            name: String,
+            #[prost(string, tag = "2")]
+            pkg: String,
+            #[prost(string, tag = "3")]
+            root: String,
+        }
+        #[derive(prost::Message)]
+        struct CallRegisteredRequestV014 {
+            #[prost(string, tag = "1")]
+            provider: String,
+            #[prost(string, tag = "2")]
+            name: String,
+            #[prost(string, tag = "3")]
+            pkg: String,
+            #[prost(string, tag = "4")]
+            root: String,
+        }
+
+        let old = CallFunctionRequestV014 {
+            name: "f".to_string(),
+            pkg: "p".to_string(),
+            root: "/ws".to_string(),
+        }
+        .encode_to_vec();
+        let decoded = pb::CallFunctionRequest::decode(&old[..]).expect("decode");
+        assert_eq!(decoded.name, "f", "the fields it does send still arrive");
+        assert!(
+            !decoded.accepts_declarations,
+            "absent must read as refusal, never as permission"
+        );
+
+        // …and that refusal is what the declaring function is answered with.
+        let mut declaring = FnOutcome::from(Value::Null());
+        declaring.declare_target(DeclaredTarget::default());
+        assert!(
+            call_function_response(declaring, decoded.accepts_declarations).is_err(),
+            "an old caller's request must not be answered with a bare value"
+        );
+
+        // Same for the plugin->host direction (field 7).
+        let old = CallRegisteredRequestV014 {
+            provider: "p".to_string(),
+            name: "f".to_string(),
+            pkg: "p".to_string(),
+            root: "/ws".to_string(),
+        }
+        .encode_to_vec();
+        assert!(
+            !pb::CallRegisteredRequest::decode(&old[..])
+                .expect("decode")
+                .accepts_declarations
+        );
+    }
 
     /// A value that still needs the sandbox must not reach a plugin — and must
     /// not be silently dropped on the way, which would surface as a missing key

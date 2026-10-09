@@ -9,6 +9,7 @@ use crate::abi::{
 };
 use crate::seam::panic_text;
 use crate::vtable::dynify;
+use anyhow::Context;
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
@@ -374,10 +375,39 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                     .map(|(k, v)| (k, convert::value_from_pb(v)))
                     .collect(),
             };
-            match rf.func.call(&ctx, args).await {
-                Ok(v) => unary(Body::CallFunctionResp(pb::CallFunctionResponse {
-                    value: Some(convert::value_to_pb(&v)),
-                })),
+            // A plugin called this host function. Its declarations ride back in
+            // the reply when the calling plugin says it carries them; otherwise
+            // they are an error, not a drop.
+            let accepts = req.accepts_declarations;
+            let res = match rf.func.call(&ctx, args).await {
+                Ok(o) => {
+                    tracing::debug!(
+                        provider = %req.provider,
+                        function = %req.name,
+                        pkg = %req.pkg,
+                        declarations = o.targets().len() + o.states().len(),
+                        "host function answered a plugin"
+                    );
+                    // Only the refusal path errors here, and there the old side
+                    // is the plugin that called in.
+                    convert::call_function_response(o, accepts).with_context(|| {
+                        format!(
+                            "host function `{}.{}`: the calling plugin does not carry \
+                             declarations (built against plugin ABI older than 0.15.0) \
+                             — rebuild the plugin",
+                            req.provider, req.name
+                        )
+                    })
+                }
+                Err(e) => Err(e).with_context(|| {
+                    format!(
+                        "host function `{}.{}` called from a plugin",
+                        req.provider, req.name
+                    )
+                }),
+            };
+            match res {
+                Ok(resp) => unary(Body::CallFunctionResp(resp)),
                 Err(e) => unary(err_body(format!("{e:#}"))),
             }
         };
@@ -654,6 +684,108 @@ mod tests {
     use super::{HostArtifactContent, HostLogSink, HostSupervisor};
     use crate::abi::{DynRead, StableArtifactContent, StableRead, StableReadDyn};
     use stabby::vec::Vec as SVec;
+
+    /// The plugin→host direction of the declaration capability, at the wire.
+    ///
+    /// A host function that declares answers a plugin which said it carries
+    /// declarations; one that did not say so (a plugin older than ABI 0.15.0,
+    /// which cannot send the flag) gets an error rather than a reply it would
+    /// read as "declared nothing".
+    #[test]
+    fn a_host_functions_declarations_need_the_callers_say_so() {
+        use crate::abi::StableFunctionRegistryDyn;
+        use hcore::htvalue::Value;
+        use hcore::htvalue::signature::{FnSignature, ParamType};
+        use hplugin::provider::{
+            DeclaredTarget, FnArgs, FnCallContext, FnOutcome, ProviderFn, ProviderFunctionDef,
+            ProviderFunctionRegistry,
+        };
+        use prost::Message;
+        use std::sync::Arc;
+
+        struct DeclaringFn;
+        #[async_trait::async_trait]
+        impl ProviderFn for DeclaringFn {
+            async fn call(
+                &self,
+                _ctx: &FnCallContext<'_>,
+                _args: FnArgs,
+            ) -> anyhow::Result<FnOutcome> {
+                let mut out = FnOutcome::from(Value::String("//p:t".into()));
+                out.declare_target(DeclaredTarget {
+                    name: "t".into(),
+                    driver: "exec".into(),
+                    ..Default::default()
+                });
+                Ok(out)
+            }
+        }
+
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider(
+            "codegen",
+            vec![ProviderFunctionDef {
+                name: "rule".into(),
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: String::new(),
+                func: Arc::new(DeclaringFn),
+            }],
+        );
+        let host = super::HostFunctionRegistry::wrap_inline(Arc::new(reg));
+
+        let request = |accepts_declarations: bool| {
+            SVec::from(
+                plugin_abi::pb::CallRegisteredRequest {
+                    provider: "codegen".into(),
+                    name: "rule".into(),
+                    pkg: "p".into(),
+                    root: "/ws".into(),
+                    positional: vec![],
+                    named: Default::default(),
+                    accepts_declarations,
+                }
+                .encode_to_vec()
+                .as_slice(),
+            )
+        };
+        let body = |bytes: SVec<u8>| {
+            plugin_abi::pb::Frame::decode(&bytes[..])
+                .expect("decode frame")
+                .body
+        };
+
+        // A plugin that carries declarations gets them.
+        let bytes = futures::executor::block_on(host.call_registered(request(true)));
+        match body(bytes) {
+            Some(plugin_abi::pb::frame::Body::CallFunctionResp(r)) => {
+                assert_eq!(r.declared_targets.len(), 1);
+                assert_eq!(r.declared_targets[0].name, "t");
+            }
+            other => panic!("expected a reply with declarations, got {other:?}"),
+        }
+
+        // One that does not gets an error, not a declaration-less reply.
+        let bytes = futures::executor::block_on(host.call_registered(request(false)));
+        match body(bytes) {
+            Some(plugin_abi::pb::frame::Body::Error(e)) => {
+                assert!(e.message.contains("codegen.rule"), "{}", e.message);
+                // The old side here is the plugin that called in, and the
+                // remedy is the plugin author's, not the user's.
+                assert!(
+                    e.message.contains("the calling plugin does not carry"),
+                    "{}",
+                    e.message
+                );
+                assert!(e.message.contains("rebuild the plugin"), "{}", e.message);
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
 
     /// `Content` naming a path the seam has to render as a `SString`.
     struct PathContent(std::path::PathBuf);

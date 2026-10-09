@@ -16,7 +16,6 @@ use crate::vtable::dynify;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
-use hcore::htvalue::Value;
 use hdriver_support::driver_managed::{
     ManagedDriver, ManagedRunInput, ManagedRunRequest, ManagedRunResponse,
 };
@@ -28,8 +27,8 @@ use hplugin::driver::{
 };
 use hplugin::hook::Hook;
 use hplugin::provider::{
-    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
-    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
+    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest,
+    GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
     ProbeResponse, Provider, ProviderFn, ProviderFunctionDef, ProviderFunctionRegistry,
     StateSchema,
 };
@@ -620,7 +619,9 @@ impl Provider for StableRemoteProvider {
 
 /// Proxy handler for a dylib provider function: each call encodes its args and
 /// the `FnCallContext`, dispatches `call_function` over the stable ABI, and
-/// decodes the returned [`Value`].
+/// decodes the reply into an [`FnOutcome`] — value plus whatever the plugin
+/// declared. The host merges the declarations at the call site, so a cdylib
+/// function stands up targets exactly as an in-process one does.
 struct StableRemoteFn {
     inner: Arc<DynProvider>,
     name: String,
@@ -628,7 +629,7 @@ struct StableRemoteFn {
 
 #[async_trait]
 impl ProviderFn for StableRemoteFn {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let pb_req = pb::CallFunctionRequest {
             name: self.name.clone(),
             pkg: ctx.pkg.to_string(),
@@ -639,6 +640,8 @@ impl ProviderFn for StableRemoteFn {
                 .iter()
                 .map(|(k, v)| (k.clone(), convert::value_to_pb(v)))
                 .collect(),
+            // The host merges declarations into the package being evaluated.
+            accepts_declarations: true,
         }
         .encode_to_vec();
         let bytes = self
@@ -646,7 +649,7 @@ impl ProviderFn for StableRemoteFn {
             .invoke(pb::ProviderMethod::CallFunction as u32, sv(&pb_req))
             .await;
         match decode_unary(&bytes)? {
-            Body::CallFunctionResp(r) => Ok(convert::value_from_pb(r.value.unwrap_or_default())),
+            Body::CallFunctionResp(r) => Ok(convert::fn_outcome_from_pb(r)),
             Body::Error(e) => anyhow::bail!("{}", e.message),
             other => anyhow::bail!("unexpected call_function response: {other:?}"),
         }

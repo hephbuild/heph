@@ -13,6 +13,14 @@ heph = { path = "../.." }
 hengine = { package = "engine", path = "../engine", features = ["test-support"] }
 htestkit = { package = "testkit", path = "../testkit" }
 hplugin-oci = { package = "plugin-oci", path = "../plugin-oci" }
+# `make_dyn_provider` + `StableRemoteProvider`: a provider reached the way a
+# cdylib is, so a declaring function is exercised across the real ABI codec.
+hplugin-sdk = { package = "plugin-sdk", path = "../plugin-sdk", features = [
+    "stabby",
+] }
+hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby" }
+hplugin = { package = "plugin", path = "../plugin" }
+async-trait = "0.1"
 hplugin-devenv = { package = "plugin-devenv", path = "../plugin-devenv" }
 hcore = { package = "core", path = "../core" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }

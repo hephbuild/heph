@@ -21,6 +21,22 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.15.0: a provider function can declare targets and provider-state, not just
+/// return a value. `CallFunctionResponse` gained `declared_targets` /
+/// `declared_states` (2, 3) and both call requests gained
+/// `accepts_declarations`, which the *caller* sets to say it carries them back
+/// to the package being evaluated. Additive wire fields, no frozen-surface
+/// change — minor because the capability is the caller's to offer, and a callee
+/// must reach it before declaring.
+///
+/// Skew fails closed, and on the flag rather than on this version: an older
+/// caller sends no `accepts_declarations`, which decodes to `false`, and a
+/// declaring function then fails the call rather than answering with its value
+/// alone — prost would skip the declaration fields, so the caller would
+/// otherwise build something other than what the author declared and hash it as
+/// if intended. An older callee never declares, so a new caller's flag is
+/// simply unread.
+///
 /// 0.14.0: new optional `heph_plugin_set_log_filter` entry, taking prost
 /// `pb::LogFilter` bytes: the host's log filter in a shape any language can apply
 /// (an ordered level enum, opaque target strings, longest prefix wins), so a
@@ -129,7 +145,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.14.0";
+pub const ABI_SEMVER: &str = "0.15.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

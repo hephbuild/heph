@@ -11,7 +11,6 @@ use anyhow::{Context, Result};
 use hcore::hartifactcontent::tar::TarPacker;
 use hcore::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
 use hcore::hasync::StdCancellationToken;
-use hcore::htvalue::Value;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunInput, ManagedRunRequest};
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::{
@@ -20,8 +19,8 @@ use hplugin::driver::{
 };
 use hplugin::hook::Hook;
 use hplugin::provider::{
-    ConfigRequest, FnArgs, FnCallContext, GetError, GetRequest, ListPackagesRequest, ListRequest,
-    ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
+    ConfigRequest, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest, ListPackagesRequest,
+    ListRequest, ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
     ProviderFunctionRegistry,
 };
 use hplugin_stabby::abi::{
@@ -606,10 +605,32 @@ async fn provider_call_function(
             .map(|(k, v)| (k, convert::value_from_pb(v)))
             .collect(),
     };
-    let body = match def.func.call(&ctx, args).await {
-        Ok(v) => Body::CallFunctionResp(pb::CallFunctionResponse {
-            value: Some(convert::value_to_pb(&v)),
-        }),
+    // Declarations ride back with the value when the host advertised that it
+    // carries them; against an older host they are an error, never a silent
+    // drop (see `CallFunctionRequest.accepts_declarations`).
+    let res = match def.func.call(&ctx, args).await {
+        Ok(o) => {
+            let n = o.targets().len() + o.states().len();
+            tracing::debug!(
+                function = %req.name,
+                pkg = %req.pkg,
+                declarations = n,
+                "provider function answered"
+            );
+            // Only the refusal path errors here, so this context is about the
+            // peer: name the side that is old and what fixes it.
+            convert::call_function_response(o, req.accepts_declarations).with_context(|| {
+                format!(
+                    "plugin function {:?}: the calling host does not carry declarations \
+                     (heph older than plugin ABI 0.15.0) — upgrade heph",
+                    req.name
+                )
+            })
+        }
+        Err(e) => Err(e).with_context(|| format!("plugin function {:?}", req.name)),
+    };
+    let body = match res {
+        Ok(resp) => Body::CallFunctionResp(resp),
         Err(e) => err_body(err_message(&e)),
     };
     unary(body)
@@ -862,7 +883,7 @@ struct GuestRegisteredFn {
 
 #[async_trait::async_trait]
 impl ProviderFn for GuestRegisteredFn {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<Value> {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<FnOutcome> {
         let pb_req = pb::CallRegisteredRequest {
             provider: self.provider.clone(),
             name: self.name.clone(),
@@ -874,6 +895,11 @@ impl ProviderFn for GuestRegisteredFn {
                 .iter()
                 .map(|(k, v)| (k.clone(), convert::value_to_pb(v)))
                 .collect(),
+            // This proxy hands the whole outcome back to its caller, so it can
+            // carry declarations. Whether they reach the package is then up to
+            // the calling function: it must `FnOutcome::absorb` them into its
+            // own outcome, not read `.value` and drop the rest.
+            accepts_declarations: true,
         }
         .encode_to_vec();
         let bytes = self
@@ -881,9 +907,7 @@ impl ProviderFn for GuestRegisteredFn {
             .call_registered(SVec::from(pb_req.as_slice()))
             .await;
         match pb::Frame::decode(&bytes[..])?.body {
-            Some(Body::CallFunctionResp(r)) => {
-                Ok(convert::value_from_pb(r.value.unwrap_or_default()))
-            }
+            Some(Body::CallFunctionResp(r)) => Ok(convert::fn_outcome_from_pb(r)),
             Some(Body::Error(e)) => anyhow::bail!("{}", e.message),
             other => anyhow::bail!("unexpected call_registered response: {other:?}"),
         }
@@ -1648,8 +1672,8 @@ mod tests {
     use hcore::htvalue::Value;
     use hcore::htvalue::signature::{FnSignature, Param, ParamType};
     use hplugin::provider::{
-        ConfigResponse, GetResponse, ListPackageResponse, ListResponse, ProbeResponse, ProviderFn,
-        ProviderFunctionDef,
+        ConfigResponse, FnOutcome, GetResponse, ListPackageResponse, ListResponse, ProbeResponse,
+        ProviderFn, ProviderFunctionDef,
     };
     use std::path::Path;
 
@@ -1661,11 +1685,44 @@ mod tests {
     struct EchoFn;
     #[async_trait::async_trait]
     impl ProviderFn for EchoFn {
-        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<Value> {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<FnOutcome> {
             let msg = match args.positional.first() {
                 Some(Value::String(s)) => s.clone(),
                 _ => anyhow::bail!("echo: `msg` must be a string"),
             };
+            // A declaring call: every field of a declaration must survive the
+            // seam, and against a caller that cannot carry them it must fail.
+            if msg == "declare" {
+                let mut out = FnOutcome::from(Value::String("//mypkg:t".into()));
+                out.declare_target(hplugin::provider::DeclaredTarget {
+                    name: "t".into(),
+                    driver: "exec".into(),
+                    labels: vec!["gen".into()],
+                    transitive: Value::Map(
+                        [(
+                            "deps".to_string(),
+                            Value::Map(
+                                [(
+                                    "g".to_string(),
+                                    Value::List(vec![Value::String(":sib".into())]),
+                                )]
+                                .into(),
+                            ),
+                        )]
+                        .into(),
+                    ),
+                    approval: hplugin::provider::Approval {
+                        required: true,
+                        notice: vec!["sec".into()],
+                    },
+                    config: [("run".to_string(), Value::String("gen".into()))].into(),
+                })
+                .declare_state(hplugin::provider::DeclaredState {
+                    provider: "codegen".into(),
+                    args: [("toolchain".to_string(), Value::String("v1".into()))].into(),
+                });
+                return Ok(out);
+            }
             let times = match args.named.get("times") {
                 Some(Value::Int(n)) => *n,
                 _ => 1,
@@ -1674,7 +1731,8 @@ mod tests {
                 "{}:{}",
                 ctx.pkg,
                 msg.repeat(usize::try_from(times).unwrap_or(0))
-            )))
+            ))
+            .into())
         }
     }
 
@@ -2480,7 +2538,7 @@ mod tests {
             },
         ))
         .expect("call echo");
-        assert_eq!(out, Value::String("mypkg:hi".into()));
+        assert_eq!(out.value(), &Value::String("mypkg:hi".into()));
 
         // Named arg crosses and is honored.
         let mut named = std::collections::HashMap::new();
@@ -2493,7 +2551,51 @@ mod tests {
             },
         ))
         .expect("call echo times=3");
-        assert_eq!(out, Value::String("mypkg:ababab".into()));
+        assert_eq!(out.value(), &Value::String("mypkg:ababab".into()));
+
+        // A declaring plugin function: the declaration crosses the seam whole,
+        // so the host can merge it into the package being evaluated.
+        let out = futures::executor::block_on(def.func.call(
+            &ctx,
+            FnArgs {
+                positional: vec![Value::String("declare".into())],
+                named: Default::default(),
+            },
+        ))
+        .expect("call declaring echo");
+        assert_eq!(out.value(), &Value::String("//mypkg:t".into()));
+        assert_eq!(out.targets().len(), 1);
+        let t = &out.targets()[0];
+        assert_eq!((t.name.as_str(), t.driver.as_str()), ("t", "exec"));
+        assert_eq!(t.labels, ["gen"]);
+        assert_eq!(t.config.get("run"), Some(&Value::String("gen".into())));
+        assert!(t.approval.required);
+        assert_eq!(t.approval.notice, ["sec"]);
+        // `transitive` crosses unparsed — the host parses it as it parses the
+        // `target()` argument, so a declaration can't carry a sandbox a BUILD
+        // file could not.
+        assert_eq!(
+            t.transitive,
+            Value::Map(
+                [(
+                    "deps".to_string(),
+                    Value::Map(
+                        [(
+                            "g".to_string(),
+                            Value::List(vec![Value::String(":sib".into())]),
+                        )]
+                        .into(),
+                    ),
+                )]
+                .into(),
+            )
+        );
+        assert_eq!(out.states().len(), 1);
+        assert_eq!(out.states()[0].provider, "codegen");
+        assert_eq!(
+            out.states()[0].args.get("toolchain"),
+            Some(&Value::String("v1".into()))
+        );
 
         // The provider's state schema crosses too (Some, with its one field).
         let schema = host.state_schema().expect("state schema crosses as Some");
@@ -2502,6 +2604,62 @@ mod tests {
         assert_eq!(schema.fields[0].ty, ParamType::Bool);
         assert!(schema.fields[0].doc.contains("verbose output"));
         assert!(!schema.fields[0].required);
+    }
+
+    // A caller that predates the capability (ABI < 0.15.0) sends no
+    // `accepts_declarations`, so it decodes as false. A declaring function must
+    // then fail the call: prost would skip the declaration fields, and the
+    // caller would build a target-less package from a BUILD file that asked for
+    // one. The guest serve path is driven directly, since the host-side proxy
+    // always advertises support.
+    #[test]
+    fn declarations_to_a_caller_that_cannot_carry_them_fail() {
+        let provider = Arc::new(FnProvider) as Arc<dyn Provider>;
+        let req = pb::CallFunctionRequest {
+            name: "echo".into(),
+            pkg: "mypkg".into(),
+            root: "/ws".into(),
+            positional: vec![convert::value_to_pb(&Value::String("declare".into()))],
+            named: Default::default(),
+            accepts_declarations: false,
+        };
+        let bytes = futures::executor::block_on(provider_call_function(provider, req));
+        match pb::Frame::decode(&bytes[..]).expect("decode frame").body {
+            Some(Body::Error(e)) => {
+                // Names what was about to be lost, which side is old, and the
+                // remedy — the plugin author cannot fix the host's version.
+                assert!(e.message.contains("declared 1 target"), "{}", e.message);
+                assert!(
+                    e.message
+                        .contains("the calling host does not carry declarations"),
+                    "{}",
+                    e.message
+                );
+                assert!(e.message.contains("upgrade heph"), "{}", e.message);
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+
+        // The same function, same caller, not declaring: unaffected.
+        let req = pb::CallFunctionRequest {
+            name: "echo".into(),
+            pkg: "mypkg".into(),
+            root: "/ws".into(),
+            positional: vec![convert::value_to_pb(&Value::String("hi".into()))],
+            named: Default::default(),
+            accepts_declarations: false,
+        };
+        let bytes = futures::executor::block_on(provider_call_function(
+            Arc::new(FnProvider) as Arc<dyn Provider>,
+            req,
+        ));
+        match pb::Frame::decode(&bytes[..]).expect("decode frame").body {
+            Some(Body::CallFunctionResp(r)) => assert_eq!(
+                convert::value_from_pb(r.value.unwrap_or_default()),
+                Value::String("mypkg:hi".into())
+            ),
+            other => panic!("expected a value, got {other:?}"),
+        }
     }
 
     // The host's aggregate function registry is injected into a dylib provider:
@@ -2605,7 +2763,178 @@ mod tests {
             },
         ))
         .expect("call proxied echo");
-        assert_eq!(out, Value::String("callerpkg:yo".into()));
+        assert_eq!(out.value(), &Value::String("callerpkg:yo".into()));
+
+        // …and the reverse seam carries a host function's declarations back to
+        // the plugin, which is what lets a plugin's rule be built out of
+        // another provider's rule.
+        let out = futures::executor::block_on(rf.func.call(
+            &ctx,
+            FnArgs {
+                positional: vec![Value::String("declare".into())],
+                named: Default::default(),
+            },
+        ))
+        .expect("call declaring host fn from a plugin");
+        assert_eq!(out.targets().len(), 1, "declaration crossed back");
+        assert_eq!(out.targets()[0].name, "t");
+        assert_eq!(out.states().len(), 1);
+    }
+
+    /// The chain the capability exists for: the host calls plugin A's function,
+    /// which calls provider B's function (through the injected registry, i.e.
+    /// back over the seam), and B's declared target reaches the host.
+    ///
+    /// A's obligation is the one thing no guard can enforce for it — it must
+    /// `absorb` the inner outcome instead of reading `.value`, or the
+    /// declarations stop at that hop. Here it absorbs, and the target arrives.
+    #[test]
+    fn declarations_cross_a_plugin_to_provider_chain() {
+        use hplugin_stabby::load_stable::StableRemoteProvider;
+        use std::sync::Mutex;
+
+        // Plugin A: its `relay` function calls `greeter.echo("declare")` on
+        // whatever registry the host injected, and passes the declarations on.
+        struct RelayFn {
+            reg: Arc<Mutex<Option<Arc<ProviderFunctionRegistry>>>>,
+        }
+        #[async_trait::async_trait]
+        impl ProviderFn for RelayFn {
+            async fn call(&self, ctx: &FnCallContext<'_>, _args: FnArgs) -> Result<FnOutcome> {
+                let reg = self
+                    .reg
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .context("no registry injected")?;
+                let inner = reg
+                    .get("greeter", "echo")
+                    .context("greeter.echo not registered")?;
+                let mut out = FnOutcome::from(Value::Null());
+                let addr = out.absorb(
+                    inner
+                        .func
+                        .call(
+                            ctx,
+                            FnArgs {
+                                positional: vec![Value::String("declare".into())],
+                                named: Default::default(),
+                            },
+                        )
+                        .await?,
+                );
+                out.set_value(addr);
+                Ok(out)
+            }
+        }
+
+        struct RelayProvider {
+            reg: Arc<Mutex<Option<Arc<ProviderFunctionRegistry>>>>,
+        }
+        impl Provider for RelayProvider {
+            fn config(&self, _req: ConfigRequest) -> Result<ConfigResponse> {
+                Ok(ConfigResponse { name: "a".into() })
+            }
+            fn list<'a>(
+                &'a self,
+                _req: ListRequest,
+                _ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>>
+            {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                _req: ProbeRequest,
+                _ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+            }
+            fn functions(&self) -> Vec<ProviderFunctionDef> {
+                vec![ProviderFunctionDef {
+                    name: "relay".into(),
+                    signature: FnSignature {
+                        positional: vec![],
+                        named: vec![],
+                        variadic: None,
+                        returns: ParamType::String,
+                    },
+                    doc: "Relay a declaration from another provider.".into(),
+                    func: Arc::new(RelayFn {
+                        reg: Arc::clone(&self.reg),
+                    }),
+                }]
+            }
+            fn set_function_registry(&self, reg: Arc<ProviderFunctionRegistry>) {
+                *self.reg.lock().unwrap_or_else(|e| e.into_inner()) = Some(reg);
+            }
+        }
+
+        let slot = Arc::new(Mutex::new(None));
+        let dynp = make_dyn_provider(Arc::new(RelayProvider {
+            reg: Arc::clone(&slot),
+        }) as Arc<dyn Provider>);
+        let host = StableRemoteProvider::new(dynp, "a");
+
+        // The host registry A reaches back into: provider B's declaring fn.
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider(
+            "greeter",
+            vec![ProviderFunctionDef {
+                name: "echo".into(),
+                signature: FnSignature {
+                    positional: vec![Param::required("msg", ParamType::String)],
+                    named: vec![],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: "echo".into(),
+                func: Arc::new(EchoFn),
+            }],
+        );
+        host.set_function_registry(Arc::new(reg));
+
+        let defs = host.functions();
+        let relay = defs.iter().find(|d| d.name == "relay").expect("relay");
+        let root = std::path::PathBuf::from("/ws");
+        let out = futures::executor::block_on(relay.func.call(
+            &FnCallContext {
+                pkg: "mypkg",
+                root: Path::new(&root),
+            },
+            FnArgs {
+                positional: vec![],
+                named: Default::default(),
+            },
+        ))
+        .expect("call relay");
+
+        // Two seam crossings later, B's target is here for the host to merge.
+        assert_eq!(out.value(), &Value::String("//mypkg:t".into()));
+        assert_eq!(out.targets().len(), 1, "B's target survived A relaying it");
+        assert_eq!(out.targets()[0].name, "t");
+        assert_eq!(out.targets()[0].driver, "exec");
+        assert_eq!(out.states().len(), 1, "B's provider_state survived too");
     }
 
     // A managed driver's config schema survives the round trip (LSP kwargs).
