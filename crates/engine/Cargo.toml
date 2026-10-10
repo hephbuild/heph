@@ -9,7 +9,7 @@ workspace = true
 [features]
 # `engine::fault_provider` for test crates outside this one (the in-process
 # e2e suite, the root crate's command tests). Never enabled by a binary.
-test-support = []
+test-support = ["hconfig/test-support"]
 
 [dependencies]
 hcore = { package = "core", path = "../core" }

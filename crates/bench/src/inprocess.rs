@@ -19,7 +19,7 @@
 use anyhow::{Context, Result};
 use bench_corpus::CorpusManifest;
 use clap::ValueEnum;
-use heph::engine::{Config, Engine, HomeDir, OutputMatcher, ResultOptions};
+use heph::engine::{Config, ConfigYamlExt as _, Engine, HomeDir, OutputMatcher, ResultOptions};
 use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use std::path::Path;
@@ -82,10 +82,13 @@ async fn resolve_all(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The corpus's heph home. The generated corpus sets no `homeDir`, so it is the
-/// default one.
+/// The corpus's heph home, resolved from its config the way the binary does.
 fn cache_dir(corpus: &Path) -> Result<HomeDir> {
-    HomeDir::resolve(corpus, None).context("resolve corpus home dir")
+    Ok(heph::engine::config_yaml::load_from_root(corpus)
+        .context("load corpus config")?
+        .resolve(corpus)
+        .context("resolve corpus config")?
+        .home_dir)
 }
 
 fn wipe_cache(corpus: &Path) -> Result<()> {

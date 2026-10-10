@@ -9,6 +9,10 @@
 //! (`**/node_modules/**` → `**/node_modules`). A glob whose final component is a
 //! wildcard (`some/*.go`) only filters files. No probing or sentinel paths.
 //!
+//! Every ignore set also prunes a directory named with
+//! [`HEPH_DIR_PREFIX`](hconfig::HEPH_DIR_PREFIX) (`.heph`, `.heph3`,
+//! `.heph-gocache`, …): heph-owned, never source.
+//!
 //! Two ignore sources, both workspace-root-relative:
 //!  - `dirs`: absolute directories pruned by exact path (heph home + literal
 //!    `fs.skip` entries resolved against the root).
@@ -58,12 +62,21 @@ impl Default for Ignore {
 /// [`CachedWalker::read_dir`] refuses to walk past.
 pub const GIT_SKIP_GLOB: &str = "**/.git/**";
 
+pub use hconfig::HEPH_DIR_PREFIX;
+
+/// Whether the last component of `path` names a heph-owned directory.
+fn is_heph_dir_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(HEPH_DIR_PREFIX))
+}
+
 impl Ignore {
     /// An ignore set for a walker with no user skip configuration: prunes
-    /// [`GIT_SKIP_GLOB`] and nothing else.
+    /// [`GIT_SKIP_GLOB`] (and, like every set, `.heph*` dirs).
     ///
-    /// `Ignore::default()` prunes *nothing*, which is wrong for any real tree —
-    /// it descends into `.git`. Callers that genuinely have no config (the LSP)
+    /// `Ignore::default()` prunes only `.heph*` dirs, which is wrong for any real
+    /// tree — it descends into `.git`. Callers that genuinely have no config (the LSP)
     /// want this instead.
     pub fn git_only() -> Self {
         Self::new(&[], &[GIT_SKIP_GLOB.to_string()]).expect("the .git ignore set is valid")
@@ -95,16 +108,27 @@ impl Ignore {
     }
 
     /// True if the directory at absolute `abs` (workspace-relative `rel`) must be
-    /// pruned — never descended into. Either an exact `dirs` entry, or a directory
-    /// whose path matches a glob / a recursive glob's prefix.
+    /// pruned — never descended into. Either an exact `dirs` entry, a directory
+    /// named with [`HEPH_DIR_PREFIX`], or a directory whose path matches a glob /
+    /// a recursive glob's prefix.
     ///
-    /// The walk root itself (`rel == ""`) is never glob-pruned — you are
+    /// The `.heph*` rule holds for every ignore set, `Ignore::default()` too: a
+    /// heph-owned directory is never source. The exact-path rule only catches the
+    /// *current* home; this one also catches a leftover home from an older
+    /// default (`.heph3`), whose staged `BUILD` files and failed sandboxes would
+    /// otherwise surface as packages — and, through `heph.core.packages()`, reach
+    /// a def hash.
+    ///
+    /// The walk root itself (`rel == ""`) is never name- or glob-pruned — you are
     /// explicitly walking it — only exact-`dirs` pruning applies.
     pub fn prune_dir(&self, abs: &Path, rel: &Path) -> bool {
         if self.dirs.iter().any(|d| d == abs) {
             return true;
         }
-        !rel.as_os_str().is_empty() && self.dir_any.is_match(rel)
+        if rel.as_os_str().is_empty() {
+            return false;
+        }
+        is_heph_dir_name(abs) || self.dir_any.is_match(rel)
     }
 
     /// True if the file at workspace-relative `rel` is excluded by an ignore glob.
@@ -250,10 +274,24 @@ mod tests {
     }
 
     #[test]
+    fn heph_named_dirs_are_pruned_by_name() {
+        // No configured dirs or globs: a leftover `.heph3`, a nested one, and
+        // `.heph-*` tool caches are still never descended.
+        let ig = Ignore::default();
+        assert!(ig.prune_dir(p("/ws/.heph3"), p(".heph3")));
+        assert!(ig.prune_dir(p("/ws/a/.heph"), p("a/.heph")));
+        assert!(ig.prune_dir(p("/ws/.heph-anything"), p(".heph-anything")));
+        assert!(ig.prunes_package(p("/ws"), p(".heph3/stage/x")));
+        assert!(!ig.prune_dir(p("/ws/heph"), p("heph")));
+        // The walk root itself is never name-pruned.
+        assert!(!ig.prune_dir(p("/ws/.heph/sandbox"), p("")));
+    }
+
+    #[test]
     fn exact_dirs_are_pruned() {
-        let home = PathBuf::from("/ws/.heph3");
+        let home = PathBuf::from("/ws/state");
         let ig = Ignore::new(std::slice::from_ref(&home), &[]).unwrap();
-        assert!(ig.prune_dir(&home, p(".heph3")));
+        assert!(ig.prune_dir(&home, p("state")));
         assert!(!ig.prune_dir(p("/ws/src"), p("src")));
     }
 

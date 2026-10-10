@@ -1136,6 +1136,42 @@ mod tests {
         assert!(msg.contains("no driver"), "{msg}");
     }
 
+    /// A leftover home from an older default (`.heph3`) is not the current home,
+    /// so the exact-path skip misses it; its staged `BUILD` files must still not
+    /// become packages — `heph.core.packages()` would carry them into a def hash.
+    #[tokio::test]
+    async fn list_packages_skips_a_leftover_heph_dir_by_name() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+        fs::write(root.join("BUILD"), "").unwrap();
+        let staged = root.join(".heph3").join("stage").join("x");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("BUILD"), "").unwrap();
+
+        // Only the *current* home is an exact-path skip.
+        let provider = Provider::from_options(
+            root.to_path_buf(),
+            &[root.join(".heph")],
+            &[],
+            &Options::new(),
+            test_runtime(),
+        )
+        .expect("provider");
+
+        let ctoken = StdCancellationToken::new();
+        let res = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
+        assert_eq!(packages, vec!["".to_string()], "{packages:?}");
+    }
+
     #[tokio::test]
     async fn list_packages_skips_core_dirs_and_globs() {
         let tmp_dir = tempdir().unwrap();

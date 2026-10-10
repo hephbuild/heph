@@ -10,11 +10,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+use crate::engine::HomeDir;
 use crate::engine::RemoteCacheDef;
+use crate::engine::config_yaml::config_file_name_at;
 use crate::engine::config_yaml::{
     ConfigYaml, FuseConfig, LockBackendConfig, MemCacheConfig, ScratchConfig,
 };
-use crate::engine::home_dir::HomeDir;
 use crate::engine::result_lock::LockBackend;
 
 /// Expand a configured scope, resolving `${git:branch}` against `root`.
@@ -186,7 +187,7 @@ impl Config {
     #[doc(hidden)]
     pub fn for_tests(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        let home_dir = HomeDir::for_tests(&root);
+        let home_dir = HomeDir::resolve(&root, None).expect("resolving a test home dir");
         Self::new(root, home_dir)
     }
 }
@@ -249,10 +250,22 @@ impl ConfigYamlExt for ConfigYaml {
             capacity_bytes: c.capacity_bytes,
         };
 
-        let home_dir = HomeDir::resolve(root, self.home_dir.as_deref())
-            .context("resolving the heph home dir")?;
-        let defaults = Config::new(root.to_path_buf(), home_dir);
+        // Absolute here, beside the home: the home is pruned from walks by exact
+        // path, and the walks join their paths onto this root — a relative root
+        // (`HEPH_CWD=.`) would never compare equal to the absolute home.
+        let root = std::path::absolute(root)
+            .with_context(|| format!("making workspace root {} absolute", root.display()))?;
+        let home_dir = HomeDir::resolve(&root, self.home_dir.as_deref()).with_context(|| {
+            format!(
+                "resolving homeDir from {}",
+                root.join(config_file_name_at(&root)).display()
+            )
+        })?;
+        let defaults = Config::new(root.clone(), home_dir.clone());
+        let root = root.as_path();
         Ok(Config {
+            root: root.to_path_buf(),
+            home_dir,
             fs_skip: self.fs.as_ref().map(|f| f.skip.clone()).unwrap_or_default(),
             parallelism: None,
             mem_cache: self
@@ -295,8 +308,6 @@ impl ConfigYamlExt for ConfigYaml {
                     region: c.region,
                 })
                 .collect(),
-            // `root` and `home_dir`.
-            ..defaults
         })
     }
 }
@@ -304,7 +315,7 @@ impl ConfigYamlExt for ConfigYaml {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::home_dir::DEFAULT_HOME_DIR;
+    use crate::engine::DEFAULT_HOME_DIR;
     use crate::engine::result_lock::LockBackend;
 
     #[test]
@@ -378,6 +389,31 @@ mod tests {
         assert_eq!(cfg.spill_threshold_bytes, defaults.spill_threshold_bytes);
         assert!(cfg.telemetry_enabled);
         assert!(cfg.remote_caches.is_empty());
+    }
+
+    #[test]
+    fn resolve_makes_a_relative_root_absolute() {
+        // `HEPH_CWD=.` hands resolve a relative root; the home is absolute, and
+        // the walks prune it by exact path against paths joined onto this root.
+        let cfg = ConfigYaml::default()
+            .resolve(Path::new("."))
+            .expect("resolve");
+        assert!(cfg.root.is_absolute(), "{}", cfg.root.display());
+        assert_eq!(cfg.home_dir.as_path(), cfg.root.join(DEFAULT_HOME_DIR));
+    }
+
+    #[test]
+    fn resolve_refuses_a_root_home_and_names_the_config() {
+        let yaml: ConfigYaml = serde_yaml::from_str("homeDir: .\n").expect("parse");
+        let err = yaml
+            .resolve(Path::new("/repo"))
+            .expect_err("a home at the root must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("resolving homeDir from /repo/.hephconfig"),
+            "{msg}"
+        );
+        assert!(msg.contains("workspace root or above it"), "{msg}");
     }
 
     #[test]

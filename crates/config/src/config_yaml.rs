@@ -42,6 +42,12 @@ pub struct ConfigYaml {
     /// Mirrored in [`VersionPin`] — see the note on [`version`](Self::version).
     #[serde(default)]
     pub version_flavour: Option<String>,
+    /// The heph home (cache, sandboxes, credentials, locks, diagnostics). A
+    /// relative path is under the workspace root; an absolute one is used as
+    /// written. No `~` or `$VAR` expansion. Unset means
+    /// [`DEFAULT_HOME_DIR`](crate::DEFAULT_HOME_DIR). Resolved by
+    /// [`HomeDir::resolve`](crate::HomeDir::resolve), which refuses the root
+    /// itself or anything above it.
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
     /// Every provider/driver — built-in or external — is declared as a single
@@ -466,7 +472,7 @@ pub enum LockBackendConfig {
 /// plugins:
 ///   - builtin: buildfile
 ///     options: { patterns: [BUILD] }
-///   - path: .heph3/heph-go-plugin.json
+///   - path: .heph/heph-go-plugin.json
 ///   - url: https://…/heph-go-plugin.json
 ///     checksum: sha256:9f86d0…
 /// ```

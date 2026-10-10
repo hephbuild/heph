@@ -13,6 +13,10 @@
 //! kill -QUIT <pid>          # or just press Ctrl-\\
 //! cat <home>/diag/dump-<pid>.txt
 //! ```
+//! `<home>` is the resolved heph home (`.heph` under the workspace root by
+//! default). A process that has not resolved its home yet — still loading the
+//! config — writes to `<temp dir>/heph-diag-<uid>/dump-<pid>.txt` instead; the
+//! warning it logs names the path either way.
 //! `SIGQUIT` follows the Go/JVM convention and, unlike `SIGUSR1`, is not already
 //! taken here (`SIGUSR2` belongs to the pprof sampler). The handler sets one
 //! atomic and returns; the work happens on the sweeper thread, and the process
@@ -112,13 +116,18 @@ pub fn set_dump_dir(home: &hengine::engine::HomeDir) {
     drop(DUMP_DIR.set(home.join("diag")));
 }
 
-/// Where dumps go before [`set_dump_dir`] has run: `<temp dir>/heph-diag`.
+/// Where dumps go before [`set_dump_dir`] has run: `<temp dir>/heph-diag-<uid>`.
 ///
-/// Absolute and independent of the cwd. Not cleaned by `heph tool gc` (it is
-/// outside every workspace), which is the price of a dump from a process that
-/// never got as far as knowing its workspace.
+/// Absolute and independent of the cwd. Per-uid and created `0700` (see
+/// [`sweep`]) because the temp dir is shared: another user must not be able to
+/// pre-create it, or plant a symlink where a dump will be written — dump files
+/// are also opened `O_NOFOLLOW`. Not cleaned by `heph tool gc` (it is outside
+/// every workspace), which is the price of a dump from a process that never got
+/// as far as knowing its workspace.
 fn fallback_dump_dir() -> std::path::PathBuf {
-    absolute(&std::env::temp_dir().join("heph-diag"))
+    // SAFETY: `getuid` cannot fail and has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    absolute(&std::env::temp_dir().join(format!("heph-diag-{uid}")))
 }
 
 /// Make `path` absolute without touching the filesystem.
@@ -138,7 +147,8 @@ fn dump_dir() -> std::path::PathBuf {
 /// Where a dump lands: in the workspace's home once it is resolved (so
 /// `heph tool gc` can sweep it), under the temp dir before that.
 ///
-/// **Absolute.** It used to be `<home>/diag/dump-<pid>.txt`, resolved against
+/// **Absolute.** It used to be the literal `.heph3/diag/dump-<pid>.txt`, resolved
+/// against
 /// whatever the process's cwd happened to be — which is not something the person
 /// reading a stall log, or an agent handed the file an hour later, has any way to
 /// know. "Your dump is at a relative path, good luck" costs a round trip in
@@ -187,20 +197,7 @@ const THREAD_GAP: std::time::Duration = std::time::Duration::from_millis(2);
 /// dumps went. That is what it did — silently, ordering-dependent, green
 /// locally and red on CI.
 fn sweep(path: &std::path::Path) {
-    if let Some(dir) = path.parent() {
-        drop(std::fs::create_dir_all(dir));
-    }
-    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
-        return;
-    };
-    // SAFETY: opening a file by C path; the fd is stored for the handler below.
-    let fd = unsafe {
-        libc::open(
-            cpath.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND,
-            0o644,
-        )
-    };
+    let fd = open_dump(path);
     if fd < 0 {
         warn!(
             path = %path.display(),
@@ -239,6 +236,35 @@ fn sweep(path: &std::path::Path) {
         );
     } else {
         warn!(threads = n, path = %path.display(), "Wrote thread backtraces and in-flight report");
+    }
+}
+
+/// Create the dump's directory (`0700`) and open the dump for writing; a
+/// negative fd (with `errno` set) on failure.
+///
+/// `0700` because the fallback dir sits in the shared temp dir (see
+/// [`fallback_dump_dir`]); it only applies to directories this call creates.
+/// `O_NOFOLLOW`: never write a dump through a symlink someone else planted.
+fn open_dump(path: &std::path::Path) -> libc::c_int {
+    if let Some(dir) = path.parent() {
+        use std::os::unix::fs::DirBuilderExt;
+        drop(
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir),
+        );
+    }
+    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
+        return -1;
+    };
+    // SAFETY: opening a file by C path; the fd is stored for the handler.
+    unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND | libc::O_NOFOLLOW,
+            0o644,
+        )
     }
 }
 
@@ -484,7 +510,7 @@ mod tests {
 
     /// The dump lands at an absolute path.
     ///
-    /// It used to be `<home>/diag/dump-<pid>.txt`, resolved against whatever cwd
+    /// It used to be the literal `.heph3/diag/dump-<pid>.txt`, resolved against whatever cwd
     /// the process was launched from — so telling someone where their dump went
     /// meant telling them "under the directory you started the build in", which
     /// is a round trip in exactly the situation where the process may already be
@@ -520,6 +546,38 @@ mod tests {
             dir.starts_with(absolute(&std::env::temp_dir())),
             "fallback must be under the temp dir: {dir:?}"
         );
+        // SAFETY: `getuid` cannot fail.
+        let uid = unsafe { libc::getuid() };
+        assert!(
+            dir.ends_with(format!("heph-diag-{uid}")),
+            "per-uid: {dir:?}"
+        );
+    }
+
+    /// The dump's directory is created private, and a symlink planted where the
+    /// dump goes is not written through.
+    #[test]
+    fn a_dump_is_opened_private_and_without_following_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("heph-diag-x");
+
+        let fd = open_dump(&dir.join("dump.txt"));
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: closing the fd this test opened.
+        unsafe { libc::close(fd) };
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+
+        let target = tmp.path().join("victim");
+        std::fs::write(&target, "untouched").expect("write");
+        let link = dir.join("dump-link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(
+            open_dump(&link) < 0,
+            "a symlinked dump path must be refused"
+        );
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "untouched");
     }
 
     /// The `SIGQUIT` dump and the watchdog's companion file must be the same

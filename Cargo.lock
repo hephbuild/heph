@@ -6817,6 +6817,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "borsh",
+ "config",
  "glob",
  "parking_lot",
  "r2d2",

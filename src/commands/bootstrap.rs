@@ -1,9 +1,11 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::thread::available_parallelism;
 
 use anyhow::Context;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::engine::config::ConfigYamlExt;
 use crate::engine::config_yaml;
@@ -142,6 +144,21 @@ fn listed_facts_kill_switch(v: Option<&std::ffi::OsStr>) -> bool {
             .any(|off| s.eq_ignore_ascii_case(off)))
 }
 
+/// The default home's name before it became [`engine::DEFAULT_HOME_DIR`].
+const LEGACY_HOME_DIR: &str = ".heph3";
+
+/// `<root>/.heph3`, when the home resolved to the default and that old home is
+/// still on disk: nothing reads it any more, and it is worth one line saying so.
+/// A configured `homeDir` gets no hint — the user chose where the home is.
+fn leftover_legacy_home(root: &std::path::Path, home: &engine::HomeDir) -> Option<PathBuf> {
+    let default = engine::HomeDir::resolve(root, None).ok()?;
+    if home != &default {
+        return None;
+    }
+    let old = root.join(LEGACY_HOME_DIR);
+    old.is_dir().then_some(old)
+}
+
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -152,6 +169,25 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // applies every default in one place and yields the engine's runtime config.
     let file = config_yaml::load_from_root(&root)?;
     let mut config = file.resolve(&root)?;
+
+    // Point `SIGQUIT` dumps at the resolved home as soon as it is known — before
+    // the engine is built and plugins are downloaded and loaded, which is where
+    // a startup hang is likeliest — so they land beside the stall log and the
+    // in-flight report rather than in the temp-dir fallback. Every command routes
+    // through here, so every command gets it.
+    crate::diag::set_dump_dir(&config.home_dir);
+
+    if let Some(old) = leftover_legacy_home(&config.root, &config.home_dir) {
+        warn!(
+            old = %old.display(),
+            new = %config.home_dir.display(),
+            "heph home moved from {LEGACY_HOME_DIR} to {}; the old cache is not reused; \
+             remove it with `rm -rf {}`",
+            engine::DEFAULT_HOME_DIR,
+            old.display(),
+        );
+    }
+
     // The kill switch for listed facts: every candidate a fact would have
     // decided is resolved instead. Read here, never by the engine. It is
     // outside every cache key on purpose: a query target's dep list is already
@@ -225,11 +261,6 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         engine.drivers_by_name.keys().cloned().collect(),
         remote_cache_backends,
     );
-
-    // Point `SIGQUIT` dumps at the resolved home, so they land beside the stall
-    // log and the in-flight report instead of under whatever cwd the process was
-    // launched from. Every command routes through here, so every command gets it.
-    crate::diag::set_dump_dir(&engine.home);
 
     let (trigger, rx) = ShutdownTrigger::new();
     spawn_sigint_producer(trigger.clone());
@@ -335,13 +366,9 @@ mod tests {
             .enter();
         let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml)?;
         let dir = tempfile::tempdir()?;
-        let root = dir.path().to_path_buf();
-        let home_dir = engine::HomeDir::resolve(&root, file.home_dir.as_deref())?;
-        let mut e = engine::Engine::new(engine::Config {
-            fs_skip: file.fs.clone().map(|f| f.skip).unwrap_or_default(),
-            parallelism: None,
-            ..engine::Config::new(root, home_dir.clone())
-        })?;
+        let config = file.resolve(dir.path())?;
+        let home_dir = config.home_dir.clone();
+        let mut e = engine::Engine::new(config)?;
 
         // `fs` is auto-registered by `Engine::new`.
         e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
@@ -381,6 +408,27 @@ plugins:
         assert!(e.drivers_by_name.contains_key("exec"));
         assert!(e.drivers_by_name.contains_key("bash"));
         assert!(e.providers_by_name.contains_key("fs"));
+    }
+
+    #[test]
+    fn a_leftover_legacy_home_is_hinted_only_for_the_default_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let default = engine::HomeDir::resolve(root, None).expect("home");
+        let custom =
+            engine::HomeDir::resolve(root, Some(std::path::Path::new("state"))).expect("home");
+
+        assert_eq!(leftover_legacy_home(root, &default), None, "no .heph3 yet");
+        std::fs::create_dir(root.join(".heph3")).expect("mkdir");
+        assert_eq!(
+            leftover_legacy_home(root, &default),
+            Some(root.join(".heph3"))
+        );
+        assert_eq!(
+            leftover_legacy_home(root, &custom),
+            None,
+            "a configured homeDir is the user's choice"
+        );
     }
 
     #[test]

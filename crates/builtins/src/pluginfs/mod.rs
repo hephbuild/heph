@@ -47,11 +47,7 @@ pub fn has_codegen_xattr(path: &std::path::Path) -> bool {
     matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
 }
 
-/// Name prefix of a heph-owned directory: the default home (`.heph`), a
-/// configured one that kept the prefix, and the tool caches beside it
-/// (`.heph-gocache`, …). Not the home dir's name — the home can be configured to
-/// anything — but "this component belongs to heph, not to the source tree".
-pub const HEPH_DIR_PREFIX: &str = ".heph";
+use hwalk::HEPH_DIR_PREFIX;
 
 /// True if `path` resolves inside a `.heph*` directory (e.g. `.heph/cache/...`),
 /// pointing at an engine-internal artifact — a materialized cache output, not raw
@@ -780,12 +776,13 @@ fn walk_glob(
                 for entry in &listing.entries {
                     let abs = dir.join(&entry.name);
                     if entry.kind == hwalk::EntryKind::Dir {
-                        // Never descend into skip dirs or skip-glob subtrees.
+                        // Never descend into skip dirs, skip-glob subtrees, or
+                        // `.heph*` dirs (`prune_dir` prunes those by name), so a
+                        // real directory pushed here is in heph only if its
+                        // parent was.
                         let rel = abs.strip_prefix(root).unwrap_or(&abs);
                         if !compiled.skip.prune_dir(&abs, rel) {
-                            let child_in_heph =
-                                dir_in_heph || entry.name.starts_with(HEPH_DIR_PREFIX);
-                            stack.push((abs, child_in_heph));
+                            stack.push((abs, dir_in_heph));
                         }
                     } else if matches!(
                         entry.kind,
@@ -1880,6 +1877,40 @@ mod tests {
             vec!["sub_keep.rs".to_string()],
             "files under a nested .heph* dir must be excluded"
         );
+    }
+
+    /// A `.heph*` directory is pruned by name, not walked and filtered: listing it
+    /// would fail here, because it is unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_glob_does_not_descend_into_a_heph_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("keep.rs"), b"keep").unwrap();
+        let heph = root.join(".heph-anything");
+        fs::create_dir(&heph).unwrap();
+        fs::write(heph.join("drop.rs"), b"drop").unwrap();
+        fs::set_permissions(&heph, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&heph).is_ok() {
+            // Running as root: permissions do not stop the read, so the test
+            // cannot tell a pruned dir from a walked-and-filtered one.
+            fs::set_permissions(&heph, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: unreadable dirs are readable to this user");
+            return;
+        }
+
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
+        let res = walk_glob(&CachedWalker::disabled(), root, &compiled);
+        fs::set_permissions(&heph, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let names: Vec<_> = res
+            .expect("the walk must not list the .heph* dir")
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        assert_eq!(names, vec!["keep.rs".to_string()]);
     }
 
     /// Cross-run via the shared walker: a first driver populates the fswalk db; a

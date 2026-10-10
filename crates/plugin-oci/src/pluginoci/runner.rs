@@ -81,19 +81,25 @@ pub struct OciRunnerDef {
 #[derive(Debug)]
 pub struct Driver {
     docker_bin: String,
-}
-
-impl Default for Driver {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// heph's resolved home, mounted into the container: sandboxes and the agent
+    /// socket live under it. Handed in by the host (`CreateConfig.home` for the
+    /// cdylib, `PluginInit.home` in-process) — never derived from a sandbox
+    /// path, where a package named `sandbox` would be mistaken for the home's.
+    home: std::path::PathBuf,
 }
 
 impl Driver {
-    pub fn new() -> Self {
+    pub fn new(home: impl Into<std::path::PathBuf>) -> Self {
         Self {
             docker_bin: "docker".to_string(),
+            home: home.into(),
         }
+    }
+
+    /// Use `docker_bin` instead of `docker` from `PATH`.
+    pub fn with_docker_bin(mut self, docker_bin: impl Into<String>) -> Self {
+        self.docker_bin = docker_bin.into();
+        self
     }
 }
 
@@ -239,7 +245,7 @@ impl ManagedDriver for Driver {
         let tree_root = req.request.tree_root_path.to_string_lossy().into_owned();
         // Sandboxes and the agent socket both live under heph's home, and the
         // container needs to see both at their own paths.
-        let heph_home = heph_home_of(&req);
+        let heph_home = self.home.to_string_lossy().into_owned();
 
         // Named `oci`, not `session`: this plugin implements the runner. See
         // `pluginoci::exec_runner` for why a held `docker run` was the wrong
@@ -272,53 +278,5 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("write {out:?}"))?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
-    }
-}
-
-/// heph's home directory, derived from the sandbox path the bridge handed us.
-///
-/// The sandbox lives at `<home>/sandbox/<...>`, so the home is what remains
-/// above the `sandbox` component. Derived rather than read from config because
-/// a driver is handed what it needs and discovers nothing.
-fn heph_home_of(req: &ManagedRunRequest<'_, '_>) -> String {
-    let mut p = req.sandbox_dir.as_path();
-    while let Some(parent) = p.parent() {
-        if p.file_name().is_some_and(|n| n == "sandbox") {
-            return parent.to_string_lossy().into_owned();
-        }
-        p = parent;
-    }
-    req.sandbox_dir.to_string_lossy().into_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    #[test]
-    fn heph_home_is_the_directory_above_sandbox() {
-        let p = PathBuf::from("/home/u/.heph3/sandbox/pkg/target/abc");
-        assert_eq!(home_from(&p), "/home/u/.heph3");
-    }
-
-    /// A path with no `sandbox` component must degrade to something usable
-    /// rather than panicking or walking to `/`.
-    #[test]
-    fn an_unexpected_sandbox_layout_falls_back_to_the_path_itself() {
-        let p = PathBuf::from("/tmp/weird/place");
-        assert_eq!(home_from(&p), "/tmp/weird/place");
-    }
-
-    /// The same walk `heph_home_of` does, over a bare path — the request type
-    /// is not constructible in a unit test.
-    fn home_from(sandbox: &std::path::Path) -> String {
-        let mut p = sandbox;
-        while let Some(parent) = p.parent() {
-            if p.file_name().is_some_and(|n| n == "sandbox") {
-                return parent.to_string_lossy().into_owned();
-            }
-            p = parent;
-        }
-        sandbox.to_string_lossy().into_owned()
     }
 }

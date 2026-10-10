@@ -59,6 +59,18 @@ impl WorkspaceBuilder {
         self
     }
 
+    /// [`Self::with_managed_driver`] for a driver built from the engine's
+    /// [`PluginInit`] (its root, its resolved home, …).
+    pub fn with_managed_driver_factory(
+        mut self,
+        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKManagedDriver> + 'static,
+    ) -> Self {
+        self.setups.push(Box::new(move |e: &mut Engine| {
+            e.register_managed_driver(factory)
+        }));
+        self
+    }
+
     pub fn with_managed_driver(mut self, driver: Box<dyn SDKManagedDriver>) -> Self {
         self.setups.push(Box::new(move |e: &mut Engine| {
             e.register_managed_driver(|_| driver)

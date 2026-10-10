@@ -151,10 +151,14 @@ impl Scenario {
     }
 }
 
-/// The corpus's heph home. The generated corpus sets no `homeDir`, so it is the
-/// default one the binary resolves.
+/// The corpus's heph home, resolved from its config the way the binary does.
 fn cache_dir(corpus: &Path) -> Result<heph::engine::HomeDir> {
-    heph::engine::HomeDir::resolve(corpus, None).context("resolve corpus home dir")
+    use heph::engine::ConfigYamlExt as _;
+    Ok(heph::engine::config_yaml::load_from_root(corpus)
+        .context("load corpus config")?
+        .resolve(corpus)
+        .context("resolve corpus config")?
+        .home_dir)
 }
 
 fn wipe_cache(corpus: &Path) -> Result<()> {

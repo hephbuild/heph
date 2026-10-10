@@ -28,6 +28,9 @@ use tracing::{error, warn};
 /// [`skip_globs`]: PluginInit::skip_globs
 pub struct PluginInit {
     pub root: PathBuf,
+    /// The resolved heph home — the in-process counterpart of the cdylib
+    /// `CreateConfig.home`.
+    pub home: crate::engine::HomeDir,
     /// Absolute directories to prune by exact path: the heph home plus the
     /// literal (non-glob) `fs.skip` entries, resolved relative to the repo root.
     pub skip_dirs: Vec<PathBuf>,
@@ -409,9 +412,34 @@ pub struct Driver {
     pub driver: Box<dyn SDKDriver>,
 }
 
+/// Create the home if needed and make it ignore itself: a `<home>/.gitignore`
+/// of `*`, written only when absent (a user's own file is left alone). The
+/// default home's name changed (`.heph3` → `.heph`), and a repo's `.gitignore`
+/// that named the old one would otherwise show the new one as untracked — this
+/// holds for any name and any `homeDir`.
+fn ensure_home(home: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(home)
+        .with_context(|| format!("creating heph home {}", home.display()))?;
+    let ignore = home.join(".gitignore");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ignore)
+    {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            f.write_all(b"*\n")
+                .with_context(|| format!("writing {}", ignore.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("creating {}", ignore.display())),
+    }
+}
+
 impl Engine {
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let home = cfg.home_dir.clone();
+        ensure_home(&home)?;
 
         let parallelism = cfg.parallelism.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -696,6 +724,7 @@ impl Engine {
     fn plugin_init_payload(&self) -> PluginInit {
         PluginInit {
             root: self.cfg.root.clone(),
+            home: self.home.clone(),
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
             walker: self.walker.clone(),
@@ -1017,6 +1046,24 @@ impl hplugin::lsp::LspEngine for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_home_ignores_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let engine = Engine::new(Config::for_tests(dir.path())).expect("engine");
+        let ignore = engine.home.join(".gitignore");
+        assert_eq!(std::fs::read_to_string(&ignore).expect("read"), "*\n");
+
+        // A file the user wrote is left alone.
+        std::fs::write(&ignore, "custom\n").expect("write");
+        drop(engine);
+        let engine = Engine::new(Config::for_tests(dir.path())).expect("engine");
+        assert_eq!(
+            std::fs::read_to_string(engine.home.join(".gitignore")).expect("read"),
+            "custom\n"
+        );
+    }
 
     // Names the dir after pid 1 (init/launchd): always alive, always owned by
     // another user, so a non-root caller's `kill(1, 0)` always answers

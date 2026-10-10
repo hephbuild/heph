@@ -24,7 +24,8 @@ pub struct ToolArgs {
 pub enum ToolCommands {
     /// Garbage collect the local cache
     ///
-    /// Sweeps the local cache (.heph/cache by default) and removes artifacts no longer
+    /// Sweeps the local cache under the heph home (`.heph` by default, `homeDir`
+    /// in config) and removes artifacts no longer
     /// reachable from any current target, reclaiming disk space. Resolves every
     /// cached target's spec, so providers may run.
     ///
