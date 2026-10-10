@@ -300,7 +300,7 @@ pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
             for (provider, fns) in registry.plugins() {
                 hb.namespace(provider, |nb| {
                     for (name, rf) in fns {
-                        // Each provider function carries per-fn state (its async
+                        // Each plugin function carries per-fn state (its async
                         // `PluginFn` + declared signature), so it's registered as a
                         // custom callable value rather than `set_function` (whose
                         // 0.14 `NativeFuncFn` is a stateless `fn` pointer). The
@@ -387,13 +387,13 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
     ) -> starlark::Result<Value<'v>> {
         let extra = eval
             .extra
-            .expect("evaluator extra must be set before calling a provider function")
+            .expect("evaluator extra must be set before calling a plugin function")
             .downcast_ref::<Extra>()
             .expect("evaluator extra must be of type Extra");
 
         // No public accessor returns an arbitrary positional slice; read up to a
         // fixed cap and let the signature validator enforce the real arity. Eight
-        // is far beyond any provider function (the widest takes one positional);
+        // is far beyond any plugin function (the widest takes one positional);
         // more than that trips Starlark's own too-many-args error first.
         //
         // The `_kwargs` variant, deliberately: the plain `parse_positional`
@@ -438,7 +438,7 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
         let outcome = futures::executor::block_on(self.func.call(&ctx, fn_args))
             .map_err(starlark::Error::new_other)?;
 
-        // A provider function may declare targets / provider-state (a "build-file
+        // A plugin function may declare targets / provider-state (a "build-file
         // plugin" wrapping a driver). Everything is checked before anything is
         // merged, so a call either lands whole or not at all. Declarations go
         // through the same checks and sinks as the `target()` / `provider_state()`
@@ -572,7 +572,7 @@ fn rust_to_starlark<'v>(heap: starlark::values::Heap<'v>, v: &htvalue::Value) ->
 const TARGET_RESERVED_KEYS: &[&str] = &["name", "driver", "labels", "transitive", "approval"];
 
 /// The check a provider_state must pass, whether a BUILD file wrote
-/// `provider_state()` or a provider function declared it.
+/// `provider_state()` or a plugin function declared it.
 fn validate_state_decl(provider: &str) -> anyhow::Result<()> {
     if provider.is_empty() {
         anyhow::bail!("provider_state: missing provider");
@@ -581,7 +581,7 @@ fn validate_state_decl(provider: &str) -> anyhow::Result<()> {
 }
 
 /// The checks a target must pass before it reaches the package, whether a
-/// BUILD file wrote `target()` or a provider function declared it — a declared
+/// BUILD file wrote `target()` or a plugin function declared it — a declared
 /// target must not be able to carry what a hand-written one cannot.
 fn validate_target_decl(name: &str, labels: &[String]) -> anyhow::Result<()> {
     if name.is_empty() {
@@ -4528,7 +4528,7 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
         );
     }
 
-    /// A provider function's declared **named** parameters must actually be
+    /// A plugin function's declared **named** parameters must actually be
     /// callable.
     ///
     /// They were not: the dispatch began with Starlark's `no_named_args()`, which

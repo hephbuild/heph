@@ -75,7 +75,7 @@ pub fn value_from_pb(v: pb::Value) -> Value {
     }
 }
 
-// ---- Provider functions (signature + def) ----
+// ---- Plugin functions (signature + def) ----
 //
 // A provider's BUILD-file functions cross the stable ABI as metadata (name /
 // signature / doc); the handler stays guest-side and is invoked via
@@ -542,7 +542,7 @@ fn approval_from_pb(a: pb::Approval) -> Approval {
     }
 }
 
-// ---- Declarations (what a provider function declared) ----
+// ---- Declarations (what a plugin function declared) ----
 //
 // `transitive` crosses as the unparsed `htvalue::Value` the BUILD file writes,
 // not a `Sandbox`: the host parses it with the same code as the `target()`
@@ -602,7 +602,7 @@ pub fn declared_state_from_pb(s: pb::DeclaredState) -> DeclaredState {
     }
 }
 
-/// Encode a provider function's outcome as a `CallFunction` reply.
+/// Encode a plugin function's outcome as a `CallFunction` reply.
 ///
 /// `accepts_declarations` is what the *caller* said it can carry. False (an
 /// older peer, which never sends the field) plus a declaring function is an

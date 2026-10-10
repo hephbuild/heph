@@ -171,10 +171,10 @@ pub enum InspectCommands {
     ///
     /// `heph inspect states -p go --json`
     States(states::Args),
-    /// List provider-exposed functions (`heph.<provider>.<fn>`)
+    /// List plugin-exposed functions (`heph.<plugin>.<fn>`)
     ///
-    /// Prints every function registered by a provider for use in BUILD files,
-    /// in `heph.<provider>.<function>` form, one per line.
+    /// Prints every function registered by a plugin for use in BUILD files,
+    /// in `heph.<plugin>.<function>` form, one per line.
     ///
     /// Example: `heph inspect functions`
     Functions(functions::Args),
