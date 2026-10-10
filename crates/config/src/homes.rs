@@ -10,21 +10,22 @@
 //! worktree of a repository hits one cache. The **checkout** home is this
 //! checkout's own `<root>/<homeDir>`; it holds what must not be shared between
 //! two working trees — sandboxes (and their FUSE mount and execute lock), the
-//! filesystem-walk cache, and approval notices. Outside a linked worktree the
-//! two are the same directory. See `docs/HOME_DIR.md`.
+//! filesystem-walk cache, approval notices, and the cache entries of targets
+//! that never go to a remote cache. Outside a linked worktree the two are the
+//! same directory. See `docs/HOME_DIR.md`.
 
 use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
-use crate::git_checkout::{CheckoutKind, GitCheckout, linked_worktree_count};
+use crate::git_checkout::{CheckoutKind, GitCheckout, LinkedWorktrees, linked_worktrees};
 use crate::home_dir::{DEFAULT_HOME_DIR, HomeDir};
 
 /// This checkout's own home — a type of its own, not a [`HomeDir`], so a site
 /// that needs one cannot be handed the other: everything that belongs to one
 /// working tree (sandboxes, their FUSE mount and execute lock, the fswalk cache,
-/// approval notices) takes a `CheckoutHome`, everything else the shared
-/// [`HomeDir`].
+/// approval notices, local-only cache entries) takes a `CheckoutHome`,
+/// everything else the shared [`HomeDir`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CheckoutHome(PathBuf);
 
@@ -62,11 +63,13 @@ pub enum HomeSharing {
         /// The worktree's name (`<common dir>/worktrees/<name>`).
         name: String,
         /// Linked worktrees of the repository, this one included.
-        linked_worktrees: usize,
+        worktrees: LinkedWorktrees,
     },
     /// The main checkout of a repository that has linked worktrees, which may
-    /// use this home.
-    Main { linked_worktrees: usize },
+    /// use this home. Decided whatever this checkout's own `shareHome` says:
+    /// that flag only decides whether *this* checkout uses another's home,
+    /// not whether others use this one.
+    Main { worktrees: LinkedWorktrees },
 }
 
 impl HomeSharing {
@@ -76,28 +79,43 @@ impl HomeSharing {
         match self {
             HomeSharing::Own(_) => false,
             HomeSharing::Linked { .. } => true,
-            HomeSharing::Main { linked_worktrees } => *linked_worktrees > 0,
+            HomeSharing::Main { worktrees } => worktrees.registered > 0,
         }
+    }
+
+    /// "N registered worktree(s) no longer exist; run `git worktree prune`",
+    /// when some do not. A stale registration keeps the home counted as shared.
+    pub fn stale_worktrees_note(&self) -> Option<String> {
+        let missing = match self {
+            HomeSharing::Own(_) => 0,
+            HomeSharing::Linked { worktrees, .. } | HomeSharing::Main { worktrees } => {
+                worktrees.missing
+            }
+        };
+        (missing > 0).then(|| {
+            format!("{missing} registered worktree(s) no longer exist; run `git worktree prune`")
+        })
     }
 }
 
 impl fmt::Display for HomeSharing {
+    /// Reads as the end of "the home is …".
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HomeSharing::Own(why) => write!(f, "own home ({why})"),
+            HomeSharing::Own(why) => write!(f, "this checkout's own ({why})"),
             HomeSharing::Linked {
                 main_root,
                 name,
-                linked_worktrees,
+                worktrees,
             } => write!(
                 f,
-                "shared from {} (linked worktree {name}; {linked_worktrees} linked worktree(s))",
-                main_root.display()
+                "the main checkout's at {}, used by linked worktree {name} and shared with {} linked worktree(s)",
+                main_root.display(),
+                worktrees.registered
             ),
-            HomeSharing::Main { linked_worktrees } => write!(
-                f,
-                "main checkout, shared with {linked_worktrees} linked worktree(s)"
-            ),
+            HomeSharing::Main { worktrees } => {
+                write!(f, "shared with {} linked worktree(s)", worktrees.registered)
+            }
         }
     }
 }
@@ -110,6 +128,26 @@ pub struct Homes {
     sharing: HomeSharing,
 }
 
+/// What detection decided, and whether the fallback is worth a warning.
+struct Detected {
+    sharing: HomeSharing,
+    /// A `.git` or `commondir` is there but could not be followed.
+    warn: bool,
+}
+
+impl Detected {
+    fn quiet(sharing: HomeSharing) -> Self {
+        Self {
+            sharing,
+            warn: false,
+        }
+    }
+
+    fn own(why: impl Into<String>) -> Self {
+        Self::quiet(HomeSharing::Own(why.into()))
+    }
+}
+
 impl Homes {
     /// Resolve the homes of the workspace at `root`.
     ///
@@ -119,36 +157,63 @@ impl Homes {
     /// detection; `None` means [`DEFAULT_HOME_DIR`].
     ///
     /// `share_home` is `worktree.shareHome`. When on and `root` is in a linked
-    /// git worktree whose root maps to an existing directory in the main
-    /// checkout, the shared home is that directory's `homeDir`; otherwise it is
-    /// the checkout's own. Detection never fails the resolve: every reason it
-    /// gives up is logged at `debug` and lands in [`Homes::sharing`].
+    /// git worktree whose root maps to an existing heph workspace in the main
+    /// checkout, with the same `homeDir` and a writable home, the shared home
+    /// is that workspace's home; otherwise it is the checkout's own. Detection
+    /// never fails the resolve: every reason it gives up lands in
+    /// [`Homes::sharing`] and is logged (at `warn` for a `.git` or `commondir`
+    /// that is there but unreadable, at `debug` otherwise).
     pub fn resolve(
         root: &Path,
         configured: Option<&Path>,
         share_home: bool,
     ) -> anyhow::Result<Self> {
+        Self::resolve_with(root, configured, Some(share_home))
+    }
+
+    /// `detect: None` turns worktree detection off entirely (tests only).
+    fn resolve_with(
+        root: &Path,
+        configured: Option<&Path>,
+        detect: Option<bool>,
+    ) -> anyhow::Result<Self> {
         let own = HomeDir::resolve(root, configured)?;
         let rel = configured.unwrap_or(Path::new(DEFAULT_HOME_DIR));
 
-        let sharing = if rel.is_absolute() {
-            HomeSharing::Own("homeDir is absolute".to_string())
-        } else if !share_home {
-            HomeSharing::Own("worktree.shareHome is false".to_string())
+        let detected = if rel.is_absolute() {
+            Detected::own("homeDir is absolute")
         } else {
-            detect_sharing(root, rel)
+            match detect {
+                None => Detected::own("worktree detection is off"),
+                Some(share_home) => detect_sharing(root, rel, share_home),
+            }
         };
+        let sharing = detected.sharing;
         let shared = match &sharing {
             // Against the main checkout's root, so the same guard holds there.
             HomeSharing::Linked { main_root, .. } => HomeDir::resolve(main_root, configured)?,
             HomeSharing::Own(_) | HomeSharing::Main { .. } => own.clone(),
         };
         let checkout = CheckoutHome(own.as_path().to_path_buf());
-        tracing::debug!(
-            shared = %shared.display(),
-            checkout = %checkout.display(),
-            "heph home: {sharing}"
-        );
+        match &sharing {
+            HomeSharing::Linked {
+                main_root, name, ..
+            } => tracing::info!(
+                checkout = %checkout.display(),
+                "using shared home {} (linked worktree {name} of {})",
+                shared.display(),
+                main_root.display()
+            ),
+            HomeSharing::Own(why) if detected.warn => tracing::warn!(
+                home = %shared.display(),
+                "using this checkout's own home: {why}"
+            ),
+            _ => tracing::debug!(
+                shared = %shared.display(),
+                checkout = %checkout.display(),
+                "heph home: {sharing}"
+            ),
+        }
         Ok(Self {
             shared,
             checkout,
@@ -164,8 +229,8 @@ impl Homes {
 
     /// This checkout's own home: sandboxes, the execute lock, staged inputs
     /// (linked into the sandboxes), the filesystem-walk cache, approval
-    /// notices. The same directory as
-    /// [`Homes::shared`] outside a linked worktree.
+    /// notices, the cache entries of targets that never go to a remote. The
+    /// same directory as [`Homes::shared`] outside a linked worktree.
     pub fn checkout(&self) -> &CheckoutHome {
         &self.checkout
     }
@@ -175,11 +240,13 @@ impl Homes {
     }
 
     /// The default homes of a workspace rooted at `root` (a test's tempdir),
-    /// with worktree detection on — what a config without `homeDir` resolves.
+    /// with worktree detection **off**: a test's result must not depend on
+    /// whatever git checkout happens to sit above the temp dir. A test that
+    /// builds a git layout calls [`Homes::resolve`].
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn for_tests(root: &Path) -> Self {
-        Self::resolve(root, None, true).expect("resolving test homes")
+        Self::resolve_with(root, None, None).expect("resolving test homes")
     }
 }
 
@@ -190,31 +257,42 @@ impl Homes {
 /// of the tree it really is in, and "is the main checkout's root this one"
 /// must compare real directories, not spellings of them (`/var` is
 /// `/private/var` on macOS).
-fn detect_sharing(root: &Path, home_rel: &Path) -> HomeSharing {
+fn detect_sharing(root: &Path, home_rel: &Path, share_home: bool) -> Detected {
     let root = match root.canonicalize() {
         Ok(p) => p,
-        Err(e) => return HomeSharing::Own(format!("canonicalizing {}: {e}", root.display())),
+        Err(e) => return Detected::own(format!("canonicalizing {}: {e}", root.display())),
     };
     let root = root.as_path();
     let co = match GitCheckout::discover(root) {
         Ok(co) => co,
-        Err(why) => return HomeSharing::Own(why),
+        Err(no) => {
+            return Detected {
+                warn: no.malformed,
+                sharing: HomeSharing::Own(no.reason),
+            };
+        }
     };
     match co.kind {
-        CheckoutKind::Main { common_dir } => match linked_worktree_count(&common_dir) {
-            0 => HomeSharing::Own("main checkout without linked worktrees".to_string()),
-            n => HomeSharing::Main {
-                linked_worktrees: n,
-            },
-        },
-        CheckoutKind::Unshared(why) => HomeSharing::Own(why.to_string()),
+        // Counted whatever `share_home` says: it decides whether this
+        // checkout uses another's home, and the main checkout uses its own
+        // either way. Whether worktrees use *this* one is theirs to decide.
+        CheckoutKind::Main { common_dir } => {
+            let worktrees = linked_worktrees(&common_dir);
+            if worktrees.registered == 0 {
+                Detected::own("main checkout without linked worktrees")
+            } else {
+                Detected::quiet(HomeSharing::Main { worktrees })
+            }
+        }
+        CheckoutKind::Unshared(why) => Detected::own(why),
+        CheckoutKind::Linked { .. } if !share_home => Detected::own("worktree.shareHome is false"),
         CheckoutKind::Linked {
             common_dir,
             main_top,
             name,
         } => {
             let Ok(rel) = root.strip_prefix(&co.top) else {
-                return HomeSharing::Own(format!(
+                return Detected::own(format!(
                     "root {} is not under worktree {}",
                     root.display(),
                     co.top.display()
@@ -224,7 +302,7 @@ fn detect_sharing(root: &Path, home_rel: &Path) -> HomeSharing {
             let main_root = match mapped.canonicalize() {
                 Ok(p) if p.is_dir() => p,
                 _ => {
-                    return HomeSharing::Own(format!(
+                    return Detected::own(format!(
                         "{} does not exist in the main checkout",
                         mapped.display()
                     ));
@@ -233,28 +311,85 @@ fn detect_sharing(root: &Path, home_rel: &Path) -> HomeSharing {
             if main_root == root {
                 // A `gitdir` pointing back at this very tree: there is no
                 // other checkout to share with.
-                return HomeSharing::Own(format!(
+                return Detected::own(format!(
                     "the main checkout's root is this root ({})",
                     root.display()
                 ));
             }
-            let would_share = HomeDir::resolve(&main_root, Some(home_rel));
-            if would_share.is_ok_and(|h| root.starts_with(h.as_path())) {
+            if let Err(why) = main_home_matches(&main_root, home_rel) {
+                return Detected::own(why);
+            }
+            let would_share = match HomeDir::resolve(&main_root, Some(home_rel)) {
+                Ok(h) => h,
+                Err(e) => {
+                    return Detected::own(format!("resolving the main checkout's home: {e:#}"));
+                }
+            };
+            if root.starts_with(would_share.as_path()) {
                 // A worktree placed inside the home it would share: the home
                 // would hold its own sources, and walkers refuse anything
                 // under a `.heph*` dir.
-                return HomeSharing::Own(format!(
+                return Detected::own(format!(
                     "{} is inside the main checkout's home",
                     root.display()
                 ));
             }
-            HomeSharing::Linked {
+            if !writable(&would_share) {
+                return Detected::own(format!(
+                    "the main checkout's home {} is not writable",
+                    would_share.display()
+                ));
+            }
+            Detected::quiet(HomeSharing::Linked {
                 main_root,
                 name,
-                linked_worktrees: linked_worktree_count(&common_dir),
-            }
+                worktrees: linked_worktrees(&common_dir),
+            })
         }
     }
+}
+
+/// `Ok` when `main_root` is a heph workspace whose own config resolves the
+/// same home as this checkout's `homeDir` does. The shared home is the main
+/// checkout's, so it is the main checkout's config that says where it is; a
+/// worktree on a branch that moved `homeDir` must not invent a home there.
+fn main_home_matches(main_root: &Path, home_rel: &Path) -> Result<(), String> {
+    if !crate::CONFIG_FILE_NAMES
+        .iter()
+        .any(|n| main_root.join(n).exists())
+    {
+        return Err(format!(
+            "the main checkout's {} is not a heph workspace (no {})",
+            main_root.display(),
+            crate::CONFIG_FILE_NAME
+        ));
+    }
+    let cfg = crate::load_from_root(main_root)
+        .map_err(|e| format!("loading the main checkout's config: {e:#}"))?;
+    let main_home = HomeDir::resolve(main_root, cfg.home_dir.as_deref())
+        .map_err(|e| format!("resolving the main checkout's homeDir: {e:#}"))?;
+    let ours = HomeDir::resolve(main_root, Some(home_rel))
+        .map_err(|e| format!("resolving this checkout's homeDir in the main checkout: {e:#}"))?;
+    if main_home != ours {
+        return Err(format!(
+            "the main checkout's homeDir ({}) differs from this checkout's ({})",
+            cfg.home_dir
+                .as_deref()
+                .unwrap_or(Path::new(DEFAULT_HOME_DIR))
+                .display(),
+            home_rel.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `path` — or, when it does not exist yet, its nearest existing
+/// ancestor (where the engine would create it) — is writable by this process.
+/// `access(W_OK)` on linux and macOS alike.
+fn writable(path: &Path) -> bool {
+    path.ancestors()
+        .find(|a| a.symlink_metadata().is_ok())
+        .is_some_and(|existing| rustix::fs::access(existing, rustix::fs::Access::WRITE_OK).is_ok())
 }
 
 #[cfg(test)]
@@ -278,6 +413,13 @@ mod tests {
         (tmp, main, wt)
     }
 
+    fn one_worktree() -> LinkedWorktrees {
+        LinkedWorktrees {
+            registered: 1,
+            missing: 0,
+        }
+    }
+
     fn assert_own(h: &Homes, root: &Path) {
         assert!(
             matches!(h.sharing(), HomeSharing::Own(_)),
@@ -286,6 +428,16 @@ mod tests {
         );
         assert_eq!(h.shared().as_path(), root.join(DEFAULT_HOME_DIR));
         assert_eq!(h.checkout().as_path(), h.shared().as_path());
+    }
+
+    /// Asserts the fallback, and that its reason says `needle`.
+    fn assert_own_because(h: &Homes, root: &Path, needle: &str) {
+        assert_own(h, root);
+        assert!(
+            matches!(h.sharing(), HomeSharing::Own(why) if why.contains(needle)),
+            "expected a reason containing {needle:?}, got {:?}",
+            h.sharing()
+        );
     }
 
     /// Outside a git checkout both homes are the one `HomeDir::resolve` gives
@@ -334,7 +486,7 @@ mod tests {
             &HomeSharing::Linked {
                 main_root: main.clone(),
                 name: "wt".to_string(),
-                linked_worktrees: 1,
+                worktrees: one_worktree(),
             }
         );
         // And the main checkout knows its home is shared.
@@ -343,7 +495,22 @@ mod tests {
         assert_eq!(
             m.sharing(),
             &HomeSharing::Main {
-                linked_worktrees: 1
+                worktrees: one_worktree()
+            }
+        );
+        assert!(m.sharing().is_shared());
+    }
+
+    /// `shareHome: false` in the main checkout does not stop it counting its
+    /// worktrees: they may still share its home, so gc must still know.
+    #[test]
+    fn main_counts_worktrees_whatever_its_share_home() {
+        let (_tmp, main, _wt) = repo_with_worktree();
+        let m = Homes::resolve(&main, None, false).expect("resolve");
+        assert_eq!(
+            m.sharing(),
+            &HomeSharing::Main {
+                worktrees: one_worktree()
             }
         );
         assert!(m.sharing().is_shared());
@@ -353,6 +520,7 @@ mod tests {
     fn detect_worktree_subdir_root() {
         let (_tmp, main, wt) = repo_with_worktree();
         std::fs::create_dir_all(main.join("sub")).expect("mkdir");
+        std::fs::write(main.join("sub").join(crate::CONFIG_FILE_NAME), "").expect("config");
         std::fs::create_dir_all(wt.join("sub")).expect("mkdir");
         let h = resolve(&wt.join("sub"), None);
         assert_eq!(
@@ -403,22 +571,37 @@ mod tests {
         );
     }
 
+    /// git's own form: an absolute `gitdir:` and a relative `commondir`.
     #[test]
-    fn detect_commondir_relative_and_absolute() {
+    fn detect_relative_commondir() {
         let (_tmp, main, wt) = repo_with_worktree();
-        // git's own relative form.
         assert_eq!(
             resolve(&wt, None).shared().as_path(),
             main.join(DEFAULT_HOME_DIR)
         );
-        // An absolute commondir, and a relative `gitdir:` in the `.git` file.
+    }
+
+    /// A relative `gitdir:` in the `.git` file, anchored at the file's dir.
+    #[test]
+    fn detect_relative_gitdir() {
+        let (_tmp, main, wt) = repo_with_worktree();
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").expect(".git");
+        assert_eq!(
+            resolve(&wt, None).shared().as_path(),
+            main.join(DEFAULT_HOME_DIR)
+        );
+    }
+
+    /// An absolute `commondir`.
+    #[test]
+    fn detect_absolute_commondir() {
+        let (_tmp, main, wt) = repo_with_worktree();
         let admin = main.join(".git").join("worktrees").join("wt");
         std::fs::write(
             admin.join("commondir"),
             format!("{}\n", main.join(".git").display()),
         )
         .expect("commondir");
-        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").expect(".git");
         assert_eq!(
             resolve(&wt, None).shared().as_path(),
             main.join(DEFAULT_HOME_DIR)
@@ -438,33 +621,58 @@ mod tests {
             main.join(DEFAULT_HOME_DIR)
         );
 
-        let cases: [(&str, &[u8]); 5] = [
-            ("empty file", b""),
-            ("no gitdir prefix", b"/somewhere/else\n"),
-            ("empty path", b"gitdir:   \n"),
-            ("non-UTF-8", b"gitdir: /tmp/\xff\xfe\n"),
+        let cases: [(&str, &[u8], &str); 5] = [
+            ("empty file", b"", "no `gitdir:` line"),
+            (
+                "no gitdir prefix",
+                b"/somewhere/else\n",
+                "no `gitdir:` line",
+            ),
+            ("empty path", b"gitdir:   \n", "empty path"),
+            ("non-UTF-8", b"gitdir: /tmp/\xff\xfe\n", "not UTF-8"),
             (
                 "dangling",
                 b"gitdir: /definitely/not/here/.git/worktrees/x\n",
+                "which is not a directory",
             ),
         ];
-        for (what, bytes) in cases {
+        for (what, bytes, reason) in cases {
             std::fs::write(&dot_git, bytes).expect("write");
             let h = resolve(&wt, None);
+            assert_own(&h, &wt);
             assert!(
-                matches!(h.sharing(), HomeSharing::Own(_)),
-                "{what}: {:?}",
+                matches!(h.sharing(), HomeSharing::Own(why) if why.contains(reason)),
+                "{what}: expected {reason:?} in {:?}",
                 h.sharing()
             );
-            assert_own(&h, &wt);
         }
 
         // A dangling or malformed commondir is a fallback too.
         std::fs::write(&dot_git, format!("gitdir: {}\n", admin.display())).expect("write");
-        for bytes in [&b""[..], b"/no/such/common\n", b"\xff\n"] {
+        for (bytes, reason) in [
+            (&b""[..], "empty path"),
+            (b"/no/such/common\n", "which is not a directory"),
+            (b"\xff\n", "not UTF-8"),
+        ] {
             std::fs::write(admin.join("commondir"), bytes).expect("write");
-            assert_own(&resolve(&wt, None), &wt);
+            assert_own_because(&resolve(&wt, None), &wt, reason);
         }
+    }
+
+    /// A main checkout whose mapped root is, through a symlink, this very
+    /// worktree's root: there is no other checkout to share with.
+    #[cfg(unix)]
+    #[test]
+    fn detect_main_root_is_this_root() {
+        let (_tmp, main, wt) = repo_with_worktree();
+        std::fs::create_dir_all(wt.join("sub")).expect("mkdir");
+        std::os::unix::fs::symlink(wt.join("sub"), main.join("sub")).expect("symlink");
+        let root = wt.join("sub");
+        assert_own_because(
+            &resolve(&root, None),
+            &root,
+            "the main checkout's root is this root",
+        );
     }
 
     #[test]
@@ -473,13 +681,80 @@ mod tests {
         // `wt/only-here` has no counterpart in the main checkout.
         let root = wt.join("only-here");
         std::fs::create_dir_all(&root).expect("mkdir");
-        let h = resolve(&root, None);
-        assert_own(&h, &root);
-        assert!(
-            matches!(h.sharing(), HomeSharing::Own(why) if why.contains("does not exist in the main checkout")),
-            "{:?}",
-            h.sharing()
+        assert_own_because(
+            &resolve(&root, None),
+            &root,
+            "does not exist in the main checkout",
         );
+    }
+
+    #[test]
+    fn main_not_a_heph_workspace_keeps_own() {
+        let (_tmp, main, wt) = repo_with_worktree();
+        std::fs::remove_file(main.join(crate::CONFIG_FILE_NAME)).expect("rm config");
+        assert_own_because(&resolve(&wt, None), &wt, "is not a heph workspace");
+    }
+
+    #[test]
+    fn main_config_that_fails_to_load_keeps_own() {
+        let (_tmp, main, wt) = repo_with_worktree();
+        std::fs::write(main.join(crate::CONFIG_FILE_NAME), "notAKey: [\n").expect("write");
+        assert_own_because(
+            &resolve(&wt, None),
+            &wt,
+            "loading the main checkout's config",
+        );
+    }
+
+    /// The shared home is where the *main* checkout's config puts it. A
+    /// worktree whose `homeDir` differs keeps its own rather than inventing a
+    /// home in the main checkout.
+    #[test]
+    fn main_home_dir_differs_keeps_own() {
+        let (_tmp, main, wt) = repo_with_worktree();
+        std::fs::write(main.join(crate::CONFIG_FILE_NAME), "homeDir: .elsewhere\n").expect("write");
+        assert_own_because(&resolve(&wt, None), &wt, "differs from this checkout's");
+
+        // Both saying the same thing in different spellings is the same home.
+        std::fs::write(main.join(crate::CONFIG_FILE_NAME), "homeDir: ./.heph\n").expect("write");
+        assert_eq!(
+            resolve(&wt, None).shared().as_path(),
+            main.join(DEFAULT_HOME_DIR)
+        );
+    }
+
+    /// A main checkout's home that this process cannot write — or, before it
+    /// exists, whose nearest existing parent it cannot — is not shared.
+    #[cfg(unix)]
+    #[test]
+    fn main_home_not_writable_keeps_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, main, wt) = repo_with_worktree();
+        let set = |p: &Path, mode| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        // Root ignores mode bits; nothing to test there.
+        let probe = main.join("probe");
+        set(&main, 0o555);
+        let as_root = std::fs::write(&probe, "").is_ok();
+        if as_root {
+            set(&main, 0o755);
+            eprintln!("skipping: running as root");
+            return;
+        }
+
+        // The home does not exist yet: its parent (the main checkout) decides.
+        assert_own_because(&resolve(&wt, None), &wt, "is not writable");
+        set(&main, 0o755);
+        assert!(resolve(&wt, None).sharing().is_shared());
+
+        // The home exists and is read-only.
+        let home = main.join(DEFAULT_HOME_DIR);
+        std::fs::create_dir_all(&home).expect("mkdir");
+        set(&home, 0o555);
+        let h = resolve(&wt, None);
+        set(&home, 0o755);
+        assert_own_because(&h, &wt, "is not writable");
     }
 
     #[test]
@@ -488,6 +763,14 @@ mod tests {
         let h = Homes::resolve(&wt, None, false).expect("resolve");
         assert_own(&h, &wt);
         assert!(!h.sharing().is_shared());
+    }
+
+    /// Engine tests run under a temp dir that may sit inside some git
+    /// checkout; `for_tests` must not care.
+    #[test]
+    fn for_tests_does_not_detect() {
+        let (_tmp, _main, wt) = repo_with_worktree();
+        assert_own_because(&Homes::for_tests(&wt), &wt, "detection is off");
     }
 
     #[test]
@@ -512,6 +795,7 @@ mod tests {
     fn symlinked_root_is_detected_canonically() {
         let (tmp, main, wt) = repo_with_worktree();
         std::fs::create_dir_all(main.join("sub")).expect("mkdir");
+        std::fs::write(main.join("sub").join(crate::CONFIG_FILE_NAME), "").expect("config");
         std::fs::create_dir_all(wt.join("sub")).expect("mkdir");
         let elsewhere = tmp.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).expect("mkdir");
@@ -533,7 +817,7 @@ mod tests {
         assert_eq!(
             m.sharing(),
             &HomeSharing::Main {
-                linked_worktrees: 1
+                worktrees: one_worktree()
             }
         );
     }
@@ -555,8 +839,23 @@ mod tests {
     #[test]
     fn relative_home_dir_is_detected() {
         let (_tmp, main, wt) = repo_with_worktree();
+        std::fs::write(main.join(crate::CONFIG_FILE_NAME), "homeDir: state/h\n").expect("write");
         let h = resolve(&wt, Some("state/h"));
         assert_eq!(h.shared().as_path(), main.join("state/h"));
         assert_eq!(h.checkout().as_path(), wt.join("state/h"));
+    }
+
+    #[test]
+    fn stale_worktrees_are_noted() {
+        let (tmp, main, _wt) = repo_with_worktree();
+        let gone = tmp.path().canonicalize().expect("canon").join("gone");
+        linked_worktree(&main, &gone, "gone", "b");
+        std::fs::remove_dir_all(&gone).expect("rm");
+        let m = resolve(&main, None);
+        assert_eq!(
+            m.sharing().stale_worktrees_note().as_deref(),
+            Some("1 registered worktree(s) no longer exist; run `git worktree prune`")
+        );
+        assert_eq!(m.sharing().to_string(), "shared with 2 linked worktree(s)");
     }
 }

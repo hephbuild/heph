@@ -12,6 +12,15 @@ use enclose::enclose;
 use hmodel::htaddr::Addr;
 use std::sync::Arc;
 
+/// The locks a run holds from just before it claims its sandbox until its
+/// outputs are cached. Fields drop in declaration order: the execute lock is
+/// released before the rebuild lock, the reverse of how they were taken.
+#[derive(Debug)]
+pub(crate) struct RunGuards {
+    _execute: crate::engine::result_lock::ExecuteGuard,
+    _rebuild: Option<crate::engine::result_lock::RebuildGuard>,
+}
+
 impl Engine {
     #[async_recursion]
     #[expect(
@@ -31,11 +40,14 @@ impl Engine {
         // `outputs_are_material`: this target's outputs are credential material.
         // The one thing it changes is the failure path — see the `Err` arm below.
         outputs_are_material: bool,
+        // `rebuild`: this run rebuilds a revision under its riding read, and
+        // takes the revision's rebuild lock first. See `lock_rebuild`.
+        rebuild: bool,
     ) -> anyhow::Result<(
         Vec<OutputArtifact>,
         crate::engine::sandbox_cleaner::SandboxTeardown,
         Vec<hplugin::driver::SandboxGuard>,
-        crate::engine::result_lock::ExecuteGuard,
+        RunGuards,
     )> {
         let driver = self
             .drivers_by_name
@@ -102,6 +114,26 @@ impl Engine {
         // a forced rebuild of that dep), before the worker permit (a target
         // parked here holds no worker). Returned to the caller, which holds it
         // until the outputs are cached. See `ResultLock::lock_execute`.
+        //
+        // A rebuild under a riding read (see `execute_and_cache`) first takes
+        // the revision's rebuild lock, in the *shared* lock dir: it writes the
+        // shared cache entry holding only a read of it, and the execute lock is
+        // per checkout. Taken here, after deps and right before the execute
+        // lock, and nowhere else — see `ResultLock::lock_rebuild`.
+        let rebuild_guard = if rebuild {
+            hcore::hmemoizer::set_phase("execute:rebuild_lock");
+            Some(
+                self.acquire_with_notice(
+                    &rs,
+                    addr,
+                    Some(hashin),
+                    self.result_lock().lock_rebuild(addr, hashin, rs.ctoken()),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         hcore::hmemoizer::set_phase("execute:execute_lock");
         let execute_guard = self
             .acquire_with_notice(
@@ -312,7 +344,17 @@ impl Engine {
         )
         .await;
         htelemetry::telemetry::record_execute_ms(exec_started.elapsed().as_millis() as u64);
-        res.map(|(artifacts, teardown, guards)| (artifacts, teardown, guards, execute_guard))
+        res.map(|(artifacts, teardown, guards)| {
+            (
+                artifacts,
+                teardown,
+                guards,
+                RunGuards {
+                    _execute: execute_guard,
+                    _rebuild: rebuild_guard,
+                },
+            )
+        })
     }
 
     async fn inputs_result_exec(

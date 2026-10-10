@@ -33,6 +33,11 @@ pub struct PluginInit {
     /// (the OCI runner) mounts it so a container sees this checkout's
     /// sandboxes, which live there.
     pub home: crate::engine::CheckoutHome,
+    /// The home every checkout shares — the in-process counterpart of
+    /// `CreateConfig.shared_home`. The same directory as `home` outside a
+    /// linked git worktree. The OCI runner mounts it too: a sandbox's scratch
+    /// symlinks point into it.
+    pub shared_home: crate::engine::HomeDir,
     /// Absolute directories to prune by exact path: the heph home plus the
     /// literal (non-glob) `fs.skip` entries, resolved relative to the repo root.
     pub skip_dirs: Vec<PathBuf>,
@@ -77,6 +82,13 @@ pub struct Engine {
     /// memory and never touch the SQLite WAL; entries over the per-entry cap
     /// spill to `local_cache`. See [`LocalCacheTmp`].
     pub(crate) local_cache_tmp: Arc<dyn LocalCache>,
+    /// This checkout's own durable store, holding the entries of targets that
+    /// never go to a remote cache ([`CacheScope::Checkout`]). `None` when the
+    /// checkout home is the shared home: then there is one store,
+    /// `local_cache`. Read through [`Engine::local_cache_for`].
+    ///
+    /// [`CacheScope::Checkout`]: crate::engine::local_cache::CacheScope::Checkout
+    pub(crate) checkout_cache: Option<CheckoutCacheStore>,
     /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
     /// tree-walking plugins via [`PluginInit`].
     pub(crate) walker: Arc<hwalk::CachedWalker>,
@@ -457,7 +469,126 @@ fn ensure_home(home: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// What opening a durable local cache store needs from the [`Config`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoreOptions {
+    mem: crate::engine::config::MemCacheOptions,
+    spill_threshold_bytes: u64,
+    parallelism: usize,
+}
+
+impl StoreOptions {
+    /// The durable store under `dir` (`<home>/cache`): manifests and small or
+    /// medium blobs in sqlite, large blobs spilled to plain files, fronted by
+    /// the mem tier unless it is disabled.
+    fn open(self, dir: &Path) -> anyhow::Result<Arc<dyn LocalCache>> {
+        let sqlite: Arc<dyn LocalCache> = Arc::new(LocalCacheSQLite::with_pipe_limit(
+            dir.join("cache.db"),
+            self.mem.per_entry_bytes,
+            2 * self.parallelism,
+        )?);
+        let blobs = Arc::new(crate::engine::local_cache_fs::LocalCacheFS::new(
+            dir.join("blobs"),
+        )?);
+        let durable: Arc<dyn LocalCache> =
+            Arc::new(crate::engine::local_cache_spill::LocalCacheSpill::new(
+                sqlite,
+                blobs,
+                usize::try_from(self.spill_threshold_bytes).unwrap_or(usize::MAX),
+            ));
+        Ok(if self.mem.capacity_bytes == 0 {
+            durable
+        } else {
+            Arc::new(LocalCacheMem::new(
+                durable,
+                self.mem.per_entry_bytes,
+                self.mem.capacity_bytes,
+            ))
+        })
+    }
+}
+
+/// The checkout's own durable store ([`CacheScope::Checkout`]), opened on
+/// first use.
+///
+/// [`CacheScope::Checkout`]: crate::engine::local_cache::CacheScope::Checkout
+pub(crate) struct CheckoutCacheStore {
+    dir: PathBuf,
+    opts: StoreOptions,
+    store: std::sync::OnceLock<Arc<dyn LocalCache>>,
+    /// Serializes the open, so two first users cannot both open the sqlite db.
+    opening: Mutex<()>,
+}
+
+impl CheckoutCacheStore {
+    fn new(dir: PathBuf, opts: StoreOptions) -> Self {
+        Self {
+            dir,
+            opts,
+            store: std::sync::OnceLock::new(),
+            opening: Mutex::new(()),
+        }
+    }
+
+    fn get(&self) -> anyhow::Result<Arc<dyn LocalCache>> {
+        if let Some(s) = self.store.get() {
+            return Ok(Arc::clone(s));
+        }
+        let _opening = self.opening.lock();
+        if let Some(s) = self.store.get() {
+            return Ok(Arc::clone(s));
+        }
+        let s = self
+            .opts
+            .open(&self.dir)
+            .with_context(|| format!("opening the checkout's cache {}", self.dir.display()))?;
+        Ok(Arc::clone(self.store.get_or_init(|| s)))
+    }
+
+    /// The store if it holds anything: open already, or a database on disk.
+    /// What gc and clean sweep — they must not create a store to find it
+    /// empty.
+    fn existing(&self) -> anyhow::Result<Option<Arc<dyn LocalCache>>> {
+        if self.store.get().is_some() || self.dir.join("cache.db").exists() {
+            self.get().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 impl Engine {
+    /// The local cache store for `scope`. One store when the checkout home is
+    /// the shared home; otherwise the checkout's own is opened on first use.
+    pub(crate) fn local_cache_for(
+        &self,
+        scope: crate::engine::local_cache::CacheScope,
+    ) -> anyhow::Result<Arc<dyn LocalCache>> {
+        use crate::engine::local_cache::CacheScope;
+        match (scope, &self.checkout_cache) {
+            (CacheScope::Checkout, Some(store)) => store.get(),
+            (CacheScope::Shared, _) | (CacheScope::Checkout, None) => {
+                Ok(Arc::clone(&self.local_cache))
+            }
+        }
+    }
+
+    /// Every distinct store that holds entries, with its scope: the shared one,
+    /// and the checkout's when it is a separate store that exists. What gc and
+    /// clean sweep.
+    pub(crate) fn local_caches(
+        &self,
+    ) -> anyhow::Result<Vec<(crate::engine::local_cache::CacheScope, Arc<dyn LocalCache>)>> {
+        use crate::engine::local_cache::CacheScope;
+        let mut out = vec![(CacheScope::Shared, Arc::clone(&self.local_cache))];
+        if let Some(store) = &self.checkout_cache
+            && let Some(c) = store.existing()?
+        {
+            out.push((CacheScope::Checkout, c));
+        }
+        Ok(out)
+    }
+
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let home = cfg.homes.shared().clone();
         let checkout_home = cfg.homes.checkout().clone();
@@ -481,31 +612,17 @@ impl Engine {
                 .unwrap_or(1)
         });
 
-        let sqlite: Arc<dyn LocalCache> = Arc::new(LocalCacheSQLite::with_pipe_limit(
-            home.join("cache").join("cache.db"),
-            cfg.mem_cache.per_entry_bytes,
-            2 * parallelism,
-        )?);
-        // Durable tier: manifests + small/medium blobs in sqlite, large blobs
-        // spilled to plain files. The mem tier (below) fronts both.
-        let blobs = Arc::new(crate::engine::local_cache_fs::LocalCacheFS::new(
-            home.join("cache").join("blobs"),
-        )?);
-        let durable: Arc<dyn LocalCache> =
-            Arc::new(crate::engine::local_cache_spill::LocalCacheSpill::new(
-                sqlite,
-                blobs,
-                usize::try_from(cfg.spill_threshold_bytes).unwrap_or(usize::MAX),
-            ));
-        let local_cache: Arc<dyn LocalCache> = if cfg.mem_cache.capacity_bytes == 0 {
-            durable
-        } else {
-            Arc::new(LocalCacheMem::new(
-                durable,
-                cfg.mem_cache.per_entry_bytes,
-                cfg.mem_cache.capacity_bytes,
-            ))
+        let store_opts = StoreOptions {
+            mem: cfg.mem_cache,
+            spill_threshold_bytes: cfg.spill_threshold_bytes,
+            parallelism,
         };
+        let local_cache = store_opts.open(&home.join("cache"))?;
+        // The checkout's own store, for the entries that must not be shared
+        // (see `CacheScope`). Opened on first use: most worktrees build no
+        // local-only target and never need it.
+        let checkout_cache = (checkout_home.as_path() != home.as_path())
+            .then(|| CheckoutCacheStore::new(checkout_home.join("cache"), store_opts));
 
         // Mem-only tier for tmp/uncacheable revisions; spills oversized or
         // over-budget entries to the durable cache so a reader never misses.
@@ -579,6 +696,7 @@ impl Engine {
             runtime: runtime.clone(),
             local_cache,
             local_cache_tmp,
+            checkout_cache,
             walker,
             providers: vec![],
             providers_by_name: HashMap::new(),
@@ -770,6 +888,7 @@ impl Engine {
         PluginInit {
             root: self.cfg.root.clone(),
             home: self.checkout_home.clone(),
+            shared_home: self.shared_home.clone(),
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
             walker: self.walker.clone(),
@@ -1128,7 +1247,7 @@ mod tests {
         linked_worktree(&main, &wt, "wt", "feat");
 
         let _rt = crate::engine::test_rt_enter();
-        let engine = Engine::new(Config::for_tests(&wt)).expect("engine");
+        let engine = Engine::new(Config::for_tests_detected(&wt)).expect("engine");
         assert_ne!(engine.shared_home.as_path(), engine.checkout_home.as_path());
         for home in [engine.shared_home.as_path(), engine.checkout_home.as_path()] {
             assert_eq!(
@@ -1143,6 +1262,84 @@ mod tests {
             wt.join(".heph"),
             "plugins get the checkout's home"
         );
+        assert_eq!(
+            engine.plugin_init_payload().shared_home.as_path(),
+            main.join(".heph"),
+            "and the shared home beside it"
+        );
+    }
+
+    #[test]
+    fn cache_scope_follows_remote_eligibility() {
+        use crate::engine::driver::targetdef::CacheConfig;
+        use crate::engine::local_cache::CacheScope;
+        assert_eq!(CacheScope::of(&CacheConfig::on(true)), CacheScope::Shared);
+        assert_eq!(
+            CacheScope::of(&CacheConfig::on(false)),
+            CacheScope::Checkout
+        );
+        assert_eq!(CacheScope::of(&CacheConfig::off()), CacheScope::Checkout);
+    }
+
+    /// One home, one store: both scopes are the same `LocalCache`, so nothing
+    /// changes outside a linked worktree.
+    #[test]
+    fn one_home_is_one_store() {
+        use crate::engine::local_cache::CacheScope;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let engine = Engine::new(Config::for_tests(dir.path())).expect("engine");
+        let shared = engine.local_cache_for(CacheScope::Shared).expect("shared");
+        let checkout = engine
+            .local_cache_for(CacheScope::Checkout)
+            .expect("checkout");
+        assert!(Arc::ptr_eq(&shared, &checkout));
+        assert_eq!(engine.local_caches().expect("stores").len(), 1);
+    }
+
+    /// In a linked worktree the checkout scope is its own store, under the
+    /// worktree's home, opened on first use: what one scope holds the other
+    /// does not see, and gc/clean only list it once it exists.
+    #[test]
+    fn a_worktree_has_a_checkout_store_of_its_own() {
+        use crate::engine::local_cache::{CacheScope, MANIFEST_V1};
+        use hconfig::git_checkout::test_layout::{linked_worktree, main_checkout};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let (main, wt) = (base.join("main"), base.join("wt"));
+        main_checkout(&main, "master");
+        linked_worktree(&main, &wt, "wt", "feat");
+        let _rt = crate::engine::test_rt_enter();
+        let engine = Engine::new(Config::for_tests_detected(&wt)).expect("engine");
+
+        assert_eq!(
+            engine.local_caches().expect("stores").len(),
+            1,
+            "no checkout store until something needs one"
+        );
+        let checkout = engine
+            .local_cache_for(CacheScope::Checkout)
+            .expect("checkout");
+        let shared = engine.local_cache_for(CacheScope::Shared).expect("shared");
+        assert!(!Arc::ptr_eq(&shared, &checkout));
+        assert!(wt.join(".heph").join("cache").join("cache.db").exists());
+
+        let a = hmodel::htaddr::parse_addr("//p:a").expect("addr");
+        let mut w = checkout.writer(&a, "h", MANIFEST_V1).expect("writer");
+        std::io::Write::write_all(&mut w, b"x").expect("write");
+        w.commit().expect("commit");
+        assert!(checkout.exists(&a, "h", MANIFEST_V1).expect("exists"));
+        assert!(
+            !shared.exists(&a, "h", MANIFEST_V1).expect("exists"),
+            "the shared store does not see the checkout's entry"
+        );
+        let scopes: Vec<_> = engine
+            .local_caches()
+            .expect("stores")
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(scopes, [CacheScope::Shared, CacheScope::Checkout]);
     }
 
     // Names the dir after pid 1 (init/launchd): always alive, always owned by

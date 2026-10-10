@@ -986,6 +986,7 @@ impl Engine {
                 // The outputs are material: a failure must not leave them in a
                 // sandbox kept for diagnostics.
                 true,
+                false,
             )
             .await;
 

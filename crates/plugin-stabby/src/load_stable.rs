@@ -78,6 +78,7 @@ pub fn load(
     path: &std::path::Path,
     root: &str,
     home: &str,
+    shared_home: &str,
     options: std::collections::HashMap<String, pb::Value>,
 ) -> anyhow::Result<LoadedComponents> {
     use crate::abi::PluginComponents;
@@ -89,6 +90,7 @@ pub fn load(
     let cfg = pb::CreateConfig {
         root: root.to_string(),
         home: home.to_string(),
+        shared_home: shared_home.to_string(),
         options,
     }
     .encode_to_vec();

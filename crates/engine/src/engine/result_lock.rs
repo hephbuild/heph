@@ -41,7 +41,8 @@
 //! them ([`KeyedHandle`]), so exclusion holds in-process as well as across
 //! processes. The default filesystem backend serializes across *processes* via
 //! `flock(2)` lock files under `<home>/lock/` — `<addr>.outer.lock` and
-//! `<addr>.<revision>.inner.lock`, plus `<addr>.execute.lock` under the
+//! `<addr>.<revision>.inner.lock` (and `<addr>.<revision>.rebuild.lock`, see
+//! [`ResultLock::lock_rebuild`]), plus `<addr>.execute.lock` under the
 //! *checkout's* home (see [`ResultLock::new`]); the in-memory backend serializes
 //! only within this process.
 
@@ -185,6 +186,14 @@ pub enum ExecuteGuard {
     Mem(KeyedGuard<Addr, MemLock, MemGuard>),
 }
 
+/// A rebuild of one revision under its riding read in progress. See
+/// [`ResultLock::lock_rebuild`].
+#[derive(Debug)]
+pub enum RebuildGuard {
+    Fs(KeyedGuard<RevisionKey, FLock, FWriteGuard>),
+    Mem(KeyedGuard<RevisionKey, MemLock, MemGuard>),
+}
+
 /// Exclusive hold on one revision, taken under a [`TargetGuard`]. Its readers
 /// have drained, and none can start until it drops.
 #[derive(Debug)]
@@ -246,6 +255,10 @@ pub struct Registries<G, R, E> {
     /// One per target, held across a run of it — see
     /// [`ResultLock::lock_execute`].
     executes: KeyedLock<Addr, E>,
+    /// One per revision, held across a rebuild under a riding read — see
+    /// [`ResultLock::lock_rebuild`]. Same lock type as the execute lock, in
+    /// the shared lock dir.
+    rebuilds: KeyedLock<RevisionKey, E>,
 }
 
 impl<G, R, E> Registries<G, R, E>
@@ -258,11 +271,13 @@ where
         gateway: impl Fn(&Addr) -> G + Send + Sync + 'static,
         revision: impl Fn(&RevisionKey) -> R + Send + Sync + 'static,
         execute: impl Fn(&Addr) -> E + Send + Sync + 'static,
+        rebuild: impl Fn(&RevisionKey) -> E + Send + Sync + 'static,
     ) -> Self {
         Self {
             gateways: KeyedLock::new(gateway),
             revisions: KeyedRWLock::new(revision),
             executes: KeyedLock::new(execute),
+            rebuilds: KeyedLock::new(rebuild),
         }
     }
 
@@ -322,15 +337,19 @@ impl ResultLock {
                     enclose::enclose!((dir) move |addr: &Addr| {
                         GatewayLock::new(outer_lock_path(&dir, addr))
                     }),
-                    move |rev: &RevisionKey| {
+                    enclose::enclose!((dir) move |rev: &RevisionKey| {
                         FRWLock::new(inner_lock_path(&dir, &rev.addr, &rev.hashin))
-                    },
+                    }),
                     move |addr: &Addr| FLock::new(execute_lock_path(&execute_dir, addr)),
+                    move |rev: &RevisionKey| {
+                        FLock::new(rebuild_lock_path(&dir, &rev.addr, &rev.hashin))
+                    },
                 ),
             },
             LockBackend::Mem => ResultLock::Mem(Registries::new(
                 |_| MemLock::default(),
                 |_| MemRWLock::default(),
+                |_| MemLock::default(),
                 |_| MemLock::default(),
             )),
         }
@@ -359,6 +378,44 @@ impl ResultLock {
             )),
             ResultLock::Mem(locks) => Ok(ExecuteGuard::Mem(
                 locks.executes.lock(addr.clone(), ctoken).await?,
+            )),
+        }
+    }
+
+    /// Acquire the rebuild lock of revision `(addr, hashin)`: exclusive across
+    /// every rebuild of that revision *under a riding read*, in any process
+    /// and any checkout sharing the home.
+    ///
+    /// That rebuild (a cache hit whose blobs turned out to be unavailable)
+    /// writes the shared cache entry while holding only a read of it, so the
+    /// revision lock cannot exclude a second one. The execute lock used to,
+    /// but it guards a sandbox path and is per checkout: two checkouts
+    /// rebuilding one revision would each write the same shared key. This lock
+    /// lives in the shared lock dir and closes that.
+    ///
+    /// Ordering: taken by that rebuild only, after its deps have resolved and
+    /// immediately **before** the execute lock, and released after the outputs
+    /// are cached. Nothing else takes it, and it is only ever acquired with
+    /// no execute lock held — so the order is always rebuild → execute, and it
+    /// cannot take part in a cycle.
+    pub async fn lock_rebuild(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> Result<RebuildGuard> {
+        match self {
+            ResultLock::Fs { locks, .. } => Ok(RebuildGuard::Fs(
+                locks
+                    .rebuilds
+                    .lock(revision_key(addr, hashin), ctoken)
+                    .await?,
+            )),
+            ResultLock::Mem(locks) => Ok(RebuildGuard::Mem(
+                locks
+                    .rebuilds
+                    .lock(revision_key(addr, hashin), ctoken)
+                    .await?,
             )),
         }
     }
@@ -645,6 +702,15 @@ fn outer_lock_path(dir: &Path, addr: &Addr) -> PathBuf {
 /// Path of the per-addr execute lock file. See [`ResultLock::lock_execute`].
 fn execute_lock_path(dir: &Path, addr: &Addr) -> PathBuf {
     dir.join(format!("{}.execute.lock", addr.hash_str()))
+}
+
+/// Path of the per-revision rebuild lock file. See [`ResultLock::lock_rebuild`].
+fn rebuild_lock_path(dir: &Path, addr: &Addr, hashin: &str) -> PathBuf {
+    dir.join(format!(
+        "{}.{:x}.rebuild.lock",
+        addr.hash_str(),
+        xxhash_rust::xxh3::xxh3_64(hashin.as_bytes())
+    ))
 }
 
 /// Path of the per-revision inner reader/writer lock file.
@@ -1180,6 +1246,57 @@ mod tests {
         assert!(
             wt.try_lock_target(&addr("a")).expect("probe").is_none(),
             "the gateway lives in the shared home"
+        );
+    }
+
+    /// A rebuild under a riding read writes the *shared* entry, so it is
+    /// exclusive across checkouts even though their execute locks are not:
+    /// the rebuild lock lives in the shared lock dir, per revision.
+    #[tokio::test]
+    async fn rebuild_lock_is_shared_across_checkouts() {
+        let shared = tempfile::tempdir().expect("tempdir");
+        let main_home = tempfile::tempdir().expect("tempdir");
+        let wt_home = tempfile::tempdir().expect("tempdir");
+        let lock_for = |checkout: &tempfile::TempDir| {
+            ResultLock::new(
+                LockBackend::Fs,
+                shared.path().to_path_buf(),
+                checkout.path().to_path_buf(),
+            )
+        };
+        let main = lock_for(&main_home);
+        let wt = lock_for(&wt_home);
+
+        let main_rebuild = promptly(main.lock_rebuild(&addr("a"), "h1", &ct()))
+            .await
+            .expect("main rebuilds");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                wt.lock_rebuild(&addr("a"), "h1", &ct())
+            )
+            .await
+            .is_err(),
+            "the worktree's rebuild of the same revision waits"
+        );
+        promptly(wt.lock_rebuild(&addr("a"), "h2", &ct()))
+            .await
+            .expect("another revision is independent");
+        // The run itself is still per checkout.
+        promptly(wt.lock_execute(&addr("a"), &ct()))
+            .await
+            .expect("execute locks stay per checkout");
+        drop(main_rebuild);
+        let _wt_rebuild = promptly(wt.lock_rebuild(&addr("a"), "h1", &ct()))
+            .await
+            .expect("free once main's rebuild is done");
+        assert!(
+            shared.path().read_dir().expect("ls").any(|e| e
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".rebuild.lock")),
+            "the rebuild lock file is in the shared lock dir"
         );
     }
 

@@ -291,7 +291,7 @@ mod tests {
         linked_worktree(&main, &wt, "wt", "feat");
 
         let _rt = crate::engine::test_rt_enter();
-        let engine = Engine::new(Config::for_tests(&wt)).expect("engine");
+        let engine = Engine::new(Config::for_tests_detected(&wt)).expect("engine");
         assert_eq!(
             engine.shared_home.as_path(),
             main.join(".heph"),

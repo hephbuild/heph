@@ -15,6 +15,8 @@ test-support = []
 [dependencies]
 anyhow = "1.0.102"
 memoize = "0.6.0"
+# `access(W_OK)` on the main checkout's home before sharing it.
+rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tracing = "0.1"

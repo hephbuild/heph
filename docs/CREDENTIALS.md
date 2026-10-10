@@ -397,8 +397,12 @@ remotely-shippable artifact, so a runner capture must never see material.
   led there. Mechanically this is what `~/.aws/cli/cache` already is — heph is not
   inventing a mechanism, only owning one — with one difference worth stating:
   `<home>` is the *workspace's* home (`.heph` unless `homeDir` says
-  otherwise), not a user-level directory, so credentials are per checkout and
-  `rm -rf .heph` is a logout.
+  otherwise), not a user-level directory, so credentials are per workspace and
+  `rm -rf .heph` is a logout. In a linked git worktree that is the main
+  checkout's home ([HOME_DIR.md](HOME_DIR.md)), so every checkout of the
+  repository shares one `auth/`. The key names no checkout: an `exec` source
+  whose relative script differs between two branches is served the same cached
+  token in both, until it expires.
 - **No daemon.** Same reasoning as the local build cache.
 
 The key separates *declarations*, not identities. A parent's key is a function of

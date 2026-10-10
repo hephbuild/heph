@@ -183,12 +183,24 @@ impl Config {
     }
 
     /// [`Config::new`] for a workspace rooted at `root` (a test's tempdir), with
-    /// the default homes under it.
+    /// the default homes under it and worktree detection **off**: what sits
+    /// above the temp dir must not change a test's homes.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn for_tests(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let homes = Homes::for_tests(&root);
+        Self::new(root, homes)
+    }
+
+    /// [`Config::for_tests`] with worktree detection on, as a config without
+    /// `homeDir` resolves: for a test that builds a git layout (see
+    /// `git_checkout::test_layout`) and is about what detection decides.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn for_tests_detected(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let homes = Homes::resolve(&root, None, true).expect("resolving test homes");
         Self::new(root, homes)
     }
 }

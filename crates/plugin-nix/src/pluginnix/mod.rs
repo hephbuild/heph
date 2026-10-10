@@ -220,6 +220,16 @@ fn sanitize_env_name(addr_str: &str) -> String {
     out
 }
 
+/// The gcroot symlink's file name for one revision of a target:
+/// `<addr hash>-<hashin hash>`. The `hashin` is hashed rather than spliced in,
+/// so the name is a bounded, filesystem-safe component whatever the key.
+fn gcroot_name(addr_hash: &str, hashin: &str) -> String {
+    format!(
+        "{addr_hash}-{:x}",
+        xxhash_rust::xxh3::xxh3_64(hashin.as_bytes())
+    )
+}
+
 #[async_trait]
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -369,7 +379,15 @@ impl ManagedDriver for Driver {
         tokio::fs::create_dir_all(&gcroots_dir)
             .await
             .with_context(|| format!("create gcroots dir {:?}", gcroots_dir))?;
-        let gcroot_path = gcroots_dir.join(req.request.target.addr.hash_str());
+        // Keyed by revision (addr + hashin), not by addr alone: the gcroots
+        // dir is in the shared home, so a main checkout and a linked worktree
+        // building different revisions of one target would otherwise replace
+        // each other's root, and a `nix-collect-garbage` could then reclaim the
+        // store path the other's cached wrapper points at.
+        let gcroot_path = gcroots_dir.join(gcroot_name(
+            &req.request.target.addr.hash_str(),
+            req.request.hashin,
+        ));
         // `nix build --out-link` refuses to overwrite an existing path.
         match tokio::fs::remove_file(&gcroot_path).await {
             Ok(()) => {}
@@ -481,6 +499,18 @@ mod tests {
 
     fn ctoken() -> StdCancellationToken {
         StdCancellationToken::new()
+    }
+
+    /// Two revisions of one target get two roots, so two checkouts building
+    /// different revisions into the shared home do not replace each other's;
+    /// one revision always maps to the same root.
+    #[test]
+    fn gcroot_is_per_revision() {
+        assert_ne!(gcroot_name("abc", "h1"), gcroot_name("abc", "h2"));
+        assert_ne!(gcroot_name("abc", "h1"), gcroot_name("abd", "h1"));
+        assert_eq!(gcroot_name("abc", "h1"), gcroot_name("abc", "h1"));
+        assert!(gcroot_name("abc", "../../x/y").starts_with("abc-"));
+        assert!(!gcroot_name("abc", "../../x/y").contains('/'));
     }
 
     fn driver() -> Driver {

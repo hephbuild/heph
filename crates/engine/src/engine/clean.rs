@@ -151,32 +151,37 @@ impl Engine {
             // Drive off the cache's own enumeration: the only targets that can
             // possibly be cleaned are the ones it names, and the matcher decides
             // each from its addr.
-            let targets = self
-                .local_cache
-                .list_targets()
-                .context("clean: listing cache targets")?;
-            for target in targets {
-                let addr_key = match target {
-                    Ok(k) => k,
-                    Err(e) => {
-                        // The stream failed mid-way. Clean what was already seen
-                        // rather than throwing it away — a partial clean is still
-                        // a clean, and the error is surfaced.
-                        tracing::warn!(error = %format!("{e:#}"), "clean: listing targets failed mid-stream, cleaning what was seen");
-                        break;
-                    }
-                };
-                let addr = match parse_addr(&addr_key) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::warn!(addr = %addr_key, error = %format!("{e:#}"), "clean: skip unparseable cache addr");
+            //
+            // Every store in turn. An addr cached in both is submitted twice;
+            // the second `clean_addr` finds nothing left once the first holds
+            // the target lock, and counts nothing.
+            for (_, cache) in self.local_caches()? {
+                let targets = cache
+                    .list_targets()
+                    .context("clean: listing cache targets")?;
+                for target in targets {
+                    let addr_key = match target {
+                        Ok(k) => k,
+                        Err(e) => {
+                            // The stream failed mid-way. Clean what was already seen
+                            // rather than throwing it away — a partial clean is still
+                            // a clean, and the error is surfaced.
+                            tracing::warn!(error = %format!("{e:#}"), "clean: listing targets failed mid-stream, cleaning what was seen");
+                            break;
+                        }
+                    };
+                    let addr = match parse_addr(&addr_key) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::warn!(addr = %addr_key, error = %format!("{e:#}"), "clean: skip unparseable cache addr");
+                            continue;
+                        }
+                    };
+                    if matcher.matches_addr(&addr) != MatchResult::MatchYes {
                         continue;
                     }
-                };
-                if matcher.matches_addr(&addr) != MatchResult::MatchYes {
-                    continue;
+                    Arc::clone(&self).submit(&mut run, &rs, addr).await;
                 }
-                Arc::clone(&self).submit(&mut run, &rs, addr).await;
             }
         } else {
             // The cache cannot answer `label(...)`, so the graph does — and that
@@ -292,11 +297,22 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> Result<TargetOutcome> {
-        let pre = self
-            .local_cache
-            .list_target_entries(addr)
-            .with_context(|| format!("clean: list entries for {addr}"))?;
-        if pre.is_empty() {
+        // Every store: the shared one, and this checkout's own when separate
+        // (local-only entries, see `CacheScope`). A clean of an addr cleans it
+        // wherever it is cached.
+        let stores = self.local_caches()?;
+        let mut any = false;
+        for (_, cache) in &stores {
+            if !cache
+                .list_target_entries(addr)
+                .with_context(|| format!("clean: list entries for {addr}"))?
+                .is_empty()
+            {
+                any = true;
+                break;
+            }
+        }
+        if !any {
             return Ok(TargetOutcome::default());
         }
 
@@ -312,40 +328,42 @@ impl Engine {
             )
             .await?;
 
-        let hashins = self
-            .local_cache
-            .list_target_entries(addr)
-            .with_context(|| format!("clean: list entries for {addr}"))?;
-        let removed = hashins.len();
+        let mut removed = 0;
         let mut bytes = 0u64;
-        // Each revision is deleted as soon as its lock is held, so one revision
-        // a long-running command is still reading does not keep the idle ones
-        // write-locked — blocking their cache hits — while clean waits on it.
-        for hashin in hashins {
-            let revision = self
-                .acquire_with_notice(
-                    &rs,
-                    addr,
-                    Some(&hashin),
-                    self.result_lock()
-                        .write_revision(&target, addr, &hashin, rs.ctoken()),
-                )
+        for (scope, cache) in stores {
+            let hashins = cache
+                .list_target_entries(addr)
+                .with_context(|| format!("clean: list entries for {addr}"))?;
+            removed += hashins.len();
+            // Each revision is deleted as soon as its lock is held, so one revision
+            // a long-running command is still reading does not keep the idle ones
+            // write-locked — blocking their cache hits — while clean waits on it.
+            for hashin in hashins {
+                let revision = self
+                    .acquire_with_notice(
+                        &rs,
+                        addr,
+                        Some(&hashin),
+                        self.result_lock()
+                            .write_revision(&target, addr, &hashin, rs.ctoken()),
+                    )
+                    .await?;
+                // `LocalCache::delete` parks the calling thread until the sqlite
+                // writer commits its batch, and `limit` of these run at once —
+                // parking that many runtime workers would take the reactor, the timer
+                // wheel and the TUI with them. Onto the blocking pool, with the guard
+                // moved in so the lock spans the delete.
+                let engine = Arc::clone(&self);
+                let addr_owned = addr.clone();
+                let freed = hcore::blocking::run(move || {
+                    let _revision = revision;
+                    engine
+                        .gc_entry(scope, &addr_owned, &hashin)
+                        .with_context(|| format!("clean: drop revision of {addr_owned}"))
+                })
                 .await?;
-            // `LocalCache::delete` parks the calling thread until the sqlite
-            // writer commits its batch, and `limit` of these run at once —
-            // parking that many runtime workers would take the reactor, the timer
-            // wheel and the TUI with them. Onto the blocking pool, with the guard
-            // moved in so the lock spans the delete.
-            let engine = Arc::clone(&self);
-            let addr_owned = addr.clone();
-            let freed = hcore::blocking::run(move || {
-                let _revision = revision;
-                engine
-                    .gc_entry(&addr_owned, &hashin)
-                    .with_context(|| format!("clean: drop revision of {addr_owned}"))
-            })
-            .await?;
-            bytes = bytes.saturating_add(freed);
+                bytes = bytes.saturating_add(freed);
+            }
         }
         drop(target);
 

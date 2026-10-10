@@ -142,7 +142,10 @@ fn workspace() -> htestkit::Workspace {
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
         .with_managed_driver_factory(|init| {
-            Box::new(pluginoci::runner::Driver::new(init.home.to_path_buf()))
+            Box::new(pluginoci::runner::Driver::new(
+                init.home.to_path_buf(),
+                init.shared_home.to_path_buf(),
+            ))
         })
         // What the cdylib hands the host through `NamedRunner`; an in-process
         // harness registers it directly.
@@ -191,8 +194,11 @@ async fn the_mounted_home_is_the_resolved_one_even_in_a_package_named_sandbox() 
         })
         .with_managed_driver_factory(move |init| {
             Box::new(
-                pluginoci::runner::Driver::new(init.home.to_path_buf())
-                    .with_docker_bin(docker.to_string_lossy().into_owned()),
+                pluginoci::runner::Driver::new(
+                    init.home.to_path_buf(),
+                    init.shared_home.to_path_buf(),
+                )
+                .with_docker_bin(docker.to_string_lossy().into_owned()),
             )
         })
         .build()?;
@@ -211,6 +217,84 @@ async fn the_mounted_home_is_the_resolved_one_even_in_a_package_named_sandbox() 
     assert!(
         mounts.contains(&home.as_str()),
         "the mounts must carry the checkout's home {home}; got {mounts:?}"
+    );
+    Ok(())
+}
+
+/// In a linked git worktree the checkout's home and the shared home are two
+/// directories, and the container mounts both: the sandboxes are under the
+/// worktree's own home, and their scratch symlinks point into the shared one
+/// (the main checkout's). Outside a worktree the two are one directory, so the
+/// test above cannot tell a runner that mounts both from one that mounts one.
+///
+/// No daemon needed: `docker` is a stub that reports a digest.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worktree_runner_mounts_both_homes() -> anyhow::Result<()> {
+    use heph::engine::git_checkout::test_layout::{linked_worktree, main_checkout};
+    use heph::engine::{Config, Engine, Homes, OutputMatcher, ResultOptions};
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = tempfile::tempdir()?;
+    let docker = bin.path().join("docker");
+    std::fs::write(&docker, "#!/bin/sh\necho sha256:stub\n")?;
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755))?;
+
+    let tmp = tempfile::tempdir()?;
+    let base = tmp.path().canonicalize()?;
+    let (main, wt) = (base.join("main"), base.join("wt"));
+    main_checkout(&main, "master");
+    linked_worktree(&main, &wt, "wt", "feat");
+    std::fs::create_dir_all(wt.join("svc"))?;
+    std::fs::write(
+        wt.join("svc").join("BUILD"),
+        r#"target(name = "runner", driver = "oci_runner", image = "img")"#,
+    )?;
+
+    let mut e = Engine::new(Config::new(wt.clone(), Homes::resolve(&wt, None, true)?))?;
+    e.register_provider(|init| {
+        Box::new(heph::pluginbuildfile::Provider::new(
+            init.root.to_path_buf(),
+            init.runtime.clone(),
+        ))
+    })?;
+    let docker = docker.to_string_lossy().into_owned();
+    e.register_managed_driver(move |init| {
+        Box::new(
+            pluginoci::runner::Driver::new(init.home.to_path_buf(), init.shared_home.to_path_buf())
+                .with_docker_bin(docker),
+        )
+    })?;
+    let engine = std::sync::Arc::new(e);
+    engine.install_exec_runner_host();
+
+    let checkout = engine.checkout_home.to_string_lossy().into_owned();
+    let shared = engine.shared_home.to_string_lossy().into_owned();
+    assert_eq!(checkout, wt.join(".heph").to_string_lossy());
+    assert_eq!(shared, main.join(".heph").to_string_lossy());
+
+    let result = engine
+        .clone()
+        .result_addr(
+            engine.new_state(),
+            &heph::htaddr::parse_addr("//svc:runner")?,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    let doc: serde_json::Value = serde_json::from_str(&common::artifact_string(&result))?;
+    let mounts: Vec<&str> = doc["config"]["mounts"]
+        .as_array()
+        .map(|m| m.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        mounts,
+        [
+            wt.to_string_lossy().as_ref(),
+            checkout.as_str(),
+            shared.as_str()
+        ],
+        "the tree, the worktree's own home and the shared home, once each"
     );
     Ok(())
 }

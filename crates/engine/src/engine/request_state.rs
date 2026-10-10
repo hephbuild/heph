@@ -411,10 +411,12 @@ pub struct RequestStateData {
     deferred_trims: DeferredTrims,
 }
 
-/// One deferred post-write trim: how many revisions of a target to keep, and
-/// the revision this request wrote (which the trim must never delete).
+/// One deferred post-write trim: which store, how many revisions of a target
+/// to keep, and the revision this request wrote (which the trim must never
+/// delete).
 #[derive(Debug)]
 struct PendingTrim {
+    scope: crate::engine::local_cache::CacheScope,
     keep: u32,
     hashin: String,
 }
@@ -473,13 +475,24 @@ struct DeferredTrims {
 }
 
 impl DeferredTrims {
-    fn push(&self, addr: &Addr, keep: u32, hashin: String) {
+    fn push(
+        &self,
+        scope: crate::engine::local_cache::CacheScope,
+        addr: &Addr,
+        keep: u32,
+        hashin: String,
+    ) {
         if self.suppressed.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        self.trims
-            .lock()
-            .insert(addr.clone(), PendingTrim { keep, hashin });
+        self.trims.lock().insert(
+            addr.clone(),
+            PendingTrim {
+                scope,
+                keep,
+                hashin,
+            },
+        );
     }
 }
 
@@ -536,7 +549,9 @@ impl Drop for DeferredTrims {
             format!("gc trim {} target(s)", trims.len()),
             Box::new(move || {
                 let report = engine.run_trim_batch_with_delay(
-                    trims.into_iter().map(|(addr, t)| (addr, t.keep, t.hashin)),
+                    trims
+                        .into_iter()
+                        .map(|(addr, t)| (t.scope, addr, t.keep, t.hashin)),
                     delay,
                 );
                 // Say what the batch did. A drain that reports nothing cannot be
@@ -798,7 +813,13 @@ impl RequestState {
     /// construction — and its `bg_pending` is a private counter no drain loop
     /// ever observes. Unreachable today (such a request cannot build a cacheable
     /// target), asserted so it stays that way.
-    pub(crate) fn defer_trim(&self, addr: &Addr, keep: u32, hashin: String) {
+    pub(crate) fn defer_trim(
+        &self,
+        scope: crate::engine::local_cache::CacheScope,
+        addr: &Addr,
+        keep: u32,
+        hashin: String,
+    ) {
         debug_assert!(
             !self.hash_only(),
             "a hash_only request must never write a cacheable revision"
@@ -807,7 +828,7 @@ impl RequestState {
             tracing::debug!(%addr, "hash_only request: post-write trim not deferred");
             return;
         }
-        self.data.deferred_trims.push(addr, keep, hashin);
+        self.data.deferred_trims.push(scope, addr, keep, hashin);
     }
 
     /// Stop this request recording post-write trims. Used by the `heph gc`
@@ -1311,6 +1332,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine::Config;
+    use crate::engine::local_cache::CacheScope;
     use hmodel::htpkg::PkgBuf;
 
     fn addr(name: &str) -> Addr {
@@ -1380,8 +1402,8 @@ mod tests {
         let (_dir, engine) = test_engine()?;
         let (bg, rs) = bg_state(&engine);
 
-        rs.defer_trim(&addr("t"), 1, "h1".to_string());
-        rs.defer_trim(&addr("u"), 1, "h1".to_string());
+        rs.defer_trim(CacheScope::Shared, &addr("t"), 1, "h1".to_string());
+        rs.defer_trim(CacheScope::Shared, &addr("u"), 1, "h1".to_string());
         assert_eq!(
             bg.load(Ordering::Acquire),
             0,
@@ -1449,7 +1471,7 @@ mod tests {
 
         let delay = Duration::from_millis(500);
         rs.set_trim_retry_delay(delay);
-        rs.defer_trim(&a, 1, "h2".to_string());
+        rs.defer_trim(CacheScope::Shared, &a, 1, "h2".to_string());
 
         let started = std::time::Instant::now();
         drop(rs);
@@ -1485,7 +1507,7 @@ mod tests {
         let (_dir, engine) = test_engine()?;
         let (bg, rs) = bg_state(&engine);
         rs.suppress_deferred_trims();
-        rs.defer_trim(&addr("t"), 1, "h1".to_string());
+        rs.defer_trim(CacheScope::Shared, &addr("t"), 1, "h1".to_string());
         drop(rs);
         assert_eq!(
             bg.load(Ordering::Acquire),
@@ -1503,7 +1525,7 @@ mod tests {
 
         let (_dir, engine) = test_engine()?;
         let (bg, rs) = bg_state(&engine);
-        rs.defer_trim(&addr("t"), 1, "h1".to_string());
+        rs.defer_trim(CacheScope::Shared, &addr("t"), 1, "h1".to_string());
         drop(engine);
         drop(rs);
         assert_eq!(
