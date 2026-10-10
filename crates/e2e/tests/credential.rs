@@ -646,7 +646,7 @@ async fn credential_material_is_scrubbed_from_a_targets_output() -> anyhow::Resu
     );
 
     let mut found = false;
-    for entry in walkdir(&ws.dir.path().join(".heph3").join("sandbox")) {
+    for entry in walkdir(&ws.engine.home.join("sandbox")) {
         if entry.file_name().is_some_and(|n| n == "log.txt") {
             let body = std::fs::read_to_string(&entry).unwrap_or_default();
             if !body.contains("using") {
@@ -1111,7 +1111,7 @@ async fn material_with_no_expiry_is_never_left_at_rest() -> anyhow::Result<()> {
         "no-expiry-token"
     );
 
-    let auth_dir = ws.dir.path().join(".heph3").join("auth");
+    let auth_dir = ws.engine.home.join("auth");
     for f in walkdir(&auth_dir) {
         let body = std::fs::read(&f).unwrap_or_default();
         assert!(
@@ -1432,7 +1432,7 @@ target(name = "t", driver = "credential", sources = ["//auth:mint"],
     );
     // … and the only copy at rest is the per-process staging directory, which
     // the next `heph` sweeps. Nothing sits in the durable half of the store.
-    let auth = ws.dir.path().join(".heph3").join("auth");
+    let auth = ws.engine.home.join("auth");
     let live = auth.join("files").join("live");
     let mut staged = 0usize;
     for f in walkdir(&auth) {
@@ -1477,14 +1477,9 @@ target(name = "t", driver = "credential", sources = ["//auth:mint"],
         common::artifact_string(&*ws.run("//app:a").await?),
         "token: bounded-producer-secret"
     );
-    let live = ws
-        .dir
-        .path()
-        .join(".heph3")
-        .join("auth")
-        .join("files")
-        .join("live");
-    let durable = walkdir(&ws.dir.path().join(".heph3").join("auth"))
+    let auth = ws.engine.home.join("auth");
+    let live = auth.join("files").join("live");
+    let durable = walkdir(&auth)
         .into_iter()
         .filter(|f| !f.starts_with(&live))
         .any(|f| {

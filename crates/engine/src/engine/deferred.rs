@@ -703,12 +703,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _rt = crate::engine::test_rt_enter();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut engine = crate::engine::Engine::new(crate::engine::Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
-            ..Default::default()
-        })
-        .expect("engine");
+        let mut engine = crate::engine::Engine::new(crate::engine::Config::for_tests(dir.path()))
+            .expect("engine");
         engine
             .register_driver({
                 let calls = Arc::clone(&calls);

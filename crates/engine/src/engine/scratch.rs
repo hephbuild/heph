@@ -1216,10 +1216,8 @@ mod tests {
     /// An engine over `root` with a recording hook attached.
     fn recording_engine(root: &Path) -> (Arc<Engine>, Arc<Rec>) {
         let mut e = Engine::new(crate::engine::Config {
-            root: root.to_path_buf(),
-            home_dir: PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..crate::engine::Config::for_tests(root)
         })
         .expect("engine");
         let rec = Arc::new(Rec::default());

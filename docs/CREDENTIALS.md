@@ -396,8 +396,9 @@ remotely-shippable artifact, so a runner capture must never see material.
   declaration (`when` included), and the resolution keys of the credentials that
   led there. Mechanically this is what `~/.aws/cli/cache` already is — heph is not
   inventing a mechanism, only owning one — with one difference worth stating:
-  `<home>` is the *workspace's* `.heph3`, not a user-level directory, so
-  credentials are per checkout and `rm -rf .heph3` is a logout.
+  `<home>` is the *workspace's* home (`.heph` unless `homeDir` says
+  otherwise), not a user-level directory, so credentials are per checkout and
+  `rm -rf .heph` is a logout.
 - **No daemon.** Same reasoning as the local build cache.
 
 The key separates *declarations*, not identities. A parent's key is a function of

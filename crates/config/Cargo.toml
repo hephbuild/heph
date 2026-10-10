@@ -6,6 +6,10 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# `HomeDir::for_tests`. Enabled by the engine's own `test-support`.
+test-support = []
+
 [dependencies]
 anyhow = "1.0.102"
 memoize = "0.6.0"

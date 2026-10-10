@@ -13,6 +13,10 @@
 //! kill -QUIT <pid>          # or just press Ctrl-\\
 //! cat <home>/diag/dump-<pid>.txt
 //! ```
+//! `<home>` is the resolved heph home (`.heph` under the workspace root by
+//! default). A process that has not resolved its home yet — still loading the
+//! config — writes to `<temp dir>/heph-diag-<uid>/dump-<pid>.txt` instead; the
+//! warning it logs names the path either way.
 //! `SIGQUIT` follows the Go/JVM convention and, unlike `SIGUSR1`, is not already
 //! taken here (`SIGUSR2` belongs to the pprof sampler). The handler sets one
 //! atomic and returns; the work happens on the sweeper thread, and the process
@@ -100,14 +104,31 @@ extern "C" fn on_sigquit(_sig: libc::c_int) {
 /// The directory dumps land in, once the engine has resolved its home.
 static DUMP_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Point dumps at the engine's `<home>/diag`, so they land beside the stall log
-/// and the in-flight report rather than wherever the process happened to start.
+/// Point dumps at the resolved home's `<home>/diag`, so they land beside the
+/// stall log and the in-flight report rather than wherever the process happened
+/// to start.
 ///
-/// Called once the home is known; before that, [`dump_dir`] falls back to the
-/// launch directory. The fallback matters — a hang during startup still has to
-/// produce a dump somewhere findable.
-pub fn set_dump_dir(dir: &std::path::Path) {
-    drop(DUMP_DIR.set(absolute(dir)));
+/// Called once the home is known; before that, [`dump_dir`] falls back to
+/// [`fallback_dump_dir`] under the system temp dir. The fallback matters — a hang
+/// during startup still has to produce a dump somewhere findable — and it is not
+/// a guess at the home: before the config is resolved there is no home to guess.
+pub fn set_dump_dir(home: &hengine::engine::HomeDir) {
+    drop(DUMP_DIR.set(home.join("diag")));
+}
+
+/// Where dumps go before [`set_dump_dir`] has run: `<temp dir>/heph-diag-<uid>`.
+///
+/// Absolute and independent of the cwd. Per-uid, and because the temp dir is
+/// shared it is created `0700` and then *checked* ([`ensure_private_dir`]): a
+/// directory another user pre-created, a symlink in its place, or one with
+/// group/other access means no dump rather than a dump someone else can read or
+/// redirect. Dump files are also opened `O_NOFOLLOW`. Not cleaned by `heph tool gc` (it is outside
+/// every workspace), which is the price of a dump from a process that never got
+/// as far as knowing its workspace.
+fn fallback_dump_dir() -> std::path::PathBuf {
+    // SAFETY: `getuid` cannot fail and has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    absolute(&std::env::temp_dir().join(format!("heph-diag-{uid}")))
 }
 
 /// Make `path` absolute without touching the filesystem.
@@ -121,15 +142,14 @@ fn absolute(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn dump_dir() -> std::path::PathBuf {
-    DUMP_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(|| absolute(std::path::Path::new(".heph3/diag")))
+    DUMP_DIR.get().cloned().unwrap_or_else(fallback_dump_dir)
 }
 
-/// Where a dump lands. In-workspace so `heph tool gc` can sweep it.
+/// Where a dump lands: in the workspace's home once it is resolved (so
+/// `heph tool gc` can sweep it), under the temp dir before that.
 ///
-/// **Absolute.** It used to be `.heph3/diag/dump-<pid>.txt`, resolved against
+/// **Absolute.** It used to be the literal `.heph3/diag/dump-<pid>.txt`, resolved
+/// against
 /// whatever the process's cwd happened to be — which is not something the person
 /// reading a stall log, or an agent handed the file an hour later, has any way to
 /// know. "Your dump is at a relative path, good luck" costs a round trip in
@@ -178,28 +198,13 @@ const THREAD_GAP: std::time::Duration = std::time::Duration::from_millis(2);
 /// dumps went. That is what it did — silently, ordering-dependent, green
 /// locally and red on CI.
 fn sweep(path: &std::path::Path) {
-    if let Some(dir) = path.parent() {
-        drop(std::fs::create_dir_all(dir));
-    }
-    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
-        return;
+    let fd = match open_dump(path) {
+        Ok(fd) => fd,
+        Err(error) => {
+            warn!(path = %path.display(), %error, "Cannot write thread dump");
+            return;
+        }
     };
-    // SAFETY: opening a file by C path; the fd is stored for the handler below.
-    let fd = unsafe {
-        libc::open(
-            cpath.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND,
-            0o644,
-        )
-    };
-    if fd < 0 {
-        warn!(
-            path = %path.display(),
-            error = %std::io::Error::last_os_error(),
-            "Cannot write thread dump"
-        );
-        return;
-    }
     DIAG_FD.store(fd, Ordering::Relaxed);
 
     // Opt-in, and deliberately *before* the inventory: the backtrace half is the
@@ -231,6 +236,81 @@ fn sweep(path: &std::path::Path) {
     } else {
         warn!(threads = n, path = %path.display(), "Wrote thread backtraces and in-flight report");
     }
+}
+
+/// Create the dump's directory and open the dump for writing.
+///
+/// In the shared temp dir — the [`fallback_dump_dir`] — the directory must be
+/// private to this user: see [`ensure_private_dir`]. Under the resolved home it
+/// is created with default permissions, like the stall log beside it; only the
+/// fallback's own leaf is ever made `0700`, never a parent (a fresh `<home>`
+/// created here must not end up private).
+///
+/// `O_NOFOLLOW`: never write a dump through a symlink someone else planted.
+fn open_dump(path: &std::path::Path) -> Result<libc::c_int, String> {
+    if let Some(dir) = path.parent() {
+        if dir == fallback_dump_dir() {
+            ensure_private_dir(dir)?;
+        } else {
+            std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        }
+    }
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| format!("dump path {}: {e}", path.display()))?;
+    // SAFETY: opening a file by C path; the fd is stored for the handler.
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND | libc::O_NOFOLLOW,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(fd)
+}
+
+/// Create `dir` (its parents with default permissions, `dir` itself `0700`)
+/// and check that what is there now is a real directory, owned by this user,
+/// with no group/other access.
+///
+/// The check, not the create, is what makes it safe: in a shared temp dir
+/// another user can create the directory first (with any mode) or put a symlink
+/// there, and `mkdir` on an existing path changes nothing.
+fn ensure_private_dir(dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("creating {}: {e}", dir.display())),
+    }
+    let md =
+        std::fs::symlink_metadata(dir).map_err(|e| format!("inspecting {}: {e}", dir.display()))?;
+    if !md.file_type().is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+    // SAFETY: `getuid` cannot fail and has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if md.uid() != uid {
+        return Err(format!(
+            "{} is owned by uid {}, not {uid}",
+            dir.display(),
+            md.uid()
+        ));
+    }
+    if md.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} has mode {:o}; it must not be accessible to group or others",
+            dir.display(),
+            md.mode() & 0o777
+        ));
+    }
+    Ok(())
 }
 
 /// Append the parked-future state to the dump, after the thread backtraces.
@@ -475,7 +555,7 @@ mod tests {
 
     /// The dump lands at an absolute path.
     ///
-    /// It used to be `.heph3/diag/dump-<pid>.txt`, resolved against whatever cwd
+    /// It used to be the literal `.heph3/diag/dump-<pid>.txt`, resolved against whatever cwd
     /// the process was launched from — so telling someone where their dump went
     /// meant telling them "under the directory you started the build in", which
     /// is a round trip in exactly the situation where the process may already be
@@ -488,10 +568,98 @@ mod tests {
             path.ends_with(format!("dump-{}.txt", std::process::id())),
             "{path:?}"
         );
+        // No test sets `DUMP_DIR` (it is process-global), but tolerate one that
+        // did: either way the dump sits in a diag dir.
         assert!(
-            path.parent().is_some_and(|p| p.ends_with("diag")),
-            "it sits in a diag dir beside the stall log: {path:?}"
+            path.parent()
+                .is_some_and(|p| p.ends_with("diag") || p == fallback_dump_dir()),
+            "it sits in a diag dir: {path:?}"
         );
+    }
+
+    /// Before the home is resolved, dumps go under the system temp dir — not a
+    /// cwd-relative guess at a home dir that may not be the workspace's.
+    ///
+    /// Tests the fallback itself rather than [`dump_dir`], which reads the
+    /// process-global `DUMP_DIR`: asserting through it would race any test that
+    /// set it.
+    #[test]
+    fn the_fallback_dump_dir_is_under_the_temp_dir() {
+        let dir = fallback_dump_dir();
+        assert!(dir.is_absolute(), "{dir:?}");
+        assert!(
+            dir.starts_with(absolute(&std::env::temp_dir())),
+            "fallback must be under the temp dir: {dir:?}"
+        );
+        // SAFETY: `getuid` cannot fail.
+        let uid = unsafe { libc::getuid() };
+        assert!(
+            dir.ends_with(format!("heph-diag-{uid}")),
+            "per-uid: {dir:?}"
+        );
+    }
+
+    /// A symlink planted where the dump goes is not written through.
+    #[test]
+    fn a_dump_is_not_written_through_a_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("diag");
+
+        let fd = open_dump(&dir.join("dump.txt")).expect("open");
+        // SAFETY: closing the fd this test opened.
+        unsafe { libc::close(fd) };
+
+        let target = tmp.path().join("victim");
+        std::fs::write(&target, "untouched").expect("write");
+        let link = dir.join("dump-link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        open_dump(&link).expect_err("a symlinked dump path must be refused");
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "untouched");
+    }
+
+    /// The private dir is created `0700` — only the leaf, not its parents.
+    #[test]
+    fn a_fresh_private_dir_is_0700_and_its_parents_are_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("p");
+        let dir = parent.join("heph-diag-x");
+        ensure_private_dir(&dir).expect("private dir");
+        let mode =
+            |p: &std::path::Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_ne!(
+            mode(&parent),
+            0o700,
+            "a parent must keep default permissions"
+        );
+    }
+
+    /// A dir that already exists open to others — or that is a symlink — is
+    /// refused rather than written into.
+    #[test]
+    fn a_preexisting_open_or_symlinked_private_dir_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).expect("mkdir");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let err = ensure_private_dir(&open).expect_err("0777 must be refused");
+        assert!(err.contains("group or others"), "{err}");
+
+        let group = tmp.path().join("group");
+        std::fs::create_dir(&group).expect("mkdir");
+        std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+        ensure_private_dir(&group).expect_err("group access must be refused");
+
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = ensure_private_dir(&link).expect_err("a symlink must be refused");
+        assert!(err.contains("not a directory"), "{err}");
     }
 
     /// The `SIGQUIT` dump and the watchdog's companion file must be the same

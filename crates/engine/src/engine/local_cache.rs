@@ -1168,10 +1168,8 @@ mod tests {
     fn test_engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })
         .expect("engine");
         (engine, dir)
@@ -1183,11 +1181,9 @@ mod tests {
     fn test_engine_spilling_at(threshold: u64) -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
             spill_threshold_bytes: threshold,
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })
         .expect("engine");
         (engine, dir)
@@ -1199,8 +1195,6 @@ mod tests {
     fn engine_with_remote(remote_uri: &str) -> (Arc<Engine>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
             remote_caches: vec![crate::engine::RemoteCacheDef {
                 name: "shared".to_string(),
@@ -1211,7 +1205,7 @@ mod tests {
                 endpoint: None,
                 region: None,
             }],
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })
         .expect("engine");
         (Arc::new(engine), dir)

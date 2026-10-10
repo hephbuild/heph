@@ -610,10 +610,8 @@ mod tests {
     async fn gitignore_patterns_refuse_a_partial_selection() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(|_| {
             Box::new(
@@ -656,10 +654,8 @@ mod tests {
 
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
@@ -703,10 +699,8 @@ mod tests {
     async fn listed_but_unresolvable_target_is_skipped() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(|_| Box::new(GhostProvider))?;
         let engine = Arc::new(engine);

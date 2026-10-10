@@ -141,7 +141,9 @@ fn workspace() -> htestkit::Workspace {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::runner::Driver::new()))
+        .with_managed_driver_factory(|init| {
+            Box::new(pluginoci::runner::Driver::new(init.home.to_path_buf()))
+        })
         // What the cdylib hands the host through `NamedRunner`; an in-process
         // harness registers it directly.
         .with_exec_runner(std::sync::Arc::new(pluginoci::exec_runner::OciRunner::new()))
@@ -162,6 +164,54 @@ target(
 "#
         ),
     );
+}
+
+/// The container mounts heph's resolved home — the one the engine hands the
+/// driver — even for a runner in a package named `sandbox`. The home used to be
+/// derived by walking up the sandbox path to a component named `sandbox`, which
+/// a package of that name answered first.
+///
+/// No daemon needed: `docker` is a stub that reports a digest.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_mounted_home_is_the_resolved_one_even_in_a_package_named_sandbox() -> anyhow::Result<()>
+{
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tempfile::tempdir()?;
+    let docker = bin.path().join("docker");
+    std::fs::write(&docker, "#!/bin/sh\necho sha256:stub\n")?;
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755))?;
+
+    let ws = WorkspaceBuilder::new()?
+        .with_provider(|init| {
+            Box::new(heph::pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+            ))
+        })
+        .with_managed_driver_factory(move |init| {
+            Box::new(
+                pluginoci::runner::Driver::new(init.home.to_path_buf())
+                    .with_docker_bin(docker.to_string_lossy().into_owned()),
+            )
+        })
+        .build()?;
+    ws.write_build_file(
+        "sandbox/sandbox",
+        r#"target(name = "runner", driver = "oci_runner", image = "img")"#,
+    );
+    let doc = common::artifact_string(&*ws.run("//sandbox/sandbox:runner").await?);
+    let doc: serde_json::Value = serde_json::from_str(&doc)?;
+    let mounts: Vec<&str> = doc["config"]["mounts"]
+        .as_array()
+        .map(|m| m.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let home = ws.engine.home.to_string_lossy().into_owned();
+    assert!(
+        mounts.contains(&home.as_str()),
+        "the mounts must carry the resolved home {home}; got {mounts:?}"
+    );
+    Ok(())
 }
 
 /// The fingerprint is the image's content digest, taken from the daemon.

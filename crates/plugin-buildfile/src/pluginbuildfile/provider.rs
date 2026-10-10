@@ -612,7 +612,10 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         Box::pin(async move {
-            // A target inside a skipped subtree does not resolve.
+            // A target inside a skipped subtree does not resolve — including one
+            // under a `.heph*` dir, a name reserved for heph's own state. A plain
+            // `NotFound` rather than an error naming the reason: `NotFound` is
+            // what lets the next provider answer the address.
             if self
                 .skip
                 .prunes_package(&self.root, std::path::Path::new(req.addr.package.as_str()))
@@ -786,7 +789,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
         // fswalk db outside the walked tree (in production it's under pruned
-        // `.heph3`), so its writes don't bump the discovered dirs' mtimes.
+        // home), so its writes don't bump the discovered dirs' mtimes.
         let dbdir = tempdir().unwrap();
         let db = dbdir.path().join("fswalk.db");
         fs::write(root.join("BUILD"), "").unwrap();
@@ -1134,6 +1137,42 @@ mod tests {
             .expect("must error");
         let msg = format!("{err:?}");
         assert!(msg.contains("no driver"), "{msg}");
+    }
+
+    /// A leftover home from an older default (`.heph3`) is not the current home,
+    /// so the exact-path skip misses it; its staged `BUILD` files must still not
+    /// become packages — `heph.core.packages()` would carry them into a def hash.
+    #[tokio::test]
+    async fn list_packages_skips_a_leftover_heph_dir_by_name() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+        fs::write(root.join("BUILD"), "").unwrap();
+        let staged = root.join(".heph3").join("stage").join("x");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("BUILD"), "").unwrap();
+
+        // Only the *current* home is an exact-path skip.
+        let provider = Provider::from_options(
+            root.to_path_buf(),
+            &[root.join(".heph")],
+            &[],
+            &Options::new(),
+            test_runtime(),
+        )
+        .expect("provider");
+
+        let ctoken = StdCancellationToken::new();
+        let res = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
+        assert_eq!(packages, vec!["".to_string()], "{packages:?}");
     }
 
     #[tokio::test]

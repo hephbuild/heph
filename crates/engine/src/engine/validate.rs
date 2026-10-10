@@ -190,10 +190,8 @@ mod tests {
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         // exec driver parses specs into defs (with codegen-stamped outputs); the
         // fs provider/driver resolves any synthesized inputs; the static provider
@@ -462,10 +460,8 @@ mod tests {
     async fn listed_but_unresolvable_target_is_skipped() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(|_| Box::new(GhostProvider))?;
         let engine = Arc::new(engine);

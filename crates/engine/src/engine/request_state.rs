@@ -1312,7 +1312,6 @@ mod tests {
     use super::*;
     use crate::engine::Config;
     use hmodel::htpkg::PkgBuf;
-    use std::path::PathBuf;
 
     fn addr(name: &str) -> Addr {
         Addr::new(PkgBuf::from("pkg"), name.to_string(), Default::default())
@@ -1330,10 +1329,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _rt = crate::engine::test_rt_enter();
         let engine = Arc::new(Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })?);
         Ok((dir, engine))
     }
@@ -1941,10 +1938,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _rt = crate::engine::test_rt_enter();
         let mut e = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })?;
         let rec = Arc::new(Rec::default());
         e.register_hook(Arc::clone(&rec) as Arc<dyn Hook>)?;
@@ -1998,10 +1993,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _rt = crate::engine::test_rt_enter();
         let mut e = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })?;
         let rec = Arc::new(Rec::default());
         e.register_hook(Arc::clone(&rec) as Arc<dyn Hook>)?;

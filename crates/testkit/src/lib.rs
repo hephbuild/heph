@@ -3,7 +3,7 @@ use heph::engine::driver::Driver as SDKDriver;
 use heph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use heph::engine::provider::Provider as SDKProvider;
 use heph::engine::{
-    Config, EResult, Engine, EngineTargetSpec, OutputMatcher, PluginInit, ResultOptions,
+    Config, EResult, Engine, EngineTargetSpec, HomeDir, OutputMatcher, PluginInit, ResultOptions,
 };
 use heph::htaddr::{Addr, parse_addr};
 use std::path::{Path, PathBuf};
@@ -59,6 +59,18 @@ impl WorkspaceBuilder {
         self
     }
 
+    /// [`Self::with_managed_driver`] for a driver built from the engine's
+    /// [`PluginInit`] (its root, its resolved home, …).
+    pub fn with_managed_driver_factory(
+        mut self,
+        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKManagedDriver> + 'static,
+    ) -> Self {
+        self.setups.push(Box::new(move |e: &mut Engine| {
+            e.register_managed_driver(factory)
+        }));
+        self
+    }
+
     pub fn with_managed_driver(mut self, driver: Box<dyn SDKManagedDriver>) -> Self {
         self.setups.push(Box::new(move |e: &mut Engine| {
             e.register_managed_driver(|_| driver)
@@ -84,11 +96,12 @@ impl WorkspaceBuilder {
 
     pub fn build(self) -> anyhow::Result<Workspace> {
         let mut e = Engine::new(Config {
-            root: self.dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: self.parallelism,
             fs_skip: self.fs_skip,
-            ..Default::default()
+            ..Config::new(
+                self.dir.path().to_path_buf(),
+                HomeDir::resolve(self.dir.path(), None)?,
+            )
         })?;
         for setup in self.setups {
             setup(&mut e)?;

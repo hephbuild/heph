@@ -1032,7 +1032,9 @@ impl RemoteCacheSet {
         })
     }
 
-    /// An empty set — used by tests and the no-config path.
+    /// An empty set with no home. Test-only: production builds every set through
+    /// [`Self::new`] with the resolved home, even when no cache is configured.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn empty() -> Arc<Self> {
         Arc::new(Self {
             caches: Vec::new(),

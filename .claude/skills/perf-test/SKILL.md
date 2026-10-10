@@ -29,7 +29,7 @@ Goal: measure heph hot paths, surface concrete bottlenecks, propose actionable f
    >
    > **Check that the query runs in parallel before timing it.**
    > - `label()` matchers resolve serially by design (`query.rs`, `MatchShrug`), so benchmark engine-wide work with a package matcher (`//go/large/...`).
-   > - To see how much actually runs at once, send SIGQUIT mid-run. It writes `.heph3/diag/dump-*.txt`; count the `incomplete cells` there.
+   > - To see how much actually runs at once, send SIGQUIT mid-run. It writes `<home>/diag/dump-*.txt` (`.heph/diag/` by default); count the `incomplete cells` there.
    > - Check the matched-target count too. A query that matched 0 targets still exits 0. For example, `heph r build //go/...` on a generated corpus with no `host` variant BUILD file builds nothing.
 
 2. **Warmup run** — prime caches, FS, allocator. Discard output. `heph r test //...` must run from `example/`:

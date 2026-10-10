@@ -12,6 +12,7 @@ pub use config::ConfigYamlExt;
 pub use config::DEFAULT_SPILL_THRESHOLD_BYTES;
 pub use config::MemCacheOptions;
 pub use config::ScratchOptions;
+pub use hconfig::{DEFAULT_HOME_DIR, HomeDir};
 // The YAML config shape + loader + workspace-root discovery now live in the
 // engine-free `config` crate (so layers that run before the engine — e.g. the
 // self-upgrade check — can read it). Re-export under the original paths so

@@ -11,7 +11,8 @@
 //! explicit `platforms` depends on, so that platform reaches the cache key as an
 //! input hash rather than as a parse-time side effect. No hooks.
 //!
-//! Nothing crosses in [`CreateConfig`] that the drivers need — `docker_build`
+//! The one thing read from [`CreateConfig`] is the resolved heph `home`, which
+//! the `oci_runner` driver mounts into its container. Otherwise `docker_build`
 //! and the platform probe take the `docker` binary from `PATH`, the same host
 //! capability the in-process build used, and `oci_push` / `oci_pull` need no
 //! host binary at all.
@@ -22,18 +23,29 @@ use plugin_sdk::stabby::abi::{
     DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, NamedRunner, PluginComponents,
 };
 use plugin_sdk::stabby::{
-    install_log_sink, install_runner_host, install_supervisor, make_dyn_managed_driver,
-    make_dyn_provider, make_dyn_runner,
+    create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
+    make_dyn_managed_driver, make_dyn_provider, make_dyn_runner,
 };
 use std::sync::Arc;
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
-/// `pb::CreateConfig` bytes; this plugin reads nothing out of it, but the
-/// parameter stays so config fields can be added without an ABI change.
+/// `pb::CreateConfig` bytes; this plugin reads the resolved heph `home` out of
+/// it (the `oci_runner` driver mounts it into the container).
+///
+/// A config that does not decode, or carries no usable home, does not abort:
+/// the log sink is not installed yet, so an abort here would kill the host with
+/// a bare `SIGABRT` and no message. Only `oci_runner` needs the home, so it is
+/// the one driver that fails — at run, with the reason.
 #[stabby::export]
-pub extern "C" fn heph_plugin_create(_cfg: stabby::vec::Vec<u8>) -> PluginComponents {
-    build()
+pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginComponents {
+    let home = match create_config_from_bytes(&cfg) {
+        Ok(cfg) => pluginoci::runner::home_from_host(&cfg.home),
+        Err(e) => Err(format!(
+            "the host's CreateConfig could not be decoded: {e:#}"
+        )),
+    };
+    build(home)
 }
 
 /// Stable ABI log-sink entry: the host calls this right after `create` to hand
@@ -75,7 +87,7 @@ pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
     install_runner_host(host);
 }
 
-fn build() -> PluginComponents {
+fn build(home: Result<std::path::PathBuf, String>) -> PluginComponents {
     let mut drivers = stabby::vec::Vec::new();
 
     // Assembles target outputs into an image. No daemon, no execution.
@@ -130,7 +142,7 @@ fn build() -> PluginComponents {
     // naming the builtin `session` runner: the container is held open for the
     // build and targets run in it over the agent protocol, so this plugin needs
     // no runner implementation of its own.
-    let runner: Arc<dyn ManagedDriver> = Arc::new(pluginoci::runner::Driver::new());
+    let runner: Arc<dyn ManagedDriver> = Arc::new(pluginoci::runner::Driver::from_host_home(home));
     drivers.push(NamedDriver {
         name: pluginoci::runner::DRIVER_NAME.into(),
         driver: make_dyn_managed_driver(runner),

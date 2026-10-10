@@ -19,7 +19,7 @@ Engine::result(addr)
   → Engine::get_spec(addr)    # asks each Provider::get() in order
   → Engine::get_def(addr)     # Driver::parse(TargetSpec) → TargetDef
   → Engine::execute()         # Driver::run(TargetDef) → OutputArtifacts
-  → Engine::cache_locally()   # writes to .heph3/cache/ if target.cache == true
+  → Engine::cache_locally()   # writes to <home>/cache/ (.heph/cache/ by default) if target.cache == true
 ```
 
 Input hash is computed before `execute()`. Cache hit skips `Driver::run` entirely.

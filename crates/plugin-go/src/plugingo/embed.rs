@@ -201,7 +201,7 @@ pub fn compute_embed_cfg_json(
              reached the `_golist` sandbox. Likely causes, in order:\n  \
              1. Stale `_golist` cache — if these files exist on disk, an older/cached \
              `_golist` (e.g. computed by a previous binary) may be served. Clear the cache \
-             (remove `.heph3/cache`) and rebuild.\n  \
+             (remove `.heph/cache`, or `<homeDir>/cache` if configured) and rebuild.\n  \
              2. Excluded from the source walk — an `fs.skip` entry in the workspace config \
              matches the file or its directory; heph does not stage skipped files even when \
              `//go:embed` references them.\n  \

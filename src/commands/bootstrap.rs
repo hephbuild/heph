@@ -152,6 +152,14 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // applies every default in one place and yields the engine's runtime config.
     let file = config_yaml::load_from_root(&root)?;
     let mut config = file.resolve(&root)?;
+
+    // Point `SIGQUIT` dumps at the resolved home as soon as it is known — before
+    // the engine is built and plugins are downloaded and loaded, which is where
+    // a startup hang is likeliest — so they land beside the stall log and the
+    // in-flight report rather than in the temp-dir fallback. Every command routes
+    // through here, so every command gets it.
+    crate::diag::set_dump_dir(&config.home_dir);
+
     // The kill switch for listed facts: every candidate a fact would have
     // decided is resolved instead. Read here, never by the engine. It is
     // outside every cache key on purpose: a query target's dep list is already
@@ -225,11 +233,6 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         engine.drivers_by_name.keys().cloned().collect(),
         remote_cache_backends,
     );
-
-    // Point `SIGQUIT` dumps at the resolved home, so they land beside the stall
-    // log and the in-flight report instead of under whatever cwd the process was
-    // launched from. Every command routes through here, so every command gets it.
-    crate::diag::set_dump_dir(&engine.home.join("diag"));
 
     let (trigger, rx) = ShutdownTrigger::new();
     spawn_sigint_producer(trigger.clone());
@@ -335,19 +338,9 @@ mod tests {
             .enter();
         let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml)?;
         let dir = tempfile::tempdir()?;
-        let root = dir.path().to_path_buf();
-        let home_dir = file
-            .home_dir
-            .as_ref()
-            .map(|p| root.join(p))
-            .unwrap_or_else(|| root.join(".heph3"));
-        let mut e = engine::Engine::new(engine::Config {
-            root,
-            home_dir: home_dir.clone(),
-            fs_skip: file.fs.clone().map(|f| f.skip).unwrap_or_default(),
-            parallelism: None,
-            ..Default::default()
-        })?;
+        let config = file.resolve(dir.path())?;
+        let home_dir = config.home_dir.clone();
+        let mut e = engine::Engine::new(config)?;
 
         // `fs` is auto-registered by `Engine::new`.
         e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
@@ -443,10 +436,8 @@ fs:
         let root = dir.path().to_path_buf();
         let engine = Arc::new(
             engine::Engine::new(engine::Config {
-                root: root.clone(),
-                home_dir: root.join(".heph3"),
                 parallelism: None,
-                ..Default::default()
+                ..engine::Config::for_tests(root)
             })
             .expect("engine"),
         );

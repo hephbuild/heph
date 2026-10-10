@@ -42,6 +42,14 @@ pub struct ConfigYaml {
     /// Mirrored in [`VersionPin`] — see the note on [`version`](Self::version).
     #[serde(default)]
     pub version_flavour: Option<String>,
+    /// The heph home (cache, sandboxes, credentials, locks, diagnostics). A
+    /// relative path is under the workspace root; an absolute one is used as
+    /// written. No `~` or `$VAR` expansion. `.` and `..` are resolved lexically,
+    /// not against the filesystem: `link/..` is the directory holding `link`,
+    /// even when `link` is a symlink elsewhere. Unset means
+    /// [`DEFAULT_HOME_DIR`](crate::DEFAULT_HOME_DIR). Resolved by
+    /// [`HomeDir::resolve`](crate::HomeDir::resolve), which refuses the root
+    /// itself or anything above it.
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
     /// Every provider/driver — built-in or external — is declared as a single
@@ -346,6 +354,15 @@ impl Default for TelemetryConfig {
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FsConfig {
+    /// Root-relative directories and globs no tree walk enters: package
+    /// discovery, `fs` globs and the Go provider alike.
+    ///
+    /// Beyond these, `.git` is always skipped, and so is every directory named
+    /// `.heph*` ([`HEPH_DIR_PREFIX`](crate::HEPH_DIR_PREFIX)): the name is
+    /// reserved for heph's own state (the home, a leftover `.heph3`, tool caches
+    /// such as `.heph-gocache`). A directory named `.heph*` is never source — a
+    /// `BUILD` file inside one is not a package, and an address in one does not
+    /// resolve.
     #[serde(default)]
     pub skip: Vec<String>,
 }
@@ -466,7 +483,7 @@ pub enum LockBackendConfig {
 /// plugins:
 ///   - builtin: buildfile
 ///     options: { patterns: [BUILD] }
-///   - path: .heph3/heph-go-plugin.json
+///   - path: tools/heph-go-plugin.json
 ///   - url: https://…/heph-go-plugin.json
 ///     checksum: sha256:9f86d0…
 /// ```

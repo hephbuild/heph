@@ -929,10 +929,8 @@ mod tests {
 
     fn one_scratch_engine(root: &std::path::Path) -> anyhow::Result<Arc<Engine>> {
         let mut engine = Engine::new(crate::engine::Config {
-            root: root.to_path_buf(),
-            home_dir: root.join(".heph3"),
             parallelism: None,
-            ..Default::default()
+            ..crate::engine::Config::for_tests(root)
         })?;
         let provider = hbuiltins::pluginstatictarget::Provider::new(vec![
             hbuiltins::pluginstatictarget::Target {
@@ -1014,10 +1012,8 @@ mod tests {
     async fn scratch_keeps_going_under_the_default_request_state() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut engine = crate::engine::Engine::new(crate::engine::Config {
-            root: root.path().to_path_buf(),
-            home_dir: root.path().join(".heph3"),
             parallelism: None,
-            ..Default::default()
+            ..crate::engine::Config::for_tests(root.path())
         })?;
         let provider = hbuiltins::pluginstatictarget::Provider::new(vec![
             hbuiltins::pluginstatictarget::Target {

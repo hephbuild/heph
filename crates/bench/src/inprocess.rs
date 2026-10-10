@@ -19,10 +19,10 @@
 use anyhow::{Context, Result};
 use bench_corpus::CorpusManifest;
 use clap::ValueEnum;
-use heph::engine::{Config, Engine, OutputMatcher, ResultOptions};
+use heph::engine::{Config, ConfigYamlExt as _, Engine, HomeDir, OutputMatcher, ResultOptions};
 use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,14 +48,8 @@ impl Scenario {
 }
 
 fn build_engine(root: &Path) -> Result<Arc<Engine>> {
-    let mut e = Engine::new(Config {
-        root: root.to_path_buf(),
-        home_dir: PathBuf::new(),
-        parallelism: None,
-        fs_skip: Vec::new(),
-        ..Default::default()
-    })
-    .context("construct engine")?;
+    let mut e = Engine::new(Config::new(root.to_path_buf(), cache_dir(root)?))
+        .context("construct engine")?;
     e.register_provider(|init| {
         Box::new(heph::pluginbuildfile::Provider::new(
             init.root.to_path_buf(),
@@ -88,12 +82,17 @@ async fn resolve_all(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cache_dir(corpus: &Path) -> PathBuf {
-    corpus.join(".heph3")
+/// The corpus's heph home, resolved from its config the way the binary does.
+fn cache_dir(corpus: &Path) -> Result<HomeDir> {
+    Ok(heph::engine::config_yaml::load_from_root(corpus)
+        .context("load corpus config")?
+        .resolve(corpus)
+        .context("resolve corpus config")?
+        .home_dir)
 }
 
 fn wipe_cache(corpus: &Path) -> Result<()> {
-    let dir = cache_dir(corpus);
+    let dir = cache_dir(corpus)?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
     }

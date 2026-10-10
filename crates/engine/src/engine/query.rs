@@ -991,10 +991,8 @@ mod tests {
     fn make_engine(targets: Vec<pluginstatictarget::Target>) -> anyhow::Result<Arc<Engine>> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
@@ -1085,10 +1083,8 @@ mod tests {
     async fn query_spec_skips_candidates_that_cannot_be_resolved() -> anyhow::Result<()> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let provider = pluginstatictarget::Provider::new(vec![target("foo", "a", &["lint"])])?;
         engine.register_provider(move |_| Box::new(provider))?;
@@ -1203,10 +1199,8 @@ mod tests {
 
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(move |_| Box::new(Dup))?;
         let engine = Arc::new(engine);
@@ -1394,10 +1388,8 @@ mod tests {
         let list_states = Arc::new(Mutex::new(Vec::<Vec<State>>::new()));
         let list_states_clone = Arc::clone(&list_states);
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(move |_| {
             Box::new(Recorder {
@@ -1535,10 +1527,8 @@ mod tests {
         let listed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let spy_listed = Arc::clone(&listed);
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(move |_| {
             Box::new(ListSpy {
@@ -1732,10 +1722,8 @@ mod tests {
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let delay = Arc::new(delay);
         engine.register_provider(move |_| {
@@ -1944,10 +1932,8 @@ mod tests {
         ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
             let root = tempdir()?;
             let mut engine = Engine::new(Config {
-                root: root.path().to_path_buf(),
-                home_dir: std::path::PathBuf::new(),
                 parallelism: None,
-                ..Default::default()
+                ..Config::for_tests(root.path())
             })?;
             // For the def stage: a target naming any other driver fails `parse`.
             engine.register_managed_driver(|_| {
