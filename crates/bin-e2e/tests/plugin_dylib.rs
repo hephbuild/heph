@@ -249,7 +249,7 @@ fn shipped_go_cdylib_list_calls_back_states_under_across_the_seam() {
 /// only `go` on `PATH` here is a stub that fails, so a run that resolved even
 /// one spec would fail. `driver("nonexistent")` must therefore come back
 /// empty and green (a listed No is never resolved), and
-/// `--candidates` with `driver(go_compile)` must name the lib's compile —
+/// `--candidates` with `driver(go.compile)` must name the lib's compile —
 /// both decided from the listing alone.
 #[cfg(unix)]
 #[test]
@@ -328,13 +328,13 @@ fn shipped_go_cdylib_listed_facts_decide_without_get() {
 
     // A listed Yes is confirmed by default, which would run the stub; the
     // listing alone is `--candidates`.
-    let out = query_flags(&["--candidates"], "//lib/... && driver(go_compile)", "");
+    let out = query_flags(&["--candidates"], "//lib/... && driver(go.compile)", "");
     assert!(out.status.success(), "{}", describe(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(
         lines == ["//lib:build_lib@v=release,vp=cmd"],
-        "only the lib's compile is a go_compile target: {}",
+        "only the lib's compile is a go.compile target: {}",
         describe(&out)
     );
 }
@@ -502,7 +502,7 @@ fn shipped_oci_cdylib_parses_across_the_abi_without_aborting() {
         "pkg/BUILD",
         "target(name = \"df\", driver = \"bash\", run = \"echo 'FROM scratch' > $OUT\", \
          out = \"Dockerfile\")\n\
-         target(name = \"img\", driver = \"docker_build\", context = [\":df\"])\n",
+         target(name = \"img\", driver = \"oci.docker_build\", context = [\":df\"])\n",
     )
     .expect("write BUILD");
 
@@ -545,7 +545,7 @@ fn shipped_oci_cdylib_parses_across_the_abi_without_aborting() {
 /// proves — and an ABI mismatch in a cdylib is an abort at load, not an error a
 /// user can read.
 ///
-/// Deliberately does not run a `devenv_runner` target: that needs `devenv` and
+/// Deliberately does not run a `devenv.runner` target: that needs `devenv` and
 /// a nix evaluation, which is what `crates/e2e/tests/devenv_runner.rs` covers
 /// behind an opt-in. What is asserted here is what only the shipped artifact
 /// can answer — that the library maps, the create entry's type report matches,
@@ -565,7 +565,7 @@ fn shipped_devenv_cdylib_loads_and_registers_its_driver() {
 
     ws.write(
         "pkg/BUILD",
-        "target(name = \"runner\", driver = \"devenv_runner\", mode = \"wrap\")\n",
+        "target(name = \"runner\", driver = \"devenv.runner\", mode = \"wrap\")\n",
     )
     .expect("write BUILD");
 
@@ -587,12 +587,172 @@ fn shipped_devenv_cdylib_loads_and_registers_its_driver() {
     );
     assert!(
         !combined.contains("driver not found"),
-        "the devenv plugin loaded but did not register `devenv_runner`: {}",
+        "the devenv plugin loaded but did not register `devenv.runner`: {}",
         describe(&out)
     );
     assert!(
         out.status.success(),
-        "parsing a devenv_runner target should succeed: {}",
+        "parsing a devenv.runner target should succeed: {}",
         describe(&out)
     );
+}
+
+/// Load a shipped cdylib under manifest name `name`, with `options` (YAML
+/// lines under `options:`, already indented, or empty).
+fn load_as(ws: &Workspace, dist: &Dist, plugin: &str, name: &str, options: &str) {
+    let dylib = dist.plugin(plugin);
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+    let manifest = ws.root().join(format!("heph-{plugin}-plugin.json"));
+    let sum = sha256_file(&dylib).expect("hash cdylib");
+    write_manifest(&manifest, name, &dylib, Some(&sum)).expect("write manifest");
+    let options = if options.is_empty() {
+        String::new()
+    } else {
+        format!("    options:\n{options}")
+    };
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n{options}",
+        manifest.display()
+    ))
+    .expect("write config");
+}
+
+const GO_OPTIONS: &str = "      gotool: \"host\"\n";
+
+/// **A cdylib's namespace is its manifest's `name`.** The binary reports
+/// none: the same go cdylib loaded as `go` answers `heph.go.*`, and loaded as
+/// `gopher` answers `heph.gopher.*`. A manifest name that is not a valid
+/// `heph.<name>` segment fails the load, naming the name, the rule and the
+/// manifest.
+#[test]
+fn cdylib_namespace_is_its_manifest_name() {
+    let dist = Dist::locate();
+    for name in ["go", "gopher"] {
+        let ws = Workspace::new().expect("workspace");
+        load_as(&ws, &dist, "go", name, GO_OPTIONS);
+        let out = ws.run(&dist, &["inspect", "functions"]).expect("run");
+        assert!(out.status.success(), "{}", describe(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let build_addr: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.contains("build_addr("))
+            .collect();
+        assert_eq!(
+            build_addr.len(),
+            1,
+            "one build_addr, under the manifest name {name}: {}",
+            describe(&out)
+        );
+        assert!(
+            build_addr[0].starts_with(&format!("{name}.build_addr(")),
+            "{name}: {}",
+            describe(&out)
+        );
+    }
+
+    let ws = Workspace::new().expect("workspace");
+    load_as(&ws, &dist, "go", "my-go", GO_OPTIONS);
+    let out = ws.run(&dist, &["inspect", "functions"]).expect("run");
+    assert!(
+        !out.status.success(),
+        "loaded a plugin whose manifest name is not a namespace: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let manifest = ws.root().join("heph-go-plugin.json");
+    for want in [
+        "invalid plugin name \"my-go\"",
+        "[a-z_][a-z0-9_]*",
+        &manifest.display().to_string(),
+    ] {
+        assert!(
+            stderr.contains(want),
+            "missing {want:?}: {}",
+            describe(&out)
+        );
+    }
+}
+
+/// The cdylib rows of the spec's name map (the builtin rows are pinned in the
+/// root crate's `bootstrap` tests): each shipped driver answers to its new
+/// `<plugin>.<local>` name, and the name it had before is an unknown driver.
+#[test]
+fn shipped_names_match_the_name_map() {
+    let dist = Dist::locate();
+    /// `(plugin, options, [(new name, old name)])`.
+    type Row<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+    let rows: [Row; 3] = [
+        (
+            "go",
+            GO_OPTIONS,
+            &[
+                ("go.golist", "go_golist"),
+                ("go.toolchain", "go_toolchain"),
+                ("go.compile", "go_compile"),
+                ("go.testmain", "go_testmain"),
+                ("go.lint", "go_lint"),
+                ("go.lint_gate", "go_lint_gate"),
+                ("go.lint_fix", "go_lint_fix"),
+                ("go.format", "go_format"),
+                ("go.format_check", "go_format_check"),
+            ],
+        ),
+        (
+            "oci",
+            "",
+            &[
+                ("oci.docker_build", "docker_build"),
+                ("oci.image", "oci_image"),
+                ("oci.layer", "oci_layer"),
+                ("oci.index", "oci_index"),
+                ("oci.pull", "oci_pull"),
+                ("oci.push", "oci_push"),
+                ("oci.load", "oci_load"),
+                ("oci.builder_platform", "oci_builder_platform"),
+                ("oci.runner", "oci_runner"),
+            ],
+        ),
+        ("devenv", "", &[("devenv.runner", "devenv_runner")]),
+    ];
+    for (plugin, options, names) in rows {
+        let ws = Workspace::new().expect("workspace");
+        load_as(&ws, &dist, plugin, plugin, options);
+        // One target per name; `inspect def` reaches each driver's `parse`
+        // without running anything. A config error is fine — it came from the
+        // driver — but "driver not found" means the name is not registered.
+        let mut build = String::new();
+        for (i, (new, old)) in names.iter().enumerate() {
+            build.push_str(&format!("target(name = \"new{i}\", driver = \"{new}\")\n"));
+            build.push_str(&format!("target(name = \"old{i}\", driver = \"{old}\")\n"));
+        }
+        ws.write("pkg/BUILD", &build).expect("write BUILD");
+        for (i, (new, old)) in names.iter().enumerate() {
+            let out = ws
+                .run(&dist, &["inspect", "def", &format!("//pkg:new{i}")])
+                .expect("run");
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !combined.contains(&format!("driver not found: {new}")),
+                "{new} is not registered: {}",
+                describe(&out)
+            );
+            let out = ws
+                .run(&dist, &["inspect", "def", &format!("//pkg:old{i}")])
+                .expect("run");
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                combined.contains(&format!("driver not found: {old}")),
+                "the old name {old} must not resolve: {}",
+                describe(&out)
+            );
+        }
+    }
 }

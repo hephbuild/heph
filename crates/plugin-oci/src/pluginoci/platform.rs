@@ -65,7 +65,10 @@ pub const PKG: &str = "@heph/oci";
 pub const TARGET: &str = "platform";
 /// Addr arg naming the buildx builder to ask. Absent means the current one.
 pub const BUILDER_ARG: &str = "builder";
-pub const DRIVER_NAME: &str = "oci_builder_platform";
+/// The name targets select this driver by: `<plugin>.<local>`.
+pub const DRIVER_NAME: &str = "oci.builder_platform";
+/// Its local name inside the `oci` plugin.
+pub const LOCAL_NAME: &str = "builder_platform";
 
 /// The shared registry blob store's target name, in [`PKG`].
 ///
@@ -134,7 +137,7 @@ pub struct Provider;
 impl EProvider for Provider {
     fn config(&self, _req: ProviderConfigRequest) -> anyhow::Result<ProviderConfigResponse> {
         Ok(ProviderConfigResponse {
-            name: "pluginoci".to_string(),
+            name: super::PLUGIN_NAME.to_string(),
         })
     }
 
@@ -277,7 +280,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: LOCAL_NAME.to_string(),
         })
     }
 

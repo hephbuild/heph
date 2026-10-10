@@ -27,22 +27,22 @@ pub(crate) const FORMAT: &[&str] = &["go-format", "format", "fix"];
 pub(crate) const FORMAT_CHECK: &[&str] = &["go-format-check", "format-check"];
 
 /// `_golist`.
-pub(crate) const DRIVER_GOLIST: &str = "go_golist";
+pub(crate) const DRIVER_GOLIST: &str = "go.golist";
 /// A first- or third-party library compile.
-pub(crate) const DRIVER_COMPILE: &str = "go_compile";
+pub(crate) const DRIVER_COMPILE: &str = "go.compile";
 /// The stdlib build, a binary link, a test-binary link, and a test run with a
 /// `pre_run`.
 pub(crate) const DRIVER_BASH: &str = "bash";
 /// A test run without a `pre_run`: the test binary as a literal argv.
 pub(crate) const DRIVER_EXEC: &str = "exec";
 /// `lint`.
-pub(crate) const DRIVER_LINT_FIX: &str = "go_lint_fix";
+pub(crate) const DRIVER_LINT_FIX: &str = "go.lint_fix";
 /// `lint-check`.
-pub(crate) const DRIVER_LINT_GATE: &str = "go_lint_gate";
+pub(crate) const DRIVER_LINT_GATE: &str = "go.lint_gate";
 /// `format`.
-pub(crate) const DRIVER_FORMAT: &str = "go_format";
+pub(crate) const DRIVER_FORMAT: &str = "go.format";
 /// `format-check`.
-pub(crate) const DRIVER_FORMAT_CHECK: &str = "go_format_check";
+pub(crate) const DRIVER_FORMAT_CHECK: &str = "go.format_check";
 
 pub(crate) fn owned(labels: &[&str]) -> Vec<String> {
     labels.iter().map(|l| (*l).to_string()).collect()
@@ -129,8 +129,8 @@ mod tests {
         #[rustfmt::skip]
         let table: &[Row] = &[
             // name, bare, stdlib, test_driver => labels, driver, has_codegen
-            ("_golist", true, false, None, Some(none), Some("go_golist"), Some(false)),
-            ("build_lib", true, false, None, Some(BUILD), Some("go_compile"), Some(false)),
+            ("_golist", true, false, None, Some(none), Some("go.golist"), Some(false)),
+            ("build_lib", true, false, None, Some(BUILD), Some("go.compile"), Some(false)),
             ("build_lib", true, true, None, Some(BUILD), Some("bash"), Some(false)),
             ("build", true, false, None, Some(none), Some("group"), Some(false)),
             ("build", false, false, None, Some(none), Some("bash"), Some(false)),
@@ -142,10 +142,10 @@ mod tests {
             ("xtest", true, false, Some("exec"), Some(TEST), Some("exec"), Some(false)),
             ("test_race", true, false, Some("exec"), Some(TEST_RACE), Some("exec"), Some(false)),
             ("xtest_race", true, false, Some("bash"), Some(TEST_RACE), Some("bash"), Some(false)),
-            ("lint", true, false, None, Some(LINT), Some("go_lint_fix"), None),
-            ("lint-check", true, false, None, Some(LINT_CHECK), Some("go_lint_gate"), Some(false)),
-            ("format", true, false, None, Some(FORMAT), Some("go_format"), None),
-            ("format-check", true, false, None, Some(FORMAT_CHECK), Some("go_format_check"), Some(false)),
+            ("lint", true, false, None, Some(LINT), Some("go.lint_fix"), None),
+            ("lint-check", true, false, None, Some(LINT_CHECK), Some("go.lint_gate"), Some(false)),
+            ("format", true, false, None, Some(FORMAT), Some("go.format"), None),
+            ("format-check", true, false, None, Some(FORMAT_CHECK), Some("go.format_check"), Some(false)),
             ("download", true, false, None, None, None, None),
         ];
         for &(name, bare, stdlib, test_driver, labels, driver, has_codegen) in table {

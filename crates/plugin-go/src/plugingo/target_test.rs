@@ -441,7 +441,7 @@ mod tests {
             V,
             "",
         );
-        assert_eq!(spec.driver, "go_compile");
+        assert_eq!(spec.driver, "go.compile");
     }
 
     #[test]
@@ -495,7 +495,7 @@ mod tests {
             V,
             "",
         );
-        assert_eq!(spec.driver, "go_compile");
+        assert_eq!(spec.driver, "go.compile");
         assert_eq!(
             crate::plugingo::driver_compile::test_support::cfg_str(&spec, "p_flag"),
             "example.com/pkg"
@@ -749,7 +749,7 @@ mod tests {
             V,
             "",
         );
-        assert_eq!(spec.driver, "go_compile");
+        assert_eq!(spec.driver, "go.compile");
         assert_eq!(
             crate::plugingo::driver_compile::test_support::cfg_str(&spec, "go_version"),
             V

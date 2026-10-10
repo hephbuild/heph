@@ -61,7 +61,10 @@ use xxhash_rust::xxh3::Xxh3Default;
 use super::archive::{self, Blob, Blobs};
 use super::{ImageFormat, dep_files, layout_path, normalize_platform, split_platform, ws_path};
 
-pub const DRIVER_NAME: &str = "oci_image";
+/// The name BUILD files select this driver by: `<plugin>.<local>`.
+pub const DRIVER_NAME: &str = "oci.image";
+/// Its local name inside the `oci` plugin.
+pub const LOCAL_NAME: &str = "image";
 
 /// Media type of an uncompressed layer. See [`super::layer`] for why layers are
 /// not gzipped.
@@ -382,7 +385,7 @@ fn base_for(layout: Option<&archive::Layout>, platform: &str) -> anyhow::Result<
     let manifest = chosen.with_context(|| {
         format!(
             "`base` has no {platform} instance (it has: {}). Pull it with \
-             `oci_pull(layout = True, all_platforms = True)` so every platform in `platforms` \
+             an `oci.pull` target with `layout = True, all_platforms = True` so every platform in `platforms` \
              has a base to sit on.",
             available.join(", ")
         )
@@ -436,7 +439,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: LOCAL_NAME.to_string(),
         })
     }
 
@@ -493,7 +496,7 @@ impl ManagedDriver for Driver {
         anyhow::ensure!(
             !spec.layers.is_empty() || !pbp.is_empty() || spec.base.is_some(),
             "this image has no `base` and no `layers`, so it would have no filesystem at all. \
-             Add at least one `oci_layer` target."
+             Add at least one `oci.layer` target."
         );
 
         let format = spec
@@ -767,12 +770,12 @@ fn layer_tar(req: &ManagedRunRequest<'_, '_>, origin: &str) -> anyhow::Result<Pa
     match paths.as_slice() {
         [only] => Ok(only.clone()),
         [] => anyhow::bail!(
-            "the {origin} dep produced no file; an `oci_image` layer must be an `oci_layer` \
+            "the {origin} dep produced no file; an `oci.image` layer must be an `oci.layer` \
              target, which produces exactly one tar"
         ),
         many => anyhow::bail!(
             "the {origin} dep produced {} files, expected one layer tar; `layers` takes \
-             `oci_layer` targets, not arbitrary ones",
+             `oci.layer` targets, not arbitrary ones",
             many.len()
         ),
     }

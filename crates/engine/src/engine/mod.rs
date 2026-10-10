@@ -5,7 +5,7 @@
 pub mod engine;
 pub use engine::Engine;
 pub use engine::EngineFuse;
-pub use engine::PluginInit;
+pub use engine::{PluginDriver, PluginFactory, PluginInit, PluginParts};
 pub mod config;
 pub use config::Config;
 pub use config::ConfigYamlExt;

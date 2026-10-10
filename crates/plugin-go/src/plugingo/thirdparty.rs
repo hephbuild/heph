@@ -528,7 +528,7 @@ mod tests {
     fn test_build_lib_driver_is_go_compile() {
         assert_eq!(
             lib_spec(&test_pkg(vec!["logr.go".into()]), &[], None, &[]).driver,
-            "go_compile"
+            "go.compile"
         );
     }
 

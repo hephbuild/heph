@@ -176,7 +176,7 @@ in
     gen-go-large
     install-go-plugin
     # The example workspace's `execrunner` package needs both: a
-    # `devenv_runner` for the build environment and an `oci_runner` for the
+    # `devenv.runner` for the build environment and an `oci.runner` for the
     # runtime one. Neither is compiled into the CLI.
     install-devenv-plugin
     install-oci-plugin

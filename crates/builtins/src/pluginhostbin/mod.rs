@@ -20,6 +20,8 @@ use xxhash_rust::xxh3::Xxh3;
 
 const PKG: &str = "@heph/bin";
 const DRIVER_NAME: &str = "hostbin";
+/// The builtin plugin the hostbin provider and driver ship in.
+pub const PLUGIN_NAME: &str = "hostbin";
 
 fn find_binary(name: &str) -> anyhow::Result<String> {
     let path = which::which(name)?;
@@ -33,7 +35,8 @@ pub struct Provider;
 impl EProvider for Provider {
     fn config(&self, _req: ProviderConfigRequest) -> anyhow::Result<ProviderConfigResponse> {
         Ok(ProviderConfigResponse {
-            name: "pluginhostbin".to_string(),
+            // The plugin's own name: reachable as `hostbin`.
+            name: PLUGIN_NAME.to_string(),
         })
     }
 

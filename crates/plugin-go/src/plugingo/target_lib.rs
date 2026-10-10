@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn driver_is_go_compile() {
-        assert_eq!(lib_spec(&[], None, &[], &[], "mylib").driver, "go_compile");
+        assert_eq!(lib_spec(&[], None, &[], &[], "mylib").driver, "go.compile");
     }
 
     #[test]

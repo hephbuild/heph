@@ -105,14 +105,17 @@ fn workspace_with_fake(fake: &Fake) -> htestkit::Workspace {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
-            bin.clone(),
-        )))
         // `docker_build` without explicit `platforms` depends on
         // `//@heph/oci:platform`, so the probe's provider and driver have to be
         // registered for the graph to resolve at all.
-        .with_provider(|_| Box::new(pluginoci::platform::Provider))
-        .with_managed_driver(Box::new(pluginoci::platform::Driver::with_binary(bin)))
+        .with_plugin(pluginoci::PLUGIN_NAME, move |_| {
+            Ok(heph::engine::PluginParts::default()
+                .with_provider(Box::new(pluginoci::platform::Provider))
+                .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
+                    bin.clone(),
+                )))
+                .with_managed_driver(Box::new(pluginoci::platform::Driver::with_binary(bin))))
+        })
         .build()
         .expect("build workspace")
 }
@@ -129,7 +132,7 @@ async fn test_docker_build_outputs_are_consumable_by_a_downstream_target() -> an
 target(name = "srcs", driver = "bash", run = "echo hi > $OUT", out = "hi.txt")
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":srcs", ":dockerfile"],
 )
 target(
@@ -173,7 +176,7 @@ target(
     run = "echo 'FROM scratch' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "docker_build", context = [":dockerfile"])
+target(name = "img", driver = "oci.docker_build", context = [":dockerfile"])
 "#,
     );
 
@@ -206,7 +209,7 @@ target(
     run = "echo 'FROM scratch' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "docker_build", context = [":dockerfile"])
+target(name = "img", driver = "oci.docker_build", context = [":dockerfile"])
 "#,
     );
 
@@ -247,7 +250,7 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = {"": [":dockerfile"], "bin": ["//cmd/server:bin"]},
 )
 "#,
@@ -310,7 +313,7 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     dockerfile = ":gen",
     context = [":srcs"],
 )
@@ -358,7 +361,7 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":dockerfile"],
     platforms = ["linux/amd64", "linux/arm64"],
     context_by_platform = {
@@ -417,7 +420,7 @@ target(
 )
 target(
     name = "runtime",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":dockerfile"],
     stage = "runtime",
     platforms = ["linux/amd64", "linux/arm64"],
@@ -425,7 +428,7 @@ target(
 )
 target(
     name = "build",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":dockerfile"],
     stage = "build",
     platforms = ["linux/amd64", "linux/arm64"],
@@ -488,13 +491,17 @@ async fn test_docker_build_build_failure_surfaces_the_builder_error() -> anyhow:
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
-            bin.to_string_lossy().into_owned(),
-        )))
-        .with_provider(|_| Box::new(pluginoci::platform::Provider))
-        .with_managed_driver(Box::new(pluginoci::platform::Driver::with_binary(
-            bin.to_string_lossy().into_owned(),
-        )))
+        .with_plugin(pluginoci::PLUGIN_NAME, {
+            let bin = bin.to_string_lossy().into_owned();
+            move |_| {
+                Ok(heph::engine::PluginParts::default()
+                    .with_provider(Box::new(pluginoci::platform::Provider))
+                    .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
+                        bin.clone(),
+                    )))
+                    .with_managed_driver(Box::new(pluginoci::platform::Driver::with_binary(bin))))
+            }
+        })
         .build()
         .expect("build workspace");
 
@@ -507,7 +514,7 @@ target(
     run = "echo 'FROOM scratch' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "docker_build", context = [":dockerfile"])
+target(name = "img", driver = "oci.docker_build", context = [":dockerfile"])
 "#,
     );
 

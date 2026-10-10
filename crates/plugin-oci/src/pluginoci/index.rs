@@ -71,7 +71,10 @@ use xxhash_rust::xxh3::Xxh3Default;
 use super::archive::{self, Blobs, Layout};
 use super::{ImageFormat, layout_path, ws_path};
 
-pub const DRIVER_NAME: &str = "oci_index";
+/// The name BUILD files select this driver by: `<plugin>.<local>`.
+pub const DRIVER_NAME: &str = "oci.index";
+/// Its local name inside the `oci` plugin.
+pub const LOCAL_NAME: &str = "index";
 
 fn image_origin(i: usize) -> String {
     format!("images|{i}")
@@ -209,7 +212,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: LOCAL_NAME.to_string(),
         })
     }
 
@@ -237,7 +240,7 @@ impl ManagedDriver for Driver {
         anyhow::ensure!(
             !matches!(format, ImageFormat::Docker),
             "`format = \"docker\"` holds a single image, which is the one thing an oci_index does \
-             not produce. Use the default `format = \"oci\"`, and `oci_load` to put one instance \
+             not produce. Use the default `format = \"oci\"`, and `oci.load` to put one instance \
              of it in a daemon."
         );
 

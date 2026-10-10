@@ -173,7 +173,10 @@ impl<'io> ToolIo<'io> {
     }
 }
 
-pub const DRIVER_NAME: &str = "docker_build";
+/// The name BUILD files select this driver by: `<plugin>.<local>`.
+pub const DRIVER_NAME: &str = "oci.docker_build";
+/// Its local name inside the `oci` plugin.
+pub const LOCAL_NAME: &str = "docker_build";
 
 /// Builds a container image from a Dockerfile with `docker buildx`. Requires a
 /// running docker daemon and a builder that can export to a file, and is not
@@ -779,7 +782,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: LOCAL_NAME.to_string(),
         })
     }
 

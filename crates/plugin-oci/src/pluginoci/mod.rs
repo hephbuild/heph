@@ -35,6 +35,10 @@ pub mod push;
 pub mod registry;
 pub mod runner;
 
+/// The plugin these drivers ship in (its cdylib manifest's `name`); every
+/// driver here is selected as `oci.<local>`.
+pub const PLUGIN_NAME: &str = "oci";
+
 /// Archive format an image is built/consumed as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ImageFormat {
@@ -275,7 +279,7 @@ pub(crate) fn layout_path(
     anyhow::bail!(
         "{attr} is neither an OCI layout directory nor a single archive: no `oci-layout` file \
          among {} staged path(s), the first being {:?}. Produce it with \
-         `oci_pull(layout = True)`, `oci_image(...)` or `docker_build(...)`.",
+         an `oci.pull` target with `layout = True`, an `oci.image` or an `oci.docker_build`.",
         paths.len(),
         paths.first()
     )

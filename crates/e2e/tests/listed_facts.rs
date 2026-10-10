@@ -257,7 +257,7 @@ async fn addr_only_listing_behaves_as_today() -> anyhow::Result<()> {
 }
 
 /// C5, C27: the buildfile provider lists every target's driver — the one its
-/// `get` returns, `defaultDriver` included — so `driver("credential")` resolves
+/// `get` returns, `defaultDriver` included — so `driver("auth.credential")` resolves
 /// no BUILD spec.
 #[tokio::test]
 async fn buildfile_listing_carries_driver() -> anyhow::Result<()> {
@@ -315,7 +315,7 @@ target(name = "c", run = "echo c")
     );
     for r in &listed {
         assert_eq!(
-            driver("credential").matches_listed(&r.addr, &r.facts),
+            driver("auth.credential").matches_listed(&r.addr, &r.facts),
             heph::htmatcher::MatchResult::MatchNo
         );
     }
@@ -335,7 +335,7 @@ async fn unknown_driver_entry_resolves_spec() -> anyhow::Result<()> {
         },
     )?;
     assert!(
-        select(&ws, trust(&ws, TRUST), &driver("credential"))
+        select(&ws, trust(&ws, TRUST), &driver("auth.credential"))
             .await?
             .is_empty()
     );

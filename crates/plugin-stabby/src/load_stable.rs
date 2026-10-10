@@ -74,8 +74,12 @@ pub type LoadedComponents = (
 /// (different stabby version, or drifted boundary types) is a hard error. The
 /// `Library` is intentionally leaked: the returned trait objects' vtables live in
 /// the dylib's code, which must stay mapped for the process lifetime.
+///
+/// `name` is the plugin's name, from its manifest. The provider is named after
+/// it; `PluginComponents.provider_name` is ignored.
 pub fn load(
     path: &std::path::Path,
+    name: &str,
     root: &str,
     home: &str,
     options: std::collections::HashMap<String, pb::Value>,
@@ -159,7 +163,9 @@ pub fn load(
     let _: &'static mut libloading::Library = Box::leak(Box::new(lib));
 
     let PluginComponents {
-        provider_name,
+        // The manifest names the plugin, and so its provider; what the binary
+        // reports here is not read.
+        provider_name: _,
         provider,
         drivers,
         hooks,
@@ -169,7 +175,7 @@ pub fn load(
     } = comps;
     // `provider` is optional: hook-only / driver-only plugins export `None`.
     let provider: std::option::Option<DynProvider> = provider.into();
-    let host_provider = provider.map(|p| StableRemoteProvider::new(p, provider_name.to_string()));
+    let host_provider = provider.map(|p| StableRemoteProvider::new(p, name));
 
     let mut host_drivers = Vec::new();
     for nd in drivers {

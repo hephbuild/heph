@@ -290,7 +290,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(spec.driver, "go_golist");
+        assert_eq!(spec.driver, "go.golist");
     }
 
     #[test]
@@ -556,7 +556,7 @@ mod tests {
             !deps.contains_key("srcfiles"),
             "thirdparty _golist must not dep on srcfiles"
         );
-        assert_eq!(spec.driver, "go_golist");
+        assert_eq!(spec.driver, "go.golist");
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!(),

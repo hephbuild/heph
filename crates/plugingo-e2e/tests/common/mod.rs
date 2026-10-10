@@ -10,6 +10,7 @@
 )]
 
 use anyhow::Context as _;
+use heph::engine::PluginParts;
 use heph::pluginbuildfile;
 use heph::pluginexec;
 use heph::pluginhttp;
@@ -222,7 +223,7 @@ impl hplugin::provider::Provider for VariantInjector {
         _req: hplugin::provider::ConfigRequest,
     ) -> anyhow::Result<hplugin::provider::ConfigResponse> {
         Ok(hplugin::provider::ConfigResponse {
-            name: "go-variant-injector".to_string(),
+            name: "go_variant_injector".to_string(),
         })
     }
 
@@ -356,7 +357,7 @@ fn make_workspace_ordered(
 /// `runner:` config-yaml option, which is the only way a generated Go target
 /// ever names one. `None` is the plain host, as every other fixture uses.
 ///
-/// Registers the `devenv_runner` driver too, so a fixture can declare the
+/// Registers the `devenv.runner` driver too, so a fixture can declare the
 /// runner target it points at.
 fn make_workspace_ordered_runner(
     dir: TempDir,
@@ -378,30 +379,53 @@ fn make_workspace_ordered_runner(
     // against, so targets resolve `@v=…` without each BUILD declaring them.
     b = b.with_provider(|_| Box::new(VariantInjector));
 
-    if go_first {
-        let gotool = gotool.clone();
-        let provider_runner = provider_runner.clone();
-        b = b.with_provider(move |init| {
-            Box::new(
-                plugingo::Provider::with_config(
-                    init.root.to_path_buf(),
-                    plugingo::Config {
-                        foreign_name_guard,
-                        sdk_checksums: sdk_checksums_for(&gotool),
-                        go_version: gotool,
-                        govet: govet_addr(),
-                        // The bash half of the runner: the std install and the
-                        // thirdparty download invoke `go` too, and a build whose
-                        // compile drivers moved into the environment while these
-                        // stayed on the host fails on mismatched object versions.
-                        runner: provider_runner.clone(),
-                        ..Default::default()
-                    },
-                    init.runtime.clone(),
-                )
-                .expect("plugingo provider"),
-            )
-        });
+    // The `go` plugin: its provider and its nine drivers, named `go` and
+    // `go.<local>` exactly as the cdylib's are.
+    let r = runner.clone();
+    let go_plugin = move |init: &heph::engine::PluginInit| -> anyhow::Result<PluginParts> {
+        let provider = plugingo::Provider::with_config(
+            init.root.to_path_buf(),
+            plugingo::Config {
+                foreign_name_guard,
+                sdk_checksums: sdk_checksums_for(&gotool),
+                go_version: gotool,
+                govet: govet_addr(),
+                // The bash half of the runner: the std install and the
+                // thirdparty download invoke `go` too, and a build whose
+                // compile drivers moved into the environment while these
+                // stayed on the host fails on mismatched object versions.
+                runner: provider_runner,
+                ..Default::default()
+            },
+            init.runtime.clone(),
+        )
+        .context("plugingo provider")?;
+        Ok(PluginParts::default()
+            .with_provider(Box::new(provider))
+            .with_managed_driver(Box::new(
+                plugingo::GoGolistDriver::new().with_default_runner(r.clone()),
+            ))
+            .with_managed_driver(Box::new(plugingo::GoToolchainDriver))
+            .with_managed_driver(Box::new(
+                plugingo::GoCompileDriver::new().with_default_runner(r.clone()),
+            ))
+            .with_managed_driver(Box::new(plugingo::GoTestmainDriver))
+            .with_managed_driver(Box::new(
+                plugingo::GoLintDriver::new().with_default_runner(r.clone()),
+            ))
+            .with_managed_driver(Box::new(plugingo::GoLintGateDriver::new()))
+            .with_managed_driver(Box::new(plugingo::GoLintFixDriver::new()))
+            .with_managed_driver(Box::new(
+                plugingo::GoFormatDriver::new().with_default_runner(r.clone()),
+            ))
+            .with_managed_driver(Box::new(
+                plugingo::GoFormatCheckDriver::new().with_default_runner(r),
+            )))
+    };
+    let mut go_plugin = Some(go_plugin);
+
+    if go_first && let Some(go) = go_plugin.take() {
+        b = b.with_plugin("go", go);
     }
 
     b = b
@@ -443,56 +467,17 @@ fn make_workspace_ordered_runner(
             Box::new(pluginstatictarget::Provider::new(targets).expect("static provider"))
         });
 
-    if !go_first {
-        let gotool = gotool.clone();
-        let provider_runner = provider_runner.clone();
-        b = b.with_provider(move |init| {
-            Box::new(
-                plugingo::Provider::with_config(
-                    init.root.to_path_buf(),
-                    plugingo::Config {
-                        foreign_name_guard,
-                        sdk_checksums: sdk_checksums_for(&gotool),
-                        go_version: gotool,
-                        govet: govet_addr(),
-                        // The bash half of the runner: the std install and the
-                        // thirdparty download invoke `go` too, and a build whose
-                        // compile drivers moved into the environment while these
-                        // stayed on the host fails on mismatched object versions.
-                        runner: provider_runner.clone(),
-                        ..Default::default()
-                    },
-                    init.runtime.clone(),
-                )
-                .expect("plugingo provider"),
-            )
-        });
+    if let Some(go) = go_plugin.take() {
+        b = b.with_plugin("go", go);
     }
 
-    let r = || runner.clone();
     b.with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
-        .with_managed_driver(Box::new(hplugin_devenv::plugindevenv::Driver::new()))
-        .with_managed_driver(Box::new(
-            plugingo::GoGolistDriver::new().with_default_runner(r()),
-        ))
-        .with_managed_driver(Box::new(plugingo::GoToolchainDriver))
+        .with_plugin(hplugin_devenv::plugindevenv::PLUGIN_NAME, |_| {
+            Ok(PluginParts::default()
+                .with_managed_driver(Box::new(hplugin_devenv::plugindevenv::Driver::new())))
+        })
         .with_managed_driver(Box::new(pluginhttp::Driver))
-        .with_managed_driver(Box::new(
-            plugingo::GoCompileDriver::new().with_default_runner(r()),
-        ))
-        .with_managed_driver(Box::new(plugingo::GoTestmainDriver))
-        .with_managed_driver(Box::new(
-            plugingo::GoLintDriver::new().with_default_runner(r()),
-        ))
-        .with_managed_driver(Box::new(plugingo::GoLintGateDriver::new()))
-        .with_managed_driver(Box::new(plugingo::GoLintFixDriver::new()))
-        .with_managed_driver(Box::new(
-            plugingo::GoFormatDriver::new().with_default_runner(r()),
-        ))
-        .with_managed_driver(Box::new(
-            plugingo::GoFormatCheckDriver::new().with_default_runner(runner),
-        ))
         .build()
         .context("build plugingo workspace")
 }

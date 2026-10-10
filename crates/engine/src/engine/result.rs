@@ -8067,7 +8067,7 @@ mod tests {
         impl crate::engine::provider::Provider for SpawnedReentrantQueryProvider {
             fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
                 Ok(ConfigResponse {
-                    name: "spawned-reentrant".to_string(),
+                    name: "spawned_reentrant".to_string(),
                 })
             }
             fn list<'a>(

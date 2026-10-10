@@ -6,7 +6,7 @@
 //! `credentials` on the in-process registry drivers, through the real engine.
 //!
 //! What is under test is the wiring the unit tests in `pluginoci::auth` cannot
-//! see: that a `credentials` reference on `oci_pull` resolves, is acquired by the
+//! see: that a `credentials` reference on `oci.pull` resolves, is acquired by the
 //! host and arrives at the driver as a mount — and that once a target has named
 //! credentials, the driver authenticates with those or not at all.
 //!
@@ -29,12 +29,15 @@ fn workspace() -> htestkit::Workspace {
                 init.runtime.clone(),
             ))
         })
-        .with_provider(|_| Box::new(pluginoci::platform::Provider))
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::layer::Driver::new()))
-        .with_managed_driver(Box::new(pluginoci::image::Driver::new()))
-        .with_managed_driver(Box::new(pluginoci::push::Driver::new()))
-        .with_managed_driver(Box::new(pluginoci::pull::Driver::new()))
+        .with_plugin(pluginoci::PLUGIN_NAME, |_| {
+            Ok(heph::engine::PluginParts::default()
+                .with_provider(Box::new(pluginoci::platform::Provider))
+                .with_managed_driver(Box::new(pluginoci::layer::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::image::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::push::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::pull::Driver::new())))
+        })
         .build()
         .expect("build workspace")
 }
@@ -74,14 +77,14 @@ async fn a_pull_whose_credentials_do_not_cover_the_registry_fails_before_the_net
     let ws = workspace();
     ws.write_build_file(
         "auth",
-        r#"target(name = "ghcr", driver = "credential",
+        r#"target(name = "ghcr", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_OCI_PULL_TOKEN"])],
        present = heph.auth.docker(["ghcr.io"]))"#,
     );
     ws.write_build_file(
         "img",
         &format!(
-            r#"target(name = "app", driver = "oci_pull", ref = "{PINNED}",
+            r#"target(name = "app", driver = "oci.pull", ref = "{PINNED}",
        credentials = ["//auth:ghcr"], cache = False)"#
         ),
     );
@@ -105,7 +108,7 @@ async fn a_push_whose_credentials_do_not_cover_the_registry_fails_before_the_net
     let ws = workspace();
     ws.write_build_file(
         "auth",
-        r#"target(name = "ghcr", driver = "credential",
+        r#"target(name = "ghcr", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_OCI_PUSH_TOKEN"])],
        present = heph.auth.docker(["ghcr.io"]))"#,
     );
@@ -113,9 +116,9 @@ async fn a_push_whose_credentials_do_not_cover_the_registry_fails_before_the_net
         "img",
         r#"
 target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
-target(name = "etc", driver = "oci_layer", srcs = [":conf"], prefix = "/etc")
-target(name = "img", driver = "oci_image", layers = [":etc"], platforms = ["linux/amd64"])
-target(name = "push", driver = "oci_push", image = ":img", ref = "quay.io/acme/app:1",
+target(name = "etc", driver = "oci.layer", srcs = [":conf"], prefix = "/etc")
+target(name = "img", driver = "oci.image", layers = [":etc"], platforms = ["linux/amd64"])
+target(name = "push", driver = "oci.push", image = ":img", ref = "quay.io/acme/app:1",
        credentials = ["//auth:ghcr"])
 "#,
     );
@@ -138,7 +141,7 @@ async fn a_push_resolves_its_ref_before_the_network() -> anyhow::Result<()> {
     let ws = workspace();
     ws.write_build_file(
         "auth",
-        r#"target(name = "ghcr", driver = "credential",
+        r#"target(name = "ghcr", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_OCI_PUSH_REF_TOKEN"])],
        present = heph.auth.docker(["ghcr.io"]))"#,
     );
@@ -146,10 +149,10 @@ async fn a_push_resolves_its_ref_before_the_network() -> anyhow::Result<()> {
         "img",
         r#"
 target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
-target(name = "etc", driver = "oci_layer", srcs = [":conf"], prefix = "/etc")
-target(name = "img", driver = "oci_image", layers = [":etc"], platforms = ["linux/amd64"])
+target(name = "etc", driver = "oci.layer", srcs = [":conf"], prefix = "/etc")
+target(name = "img", driver = "oci.image", layers = [":etc"], platforms = ["linux/amd64"])
 target(name = "repo", driver = "bash", run = "echo quay.io/acme/app > $OUT", out = "repo.txt")
-target(name = "push", driver = "oci_push", image = ":img",
+target(name = "push", driver = "oci.push", image = ":img",
        ref = "${read://img:repo}:${image_hashout}", credentials = ["//auth:ghcr"])
 "#,
     );
@@ -178,7 +181,7 @@ async fn a_missing_credential_is_a_graph_error() -> anyhow::Result<()> {
     ws.write_build_file(
         "img",
         &format!(
-            r#"target(name = "app", driver = "oci_pull", ref = "{PINNED}",
+            r#"target(name = "app", driver = "oci.pull", ref = "{PINNED}",
        credentials = ["//auth:nope"], cache = False)"#
         ),
     );

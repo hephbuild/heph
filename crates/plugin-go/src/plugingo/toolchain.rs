@@ -131,7 +131,7 @@ pub const TOOLCHAIN_PKG_PREFIX: &str = "@heph/go/toolchain";
 pub const TOOLCHAIN_NAME: &str = "go";
 
 /// Driver name registered for the toolchain download.
-pub const TOOLCHAIN_DRIVER: &str = "go_toolchain";
+pub const TOOLCHAIN_DRIVER: &str = "go.toolchain";
 
 /// Directory (relative to the toolchain target's package) the SDK extracts to.
 /// The official tarball unpacks a top-level `go/`, so the SDK root — and thus
@@ -530,7 +530,7 @@ pub struct GoToolchainDriver;
 impl ManagedDriver for GoToolchainDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: TOOLCHAIN_DRIVER.to_string(),
+            name: "toolchain".to_string(),
         })
     }
 
@@ -837,7 +837,7 @@ mod host_go_tests {
         let a = addr();
         let cache = HostGoCache::default();
         let (goroot, go_bin) = cache
-            .resolve(RunnerRef::target(REQ, &a), "go_golist", &ct)
+            .resolve(RunnerRef::target(REQ, &a), "go.golist", &ct)
             .await
             .expect("resolve");
 
@@ -869,7 +869,7 @@ mod host_go_tests {
         let cache = HostGoCache::default();
         for _ in 0..5 {
             cache
-                .resolve(RunnerRef::target(REQ, &a), "go_golist", &ct)
+                .resolve(RunnerRef::target(REQ, &a), "go.golist", &ct)
                 .await
                 .expect("resolve");
         }
@@ -892,7 +892,7 @@ mod host_go_tests {
         };
         let ct = hcore::hasync::StdCancellationToken::new();
         let (goroot, go_bin) = HostGoCache::default()
-            .resolve(RunnerRef::local(), "go_golist", &ct)
+            .resolve(RunnerRef::local(), "go.golist", &ct)
             .await
             .expect("resolve");
         assert_eq!(go_bin, expected);
@@ -922,11 +922,11 @@ mod host_go_tests {
             Default::default(),
         );
         cache
-            .resolve(RunnerRef::target(REQ, &one), "go_golist", &ct)
+            .resolve(RunnerRef::target(REQ, &one), "go.golist", &ct)
             .await
             .expect("one");
         cache
-            .resolve(RunnerRef::target(REQ, &two), "go_golist", &ct)
+            .resolve(RunnerRef::target(REQ, &two), "go.golist", &ct)
             .await
             .expect("two");
         assert_eq!(probes.load(Ordering::SeqCst), 2);

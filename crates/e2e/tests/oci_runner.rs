@@ -3,7 +3,7 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-//! The `oci_runner` driver against a **real** docker daemon.
+//! The `oci.runner` driver against a **real** docker daemon.
 //!
 //! What only a real daemon can answer: that `docker image inspect --format
 //! {{.Id}}` returns what the driver parses, and — the point of the whole driver
@@ -141,12 +141,17 @@ fn workspace() -> htestkit::Workspace {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver_factory(|init| {
-            Box::new(pluginoci::runner::Driver::new(init.home.to_path_buf()))
+        // The runner is what the cdylib hands the host through `NamedRunner`;
+        // an in-process harness puts it in the plugin's parts directly.
+        .with_plugin(pluginoci::PLUGIN_NAME, |init| {
+            let mut parts = heph::engine::PluginParts::default().with_managed_driver(Box::new(
+                pluginoci::runner::Driver::new(init.home.to_path_buf()),
+            ));
+            parts
+                .runners
+                .push(std::sync::Arc::new(pluginoci::exec_runner::OciRunner::new()));
+            Ok(parts)
         })
-        // What the cdylib hands the host through `NamedRunner`; an in-process
-        // harness registers it directly.
-        .with_exec_runner(std::sync::Arc::new(pluginoci::exec_runner::OciRunner::new()))
         .build()
         .expect("build workspace")
 }
@@ -158,7 +163,7 @@ fn write_runner(ws: &htestkit::Workspace, image: &str) {
             r#"
 target(
     name = "runner",
-    driver = "oci_runner",
+    driver = "oci.runner",
     image = "{image}",
 )
 "#
@@ -189,16 +194,18 @@ async fn the_mounted_home_is_the_resolved_one_even_in_a_package_named_sandbox() 
                 init.runtime.clone(),
             ))
         })
-        .with_managed_driver_factory(move |init| {
-            Box::new(
-                pluginoci::runner::Driver::new(init.home.to_path_buf())
-                    .with_docker_bin(docker.to_string_lossy().into_owned()),
+        .with_plugin(pluginoci::PLUGIN_NAME, move |init| {
+            Ok(
+                heph::engine::PluginParts::default().with_managed_driver(Box::new(
+                    pluginoci::runner::Driver::new(init.home.to_path_buf())
+                        .with_docker_bin(docker.to_string_lossy().into_owned()),
+                )),
             )
         })
         .build()?;
     ws.write_build_file(
         "sandbox/sandbox",
-        r#"target(name = "runner", driver = "oci_runner", image = "img")"#,
+        r#"target(name = "runner", driver = "oci.runner", image = "img")"#,
     );
     let doc = common::artifact_string(&*ws.run("//sandbox/sandbox:runner").await?);
     let doc: serde_json::Value = serde_json::from_str(&doc)?;
@@ -368,7 +375,7 @@ async fn a_target_runs_inside_the_container() -> anyhow::Result<()> {
             r#"
 target(
     name = "runner",
-    driver = "oci_runner",
+    driver = "oci.runner",
     image = "{MARKER_IMAGE}",
 )
 target(
@@ -392,7 +399,7 @@ target(
 }
 
 /// An image the daemon has never seen must fail by name, pointing at the
-/// `oci_load` that would put it there — not fail somewhere later with a digest
+/// `oci.load` that would put it there — not fail somewhere later with a digest
 /// nobody can explain.
 #[tokio::test]
 async fn an_absent_image_is_diagnosable() -> anyhow::Result<()> {
@@ -406,7 +413,7 @@ async fn an_absent_image_is_diagnosable() -> anyhow::Result<()> {
     };
     assert!(err.contains("heph-e2e-definitely-absent"), "{err}");
     assert!(
-        err.contains("oci_load"),
+        err.contains("oci.load"),
         "must point at what puts the image in the daemon; got {err}"
     );
     Ok(())
