@@ -146,6 +146,100 @@ provider_state(
     );
 }
 
+/// **A cdylib driver can start a cold `session` runner.**
+///
+/// Plugins load on rayon workers, where there is no current tokio runtime. A
+/// loader that probed `Handle::try_current()` there always got `Err` and handed
+/// the plugin an *inline* runner host, so the host's `prepare` body ran on the
+/// plugin worker that polled it. A `wrap` runner never notices (its `prepare`
+/// touches no timer or IO), but a cold `session` start polls for the agent's
+/// socket with a host `tokio::time::sleep` — off the host runtime that is a
+/// panic, and a panic at the ABI seam is a non-unwinding abort. (The inline
+/// loader passed this on darwin/arm64: the polling thread there happened to
+/// carry the host runtime. The loader now passes the engine's handle so the
+/// outcome no longer depends on which thread polls.)
+///
+/// Nothing in-process uses the runner first, so the session is genuinely cold
+/// when the cdylib driver reaches it. The launch is a passthrough shell that
+/// drops a marker, so the marker proves the session start ran to the spawn.
+#[test]
+fn a_cdylib_driver_starts_a_cold_session_runner() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("go");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-go-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash go cdylib");
+    write_manifest(&manifest, "go", &dylib, Some(&sum)).expect("write manifest");
+
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n    options:\n      gotool: \"host\"\n      runner: \"//:runner\"\n",
+        manifest.display()
+    ))
+    .expect("write config");
+
+    // `sh -c SCRIPT ARG0 ARGS…`: the runner appends the agent invocation, so the
+    // heph binary lands in `$0` and its arguments in `$@`. Unquoted on purpose:
+    // Starlark strips backslash escapes in a triple-quoted string, and the
+    // temp paths involved carry no spaces.
+    let marker = ws.root().join("session-launched");
+    let runner_json = format!(
+        r#"{{
+  "version": 1,
+  "fingerprint": "test:cold-session",
+  "runner": "session",
+  "config": {{ "launch": ["/bin/sh", "-c", "touch {} && exec $0 $@"] }}
+}}
+"#,
+        marker.display()
+    );
+    let (goos, goarch) = common::host_os_arch();
+    ws.write(
+        "BUILD",
+        &format!(
+            r#"target(
+    name = "runner",
+    driver = "textfile",
+    text = """{runner_json}""",
+    out = "runner.json",
+)
+provider_state(
+    provider = "go",
+    variants = {{"host": {{"goos": "{goos}", "goarch": "{goarch}"}}}},
+)
+"#
+        ),
+    )
+    .expect("write BUILD");
+    ws.write("go.mod", "module example.com/seam\n\ngo 1.21\n")
+        .expect("write go.mod");
+    ws.write("cmd/main.go", "package main\n\nfunc main() {}\n")
+        .expect("write main.go");
+
+    // Whether Go is on the host is beside the point: the toolchain probe goes
+    // through the runner either way, and that is the cold start under test.
+    let out = ws.run(&dist, &["run", "//cmd:build@v=host"]).expect("run");
+    let combined = describe(&out);
+
+    assert!(
+        out.status.code().is_some(),
+        "heph died on a signal (an abort at the plugin seam): {combined}"
+    );
+    assert!(
+        !combined.contains("there is no reactor running"),
+        "the host's runner `prepare` ran off the host runtime: {combined}"
+    );
+    assert!(
+        !combined.contains("panic in a function that cannot unwind"),
+        "a panic crossed the plugin seam: {combined}"
+    );
+    assert!(
+        marker.is_file(),
+        "the cold session runner never launched: {combined}"
+    );
+}
+
 /// The second shipped cdylib, exporting a hook rather than a provider — a
 /// different export kind over the same seam, so a loader that only handles
 /// providers fails here and nowhere else.

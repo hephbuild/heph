@@ -77,12 +77,19 @@ pub type LoadedComponents = (
 ///
 /// `name` is the plugin's name, from its manifest. The provider is named after
 /// it; `PluginComponents.provider_name` is ignored.
+///
+/// `runtime` is the engine's: host-side bodies the plugin calls into (the
+/// runner host's `prepare`) are spawned there. It is passed rather than probed
+/// because `load` runs on rayon workers, where `Handle::try_current()` always
+/// fails — a probe would silently hand every production plugin the inline,
+/// runtime-less handle meant for test harnesses.
 pub fn load(
     path: &std::path::Path,
     name: &str,
     root: &str,
     home: &str,
     options: std::collections::HashMap<String, pb::Value>,
+    runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<LoadedComponents> {
     use crate::abi::PluginComponents;
     use anyhow::Context;
@@ -147,10 +154,7 @@ pub fn load(
         // `SetRunnerHostFn` before returning it.
         let set_runner = unsafe { lib.get_stabbied::<SetRunnerHostFn>(SET_RUNNER_HOST_SYMBOL) };
         if let Ok(set_runner) = set_runner {
-            set_runner(match tokio::runtime::Handle::try_current() {
-                Ok(handle) => crate::host::HostRunnerHost::wrap(handle),
-                Err(_) => crate::host::HostRunnerHost::wrap_inline(),
-            });
+            set_runner(crate::host::HostRunnerHost::wrap(runtime));
         }
         // SAFETY: get_stabbied verifies the symbol's stabby type report matches
         // `CreateFn` before returning it; calling it is then ABI-sound.
