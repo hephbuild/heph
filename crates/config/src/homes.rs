@@ -157,13 +157,14 @@ impl Homes {
     }
 
     /// The home every checkout of the repository shares: the cache, blobs,
-    /// gateway and revision locks, staged inputs, credentials, scratch, diag.
+    /// gateway and revision locks, credentials, scratch, diag.
     pub fn shared(&self) -> &HomeDir {
         &self.shared
     }
 
-    /// This checkout's own home: sandboxes, the execute lock, the
-    /// filesystem-walk cache, approval notices. The same directory as
+    /// This checkout's own home: sandboxes, the execute lock, staged inputs
+    /// (linked into the sandboxes), the filesystem-walk cache, approval
+    /// notices. The same directory as
     /// [`Homes::shared`] outside a linked worktree.
     pub fn checkout(&self) -> &CheckoutHome {
         &self.checkout

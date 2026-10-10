@@ -148,7 +148,7 @@ pub struct GcStats {
     /// Rows pruned from the shared filesystem-walk cache (stale past the TTL or
     /// orphaned because their path no longer exists).
     pub fswalk_rows_removed: usize,
-    /// Staged read-only input entries (`<home>/stage/`) reclaimed because their
+    /// Staged read-only input entries (`<checkout home>/stage/`) reclaimed because their
     /// content hash is no longer referenced by any surviving manifest.
     pub stage_entries_removed: usize,
     /// Set when the orphan sweep was skipped because the home is shared with
@@ -216,12 +216,13 @@ impl Engine {
         Ok(bytes)
     }
 
-    /// Clear all staged read-only inputs under `<home>/stage/`. Delegates to
+    /// Clear all staged read-only inputs under `<checkout home>/stage/` — the
+    /// checkout's, next to the sandboxes they link into. Delegates to
     /// [`hdriver_support::stage::clear_stage`] — the staging mechanism and its
     /// teardown live together in `driver-support`. Returns
     /// `(entries_removed, bytes_freed)`.
     fn gc_stage(&self) -> (usize, u64) {
-        hdriver_support::stage::clear_stage(&self.shared_home.join("stage"))
+        hdriver_support::stage::clear_stage(&self.checkout_home.join("stage"))
     }
 
     /// Trim `addr`'s revisions to the `keep` newest (by `created_at_nanos`),
@@ -2137,7 +2138,7 @@ mod tests {
     /// Create a stage entry `<home>/stage/<group>/<hash>/blob` plus its
     /// `<hash>.ready` witness, returning the entry dir.
     fn stage_entry(engine: &Engine, group: &str, hash: &str) -> std::path::PathBuf {
-        let gdir = engine.shared_home.join("stage").join(group);
+        let gdir = engine.checkout_home.join("stage").join(group);
         let entry = gdir.join(hash);
         std::fs::create_dir_all(&entry).expect("mkdir stage entry");
         std::fs::write(entry.join("blob"), b"staged-bytes").expect("write blob");

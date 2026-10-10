@@ -106,7 +106,7 @@ pub struct Engine {
     pub(crate) exec_runners: Arc<hexecrunner::registry::RunnerRegistry>,
     /// The workspace's shared heph home ([`Homes::shared`]), as resolved into
     /// the [`Config`]: in a linked git worktree, the main checkout's. The cache,
-    /// gateway/revision locks, staged inputs, credentials, scratch, diag.
+    /// gateway/revision locks, credentials, scratch, diag.
     ///
     /// Named for which home it is, next to `checkout_home`, so every use
     /// chooses one.
@@ -114,7 +114,8 @@ pub struct Engine {
     /// [`Homes::shared`]: crate::engine::Homes::shared
     pub shared_home: crate::engine::HomeDir,
     /// This checkout's own home ([`Homes::checkout`]): sandboxes, their FUSE
-    /// mount and execute lock, the fswalk cache, approvals. The same directory
+    /// mount and execute lock, staged inputs, the fswalk cache, approvals. A
+    /// sandbox only ever links to things in this home. The same directory
     /// as `shared_home` outside a linked worktree.
     ///
     /// [`Homes::checkout`]: crate::engine::Homes::checkout

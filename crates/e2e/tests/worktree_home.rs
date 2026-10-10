@@ -57,10 +57,14 @@ fn write_build(root: &Path, pkg: &str, content: &str) {
 /// What `heph` started in `root` builds: the homes come from the one resolver,
 /// with worktree detection on (the default).
 fn engine_at(root: &Path) -> anyhow::Result<Arc<Engine>> {
-    let mut e = Engine::new(Config::for_tests(root.to_path_buf()))?;
-    let r = root.to_path_buf();
+    engine_with(Config::for_tests(root.to_path_buf()))
+}
+
+fn engine_with(cfg: Config) -> anyhow::Result<Arc<Engine>> {
+    let root = cfg.root.clone();
+    let mut e = Engine::new(cfg)?;
     e.register_provider(move |init| {
-        Box::new(pluginbuildfile::Provider::new(r, init.runtime.clone()))
+        Box::new(pluginbuildfile::Provider::new(root, init.runtime.clone()))
     })?;
     e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash()))?;
     let e = Arc::new(e);
@@ -149,6 +153,62 @@ async fn worktree_sandbox_stays_in_worktree() -> anyhow::Result<()> {
     assert!(
         !main_home.join("sandbox").exists(),
         "no sandbox under the shared home"
+    );
+    Ok(())
+}
+
+/// Staged read-only inputs live in the worktree's own home, next to the
+/// sandboxes they are hardlinked and symlinked into. In the shared home a
+/// hardlink would fail with EXDEV across filesystems, and a symlink would
+/// dangle in an OCI container that mounts only the checkout's home. FUSE is
+/// forced off: staging is the OS sandbox runner's path.
+#[tokio::test]
+async fn worktree_staged_inputs_stay_in_worktree() -> anyhow::Result<()> {
+    use heph::engine::config_yaml::FuseEnabled;
+    let r = repo();
+    // The read-only dep lives in its own package: staging symlinks the largest
+    // subtree it owns, and the consumer writes into its own package dir.
+    write_build(
+        &r.wt,
+        "sdk",
+        r#"target(name = "tool", driver = "bash", run = "printf '#!/bin/sh\n' > $OUT && chmod +x $OUT", out = "tool.sh")"#,
+    );
+    write_build(
+        &r.wt,
+        "p",
+        r#"target(name = "use", driver = "bash", deps = {"sdk": ["//sdk:tool"]}, read_only_deps = ["sdk"], run = "printf ok > $OUT", out = "out.txt")"#,
+    );
+    let wt = || {
+        engine_with(heph::engine::Config {
+            fuse: heph::engine::FuseConfig {
+                enabled: Some(FuseEnabled::Off),
+            },
+            ..Config::for_tests(r.wt.clone())
+        })
+    };
+    // The tool is cached first: a stage entry is keyed by the artifact's
+    // content hash, which a cache-backed artifact carries.
+    run_and_settle(&wt()?, "//sdk:tool").await?;
+    assert_eq!(run_and_settle(&wt()?, "//p:use").await?, "ok");
+
+    let listing = |p: &Path| -> Vec<String> {
+        std::fs::read_dir(p)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        r.wt.join(".heph").join("stage").is_dir(),
+        "the tool was staged under the worktree's own home; wt home: {:?}, shared home: {:?}",
+        listing(&r.wt.join(".heph")),
+        listing(&r.main.join(".heph")),
+    );
+    assert!(
+        !r.main.join(".heph").join("stage").exists(),
+        "nothing is staged under the shared home"
     );
     Ok(())
 }

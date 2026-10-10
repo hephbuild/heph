@@ -55,13 +55,14 @@ because they belong to one working tree:
 | Path | Why |
 |---|---|
 | `sandbox/` and `sandboxfuse<pid>/` | A sandbox is a working copy of this checkout's inputs. `WORKSPACE_ROOT` and the sandbox paths are exactly what they are without sharing. |
+| `stage/` | Read-only inputs are staged once, then hardlinked or symlinked into sandboxes. A hardlink from the shared home would fail (EXDEV) when a worktree is on another filesystem, and a symlink would dangle inside an OCI container, which mounts only the checkout's home. Rule: a sandbox only links to things in its own checkout home. Reading or copying from the shared cache is fine. |
 | `lock/<addr>.execute.lock` | Guards the sandbox path, so each checkout can run its own copy of a target. The gateway and revision locks (`.outer.lock`, `.inner.lock`) guard the shared cache entry, so they stay in the shared home. |
 | `cache/fswalk.db`, and the Go plugin's `heph-plugin-go-fswalk.db` | Caches this tree's directory listings. A plugin's `home` (`CreateConfig.home` for a cdylib, `PluginInit.home` in process) is the checkout's home. |
 | What the OCI runner mounts | The checkout's home, because this checkout's sandboxes are there. |
 | `approval/` | Two checkouts prompting at once must not overwrite each other's notice. |
 
 Everything else lives in the shared home: `cache/cache.db`, `cache/blobs/`,
-`cache/remote-tmp/`, `stage/`, `auth/`, `scratch/`, the gateway and revision
+`cache/remote-tmp/`, `auth/`, `scratch/`, the gateway and revision
 locks, `nix-gcroots`, and `diag/`.
 
 ### `heph tool gc`
