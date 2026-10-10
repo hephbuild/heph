@@ -48,7 +48,7 @@ pub enum Commands {
     ///
     /// Read-only introspection of the build graph. Subcommands print a target's
     /// spec, resolved def, input/output hashes, or dependencies, and list
-    /// packages or provider functions. Nothing is executed unless a provider
+    /// packages or plugin functions. Nothing is executed unless a provider
     /// must run a target to answer the query.
     ///
     /// Examples:
