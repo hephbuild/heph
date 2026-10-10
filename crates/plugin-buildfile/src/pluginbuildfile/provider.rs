@@ -786,7 +786,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
         // fswalk db outside the walked tree (in production it's under pruned
-        // `.heph3`), so its writes don't bump the discovered dirs' mtimes.
+        // home), so its writes don't bump the discovered dirs' mtimes.
         let dbdir = tempdir().unwrap();
         let db = dbdir.path().join("fswalk.db");
         fs::write(root.join("BUILD"), "").unwrap();

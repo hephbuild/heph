@@ -1106,8 +1106,6 @@ fn remote_engine(
 ) -> Arc<heph::engine::Engine> {
     use heph::engine::{Config, Engine, RemoteCacheDef, ScratchOptions};
     let mut e = Engine::new(Config {
-        root: root.to_path_buf(),
-        home_dir: std::path::PathBuf::new(),
         remote_caches: vec![RemoteCacheDef {
             name: "shared".to_string(),
             uri: remote_uri.to_string(),
@@ -1122,7 +1120,7 @@ fn remote_engine(
             restore_scopes: fallbacks.iter().map(|s| s.to_string()).collect(),
             seed_on_fork: true,
         },
-        ..Default::default()
+        ..Config::for_tests(root)
     })
     .expect("engine");
     e.register_provider(|init| {

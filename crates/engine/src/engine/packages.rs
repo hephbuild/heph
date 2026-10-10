@@ -377,10 +377,8 @@ mod tests {
     async fn packages_dedups_within_and_across_providers() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         // Each provider lists `foo` twice; two providers list it again.
         engine.register_provider(move |_| Box::new(ListsPkgs::new("p1", &["foo", "foo"])))?;
@@ -402,10 +400,8 @@ mod tests {
 
     fn engine_with_builtins(root: &tempfile::TempDir) -> anyhow::Result<Engine> {
         Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })
     }
 
@@ -637,10 +633,8 @@ mod tests {
         let delay = std::time::Duration::from_millis(120);
 
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         for (name, pkgs) in [
             ("w1", &["zeta", "alpha"][..]),

@@ -222,12 +222,9 @@ mod tests {
 
     /// Build an engine with the `buildfile` provider rooted at `root`.
     fn engine_at(root: std::path::PathBuf) -> Arc<Engine> {
-        let home_dir = root.join(".heph3");
         let mut e = Engine::new(Config {
-            root,
-            home_dir,
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root)
         })
         .expect("engine");
 

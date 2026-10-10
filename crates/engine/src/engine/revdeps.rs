@@ -125,10 +125,8 @@ mod tests {
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;

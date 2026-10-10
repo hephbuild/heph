@@ -69,10 +69,10 @@
               `allow-*-in-tests` clippy.toml exemptions"
 )]
 
-use heph::engine::{Config, Engine, OutputMatcher, RemoteCacheDef, ResultOptions};
+use heph::engine::{Config, Engine, HomeDir, OutputMatcher, RemoteCacheDef, ResultOptions};
 use heph::htaddr::parse_addr;
 use heph::{pluginbuildfile, pluginexec};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -110,11 +110,9 @@ fn build_engine(root: &Path, remote_uri: &str, parallelism: Option<usize>) -> Ar
         }]
     };
     let mut e = Engine::new(Config {
-        root: root.to_path_buf(),
-        home_dir: PathBuf::new(),
         parallelism,
         remote_caches,
-        ..Default::default()
+        ..Config::for_tests(root)
     })
     .expect("engine");
     e.register_provider(|init| {
@@ -378,7 +376,7 @@ fn cache_runtime_liveness() {
 
         // A fresh engine over an erased local cache: every target must come back
         // over the remote.
-        std::fs::remove_dir_all(root.path().join(".heph3").join("cache"))
+        std::fs::remove_dir_all(HomeDir::for_tests(root.path()).join("cache"))
             .expect("delete local cache");
 
         // ---- WARM: pull everything back from the remote. ----

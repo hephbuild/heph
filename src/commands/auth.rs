@@ -674,10 +674,8 @@ mod tests {
     async fn an_unresolvable_candidate_does_not_fail_the_credential_walk() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: root.path().join(".heph3"),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let s = |v: &str| Value::String(v.to_string());
         let credential = pluginstatictarget::Target {
@@ -769,10 +767,8 @@ mod tests {
         sources: Vec<Value>,
     ) -> anyhow::Result<Arc<Engine>> {
         let mut engine = Engine::new(Config {
-            root: root.to_path_buf(),
-            home_dir: root.join(".heph3"),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root)
         })?;
         let credential = pluginstatictarget::Target {
             addr: "//auth:token".to_string(),

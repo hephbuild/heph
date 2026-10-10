@@ -47,13 +47,19 @@ pub fn has_codegen_xattr(path: &std::path::Path) -> bool {
     matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
 }
 
-/// True if `path` resolves inside a `.heph*` directory (e.g. `.heph3/cache/...`),
+/// Name prefix of a heph-owned directory: the default home (`.heph`), a
+/// configured one that kept the prefix, and the tool caches beside it
+/// (`.heph-gocache`, …). Not the home dir's name — the home can be configured to
+/// anything — but "this component belongs to heph, not to the source tree".
+pub const HEPH_DIR_PREFIX: &str = ".heph";
+
+/// True if `path` resolves inside a `.heph*` directory (e.g. `.heph/cache/...`),
 /// pointing at an engine-internal artifact — a materialized cache output, not raw
 /// workspace source — so it must be skipped by source reads like a stamped
 /// codegen file.
 ///
 /// This holds whether `path` is *itself* a symlink into the cache (`gen ->
-/// .heph3/…`) **or** lies *under* such a symlinked directory (`gen/some/file.txt`,
+/// .heph/…`) **or** lies *under* such a symlinked directory (`gen/some/file.txt`,
 /// a real file reached through the `gen` link). [`std::fs::canonicalize`] resolves
 /// every symlink along the path — ancestors included — so a file transitively
 /// inside the cache is detected, not just a leaf symlink.
@@ -71,7 +77,7 @@ pub fn resolves_into_heph_dir(path: &std::path::Path) -> bool {
 fn has_heph_component(resolved: &std::path::Path) -> bool {
     resolved.components().any(|c| {
         matches!(c, std::path::Component::Normal(name)
-            if name.to_str().is_some_and(|n| n.starts_with(".heph")))
+            if name.to_str().is_some_and(|n| n.starts_with(HEPH_DIR_PREFIX)))
     })
 }
 
@@ -89,7 +95,7 @@ fn has_heph_component(resolved: &std::path::Path) -> bool {
 /// `canonicalize(dir).join(name)`, so its components are the parent's plus
 /// `name`. Both are still checked. A symlink entry may point anywhere, so it
 /// falls back to resolving the full path — which is the case the check exists
-/// for (`gen -> .heph3/…`).
+/// for (`gen -> .heph/…`).
 fn entry_resolves_into_heph_dir(
     abs: &std::path::Path,
     name: &str,
@@ -99,7 +105,7 @@ fn entry_resolves_into_heph_dir(
     if is_symlink {
         return resolves_into_heph_dir(abs);
     }
-    parent_in_heph || name.starts_with(".heph")
+    parent_in_heph || name.starts_with(HEPH_DIR_PREFIX)
 }
 
 /// Returns the `Addr` for a single-file fs target.
@@ -777,7 +783,8 @@ fn walk_glob(
                         // Never descend into skip dirs or skip-glob subtrees.
                         let rel = abs.strip_prefix(root).unwrap_or(&abs);
                         if !compiled.skip.prune_dir(&abs, rel) {
-                            let child_in_heph = dir_in_heph || entry.name.starts_with(".heph");
+                            let child_in_heph =
+                                dir_in_heph || entry.name.starts_with(HEPH_DIR_PREFIX);
                             stack.push((abs, child_in_heph));
                         }
                     } else if matches!(
@@ -1883,7 +1890,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
         // Keep the fswalk db out of the globbed tree so its writes don't bump the
-        // walked dirs' mtimes (in production it lives under the pruned `.heph3`).
+        // walked dirs' mtimes (in production it lives under the pruned home).
         let dbdir = tempdir().unwrap();
         let db = dbdir.path().join("fswalk.db");
         fs::write(root.join("a.rs"), b"aaa").unwrap();
@@ -2032,7 +2039,9 @@ mod tests {
     #[tokio::test]
     async fn test_driver_run_glob_excludes_engine_skip_dir() {
         let tmp = tempdir().unwrap();
-        let home = tmp.path().join(".heph3");
+        // Deliberately not `.heph*`-prefixed: that prefix is skipped by name on
+        // its own, and this asserts the skip dir the engine hands over is pruned.
+        let home = tmp.path().join("engine-home");
         fs::create_dir_all(home.join("cache")).unwrap();
         fs::write(home.join("cache").join("blob"), b"").unwrap();
         fs::write(tmp.path().join("main.rs"), b"").unwrap();
@@ -3040,7 +3049,7 @@ mod tests {
         assert!(resolves_into_heph_dir(&link_heph));
 
         // The load-bearing case: a real file reached *through* a symlinked
-        // directory (`gen -> .heph3/cache/gen`). The leaf is not itself a
+        // directory (`gen -> .heph/cache/gen`). The leaf is not itself a
         // symlink, but it transitively resolves inside the cache.
         let cache_gen = cache.join("gen");
         fs::create_dir_all(cache_gen.join("some")).unwrap();

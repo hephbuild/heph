@@ -25,10 +25,8 @@ pub(crate) fn test_engine() -> (Arc<Engine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let _rt = crate::engine::test_rt_enter();
     let engine = Engine::new(Config {
-        root: dir.path().to_path_buf(),
-        home_dir: std::path::PathBuf::new(),
         parallelism: None,
-        ..Default::default()
+        ..Config::for_tests(dir.path())
     })
     .expect("engine");
     (Arc::new(engine), dir)

@@ -4957,10 +4957,8 @@ mod tests {
         let get_states = SArc::new(std::sync::Mutex::new(Vec::<Vec<State>>::new()));
         let get_states_clone = SArc::clone(&get_states);
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(move |_| {
             Box::new(ProbeRecorder {
@@ -5085,10 +5083,8 @@ mod tests {
     ) -> anyhow::Result<(SArc<Engine>, tempfile::TempDir)> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let delay: SArc<dyn Fn(usize) -> Duration + Send + Sync> = SArc::new(delay);
         engine.register_provider(move |_| {
@@ -5122,10 +5118,8 @@ mod tests {
         ] {
             let root = tempdir()?;
             let mut engine = Engine::new(Config {
-                root: root.path().to_path_buf(),
-                home_dir: std::path::PathBuf::new(),
                 parallelism: None,
-                ..Default::default()
+                ..Config::for_tests(root.path())
             })?;
             let provider = FaultProvider::new(
                 vec![hbuiltins::pluginstatictarget::Target {
@@ -5298,10 +5292,8 @@ mod tests {
         let probed = SArc::new(std::sync::Mutex::new(Vec::new()));
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let pkgs: Vec<String> = ["bar", "foo", "foo/deep", "foobar", "unrelated"]
             .iter()
@@ -5436,10 +5428,8 @@ mod tests {
         let probes = SArc::new(AtomicUsize::new(0));
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(enclose!((probes) move |_| Box::new(CountingFailProbe {
             pkgs: pkgs.clone(),
@@ -5528,10 +5518,8 @@ mod tests {
         let _rt = crate::engine::test_rt_enter();
         // `fs` is auto-registered by `Engine::new`.
         let engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })
         .unwrap();
         let fns = engine.provider_functions();
@@ -5561,10 +5549,8 @@ mod tests {
         )?;
 
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(|init| {
             Box::new(hplugin_buildfile::pluginbuildfile::Provider::new(
@@ -5611,10 +5597,8 @@ mod tests {
         )?;
 
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         // `fs` is auto-registered by `Engine::new`.
         engine.register_provider(|init| {
@@ -5650,10 +5634,8 @@ mod tests {
         let list_calls = SArc::new(AtomicUsize::new(0));
         let list_calls_clone = SArc::clone(&list_calls);
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(move |_| {
             Box::new(CountingProvider {
@@ -5683,10 +5665,8 @@ mod tests {
     async fn test_engine_result_not_found() -> anyhow::Result<()> {
         let root = tempdir()?;
         let cfg = Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         };
 
         let engine = Arc::new(Engine::new(cfg)?);
@@ -5788,10 +5768,8 @@ mod tests {
     fn engine_with(targets: Vec<pluginstatictarget::Target>) -> anyhow::Result<Arc<Engine>> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
@@ -5810,8 +5788,6 @@ mod tests {
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
             remote_caches: vec![crate::engine::RemoteCacheDef {
                 name: "shared".to_string(),
@@ -5822,7 +5798,7 @@ mod tests {
                 endpoint: None,
                 region: None,
             }],
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
@@ -6034,8 +6010,6 @@ mod tests {
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
             remote_caches: vec![crate::engine::RemoteCacheDef {
                 name: "shared".to_string(),
@@ -6046,7 +6020,7 @@ mod tests {
                 endpoint: None,
                 region: None,
             }],
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_bash()))?;
@@ -6139,7 +6113,7 @@ mod tests {
         // and then cannot produce them.
         let (engine, _home) = engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
         let mut engine = engine;
-        let home = engine.home.clone();
+        let home = engine.home.to_path_buf();
         Arc::get_mut(&mut engine)
             .expect("engine must not be shared yet")
             .remote_caches = crate::engine::RemoteCacheSet::with_backend(
@@ -6249,7 +6223,7 @@ mod tests {
         backend: Arc<CountingRemoteBackend>,
     ) -> Arc<Engine> {
         let mut engine = engine;
-        let home = engine.home.clone();
+        let home = engine.home.to_path_buf();
         Arc::get_mut(&mut engine)
             .expect("engine must not be shared yet")
             .remote_caches = crate::engine::RemoteCacheSet::with_backend(backend, home);
@@ -6797,10 +6771,8 @@ mod tests {
     ) -> anyhow::Result<Arc<Engine>> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
@@ -7254,10 +7226,8 @@ mod tests {
         // parallelism 1 keeps the limit small enough to overshoot cheaply.
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: Some(1),
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let limit = Engine::top_level_spawn_limit(engine.max_workers);
         let targets: Vec<_> = (0..limit + 50)
@@ -7601,10 +7571,8 @@ mod tests {
     async fn failed_matcher_walk_drains_instead_of_dropping_the_joinset() -> anyhow::Result<()> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
@@ -7914,10 +7882,8 @@ mod tests {
         let n = k * 2;
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let pkgs: Vec<String> = (0..n).map(|i| format!("p{i:04}")).collect();
         engine.register_provider(enclose!((slots) move |_| Box::new(PermitProvider {
@@ -7959,10 +7925,8 @@ mod tests {
         let n = k * 2;
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let pkgs: Vec<String> = (0..n).map(|i| format!("p{i:04}")).collect();
         engine.register_provider(enclose!((slots) move |_| Box::new(PermitProvider {
@@ -8058,10 +8022,8 @@ mod tests {
 
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(|_| {
             Box::new(ReentrantQueryProvider {
@@ -8166,10 +8128,8 @@ mod tests {
 
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_provider(|_| {
             Box::new(SpawnedReentrantQueryProvider {
@@ -8283,10 +8243,8 @@ mod tests {
         let root = tempdir()?;
         let lists = SArc::new(AtomicUsize::new(0));
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         let pkgs: Vec<String> = (0..n).map(|i| format!("p{i:04}")).collect();
         engine.register_provider(enclose!((lists) move |_| Box::new(CountingSlowList {
@@ -8783,10 +8741,8 @@ mod tests {
     async fn cycle_detection_returns_typed_cycle_error() -> anyhow::Result<()> {
         let root = tempdir()?;
         let engine = Arc::new(Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?);
         let addr = Addr::new(PkgBuf::from("p"), "t".to_string(), Default::default());
         // Pre-populate dag with addr→addr already there is overkill; just call result_addr
@@ -8831,10 +8787,8 @@ mod tests {
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: Some(parallelism),
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
@@ -8851,10 +8805,8 @@ mod tests {
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
@@ -9559,8 +9511,6 @@ mod tests {
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
         let dir = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
             // sqlite-direct (no in-memory layer) so `list_target_entries` /
             // `delete` reflect writes synchronously — the partial-cache test
@@ -9569,7 +9519,7 @@ mod tests {
                 capacity_bytes: 0,
                 ..Default::default()
             },
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })?;
         if let Some(wrap) = wrap_cache {
             engine.local_cache = wrap(engine.local_cache.clone());
@@ -9604,11 +9554,9 @@ mod tests {
     ) -> (Arc<dyn Content>, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
         let mut engine = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
             spill_threshold_bytes,
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })
         .expect("engine");
         engine
@@ -10046,8 +9994,6 @@ mod tests {
 
         let dir = tempdir().expect("tempdir");
         let mut engine = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
             // sqlite-direct (no in-memory tier) so every manifest read reaches the
             // counter instead of being served from an LRU on the second touch.
@@ -10055,7 +10001,7 @@ mod tests {
                 capacity_bytes: 0,
                 ..Default::default()
             },
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })
         .expect("engine");
         let manifest_reads = SArc::new(AtomicUsize::new(0));
@@ -10154,10 +10100,8 @@ mod tests {
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         // `bash` driver wraps the `run` string into `bash -u -e -c <script>`,
         // so codegen targets can run real shell. The `@heph/fs` provider+driver
@@ -10322,10 +10266,8 @@ mod tests {
 
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine
             .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
@@ -11611,13 +11553,11 @@ mod tests {
         let runs = SArc::new(AtomicUsize::new(0));
         let shell_runs = SArc::new(AtomicUsize::new(0));
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             // Enough workers that concurrent members are genuinely concurrent —
             // otherwise the execute semaphore would serialize them and hide the
             // shared-terminal overlap this suite is looking for.
             parallelism: Some(4),
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         engine.register_driver(enclose!((runs, shell_runs, log_path) move |_| {
             Box::new(TerminalDriver {
@@ -12180,10 +12120,8 @@ mod tests {
 
         let root = tempdir()?;
         let engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
 
         let mut packer = hcore::hartifactcontent::tar::TarPacker::new();
@@ -12269,10 +12207,8 @@ mod tests {
         ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, SArc<AtomicUsize>)> {
             let root = tempdir()?;
             let mut engine = Engine::new(Config {
-                root: root.path().to_path_buf(),
-                home_dir: std::path::PathBuf::new(),
                 parallelism: None,
-                ..Default::default()
+                ..Config::for_tests(root.path())
             })?;
             engine.register_managed_driver(|_| {
                 Box::new(hplugin_exec::pluginexec::Driver::new_bash())

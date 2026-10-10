@@ -83,7 +83,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // Tunables come from the plugin's `options:` map (config yaml), carried as
     // structured CreateConfig data — read the same way an in-process plugin does.
     let mut options = options_from_pb_map(cfg.options);
-    // The walker db lives in the engine's home dir (e.g. `.heph3`), not the repo
+    // The walker db lives in the engine's home dir (e.g. `.heph`), not the repo
     // root — `home` comes from the engine, never hardcoded. It's this cdylib's own
     // option — consume it so it's kept out of the provider's map, whose
     // `from_options` rejects unknown keys.

@@ -198,10 +198,8 @@ mod tests {
     fn make_engine(names: &[&'static str]) -> anyhow::Result<Arc<Engine>> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         for name in names {
             engine.register_provider(move |_| Box::new(StatingProvider(name)))?;

@@ -212,7 +212,7 @@ pub fn is_enabled(config_enabled: bool) -> bool {
 
 /// Machine-level config dir holding the install id and the spool:
 /// `$XDG_CONFIG_HOME/heph` or `~/.config/heph`. Created on demand. Deliberately
-/// *not* the per-repo `.heph3` home — the install id must survive cache nukes
+/// *not* the per-repo `.heph` home — the install id must survive cache nukes
 /// and be shared across repos.
 fn config_dir() -> anyhow::Result<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")

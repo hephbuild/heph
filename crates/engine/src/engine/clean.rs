@@ -669,10 +669,8 @@ mod tests {
     async fn clean_forwards_skips_to_the_callers_request() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut engine = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })
         .expect("engine");
         let good = addr("good");
@@ -751,12 +749,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _rt = crate::engine::test_rt_enter();
         let mut engine = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             // `max_workers` is `2 * parallelism`, so this pins the in-flight cap
             // at 2 and keeps the corpus the test needs small.
             parallelism: Some(1),
-            ..Default::default()
+            ..Config::for_tests(dir.path())
         })
         .expect("engine");
         let started = Arc::new(AtomicUsize::new(0));

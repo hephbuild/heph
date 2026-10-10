@@ -107,12 +107,10 @@ impl Workspace {
         })?;
         let root = self.inner.dir.path().to_path_buf();
         let mut engine = Engine::new(Config {
-            root: root.clone(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: cfg.parallelism,
             fs_skip: cfg.fs_skip.clone(),
             scratch,
-            ..Default::default()
+            ..Config::for_tests(root.clone())
         })
         .context("reopen: build engine over the existing workspace root")?;
         engine

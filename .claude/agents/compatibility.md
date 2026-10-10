@@ -13,7 +13,7 @@ You own the boundaries that outlive a single binary: data written to disk, bytes
 ## Boundaries you own
 
 1. **Plugin ABI** (`crates/plugin-abi`, cdylib/shm/wasm transports) — struct layout, function signatures, `ABI_SEMVER`, callback contracts. Loaded at runtime by a separately-compiled artifact. A mismatch is UB or an abort, not an error message.
-2. **On-disk cache format** (`.heph3/cache/`) — manifests, artifact layout, revision keys, index files. Read by binaries older and newer than the writer.
+2. **On-disk cache format** (`<home>/cache/`, `.heph/cache/` by default) — manifests, artifact layout, revision keys, index files. Read by binaries older and newer than the writer.
 3. **Remote cache wire format** — object layout, key scheme, manifest schema. Shared across a whole team running mixed versions, and across CI.
 4. **Protobuf** (`proto/`) — field numbers, types, required-ness, enum values, message nesting.
 5. **BUILD-file API** — Starlark builtins, target rule names, argument names and positions, defaults. Users' files are already written against these.

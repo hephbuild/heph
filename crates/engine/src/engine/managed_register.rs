@@ -10,7 +10,7 @@ use hdriver_support::driver_managed::ManagedDriver;
 impl Engine {
     pub fn new_managed_driver(&self, driver: Box<dyn ManagedDriver>) -> ManagedDriverBridge {
         let fuse = self.fuse.layered_fs().map(|fs| FuseSlot {
-            home: self.home.clone(),
+            home: self.home.to_path_buf(),
             fs,
             fuse_lower: self.fuse.lower.clone(),
             fuse_upper: self.fuse.upper.clone(),
@@ -21,7 +21,7 @@ impl Engine {
             driver,
             hplugin_exec::pluginexec::Driver::default_exec_shell_fallback(),
             self.cfg.fuse.mode(),
-            self.home.clone(),
+            self.home.to_path_buf(),
             fuse,
         )
     }

@@ -151,12 +151,14 @@ impl Scenario {
     }
 }
 
-fn cache_dir(corpus: &Path) -> PathBuf {
-    corpus.join(".heph3")
+/// The corpus's heph home. The generated corpus sets no `homeDir`, so it is the
+/// default one the binary resolves.
+fn cache_dir(corpus: &Path) -> Result<heph::engine::HomeDir> {
+    heph::engine::HomeDir::resolve(corpus, None).context("resolve corpus home dir")
 }
 
 fn wipe_cache(corpus: &Path) -> Result<()> {
-    let dir = cache_dir(corpus);
+    let dir = cache_dir(corpus)?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
     }
@@ -302,11 +304,10 @@ mod tests {
         .expect("write config");
         let file = config_yaml::load(&path).expect("parse generated config");
 
-        let mut e = Engine::new(Config {
-            root: dir.path().to_path_buf(),
-            home_dir: dir.path().join(".heph3"),
-            ..Default::default()
-        })
+        let mut e = Engine::new(Config::new(
+            dir.path().to_path_buf(),
+            super::cache_dir(dir.path()).expect("home dir"),
+        ))
         .expect("engine");
         heph::commands::bootstrap::register_builtin_factories(&mut e).expect("register");
 

@@ -229,7 +229,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // Point `SIGQUIT` dumps at the resolved home, so they land beside the stall
     // log and the in-flight report instead of under whatever cwd the process was
     // launched from. Every command routes through here, so every command gets it.
-    crate::diag::set_dump_dir(&engine.home.join("diag"));
+    crate::diag::set_dump_dir(&engine.home);
 
     let (trigger, rx) = ShutdownTrigger::new();
     spawn_sigint_producer(trigger.clone());
@@ -336,17 +336,11 @@ mod tests {
         let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml)?;
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
-        let home_dir = file
-            .home_dir
-            .as_ref()
-            .map(|p| root.join(p))
-            .unwrap_or_else(|| root.join(".heph3"));
+        let home_dir = engine::HomeDir::resolve(&root, file.home_dir.as_deref())?;
         let mut e = engine::Engine::new(engine::Config {
-            root,
-            home_dir: home_dir.clone(),
             fs_skip: file.fs.clone().map(|f| f.skip).unwrap_or_default(),
             parallelism: None,
-            ..Default::default()
+            ..engine::Config::new(root, home_dir.clone())
         })?;
 
         // `fs` is auto-registered by `Engine::new`.
@@ -443,10 +437,8 @@ fs:
         let root = dir.path().to_path_buf();
         let engine = Arc::new(
             engine::Engine::new(engine::Config {
-                root: root.clone(),
-                home_dir: root.join(".heph3"),
                 parallelism: None,
-                ..Default::default()
+                ..engine::Config::for_tests(root)
             })
             .expect("engine"),
         );

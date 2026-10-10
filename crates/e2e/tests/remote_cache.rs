@@ -12,7 +12,7 @@
 //! *different* output. An output that stays identical across runs therefore
 //! proves the result came from a cache, not a fresh execution.
 
-use heph::engine::{Config, Engine, OutputMatcher, RemoteCacheDef, ResultOptions};
+use heph::engine::{Config, Engine, HomeDir, OutputMatcher, RemoteCacheDef, ResultOptions};
 use heph::htaddr::parse_addr;
 use heph::{pluginbuildfile, pluginexec};
 use htestkit::artifact_string;
@@ -25,8 +25,6 @@ use std::time::{Duration, Instant};
 /// cache at `remote_uri`. Each call gets its own empty in-memory cache tier.
 fn build_engine(root: &Path, remote_uri: &str) -> Arc<Engine> {
     let mut e = Engine::new(Config {
-        root: root.to_path_buf(),
-        home_dir: std::path::PathBuf::new(),
         remote_caches: vec![RemoteCacheDef {
             name: "shared".to_string(),
             uri: remote_uri.to_string(),
@@ -36,7 +34,7 @@ fn build_engine(root: &Path, remote_uri: &str) -> Arc<Engine> {
             endpoint: None,
             region: None,
         }],
-        ..Default::default()
+        ..Config::for_tests(root)
     })
     .expect("engine");
     e.register_provider(|init| {
@@ -128,7 +126,7 @@ async fn remote_cache_cold_warm_hot() {
     drop(cold);
 
     // Delete the on-disk local cache so the warm run cannot hit it locally.
-    std::fs::remove_dir_all(root.path().join(".heph3").join("cache")).expect("rm local cache");
+    std::fs::remove_dir_all(HomeDir::for_tests(root.path()).join("cache")).expect("rm local cache");
 
     // ---- WARM: fresh engine (empty mem) + no local cache → pull from remote. ----
     // A re-execution would produce a new random value, so equality with the cold
@@ -217,7 +215,7 @@ target(
     );
     drop(cold);
 
-    let local_cache = root.path().join(".heph3").join("cache");
+    let local_cache = HomeDir::for_tests(root.path()).join("cache");
     std::fs::remove_dir_all(&local_cache).expect("rm local cache");
 
     // ---- WARM: `top` is a remote hit; `dep` is only needed for its hashout. ----
@@ -264,12 +262,7 @@ async fn output_is_nondeterministic_without_cache() {
 
     // No `caches:` → no remote.
     let build_plain = |root: &Path| -> Arc<Engine> {
-        let mut e = Engine::new(Config {
-            root: root.to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
-            ..Default::default()
-        })
-        .expect("engine");
+        let mut e = Engine::new(Config::for_tests(root)).expect("engine");
         e.register_provider(|init| {
             Box::new(pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
@@ -285,7 +278,7 @@ async fn output_is_nondeterministic_without_cache() {
     let e1 = build_plain(root.path());
     let first = run_drain(&e1, "//pkg:t").await;
     drop(e1);
-    std::fs::remove_dir_all(root.path().join(".heph3").join("cache")).expect("rm local cache");
+    std::fs::remove_dir_all(HomeDir::for_tests(root.path()).join("cache")).expect("rm local cache");
 
     let e2 = build_plain(root.path());
     let second = run_drain(&e2, "//pkg:t").await;

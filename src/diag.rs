@@ -100,14 +100,25 @@ extern "C" fn on_sigquit(_sig: libc::c_int) {
 /// The directory dumps land in, once the engine has resolved its home.
 static DUMP_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Point dumps at the engine's `<home>/diag`, so they land beside the stall log
-/// and the in-flight report rather than wherever the process happened to start.
+/// Point dumps at the resolved home's `<home>/diag`, so they land beside the
+/// stall log and the in-flight report rather than wherever the process happened
+/// to start.
 ///
-/// Called once the home is known; before that, [`dump_dir`] falls back to the
-/// launch directory. The fallback matters — a hang during startup still has to
-/// produce a dump somewhere findable.
-pub fn set_dump_dir(dir: &std::path::Path) {
-    drop(DUMP_DIR.set(absolute(dir)));
+/// Called once the home is known; before that, [`dump_dir`] falls back to
+/// [`fallback_dump_dir`] under the system temp dir. The fallback matters — a hang
+/// during startup still has to produce a dump somewhere findable — and it is not
+/// a guess at the home: before the config is resolved there is no home to guess.
+pub fn set_dump_dir(home: &hengine::engine::HomeDir) {
+    drop(DUMP_DIR.set(home.join("diag")));
+}
+
+/// Where dumps go before [`set_dump_dir`] has run: `<temp dir>/heph-diag`.
+///
+/// Absolute and independent of the cwd. Not cleaned by `heph tool gc` (it is
+/// outside every workspace), which is the price of a dump from a process that
+/// never got as far as knowing its workspace.
+fn fallback_dump_dir() -> std::path::PathBuf {
+    absolute(&std::env::temp_dir().join("heph-diag"))
 }
 
 /// Make `path` absolute without touching the filesystem.
@@ -121,15 +132,13 @@ fn absolute(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn dump_dir() -> std::path::PathBuf {
-    DUMP_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(|| absolute(std::path::Path::new(".heph3/diag")))
+    DUMP_DIR.get().cloned().unwrap_or_else(fallback_dump_dir)
 }
 
-/// Where a dump lands. In-workspace so `heph tool gc` can sweep it.
+/// Where a dump lands: in the workspace's home once it is resolved (so
+/// `heph tool gc` can sweep it), under the temp dir before that.
 ///
-/// **Absolute.** It used to be `.heph3/diag/dump-<pid>.txt`, resolved against
+/// **Absolute.** It used to be `<home>/diag/dump-<pid>.txt`, resolved against
 /// whatever the process's cwd happened to be — which is not something the person
 /// reading a stall log, or an agent handed the file an hour later, has any way to
 /// know. "Your dump is at a relative path, good luck" costs a round trip in
@@ -475,7 +484,7 @@ mod tests {
 
     /// The dump lands at an absolute path.
     ///
-    /// It used to be `.heph3/diag/dump-<pid>.txt`, resolved against whatever cwd
+    /// It used to be `<home>/diag/dump-<pid>.txt`, resolved against whatever cwd
     /// the process was launched from — so telling someone where their dump went
     /// meant telling them "under the directory you started the build in", which
     /// is a round trip in exactly the situation where the process may already be
@@ -488,9 +497,28 @@ mod tests {
             path.ends_with(format!("dump-{}.txt", std::process::id())),
             "{path:?}"
         );
+        // No test sets `DUMP_DIR` (it is process-global), but tolerate one that
+        // did: either way the dump sits in a diag dir.
         assert!(
-            path.parent().is_some_and(|p| p.ends_with("diag")),
-            "it sits in a diag dir beside the stall log: {path:?}"
+            path.parent()
+                .is_some_and(|p| p.ends_with("diag") || p == fallback_dump_dir()),
+            "it sits in a diag dir: {path:?}"
+        );
+    }
+
+    /// Before the home is resolved, dumps go under the system temp dir — not a
+    /// cwd-relative guess at a home dir that may not be the workspace's.
+    ///
+    /// Tests the fallback itself rather than [`dump_dir`], which reads the
+    /// process-global `DUMP_DIR`: asserting through it would race any test that
+    /// set it.
+    #[test]
+    fn the_fallback_dump_dir_is_under_the_temp_dir() {
+        let dir = fallback_dump_dir();
+        assert!(dir.is_absolute(), "{dir:?}");
+        assert!(
+            dir.starts_with(absolute(&std::env::temp_dir())),
+            "fallback must be under the temp dir: {dir:?}"
         );
     }
 

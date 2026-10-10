@@ -99,7 +99,8 @@ pub struct Engine {
     /// Held behind an `Arc` so `install_exec_runner_host` can hand the resolver
     /// a clone.
     pub(crate) exec_runners: Arc<hexecrunner::registry::RunnerRegistry>,
-    pub home: PathBuf,
+    /// The workspace's heph home, as resolved into the [`Config`].
+    pub home: crate::engine::HomeDir,
     /// The runtime every request's memoizers spawn their computations on.
     /// Captured once at construction — the engine is handed its runtime, the
     /// memoizers never discover one at spawn time.
@@ -410,12 +411,7 @@ pub struct Driver {
 
 impl Engine {
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
-        let root = cfg.root.clone();
-        let home = if cfg.home_dir.as_os_str().is_empty() {
-            root.join(".heph3")
-        } else {
-            cfg.home_dir.clone()
-        };
+        let home = cfg.home_dir.clone();
 
         let parallelism = cfg.parallelism.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -485,8 +481,9 @@ impl Engine {
 
         // Remote caches: backends are constructed synchronously here (no
         // network); latency ordering is measured lazily on first use.
-        let remote_caches = crate::engine::RemoteCacheSet::new(&cfg.remote_caches, home.clone())
-            .context("configure remote caches")?;
+        let remote_caches =
+            crate::engine::RemoteCacheSet::new(&cfg.remote_caches, home.to_path_buf())
+                .context("configure remote caches")?;
 
         // Shared cross-run filesystem-walk cache, handed to tree-walking plugins
         // via `PluginInit`. Its own sqlite db so it can be pruned independently.
@@ -916,7 +913,7 @@ impl Engine {
     }
 
     pub fn skip_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs = vec![self.home.clone()];
+        let mut dirs = vec![self.home.to_path_buf()];
         dirs.extend(
             self.cfg
                 .fs_skip

@@ -400,10 +400,8 @@ mod tests {
     fn engine_with(specs: Vec<TargetSpec>) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            ..Default::default()
+            ..Config::for_tests(root.path())
         })?;
         // group + fs are registered by Engine::new; only the exec driver needs
         // adding here. The fs provider/driver resolves the synthesized `@heph/fs`

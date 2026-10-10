@@ -503,7 +503,7 @@ in
   # session opens in a fresh git worktree.
   scripts.ccrc.exec = ''HEPH_RC=1 claude rc --spawn=worktree "''${@}"'';
 
-  scripts.rsync-to.exec = ''cd $DEVENV_ROOT && rsync -avz --exclude='.heph3/' --exclude='.claude/' --exclude='**/.claude/' --exclude='target/' --exclude='.devenv/' --exclude='.git/' $DEVENV_ROOT/ "''${@}"'';
+  scripts.rsync-to.exec = ''cd $DEVENV_ROOT && rsync -avz --exclude='.heph/' --exclude='.heph3/' --exclude='.claude/' --exclude='**/.claude/' --exclude='target/' --exclude='.devenv/' --exclude='.git/' $DEVENV_ROOT/ "''${@}"'';
 
   scripts.install-dev.exec = ''
     sed "s|<HEPH_SRC_ROOT>|$(pwd)|g" < $DEVENV_ROOT/scripts/dev.sh > /tmp/heph
