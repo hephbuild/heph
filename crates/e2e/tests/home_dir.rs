@@ -56,7 +56,8 @@ async fn the_default_home_is_dot_heph_under_the_root() {
     let e = run_with_config(root, None).await;
 
     let home = root.join(DEFAULT_HOME_DIR);
-    assert_eq!(e.home.as_path(), home);
+    assert_eq!(e.shared_home.as_path(), home);
+    assert_eq!(e.checkout_home.as_path(), home);
     assert!(
         home.join("cache").join("cache.db").is_file(),
         "the local cache must live under {}",
@@ -73,7 +74,8 @@ async fn an_absolute_home_dir_is_used_as_written() {
     let home = elsewhere.path().join("state");
     let e = run_with_config(root, Some(home.clone())).await;
 
-    assert_eq!(e.home.as_path(), home);
+    assert_eq!(e.shared_home.as_path(), home);
+    assert_eq!(e.checkout_home.as_path(), home);
     assert!(
         home.join("cache").join("cache.db").is_file(),
         "the configured home must hold the cache"

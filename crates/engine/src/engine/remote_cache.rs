@@ -1876,7 +1876,7 @@ impl Engine {
         let dir = self
             .remote_tmp_ready
             .get_or_try_init(|| {
-                let dir = self.home.join("cache").join("remote-tmp");
+                let dir = self.shared_home.join("cache").join("remote-tmp");
                 async move {
                     let dir = hcore::blocking::run(move || {
                         std::fs::create_dir_all(&dir)

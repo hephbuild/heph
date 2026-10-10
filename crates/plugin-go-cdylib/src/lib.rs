@@ -84,7 +84,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // structured CreateConfig data — read the same way an in-process plugin does.
     let mut options = options_from_pb_map(cfg.options);
     // The walker db lives in the engine's home dir (e.g. `.heph`), not the repo
-    // root — `home` comes from the engine, never hardcoded. It's this cdylib's own
+    // root — `home` comes from the engine, never hardcoded. It is the
+    // checkout's own home, so a linked worktree keeps its own walk cache. It's this cdylib's own
     // option — consume it so it's kept out of the provider's map, whose
     // `from_options` rejects unknown keys.
     let walk_db = hplugin::config::decode_opt::<PathBuf>(&options, "go", "walk_db")?

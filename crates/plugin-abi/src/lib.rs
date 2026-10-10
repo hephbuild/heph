@@ -21,6 +21,18 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.16.0: `CreateConfig` gained `string shared_home = 4` — the heph home every
+/// checkout of a repository shares, next to `home` (this checkout's own). In a
+/// linked git worktree they differ; the OCI runner mounts both into its
+/// container, because a sandbox (under `home`) holds symlinks into the shared
+/// home's `scratch/`. Additive and cold-path (a prost field of the create
+/// config, no vtable change), so an old plugin still loads and ignores it.
+///
+/// Skew: an old host sends no `shared_home`, which decodes to `""`; the OCI
+/// runner then mounts `home` alone — exactly what it did before — and says so
+/// in its log. Correct outside a worktree, where the two are one directory.
+/// Minor, therefore.
+///
 /// 0.15.0: a provider function can declare targets and provider-state, not just
 /// return a value. `CallFunctionResponse` gained `declared_targets` /
 /// `declared_states` (2, 3) and both call requests gained
@@ -145,7 +157,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.15.0";
+pub const ABI_SEMVER: &str = "0.16.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::revision_pin;
 use hexecrunner::RunnerRef;
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
@@ -15,7 +16,7 @@ use hplugin::htspec::Spec;
 use hproc::proc_exec;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
@@ -220,6 +221,14 @@ fn sanitize_env_name(addr_str: &str) -> String {
     out
 }
 
+/// Where a driver with state dir `state_dir` keeps its gcroots: one
+/// [revision pin](hdriver_support::revision_pin) per cached revision of a
+/// target. The host registers it with `Engine::register_revision_pins`, so
+/// `heph tool gc` removes the roots of revisions it no longer caches.
+pub fn gcroots_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("nix-gcroots")
+}
+
 #[async_trait]
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -365,11 +374,19 @@ impl ManagedDriver for Driver {
         // gcroot symlink path. `nix build --out-link <p>` registers <p> as an
         // indirect auto-gcroot, so the resolved store path + its closure
         // survive `nix-collect-garbage` for as long as the symlink exists.
-        let gcroots_dir = self.home_dir.join("nix-gcroots");
+        let gcroots_dir = gcroots_dir(&self.home_dir);
         tokio::fs::create_dir_all(&gcroots_dir)
             .await
             .with_context(|| format!("create gcroots dir {:?}", gcroots_dir))?;
-        let gcroot_path = gcroots_dir.join(req.request.target.addr.hash_str());
+        // One root per revision (addr + hashin), not per addr: every revision
+        // still in the cache (`cache.history` may keep several) has a wrapper
+        // pointing at its own store path, and each needs its own root. The
+        // sidecar names the revision so `heph tool gc` can drop the root once
+        // the revision is gone; it is written first, so the root never exists
+        // without it while this build runs (see `revision_pin`).
+        let pin = revision_pin::paths(&gcroots_dir, &req.request.target.addr, req.request.hashin);
+        revision_pin::write_sidecar(&pin, &req.request.target.addr, req.request.hashin).await?;
+        let gcroot_path = pin.pin;
         // `nix build --out-link` refuses to overwrite an existing path.
         match tokio::fs::remove_file(&gcroot_path).await {
             Ok(()) => {}

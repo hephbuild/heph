@@ -26,11 +26,14 @@
 )]
 
 mod config_yaml;
+pub mod git_checkout;
 mod home_dir;
+mod homes;
 mod options;
 mod root;
 
 pub use config_yaml::*;
 pub use home_dir::{DEFAULT_HOME_DIR, HEPH_DIR_PREFIX, HomeDir, normalize};
+pub use homes::{CheckoutHome, HomeSharing, Homes};
 pub use options::{Options, decode_opt, deny_unknown};
 pub use root::{get_cwd, get_root};

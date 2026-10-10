@@ -18,6 +18,43 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::{fmt, io, time};
 
+/// Which local cache store holds a target's entries.
+///
+/// In a linked git worktree there are two: the **shared** one in the main
+/// checkout's home, read and written by every checkout of the repository, and
+/// the **checkout** one in this checkout's own home. Outside a linked worktree
+/// they are one store (see [`Engine::local_cache_for`]).
+///
+/// The rule is [`CacheScope::of`] — decided from the target def alone, so the
+/// lookup and the write of one revision can never pick different stores. A
+/// target that never goes to a remote cache (`cache.remote_enabled == false`)
+/// is one whose bytes are not portable: a runner target writes this checkout's
+/// absolute paths into its `runner.json` / `mounts`, under a key every checkout
+/// computes the same. Shared, a worktree would be served the main checkout's
+/// paths. So those entries are per checkout; everything a remote may carry is
+/// already portable by contract and stays shared.
+///
+/// Remote mirroring (download into, upload from) only ever touches the shared
+/// store: it runs only for a target with `remote_enabled`, which is `Shared`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CacheScope {
+    /// The shared home's store: `<shared home>/cache/`.
+    Shared,
+    /// This checkout's own store: `<checkout home>/cache/`.
+    Checkout,
+}
+
+impl CacheScope {
+    /// The store a target's entries live in. See the type doc.
+    pub fn of(cache: &crate::engine::driver::targetdef::CacheConfig) -> Self {
+        if cache.remote_enabled {
+            CacheScope::Shared
+        } else {
+            CacheScope::Checkout
+        }
+    }
+}
+
 struct CountingWriter<W: io::Write> {
     inner: W,
     count: u64,
@@ -655,9 +692,11 @@ impl Engine {
         .await
     }
 
-    /// Persist `artifacts` for `addr` under the input hash `hashin`.
+    /// Persist `artifacts` for `addr` under the input hash `hashin`, in the
+    /// `scope` store ([`CacheScope::of`] the target's def).
     pub async fn cache_locally(
         &self,
+        scope: CacheScope,
         ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
@@ -697,11 +736,16 @@ impl Engine {
         // and are never read back across runs, so route them to the mem-only
         // `local_cache_tmp` — small entries stay in memory and skip the SQLite
         // WAL write. `CacheArtifact` carries the cache it was written to, so
-        // reads resolve against the same store.
+        // reads resolve against the same store. A tmp key is unique to this
+        // write and never looked up, so which home it spills into cannot serve
+        // one checkout another's bytes: it stays on the shared tmp store
+        // whatever the scope.
+        let durable;
         let cache = if tmp {
             &self.local_cache_tmp
         } else {
-            &self.local_cache
+            durable = self.local_cache_for(scope)?;
+            &durable
         };
 
         // All artifacts in flight at once, not one at a time: each write is a
@@ -774,10 +818,11 @@ impl Engine {
     /// Read and deserialize a group's manifest. `Ok(None)` if it is absent.
     pub(crate) fn read_manifest(
         &self,
+        scope: CacheScope,
         addr: &Addr,
         hashin: &str,
     ) -> anyhow::Result<Option<Manifest>> {
-        Self::read_manifest_from(&self.local_cache, addr, hashin)
+        Self::read_manifest_from(&self.local_cache_for(scope)?, addr, hashin)
     }
 
     /// [`read_manifest`](Self::read_manifest) against a cache handle rather than
@@ -810,6 +855,7 @@ impl Engine {
     /// just-written entry under the key a subsequent run will compute.
     pub(crate) fn duplicate_cache_revision(
         &self,
+        scope: CacheScope,
         addr: &Addr,
         src_key: &str,
         dst_key: &str,
@@ -817,10 +863,11 @@ impl Engine {
         if src_key == dst_key {
             return Ok(false);
         }
-        let Some(manifest) = self.read_manifest(addr, src_key)? else {
+        let cache = self.local_cache_for(scope)?;
+        let Some(manifest) = Self::read_manifest_from(&cache, addr, src_key)? else {
             return Ok(false);
         };
-        self.duplicate_cache_entry(addr, src_key, dst_key, &manifest)?;
+        Self::duplicate_cache_entry(&cache, addr, src_key, dst_key, &manifest)?;
         Ok(true)
     }
 
@@ -830,22 +877,20 @@ impl Engine {
     /// manifest's `hashin` differs so a reader keyed by `dst_key` sees a
     /// consistent revision.
     fn duplicate_cache_entry(
-        &self,
+        cache: &Arc<dyn LocalCache>,
         addr: &Addr,
         src_key: &str,
         dst_key: &str,
         manifest: &Manifest,
     ) -> anyhow::Result<()> {
         for artifact in &manifest.artifacts {
-            let mut reader = self
-                .local_cache
+            let mut reader = cache
                 .reader(addr, src_key, &artifact.name)
                 .with_context(|| {
                     format!("open source blob {} for {addr} {src_key}", artifact.name)
                 })?
                 .reader;
-            let mut writer = self
-                .local_cache
+            let mut writer = cache
                 .writer(addr, dst_key, &artifact.name)
                 .with_context(|| {
                     format!("open dest blob {} for {addr} {dst_key}", artifact.name)
@@ -874,8 +919,7 @@ impl Engine {
             created_at_nanos: dup_created,
             ..manifest.clone()
         };
-        let mut manifest_writer = self
-            .local_cache
+        let mut manifest_writer = cache
             .writer(addr, dst_key, MANIFEST_V1)
             .with_context(|| format!("open manifest writer for {addr} {dst_key}"))?;
         borsh::to_writer(&mut manifest_writer, &dup_manifest)
@@ -897,6 +941,7 @@ impl Engine {
     /// plus a borsh parse is more than a runtime worker should disappear into.
     pub(crate) async fn read_manifest_blocking(
         &self,
+        scope: CacheScope,
         _ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
@@ -904,8 +949,11 @@ impl Engine {
         // Cloned rather than borrowed: a pool job outlives a dropped caller future
         // (cancellation), so it cannot borrow the caller's frame. An `Addr` plus a
         // hash is a handful of small strings — cheap next to the read itself.
-        let (local_cache, addr, hashin) =
-            (self.local_cache.clone(), addr.clone(), hashin.to_string());
+        let (local_cache, addr, hashin) = (
+            self.local_cache_for(scope)?,
+            addr.clone(),
+            hashin.to_string(),
+        );
         hcore::blocking::run(move || Self::read_manifest_from(&local_cache, &addr, &hashin)).await
     }
 
@@ -960,6 +1008,7 @@ impl Engine {
     /// not which of its blobs happen to be resident.
     pub(crate) async fn missing_local_blobs(
         &self,
+        scope: CacheScope,
         _ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
@@ -976,7 +1025,7 @@ impl Engine {
         let mut missing = Vec::new();
         for artifact in Self::needed_artifacts(manifest, outputs) {
             if !self
-                .exists_local(addr, hashin, &artifact.name)
+                .exists_local(scope, addr, hashin, &artifact.name)
                 .await
                 .with_context(|| {
                     format!("probe local blob {} for {addr} {hashin}", artifact.name)
@@ -1019,12 +1068,14 @@ impl Engine {
     /// threshold.
     pub(crate) async fn exists_local(
         &self,
+        scope: CacheScope,
         addr: &Addr,
         hashin: &str,
         name: &str,
     ) -> anyhow::Result<bool> {
+        let cache = self.local_cache_for(scope)?;
         for _ in 0..MAX_QUEUE_WAITS {
-            match self.local_cache.existence(addr, hashin, name)? {
+            match cache.existence(addr, hashin, name)? {
                 Existence::Committed(found) => return Ok(found),
                 Existence::Queued(pending) => pending.await,
             }
@@ -1036,7 +1087,7 @@ impl Engine {
             waits = MAX_QUEUE_WAITS,
             "local cache kept reporting a queued write for one key; answering from committed state"
         );
-        self.local_cache.exists_committed(addr, hashin, name)
+        cache.exists_committed(addr, hashin, name)
     }
 
     /// Build this caller's artifact set from an already-parsed `manifest`, gating
@@ -1059,8 +1110,13 @@ impl Engine {
     ///
     /// `residency` says whether the per-blob probe is still needed — see
     /// [`BlobResidency`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the read's identity (scope, addr, hashin), what it reads, and how far residency is settled"
+    )]
     pub(crate) async fn artifacts_from_manifest(
         &self,
+        scope: CacheScope,
         _ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
@@ -1068,7 +1124,7 @@ impl Engine {
         outputs: &[String],
         residency: BlobResidency,
     ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
-        let local_cache = &self.local_cache;
+        let local_cache = &self.local_cache_for(scope)?;
         // Stays on the calling worker for the same reason as `missing_local_blobs`:
         // point lookups and struct building over a manifest already in memory, with
         // `exists_local` keeping the probe non-blocking.
@@ -1099,7 +1155,7 @@ impl Engine {
 
             if residency == BlobResidency::Unknown
                 && !self
-                    .exists_local(addr, hashin, artifact.name.as_ref())
+                    .exists_local(scope, addr, hashin, artifact.name.as_ref())
                     .await
                     .with_context(|| {
                         format!("probe local blob {} for {addr} {hashin}", artifact.name)
@@ -1134,13 +1190,15 @@ impl Engine {
         hashin: &str,
         outputs: Vec<String>,
     ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
+        let scope = CacheScope::of(&def.target.cache);
         let Some(manifest) = self
-            .read_manifest_blocking(ctoken, &def.target.addr, hashin)
+            .read_manifest_blocking(scope, ctoken, &def.target.addr, hashin)
             .await?
         else {
             return Ok(None);
         };
         self.artifacts_from_manifest(
+            scope,
             ctoken,
             &def.target.addr,
             hashin,
@@ -1228,6 +1286,7 @@ mod tests {
         let (engine_a, _a) = engine_with_remote(&remote_uri);
         engine_a
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHIN1",
@@ -1242,7 +1301,7 @@ mod tests {
         let (engine_b, _b) = engine_with_remote(&remote_uri);
         assert!(
             engine_b
-                .read_manifest_blocking(&ctoken, &addr, "HASHIN1")
+                .read_manifest_blocking(CacheScope::Shared, &ctoken, &addr, "HASHIN1")
                 .await
                 .expect("read")
                 .is_none(),
@@ -1326,6 +1385,7 @@ mod tests {
         assert!(
             engine
                 .artifacts_from_manifest(
+                    CacheScope::Shared,
                     &ctoken,
                     &addr,
                     "HASHRES",
@@ -1341,6 +1401,7 @@ mod tests {
 
         let (arts, meta) = engine
             .artifacts_from_manifest(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHRES",
@@ -1369,6 +1430,7 @@ mod tests {
         let (engine, _dir) = engine_with_remote(&remote_uri);
         engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHTMP",
@@ -1383,7 +1445,7 @@ mod tests {
             .expect("cache_locally");
         engine.upload_to_remote(&addr, "HASHTMP").await;
 
-        let tmp_dir = engine.home.join("cache").join("remote-tmp");
+        let tmp_dir = engine.shared_home.join("cache").join("remote-tmp");
         let leftovers: Vec<_> = std::fs::read_dir(&tmp_dir)
             .expect("the upload must have created the temp dir")
             .filter_map(Result::ok)
@@ -1412,6 +1474,7 @@ mod tests {
         let (engine, _e) = engine_with_remote(&remote_uri);
         engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHBG",
@@ -1465,6 +1528,7 @@ mod tests {
         let (engine, _e) = engine_with_remote(&remote_uri);
         engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHLOCK",
@@ -1550,6 +1614,7 @@ mod tests {
         let (engine_a, _a) = engine_with_remote(&remote_uri);
         engine_a
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHEVICT",
@@ -1624,12 +1689,19 @@ mod tests {
             })
             .collect();
         engine
-            .cache_locally(&ctoken, &addr, "HASHIN_ORDER", artifacts, false)
+            .cache_locally(
+                CacheScope::Shared,
+                &ctoken,
+                &addr,
+                "HASHIN_ORDER",
+                artifacts,
+                false,
+            )
             .await
             .expect("cache_locally");
 
         let manifest = engine
-            .read_manifest(&addr, "HASHIN_ORDER")
+            .read_manifest(CacheScope::Shared, &addr, "HASHIN_ORDER")
             .expect("read manifest")
             .expect("manifest present");
         let names: Vec<_> = manifest.artifacts.iter().map(|a| a.name.as_str()).collect();
@@ -1671,7 +1743,14 @@ mod tests {
             .map(|i| raw_artifact(&format!("a{i}"), &vec![b'x'; 256 * 1024]))
             .collect();
         engine
-            .cache_locally(&ctoken, &addr, "HASHIN_LAST", artifacts, false)
+            .cache_locally(
+                CacheScope::Shared,
+                &ctoken,
+                &addr,
+                "HASHIN_LAST",
+                artifacts,
+                false,
+            )
             .await
             .expect("cache_locally");
 
@@ -1713,6 +1792,7 @@ mod tests {
         };
         let Err(err) = engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHIN_MULTIFAIL",
@@ -1753,6 +1833,7 @@ mod tests {
             .expect("hold every pack slot");
 
         let write = engine.cache_locally(
+            CacheScope::Shared,
             &ctoken,
             &addr,
             "HASHIN_SLOT",
@@ -1785,6 +1866,7 @@ mod tests {
 
         let Err(err) = engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHIN_DUP",
@@ -1798,7 +1880,7 @@ mod tests {
         assert!(format!("{err:#}").contains("same"), "got: {err:#}");
         assert!(
             engine
-                .read_manifest(&addr, "HASHIN_DUP")
+                .read_manifest(CacheScope::Shared, &addr, "HASHIN_DUP")
                 .expect("read manifest")
                 .is_none(),
             "nothing may be committed for a rejected revision"
@@ -1813,11 +1895,18 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let addr = test_addr();
         engine
-            .cache_locally(&ctoken, &addr, "HASHIN_EMPTY", vec![], false)
+            .cache_locally(
+                CacheScope::Shared,
+                &ctoken,
+                &addr,
+                "HASHIN_EMPTY",
+                vec![],
+                false,
+            )
             .await
             .expect("cache_locally");
         let manifest = engine
-            .read_manifest(&addr, "HASHIN_EMPTY")
+            .read_manifest(CacheScope::Shared, &addr, "HASHIN_EMPTY")
             .expect("read manifest")
             .expect("manifest present");
         assert!(manifest.artifacts.is_empty());
@@ -1836,20 +1925,33 @@ mod tests {
             .map(|i| raw_artifact(&format!("a{i}"), &vec![b'x'; 512 * 1024]))
             .collect();
         {
-            let write =
-                engine.cache_locally(&ctoken, &addr, "HASHIN_DROP", artifacts.clone(), false);
+            let write = engine.cache_locally(
+                CacheScope::Shared,
+                &ctoken,
+                &addr,
+                "HASHIN_DROP",
+                artifacts.clone(),
+                false,
+            );
             tokio::pin!(write);
             // Poll it exactly once to start the fan-out, then drop it.
             let _ = futures::poll!(&mut write);
         }
 
         engine
-            .cache_locally(&ctoken, &addr, "HASHIN_DROP", artifacts, false)
+            .cache_locally(
+                CacheScope::Shared,
+                &ctoken,
+                &addr,
+                "HASHIN_DROP",
+                artifacts,
+                false,
+            )
             .await
             .expect("a fresh write after an abandoned one must succeed");
         assert!(
             engine
-                .read_manifest(&addr, "HASHIN_DROP")
+                .read_manifest(CacheScope::Shared, &addr, "HASHIN_DROP")
                 .expect("read manifest")
                 .is_some()
         );
@@ -1875,6 +1977,7 @@ mod tests {
         };
         let Err(err) = engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHIN_FAIL",
@@ -1892,7 +1995,7 @@ mod tests {
 
         assert!(
             engine
-                .read_manifest(&addr, "HASHIN_FAIL")
+                .read_manifest(CacheScope::Shared, &addr, "HASHIN_FAIL")
                 .expect("read manifest")
                 .is_none(),
             "a failed revision must not commit a manifest"
@@ -1975,6 +2078,7 @@ mod tests {
 
         let arts = engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHIN_ADOPT",
@@ -2002,7 +2106,7 @@ mod tests {
         );
 
         let manifest = engine
-            .read_manifest(&addr, "HASHIN_ADOPT")
+            .read_manifest(CacheScope::Shared, &addr, "HASHIN_ADOPT")
             .expect("read manifest")
             .expect("manifest committed");
         assert_eq!(manifest.artifacts[0].size, bytes.len() as u64);
@@ -2023,6 +2127,7 @@ mod tests {
 
         let arts = engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHIN_COPY",
@@ -2064,6 +2169,7 @@ mod tests {
 
         let arts = engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "HASHIN_SMALL",
@@ -2099,6 +2205,7 @@ mod tests {
 
         engine
             .cache_locally(
+                CacheScope::Shared,
                 &ctoken,
                 &addr,
                 "PRIMARYHASH",
@@ -2111,19 +2218,19 @@ mod tests {
         // No-ops: equal keys and a missing source manifest.
         assert!(
             !engine
-                .duplicate_cache_revision(&addr, "PRIMARYHASH", "PRIMARYHASH")
+                .duplicate_cache_revision(CacheScope::Shared, &addr, "PRIMARYHASH", "PRIMARYHASH")
                 .expect("equal keys")
         );
         assert!(
             !engine
-                .duplicate_cache_revision(&addr, "MISSINGHASH", "FIXPOINTKEY")
+                .duplicate_cache_revision(CacheScope::Shared, &addr, "MISSINGHASH", "FIXPOINTKEY")
                 .expect("missing source")
         );
 
         // Real duplication under a derived key.
         assert!(
             engine
-                .duplicate_cache_revision(&addr, "PRIMARYHASH", "FIXPOINTKEY")
+                .duplicate_cache_revision(CacheScope::Shared, &addr, "PRIMARYHASH", "FIXPOINTKEY")
                 .expect("duplicate")
         );
 
@@ -2247,7 +2354,7 @@ mod tests {
 
         assert!(
             engine
-                .exists_local(&test_addr(), "h", "blob")
+                .exists_local(CacheScope::Shared, &test_addr(), "h", "blob")
                 .await
                 .expect("probe"),
             "a queued write must resolve to present, not to the committed miss"
@@ -2288,7 +2395,7 @@ mod tests {
 
         let found = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            engine.exists_local(&test_addr(), "h", "blob"),
+            engine.exists_local(CacheScope::Shared, &test_addr(), "h", "blob"),
         )
         .await
         .expect("a never-settling backend must not hang the probe")

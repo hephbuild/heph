@@ -81,14 +81,67 @@ pub struct OciRunnerDef {
 #[derive(Debug)]
 pub struct Driver {
     docker_bin: String,
-    /// heph's resolved home, mounted into the container: sandboxes and the agent
-    /// socket live under it. Handed in by the host (`CreateConfig.home` for the
+    /// This checkout's heph home, mounted into the container: the sandboxes
+    /// live under it (in a linked git worktree that is the worktree's own home,
+    /// not the shared one). Handed in by the host (`CreateConfig.home` for the
     /// cdylib, `PluginInit.home` in-process) — never derived from a sandbox
     /// path, where a package named `sandbox` would be mistaken for the home's.
     ///
     /// `Err` holds why the host's home is unusable; the driver is still
     /// registered, and fails its runs with that reason (see [`home_from_host`]).
     home: Result<std::path::PathBuf, String>,
+    /// The home every checkout shares. Its `scratch/` is mounted too (only
+    /// that): a sandbox holds symlinks into it, which would dangle in the
+    /// container otherwise. The same directory as `home` outside a linked
+    /// worktree, where `home`'s mount already covers it.
+    /// `Ok(None)` from a host that predates `CreateConfig.shared_home`; `Err`
+    /// fails runs like `home`'s (see [`shared_home_from_host`]).
+    shared_home: Result<Option<std::path::PathBuf>, String>,
+}
+
+/// The shared home a cdylib host passed in `CreateConfig.shared_home`. Empty is
+/// a host older than the field (ABI < 0.16.0): `Ok(None)`, not an error — the
+/// runner then mounts the checkout's home alone, as it always did. A relative
+/// path is refused like [`home_from_host`]'s.
+pub fn shared_home_from_host(shared_home: &str) -> Result<Option<std::path::PathBuf>, String> {
+    if shared_home.is_empty() {
+        return Ok(None);
+    }
+    let path = std::path::PathBuf::from(shared_home);
+    if !path.is_absolute() {
+        return Err(format!(
+            "the host passed a relative shared heph home ({shared_home:?}); it must be absolute"
+        ));
+    }
+    Ok(Some(path))
+}
+
+/// What the runner's container mounts, each at its own path: the workspace
+/// tree, this checkout's home (its sandboxes), and the shared home's
+/// `scratch/` when it is not already under one of those.
+///
+/// Only `scratch/` of the shared home: a sandbox's scratch mounts are the one
+/// thing in a sandbox that points into it (staged inputs are in the checkout's
+/// home, presented credential files in the sandbox). Mounting the whole shared
+/// home would hand the container the main checkout's cache, credentials and
+/// locks for nothing. Outside a linked worktree the shared home is `home`, so
+/// the mounts are `[tree, home]`.
+fn container_mounts(
+    tree_root: &std::path::Path,
+    home: &std::path::Path,
+    shared_home: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut mounts = vec![tree_root.to_path_buf(), home.to_path_buf()];
+    if let Some(shared) = shared_home {
+        let scratch = shared.join("scratch");
+        if !mounts.iter().any(|m| scratch.starts_with(m)) {
+            mounts.push(scratch);
+        }
+    }
+    mounts
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// The home a cdylib host passed in `CreateConfig.home`, checked: the proto
@@ -108,15 +161,24 @@ pub fn home_from_host(home: &str) -> Result<std::path::PathBuf, String> {
 }
 
 impl Driver {
-    pub fn new(home: impl Into<std::path::PathBuf>) -> Self {
-        Self::from_host_home(Ok(home.into()))
+    /// `home` is this checkout's (`PluginInit.home`), `shared_home` the one
+    /// every checkout shares (`PluginInit.shared_home`).
+    pub fn new(
+        home: impl Into<std::path::PathBuf>,
+        shared_home: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self::from_host_home(Ok(home.into()), Ok(Some(shared_home.into())))
     }
 
-    /// A driver over a home that may be unusable; see [`Self::home`].
-    pub fn from_host_home(home: Result<std::path::PathBuf, String>) -> Self {
+    /// A driver over homes that may be unusable; see [`Self::home`].
+    pub fn from_host_home(
+        home: Result<std::path::PathBuf, String>,
+        shared_home: Result<Option<std::path::PathBuf>, String>,
+    ) -> Self {
         Self {
             docker_bin: "docker".to_string(),
             home,
+            shared_home,
         }
     }
 
@@ -233,6 +295,21 @@ impl ManagedDriver for Driver {
                  The heph binary and the OCI plugin are likely mismatched versions."
             )
         })?;
+        let shared_home = match &self.shared_home {
+            Ok(Some(p)) => Some(p.as_path()),
+            Ok(None) => {
+                tracing::warn!(
+                    "oci_runner: the host passed no shared heph home (heph older than plugin ABI \
+                     0.16.0); mounting only this checkout's home. In a linked git worktree, \
+                     scratch caches will not resolve inside the container — upgrade heph."
+                );
+                None
+            }
+            Err(why) => anyhow::bail!(
+                "oci_runner cannot mount heph's shared home into the container: {why}. \
+                 The heph binary and the OCI plugin are likely mismatched versions."
+            ),
+        };
         let def = req.request.target.def_de::<OciRunnerDef>().clone();
 
         // The digest, from the daemon. Resolved rather than trusted: a tag is a
@@ -274,10 +351,12 @@ impl ManagedDriver for Driver {
         // and that is exactly what stopped a container check from working on a
         // macOS host, where the binary is Darwin and the image is Linux.
         // `docker exec` needs nothing of heph inside the image.
-        let tree_root = req.request.tree_root_path.to_string_lossy().into_owned();
-        // Sandboxes and the agent socket both live under heph's home, and the
-        // container needs to see both at their own paths.
-        let heph_home = heph_home.to_string_lossy().into_owned();
+        //
+        // Sandboxes and the agent socket both live under this checkout's
+        // home, and the container needs to see both at their own paths. A
+        // sandbox's scratch mounts are symlinks into the *shared* home's
+        // `scratch/`, so in a linked worktree that directory is mounted too.
+        let mounts = container_mounts(&req.request.tree_root_path, heph_home, shared_home);
 
         // Named `oci`, not `session`: this plugin implements the runner. See
         // `pluginoci::exec_runner` for why a held `docker run` was the wrong
@@ -298,7 +377,7 @@ impl ManagedDriver for Driver {
                 // be the one the fingerprint describes, even if the tag moves
                 // mid-build.
                 "image": digest,
-                "mounts": [tree_root, heph_home],
+                "mounts": mounts,
                 "run_args": def.run_args.clone(),
                 "docker": self.docker_bin.clone(),
             },
@@ -335,5 +414,39 @@ mod tests {
     fn a_relative_host_home_is_refused() {
         let err = home_from_host(".heph").expect_err("relative");
         assert!(err.contains("must be absolute"), "{err}");
+    }
+
+    /// An old host sends no `shared_home`: not an error, the runner mounts the
+    /// checkout home alone, as it did before the field existed.
+    #[test]
+    fn an_empty_shared_home_is_absent_not_an_error() {
+        assert_eq!(shared_home_from_host(""), Ok(None));
+        assert_eq!(
+            shared_home_from_host("/main/.heph"),
+            Ok(Some(std::path::PathBuf::from("/main/.heph")))
+        );
+        let err = shared_home_from_host("rel").expect_err("relative");
+        assert!(err.contains("must be absolute"), "{err}");
+    }
+
+    #[test]
+    fn mounts_both_homes_once_each() {
+        let p = std::path::Path::new;
+        // A linked worktree: the tree, its own home, and the shared home's
+        // scratch store — not the rest of the shared home.
+        assert_eq!(
+            container_mounts(p("/wt"), p("/wt/.heph"), Some(p("/main/.heph"))),
+            ["/wt", "/wt/.heph", "/main/.heph/scratch"]
+        );
+        // Outside a worktree the homes are one directory: mounted once.
+        assert_eq!(
+            container_mounts(p("/repo"), p("/repo/.heph"), Some(p("/repo/.heph"))),
+            ["/repo", "/repo/.heph"]
+        );
+        // An old host: the checkout home alone.
+        assert_eq!(
+            container_mounts(p("/repo"), p("/repo/.heph"), None),
+            ["/repo", "/repo/.heph"]
+        );
     }
 }

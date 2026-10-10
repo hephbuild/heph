@@ -92,6 +92,23 @@ pub fn telemetry_enabled_from_config() -> bool {
         .unwrap_or(true)
 }
 
+/// The nix driver, with its state dir in the checkout's home, and its gcroots
+/// registered for `heph tool gc` to sweep.
+///
+/// The checkout's home, not the shared one: a nix target never goes to a
+/// remote cache, so its revisions live in the checkout's own store
+/// (`CacheScope::Checkout`), and gc judges a root against the stores of the
+/// checkout it runs in. In the shared home, a root would belong to a worktree
+/// whose store the gc of another checkout cannot see.
+fn register_nix_driver(
+    e: &mut engine::Engine,
+    checkout_home: &engine::CheckoutHome,
+) -> anyhow::Result<()> {
+    let state_dir = checkout_home.join("nix-driver");
+    e.register_revision_pins(pluginnix::gcroots_dir(&state_dir));
+    e.register_managed_driver(move |_| Box::new(pluginnix::Driver::new(state_dir)))
+}
+
 /// Build the engine for this invocation.
 ///
 /// Takes nothing from the CLI. Everything a *run* can switch — `--force`,
@@ -158,7 +175,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // a startup hang is likeliest — so they land beside the stall log and the
     // in-flight report rather than in the temp-dir fallback. Every command routes
     // through here, so every command gets it.
-    crate::diag::set_dump_dir(&config.home_dir);
+    crate::diag::set_dump_dir(config.homes.shared());
 
     // The kill switch for listed facts: every candidate a fact would have
     // decided is resolved instead. Read here, never by the engine. It is
@@ -171,9 +188,9 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     );
 
     // Captured before `config` is moved into the engine: the nix driver's state
-    // dir hangs off `home_dir`, and telemetry reports the remote-cache backend
-    // kinds (scheme only — never the URIs).
-    let home_dir = config.home_dir.clone();
+    // dir hangs off the checkout's home, and telemetry reports the remote-cache
+    // backend kinds (scheme only — never the URIs).
+    let checkout_home = config.homes.checkout().clone();
     let remote_cache_backends: Vec<String> = config
         .remote_caches
         .iter()
@@ -202,7 +219,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // a separate cdylib loaded from a `path:`/`url:` manifest entry
     // (`heph-oci-plugin.json`), under their own `docker_build` / `oci_pull` /
     // `oci_push` / `oci_load` names.
-    e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
+    register_nix_driver(&mut e, &checkout_home)?;
 
     register_builtin_factories(&mut e)?;
 
@@ -339,7 +356,7 @@ mod tests {
         let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml)?;
         let dir = tempfile::tempdir()?;
         let config = file.resolve(dir.path())?;
-        let home_dir = config.home_dir.clone();
+        let checkout_home = config.homes.checkout().clone();
         let mut e = engine::Engine::new(config)?;
 
         // `fs` is auto-registered by `Engine::new`.
@@ -347,9 +364,7 @@ mod tests {
         e.register_driver(|_| Box::new(pluginhostbin::Driver))?;
         e.register_driver(|_| Box::new(plugintextfile::Driver))?;
         e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
-        e.register_managed_driver(|_| {
-            Box::new(pluginnix::Driver::new(home_dir.join("nix-driver")))
-        })?;
+        register_nix_driver(&mut e, &checkout_home)?;
 
         register_builtin_factories(&mut e)?;
 

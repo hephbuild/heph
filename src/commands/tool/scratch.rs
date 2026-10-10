@@ -323,11 +323,12 @@ async fn head_trace(
     // skipped straight to the network would name the wrong winner in exactly the
     // case this command exists for: a fresh branch on a machine that has built
     // its base.
-    let local = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, &scope);
-    let head_of = |sc: &str| crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, sc);
+    let local = crate::engine::scratch_remote::scope_head_dir(&engine.shared_home, &slot, &scope);
+    let head_of =
+        |sc: &str| crate::engine::scratch_remote::scope_head_dir(&engine.shared_home, &slot, sc);
 
     let trace = local_trace(
-        &engine.home,
+        &engine.shared_home,
         &slot,
         &scope,
         &fallbacks,
@@ -458,7 +459,10 @@ async fn path(addr: &str) -> anyhow::Result<()> {
         .find(|s| s.meta.as_ref().is_some_and(|m| m.addr == addr));
     match found {
         Some(slot) => {
-            println!("{}", store_root(&engine.home).join(&slot.slot).display());
+            println!(
+                "{}",
+                store_root(&engine.shared_home).join(&slot.slot).display()
+            );
             Ok(())
         }
         // Not an error to be cold — a cache that has never been built has no
@@ -527,13 +531,14 @@ async fn push(addr: Option<&str>, all: bool, force: bool, producer: String) -> a
             .as_ref()
             .map(|m| m.addr.clone())
             .unwrap_or_else(|| slot.slot.clone());
-        let dir = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot.slot, &scope);
+        let dir =
+            crate::engine::scratch_remote::scope_head_dir(&engine.shared_home, &slot.slot, &scope);
         if !dir.is_dir() {
             println!("{name}: nothing built in this lineage, skipped");
             continue;
         }
         let parent =
-            crate::engine::scratch_remote::read_local_meta(&engine.home, &slot.slot, &scope);
+            crate::engine::scratch_remote::read_local_meta(&engine.shared_home, &slot.slot, &scope);
         let parent = if force { None } else { parent };
         match engine
             .scratch_push(&slot.slot, &scope, &dir, parent.as_ref(), &producer)
@@ -673,11 +678,11 @@ async fn pull_selected(
             outln!(out, "{addr}: nothing published for this branch");
             continue;
         };
-        let dir = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, &scope);
+        let dir = crate::engine::scratch_remote::scope_head_dir(&engine.shared_home, &slot, &scope);
         match engine.scratch_pull(&head, &dir).await {
             Ok(bytes) => {
                 crate::engine::scratch_remote::write_local_meta(
-                    &engine.home,
+                    &engine.shared_home,
                     &slot,
                     &scope,
                     &head.meta,
@@ -688,7 +693,7 @@ async fn pull_selected(
                 // stops describing itself the moment it is populated any way but
                 // by building.
                 crate::engine::scratch_store::write_slot_meta(
-                    &engine.home,
+                    &engine.shared_home,
                     &slot,
                     &crate::engine::scratch_store::SlotMeta {
                         format: 1,

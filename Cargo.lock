@@ -838,6 +838,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "memoize",
+ "rustix",
  "serde",
  "serde_yaml",
  "tempfile",
@@ -6261,6 +6262,7 @@ name = "testkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "config",
  "execrunner",
  "heph",
  "tempfile",

@@ -7,12 +7,16 @@ edition = "2024"
 workspace = true
 
 [features]
-# `HomeDir::for_tests`. Enabled by the engine's own `test-support`.
+# `HomeDir::for_tests`, `Homes::for_tests` and `git_checkout::test_layout`
+# (hand-built git worktree layouts). Enabled by the engine's own
+# `test-support`; never by a binary.
 test-support = []
 
 [dependencies]
 anyhow = "1.0.102"
 memoize = "0.6.0"
+# `access(W_OK)` on the main checkout's home before sharing it.
+rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tracing = "0.1"

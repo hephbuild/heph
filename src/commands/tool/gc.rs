@@ -53,6 +53,24 @@ impl App for GcApp {
             .engine
             .new_state_with_events(self.fail_fast, ctx.event_sender());
         let res = self.engine.clone().gc_all(rs.clone()).await;
+        // Not in the progress summary, which counts what was removed: this is
+        // what was deliberately *not* looked at, and why.
+        if let Ok(stats) = &res
+            && let Some(sharing) = &stats.orphan_sweep_skipped
+        {
+            println!(
+                "{}",
+                orphan_sweep_skipped_message(sharing, stats.orphans_kept)
+            );
+        }
+        if let Ok(stats) = &res
+            && stats.revision_pins_removed > 0
+        {
+            println!(
+                "Removed {} nix gcroot(s) of revisions no longer cached.",
+                stats.revision_pins_removed
+            );
+        }
 
         // Scratch caches are swept here too, because nothing else bounds them:
         // they are keyed by a declaration rather than by an input hash, so there
@@ -75,6 +93,23 @@ impl App for GcApp {
         // no extra print here, which would duplicate it.
         crate::commands::errors::finalize!(ctx, rs, res, _stats => { Ok(()) })
     }
+}
+
+/// Why the orphan sweep was skipped, as sentences: what the home is shared
+/// with, what was kept, any registered worktree that no longer exists (it
+/// keeps the home counted as shared), and the opt-out.
+fn orphan_sweep_skipped_message(sharing: &crate::engine::HomeSharing, kept: usize) -> String {
+    let mut msg = format!(
+        "Orphan sweep skipped: the home is {sharing}, so {kept} target(s) that do not resolve \
+         here were kept."
+    );
+    if let Some(note) = sharing.stale_worktrees_note() {
+        msg.push(' ');
+        msg.push_str(&note);
+        msg.push('.');
+    }
+    msg.push_str(" To give each checkout its own home, set `worktree.shareHome: false`.");
+    msg
 }
 
 pub fn execute(args: &GcArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
@@ -103,4 +138,31 @@ async fn execute_async(_args: GcArgs, sink: LogSink, global: GlobalOptions) -> a
 mod tests {
     use super::*;
     use hcore::units::parse_size;
+
+    #[test]
+    fn orphan_sweep_message_reads_as_sentences() {
+        let sharing = crate::engine::HomeSharing::Main {
+            worktrees: crate::engine::git_checkout::LinkedWorktrees {
+                registered: 3,
+                missing: 2,
+            },
+        };
+        assert_eq!(
+            orphan_sweep_skipped_message(&sharing, 4),
+            "Orphan sweep skipped: the home is shared with 3 linked worktree(s), so 4 target(s) \
+             that do not resolve here were kept. 2 registered worktree(s) no longer exist; run \
+             `git worktree prune`. To give each checkout its own home, set \
+             `worktree.shareHome: false`."
+        );
+        let none_missing = crate::engine::HomeSharing::Main {
+            worktrees: crate::engine::git_checkout::LinkedWorktrees {
+                registered: 1,
+                missing: 0,
+            },
+        };
+        assert!(
+            !orphan_sweep_skipped_message(&none_missing, 0).contains("prune"),
+            "no prune advice when every worktree exists"
+        );
+    }
 }

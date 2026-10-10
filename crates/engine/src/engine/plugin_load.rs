@@ -41,8 +41,13 @@ impl Engine {
             }
         }
         let root = self.cfg.root.clone();
-        let home = self.home.clone();
-        load_dylib_plugins(self, &root, &home, manifests)
+        // A cdylib's `home` is for its own per-checkout state (the Go plugin's
+        // fswalk db is the only reader): the checkout's home, not the shared one.
+        // The shared home rides beside it for the OCI runner, which mounts both
+        // (a sandbox's scratch symlinks point into the shared home).
+        let home = self.checkout_home.clone();
+        let shared_home = self.shared_home.clone();
+        load_dylib_plugins(self, &root, &home, &shared_home, manifests)
     }
 }
 
@@ -79,6 +84,7 @@ fn load_dylib_plugins(
     e: &mut Engine,
     root: &std::path::Path,
     home_dir: &std::path::Path,
+    shared_home: &std::path::Path,
     manifests: Vec<ManifestPlugin>,
 ) -> anyhow::Result<()> {
     use rayon::prelude::*;
@@ -88,12 +94,19 @@ fn load_dylib_plugins(
     }
     let root_str = root.to_string_lossy().into_owned();
     let home_str = home_dir.to_string_lossy().into_owned();
+    let shared_home_str = shared_home.to_string_lossy().into_owned();
     let loaded = manifests
         .into_par_iter()
         .map(|m| -> anyhow::Result<_> {
             let dylib = resolve_manifest_dylib(&m.identifier, m.checksum.as_deref(), root)?;
-            hplugin_stabby::load_stable::load(&dylib, &root_str, &home_str, m.options)
-                .with_context(|| format!("load plugin dylib {}", dylib.display()))
+            hplugin_stabby::load_stable::load(
+                &dylib,
+                &root_str,
+                &home_str,
+                &shared_home_str,
+                m.options,
+            )
+            .with_context(|| format!("load plugin dylib {}", dylib.display()))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -120,6 +133,7 @@ fn load_dylib_plugins(
     _e: &mut Engine,
     _root: &std::path::Path,
     _home_dir: &std::path::Path,
+    _shared_home: &std::path::Path,
     manifests: Vec<ManifestPlugin>,
 ) -> anyhow::Result<()> {
     if manifests.is_empty() {

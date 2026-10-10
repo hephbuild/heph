@@ -81,6 +81,21 @@ pub struct ConfigYaml {
     pub caches: BTreeMap<String, RemoteCacheConfigPatch>,
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+    /// Linked git worktree behaviour. See [`WorktreeConfig`].
+    #[serde(default)]
+    pub worktree: Option<WorktreeConfig>,
+}
+
+/// Linked git worktree behaviour: `worktree: { shareHome: false }`.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WorktreeConfig {
+    /// In a linked worktree, use the main checkout's home (and so its cache)
+    /// instead of one under this checkout. Sandboxes, the filesystem-walk cache
+    /// and approvals stay per checkout either way. Defaults to `true`; an
+    /// absolute `homeDir` is used as written regardless.
+    #[serde(default)]
+    pub share_home: Option<bool>,
 }
 
 /// One resolved named remote cache: `caches: { name: { uri, read, write } }`.
@@ -253,6 +268,12 @@ impl ConfigYaml {
         self.telemetry.map(|t| t.enabled).unwrap_or(true)
     }
 
+    /// Whether a linked git worktree shares the main checkout's home
+    /// (`worktree.shareHome`, default `true`).
+    pub fn share_home(&self) -> bool {
+        self.worktree.and_then(|w| w.share_home).unwrap_or(true)
+    }
+
     /// Finalize the layered cache patches into resolved configs, applying field
     /// defaults. Errors if any cache never had its required `uri` set.
     pub fn resolved_caches(&self) -> anyhow::Result<BTreeMap<String, RemoteCacheConfig>> {
@@ -300,6 +321,12 @@ impl ConfigYaml {
         }
         if other.telemetry.is_some() {
             self.telemetry = other.telemetry;
+        }
+        if let Some(w) = other.worktree {
+            let base = self.worktree.get_or_insert_default();
+            if w.share_home.is_some() {
+                base.share_home = w.share_home;
+            }
         }
 
         // Caches deep-merge by key: a profile patches individual fields (e.g.
@@ -1234,6 +1261,29 @@ caches:
             base.lock.expect("lock survives").backend,
             Some(LockBackendConfig::Fs)
         );
+    }
+
+    #[test]
+    fn worktree_share_home_parses_defaults_and_merges() {
+        assert!(ConfigYaml::default().share_home(), "on by default");
+
+        let mut base: ConfigYaml =
+            serde_yaml::from_str("worktree:\n  shareHome: false\n").expect("parse base");
+        assert!(!base.share_home());
+
+        // A profile that does not mention it leaves the base value.
+        base.merge(serde_yaml::from_str("homeDir: .p\n").expect("parse"));
+        assert!(!base.share_home());
+        // An empty section patches nothing.
+        base.merge(serde_yaml::from_str("worktree: {}\n").expect("parse"));
+        assert!(!base.share_home());
+        // A profile that sets it wins.
+        base.merge(serde_yaml::from_str("worktree:\n  shareHome: true\n").expect("parse"));
+        assert!(base.share_home());
+
+        let err = serde_yaml::from_str::<ConfigYaml>("worktree:\n  share_home: false\n")
+            .expect_err("snake_case is not the key");
+        assert!(err.to_string().contains("share_home"), "{err}");
     }
 
     #[test]

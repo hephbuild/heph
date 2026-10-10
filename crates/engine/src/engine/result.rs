@@ -23,7 +23,9 @@ use hmodel::htpkg::PkgBuf;
 
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
-use crate::engine::local_cache::{BlobResidency, CacheArtifact, Manifest, ManifestArtifactType};
+use crate::engine::local_cache::{
+    BlobResidency, CacheArtifact, CacheScope, Manifest, ManifestArtifactType,
+};
 use crate::engine::remote_cache::RemoteRevision;
 use crate::engine::result_lock::ResultReadGuard;
 use anyhow::Context;
@@ -1070,6 +1072,8 @@ pub(crate) struct LockedResolution {
 /// resolve-then-use path, and never a meta-only edge (see
 /// [`MemoResult::claim`]).
 pub(crate) struct GuardSlot {
+    /// The store the revision is in, so a revalidation reads the same one.
+    scope: CacheScope,
     addr: Addr,
     hashin: String,
     /// What the revision looked like when this request resolved it.
@@ -1126,6 +1130,7 @@ fn manifest_hashouts(manifest: &Manifest) -> Vec<&str> {
 impl GuardSlot {
     /// The slot, and the strong guard to hand to the cell's creator.
     fn new(
+        scope: CacheScope,
         addr: &Addr,
         hashin: &str,
         resolved: Resolved,
@@ -1133,6 +1138,7 @@ impl GuardSlot {
     ) -> (Arc<Self>, Arc<ResultReadGuard>) {
         let read = Arc::new(read);
         let slot = Arc::new(Self {
+            scope,
             addr: addr.clone(),
             hashin: hashin.to_owned(),
             resolved,
@@ -1173,7 +1179,7 @@ impl GuardSlot {
     /// Whether the revision on disk is still the one this request resolved.
     async fn validate(&self, engine: &Engine, rs: &RequestState) -> anyhow::Result<()> {
         let manifest = engine
-            .read_manifest_blocking(rs.ctoken(), &self.addr, &self.hashin)
+            .read_manifest_blocking(self.scope, rs.ctoken(), &self.addr, &self.hashin)
             .await
             .with_context(|| format!("revalidating {} {}", self.addr, self.hashin))?;
         let unchanged = manifest.is_some_and(|m| manifest_hashouts(&m) == self.resolved.hashouts());
@@ -2466,6 +2472,7 @@ impl Engine {
                         {
                             Some(residency) => {
                                 self.artifacts_from_manifest(
+                                    CacheScope::of(&def.target.cache),
                                     rs.ctoken(),
                                     &def.target.addr,
                                     opts.hashin.as_str(),
@@ -2507,11 +2514,22 @@ impl Engine {
                     //
                     // This executes under the riding *read* lock of the revision
                     // rather than the gateway + write lock the miss path holds.
-                    // The *run* itself is still exclusive per addr: `execute`
-                    // takes the target's execute lock, so it cannot share the
-                    // per-addr sandbox with any other build of this target. What
-                    // remains open is the cache entry, a real, accepted exemption
-                    // rather than a proof of safety:
+                    // Two locks still order it:
+                    //
+                    // - the target's **execute** lock, per checkout: no other
+                    //   build of this target in this checkout shares its
+                    //   per-addr sandbox. In a linked worktree a second
+                    //   checkout has its own sandbox and its own execute lock,
+                    //   so this lock alone does not stop two checkouts
+                    //   rebuilding the one shared entry;
+                    // - so the revision's **rebuild** lock, in the shared lock
+                    //   dir, taken just before the execute lock
+                    //   (`execute_and_cache_inner(.., rebuild = true)`): one
+                    //   rebuild of this revision at a time across every process
+                    //   and checkout sharing the home.
+                    //
+                    // What remains open is the cache entry against *readers*, a
+                    // real, accepted exemption rather than a proof of safety:
                     //
                     // - In-process, the execute memoizer collapses concurrent
                     //   callers to one run, and `reconcile_rebuilt_hashouts` below
@@ -2524,7 +2542,8 @@ impl Engine {
                     //   `CacheArtifact::hashout()` reports the *manifest's* recorded
                     //   hashout, which nothing re-verifies against the bytes. If the
                     //   target is not reproducible, B can read A's new bytes under
-                    //   the old hashout.
+                    //   the old hashout. The rebuild lock makes B wait rather than
+                    //   rebuild alongside A, then rebuild again after it.
                     //
                     // Closing that would mean taking the write lock here — and this
                     // branch runs while THIS request holds a riding read on the
@@ -2572,7 +2591,7 @@ impl Engine {
                         htelemetry::telemetry::record_cache_hit_rebuilt();
                         let (cached, meta) = self
                             .clone()
-                            .execute_and_cache_inner(rs.clone(), opts)
+                            .execute_and_cache_inner(rs.clone(), opts, true)
                             .await?;
                         // The revision was already accepted as a hit before this
                         // rebuild, so a dependent may already have folded the
@@ -2663,7 +2682,14 @@ impl Engine {
     ) -> anyhow::Result<Option<BlobResidency>> {
         let addr = &def.target.addr;
         let missing = self
-            .missing_local_blobs(rs.ctoken(), addr, hashin, manifest, outputs)
+            .missing_local_blobs(
+                CacheScope::of(&def.target.cache),
+                rs.ctoken(),
+                addr,
+                hashin,
+                manifest,
+                outputs,
+            )
             .await?;
         if missing.is_empty() {
             return Ok(Some(BlobResidency::Established));
@@ -2967,7 +2993,7 @@ impl Engine {
             };
             let (cached, meta) = self
                 .clone()
-                .execute_and_cache_inner(rs.clone(), opts)
+                .execute_and_cache_inner(rs.clone(), opts, false)
                 .await?;
             let executed = Arc::new(ExecutedArtifacts { cached, meta });
             let (guard, handed) = match write {
@@ -2980,6 +3006,7 @@ impl Engine {
                     let read = self.result_lock().read(addr, hashin, ctoken).await?;
                     drop(up);
                     let (slot, read) = GuardSlot::new(
+                        CacheScope::of(&def.target.cache),
                         addr,
                         hashin,
                         Resolved::Executed(Arc::clone(&executed)),
@@ -3019,8 +3046,13 @@ impl Engine {
             // Where its blobs live is left unresolved: a caller that needs bytes
             // and hasn't got them forces the cell, and one that only needs
             // hashouts never does.
-            let (slot, read) =
-                GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
+            let (slot, read) = GuardSlot::new(
+                CacheScope::of(&def.target.cache),
+                addr,
+                hashin,
+                Resolved::Hit(Arc::clone(&manifest)),
+                read,
+            );
             return Ok((
                 Arc::new(LockedResolution {
                     guard: Some(slot),
@@ -3142,7 +3174,7 @@ impl Engine {
                         }
                         let (cached, meta) = self
                             .clone()
-                            .execute_and_cache_inner(rs.clone(), opts)
+                            .execute_and_cache_inner(rs.clone(), opts, false)
                             .await?;
                         (
                             Some(Arc::new(ExecutedArtifacts { cached, meta })),
@@ -3171,7 +3203,13 @@ impl Engine {
             (None, Some(m)) => Resolved::Hit(Arc::clone(m)),
             (None, None) => anyhow::bail!("{addr}: resolved with neither a manifest nor outputs"),
         };
-        let (slot, read) = GuardSlot::new(addr, hashin, resolved, read);
+        let (slot, read) = GuardSlot::new(
+            CacheScope::of(&def.target.cache),
+            addr,
+            hashin,
+            resolved,
+            read,
+        );
         Ok((
             Arc::new(LockedResolution {
                 guard: Some(slot),
@@ -3506,10 +3544,15 @@ impl Engine {
 
     // Memoized by addr:hashin — at most one execute+cache cycle runs per target per request,
     // preventing double-execute when the same target is requested with different output matchers.
+    //
+    // `rebuild`: this run rebuilds a revision already announced as a hit,
+    // under its riding read (see `execute_and_cache`). The run then takes the
+    // revision's shared rebuild lock before its execute lock.
     async fn execute_and_cache_inner(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         opts: &ExecuteOptions<'_>,
+        rebuild: bool,
     ) -> anyhow::Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>)> {
         let addr = opts.def.target.addr.clone();
         let hashin = opts.hashin.clone();
@@ -3541,7 +3584,7 @@ impl Engine {
                     // `cache_locally`, which reads the outputs out of the sandbox.
                     let (artifacts, sandbox_teardown, sandbox_guards, _execute_guard) = engine
                         .clone()
-                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false)
+                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false, rebuild)
                         .await
                         .with_context(|| format!("execute {addr}"))?;
 
@@ -3613,6 +3656,7 @@ impl Engine {
                                 }
                             },
                             engine.cache_locally(
+                                CacheScope::of(&def.target.cache),
                                 rs.ctoken(),
                                 &addr,
                                 &hashin,
@@ -3654,7 +3698,12 @@ impl Engine {
                     // `RequestState::defer_trim` submits it later, onto the
                     // bookkeeping lane and still fire-and-forget.
                     if out.is_ok() && !use_tmp_cache {
-                        rs.defer_trim(&addr, def.target.cache.history, hashin);
+                        rs.defer_trim(
+                            CacheScope::of(&def.target.cache),
+                            &addr,
+                            def.target.cache.history,
+                            hashin,
+                        );
                     }
 
                     // Completion path of the sandbox teardown. The teardown is
@@ -3919,9 +3968,10 @@ impl Engine {
         // Blob copy is synchronous IO — run it off the async poll like every
         // other cache write (see `cache_artifact_locally`).
         let primary = opts.hashin.clone();
+        let scope = CacheScope::of(&opts.def.target.cache);
         let dup = hcore::blocking::run(enclose!(
             (self => engine, addr, fixpoint, primary) move || {
-                engine.duplicate_cache_revision(&addr, &primary, &fixpoint)
+                engine.duplicate_cache_revision(scope, &addr, &primary, &fixpoint)
             }
         ))
         .await;
@@ -3992,7 +4042,7 @@ impl Engine {
         let addr = &def.target.addr;
         let hashin = opts.hashin.as_str();
         let hit = self
-            .read_manifest_blocking(rs.ctoken(), addr, hashin)
+            .read_manifest_blocking(CacheScope::of(&def.target.cache), rs.ctoken(), addr, hashin)
             .await?
             .map(Arc::new);
         if hit.is_some() && !rs.hash_only() {
@@ -4750,7 +4800,11 @@ mod tests {
     #[tokio::test]
     async fn guarded_artifact_forwards_the_direct_open_fast_paths() {
         let dir = tempdir().expect("tempdir");
-        let lock = SArc::new(ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()));
+        let lock = SArc::new(ResultLock::new(
+            LockBackend::Mem,
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
         let addr = Addr::new(PkgBuf::from("pkg"), "x".to_string(), BTreeMap::new());
         let read = lock
             .read(&addr, "h", &StdCancellationToken::new())
@@ -4790,7 +4844,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn guarded_artifact_holds_read_lock_until_all_handles_drop() {
         let dir = tempdir().expect("tempdir");
-        let lock = SArc::new(ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()));
+        let lock = SArc::new(ResultLock::new(
+            LockBackend::Mem,
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
         let addr = Addr::new(PkgBuf::from("pkg"), "x".to_string(), BTreeMap::new());
 
         let read = lock
@@ -6113,7 +6171,7 @@ mod tests {
         // and then cannot produce them.
         let (engine, _home) = engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
         let mut engine = engine;
-        let home = engine.home.to_path_buf();
+        let home = engine.shared_home.to_path_buf();
         Arc::get_mut(&mut engine)
             .expect("engine must not be shared yet")
             .remote_caches = crate::engine::RemoteCacheSet::with_backend(
@@ -6223,7 +6281,7 @@ mod tests {
         backend: Arc<CountingRemoteBackend>,
     ) -> Arc<Engine> {
         let mut engine = engine;
-        let home = engine.home.to_path_buf();
+        let home = engine.shared_home.to_path_buf();
         Arc::get_mut(&mut engine)
             .expect("engine must not be shared yet")
             .remote_caches = crate::engine::RemoteCacheSet::with_backend(backend, home);

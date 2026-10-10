@@ -986,6 +986,7 @@ impl Engine {
                 // The outputs are material: a failure must not leave them in a
                 // sandbox kept for diagnostics.
                 true,
+                false,
             )
             .await;
 
@@ -1485,7 +1486,7 @@ impl Engine {
     }
 
     fn credential_store(&self) -> CredentialStore {
-        CredentialStore::new(&self.home)
+        CredentialStore::new(&self.shared_home)
     }
 
     /// The cross-process acquisition lock for one resolution key.

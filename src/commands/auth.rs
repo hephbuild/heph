@@ -326,7 +326,7 @@ fn cached_expiry(
     addr: &Addr,
     source: &hbuiltins::plugincredential::SourceDecl,
 ) -> Option<String> {
-    let store = crate::engine::CredentialStore::new(&engine.home);
+    let store = crate::engine::CredentialStore::new(&engine.shared_home);
     let key = crate::engine::credential_store::resolution_key(
         &addr.format(),
         &serde_json::to_string(&source.kind).unwrap_or_default(),
@@ -540,7 +540,7 @@ async fn logout() -> anyhow::Result<()> {
     // clearing only the disk would make this command mean something different
     // depending on who called it.
     engine.forget_credentials();
-    let store = crate::engine::CredentialStore::new(&engine.home);
+    let store = crate::engine::CredentialStore::new(&engine.shared_home);
     store.clear()?;
     println!("cleared {}", store.root().display());
     Ok(())

@@ -376,8 +376,8 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     let watchdog = (!global.stall_notice.is_zero()).then(|| {
         let threshold = global.stall_notice;
         let diag_sink = sink.clone();
-        let log = hengine::engine::diag::StallLog::new(&engine.home);
-        let inflight = hengine::engine::diag::InflightLog::new(&engine.home);
+        let log = hengine::engine::diag::StallLog::new(&engine.shared_home);
+        let inflight = hengine::engine::diag::InflightLog::new(&engine.shared_home);
         hengine::engine::diag::Watchdog::spawn(
             std::sync::Arc::clone(hengine::engine::diag::global()),
             threshold,

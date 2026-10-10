@@ -36,6 +36,7 @@
 //! would leave targets resolving paths that do not exist. That constraint is
 //! unchanged from the `session` form and is why the mounts are not configurable.
 
+use anyhow::Context as _;
 use hexecrunner::SpecRewrite;
 use hexecrunner::registry::{ExecRunner, RunnerCtx};
 use serde::Deserialize;
@@ -161,6 +162,10 @@ impl OciRunner {
 
         let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--rm".into()];
         for m in &cfg.mounts {
+            // A bind source that does not exist is created by the docker
+            // daemon — as root, on Linux — which would leave e.g. the shared
+            // home's `scratch/` unwritable by heph. Create it as this user.
+            std::fs::create_dir_all(m).with_context(|| format!("create mount source {m}"))?;
             args.push("-v".into());
             args.push(format!("{m}:{m}"));
         }

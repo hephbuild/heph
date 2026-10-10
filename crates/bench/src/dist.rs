@@ -151,20 +151,22 @@ impl Scenario {
     }
 }
 
-/// The corpus's heph home, resolved from its config the way the binary does.
-fn cache_dir(corpus: &Path) -> Result<heph::engine::HomeDir> {
+/// The corpus's heph homes, resolved from its config the way the binary does.
+fn cache_dir(corpus: &Path) -> Result<heph::engine::Homes> {
     use heph::engine::ConfigYamlExt as _;
     Ok(heph::engine::config_yaml::load_from_root(corpus)
         .context("load corpus config")?
         .resolve(corpus)
         .context("resolve corpus config")?
-        .home_dir)
+        .homes)
 }
 
 fn wipe_cache(corpus: &Path) -> Result<()> {
-    let dir = cache_dir(corpus)?;
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    let homes = cache_dir(corpus)?;
+    for dir in [homes.shared().as_path(), homes.checkout().as_path()] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()))?;
+        }
     }
     Ok(())
 }

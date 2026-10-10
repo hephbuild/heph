@@ -7,7 +7,12 @@
 //! - [`Engine::gc_all`] — the `heph gc` sweep. For every `(addr, hashin)` group
 //!   in the cache: if the target no longer resolves (`get_spec` →
 //!   `TargetNotFoundError`) every revision is dropped; otherwise the target is
-//!   trimmed to its `cache.history` newest revisions.
+//!   trimmed to its `cache.history` newest revisions — in the shared store of
+//!   a shared home, `history × checkouts` ([`Engine::history_limit`]). When
+//!   the home is shared with other git worktrees the first rule is off (see
+//!   [`GcStats::orphan_sweep_skipped`]). Then the registered revision pins
+//!   (nix gcroots) whose revision is gone are removed (see
+//!   [`Engine::register_revision_pins`]).
 //! - [`Engine::try_trim_after_write`] — the post-write trim. Non-blocking: it
 //!   trims the just-written target only if its lock is free, and never deletes
 //!   the revision that was just written. Deferred to the end of the request
@@ -21,11 +26,11 @@
 //! (`created_at_nanos`); the full artifact name list to delete comes from the
 //! same manifest.
 
-use crate::engine::Engine;
 use crate::engine::error::TargetNotFoundError;
-use crate::engine::local_cache::{Existence, MANIFEST_V1};
+use crate::engine::local_cache::{CacheScope, Existence, LocalCache, MANIFEST_V1};
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::TargetGuard;
+use crate::engine::{Engine, HomeSharing};
 use anyhow::{Context, Result};
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::{Addr, parse_addr};
@@ -146,9 +151,20 @@ pub struct GcStats {
     /// Rows pruned from the shared filesystem-walk cache (stale past the TTL or
     /// orphaned because their path no longer exists).
     pub fswalk_rows_removed: usize,
-    /// Staged read-only input entries (`<home>/stage/`) reclaimed because their
+    /// Staged read-only input entries (`<checkout home>/stage/`) reclaimed because their
     /// content hash is no longer referenced by any surviving manifest.
     pub stage_entries_removed: usize,
+    /// Revision pins (nix gcroots) removed because the revision they pinned is
+    /// no longer cached. See [`Engine::register_revision_pins`].
+    pub revision_pins_removed: usize,
+    /// Set when the orphan sweep was skipped because the home is shared with
+    /// other git checkouts (see [`HomeSharing::is_shared`]): a target that does
+    /// not resolve here may be another worktree's, so nothing is dropped for
+    /// not resolving. History trimming still ran.
+    pub orphan_sweep_skipped: Option<HomeSharing>,
+    /// Targets that did not resolve here but were kept because of
+    /// [`orphan_sweep_skipped`](Self::orphan_sweep_skipped).
+    pub orphans_kept: usize,
 }
 
 /// Per-target result of a GC pass, accumulated into [`GcStats`].
@@ -158,6 +174,37 @@ struct TargetOutcome {
     kept: usize,
     bytes: u64,
     orphan: bool,
+}
+
+/// One deferred post-write trim: the store, the target, how many revisions to
+/// keep, and the revision just written (never deleted).
+pub(crate) type TrimItem = (CacheScope, Addr, u32, String);
+
+/// How old a revision pin's sidecar must be before `heph tool gc` may remove
+/// the pin.
+///
+/// The locks alone do not cover a build's tail. A build commits its manifest
+/// into the sqlite write-behind queue (`SqliteCacheWriter::commit` only
+/// enqueues) and then lets go of the gateway and, when its request ends, of
+/// its riding read, without waiting for the writer thread's batch commit. A gc
+/// in another process cannot see that queued write, so in that window it finds
+/// the revision absent, takes both locks, and would remove the pin of a
+/// revision about to land. The driver rewrites the sidecar on every build of
+/// the revision, so a pin this young belongs to a build that may still be
+/// writing. An hour is far past any queue drain; a pin of a revision that
+/// really is gone waits one more `gc` at most.
+const PIN_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// Whether `sidecar` was written less than [`PIN_GRACE`] ago. Unreadable
+/// metadata, or an mtime in the future, counts as young: keeping a pin is
+/// always safe.
+fn pin_is_young(sidecar: &std::path::Path) -> bool {
+    let Ok(mtime) = std::fs::metadata(sidecar).and_then(|m| m.modified()) else {
+        return true;
+    };
+    std::time::SystemTime::now()
+        .duration_since(mtime)
+        .map_or(true, |age| age < PIN_GRACE)
 }
 
 /// What phase 1 decided for a target; applied under its lock in phase 2.
@@ -181,18 +228,18 @@ impl Engine {
     /// the *choice* of which ones differs. Callers must hold the addr's target
     /// lock and this revision's write lock (`ResultLock::try_write_revision` /
     /// `write_revision`).
-    pub(crate) fn gc_entry(&self, addr: &Addr, hashin: &str) -> Result<u64> {
+    pub(crate) fn gc_entry(&self, scope: CacheScope, addr: &Addr, hashin: &str) -> Result<u64> {
+        let cache = self.local_cache_for(scope)?;
         let mut bytes = 0u64;
-        if let Some(manifest) = self.read_manifest(addr, hashin)? {
+        if let Some(manifest) = Self::read_manifest_from(&cache, addr, hashin)? {
             for a in &manifest.artifacts {
                 // A manifest can name blobs that were never downloaded (a
                 // revision mirrored from a remote materializes lazily), so only
                 // count bytes actually reclaimed.
-                let present = self
-                    .local_cache
+                let present = cache
                     .exists(addr, hashin, &a.name)
                     .with_context(|| format!("probe cached artifact {} for {addr}", a.name))?;
-                self.local_cache
+                cache
                     .delete(addr, hashin, &a.name)
                     .with_context(|| format!("delete cached artifact {} for {addr}", a.name))?;
                 if present {
@@ -200,18 +247,35 @@ impl Engine {
                 }
             }
         }
-        self.local_cache
+        cache
             .delete(addr, hashin, MANIFEST_V1)
             .with_context(|| format!("delete manifest for {addr} {hashin}"))?;
         Ok(bytes)
     }
 
-    /// Clear all staged read-only inputs under `<home>/stage/`. Delegates to
+    /// The number of revisions of a target declaring `cache.history = history`
+    /// that `scope`'s store keeps. Every trim of a store goes through here —
+    /// the post-write trim and `heph gc` alike — so the two never disagree.
+    ///
+    /// The shared store holds every checkout's revisions of a target, so when
+    /// the home is shared its budget scales with the checkouts that use it
+    /// ([`HomeSharing::shared_history`]); otherwise two checkouts building
+    /// different revisions would evict each other. A checkout's own store is
+    /// one checkout's, and keeps plain `history`.
+    pub(crate) fn history_limit(&self, scope: CacheScope, history: u32) -> u32 {
+        match scope {
+            CacheScope::Shared => self.cfg.homes.sharing().shared_history(history),
+            CacheScope::Checkout => history,
+        }
+    }
+
+    /// Clear all staged read-only inputs under `<checkout home>/stage/` — the
+    /// checkout's, next to the sandboxes they link into. Delegates to
     /// [`hdriver_support::stage::clear_stage`] — the staging mechanism and its
     /// teardown live together in `driver-support`. Returns
     /// `(entries_removed, bytes_freed)`.
     fn gc_stage(&self) -> (usize, u64) {
-        hdriver_support::stage::clear_stage(&self.home.join("stage"))
+        hdriver_support::stage::clear_stage(&self.checkout_home.join("stage"))
     }
 
     /// Trim `addr`'s revisions to the `keep` newest (by `created_at_nanos`),
@@ -230,6 +294,7 @@ impl Engine {
     /// it once released.
     fn trim_addr_history(
         &self,
+        scope: CacheScope,
         target: &TargetGuard,
         addr: &Addr,
         hashins: &[String],
@@ -246,7 +311,7 @@ impl Engine {
                 // A revision whose manifest is unreadable sorts oldest (ts 0) so
                 // it is the first to be reclaimed.
                 let ts = self
-                    .read_manifest(addr, hashin)?
+                    .read_manifest(scope, addr, hashin)?
                     .map(|m| m.created_at_nanos)
                     .unwrap_or(0);
                 with_ts.push((hashin.as_str(), ts));
@@ -264,7 +329,7 @@ impl Engine {
                 kept += 1;
                 continue;
             }
-            match self.gc_revision(target, addr, hashin)? {
+            match self.gc_revision(scope, target, addr, hashin)? {
                 Some(freed) => {
                     bytes = bytes.saturating_add(freed);
                     removed += 1;
@@ -278,7 +343,13 @@ impl Engine {
     /// Delete one revision under its own write lock, taken without waiting.
     /// `Ok(None)` when it is in use and was left alone. See
     /// [`trim_addr_history`](Self::trim_addr_history).
-    fn gc_revision(&self, target: &TargetGuard, addr: &Addr, hashin: &str) -> Result<Option<u64>> {
+    fn gc_revision(
+        &self,
+        scope: CacheScope,
+        target: &TargetGuard,
+        addr: &Addr,
+        hashin: &str,
+    ) -> Result<Option<u64>> {
         let Some(_revision) = self
             .result_lock()
             .try_write_revision(target, addr, hashin)
@@ -287,9 +358,91 @@ impl Engine {
             tracing::debug!(%addr, hashin, "gc: revision in use, kept");
             return Ok(None);
         };
-        self.gc_entry(addr, hashin)
+        self.gc_entry(scope, addr, hashin)
             .with_context(|| format!("drop revision {hashin} of {addr}"))
             .map(Some)
+    }
+
+    /// Remove every registered revision pin whose revision is in none of this
+    /// checkout's stores. Returns how many were removed. Best-effort: a
+    /// failure is logged and the pin kept, never failing the sweep.
+    fn gc_revision_pins(&self) -> usize {
+        let mut removed = 0;
+        for dir in &self.revision_pin_dirs {
+            let pins = match hdriver_support::revision_pin::list(dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), dir = %dir.display(), "gc: listing revision pins failed");
+                    continue;
+                }
+            };
+            for pin in pins {
+                match self.gc_revision_pin(&pin) {
+                    Ok(true) => removed += 1,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        error = %format!("{e:#}"),
+                        addr = %pin.addr,
+                        hashin = %pin.hashin,
+                        "gc: revision pin kept"
+                    ),
+                }
+            }
+        }
+        removed
+    }
+
+    /// Remove `pin` if its revision is no longer cached. `Ok(false)` when it is
+    /// kept: the revision is cached, or is being built (the target's gateway is
+    /// held — the build may be about to write it) or read (its revision lock
+    /// is), the same lock-skipping as [`gc_revision`](Self::gc_revision). A pin
+    /// younger than [`PIN_GRACE`] is kept whatever the cache says (see there).
+    fn gc_revision_pin(&self, pin: &hdriver_support::revision_pin::Pin) -> Result<bool> {
+        if pin_is_young(&pin.paths.sidecar) {
+            tracing::debug!(addr = %pin.addr, hashin = %pin.hashin, "gc: revision pin kept, too recent");
+            return Ok(false);
+        }
+        // Unlocked first: a pin of a cached revision — the steady state — is
+        // kept without taking any lock.
+        if self.revision_cached(&pin.addr, &pin.hashin)? {
+            return Ok(false);
+        }
+        let lock = self.result_lock();
+        let Some(target) = lock
+            .try_lock_target(&pin.addr)
+            .with_context(|| format!("locking {}", pin.addr))?
+        else {
+            tracing::debug!(addr = %pin.addr, "gc: revision pin kept, target is being built");
+            return Ok(false);
+        };
+        let Some(_revision) = lock
+            .try_write_revision(&target, &pin.addr, &pin.hashin)
+            .with_context(|| format!("locking revision {} of {}", pin.hashin, pin.addr))?
+        else {
+            tracing::debug!(addr = %pin.addr, hashin = %pin.hashin, "gc: revision pin kept, revision in use");
+            return Ok(false);
+        };
+        // Again under the locks: a build that finished between the first check
+        // and the lock has written the revision.
+        if self.revision_cached(&pin.addr, &pin.hashin)? {
+            return Ok(false);
+        }
+        pin.remove()?;
+        tracing::debug!(addr = %pin.addr, hashin = %pin.hashin, "gc: revision pin removed");
+        Ok(true)
+    }
+
+    /// Whether revision `(addr, hashin)` is in any of this checkout's stores.
+    fn revision_cached(&self, addr: &Addr, hashin: &str) -> Result<bool> {
+        for (scope, cache) in self.local_caches()? {
+            if cache
+                .exists(addr, hashin, MANIFEST_V1)
+                .with_context(|| format!("probing {scope:?} store for {addr} {hashin}"))?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The target's cached revisions, logged under `stage` when the read fails.
@@ -298,8 +451,13 @@ impl Engine {
     /// [`TrimOutcome::Failed`] after logging, and threading an `anyhow::Error`
     /// through only to drop it invites a caller to propagate one instead — this is
     /// a fire-and-forget background lane.
-    fn revisions(&self, addr: &Addr, stage: &'static str) -> Option<Vec<String>> {
-        self.local_cache
+    fn revisions(
+        &self,
+        cache: &dyn LocalCache,
+        addr: &Addr,
+        stage: &'static str,
+    ) -> Option<Vec<String>> {
+        cache
             .list_target_entries(addr)
             .inspect_err(|e| {
                 tracing::debug!(error = %format!("{e:#}"), %addr, stage, "post-write gc enumerate");
@@ -362,11 +520,20 @@ impl Engine {
     /// the skip instead, with one immediate re-probe and one delayed retry.
     pub(crate) fn try_trim_after_write(
         &self,
+        scope: CacheScope,
         addr: &Addr,
         keep: u32,
         written_hashin: &str,
     ) -> TrimOutcome {
-        let Some(pre) = self.revisions(addr, "pre-count") else {
+        let keep = self.history_limit(scope, keep);
+        let cache = match self.local_cache_for(scope) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc store");
+                return TrimOutcome::Failed;
+            }
+        };
+        let Some(pre) = self.revisions(&*cache, addr, "pre-count") else {
             return TrimOutcome::Failed;
         };
         // Correct the count for our own write only when it cannot already see it.
@@ -375,10 +542,7 @@ impl Engine {
         let count = if pre.iter().any(|h| h == written_hashin) {
             pre.len()
         } else {
-            match self
-                .local_cache
-                .existence(addr, written_hashin, MANIFEST_V1)
-            {
+            match cache.existence(addr, written_hashin, MANIFEST_V1) {
                 // Queued or committed, the revision exists as far as a budget
                 // decision is concerned. `Queued` is dropped without awaiting: it
                 // is the answer, not something to wait on.
@@ -419,16 +583,23 @@ impl Engine {
                 // mem tier cannot answer from a stale resident entry. Each of those
                 // three is pinned by its own test; without them this is not a
                 // barrier at all, and the failure is silent.
-                if let Err(e) = self.local_cache.exists(addr, written_hashin, MANIFEST_V1) {
+                if let Err(e) = cache.exists(addr, written_hashin, MANIFEST_V1) {
                     tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc barrier");
                     return TrimOutcome::Failed;
                 }
                 // Re-listed under the lock: authoritative, and it may have grown
                 // since the unlocked pre-count above.
-                let Some(hashins) = self.revisions(addr, "locked") else {
+                let Some(hashins) = self.revisions(&*cache, addr, "locked") else {
                     return TrimOutcome::Failed;
                 };
-                match self.trim_addr_history(&guard, addr, &hashins, keep, Some(written_hashin)) {
+                match self.trim_addr_history(
+                    scope,
+                    &guard,
+                    addr,
+                    &hashins,
+                    keep,
+                    Some(written_hashin),
+                ) {
                     Ok((removed, _kept, bytes)) => TrimOutcome::Settled { removed, bytes },
                     Err(e) => {
                         tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc trim");
@@ -476,7 +647,7 @@ impl Engine {
     /// then the retry has no coverage at all.
     pub(crate) fn run_trim_batch_with_delay(
         &self,
-        trims: impl IntoIterator<Item = (Addr, u32, String)>,
+        trims: impl IntoIterator<Item = TrimItem>,
         delay: Duration,
     ) -> TrimBatchReport {
         let mut report = TrimBatchReport::default();
@@ -490,7 +661,7 @@ impl Engine {
         // and is *moved* into, never cloned into. Not pre-sized: the expected
         // subset is a straggler or two, and reserving the whole batch would cost
         // the full footprint on every run with a single one.
-        let mut contended: Vec<(Addr, u32, String)> = Vec::new();
+        let mut contended: Vec<TrimItem> = Vec::new();
         for trim in trims {
             report.batch += 1;
             self.attempt_trim(trim, &mut report, &mut contended);
@@ -506,7 +677,7 @@ impl Engine {
         // thread (see above), so a guard whose owner was torn down during the
         // first pass may already be free. One non-blocking `flock` per
         // contended addr to find out is a good trade against sleeping 25ms.
-        let mut delayed: Vec<(Addr, u32, String)> = Vec::new();
+        let mut delayed: Vec<TrimItem> = Vec::new();
         for trim in contended {
             self.attempt_trim(trim, &mut report, &mut delayed);
         }
@@ -519,8 +690,8 @@ impl Engine {
         // attempt.
         std::thread::sleep(delay);
 
-        for (addr, keep, hashin) in delayed {
-            match self.trim_contained(&addr, keep, &hashin) {
+        for (scope, addr, keep, hashin) in delayed {
+            match self.trim_contained(scope, &addr, keep, &hashin) {
                 TrimOutcome::Settled { removed, bytes } => {
                     report.removed += removed;
                     report.bytes = report.bytes.saturating_add(bytes);
@@ -551,11 +722,11 @@ impl Engine {
     /// (empty) `Vec`.
     fn attempt_trim(
         &self,
-        trim: (Addr, u32, String),
+        trim: TrimItem,
         report: &mut TrimBatchReport,
-        again: &mut Vec<(Addr, u32, String)>,
+        again: &mut Vec<TrimItem>,
     ) {
-        match self.trim_contained(&trim.0, trim.1, &trim.2) {
+        match self.trim_contained(trim.0, &trim.1, trim.2, &trim.3) {
             TrimOutcome::Settled { removed, bytes } => {
                 report.removed += removed;
                 report.bytes = report.bytes.saturating_add(bytes);
@@ -572,9 +743,15 @@ impl Engine {
     /// one it was. A panicked trim reports [`TrimOutcome::Failed`], never
     /// `Contended` — retrying it would only panic again, and charge the whole
     /// batch the delay for the privilege.
-    fn trim_contained(&self, addr: &Addr, keep: u32, hashin: &str) -> TrimOutcome {
+    fn trim_contained(
+        &self,
+        scope: CacheScope,
+        addr: &Addr,
+        keep: u32,
+        hashin: &str,
+    ) -> TrimOutcome {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.try_trim_after_write(addr, keep, hashin)
+            self.try_trim_after_write(scope, addr, keep, hashin)
         })) {
             Ok(outcome) => outcome,
             Err(_) => {
@@ -610,14 +787,34 @@ impl Engine {
         let mut stats = GcStats {
             errored: decisions
                 .iter()
-                .filter(|(_, d)| matches!(d, Decision::Skip))
+                .filter(|(_, _, d)| matches!(d, Decision::Skip))
                 .count(),
             ..GcStats::default()
         };
 
+        // A shared home holds other checkouts' targets too, and "does not
+        // resolve here" says nothing about them: a branch in another worktree
+        // may define it. So the orphan sweep is off there; history trimming,
+        // which only ever applies a target's own `cache.history`, still runs.
+        // The checkout's own store (local-only entries, see `CacheScope`) is
+        // nobody else's, so it always gets the full sweep.
+        let sharing = self.cfg.homes.sharing();
+        let shared_is_shared = sharing.is_shared();
+        if shared_is_shared {
+            stats.orphan_sweep_skipped = Some(sharing.clone());
+            tracing::info!(home = %self.shared_home.display(), "gc: orphan sweep of the shared store skipped: home is {sharing}");
+        }
+
         let limit = self.max_workers.max(1);
         let mut set: JoinSet<(Addr, Result<TargetOutcome>)> = JoinSet::new();
-        for (addr, decision) in decisions {
+        for (scope, addr, decision) in decisions {
+            let keep_orphans = shared_is_shared && scope == CacheScope::Shared;
+            if keep_orphans && matches!(decision, Decision::Orphan) {
+                tracing::debug!(%addr, "gc: kept, does not resolve here but the home is shared");
+                stats.orphans_kept += 1;
+                emit_gc_target_swept(&rs, 0, 0);
+                continue;
+            }
             let (Decision::Orphan | Decision::Trim(_)) = decision else {
                 // Skipped target: count already recorded; advance the explored
                 // count without taking its lock.
@@ -630,12 +827,20 @@ impl Engine {
             let engine = Arc::clone(&self);
             let crs = rs.clone();
             set.spawn(async move {
-                let out = engine.gc_apply(crs, &addr, decision).await;
+                let out = engine.gc_apply(crs, scope, &addr, decision).await;
                 (addr, out)
             });
         }
         while !set.is_empty() {
             Self::drain_one(&mut set, &rs, &mut stats).await;
+        }
+
+        // After the trim, so a revision it just evicted releases its pin in
+        // this same sweep. Reads the stores and deletes files: blocking pool.
+        if !self.revision_pin_dirs.is_empty() {
+            let engine = Arc::clone(&self);
+            stats.revision_pins_removed =
+                hcore::blocking::run(move || engine.gc_revision_pins()).await;
         }
 
         // Prune the shared filesystem-walk cache: drop rows untouched past the
@@ -667,7 +872,7 @@ impl Engine {
     async fn gc_resolve_decisions(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
-    ) -> Vec<(Addr, Decision)> {
+    ) -> Vec<(CacheScope, Addr, Decision)> {
         let resolve_rs = self.new_state_full(
             false,
             rs.events_sender(),
@@ -680,42 +885,51 @@ impl Engine {
         // state drops, i.e. concurrently with phase 2's write locks. This sweep
         // is the authoritative trim; it does not need a second one racing it.
         resolve_rs.suppress_deferred_trims();
-        let targets = match self.local_cache.list_targets() {
-            Ok(t) => t,
+        let stores = match self.local_caches() {
+            Ok(s) => s,
             Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "gc: listing cache targets failed");
-                return Vec::new();
+                tracing::warn!(error = %format!("{e:#}"), "gc: opening the checkout's cache failed, sweeping the shared one");
+                vec![(CacheScope::Shared, Arc::clone(&self.local_cache))]
             }
         };
 
         let limit = self.max_workers.max(1);
-        let mut set: JoinSet<(Addr, Decision)> = JoinSet::new();
-        let mut decisions: Vec<(Addr, Decision)> = Vec::new();
+        let mut set: JoinSet<(CacheScope, Addr, Decision)> = JoinSet::new();
+        let mut decisions: Vec<(CacheScope, Addr, Decision)> = Vec::new();
 
-        for target in targets {
-            let addr_key = match target {
-                Ok(k) => k,
+        for (scope, cache) in stores {
+            let targets = match cache.list_targets() {
+                Ok(t) => t,
                 Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "gc: listing targets failed mid-stream, resolving what was seen");
-                    break;
-                }
-            };
-            let addr = match parse_addr(&addr_key) {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!(addr = %addr_key, error = %format!("{e:#}"), "gc: skip unparseable cache addr");
+                    tracing::warn!(error = %format!("{e:#}"), ?scope, "gc: listing cache targets failed");
                     continue;
                 }
             };
-            while set.len() >= limit {
-                push_decision(&mut decisions, set.join_next().await);
+            for target in targets {
+                let addr_key = match target {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), ?scope, "gc: listing targets failed mid-stream, resolving what was seen");
+                        break;
+                    }
+                };
+                let addr = match parse_addr(&addr_key) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!(addr = %addr_key, error = %format!("{e:#}"), "gc: skip unparseable cache addr");
+                        continue;
+                    }
+                };
+                while set.len() >= limit {
+                    push_decision(&mut decisions, set.join_next().await);
+                }
+                let engine = Arc::clone(&self);
+                let rrs = resolve_rs.clone();
+                set.spawn(async move {
+                    let d = engine.gc_decide(rrs, &addr).await;
+                    (scope, addr, d)
+                });
             }
-            let engine = Arc::clone(&self);
-            let rrs = resolve_rs.clone();
-            set.spawn(async move {
-                let d = engine.gc_decide(rrs, &addr).await;
-                (addr, d)
-            });
         }
         while !set.is_empty() {
             push_decision(&mut decisions, set.join_next().await);
@@ -762,11 +976,16 @@ impl Engine {
     async fn gc_apply(
         self: Arc<Self>,
         rs: Arc<RequestState>,
+        scope: CacheScope,
         addr: &Addr,
         decision: Decision,
     ) -> Result<TargetOutcome> {
-        let pre = self
-            .local_cache
+        let decision = match decision {
+            Decision::Trim(history) => Decision::Trim(self.history_limit(scope, history)),
+            d @ (Decision::Orphan | Decision::Skip) => d,
+        };
+        let cache = self.local_cache_for(scope)?;
+        let pre = cache
             .list_target_entries(addr)
             .with_context(|| format!("gc: list entries for {addr}"))?;
         let needs_lock = match decision {
@@ -798,8 +1017,7 @@ impl Engine {
             )
             .await?;
 
-        let hashins = self
-            .local_cache
+        let hashins = cache
             .list_target_entries(addr)
             .with_context(|| format!("gc: list entries for {addr}"))?;
 
@@ -819,7 +1037,7 @@ impl Engine {
                 // orphan removed only once nothing of it is left.
                 let (removed, kept, bytes) = hcore::blocking::run(move || {
                     engine
-                        .trim_addr_history(&guard, &addr_owned, &hashins, 0, None)
+                        .trim_addr_history(scope, &guard, &addr_owned, &hashins, 0, None)
                         .with_context(|| format!("gc: drop orphan {addr_owned}"))
                 })
                 .await?;
@@ -832,7 +1050,7 @@ impl Engine {
             }
             Decision::Trim(history) => {
                 let (removed, kept, bytes) = hcore::blocking::run(move || {
-                    engine.trim_addr_history(&guard, &addr_owned, &hashins, history, None)
+                    engine.trim_addr_history(scope, &guard, &addr_owned, &hashins, history, None)
                 })
                 .await?;
                 Ok(TargetOutcome {
@@ -886,8 +1104,8 @@ impl Engine {
 /// Fold one resolved decision into the list, tolerating a panicked resolve task
 /// (logged, dropped — the target is simply left untouched in phase 2).
 fn push_decision(
-    decisions: &mut Vec<(Addr, Decision)>,
-    joined: Option<std::result::Result<(Addr, Decision), tokio::task::JoinError>>,
+    decisions: &mut Vec<(CacheScope, Addr, Decision)>,
+    joined: Option<std::result::Result<(CacheScope, Addr, Decision), tokio::task::JoinError>>,
 ) {
     match joined {
         Some(Ok(entry)) => decisions.push(entry),
@@ -1142,7 +1360,7 @@ mod tests {
         let guard = wlock(&engine, &a).await;
         let hashins = engine.local_cache.list_target_entries(&a).expect("hashins");
         let (removed, kept, bytes) = engine
-            .trim_addr_history(&guard, &a, &hashins, 1, None)
+            .trim_addr_history(CacheScope::Shared, &guard, &a, &hashins, 1, None)
             .expect("trim");
 
         assert_eq!((removed, kept), (2, 1));
@@ -1171,7 +1389,7 @@ mod tests {
         let guard = wlock(&engine, &a).await;
         let hashins = engine.local_cache.list_target_entries(&a).expect("hashins");
         let (removed, kept, _bytes) = engine
-            .trim_addr_history(&guard, &a, &hashins, 2, None)
+            .trim_addr_history(CacheScope::Shared, &guard, &a, &hashins, 2, None)
             .expect("trim");
 
         assert_eq!((removed, kept), (1, 2));
@@ -1191,7 +1409,7 @@ mod tests {
         let guard = wlock(&engine, &a).await;
         let hashins = engine.local_cache.list_target_entries(&a).expect("hashins");
         let (removed, kept, _bytes) = engine
-            .trim_addr_history(&guard, &a, &hashins, 1, Some("old"))
+            .trim_addr_history(CacheScope::Shared, &guard, &a, &hashins, 1, Some("old"))
             .expect("trim");
 
         assert_eq!((removed, kept), (0, 2));
@@ -1219,7 +1437,7 @@ mod tests {
         let guard = wlock(&engine, &a).await;
         let hashins = engine.local_cache.list_target_entries(&a).expect("hashins");
         let (removed, kept, _bytes) = engine
-            .trim_addr_history(&guard, &a, &hashins, 1, None)
+            .trim_addr_history(CacheScope::Shared, &guard, &a, &hashins, 1, None)
             .expect("trim");
 
         assert_eq!((removed, kept), (1, 2));
@@ -1239,7 +1457,7 @@ mod tests {
         write_revision(&engine, &a, "h2", 200, &["o.tar"]);
 
         assert_eq!(
-            engine.try_trim_after_write(&a, 1, "h2"),
+            engine.try_trim_after_write(CacheScope::Shared, &a, 1, "h2"),
             TrimOutcome::Settled {
                 removed: 1,
                 bytes: 4
@@ -1267,7 +1485,7 @@ mod tests {
             .expect("write lock");
 
         assert_eq!(
-            engine.try_trim_after_write(&a, 1, "h2"),
+            engine.try_trim_after_write(CacheScope::Shared, &a, 1, "h2"),
             TrimOutcome::Contended,
             "a held lock is contention, the one outcome worth retrying",
         );
@@ -1297,7 +1515,7 @@ mod tests {
         // not `Contended`: the lock was never asked for, so a retry has nothing
         // to win and must not be charged the delay for it.
         assert_eq!(
-            engine.try_trim_after_write(&a, 2, "h2"),
+            engine.try_trim_after_write(CacheScope::Shared, &a, 2, "h2"),
             TrimOutcome::SETTLED_NOTHING,
         );
 
@@ -1331,7 +1549,7 @@ mod tests {
         barrier_reads.store(0, Ordering::SeqCst);
         manifest_reads.store(0, Ordering::SeqCst);
 
-        engine.try_trim_after_write(&a, 1, "h2");
+        engine.try_trim_after_write(CacheScope::Shared, &a, 1, "h2");
 
         assert_eq!(
             barrier_reads.load(Ordering::SeqCst),
@@ -1379,7 +1597,7 @@ mod tests {
         // Uncorrected the count is `["h1"]`, `1 <= keep`, and the answer is
         // SETTLED_NOTHING with `h1` still on disk.
         assert_eq!(
-            engine.try_trim_after_write(&a, 1, "h2"),
+            engine.try_trim_after_write(CacheScope::Shared, &a, 1, "h2"),
             TrimOutcome::Settled {
                 removed: 1,
                 bytes: 4
@@ -1414,7 +1632,7 @@ mod tests {
 
         // 2 revisions (one of them invisible to the enumeration), history 2.
         assert_eq!(
-            engine.try_trim_after_write(&a, 2, "h2"),
+            engine.try_trim_after_write(CacheScope::Shared, &a, 2, "h2"),
             TrimOutcome::SETTLED_NOTHING,
             "the queued revision counts, so the target is inside its budget",
         );
@@ -1444,7 +1662,7 @@ mod tests {
 
         // Visible: ["h2"]. Ours (h3) is corrected in, h1 is not → count 2 > 1.
         assert_eq!(
-            engine.try_trim_after_write(&a, 1, "h3"),
+            engine.try_trim_after_write(CacheScope::Shared, &a, 1, "h3"),
             TrimOutcome::Settled {
                 removed: 1,
                 bytes: 4
@@ -1468,7 +1686,7 @@ mod tests {
         cache.barrier_reads.store(0, Ordering::SeqCst);
 
         assert_eq!(
-            engine.try_trim_after_write(&a, 1, "h2"),
+            engine.try_trim_after_write(CacheScope::Shared, &a, 1, "h2"),
             TrimOutcome::SETTLED_NOTHING,
             "one real revision against keep=1: nothing to do",
         );
@@ -1523,8 +1741,8 @@ mod tests {
 
         let mut held = Some(hold_write(&engine, &busy));
         let batch = vec![
-            (busy.clone(), 1, "h2".to_string()),
-            (sentinel.clone(), 1, "h2".to_string()),
+            (CacheScope::Shared, busy.clone(), 1, "h2".to_string()),
+            (CacheScope::Shared, sentinel.clone(), 1, "h2".to_string()),
         ];
 
         let report = std::thread::scope(|scope| {
@@ -1591,7 +1809,7 @@ mod tests {
         cache.barrier_reads.store(0, Ordering::SeqCst);
 
         let report = engine.run_trim_batch_with_delay(
-            vec![(a.clone(), 1, "h2".to_string())],
+            vec![(CacheScope::Shared, a.clone(), 1, "h2".to_string())],
             Duration::from_millis(1),
         );
 
@@ -1636,8 +1854,8 @@ mod tests {
 
         let mut held = Some(hold_write(&engine, &busy));
         let batch = vec![
-            (busy.clone(), 1, "h2".to_string()),
-            (sentinel.clone(), 1, "h2".to_string()),
+            (CacheScope::Shared, busy.clone(), 1, "h2".to_string()),
+            (CacheScope::Shared, sentinel.clone(), 1, "h2".to_string()),
         ];
 
         let report = std::thread::scope(|scope| {
@@ -1691,8 +1909,8 @@ mod tests {
         let started = std::time::Instant::now();
         let report = engine.run_trim_batch_with_delay(
             vec![
-                (a.clone(), 1, "h2".to_string()),
-                (b.clone(), 1, "h2".to_string()),
+                (CacheScope::Shared, a.clone(), 1, "h2".to_string()),
+                (CacheScope::Shared, b.clone(), 1, "h2".to_string()),
             ],
             delay,
         );
@@ -1745,8 +1963,8 @@ mod tests {
         let started = std::time::Instant::now();
         let report = engine.run_trim_batch_with_delay(
             vec![
-                (a.clone(), 1, "h2".to_string()),
-                (b.clone(), 1, "h2".to_string()),
+                (CacheScope::Shared, a.clone(), 1, "h2".to_string()),
+                (CacheScope::Shared, b.clone(), 1, "h2".to_string()),
             ],
             delay,
         );
@@ -1799,8 +2017,10 @@ mod tests {
 
         let delay = Duration::from_secs(30);
         let started = std::time::Instant::now();
-        let report =
-            engine.run_trim_batch_with_delay(vec![(a.clone(), 1, "h2".to_string())], delay);
+        let report = engine.run_trim_batch_with_delay(
+            vec![(CacheScope::Shared, a.clone(), 1, "h2".to_string())],
+            delay,
+        );
 
         assert!(
             started.elapsed() < delay,
@@ -1827,14 +2047,16 @@ mod tests {
         let (engine, _dir) = test_engine();
         let a = two_revisions(&engine, "t");
 
-        let lock_dir = engine.home.join("lock");
+        let lock_dir = engine.shared_home.join("lock");
         std::fs::remove_dir_all(&lock_dir).expect("remove lock dir");
         std::fs::write(&lock_dir, b"not a directory").expect("write file over lock dir");
 
         let delay = Duration::from_secs(30);
         let started = std::time::Instant::now();
-        let report =
-            engine.run_trim_batch_with_delay(vec![(a.clone(), 1, "h2".to_string())], delay);
+        let report = engine.run_trim_batch_with_delay(
+            vec![(CacheScope::Shared, a.clone(), 1, "h2".to_string())],
+            delay,
+        );
 
         assert!(
             started.elapsed() < delay,
@@ -1863,8 +2085,10 @@ mod tests {
 
         let delay = Duration::from_secs(30);
         let started = std::time::Instant::now();
-        let report =
-            engine.run_trim_batch_with_delay(vec![(a.clone(), 1, "h2".to_string())], delay);
+        let report = engine.run_trim_batch_with_delay(
+            vec![(CacheScope::Shared, a.clone(), 1, "h2".to_string())],
+            delay,
+        );
 
         assert!(
             started.elapsed() < delay,
@@ -1906,7 +2130,7 @@ mod tests {
             drop(guard);
         });
         let report = engine.run_trim_batch_with_delay(
-            vec![(a.clone(), 1, "h2".to_string())],
+            vec![(CacheScope::Shared, a.clone(), 1, "h2".to_string())],
             Duration::from_secs(2),
         );
         releaser.join().expect("releaser thread");
@@ -1988,6 +2212,156 @@ mod tests {
             .expect("gc_all");
         assert_eq!(stats.orphan_targets_removed, 1);
         assert!(!present(&engine, &a, "read"));
+    }
+
+    /// `heph tool gc` removes the pin (nix gcroot) of every revision it no
+    /// longer caches, after its own trim: a revision the sweep evicts loses its
+    /// pin in that same sweep, while a revision still cached keeps its pin. A
+    /// pin of an uncached revision whose target is being built is kept (the
+    /// build may be about to write it) and goes once the build is over.
+    #[tokio::test]
+    async fn gc_all_removes_the_pins_of_evicted_revisions() {
+        use hdriver_support::revision_pin;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pins = dir.path().join("pins");
+        std::fs::create_dir_all(&pins).expect("pins dir");
+        let engine = {
+            let _rt = crate::engine::test_rt_enter();
+            let mut e = Engine::new(Config {
+                parallelism: None,
+                ..Config::for_tests(dir.path())
+            })
+            .expect("engine");
+            e.register_revision_pins(pins.clone());
+            Arc::new(e)
+        };
+        let pin = |a: &Addr, h: &str| {
+            let p = revision_pin::paths(&pins, a, h);
+            std::fs::write(&p.pin, "").expect("pin");
+            p
+        };
+        // Sidecars are written through the driver's API, so the test reads
+        // what a driver writes, then aged past `PIN_GRACE`.
+        let sidecar = |p: &revision_pin::PinPaths, a: &Addr, h: &str| {
+            let (p, a, h) = (p.clone(), a.clone(), h.to_string());
+            async move {
+                revision_pin::write_sidecar(&p, &a, &h)
+                    .await
+                    .expect("sidecar");
+                backdate(&p.sidecar);
+            }
+        };
+
+        // An orphan with two revisions; one is being read, so it survives.
+        let a = addr("ghost");
+        write_revision(&engine, &a, "read", 100, &["o.tar"]);
+        write_revision(&engine, &a, "idle", 200, &["o.tar"]);
+        let read_pin = pin(&a, "read");
+        sidecar(&read_pin, &a, "read").await;
+        let idle_pin = pin(&a, "idle");
+        sidecar(&idle_pin, &a, "idle").await;
+        // A revision never cached, its target being built.
+        let b = addr("building");
+        let building_pin = pin(&b, "h1");
+        sidecar(&building_pin, &b, "h1").await;
+        // A pin with no sidecar names no revision.
+        let unnamed = pins.join("unnamed");
+        std::fs::write(&unnamed, "").expect("unnamed pin");
+
+        let riding = engine
+            .result_lock()
+            .read(&a, "read", &StdCancellationToken::new())
+            .await
+            .expect("read");
+        let building = wlock(&engine, &b).await;
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all");
+        assert!(present(&engine, &a, "read") && !present(&engine, &a, "idle"));
+        assert_eq!(stats.revision_pins_removed, 1, "{stats:?}");
+        assert!(
+            !idle_pin.pin.exists() && !idle_pin.sidecar.exists(),
+            "evicted"
+        );
+        assert!(
+            read_pin.pin.exists() && read_pin.sidecar.exists(),
+            "still cached"
+        );
+        assert!(building_pin.pin.exists(), "its target is being built");
+        assert!(unnamed.exists());
+
+        drop(building);
+        drop(riding);
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all");
+        assert_eq!(stats.revision_pins_removed, 2, "{stats:?}");
+        assert!(!read_pin.pin.exists() && !building_pin.pin.exists());
+        assert!(unnamed.exists(), "never swept");
+    }
+
+    /// A pin whose revision is uncached but still read is kept: the reader may
+    /// be running what the pin keeps alive.
+    #[tokio::test]
+    async fn revision_pin_of_a_read_revision_is_kept() {
+        use hdriver_support::revision_pin;
+        let (engine, dir) = test_engine();
+        let a = addr("t");
+        let p = revision_pin::paths(dir.path(), &a, "h1");
+        revision_pin::write_sidecar(&p, &a, "h1")
+            .await
+            .expect("sidecar");
+        backdate(&p.sidecar);
+        std::fs::write(&p.pin, "").expect("pin");
+        let listed = revision_pin::list(dir.path()).expect("list");
+        assert_eq!(listed.len(), 1);
+
+        let riding = engine
+            .result_lock()
+            .read(&a, "h1", &StdCancellationToken::new())
+            .await
+            .expect("read");
+        assert!(!engine.gc_revision_pin(&listed[0]).expect("gc pin"));
+        assert!(p.pin.exists());
+        drop(riding);
+        assert!(engine.gc_revision_pin(&listed[0]).expect("gc pin"));
+        assert!(!p.pin.exists() && !p.sidecar.exists());
+    }
+
+    /// Age a sidecar past [`PIN_GRACE`].
+    fn backdate(sidecar: &std::path::Path) {
+        let then = std::time::SystemTime::now() - PIN_GRACE - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(sidecar)
+            .expect("open sidecar")
+            .set_modified(then)
+            .expect("backdate sidecar");
+    }
+
+    /// A pin younger than `PIN_GRACE` is kept even when its revision is
+    /// uncached and nothing holds a lock: its build may have released its
+    /// locks with the manifest still in the write-behind queue, invisible to
+    /// another process's gc.
+    #[tokio::test]
+    async fn a_young_revision_pin_is_kept() {
+        use hdriver_support::revision_pin;
+        let (engine, dir) = test_engine();
+        let a = addr("t");
+        let p = revision_pin::paths(dir.path(), &a, "h1");
+        revision_pin::write_sidecar(&p, &a, "h1")
+            .await
+            .expect("sidecar");
+        std::fs::write(&p.pin, "").expect("pin");
+        let listed = revision_pin::list(dir.path()).expect("list");
+        assert!(!engine.gc_revision_pin(&listed[0]).expect("gc pin"));
+        assert!(p.pin.exists() && p.sidecar.exists());
+
+        backdate(&p.sidecar);
+        assert!(engine.gc_revision_pin(&listed[0]).expect("gc pin"));
+        assert!(!p.pin.exists());
     }
 
     #[tokio::test]
@@ -2110,7 +2484,7 @@ mod tests {
     /// Create a stage entry `<home>/stage/<group>/<hash>/blob` plus its
     /// `<hash>.ready` witness, returning the entry dir.
     fn stage_entry(engine: &Engine, group: &str, hash: &str) -> std::path::PathBuf {
-        let gdir = engine.home.join("stage").join(group);
+        let gdir = engine.checkout_home.join("stage").join(group);
         let entry = gdir.join(hash);
         std::fs::create_dir_all(&entry).expect("mkdir stage entry");
         std::fs::write(entry.join("blob"), b"staged-bytes").expect("write blob");
@@ -2140,7 +2514,7 @@ mod tests {
         // revision is retained.
         let rs = engine.new_state();
         let out = Arc::clone(&engine)
-            .gc_apply(rs, &a, Decision::Trim(2))
+            .gc_apply(rs, CacheScope::Shared, &a, Decision::Trim(2))
             .await
             .expect("apply");
 
@@ -2159,7 +2533,7 @@ mod tests {
         // 3 revisions, history 1 → over budget, lock taken, trims to newest.
         let rs = engine.new_state();
         let out = Arc::clone(&engine)
-            .gc_apply(rs, &a, Decision::Trim(1))
+            .gc_apply(rs, CacheScope::Shared, &a, Decision::Trim(1))
             .await
             .expect("apply");
 

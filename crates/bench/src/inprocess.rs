@@ -19,7 +19,7 @@
 use anyhow::{Context, Result};
 use bench_corpus::CorpusManifest;
 use clap::ValueEnum;
-use heph::engine::{Config, ConfigYamlExt as _, Engine, HomeDir, OutputMatcher, ResultOptions};
+use heph::engine::{Config, ConfigYamlExt as _, Engine, Homes, OutputMatcher, ResultOptions};
 use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use std::path::Path;
@@ -82,19 +82,21 @@ async fn resolve_all(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The corpus's heph home, resolved from its config the way the binary does.
-fn cache_dir(corpus: &Path) -> Result<HomeDir> {
+/// The corpus's heph homes, resolved from its config the way the binary does.
+fn cache_dir(corpus: &Path) -> Result<Homes> {
     Ok(heph::engine::config_yaml::load_from_root(corpus)
         .context("load corpus config")?
         .resolve(corpus)
         .context("resolve corpus config")?
-        .home_dir)
+        .homes)
 }
 
 fn wipe_cache(corpus: &Path) -> Result<()> {
-    let dir = cache_dir(corpus)?;
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    let homes = cache_dir(corpus)?;
+    for dir in [homes.shared().as_path(), homes.checkout().as_path()] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()))?;
+        }
     }
     Ok(())
 }
