@@ -82,6 +82,11 @@ carry `cache = False` whether or not they use this feature.
 | **presentation** | how material reaches the sandbox: environment variables, files, or a callback helper. |
 | **reference** | `credentials = ["//auth:aws"]` on a consumer. An `Input` with `hashed: false, runtime: false` plus an annotation. |
 
+All of it is the builtin `auth` plugin: the `auth.credential` driver plus the
+`heph.auth.*` functions, and no provider. The functions are the plugin's (see
+`docs/PLUGIN_FUNCTIONS.md`), so nothing stands in for a provider to carry them;
+`auth` appears in no provider listing and takes no `provider_state`.
+
 Why a target rather than a field on the consumer: identical reasoning to
 `scratch`. Settings live in exactly one place, so two consumers cannot disagree
 about which role to assume; the address gives packages, visibility and

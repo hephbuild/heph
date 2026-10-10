@@ -1241,6 +1241,10 @@ impl Engine {
             listed_facts_trust,
         }: RequestMode,
     ) -> Arc<RequestState> {
+        // A request is past registration by construction (the engine is
+        // shared), so every request starts with the function registry sealed —
+        // whichever provider path it takes to a BUILD evaluation.
+        self.seal_functions();
         // Unique per top-level request. `with_parent`/`with_skip_provider`
         // children share this `RequestStateData` (and thus this id), so a request
         // subtree keys into one bucket of any per-request cache (e.g. pluginfs's

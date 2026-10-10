@@ -145,7 +145,10 @@ pub fn register_builtin_factories(e: &mut engine::Engine) -> anyhow::Result<()> 
                 opts,
                 init.runtime.clone(),
             )?
-            .with_walker(init.walker.clone()),
+            .with_walker(init.walker.clone())
+            // `heph.<plugin>.<fn>`: read from this engine's registry once
+            // sealed, before the first BUILD evaluation.
+            .with_functions(Arc::clone(&init.functions)),
         )))
     })?;
     e.register_plugin_factory("exec", |_init, opts| {
@@ -422,8 +425,9 @@ plugins:
         }
         assert_eq!(
             sorted(e.providers_by_name.keys()),
-            // `auth` carries `heph.auth.*` until functions belong to plugins.
-            ["auth", "buildfile", "fs", "hostbin", "query"]
+            // No `auth`: its `heph.auth.*` functions are the plugin's, so it
+            // needs no provider to carry them.
+            ["buildfile", "fs", "hostbin", "query"]
         );
         assert_eq!(
             sorted(e.drivers_by_name.keys()),

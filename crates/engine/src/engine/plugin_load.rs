@@ -91,24 +91,35 @@ fn load_dylib_plugins(
     // Taken here, not probed inside `load`: the rayon workers below have no
     // current tokio runtime.
     let runtime = e.runtime.clone();
+    // Each instance's registry handle resolves through this engine's slot, so a
+    // second engine in the process never reaches these plugins' functions.
+    let functions = e.function_slot();
     let loaded = manifests
         .into_par_iter()
         .map(|m| -> anyhow::Result<_> {
             let resolved = resolve_manifest_dylib(&m.identifier, m.checksum.as_deref(), root)?;
             let dylib = &resolved.dylib;
             // The plugin's name is its manifest's: the binary reports none.
-            let (provider, drivers, hooks, runners) = hplugin_stabby::load_stable::load(
+            let hplugin_stabby::load_stable::LoadedComponents {
+                provider,
+                drivers,
+                functions,
+                hooks,
+                runners,
+            } = hplugin_stabby::load_stable::load(
                 dylib,
                 &resolved.name,
                 &root_str,
                 &home_str,
                 m.options,
                 runtime.clone(),
+                std::sync::Arc::clone(&functions),
             )
             .with_context(|| format!("load plugin dylib {}", dylib.display()))?;
             let mut parts = super::PluginParts {
                 provider: provider
                     .map(|p| Box::new(p) as Box<dyn crate::engine::provider::Provider>),
+                functions,
                 hooks: hooks
                     .into_iter()
                     .map(|(_, h)| {

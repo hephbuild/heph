@@ -264,8 +264,11 @@ async fn buildfile_listing_carries_driver() -> anyhow::Result<()> {
     use heph::engine::provider::{ListRequest, NoopExecutor};
     let ws = htestkit::WorkspaceBuilder::new()?
         .with_provider(|init| {
-            let mut p =
-                heph::pluginbuildfile::Provider::new(init.root.to_path_buf(), init.runtime.clone());
+            let mut p = heph::pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                std::sync::Arc::clone(&init.functions),
+            );
             p.default_driver = Some("bash".to_string());
             Box::new(p)
         })

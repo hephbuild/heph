@@ -401,6 +401,8 @@ fn make_workspace_ordered_runner(
         )
         .context("plugingo provider")?;
         Ok(PluginParts::default()
+            // `heph.go.*`, exported beside the provider as the cdylib does.
+            .with_functions(provider.functions())
             .with_provider(Box::new(provider))
             .with_managed_driver(Box::new(
                 plugingo::GoGolistDriver::new().with_default_runner(r.clone()),
@@ -433,6 +435,7 @@ fn make_workspace_ordered_runner(
             Box::new(pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
                 init.runtime.clone(),
+                std::sync::Arc::clone(&init.functions),
             ))
         })
         .with_provider(move |_| {

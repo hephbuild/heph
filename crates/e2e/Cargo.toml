@@ -22,6 +22,8 @@ hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby" }
 hplugin = { package = "plugin", path = "../plugin" }
 async-trait = "0.1"
 hplugin-devenv = { package = "plugin-devenv", path = "../plugin-devenv" }
+# `heph.go.build_addr` in-process, for the def-hash pin in `plugin_functions`.
+hplugin-go = { package = "plugin-go", path = "../plugin-go" }
 hcore = { package = "core", path = "../core" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 futures = "0.3"

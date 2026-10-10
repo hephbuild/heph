@@ -15,7 +15,8 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::targetdef::{RawDef, RawDefBytes};
-use hplugin::provider::{Approval, DeclaredState, DeclaredTarget, FnOutcome, State, TargetSpec};
+use hplugin::function::{DeclaredState, DeclaredTarget, FnOutcome};
+use hplugin::provider::{Approval, State, TargetSpec};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

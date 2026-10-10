@@ -5,11 +5,11 @@
 //! executor across natively (`HostExecutor`) so callbacks are direct.
 
 use crate::abi::{
-    CREATE_SYMBOL, CreateFn, DynExecutor, DynHook, DynItemStream, DynManagedDriver, DynProvider,
-    SET_LOG_FILTER_SYMBOL, SET_LOG_SINK_SYMBOL, SET_RUNNER_HOST_SYMBOL, SET_SUPERVISOR_SYMBOL,
-    SetLogFilterFn, SetLogSinkFn, SetRunnerHostFn, SetSupervisorFn, StableCancelDyn, StableHookDyn,
-    StableItemStream, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
-    StableProviderDyn,
+    CREATE_SYMBOL, CreateFn, DynExecutor, DynHook, DynItemStream, DynManagedDriver,
+    DynPluginFunctions, DynProvider, NamedFunction, SET_LOG_FILTER_SYMBOL, SET_LOG_SINK_SYMBOL,
+    SET_RUNNER_HOST_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogFilterFn, SetLogSinkFn, SetRunnerHostFn,
+    SetSupervisorFn, StableCancelDyn, StableHookDyn, StableItemStream, StableItemStreamDyn,
+    StableManagedDriverDyn, StableMetaDyn, StablePluginFunctionsDyn, StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use crate::vtable::dynify;
@@ -25,11 +25,11 @@ use hplugin::driver::{
     ConfigResponse as DriverConfigResponse, DriverSchema, ParseRequest, ParseResponse,
     inputartifact,
 };
+use hplugin::function::{FnArgs, FnCallContext, FnOutcome, FunctionSlot, PluginFn, PluginFnDef};
 use hplugin::hook::Hook;
 use hplugin::provider::{
-    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest,
-    GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
-    ProbeResponse, Provider, ProviderFn, ProviderFunctionDef, ProviderFunctionRegistry,
+    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
     StateSchema,
 };
 use plugin_abi::pb::frame::Body;
@@ -58,31 +58,133 @@ fn wrap_executor(exec: &Arc<dyn hplugin::provider::ProviderExecutor>) -> DynExec
     }
 }
 
-/// A loaded plugin's host-side handles: an optional provider + named drivers +
-/// named hooks.
-pub type LoadedComponents = (
-    Option<StableRemoteProvider>,
-    Vec<(String, StableRemoteManagedDriver)>,
-    Vec<(String, StableRemoteHook)>,
-    // Exec runners the plugin implements, ready to register beside the
-    // builtins. Empty for a plugin that only names one in its `runner.json`.
-    Vec<std::sync::Arc<dyn hexecrunner::registry::ExecRunner>>,
-);
+/// A loaded plugin's host-side handles.
+pub struct LoadedComponents {
+    pub provider: Option<StableRemoteProvider>,
+    pub drivers: Vec<(String, StableRemoteManagedDriver)>,
+    /// The plugin's BUILD-file functions, metadata decoded, each calling through
+    /// the plugin's one functions handle.
+    pub functions: Vec<PluginFnDef>,
+    pub hooks: Vec<(String, StableRemoteHook)>,
+    /// Exec runners the plugin implements, ready to register beside the
+    /// builtins. Empty for a plugin that only names one in its `runner.json`.
+    pub runners: Vec<std::sync::Arc<dyn hexecrunner::registry::ExecRunner>>,
+}
+
+/// The text a create entry that fails stabby's structural check gets: the
+/// plugin was built against a different `PluginComponents` / `CreateFn` layout,
+/// which is what an ABI break changes. No version is read at load; the layout
+/// is the check.
+pub fn abi_mismatch_hint(path: &std::path::Path) -> String {
+    format!(
+        "plugin {} was built against a different heph ABI (host {}); reinstall plugins \
+         from the same release as this heph",
+        path.display(),
+        plugin_abi::ABI_SEMVER
+    )
+}
+
+/// An optional entry point. `None`, silently, when the plugin does not export
+/// `symbol` (an SDK that predates it); `None` with a `warn!` when it exports one
+/// whose stabby type report does not match ours — a skewed plugin, whose
+/// capability would otherwise just vanish without a word.
+fn optional_entry<'l, T: stabby::IStable>(
+    lib: &'l libloading::Library,
+    symbol: &[u8],
+    path: &std::path::Path,
+) -> Option<stabby::libloading::Symbol<'l, T>> {
+    use stabby::libloading::StabbyLibrary;
+    // SAFETY: only probes that the symbol exists; nothing is called through
+    // this pointer type.
+    if unsafe { lib.get::<*const ()>(symbol) }.is_err() {
+        return None;
+    }
+    // SAFETY: get_stabbied checks the symbol's stabby type report against `T`
+    // before returning it.
+    match unsafe { lib.get_stabbied::<T>(symbol) } {
+        Ok(entry) => Some(entry),
+        Err(e) => {
+            tracing::warn!(
+                plugin = %path.display(),
+                symbol = %String::from_utf8_lossy(symbol),
+                error = %e,
+                "plugin exports this entry point with a type that does not match this heph; \
+                 skipping it. Rebuild the plugin against the same heph release"
+            );
+            None
+        }
+    }
+}
+
+/// Decode a plugin's exported function metadata into host-side defs, each
+/// calling through `handle`. Fails — naming the plugin and the function — on
+/// undecodable metadata, a missing signature, a name that disagrees with its
+/// metadata, or functions without a handle: a dropped function would surface
+/// later as a confusing "no function" in some BUILD file.
+pub fn decode_functions(
+    plugin: &str,
+    functions: Vec<NamedFunction>,
+    handle: Option<DynPluginFunctions>,
+) -> anyhow::Result<Vec<PluginFnDef>> {
+    use anyhow::Context;
+    if functions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let handle = Arc::new(handle.ok_or_else(|| {
+        anyhow::anyhow!(
+            "plugin {plugin:?} exports {} function(s) but no function handle to call them through",
+            functions.len()
+        )
+    })?);
+    functions
+        .into_iter()
+        .map(|nf| {
+            let name = nf.name.to_string();
+            let def = pb::FunctionDef::decode(&nf.meta[..])
+                .with_context(|| format!("decoding the metadata of function {plugin}.{name}"))?;
+            if def.name != name {
+                anyhow::bail!(
+                    "plugin {plugin:?} exports function {name:?} whose metadata names {:?}",
+                    def.name
+                );
+            }
+            let signature = def.signature.ok_or_else(|| {
+                anyhow::anyhow!("function {plugin}.{name} has no signature in its metadata")
+            })?;
+            Ok(PluginFnDef {
+                signature: convert::fn_signature_from_pb(signature),
+                doc: def.doc,
+                func: Arc::new(StableRemoteFn {
+                    handle: Arc::clone(&handle),
+                    name: name.clone(),
+                }),
+                name,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .with_context(|| format!("loading the functions of plugin {plugin:?}"))
+}
 
 /// Load a plugin cdylib and construct the host-side handles. The library's ABI is
 /// verified against ours via stabby's type reports (`get_stabbied`); a mismatch
-/// (different stabby version, or drifted boundary types) is a hard error. The
-/// `Library` is intentionally leaked: the returned trait objects' vtables live in
-/// the dylib's code, which must stay mapped for the process lifetime.
+/// (different stabby version, or drifted boundary types) is a hard error, reported
+/// with [`abi_mismatch_hint`]. The `Library` is intentionally leaked: the returned
+/// trait objects' vtables live in the dylib's code, which must stay mapped for
+/// the process lifetime.
 ///
-/// `name` is the plugin's name, from its manifest. The provider is named after
-/// it; `PluginComponents.provider_name` is ignored.
+/// `name` is the plugin's name, from its manifest. Its provider and functions
+/// are named after it; the binary reports no name.
 ///
 /// `runtime` is the engine's: host-side bodies the plugin calls into (the
-/// runner host's `prepare`) are spawned there. It is passed rather than probed
-/// because `load` runs on rayon workers, where `Handle::try_current()` always
-/// fails — a probe would silently hand every production plugin the inline,
-/// runtime-less handle meant for test harnesses.
+/// runner host's `prepare`, the function registry's `call_registered`) are
+/// spawned there. It is passed rather than probed because `load` runs on rayon
+/// workers, where `Handle::try_current()` always fails — a probe would silently
+/// hand every production plugin the inline, runtime-less handle meant for test
+/// harnesses.
+///
+/// `functions` is the loading engine's function slot. The plugin's create entry
+/// gets a registry handle resolving through it — this instance's own, so two
+/// engines in one process never see each other's functions.
 pub fn load(
     path: &std::path::Path,
     name: &str,
@@ -90,6 +192,7 @@ pub fn load(
     home: &str,
     options: std::collections::HashMap<String, pb::Value>,
     runtime: tokio::runtime::Handle,
+    functions: Arc<FunctionSlot>,
 ) -> anyhow::Result<LoadedComponents> {
     use crate::abi::PluginComponents;
     use anyhow::Context;
@@ -101,6 +204,7 @@ pub fn load(
         root: root.to_string(),
         home: home.to_string(),
         options,
+        name: name.to_string(),
     }
     .encode_to_vec();
 
@@ -117,19 +221,15 @@ pub fn load(
         // silently dropped — right before the ABI seam turns any panic into a
         // non-unwinding abort with no diagnostic at all. Optional: a plugin built
         // against an older SDK simply won't export these symbols; that is not an
-        // error.
-        // SAFETY: get_stabbied checks the symbol's stabby type report against
-        // `SetLogSinkFn` before returning it.
-        if let Ok(set_sink) = unsafe { lib.get_stabbied::<SetLogSinkFn>(SET_LOG_SINK_SYMBOL) } {
+        // error — but one exported with a mismatched type is warned about.
+        if let Some(set_sink) = optional_entry::<SetLogSinkFn>(&lib, SET_LOG_SINK_SYMBOL, path) {
             set_sink(crate::host::HostLogSink::wrap());
         }
         // Then the host's log filter, so the plugin drops what the host would
         // discard instead of forwarding every event. Same older-SDK tolerance; a
         // plugin without it, or a host that set no filter, forwards everything.
-        // SAFETY: get_stabbied checks the symbol's stabby type report against
-        // `SetLogFilterFn` before returning it.
-        let set_filter = unsafe { lib.get_stabbied::<SetLogFilterFn>(SET_LOG_FILTER_SYMBOL) };
-        if let (Ok(set_filter), Some(bytes)) = (set_filter, crate::hostlog::plugin_log_filter()) {
+        let set_filter = optional_entry::<SetLogFilterFn>(&lib, SET_LOG_FILTER_SYMBOL, path);
+        if let (Some(set_filter), Some(bytes)) = (set_filter, crate::hostlog::plugin_log_filter()) {
             set_filter(stabby::vec::Vec::from(bytes.as_slice()));
         }
         // Hand the plugin the host's supervisor client. The plugin's own copy of
@@ -137,10 +237,9 @@ pub fn load(
         // across the dylib boundary), so without this every child it spawns goes
         // unregistered — no reaping on a hard kill of the host, and a warning per
         // spawn. Same older-SDK tolerance as the log sink.
-        // SAFETY: get_stabbied checks the symbol's stabby type report against
-        // `SetSupervisorFn` before returning it.
-        let set_supervisor = unsafe { lib.get_stabbied::<SetSupervisorFn>(SET_SUPERVISOR_SYMBOL) };
-        if let Ok(set_supervisor) = set_supervisor {
+        if let Some(set_supervisor) =
+            optional_entry::<SetSupervisorFn>(&lib, SET_SUPERVISOR_SYMBOL, path)
+        {
             set_supervisor(crate::host::HostSupervisor::wrap());
         }
         // Hand the plugin a handle to the host's exec-runner registry. Same
@@ -150,33 +249,42 @@ pub fn load(
         // "no runner host is installed in this component". It does not degrade
         // to a local spawn — that would run the target outside the environment
         // its cache key claims. Same older-SDK tolerance as the two above.
-        // SAFETY: get_stabbied checks the symbol's stabby type report against
-        // `SetRunnerHostFn` before returning it.
-        let set_runner = unsafe { lib.get_stabbied::<SetRunnerHostFn>(SET_RUNNER_HOST_SYMBOL) };
-        if let Ok(set_runner) = set_runner {
-            set_runner(crate::host::HostRunnerHost::wrap(runtime));
+        if let Some(set_runner) =
+            optional_entry::<SetRunnerHostFn>(&lib, SET_RUNNER_HOST_SYMBOL, path)
+        {
+            set_runner(crate::host::HostRunnerHost::wrap(runtime.clone()));
         }
         // SAFETY: get_stabbied verifies the symbol's stabby type report matches
         // `CreateFn` before returning it; calling it is then ABI-sound.
         let create = unsafe { lib.get_stabbied::<CreateFn>(CREATE_SYMBOL) }
-            .map_err(|e| anyhow::anyhow!("stabby ABI check failed for {}: {e}", path.display()))?;
-        create(sv(&cfg))
+            .map_err(|e| anyhow::anyhow!("stabby ABI check failed: {e}"))
+            .with_context(|| abi_mismatch_hint(path))?;
+        // This instance's registry handle: resolved through this engine's slot,
+        // on this engine's runtime.
+        create(
+            sv(&cfg),
+            crate::host::HostFunctionRegistry::wrap(functions, runtime),
+        )
     };
     // Keep the dylib mapped for the process lifetime (the returned trait objects'
     // vtables point into its code); leaking the handle is intentional.
     let _: &'static mut libloading::Library = Box::leak(Box::new(lib));
 
     let PluginComponents {
-        // The manifest names the plugin, and so its provider; what the binary
-        // reports here is not read.
-        provider_name: _,
         provider,
         drivers,
+        functions,
+        function_handle,
         hooks,
         runners,
         // Reserved return-side metadata; nothing consumes it yet.
         meta: _,
     } = comps;
+    let functions = decode_functions(
+        name,
+        functions.into_iter().collect(),
+        function_handle.into(),
+    )?;
     // `provider` is optional: hook-only / driver-only plugins export `None`.
     let provider: std::option::Option<DynProvider> = provider.into();
     let host_provider = provider.map(|p| StableRemoteProvider::new(p, name));
@@ -202,7 +310,13 @@ pub fn load(
             name, nr.runner,
         )));
     }
-    Ok((host_provider, host_drivers, host_hooks, host_runners))
+    Ok(LoadedComponents {
+        provider: host_provider,
+        drivers: host_drivers,
+        functions,
+        hooks: host_hooks,
+        runners: host_runners,
+    })
 }
 
 fn decode_unary(bytes: &[u8]) -> anyhow::Result<Body> {
@@ -561,32 +675,6 @@ impl Provider for StableRemoteProvider {
         })
     }
 
-    fn functions(&self) -> Vec<ProviderFunctionDef> {
-        // Sync metadata call across the seam; decode the plugin's function defs
-        // and wrap each handler in a proxy that dispatches back over the ABI.
-        let bytes = self.inner.meta(pb::ProviderMethod::Functions as u32);
-        let resp = match pb::FunctionsResponse::decode(&bytes[..]) {
-            Ok(r) => r,
-            // A decode failure here would be an ABI bug; surface no functions
-            // rather than poison registry wiring (which has no error channel).
-            Err(_) => return Vec::new(),
-        };
-        resp.functions
-            .into_iter()
-            .filter_map(|d| {
-                Some(ProviderFunctionDef {
-                    signature: convert::fn_signature_from_pb(d.signature?),
-                    doc: d.doc,
-                    func: Arc::new(StableRemoteFn {
-                        inner: Arc::clone(&self.inner),
-                        name: d.name.clone(),
-                    }),
-                    name: d.name,
-                })
-            })
-            .collect()
-    }
-
     fn state_schema(&self) -> Option<StateSchema> {
         // An empty SVec encodes `None`; any encoded `Schema` (even fields-empty)
         // encodes `Some`.
@@ -598,47 +686,21 @@ impl Provider for StableRemoteProvider {
             .ok()
             .map(convert::state_schema_from_pb)
     }
-
-    fn set_function_registry(&self, reg: Arc<ProviderFunctionRegistry>) {
-        // Cross the metadata once, and hand the plugin a callback to invoke any
-        // function in the aggregate registry (handlers are not transmissible).
-        let functions = reg
-            .iter()
-            .map(|(provider, name, rf)| pb::RegisteredFunction {
-                provider: provider.to_string(),
-                name: name.to_string(),
-                signature: Some(convert::fn_signature_to_pb(&rf.signature)),
-                doc: rf.doc.clone(),
-            })
-            .collect();
-        let metadata = pb::FunctionRegistry { functions }.encode_to_vec();
-        // Same explicit fork as `wrap_executor`: production wiring happens on
-        // the engine runtime; only runtime-less in-process harnesses take the
-        // inline arm, and they drive the callback futures themselves.
-        let cb = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => crate::host::HostFunctionRegistry::wrap(reg, handle),
-            Err(_) => crate::host::HostFunctionRegistry::wrap_inline(reg),
-        };
-        self.inner.invoke_registry(
-            pb::ProviderMethod::SetFunctionRegistry as u32,
-            sv(&metadata),
-            cb,
-        );
-    }
 }
 
-/// Proxy handler for a dylib provider function: each call encodes its args and
-/// the `FnCallContext`, dispatches `call_function` over the stable ABI, and
-/// decodes the reply into an [`FnOutcome`] — value plus whatever the plugin
-/// declared. The host merges the declarations at the call site, so a cdylib
-/// function stands up targets exactly as an in-process one does.
+/// Proxy handler for a cdylib plugin function: each call encodes its args and
+/// the `FnCallContext`, dispatches `FUNCTION_METHOD_CALL` through the plugin's
+/// one functions handle, and decodes the reply into an [`FnOutcome`] — value
+/// plus whatever the plugin declared. The host merges the declarations at the
+/// call site, so a cdylib function stands up targets exactly as an in-process
+/// one does.
 struct StableRemoteFn {
-    inner: Arc<DynProvider>,
+    handle: Arc<DynPluginFunctions>,
     name: String,
 }
 
 #[async_trait]
-impl ProviderFn for StableRemoteFn {
+impl PluginFn for StableRemoteFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let pb_req = pb::CallFunctionRequest {
             name: self.name.clone(),
@@ -655,8 +717,12 @@ impl ProviderFn for StableRemoteFn {
         }
         .encode_to_vec();
         let bytes = self
-            .inner
-            .invoke(pb::ProviderMethod::CallFunction as u32, sv(&pb_req))
+            .handle
+            .invoke(
+                pb::FunctionMethod::Call as u32,
+                self.name.as_str().into(),
+                sv(&pb_req),
+            )
             .await;
         match decode_unary(&bytes)? {
             Body::CallFunctionResp(r) => Ok(convert::fn_outcome_from_pb(r)),
@@ -1054,6 +1120,89 @@ fn managed_input_to_pb(mi: &ManagedRunInput) -> pb::ManagedRunInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A functions handle no test calls: D11 fails before any call.
+    struct NeverCalled;
+
+    impl crate::abi::StablePluginFunctions for NeverCalled {
+        extern "C" fn invoke<'a>(
+            &'a self,
+            method: u32,
+            _name: stabby::string::String,
+            _req: SVec<u8>,
+        ) -> stabby::future::DynFutureUnsync<'a, SVec<u8>> {
+            dynify(stabby::boxed::Box::new(async move {
+                panic!("method {method} called on a plugin whose load must have failed")
+            }))
+        }
+    }
+
+    fn handle() -> Option<DynPluginFunctions> {
+        Some(dynify(stabby::boxed::Box::new(NeverCalled)))
+    }
+
+    fn named(name: &str, meta: &[u8]) -> NamedFunction {
+        NamedFunction {
+            name: name.into(),
+            meta: SVec::from(meta),
+        }
+    }
+
+    fn signature() -> pb::FnSignature {
+        convert::fn_signature_to_pb(&hcore::htvalue::signature::FnSignature {
+            positional: vec![],
+            named: vec![],
+            variadic: None,
+            returns: hcore::htvalue::signature::ParamType::String,
+        })
+    }
+
+    /// D11: metadata the host cannot decode fails the plugin's load, naming the
+    /// plugin and the function — it used to be dropped, and the function then
+    /// surfaced as "no function" in some BUILD file.
+    #[test]
+    fn undecodable_function_metadata_fails_load() {
+        let err = decode_functions("gen", vec![named("rule", &[0xff, 0xff, 0xff])], handle())
+            .err()
+            .expect("undecodable metadata must fail the load");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("plugin \"gen\""), "{msg}");
+        assert!(msg.contains("gen.rule"), "{msg}");
+    }
+
+    /// D11: a function whose metadata carries no signature fails the load too;
+    /// the host cannot validate a call against nothing.
+    #[test]
+    fn function_without_signature_fails_load() {
+        let meta = pb::FunctionDef {
+            name: "rule".into(),
+            signature: None,
+            doc: String::new(),
+        }
+        .encode_to_vec();
+        let err = decode_functions("gen", vec![named("rule", &meta)], handle())
+            .err()
+            .expect("a missing signature must fail the load");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("gen.rule has no signature"), "{msg}");
+
+        // Functions without a handle to call them through fail as well.
+        let meta = pb::FunctionDef {
+            name: "rule".into(),
+            signature: Some(signature()),
+            doc: String::new(),
+        }
+        .encode_to_vec();
+        let err = decode_functions("gen", vec![named("rule", &meta)], None)
+            .err()
+            .expect("functions without a handle must fail the load");
+        assert!(format!("{err:#}").contains("no function handle"), "{err:#}");
+
+        // The well-formed case decodes, signature and all.
+        let defs = decode_functions("gen", vec![named("rule", &meta)], handle()).expect("decodes");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].signature.render("rule"), "rule() -> string");
+    }
 
     /// A run input's hashout crosses to the guest. Without it a guest driver
     /// reading `content.hashout()` sees `""`, which in-process tests never do.

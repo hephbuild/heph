@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+// BUILD-file functions: `heph.<plugin>.<fn>(…)`. A function is a component of a
+// plugin (next to its provider, drivers, hooks and runners), not a method on a
+// provider. Mirrors hplugin::function.
+//
+// A plugin reports each function's metadata (`FunctionDef`) once, at load, in
+// `PluginComponents.functions`; the host calls one through the plugin's single
+// functions handle (`StablePluginFunctions::invoke`). The other direction — a
+// plugin calling another plugin's function — goes through the registry handle
+// the host passes to `heph_plugin_create` (`call_registered`).
+package heph.plugin.v1;
+
+import "plugin/v1/common.proto";
+import "plugin/v1/provider.proto";
+import "plugin/v1/targetdef.proto";
+
+// Selects which function RPC `StablePluginFunctions::invoke` runs. The numeric
+// value is the `method` argument crossing the dylib seam. Append-only, like
+// `ProviderMethod`: an unknown value answers `Error{Unimplemented}`.
+enum FunctionMethod {
+  FUNCTION_METHOD_UNSPECIFIED = 0;
+  FUNCTION_METHOD_CALL = 1; // req: CallFunctionRequest, reply: CallFunctionResponse
+}
+
+// Mirrors signature::Param. An unset `default` means the parameter is required.
+message Param {
+  string name = 1;
+  ParamType ty = 2;
+  optional Value default = 3;
+}
+
+// Mirrors signature::FnSignature.
+message FnSignature {
+  repeated Param positional = 1;
+  repeated Param named = 2;
+  optional Param variadic = 3;
+  ParamType returns = 4;
+}
+
+// Mirrors function::PluginFnDef sans its handler (which stays guest-side and is
+// reached through the plugin's functions handle). Carried as the `meta` bytes
+// of a `NamedFunction`; a missing `signature` fails the plugin's load.
+message FunctionDef {
+  string name = 1;
+  FnSignature signature = 2;
+  string doc = 3;
+}
+
+// Invoke a function by name. `pkg`/`root` reconstruct the FnCallContext;
+// `positional`/`named` are the call arguments.
+message CallFunctionRequest {
+  string name = 1;
+  string pkg = 2;
+  string root = 3;
+  repeated Value positional = 4;
+  map<string, Value> named = 5;
+  // The caller can carry a declaring function's `declared_targets` /
+  // `declared_states` back to the package being evaluated (since 0.15.0).
+  //
+  // Load-bearing, not informational. An older caller does not send the field,
+  // so it decodes as `false` — "cannot carry them" — and a callee that declared
+  // must fail the call rather than answer with the value alone, which would
+  // drop the declarations silently (prost skips fields the reader doesn't know).
+  // The flag, not the ABI version, is what a callee tests.
+  bool accepts_declarations = 6;
+}
+message CallFunctionResponse {
+  Value value = 1;
+  // What the call declared, merged by the host into the package being
+  // evaluated. Only ever non-empty when the request set
+  // `accepts_declarations`.
+  repeated DeclaredTarget declared_targets = 2;
+  repeated DeclaredState declared_states = 3;
+}
+
+// A target a plugin function declared, mirroring the arguments of the
+// `target()` builtin. The host merges it into the package being evaluated, as
+// if that BUILD file had written the `target(...)` call itself.
+message DeclaredTarget {
+  string name = 1;
+  // Empty falls back to the package's provider default, same as `target()`.
+  string driver = 2;
+  repeated string labels = 3;
+  // The *unparsed* `transitive = {…}` map, parsed host-side by the same code
+  // that parses the builtin's argument — so a declared target cannot carry a
+  // transitive sandbox a BUILD file could not (an unhashed dep, say). Absent =
+  // none.
+  Value transitive = 4;
+  Approval approval = 5;
+  // Driver options. The keys `target()` consumes itself (`name`, `driver`,
+  // `labels`, `transitive`, `approval`) are rejected host-side.
+  map<string, Value> config = 6;
+}
+
+// Package-level provider state a plugin function declared, mirroring the
+// `provider_state(provider=…, **args)` builtin.
+message DeclaredState {
+  string provider = 1;
+  map<string, Value> args = 2;
+}
+
+// Invoke another plugin's function through the host registry (the inverse of
+// CallFunctionRequest: the addressing carries the owning `plugin`).
+message CallRegisteredRequest {
+  // Was `provider` before 0.16.0; same number, so the wire is unchanged.
+  string plugin = 1;
+  string name = 2;
+  string pkg = 3;
+  string root = 4;
+  repeated Value positional = 5;
+  map<string, Value> named = 6;
+  // As `CallFunctionRequest.accepts_declarations`, for this direction: the
+  // calling plugin forwards what the host function declared in its own reply,
+  // so the declarations reach the package being evaluated. An older plugin does
+  // not send it, and the host then fails a declaring function rather than
+  // dropping what it declared.
+  bool accepts_declarations = 7;
+}

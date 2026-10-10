@@ -37,14 +37,16 @@ anything `get_stabbied` would reject:
 - Add, remove, reorder, or re-sign a method on a `#[stabby::stabby]` trait — the
   vtable slots: `StableProvider`, `StableManagedDriver` (the `invoke*` slots),
   `StableExecutor`, `StableItemStream`, `StableRead`, `StableArtifactContent`,
-  `StableFunctionRegistry`, `StableMeta`, `StableCancel`, `StableHook`,
-  `StableLogSink`, `StableSupervisor`, `StableRunnerHost`, `StableRunner`.
+  `StableFunctionRegistry`, `StablePluginFunctions`, `StableMeta`, `StableCancel`,
+  `StableHook`, `StableLogSink`, `StableSupervisor`, `StableRunnerHost`,
+  `StableRunner`.
 - Add, remove, or reorder a field on a `#[stabby::stabby]` struct: `StableAddr`,
   `StableArg`, `NoteDepOutcome`, `ResultOutcome`, `QueryOutcome`, `NamedDriver`,
-  `NamedHook`, `NamedRunner`, `PluginComponents`.
+  `NamedFunction`, `NamedHook`, `NamedRunner`, `PluginComponents`.
 - Change a `dynptr!` / type-alias: `DynRead`, `DynArtifact`, `DynItemStream`,
   `DynExecutor`, `DynProvider`, `DynManagedDriver`, `DynFunctionRegistry`,
-  `DynHook`, `DynLogSink`, `DynSupervisor`, `DynRunnerHost`, `DynRunner`.
+  `DynPluginFunctions`, `DynHook`, `DynLogSink`, `DynSupervisor`, `DynRunnerHost`,
+  `DynRunner`.
 - Change the shape `hexecrunner::wire` encodes (both directions —
   `PrepareRequest`/`PrepareReply` for a plugin calling the host,
   `RunnerRequest`/`RunnerReply` for the host calling a plugin's runner). It is not a stabby type — the
@@ -146,3 +148,23 @@ as an acknowledged break and passes. (Past 1.0, bump instead.)
 
 When in doubt, bump. A false bump is cheap; a missed real break ships a host/plugin
 pair that mismatches at load and aborts the plugin.
+
+## A refused plugin says why
+
+A mismatched create entry is not an abort: the host wraps `get_stabbied`'s failure
+as "plugin <path> was built against a different heph ABI (host <ABI_SEMVER>);
+reinstall plugins from the same release as this heph". An *optional* entry
+(`SET_*_SYMBOL`) the plugin exports with a mismatched type is skipped with a
+`warn!` naming the symbol — only a plugin that does not export it at all is
+skipped in silence.
+
+## History of breaks
+
+- **0.16.0** — functions belong to plugins. `PluginComponents` lost
+  `provider_name` (the manifest names the plugin) and gained `functions`
+  (`NamedFunction`: name + prost `FunctionDef` metadata, decoded once at load; bad
+  metadata fails the load) and `function_handle` (one `DynPluginFunctions` per
+  plugin, dispatched by `pb::FunctionMethod`). `CreateFn` takes the engine's
+  `DynFunctionRegistry` per instance. `StableProvider::invoke_registry` is gone;
+  `ProviderMethod` 5, 6 and 8 are reserved. `CallRegisteredRequest.provider` is
+  `plugin` (same number). `CreateConfig.name` (4) carries the manifest name.

@@ -327,7 +327,7 @@ mod tests {
             patterns.clone(),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(hplugin::provider::ProviderFunctionRegistry::default()),
+            Arc::new(hplugin::function::FunctionRegistry::default()),
             Arc::new(std::sync::OnceLock::new()),
             Arc::clone(&walker),
             Arc::new(crate::pluginbuildfile::provider::PackageList::new(

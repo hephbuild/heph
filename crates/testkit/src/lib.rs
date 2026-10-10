@@ -112,6 +112,10 @@ impl WorkspaceBuilder {
         // Same call the CLI makes right after `Arc::new`: without it a target
         // naming a runner fails with "no runner host is installed".
         engine.install_exec_runner_host();
+        // Registration is over: seal the function registry, so a test driving
+        // a provider directly (no request, which would seal it) still sees
+        // `heph.<plugin>.<fn>`.
+        let _sealed = engine.function_registry();
         Ok(Workspace {
             dir: self.dir,
             engine,

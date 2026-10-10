@@ -19,7 +19,8 @@
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_oci::pluginoci;
 use plugin_sdk::stabby::abi::{
-    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, NamedRunner, PluginComponents,
+    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, NamedRunner,
+    PluginComponents,
 };
 use plugin_sdk::stabby::{
     install_log_sink, install_runner_host, install_supervisor, make_dyn_managed_driver,
@@ -30,9 +31,13 @@ use std::sync::Arc;
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
 /// `pb::CreateConfig` bytes; this plugin reads nothing out of it, but the
-/// parameter stays so config fields can be added without an ABI change.
+/// parameter stays so config fields can be added without an ABI change. The oci
+/// plugin exports no functions, so the engine's function registry goes unused.
 #[stabby::export]
-pub extern "C" fn heph_plugin_create(_cfg: stabby::vec::Vec<u8>) -> PluginComponents {
+pub extern "C" fn heph_plugin_create(
+    _cfg: stabby::vec::Vec<u8>,
+    _functions: DynFunctionRegistry,
+) -> PluginComponents {
     build()
 }
 
@@ -150,9 +155,10 @@ fn build() -> PluginComponents {
     });
 
     PluginComponents {
-        provider_name: "oci".into(),
         provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
+        functions: stabby::vec::Vec::new(),
+        function_handle: stabby::option::Option::None(),
         hooks: stabby::vec::Vec::new(),
         runners,
         meta: stabby::vec::Vec::new(),

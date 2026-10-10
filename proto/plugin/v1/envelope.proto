@@ -9,6 +9,7 @@ package heph.plugin.v1;
 import "plugin/v1/provider.proto";
 import "plugin/v1/driver.proto";
 import "plugin/v1/callback.proto";
+import "plugin/v1/function.proto";
 
 enum Transport {
   TRANSPORT_UNSPECIFIED = 0;

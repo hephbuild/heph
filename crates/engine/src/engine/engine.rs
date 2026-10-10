@@ -12,6 +12,7 @@ use crate::engine::result_lock::ResultLock;
 use crate::engine::{driver, provider};
 use anyhow::Context;
 use hlock::hlock::{FLock, FWriteGuard, Lock};
+use hplugin::function::{FunctionRegistry, FunctionSlot, PluginFnDef};
 use hsandboxfuse as sandboxfuse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,10 @@ use tracing::{error, warn};
 /// [`skip_dirs`]: PluginInit::skip_dirs
 /// [`skip_globs`]: PluginInit::skip_globs
 pub struct PluginInit {
+    /// The plugin's name: its registration key (a builtin) or its manifest's
+    /// `name` (a cdylib). Its `heph.<name>` namespace and the prefix of every
+    /// component's name — handed over for a plugin that wants it in messages.
+    pub name: String,
     pub root: PathBuf,
     /// Absolute directories to prune by exact path: the heph home plus the
     /// literal (non-glob) `fs.skip` entries, resolved relative to the repo root.
@@ -41,6 +46,11 @@ pub struct PluginInit {
     /// (a cdylib plugin uses its own runtime instead; this field serves the
     /// in-process construction path).
     pub runtime: tokio::runtime::Handle,
+    /// This engine's function registry, for a plugin whose functions call
+    /// another plugin's (`heph.<plugin>.<fn>` by `(plugin, fn)`). Unsealed while
+    /// plugins register — reading it then is an error — and sealed before the
+    /// first BUILD evaluation. Per engine: never share it across engines.
+    pub functions: Arc<FunctionSlot>,
 }
 
 /// True if `entry` contains wax glob metacharacters — used to split `fs.skip`
@@ -71,11 +81,19 @@ pub enum PluginDriver {
 pub struct PluginParts {
     pub provider: Option<Box<dyn SDKProvider>>,
     pub drivers: Vec<PluginDriver>,
+    /// BUILD-file functions, `heph.<plugin>.<fn>`. A plugin may have functions
+    /// and no provider at all.
+    pub functions: Vec<PluginFnDef>,
     pub hooks: Vec<Arc<dyn SDKHook>>,
     pub runners: Vec<Arc<dyn hexecrunner::registry::ExecRunner>>,
 }
 
 impl PluginParts {
+    pub fn with_functions(mut self, functions: Vec<PluginFnDef>) -> Self {
+        self.functions.extend(functions);
+        self
+    }
+
     pub fn with_provider(mut self, provider: Box<dyn SDKProvider>) -> Self {
         self.provider = Some(provider);
         self
@@ -111,6 +129,10 @@ pub fn component_name(plugin: &str, local: &str) -> String {
 /// The rule a plugin name follows: it is the `heph.<name>` BUILD namespace, so
 /// it must be a Starlark identifier segment.
 pub const PLUGIN_NAME_RULE: &str = "[a-z_][a-z0-9_]*";
+
+/// `PluginInit.name` for the test-only bare registrations, whose plugin is
+/// named after the component they construct — so not known until it exists.
+const BARE_PLUGIN_NAME: &str = "";
 
 /// Names no plugin may take: `core` is the static `heph.core` namespace.
 const RESERVED_PLUGIN_NAMES: &[&str] = &["core"];
@@ -240,10 +262,15 @@ pub struct Engine {
     /// (a cheap no-op on every path) unless `caches:` is configured.
     pub(crate) remote_caches: Arc<crate::engine::RemoteCacheSet>,
 
-    /// Aggregates every provider's exposed functions and injects the registry
-    /// into consumers (the buildfile provider) exactly once, lazily on the first
-    /// provider dispatch — by which point all registration has completed.
-    pub(crate) provider_functions_wired: std::sync::Once,
+    /// Every plugin's BUILD-file functions, keyed `(plugin, fn)`. Built
+    /// incrementally while plugins register (`Arc::get_mut`, so only while the
+    /// engine holds the only reference), then sealed into [`Self::function_slot`].
+    /// The engine holds the only strong reference: the slot and every plugin's
+    /// registry handle hold it weakly.
+    pub(crate) functions: Arc<FunctionRegistry>,
+    /// The handle every plugin is given (in `PluginInit`, or behind a cdylib's
+    /// registry handle). An error to read before [`Self::seal_functions`].
+    pub(crate) function_slot: Arc<FunctionSlot>,
 
     /// The remote cache's temp directory, created and swept of abandoned temps
     /// on first use (`Engine::remote_tmp_dir`). Lazy, so a build with no
@@ -637,7 +664,8 @@ impl Engine {
             credential_lock,
             deferred_values: hcore::hmemoizer::Memoizer::with_tag_task("deferred_value", runtime),
             remote_caches,
-            provider_functions_wired: std::sync::Once::new(),
+            functions: Arc::new(FunctionRegistry::default()),
+            function_slot: FunctionSlot::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
         };
@@ -647,12 +675,12 @@ impl Engine {
         engine.register_plugin("scratch", |_| {
             Ok(PluginParts::default().with_driver(Box::new(hbuiltins::pluginscratch::Driver)))
         })?;
-        // `auth.credential`, plus the provider that carries `heph.auth.*` into
-        // BUILD files (it serves no targets).
+        // `auth.credential` plus the `heph.auth.*` functions — no provider: the
+        // functions are the plugin's, so nothing has to stand in for one.
         engine.register_plugin(hbuiltins::plugincredential::PLUGIN_NAME, |_| {
             Ok(PluginParts::default()
-                .with_provider(Box::new(hbuiltins::plugincredential::functions::Provider))
-                .with_driver(Box::new(hbuiltins::plugincredential::Driver)))
+                .with_driver(Box::new(hbuiltins::plugincredential::Driver))
+                .with_functions(hbuiltins::plugincredential::functions::definitions()))
         })?;
         engine.register_plugin("query", |_| {
             Ok(
@@ -661,22 +689,24 @@ impl Engine {
             )
         })?;
 
-        // The `fs` provider + driver are always-on built-ins. Each builds its
-        // `Ignore` from the same `PluginInit` (home + `fs.skip` dirs/globs) the
-        // engine hands every plugin, so every fs glob walk prunes the same paths.
-        // A bad `fs.skip` glob surfaces as an error here.
+        // The `fs` provider, driver and `heph.fs.*` functions are always-on
+        // built-ins. Each builds its `Ignore` from the same `PluginInit` (home +
+        // `fs.skip` dirs/globs) the engine hands every plugin, so every fs glob
+        // walk prunes the same paths. A bad `fs.skip` glob surfaces as an error
+        // here.
         engine.register_plugin("fs", |init| {
-            let provider_ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
+            let functions_ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             let driver_ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             Ok(PluginParts::default()
-                .with_provider(Box::new(hbuiltins::pluginfs::Provider::new(
-                    provider_ignore,
-                    init.walker.clone(),
-                )))
+                .with_provider(Box::new(hbuiltins::pluginfs::Provider))
                 .with_driver(Box::new(hbuiltins::pluginfs::Driver::new(
                     driver_ignore,
                     init.walker.clone(),
-                ))))
+                )))
+                .with_functions(hbuiltins::pluginfs::functions(
+                    &functions_ignore,
+                    &init.walker,
+                )))
         })?;
 
         Ok(engine)
@@ -720,15 +750,22 @@ impl Engine {
         &self.cfg.root
     }
 
-    /// The aggregate provider-function registry (every provider's `heph.<p>.<fn>`
-    /// functions), built fresh. Used by the BUILD-file LSP to assemble the same
-    /// Starlark globals BUILD evaluation sees, for symbol completion/hover.
-    pub fn provider_function_registry(&self) -> Arc<provider::ProviderFunctionRegistry> {
-        let mut registry = provider::ProviderFunctionRegistry::default();
-        for provider in &self.providers {
-            registry.insert_provider(&provider.name, provider.provider.functions());
-        }
-        Arc::new(registry)
+    /// The sealed plugin-function registry (every plugin's `heph.<p>.<fn>`),
+    /// sealing it if nothing has yet. The same registry BUILD evaluation reads
+    /// — the LSP assembles its Starlark globals from it, and `heph inspect
+    /// functions` lists it. Built once, during registration; never rebuilt.
+    pub fn function_registry(&self) -> Arc<FunctionRegistry> {
+        self.seal_functions();
+        Arc::clone(&self.functions)
+    }
+
+    /// Seal the function registry: from here on every plugin's slot resolves
+    /// it, and registering another plugin is an error. Idempotent and cheap —
+    /// called at the top of every provider dispatch, by which point
+    /// registration has finished (registering needs `&mut self`, which a
+    /// shared engine no longer hands out).
+    pub(crate) fn seal_functions(&self) {
+        self.function_slot.seal(&self.functions);
     }
 
     /// The config schema a registered driver exposes. Used by the BUILD-file LSP
@@ -756,53 +793,42 @@ impl Engine {
             .and_then(|p| p.provider.state_schema())
     }
 
-    /// Every `(provider name, function name, rendered signature)` exposed across
-    /// all registered providers, sorted. The rendered signature looks like
-    /// `glob(pattern: string) -> list[string]`. Surfaced via `heph inspect functions`.
-    pub fn provider_functions(&self) -> Vec<(String, String, String)> {
-        let mut out: Vec<(String, String, String)> = self
-            .providers
+    /// Every `(plugin name, function name, rendered signature)` exposed across
+    /// all registered plugins, sorted by plugin, then function. The rendered
+    /// signature looks like `glob(pattern: string) -> list[string]`. Surfaced
+    /// via `heph inspect functions`.
+    pub fn functions(&self) -> Vec<(String, String, String)> {
+        self.function_registry()
             .iter()
-            .flat_map(|p| {
-                p.provider.functions().into_iter().map(move |def| {
-                    let rendered = def.signature.render(&def.name);
-                    (p.name.clone(), def.name, rendered)
-                })
+            .map(|(plugin, name, rf)| {
+                (
+                    plugin.to_string(),
+                    name.to_string(),
+                    rf.signature.render(name),
+                )
             })
-            .collect();
-        out.sort();
-        out
-    }
-
-    /// Build the aggregate function registry from every registered provider and
-    /// inject it into each provider, exactly once. Idempotent and cheap after the
-    /// first call. Invoked at the top of provider-dispatch paths so the registry
-    /// is complete by the first BUILD evaluation.
-    pub(crate) fn ensure_provider_functions_wired(&self) {
-        self.provider_functions_wired.call_once(|| {
-            let mut registry = provider::ProviderFunctionRegistry::default();
-            for provider in &self.providers {
-                registry.insert_provider(&provider.name, provider.provider.functions());
-            }
-            let registry = Arc::new(registry);
-            for provider in &self.providers {
-                provider
-                    .provider
-                    .set_function_registry(Arc::clone(&registry));
-            }
-        });
+            .collect()
     }
 
     /// The [`PluginInit`] context handed to every plugin constructor (direct
-    /// registration or factory): workspace root + the engine's skip dirs/globs.
-    fn plugin_init_payload(&self) -> PluginInit {
+    /// registration or factory): the plugin's name, the workspace root, the
+    /// engine's skip dirs/globs, and its function slot.
+    fn plugin_init_payload(&self, name: &str) -> PluginInit {
         PluginInit {
+            name: name.to_string(),
             root: self.cfg.root.clone(),
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
             walker: self.walker.clone(),
             runtime: self.runtime.clone(),
+            functions: Arc::clone(&self.function_slot),
         }
+    }
+
+    /// This engine's function slot — what a cdylib's registry handle resolves
+    /// through.
+    pub(crate) fn function_slot(&self) -> Arc<FunctionSlot> {
+        Arc::clone(&self.function_slot)
     }
 
     /// Refuses `name` if it breaks the naming rule, is reserved, or is already
@@ -833,7 +859,7 @@ impl Engine {
     ) -> anyhow::Result<()> {
         let source = format!("builtin plugin {name:?}");
         self.check_plugin_name(name, &source)?;
-        let parts = build(&self.plugin_init_payload())
+        let parts = build(&self.plugin_init_payload(name))
             .with_context(|| format!("constructing plugin {name:?}"))?;
         self.insert_plugin(name, source, parts)
     }
@@ -849,9 +875,16 @@ impl Engine {
         parts: PluginParts,
     ) -> anyhow::Result<()> {
         self.check_plugin_name(name, &source)?;
+        if self.function_slot.is_sealed() {
+            anyhow::bail!(
+                "{source} registered after the engine sealed its function registry; every \
+                 plugin must be registered before the first BUILD evaluation"
+            );
+        }
         let PluginParts {
             provider,
             drivers,
+            functions,
             hooks,
             runners,
         } = parts;
@@ -905,6 +938,17 @@ impl Engine {
             anyhow::bail!("driver with name '{}' already registered", d.name);
         }
 
+        // All or nothing, and refused before any other part lands. `get_mut`
+        // fails only once the registry has been handed out, which sealing does.
+        Arc::get_mut(&mut self.functions)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{source} registered after the engine handed out its function registry"
+                )
+            })?
+            .insert(name, functions)
+            .with_context(|| format!("registering the functions of {source}"))?;
+
         for runner in runners {
             self.register_exec_runner(runner)
                 .with_context(|| format!("registering an exec runner of plugin {name:?}"))?;
@@ -930,7 +974,7 @@ impl Engine {
         &mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKProvider>,
     ) -> anyhow::Result<()> {
-        let provider = factory(&self.plugin_init_payload());
+        let provider = factory(&self.plugin_init_payload(BARE_PLUGIN_NAME));
         let name = provider
             .config(provider::ConfigRequest {})
             .context("reading the provider config")?
@@ -949,7 +993,7 @@ impl Engine {
         &mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKDriver>,
     ) -> anyhow::Result<()> {
-        let driver = factory(&self.plugin_init_payload());
+        let driver = factory(&self.plugin_init_payload(BARE_PLUGIN_NAME));
         self.insert_bare_driver(PluginDriver::Plain(driver))
     }
 
@@ -959,7 +1003,7 @@ impl Engine {
         &mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKManagedDriver>,
     ) -> anyhow::Result<()> {
-        let managed = factory(&self.plugin_init_payload());
+        let managed = factory(&self.plugin_init_payload(BARE_PLUGIN_NAME));
         self.insert_bare_driver(PluginDriver::Managed(managed))
     }
 
@@ -1106,7 +1150,7 @@ impl Engine {
             }
             anyhow::bail!("unknown builtin plugin '{name}'");
         };
-        let parts = factory(&self.plugin_init_payload(), options)
+        let parts = factory(&self.plugin_init_payload(name), options)
             .with_context(|| format!("constructing builtin plugin {name:?}"))?;
         self.insert_plugin(name, format!("builtin plugin {name:?}"), parts)
     }
@@ -1117,8 +1161,8 @@ impl hplugin::lsp::LspEngine for Engine {
         &self.cfg.root
     }
 
-    fn provider_function_registry(&self) -> Arc<provider::ProviderFunctionRegistry> {
-        Engine::provider_function_registry(self)
+    fn function_registry(&self) -> Arc<FunctionRegistry> {
+        Engine::function_registry(self)
     }
 
     fn driver_schema(&self, name: &str) -> Option<crate::engine::driver::DriverSchema> {
@@ -1448,20 +1492,51 @@ mod tests {
             assert!(format!("{err:#}").contains("local name \"a.b\""));
         }
 
+        /// A function that only has a name: registration never calls it.
+        struct NoopFn;
+
+        #[async_trait::async_trait]
+        impl hplugin::function::PluginFn for NoopFn {
+            async fn call(
+                &self,
+                _: &hplugin::function::FnCallContext<'_>,
+                _: hplugin::function::FnArgs,
+            ) -> anyhow::Result<hplugin::function::FnOutcome> {
+                anyhow::bail!("not under test")
+            }
+        }
+
+        fn function(name: &str) -> PluginFnDef {
+            use hcore::htvalue::signature::{FnSignature, ParamType};
+            PluginFnDef {
+                name: name.to_string(),
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: String::new(),
+                func: Arc::new(NoopFn),
+            }
+        }
+
         #[tokio::test]
-        async fn builtin_bundle_registers_provider_and_drivers() {
+        async fn builtin_bundle_registers_provider_drivers_and_functions() {
             let (_root, mut e) = engine();
             e.register_plugin_factory("bundle", |init, opts| {
-                // The factory sees the same init every plugin gets, and its
-                // own YAML options.
+                // The factory sees the same init every plugin gets — its own
+                // name included — and its own YAML options.
                 assert!(init.root.is_absolute());
+                assert_eq!(init.name, "bundle");
                 let local: String =
                     hplugin::config::decode_opt(opts, "bundle", "local")?.unwrap_or_default();
                 let local: &'static str = Box::leak(local.into_boxed_str());
                 Ok(PluginParts::default()
                     .with_provider(provider(""))
                     .with_driver(Box::new(NamedDriver("")))
-                    .with_driver(Box::new(NamedDriver(local))))
+                    .with_driver(Box::new(NamedDriver(local)))
+                    .with_functions(vec![function(local)]))
             })
             .expect("factory");
             assert!(
@@ -1481,12 +1556,77 @@ mod tests {
                 vec!["bundle", "bundle.from_opts"]
             );
             assert!(e.providers_by_name.contains_key("bundle"));
+            assert!(
+                e.function_registry().get("bundle", "from_opts").is_some(),
+                "the bundle's function registers under the bundle's name"
+            );
+        }
 
+        /// A builtin applied twice is refused, before the seal.
+        #[tokio::test]
+        async fn builtin_bundle_applies_once() {
+            let (_root, mut e) = engine();
+            e.register_plugin_factory("bundle", |_, _| Ok(PluginParts::default()))
+                .expect("factory");
+            let opts = Options::default();
+            e.apply_builtin("bundle", &opts).expect("apply");
             let err = e.apply_builtin("bundle", &opts).expect_err("applied twice");
             assert_eq!(
                 format!("{err:#}"),
                 "builtin plugin 'bundle' is already registered"
             );
+        }
+
+        /// D6: the slot every plugin gets errs until the engine seals it, and
+        /// resolves the engine's registry after.
+        #[tokio::test]
+        async fn registry_read_before_seal_is_an_error() {
+            let (_root, mut e) = engine();
+            let mut seen = None;
+            e.register_plugin("early", |init| {
+                seen = Some(Arc::clone(&init.functions));
+                Ok(PluginParts::default().with_functions(vec![function("f")]))
+            })
+            .expect("register");
+            let slot = seen.expect("init carries the slot");
+            let err = slot.get().expect_err("read before the seal");
+            assert!(
+                format!("{err:#}").contains("before every plugin was registered"),
+                "{err:#}"
+            );
+
+            e.seal_functions();
+            let registry = slot.get().expect("sealed");
+            assert!(registry.get("early", "f").is_some());
+            assert!(registry.get("fs", "glob").is_some());
+        }
+
+        /// D6: once the registry is sealed, registering a plugin is an error
+        /// naming the plugin — never a function that silently misses the
+        /// namespace every BUILD file already sees.
+        #[tokio::test]
+        async fn plugin_registered_after_seal_is_refused() {
+            let (_root, mut e) = engine();
+            let _ = e.function_registry();
+            let err = e
+                .register_plugin("late", |_| {
+                    Ok(PluginParts::default().with_functions(vec![function("f")]))
+                })
+                .expect_err("registered after the seal");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("builtin plugin \"late\""), "{msg}");
+            assert!(msg.contains("after the engine sealed"), "{msg}");
+            assert!(e.function_registry().get("late", "f").is_none());
+        }
+
+        /// I2: a function-bearing plugin may have no provider; the two never
+        /// shared a namespace by accident.
+        #[tokio::test]
+        async fn auth_is_functions_and_a_driver_without_a_provider() {
+            let (_root, e) = engine();
+            assert!(!e.providers_by_name.contains_key("auth"));
+            assert!(e.drivers_by_name.contains_key("auth.credential"));
+            assert!(e.function_registry().get("auth", "env").is_some());
         }
     }
 }
