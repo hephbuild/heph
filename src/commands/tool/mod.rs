@@ -5,6 +5,7 @@ mod clean;
 mod completions;
 pub mod gc;
 mod gen_gitignore;
+mod plugins;
 mod resolve_plugins;
 mod scratch;
 
@@ -112,6 +113,15 @@ pub enum ToolCommands {
     /// Example: `heph tool resolve-plugins --force`
     #[command(name = "resolve-plugins")]
     ResolvePlugins(resolve_plugins::Args),
+    /// List the loaded plugins and their components, by full name
+    ///
+    /// Prints every registered plugin (builtins and the `plugins:` entries)
+    /// with where it came from, then each provider, driver, function and exec
+    /// runner it contributes, under the name a BUILD file uses: a driver as
+    /// `driver = "<plugin>.<local>"`, a function as `heph.<plugin>.<fn>`.
+    ///
+    /// Example: `heph tool plugins --json`
+    Plugins(plugins::Args),
 }
 
 impl ToolArgs {
@@ -136,6 +146,7 @@ impl ToolCommands {
             ToolCommands::BuildFmt(args) => build_fmt::execute(args, sink, global),
             ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, global),
             ToolCommands::ResolvePlugins(args) => resolve_plugins::execute(args, sink, global),
+            ToolCommands::Plugins(args) => plugins::execute(args, sink, global),
         }
     }
 }

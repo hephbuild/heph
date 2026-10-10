@@ -115,6 +115,21 @@ impl PluginParts {
 pub type PluginFactory =
     Box<dyn FnOnce(&PluginInit, &Options) -> anyhow::Result<PluginParts> + Send + Sync>;
 
+/// One registered plugin and the full name of each component it contributed —
+/// what `heph tool plugins` lists.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PluginInfo {
+    pub name: String,
+    /// Where it came from: `builtin plugin "fs"`, or a cdylib's path and manifest.
+    pub source: String,
+    pub provider: Option<String>,
+    pub drivers: Vec<String>,
+    /// As called from a BUILD file: `heph.<plugin>.<fn>`.
+    pub functions: Vec<String>,
+    pub runners: Vec<String>,
+    pub hooks: usize,
+}
+
 /// The name every provider/driver is reachable under: `<plugin>` when the
 /// component reports no local name (or its plugin's own), `<plugin>.<local>`
 /// otherwise.
@@ -221,9 +236,9 @@ pub struct Engine {
 
     /// YAML-selected builtins, by plugin name; consumed when applied.
     pub(crate) plugin_factories: HashMap<String, PluginFactory>,
-    /// Every registered plugin's name and where it came from (for the
-    /// duplicate-name error, which names both sources).
-    pub(crate) plugins: HashMap<String, String>,
+    /// Every registered plugin, by name: where it came from (for the
+    /// duplicate-name error, which names both sources) and its components.
+    pub(crate) plugins: HashMap<String, PluginInfo>,
 
     /// Process-wide FUSE sandbox state. Mount is eager — attempted in
     /// `Engine::new` so the bridge gets a ready `LayeredFs` at
@@ -835,11 +850,15 @@ impl Engine {
     /// taken by a registered plugin or a pending builtin factory.
     fn check_plugin_name(&self, name: &str, source: &str) -> anyhow::Result<()> {
         validate_plugin_name(name).with_context(|| format!("registering {source}"))?;
-        let existing = self.plugins.get(name).cloned().or_else(|| {
-            self.plugin_factories
-                .contains_key(name)
-                .then(|| format!("builtin plugin {name:?} (selectable from `plugins:`)"))
-        });
+        let existing = self
+            .plugins
+            .get(name)
+            .map(|p| p.source.clone())
+            .or_else(|| {
+                self.plugin_factories
+                    .contains_key(name)
+                    .then(|| format!("builtin plugin {name:?} (selectable from `plugins:`)"))
+            });
         if let Some(existing) = existing {
             anyhow::bail!(
                 "plugin name {name:?} is taken twice: by {existing}, and by {source}. \
@@ -938,6 +957,22 @@ impl Engine {
             anyhow::bail!("driver with name '{}' already registered", d.name);
         }
 
+        let mut info = PluginInfo {
+            name: name.to_string(),
+            source: source.clone(),
+            provider: provider.as_ref().map(|p| p.name.clone()),
+            drivers: resolved.iter().map(|d| d.name.clone()).collect(),
+            functions: functions
+                .iter()
+                .map(|f| format!("heph.{name}.{}", f.name))
+                .collect(),
+            runners: runners.iter().map(|r| r.name().to_string()).collect(),
+            hooks: hooks.len(),
+        };
+        info.drivers.sort();
+        info.functions.sort();
+        info.runners.sort();
+
         // All or nothing, and refused before any other part lands. `get_mut`
         // fails only once the registry has been handed out, which sealing does.
         Arc::get_mut(&mut self.functions)
@@ -963,8 +998,16 @@ impl Engine {
             self.drivers_by_name.insert(driver.name.clone(), driver);
         }
         self.hooks.extend(hooks);
-        self.plugins.insert(name.to_string(), source);
+        self.plugins.insert(name.to_string(), info);
         Ok(())
+    }
+
+    /// Every registered plugin with the full names of its components, sorted
+    /// by plugin name. Surfaced via `heph tool plugins`.
+    pub fn plugins(&self) -> Vec<&PluginInfo> {
+        let mut plugins: Vec<&PluginInfo> = self.plugins.values().collect();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        plugins
     }
 
     /// Test convenience: registers a one-component plugin named after the
@@ -1560,6 +1603,16 @@ mod tests {
                 e.function_registry().get("bundle", "from_opts").is_some(),
                 "the bundle's function registers under the bundle's name"
             );
+
+            let info = e
+                .plugins()
+                .into_iter()
+                .find(|p| p.name == "bundle")
+                .expect("bundle is listed");
+            assert_eq!(info.source, "builtin plugin \"bundle\"");
+            assert_eq!(info.provider.as_deref(), Some("bundle"));
+            assert_eq!(info.drivers, vec!["bundle", "bundle.from_opts"]);
+            assert_eq!(info.functions, vec!["heph.bundle.from_opts"]);
         }
 
         /// A builtin applied twice is refused, before the seal.
