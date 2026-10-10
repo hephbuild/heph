@@ -7,9 +7,12 @@
 //! - [`Engine::gc_all`] — the `heph gc` sweep. For every `(addr, hashin)` group
 //!   in the cache: if the target no longer resolves (`get_spec` →
 //!   `TargetNotFoundError`) every revision is dropped; otherwise the target is
-//!   trimmed to its `cache.history` newest revisions. When the home is shared
-//!   with other git worktrees the first rule is off (see
-//!   [`GcStats::orphan_sweep_skipped`]).
+//!   trimmed to its `cache.history` newest revisions — in the shared store of
+//!   a shared home, `history × checkouts` ([`Engine::history_limit`]). When
+//!   the home is shared with other git worktrees the first rule is off (see
+//!   [`GcStats::orphan_sweep_skipped`]). Then the registered revision pins
+//!   (nix gcroots) whose revision is gone are removed (see
+//!   [`Engine::register_revision_pins`]).
 //! - [`Engine::try_trim_after_write`] — the post-write trim. Non-blocking: it
 //!   trims the just-written target only if its lock is free, and never deletes
 //!   the revision that was just written. Deferred to the end of the request
@@ -151,6 +154,9 @@ pub struct GcStats {
     /// Staged read-only input entries (`<checkout home>/stage/`) reclaimed because their
     /// content hash is no longer referenced by any surviving manifest.
     pub stage_entries_removed: usize,
+    /// Revision pins (nix gcroots) removed because the revision they pinned is
+    /// no longer cached. See [`Engine::register_revision_pins`].
+    pub revision_pins_removed: usize,
     /// Set when the orphan sweep was skipped because the home is shared with
     /// other git checkouts (see [`HomeSharing::is_shared`]): a target that does
     /// not resolve here may be another worktree's, so nothing is dropped for
@@ -218,6 +224,22 @@ impl Engine {
             .delete(addr, hashin, MANIFEST_V1)
             .with_context(|| format!("delete manifest for {addr} {hashin}"))?;
         Ok(bytes)
+    }
+
+    /// The number of revisions of a target declaring `cache.history = history`
+    /// that `scope`'s store keeps. Every trim of a store goes through here —
+    /// the post-write trim and `heph gc` alike — so the two never disagree.
+    ///
+    /// The shared store holds every checkout's revisions of a target, so when
+    /// the home is shared its budget scales with the checkouts that use it
+    /// ([`HomeSharing::shared_history`]); otherwise two checkouts building
+    /// different revisions would evict each other. A checkout's own store is
+    /// one checkout's, and keeps plain `history`.
+    pub(crate) fn history_limit(&self, scope: CacheScope, history: u32) -> u32 {
+        match scope {
+            CacheScope::Shared => self.cfg.homes.sharing().shared_history(history),
+            CacheScope::Checkout => history,
+        }
     }
 
     /// Clear all staged read-only inputs under `<checkout home>/stage/` — the
@@ -314,6 +336,83 @@ impl Engine {
             .map(Some)
     }
 
+    /// Remove every registered revision pin whose revision is in none of this
+    /// checkout's stores. Returns how many were removed. Best-effort: a
+    /// failure is logged and the pin kept, never failing the sweep.
+    fn gc_revision_pins(&self) -> usize {
+        let mut removed = 0;
+        for dir in &self.revision_pin_dirs {
+            let pins = match hdriver_support::revision_pin::list(dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), dir = %dir.display(), "gc: listing revision pins failed");
+                    continue;
+                }
+            };
+            for pin in pins {
+                match self.gc_revision_pin(&pin) {
+                    Ok(true) => removed += 1,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        error = %format!("{e:#}"),
+                        addr = %pin.addr,
+                        hashin = %pin.hashin,
+                        "gc: revision pin kept"
+                    ),
+                }
+            }
+        }
+        removed
+    }
+
+    /// Remove `pin` if its revision is no longer cached. `Ok(false)` when it is
+    /// kept: the revision is cached, or is being built (the target's gateway is
+    /// held — the build may be about to write it) or read (its revision lock
+    /// is), the same lock-skipping as [`gc_revision`](Self::gc_revision).
+    fn gc_revision_pin(&self, pin: &hdriver_support::revision_pin::Pin) -> Result<bool> {
+        // Unlocked first: a pin of a cached revision — the steady state — is
+        // kept without taking any lock.
+        if self.revision_cached(&pin.addr, &pin.hashin)? {
+            return Ok(false);
+        }
+        let lock = self.result_lock();
+        let Some(target) = lock
+            .try_lock_target(&pin.addr)
+            .with_context(|| format!("locking {}", pin.addr))?
+        else {
+            tracing::debug!(addr = %pin.addr, "gc: revision pin kept, target is being built");
+            return Ok(false);
+        };
+        let Some(_revision) = lock
+            .try_write_revision(&target, &pin.addr, &pin.hashin)
+            .with_context(|| format!("locking revision {} of {}", pin.hashin, pin.addr))?
+        else {
+            tracing::debug!(addr = %pin.addr, hashin = %pin.hashin, "gc: revision pin kept, revision in use");
+            return Ok(false);
+        };
+        // Again under the locks: a build that finished between the first check
+        // and the lock has written the revision.
+        if self.revision_cached(&pin.addr, &pin.hashin)? {
+            return Ok(false);
+        }
+        pin.remove()?;
+        tracing::debug!(addr = %pin.addr, hashin = %pin.hashin, "gc: revision pin removed");
+        Ok(true)
+    }
+
+    /// Whether revision `(addr, hashin)` is in any of this checkout's stores.
+    fn revision_cached(&self, addr: &Addr, hashin: &str) -> Result<bool> {
+        for (scope, cache) in self.local_caches()? {
+            if cache
+                .exists(addr, hashin, MANIFEST_V1)
+                .with_context(|| format!("probing {scope:?} store for {addr} {hashin}"))?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The target's cached revisions, logged under `stage` when the read fails.
     ///
     /// `None` rather than the error: every caller here turns a failure into
@@ -394,6 +493,7 @@ impl Engine {
         keep: u32,
         written_hashin: &str,
     ) -> TrimOutcome {
+        let keep = self.history_limit(scope, keep);
         let cache = match self.local_cache_for(scope) {
             Ok(c) => c,
             Err(e) => {
@@ -703,6 +803,14 @@ impl Engine {
             Self::drain_one(&mut set, &rs, &mut stats).await;
         }
 
+        // After the trim, so a revision it just evicted releases its pin in
+        // this same sweep. Reads the stores and deletes files: blocking pool.
+        if !self.revision_pin_dirs.is_empty() {
+            let engine = Arc::clone(&self);
+            stats.revision_pins_removed =
+                hcore::blocking::run(move || engine.gc_revision_pins()).await;
+        }
+
         // Prune the shared filesystem-walk cache: drop rows untouched past the
         // TTL and rows whose path no longer exists. Best-effort — a prune failure
         // never fails the artifact GC.
@@ -840,6 +948,10 @@ impl Engine {
         addr: &Addr,
         decision: Decision,
     ) -> Result<TargetOutcome> {
+        let decision = match decision {
+            Decision::Trim(history) => Decision::Trim(self.history_limit(scope, history)),
+            d @ (Decision::Orphan | Decision::Skip) => d,
+        };
         let cache = self.local_cache_for(scope)?;
         let pre = cache
             .list_target_entries(addr)
@@ -2068,6 +2180,120 @@ mod tests {
             .expect("gc_all");
         assert_eq!(stats.orphan_targets_removed, 1);
         assert!(!present(&engine, &a, "read"));
+    }
+
+    /// `heph tool gc` removes the pin (nix gcroot) of every revision it no
+    /// longer caches, after its own trim: a revision the sweep evicts loses its
+    /// pin in that same sweep, while a revision still cached keeps its pin. A
+    /// pin of an uncached revision whose target is being built is kept (the
+    /// build may be about to write it) and goes once the build is over.
+    #[tokio::test]
+    async fn gc_all_removes_the_pins_of_evicted_revisions() {
+        use hdriver_support::revision_pin;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pins = dir.path().join("pins");
+        std::fs::create_dir_all(&pins).expect("pins dir");
+        let engine = {
+            let _rt = crate::engine::test_rt_enter();
+            let mut e = Engine::new(Config {
+                parallelism: None,
+                ..Config::for_tests(dir.path())
+            })
+            .expect("engine");
+            e.register_revision_pins(pins.clone());
+            Arc::new(e)
+        };
+        let pin = |a: &Addr, h: &str| {
+            let p = revision_pin::paths(&pins, a, h);
+            std::fs::write(&p.pin, "").expect("pin");
+            p
+        };
+        // Sidecars are written through the driver's API, so the test reads
+        // what a driver writes.
+        let sidecar = |p: &revision_pin::PinPaths, a: &Addr, h: &str| {
+            let (p, a, h) = (p.clone(), a.clone(), h.to_string());
+            async move {
+                revision_pin::write_sidecar(&p, &a, &h)
+                    .await
+                    .expect("sidecar")
+            }
+        };
+
+        // An orphan with two revisions; one is being read, so it survives.
+        let a = addr("ghost");
+        write_revision(&engine, &a, "read", 100, &["o.tar"]);
+        write_revision(&engine, &a, "idle", 200, &["o.tar"]);
+        let read_pin = pin(&a, "read");
+        sidecar(&read_pin, &a, "read").await;
+        let idle_pin = pin(&a, "idle");
+        sidecar(&idle_pin, &a, "idle").await;
+        // A revision never cached, its target being built.
+        let b = addr("building");
+        let building_pin = pin(&b, "h1");
+        sidecar(&building_pin, &b, "h1").await;
+        // A pin with no sidecar names no revision.
+        let unnamed = pins.join("unnamed");
+        std::fs::write(&unnamed, "").expect("unnamed pin");
+
+        let riding = engine
+            .result_lock()
+            .read(&a, "read", &StdCancellationToken::new())
+            .await
+            .expect("read");
+        let building = wlock(&engine, &b).await;
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all");
+        assert!(present(&engine, &a, "read") && !present(&engine, &a, "idle"));
+        assert_eq!(stats.revision_pins_removed, 1, "{stats:?}");
+        assert!(
+            !idle_pin.pin.exists() && !idle_pin.sidecar.exists(),
+            "evicted"
+        );
+        assert!(
+            read_pin.pin.exists() && read_pin.sidecar.exists(),
+            "still cached"
+        );
+        assert!(building_pin.pin.exists(), "its target is being built");
+        assert!(unnamed.exists());
+
+        drop(building);
+        drop(riding);
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all");
+        assert_eq!(stats.revision_pins_removed, 2, "{stats:?}");
+        assert!(!read_pin.pin.exists() && !building_pin.pin.exists());
+        assert!(unnamed.exists(), "never swept");
+    }
+
+    /// A pin whose revision is uncached but still read is kept: the reader may
+    /// be running what the pin keeps alive.
+    #[tokio::test]
+    async fn revision_pin_of_a_read_revision_is_kept() {
+        use hdriver_support::revision_pin;
+        let (engine, dir) = test_engine();
+        let a = addr("t");
+        let p = revision_pin::paths(dir.path(), &a, "h1");
+        revision_pin::write_sidecar(&p, &a, "h1")
+            .await
+            .expect("sidecar");
+        std::fs::write(&p.pin, "").expect("pin");
+        let listed = revision_pin::list(dir.path()).expect("list");
+        assert_eq!(listed.len(), 1);
+
+        let riding = engine
+            .result_lock()
+            .read(&a, "h1", &StdCancellationToken::new())
+            .await
+            .expect("read");
+        assert!(!engine.gc_revision_pin(&listed[0]).expect("gc pin"));
+        assert!(p.pin.exists());
+        drop(riding);
+        assert!(engine.gc_revision_pin(&listed[0]).expect("gc pin"));
+        assert!(!p.pin.exists() && !p.sidecar.exists());
     }
 
     #[tokio::test]

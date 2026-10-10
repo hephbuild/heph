@@ -332,13 +332,13 @@ async fn local_only_entries_are_per_checkout() -> anyhow::Result<()> {
 /// misses and builds its own entry; the main checkout's entry survives and
 /// still hits.
 ///
-/// `history = 2`: `cache.history` counts a target's revisions in the shared
-/// store, across every checkout. At the default of 1 the worktree's write
-/// trims the main checkout's revision — see the next test.
+/// At the default `history = 1`: the shared store keeps `history × checkouts`
+/// revisions of a target (here 2: main and the worktree), so the worktree's
+/// write does not trim the main checkout's revision.
 #[tokio::test]
 async fn divergent_sources_miss_and_keep_mains_entry() -> anyhow::Result<()> {
     let r = repo();
-    let build = r#"target(name = "d", driver = "bash", deps = [file("in.txt")], cache = {"history": 2}, run = "cat $SRC > $OUT; printf -- '-%s' $RANDOM >> $OUT", out = "out.txt")"#;
+    let build = DIVERGENT;
     write_build(&r.main, "p", build);
     write_build(&r.wt, "p", build);
     std::fs::write(r.main.join("p").join("in.txt"), "main")?;
@@ -359,26 +359,32 @@ async fn divergent_sources_miss_and_keep_mains_entry() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pins today's behaviour, which is a known cost of sharing: `cache.history`
-/// is per target in the shared store, not per checkout. At the default of 1,
-/// two checkouts building different revisions of one target evict each
-/// other's, and each rebuilds on its next run.
-#[tokio::test]
-async fn divergent_sources_at_history_1_evict_each_other() -> anyhow::Result<()> {
-    let r = repo();
-    let build = r#"target(name = "d", driver = "bash", deps = [file("in.txt")], run = "cat $SRC > $OUT; printf -- '-%s' $RANDOM >> $OUT", out = "out.txt")"#;
-    write_build(&r.main, "p", build);
-    write_build(&r.wt, "p", build);
-    std::fs::write(r.main.join("p").join("in.txt"), "main")?;
-    std::fs::write(r.wt.join("p").join("in.txt"), "wt")?;
+/// Reads `in.txt`, plus a fresh stamp: one output per source, and a rebuild is
+/// told from a hit.
+const DIVERGENT: &str = r#"target(name = "d", driver = "bash", deps = [file("in.txt")], run = "cat $SRC > $OUT; printf -- '-%s' $RANDOM >> $OUT", out = "out.txt")"#;
 
-    let main_out = run_and_settle(&engine_at(&r.main)?, "//p:d").await?;
-    run_and_settle(&engine_at(&r.wt)?, "//p:d").await?;
-    let again = run_and_settle(&engine_at(&r.main)?, "//p:d").await?;
-    assert!(again.starts_with("main-"), "{again}");
+/// Once sharing stops, the shared store's limit is plain `history` again. The
+/// worktree is deleted without `git worktree prune`: it stays registered, but
+/// a worktree that no longer exists builds nothing and does not count, so the
+/// main checkout is the only checkout left and keeps one revision.
+#[tokio::test]
+async fn history_is_plain_once_the_worktree_is_gone() -> anyhow::Result<()> {
+    let r = repo();
+    write_build(&r.main, "p", DIVERGENT);
+    let src = r.main.join("p").join("in.txt");
+    std::fs::write(&src, "one")?;
+    std::fs::remove_dir_all(&r.wt)?;
+    let main = engine_at(&r.main)?;
+
+    let one = run_and_settle(&main, "//p:d").await?;
+    std::fs::write(&src, "two")?;
+    run_and_settle(&main, "//p:d").await?;
+    std::fs::write(&src, "one")?;
+    let again = run_and_settle(&main, "//p:d").await?;
+    assert!(again.starts_with("one-"), "{again}");
     assert_ne!(
-        again, main_out,
-        "history = 1 kept only the worktree's revision, so main rebuilt"
+        again, one,
+        "history = 1 with one live checkout kept only the newest revision, so it rebuilt"
     );
     Ok(())
 }

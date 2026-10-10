@@ -103,6 +103,12 @@ pub struct Engine {
     /// only observed. Usually empty (a cheap no-op on the emit hot path).
     pub(crate) hooks: Vec<Arc<dyn SDKHook>>,
 
+    /// Directories of [revision pins](hdriver_support::revision_pin) — files a
+    /// driver keeps alive for one cached revision, such as nix gcroots.
+    /// `heph tool gc` removes each pin whose revision it no longer caches. See
+    /// [`Engine::register_revision_pins`].
+    pub(crate) revision_pin_dirs: Vec<std::path::PathBuf>,
+
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
     /// Every exec runner this host knows, by name: `local`, `wrap`, `session`.
     ///
@@ -703,6 +709,7 @@ impl Engine {
             drivers: vec![],
             drivers_by_name: HashMap::new(),
             hooks: vec![],
+            revision_pin_dirs: vec![],
             requests: Mutex::new(HashMap::new()),
             exec_runners: Arc::new({
                 let mut registry = hexecrunner::registry::RunnerRegistry::with_builtins();
@@ -1021,6 +1028,21 @@ impl Engine {
     pub fn register_hook(&mut self, hook: Arc<dyn SDKHook>) -> anyhow::Result<()> {
         self.hooks.push(hook);
         Ok(())
+    }
+
+    /// Have `heph tool gc` sweep `dir`, a directory of
+    /// [revision pins](hdriver_support::revision_pin): after the cache trim,
+    /// each pin whose revision is in none of this checkout's stores is removed,
+    /// unless the revision is being built or read.
+    ///
+    /// A pin is judged against this checkout's stores only, so `dir` must hold
+    /// the pins of this checkout's revisions — for a target whose entries are
+    /// per checkout ([`CacheScope::Checkout`]), a directory in the checkout's
+    /// home.
+    ///
+    /// [`CacheScope::Checkout`]: crate::engine::local_cache::CacheScope::Checkout
+    pub fn register_revision_pins(&mut self, dir: std::path::PathBuf) {
+        self.revision_pin_dirs.push(dir);
     }
 
     /// Snapshot of the registered hooks, cloned into a request's state so every

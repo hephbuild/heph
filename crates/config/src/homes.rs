@@ -83,6 +83,33 @@ impl HomeSharing {
         }
     }
 
+    /// The checkouts that may build into the shared home: the main checkout
+    /// plus every linked worktree that still exists on disk. A registered
+    /// worktree whose working tree is gone builds nothing, so it does not
+    /// count. 1 when the home is this checkout's own.
+    ///
+    /// Read from the `LinkedWorktrees` detection counted at resolve time, so
+    /// it is fixed for the process.
+    pub fn checkouts(&self) -> u32 {
+        match self {
+            HomeSharing::Own(_) => 1,
+            HomeSharing::Linked { worktrees, .. } | HomeSharing::Main { worktrees } => {
+                let live = worktrees.registered.saturating_sub(worktrees.missing);
+                u32::try_from(live).unwrap_or(u32::MAX).saturating_add(1)
+            }
+        }
+    }
+
+    /// The `cache.history` the **shared** store enforces for a target declaring
+    /// `history`: `history × checkouts`. In the shared store a target's
+    /// revisions are every checkout's, so a per-target budget of `history`
+    /// would let two checkouts building different revisions evict each other;
+    /// scaled, each keeps roughly its own `history`. Unchanged when the home is
+    /// not shared. A checkout's own store keeps plain `history`.
+    pub fn shared_history(&self, history: u32) -> u32 {
+        history.saturating_mul(self.checkouts())
+    }
+
     /// "N registered worktree(s) no longer exist; run `git worktree prune`",
     /// when some do not. A stale registration keeps the home counted as shared.
     pub fn stale_worktrees_note(&self) -> Option<String> {
@@ -418,6 +445,62 @@ mod tests {
             registered: 1,
             missing: 0,
         }
+    }
+
+    /// The shared store's history is `history × checkouts`: the main checkout
+    /// plus the linked worktrees that still exist. A registered worktree whose
+    /// tree is gone does not count, and an unshared home keeps plain `history`.
+    #[test]
+    fn shared_history_scales_with_live_checkouts() {
+        let wts = |registered, missing| LinkedWorktrees {
+            registered,
+            missing,
+        };
+        let own = HomeSharing::Own("not a git checkout".to_string());
+        assert_eq!(own.checkouts(), 1);
+        assert_eq!(own.shared_history(1), 1);
+        assert_eq!(own.shared_history(3), 3);
+
+        let main = HomeSharing::Main {
+            worktrees: wts(2, 0),
+        };
+        assert_eq!(main.checkouts(), 3);
+        assert_eq!(main.shared_history(1), 3);
+        assert_eq!(main.shared_history(2), 6);
+        assert_eq!(main.shared_history(0), 0);
+
+        let linked = HomeSharing::Linked {
+            main_root: PathBuf::from("/m"),
+            name: "wt".to_string(),
+            worktrees: one_worktree(),
+        };
+        assert_eq!(linked.shared_history(1), 2, "main + this worktree");
+
+        let stale = HomeSharing::Main {
+            worktrees: wts(3, 1),
+        };
+        assert_eq!(stale.shared_history(1), 3, "the missing one is not counted");
+        let all_gone = HomeSharing::Main {
+            worktrees: wts(2, 2),
+        };
+        assert!(all_gone.is_shared());
+        assert_eq!(
+            all_gone.shared_history(1),
+            1,
+            "only the main checkout is left"
+        );
+
+        assert_eq!(main.shared_history(u32::MAX), u32::MAX, "saturates");
+    }
+
+    /// A worktree removed without `git worktree prune` stops counting, as
+    /// detection reads it.
+    #[test]
+    fn deleted_worktree_does_not_count_as_a_checkout() {
+        let (_tmp, main, wt) = repo_with_worktree();
+        assert_eq!(resolve(&main, None).sharing().checkouts(), 2);
+        std::fs::remove_dir_all(&wt).expect("remove worktree");
+        assert_eq!(resolve(&main, None).sharing().checkouts(), 1);
     }
 
     fn assert_own(h: &Homes, root: &Path) {

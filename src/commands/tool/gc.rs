@@ -63,6 +63,14 @@ impl App for GcApp {
                 orphan_sweep_skipped_message(sharing, stats.orphans_kept)
             );
         }
+        if let Ok(stats) = &res
+            && stats.revision_pins_removed > 0
+        {
+            println!(
+                "Removed {} nix gcroot(s) of revisions no longer cached.",
+                stats.revision_pins_removed
+            );
+        }
 
         // Scratch caches are swept here too, because nothing else bounds them:
         // they are keyed by a declaration rather than by an input hash, so there

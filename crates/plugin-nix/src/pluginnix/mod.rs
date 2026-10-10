@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::revision_pin;
 use hexecrunner::RunnerRef;
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
@@ -15,7 +16,7 @@ use hplugin::htspec::Spec;
 use hproc::proc_exec;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
@@ -220,14 +221,12 @@ fn sanitize_env_name(addr_str: &str) -> String {
     out
 }
 
-/// The gcroot symlink's file name for one revision of a target:
-/// `<addr hash>-<hashin hash>`. The `hashin` is hashed rather than spliced in,
-/// so the name is a bounded, filesystem-safe component whatever the key.
-fn gcroot_name(addr_hash: &str, hashin: &str) -> String {
-    format!(
-        "{addr_hash}-{:x}",
-        xxhash_rust::xxh3::xxh3_64(hashin.as_bytes())
-    )
+/// Where a driver with state dir `state_dir` keeps its gcroots: one
+/// [revision pin](hdriver_support::revision_pin) per cached revision of a
+/// target. The host registers it with `Engine::register_revision_pins`, so
+/// `heph tool gc` removes the roots of revisions it no longer caches.
+pub fn gcroots_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("nix-gcroots")
 }
 
 #[async_trait]
@@ -375,19 +374,19 @@ impl ManagedDriver for Driver {
         // gcroot symlink path. `nix build --out-link <p>` registers <p> as an
         // indirect auto-gcroot, so the resolved store path + its closure
         // survive `nix-collect-garbage` for as long as the symlink exists.
-        let gcroots_dir = self.home_dir.join("nix-gcroots");
+        let gcroots_dir = gcroots_dir(&self.home_dir);
         tokio::fs::create_dir_all(&gcroots_dir)
             .await
             .with_context(|| format!("create gcroots dir {:?}", gcroots_dir))?;
-        // Keyed by revision (addr + hashin), not by addr alone: the gcroots
-        // dir is in the shared home, so a main checkout and a linked worktree
-        // building different revisions of one target would otherwise replace
-        // each other's root, and a `nix-collect-garbage` could then reclaim the
-        // store path the other's cached wrapper points at.
-        let gcroot_path = gcroots_dir.join(gcroot_name(
-            &req.request.target.addr.hash_str(),
-            req.request.hashin,
-        ));
+        // One root per revision (addr + hashin), not per addr: every revision
+        // still in the cache (`cache.history` may keep several) has a wrapper
+        // pointing at its own store path, and each needs its own root. The
+        // sidecar names the revision so `heph tool gc` can drop the root once
+        // the revision is gone; it is written first, so the root never exists
+        // without it while this build runs (see `revision_pin`).
+        let pin = revision_pin::paths(&gcroots_dir, &req.request.target.addr, req.request.hashin);
+        revision_pin::write_sidecar(&pin, &req.request.target.addr, req.request.hashin).await?;
+        let gcroot_path = pin.pin;
         // `nix build --out-link` refuses to overwrite an existing path.
         match tokio::fs::remove_file(&gcroot_path).await {
             Ok(()) => {}
@@ -499,18 +498,6 @@ mod tests {
 
     fn ctoken() -> StdCancellationToken {
         StdCancellationToken::new()
-    }
-
-    /// Two revisions of one target get two roots, so two checkouts building
-    /// different revisions into the shared home do not replace each other's;
-    /// one revision always maps to the same root.
-    #[test]
-    fn gcroot_is_per_revision() {
-        assert_ne!(gcroot_name("abc", "h1"), gcroot_name("abc", "h2"));
-        assert_ne!(gcroot_name("abc", "h1"), gcroot_name("abd", "h1"));
-        assert_eq!(gcroot_name("abc", "h1"), gcroot_name("abc", "h1"));
-        assert!(gcroot_name("abc", "../../x/y").starts_with("abc-"));
-        assert!(!gcroot_name("abc", "../../x/y").contains('/'));
     }
 
     fn driver() -> Driver {

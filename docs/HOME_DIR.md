@@ -79,12 +79,11 @@ because they belong to one working tree:
 | `cache/cache.db` and `cache/blobs/` **for `remote: false` targets** | A target that never goes to a remote cache (`cache = {"remote": False}`, and every runner target: devenv, nix, `oci_runner`) is one whose bytes may name this checkout's absolute paths (a `runner.json`'s `cwd` or `mounts`), under a key every checkout computes the same. Shared, a worktree would run in the main checkout's paths. So these entries live in a store of the checkout's own, opened the first time such a target is built. Lookup and write pick the store by the same rule from the target's def. |
 | `cache/fswalk.db`, and the Go plugin's `heph-plugin-go-fswalk.db` | Caches this tree's directory listings. A plugin's `home` (`CreateConfig.home` for a cdylib, `PluginInit.home` in process) is the checkout's home. |
 | `approval/` | Two checkouts prompting at once must not overwrite each other's notice. |
+| `nix-driver/nix-gcroots/` | One gcroot per cached revision of a nix target, keeping its store paths from `nix-collect-garbage`. A nix target is `remote: false`, so its revisions are in the checkout's own store, and its roots sit next to them. `heph tool gc` removes the roots of revisions this checkout no longer caches (below). |
 
 Everything else lives in the shared home: the cache store of every
 remote-eligible target (`cache/cache.db`, `cache/blobs/`), `cache/remote-tmp/`,
-`auth/`, `scratch/`, the gateway, revision and rebuild locks, `nix-gcroots`
-(one root per target revision, so two checkouts do not replace each other's),
-and `diag/`.
+`auth/`, `scratch/`, the gateway, revision and rebuild locks, and `diag/`.
 
 The OCI runner mounts the workspace tree, the checkout's home (its sandboxes)
 and the shared home (a sandbox's scratch mounts are symlinks into it) into its
@@ -97,11 +96,15 @@ container. A plugin gets the shared home as `CreateConfig.shared_home` /
   the shared home, so a build of `//p:a` in one checkout waits for a build of
   `//p:a` in another — whichever revision each is building. Different targets
   never wait on each other.
-- **`cache.history` counts across checkouts.** It is per target in the shared
-  store. At the default of 1, two checkouts building different revisions of one
-  target (a branch that changed its sources) keep evicting each other's, and
-  each rebuilds on its next run. Raise `history` for targets you build on
-  several branches at once.
+- **The shared cache grows with the number of worktrees.** The shared store
+  holds every checkout's revisions of a target, so when the home is shared it
+  keeps up to `history × checkouts` revisions per target instead of `history`.
+  `checkouts` is the main checkout plus each linked worktree that still exists
+  on disk (a registered worktree whose tree is gone does not count), counted
+  once when heph starts. Two checkouts building different revisions of one
+  target (a branch that changed its sources) then keep both rather than
+  evicting each other's. The checkout's own store (`remote: false` entries)
+  keeps plain `history`, and so does an unshared home.
 - **A worktree on another filesystem** pays a byte copy for each blob it writes
   into the shared cache: the write is a rename where the filesystems agree and
   falls back to a copy where they do not.
@@ -127,8 +130,10 @@ Check, in order:
    read.
 5. **The target is `remote: false`.** Its entries are per checkout (above), so
    the first build in each worktree is a miss by design.
-6. **`cache.history` evicted it.** Another checkout built a different revision
-   of the same target (above).
+6. **`cache.history` evicted it.** The shared store keeps `history × checkouts`
+   revisions of a target (above), so this takes more new revisions than that
+   budget across all checkouts, for example one checkout building several
+   revisions in a row.
 7. **An `oci_runner` consumer.** Its key includes host paths (the runner's
    mounts carry the checkout's absolute paths), so it differs per checkout.
    This predates sharing and is known.
@@ -144,7 +149,8 @@ whenever the home is or may be shared:
 - it runs in a main checkout whose repository has any linked worktrees
   (`.git/worktrees/*`), whatever its own `shareHome` says.
 
-History trimming (`cache.history`) still runs. The checkout's own store
+History trimming (`cache.history`, scaled by the number of checkouts in the
+shared store; see "Costs of sharing") still runs. The checkout's own store
 (`remote: false` entries) belongs to this checkout alone, so it always gets the
 full sweep. `gc` prints why it skipped, e.g. `Orphan sweep skipped: the home is
 shared with 2 linked worktree(s), so 3 target(s) that do not resolve here were
@@ -159,6 +165,14 @@ and runs the full orphan sweep. If several checkouts point an absolute `homeDir`
 at one directory, a `gc` in any of them drops the targets that only the others
 define. Use a relative `homeDir` (shared through detection) or
 `shareHome: false` if checkouts need their own caches.
+
+After the trim, `gc` removes the nix gcroot of every revision it no longer
+caches, so `nix-collect-garbage` can reclaim the store paths. The nix driver
+keeps one root per cached revision, with a sidecar file naming that revision,
+in `<checkout home>/nix-driver/nix-gcroots/`. A root is kept while its
+revision is in either of this checkout's stores, while its target is being
+built, and while its revision is being read. A root with no sidecar names no
+revision and is never removed.
 
 ## `${git:branch}`
 
