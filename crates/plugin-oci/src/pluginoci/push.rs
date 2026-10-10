@@ -34,7 +34,10 @@ use xxhash_rust::xxh3::Xxh3Default;
 use super::auth::RegistryCredentials;
 use super::{archive::Layout, dep_input, dep_single_file, registry};
 
-pub const DRIVER_NAME: &str = "oci_push";
+/// The name BUILD files select this driver by: `<plugin>.<local>`.
+pub const DRIVER_NAME: &str = "oci.push";
+/// Its local name inside the `oci` plugin.
+pub const LOCAL_NAME: &str = "push";
 
 /// The `origin_id` of the single image-archive dep input.
 const IMAGE_ORIGIN: &str = "image";
@@ -212,7 +215,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: LOCAL_NAME.to_string(),
         })
     }
 

@@ -35,7 +35,7 @@
 # identity the runner happened to have — precisely the accident this prevents.
 demo = target(
     name = "demo",
-    driver = "credential",
+    driver = "auth.credential",
     sources = [
         # CI: mint the runner's OIDC token. On a laptop this probe fails cleanly
         # (there is no OIDC endpoint), which is what lets one declaration serve
@@ -115,7 +115,7 @@ mint = target(
 
 derived = target(
     name = "derived",
-    driver = "credential",
+    driver = "auth.credential",
     sources = [mint],
     present = {"env": {"DERIVED_TOKEN": "${token}"}},
 )

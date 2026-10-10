@@ -81,48 +81,48 @@ fn build() -> PluginComponents {
     // Assembles target outputs into an image. No daemon, no execution.
     let image: Arc<dyn ManagedDriver> = Arc::new(pluginoci::image::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::image::DRIVER_NAME.into(),
+        name: pluginoci::image::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(image),
     });
     let layer: Arc<dyn ManagedDriver> = Arc::new(pluginoci::layer::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::layer::DRIVER_NAME.into(),
+        name: pluginoci::layer::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(layer),
     });
     // Groups per-platform images into one multi-platform image.
     let index: Arc<dyn ManagedDriver> = Arc::new(pluginoci::index::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::index::DRIVER_NAME.into(),
+        name: pluginoci::index::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(index),
     });
     // Builds a Dockerfile + context into a cacheable image archive.
     let docker: Arc<dyn ManagedDriver> = Arc::new(pluginoci::docker_build::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::docker_build::DRIVER_NAME.into(),
+        name: pluginoci::docker_build::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(docker),
     });
     // Pulls a base image into a cacheable archive (or OCI layout).
     let pull: Arc<dyn ManagedDriver> = Arc::new(pluginoci::pull::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::pull::DRIVER_NAME.into(),
+        name: pluginoci::pull::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(pull),
     });
     // Actions — uncached, they mutate a registry or the local daemon.
     let push: Arc<dyn ManagedDriver> = Arc::new(pluginoci::push::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::push::DRIVER_NAME.into(),
+        name: pluginoci::push::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(push),
     });
     let load: Arc<dyn ManagedDriver> = Arc::new(pluginoci::load::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::load::DRIVER_NAME.into(),
+        name: pluginoci::load::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(load),
     });
     // Asks buildx which platform it would build by default. Depended on, never
     // named by a user.
     let platform: Arc<dyn ManagedDriver> = Arc::new(pluginoci::platform::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::platform::DRIVER_NAME.into(),
+        name: pluginoci::platform::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(platform),
     });
 
@@ -132,7 +132,7 @@ fn build() -> PluginComponents {
     // no runner implementation of its own.
     let runner: Arc<dyn ManagedDriver> = Arc::new(pluginoci::runner::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::runner::DRIVER_NAME.into(),
+        name: pluginoci::runner::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(runner),
     });
 

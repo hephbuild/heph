@@ -17,7 +17,7 @@
 //! skips (it does not fail) when there is no usable `docker` — notably macOS
 //! CI, which has no daemon.
 //!
-//! The registry and daemon halves (`oci_push` / `oci_pull` / `oci_load`) are
+//! The registry and daemon halves (`oci.push` / `oci.pull` / `oci.load`) are
 //! covered too, against a throwaway `registry:2` container. Those tests need the
 //! network once, to pull the registry image, and skip if they cannot get it.
 //! They no longer need any host tool beyond docker itself: push and pull speak
@@ -297,19 +297,22 @@ fn workspace() -> htestkit::Workspace {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::docker_build::Driver::new()))
-        .with_provider(|_| Box::new(pluginoci::platform::Provider))
-        .with_managed_driver(Box::new(pluginoci::platform::Driver::new()))
-        .with_managed_driver(Box::new(pluginoci::load::Driver::new()))
-        .with_managed_driver(Box::new(pluginoci::push::Driver::new()))
-        .with_managed_driver(Box::new(pluginoci::pull::Driver::new()))
+        .with_plugin(pluginoci::PLUGIN_NAME, |_| {
+            Ok(heph::engine::PluginParts::default()
+                .with_provider(Box::new(pluginoci::platform::Provider))
+                .with_managed_driver(Box::new(pluginoci::docker_build::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::platform::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::load::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::push::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::pull::Driver::new())))
+        })
         .build()
         .expect("build workspace")
 }
 
 /// A throwaway `registry:2` on a random host port, removed on drop.
 ///
-/// `oci_push` and `oci_pull` only speak `docker://`, so a registry is the only
+/// `oci.push` and `oci.pull` only speak `docker://`, so a registry is the only
 /// way to exercise them at all. A local one keeps the test off the network for
 /// everything except the one-time pull of the registry image itself.
 struct Registry {
@@ -512,7 +515,7 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":dockerfile", ":payload"],
     {builder}
 )
@@ -576,7 +579,7 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     format = "docker",
     context = {{"": [":dockerfile"], "bin": ["//cmd/server:bin"]}},
     {builder}
@@ -626,7 +629,7 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = {{"": [":dockerfile"], "bin": ["//cmd/server:bin"]}},
     {builder}
 )
@@ -666,7 +669,7 @@ target(
 target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
 target(
     name = "good",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     stage = "good",
     out = "good.tar",
     context = [":dockerfile", ":payload"],
@@ -674,7 +677,7 @@ target(
 )
 target(
     name = "bad",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     stage = "bad",
     out = "bad.tar",
     context = [":dockerfile", ":payload"],
@@ -721,7 +724,7 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":dockerfile", ":payload"],
     platforms = ["linux/amd64", "linux/arm64"],
     {builder}
@@ -785,14 +788,14 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     format = "docker",
     context = [":dockerfile", ":payload"],
     {builder}
 )
-target(name = "load", driver = "oci_load", image = ":img", tag = "{tag}")
-target(name = "autoload", driver = "oci_load", image = ":img")
-target(name = "namedload", driver = "oci_load", image = ":img", tag = "{named_repo}")
+target(name = "load", driver = "oci.load", image = ":img", tag = "{tag}")
+target(name = "autoload", driver = "oci.load", image = ":img")
+target(name = "namedload", driver = "oci.load", image = ":img", tag = "{named_repo}")
 "#,
             builder = builder_attr(&builder),
         ),
@@ -843,7 +846,7 @@ target(name = "namedload", driver = "oci_load", image = ":img", tag = "{named_re
     let namedloaded = namedloaded?;
     assert!(
         explicit.is_ok_and(|o| o.status.success()),
-        "the tag {tag} must exist in the daemon after oci_load"
+        "the tag {tag} must exist in the daemon after oci.load"
     );
     // The output is the ref, and the claim it makes is that this exact string
     // resolves in the daemon — so it is checked against the daemon's own view
@@ -934,11 +937,11 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":dockerfile", ":payload"],
     {builder}
 )
-target(name = "load", driver = "oci_load", image = ":img", tag = "{tag}")
+target(name = "load", driver = "oci.load", image = ":img", tag = "{tag}")
 "#,
             builder = builder_attr(&builder),
         ),
@@ -991,21 +994,21 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":dockerfile", ":payload"],
     platforms = ["linux/amd64", "linux/arm64"],
     {builder}
 )
 target(
     name = "push",
-    driver = "oci_push",
+    driver = "oci.push",
     image = ":img",
     ref = "{host}/heph-e2e/app:multi",
     insecure = True,
 )
 target(
     name = "base",
-    driver = "oci_pull",
+    driver = "oci.pull",
     ref = "{host}/heph-e2e/app:multi",
     layout = True,
     all_platforms = True,
@@ -1019,7 +1022,7 @@ target(
 )
 target(
     name = "derived",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     dockerfile = "Dockerfile.derived",
     out = "derived.tar",
     context = [":derived_dockerfile", ":payload"],
@@ -1101,14 +1104,14 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":dockerfile", ":payload"],
     {builder}
 )
 target(name = "repo", driver = "bash", run = "echo {host}/heph-e2e/tagged > $OUT", out = "repo.txt")
 target(
     name = "push",
-    driver = "oci_push",
+    driver = "oci.push",
     image = ":img",
     ref = "${{read://app:repo}}:${{image_hashout}}",
     insecure = True,
@@ -1216,7 +1219,7 @@ target(
 )
 target(
     name = "img",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     context = [":dockerfile", ":payload"],
     platforms = ["linux/amd64", "linux/arm64"],
     builder = "{name}",
@@ -1269,7 +1272,7 @@ target(
     run = "printf 'FROM scratch\nCOPY app/payload.txt /payload.txt\n' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "docker_build", context = [":dockerfile", ":payload"])
+target(name = "img", driver = "oci.docker_build", context = [":dockerfile", ":payload"])
 "#,
     );
 

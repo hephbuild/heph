@@ -221,7 +221,7 @@ struct UnitcheckerConfig {
 impl ManagedDriver for GoLintDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: "go_lint".to_string(),
+            name: "lint".to_string(),
         })
     }
 
@@ -731,7 +731,7 @@ fn merge_report_findings(reports: &[Vec<u8>]) -> anyhow::Result<Vec<String>> {
 impl ManagedDriver for GoLintGateDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: "go_lint_gate".to_string(),
+            name: "lint_gate".to_string(),
         })
     }
 
@@ -1081,7 +1081,7 @@ const GO_LINT_FIX_FORMAT_VERSION: u32 = 1;
 impl ManagedDriver for GoLintFixDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: "go_lint_fix".to_string(),
+            name: "lint_fix".to_string(),
         })
     }
 
@@ -1352,7 +1352,7 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
 
     TargetSpec {
         addr: p.addr,
-        driver: "go_lint".to_string(),
+        driver: "go.lint".to_string(),
         config,
         // No labels: `_lint-analyze` is the analyze unit `lint` / `lint-check` consume, not
         // a target anyone selects. Labels are the selection surface, so it has none
@@ -1585,7 +1585,7 @@ mod tests {
 
     #[test]
     fn driver_is_go_lint() {
-        assert_eq!(spec(&[], &[]).driver, "go_lint");
+        assert_eq!(spec(&[], &[]).driver, "go.lint");
     }
 
     #[test]
@@ -1853,7 +1853,7 @@ mod tests {
             Default::default(),
         );
         let s = build_lint_gate_spec(addr("lint-check"), std::slice::from_ref(&analyze), None);
-        assert_eq!(s.driver, "go_lint_gate");
+        assert_eq!(s.driver, "go.lint_gate");
         let deps = match s.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("deps not a map"),
@@ -2232,7 +2232,7 @@ mod tests {
             &["a.go".to_string()],
             None,
         );
-        assert_eq!(s.driver, "go_lint_fix");
+        assert_eq!(s.driver, "go.lint_fix");
 
         // Depends on `_lint-analyze`'s report + the sources (default group).
         let deps = match s.config.get("deps").unwrap() {

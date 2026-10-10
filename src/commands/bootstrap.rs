@@ -99,16 +99,45 @@ pub fn telemetry_enabled_from_config() -> bool {
 /// on the engine, so one engine serves an ordinary request and an audit request
 /// without being rebuilt, and each switch has exactly one source of truth. Only
 /// workspace-level policy reaches `Config`.
+/// The always-on builtins the binary adds beside the engine's own (`fs`,
+/// `group`, `scratch`, `auth`, `query`): each one plugin, named after itself.
+/// None takes options. The `go`, `oci`, `devenv` and `gha` plugins are not
+/// compiled in: they ship as cdylibs loaded from a `path:`/`url:` manifest
+/// entry, named by that manifest.
+pub fn register_builtin_plugins(
+    e: &mut engine::Engine,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use engine::PluginParts;
+    e.register_plugin(pluginhostbin::PLUGIN_NAME, |_| {
+        Ok(PluginParts::default()
+            .with_provider(Box::new(pluginhostbin::Provider))
+            .with_driver(Box::new(pluginhostbin::Driver)))
+    })?;
+    e.register_plugin(plugintextfile::DRIVER_NAME, |_| {
+        Ok(PluginParts::default().with_driver(Box::new(plugintextfile::Driver)))
+    })?;
+    // `http_fetch`: downloads a URL (templated over the target's addr args) into a
+    // cacheable file output — how tool binaries are provisioned off the internet.
+    e.register_plugin(pluginhttp::DRIVER_NAME, |_| {
+        Ok(PluginParts::default().with_managed_driver(Box::new(pluginhttp::Driver)))
+    })?;
+    let nix_dir = home_dir.join("nix-driver");
+    e.register_plugin(pluginnix::DRIVER_NAME, |_| {
+        Ok(PluginParts::default().with_managed_driver(Box::new(pluginnix::Driver::new(nix_dir))))
+    })?;
+    Ok(())
+}
+
 /// Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
-/// <name> }` entry selects them. The go plugin is no longer compiled in: it
-/// ships as a separate cdylib loaded from a `path:`/`url:` manifest entry,
-/// under its own `go`/`go_*` names.
+/// <name> }` entry selects them.
 ///
 /// Public so a config generated elsewhere (`heph-bench`'s Tier B corpus) can be
 /// checked against the set the binary actually accepts.
 pub fn register_builtin_factories(e: &mut engine::Engine) -> anyhow::Result<()> {
-    e.register_provider_factory("buildfile", |init, opts| {
-        Ok(Box::new(
+    use engine::PluginParts;
+    e.register_plugin_factory("buildfile", |init, opts| {
+        Ok(PluginParts::default().with_provider(Box::new(
             pluginbuildfile::Provider::from_options(
                 init.root.to_path_buf(),
                 &init.skip_dirs,
@@ -117,13 +146,15 @@ pub fn register_builtin_factories(e: &mut engine::Engine) -> anyhow::Result<()> 
                 init.runtime.clone(),
             )?
             .with_walker(init.walker.clone()),
-        ))
+        )))
     })?;
-    e.register_managed_driver_factory("exec", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
+    e.register_plugin_factory("exec", |_init, opts| {
+        Ok(PluginParts::default()
+            .with_managed_driver(Box::new(pluginexec::Driver::from_options_exec(opts)?)))
     })?;
-    e.register_managed_driver_factory("bash", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
+    e.register_plugin_factory("bash", |_init, opts| {
+        Ok(PluginParts::default()
+            .with_managed_driver(Box::new(pluginexec::Driver::from_options_bash(opts)?)))
     })?;
     Ok(())
 }
@@ -184,18 +215,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
 
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the
     // engine's own skip dirs. The remaining built-ins have no config.
-    e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
-    e.register_driver(|_| Box::new(pluginhostbin::Driver))?;
-    e.register_driver(|_| Box::new(plugintextfile::Driver))?;
-    // `http_fetch`: downloads a URL (templated over the target's addr args) into a
-    // cacheable file output — how tool binaries are provisioned off the internet.
-    e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
-    // The `oci_*` drivers are not compiled in: like the go plugin, they ship as
-    // a separate cdylib loaded from a `path:`/`url:` manifest entry
-    // (`heph-oci-plugin.json`), under their own `docker_build` / `oci_pull` /
-    // `oci_push` / `oci_load` names.
-    e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
-
+    register_builtin_plugins(&mut e, &home_dir)?;
     register_builtin_factories(&mut e)?;
 
     // Apply every `plugins:` entry: a `builtin:` instantiates the matching
@@ -350,14 +370,7 @@ mod tests {
         })?;
 
         // `fs` is auto-registered by `Engine::new`.
-        e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
-        e.register_driver(|_| Box::new(pluginhostbin::Driver))?;
-        e.register_driver(|_| Box::new(plugintextfile::Driver))?;
-        e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
-        e.register_managed_driver(|_| {
-            Box::new(pluginnix::Driver::new(home_dir.join("nix-driver")))
-        })?;
-
+        register_builtin_plugins(&mut e, &home_dir)?;
         register_builtin_factories(&mut e)?;
 
         // The helper exercises built-in plugins only (no cdylib loading).
@@ -387,6 +400,46 @@ plugins:
         assert!(e.drivers_by_name.contains_key("exec"));
         assert!(e.drivers_by_name.contains_key("bash"));
         assert!(e.providers_by_name.contains_key("fs"));
+    }
+
+    /// The builtin rows of the spec's name map: every provider and driver a
+    /// fully configured binary registers (before any cdylib), by the name a
+    /// BUILD file or `provider_state` uses. A rename that is not in the map
+    /// fails here; the cdylib rows are pinned in `bin-e2e`'s `plugin_dylib`.
+    #[test]
+    fn shipped_names_match_the_name_map() {
+        let yaml = r#"
+plugins:
+  - builtin: buildfile
+  - builtin: exec
+  - builtin: bash
+"#;
+        let (_dir, e) = build_engine_from_yaml(yaml).expect("engine");
+        fn sorted<'a>(names: impl Iterator<Item = &'a String>) -> Vec<&'a str> {
+            let mut names: Vec<&str> = names.map(String::as_str).collect();
+            names.sort_unstable();
+            names
+        }
+        assert_eq!(
+            sorted(e.providers_by_name.keys()),
+            // `auth` carries `heph.auth.*` until functions belong to plugins.
+            ["auth", "buildfile", "fs", "hostbin", "query"]
+        );
+        assert_eq!(
+            sorted(e.drivers_by_name.keys()),
+            [
+                "auth.credential",
+                "bash",
+                "exec",
+                "fs",
+                "group",
+                "hostbin",
+                "http_fetch",
+                "nix",
+                "scratch",
+                "textfile",
+            ]
+        );
     }
 
     #[test]

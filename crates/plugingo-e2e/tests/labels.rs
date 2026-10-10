@@ -124,8 +124,8 @@ async fn select_counting_golist(
     Ok((addrs, golists.into_iter().collect()))
 }
 
-// C5, C27: `heph auth status` selects `driver("credential")`. Every go entry
-// lists its driver, so none is resolved — no `go list` anywhere — and the
+// C5, C27: `heph auth status` selects `driver("auth.credential")`. Every go
+// entry lists its driver, so none is resolved — no `go list` anywhere — and the
 // credential BUILD target is still found.
 #[tokio::test]
 async fn auth_status_never_gets_go() -> anyhow::Result<()> {
@@ -133,12 +133,12 @@ async fn auth_status_never_gets_go() -> anyhow::Result<()> {
     let dir = fixture("with_dep")?;
     std::fs::write(
         dir.path().join("lib").join("BUILD"),
-        r#"target(name = "token", driver = "credential")"#,
+        r#"target(name = "token", driver = "auth.credential")"#,
     )?;
     let ws = make_workspace(dir)?;
     let m = Matcher::And(vec![
         Matcher::PackagePrefix(PkgBuf::from("")),
-        Matcher::Driver("credential".to_string()),
+        Matcher::Driver("auth.credential".to_string()),
     ]);
     let (addrs, golists) = select_counting_golist(&ws, &m).await?;
     assert_eq!(addrs, vec!["//lib:token"]);

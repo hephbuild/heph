@@ -1,7 +1,7 @@
 //! Host-side handling of credential references: the chain walk, acquisition, and
 //! presentation.
 //!
-//! A credential is declared as a target (`driver = "credential"`) and referenced
+//! A credential is declared as a target (`driver = "auth.credential"`) and referenced
 //! by addr from the targets that use it. The reference arrives as an [`Input`]
 //! with `hashed: false, runtime: false`, marked by
 //! [`CREDENTIAL_ANNOTATION`](hdriver_support::credential::CREDENTIAL_ANNOTATION).

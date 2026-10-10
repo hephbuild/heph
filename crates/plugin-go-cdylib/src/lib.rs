@@ -123,57 +123,57 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let golist: Arc<dyn ManagedDriver> =
         Arc::new(GoGolistDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
-        name: "go_golist".into(),
+        name: "golist".into(),
         driver: make_dyn_managed_driver(golist),
     });
     // Hermetic Go toolchain: downloads + extracts the pinned SDK that backs
     // every Go build/list/test target.
     let toolchain: Arc<dyn ManagedDriver> = Arc::new(GoToolchainDriver);
     drivers.push(NamedDriver {
-        name: "go_toolchain".into(),
+        name: "toolchain".into(),
         driver: make_dyn_managed_driver(toolchain),
     });
     let compile: Arc<dyn ManagedDriver> =
         Arc::new(GoCompileDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
-        name: "go_compile".into(),
+        name: "compile".into(),
         driver: make_dyn_managed_driver(compile),
     });
     let testmain: Arc<dyn ManagedDriver> = Arc::new(GoTestmainDriver);
     drivers.push(NamedDriver {
-        name: "go_testmain".into(),
+        name: "testmain".into(),
         driver: make_dyn_managed_driver(testmain),
     });
     // Per-package go/analysis (vet) with serialized facts, nogo-style.
     let lint: Arc<dyn ManagedDriver> =
         Arc::new(GoLintDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
-        name: "go_lint".into(),
+        name: "lint".into(),
         driver: make_dyn_managed_driver(lint),
     });
     // Gate: fails the build when a package's lint report has findings.
     let lint_gate: Arc<dyn ManagedDriver> = Arc::new(GoLintGateDriver::new());
     drivers.push(NamedDriver {
-        name: "go_lint_gate".into(),
+        name: "lint_gate".into(),
         driver: make_dyn_managed_driver(lint_gate),
     });
     // Fix: applies the report's suggested fixes back into source (codegen).
     let lint_fix: Arc<dyn ManagedDriver> = Arc::new(GoLintFixDriver::new());
     drivers.push(NamedDriver {
-        name: "go_lint_fix".into(),
+        name: "lint_fix".into(),
         driver: make_dyn_managed_driver(lint_fix),
     });
     // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
     let format: Arc<dyn ManagedDriver> =
         Arc::new(GoFormatDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
-        name: "go_format".into(),
+        name: "format".into(),
         driver: make_dyn_managed_driver(format),
     });
     let format_check: Arc<dyn ManagedDriver> =
         Arc::new(GoFormatCheckDriver::new().with_default_runner(go_runner));
     drivers.push(NamedDriver {
-        name: "go_format_check".into(),
+        name: "format_check".into(),
         driver: make_dyn_managed_driver(format_check),
     });
 

@@ -56,14 +56,100 @@ pub(crate) fn normalize_skip(entry: &str) -> &str {
     entry.strip_prefix("./").unwrap_or(entry)
 }
 
-/// Factory args: the [`PluginInit`] context and the plugin's YAML options.
-pub type ProviderFactory =
-    Box<dyn FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync>;
-pub type DriverFactory =
-    Box<dyn FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKDriver>> + Send + Sync>;
-pub type ManagedDriverFactory = Box<
-    dyn FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKManagedDriver>> + Send + Sync,
->;
+/// One driver a plugin ships: a plain [`SDKDriver`], or a [`SDKManagedDriver`]
+/// the engine wraps in its sandbox bridge.
+pub enum PluginDriver {
+    Plain(Box<dyn SDKDriver>),
+    Managed(Box<dyn SDKManagedDriver>),
+}
+
+/// Everything one plugin contributes. It carries no name: the engine supplies
+/// it from the registration key (a builtin) or the manifest (a cdylib), and
+/// names each component after it — `<plugin>` for a component that reports no
+/// local name (or one equal to the plugin's), `<plugin>.<local>` otherwise.
+#[derive(Default)]
+pub struct PluginParts {
+    pub provider: Option<Box<dyn SDKProvider>>,
+    pub drivers: Vec<PluginDriver>,
+    pub hooks: Vec<Arc<dyn SDKHook>>,
+    pub runners: Vec<Arc<dyn hexecrunner::registry::ExecRunner>>,
+}
+
+impl PluginParts {
+    pub fn with_provider(mut self, provider: Box<dyn SDKProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    pub fn with_driver(mut self, driver: Box<dyn SDKDriver>) -> Self {
+        self.drivers.push(PluginDriver::Plain(driver));
+        self
+    }
+
+    pub fn with_managed_driver(mut self, driver: Box<dyn SDKManagedDriver>) -> Self {
+        self.drivers.push(PluginDriver::Managed(driver));
+        self
+    }
+}
+
+/// A YAML-selected builtin: built from the [`PluginInit`] context and the
+/// plugin's `options:` when a `plugins: - { builtin: <name> }` entry names it.
+pub type PluginFactory =
+    Box<dyn FnOnce(&PluginInit, &Options) -> anyhow::Result<PluginParts> + Send + Sync>;
+
+/// The name every provider/driver is reachable under: `<plugin>` when the
+/// component reports no local name (or its plugin's own), `<plugin>.<local>`
+/// otherwise.
+pub fn component_name(plugin: &str, local: &str) -> String {
+    if local.is_empty() || local == plugin {
+        plugin.to_string()
+    } else {
+        format!("{plugin}.{local}")
+    }
+}
+
+/// The rule a plugin name follows: it is the `heph.<name>` BUILD namespace, so
+/// it must be a Starlark identifier segment.
+pub const PLUGIN_NAME_RULE: &str = "[a-z_][a-z0-9_]*";
+
+/// Names no plugin may take: `core` is the static `heph.core` namespace.
+const RESERVED_PLUGIN_NAMES: &[&str] = &["core"];
+
+fn is_valid_name_segment(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The full name of a component `kind` ("provider"/"driver") reporting the
+/// local name `local`, inside plugin `plugin`. A local name follows the same
+/// character rule as a plugin name, so `<plugin>.<local>` stays unambiguous.
+fn resolve_component_name(plugin: &str, local: &str, kind: &str) -> anyhow::Result<String> {
+    if !local.is_empty() && !is_valid_name_segment(local) {
+        anyhow::bail!(
+            "plugin {plugin:?} has a {kind} with local name {local:?}; a local name must match \
+             `{PLUGIN_NAME_RULE}` (or be empty, to be reachable as {plugin:?})"
+        );
+    }
+    Ok(component_name(plugin, local))
+}
+
+/// Checks a plugin name against the naming rule and the reserved set.
+pub fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
+    if RESERVED_PLUGIN_NAMES.contains(&name) {
+        anyhow::bail!(
+            "plugin name {name:?} is reserved (it is the built-in `heph.{name}` namespace); \
+             choose another name"
+        );
+    }
+    if !is_valid_name_segment(name) {
+        anyhow::bail!(
+            "invalid plugin name {name:?}: a plugin name must match `{PLUGIN_NAME_RULE}`, \
+             because it is the `heph.<name>` namespace in BUILD files"
+        );
+    }
+    Ok(())
+}
 
 pub struct Engine {
     pub(crate) cfg: Config,
@@ -111,9 +197,11 @@ pub struct Engine {
     /// reflects the *free* count, not the configured max).
     pub(crate) max_workers: usize,
 
-    pub(crate) provider_factories: HashMap<String, ProviderFactory>,
-    pub(crate) driver_factories: HashMap<String, DriverFactory>,
-    pub(crate) managed_driver_factories: HashMap<String, ManagedDriverFactory>,
+    /// YAML-selected builtins, by plugin name; consumed when applied.
+    pub(crate) plugin_factories: HashMap<String, PluginFactory>,
+    /// Every registered plugin's name and where it came from (for the
+    /// duplicate-name error, which names both sources).
+    pub(crate) plugins: HashMap<String, String>,
 
     /// Process-wide FUSE sandbox state. Mount is eager — attempted in
     /// `Engine::new` so the bridge gets a ready `LayeredFs` at
@@ -540,9 +628,8 @@ impl Engine {
                 pool
             },
             max_workers,
-            provider_factories: HashMap::new(),
-            driver_factories: HashMap::new(),
-            managed_driver_factories: HashMap::new(),
+            plugin_factories: HashMap::new(),
+            plugins: HashMap::new(),
             fuse,
             result_lock,
             scratch_lock,
@@ -554,30 +641,42 @@ impl Engine {
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
         };
-        engine.register_driver(|_| Box::new(hbuiltins::plugingroup::Driver))?;
-        engine.register_driver(|_| Box::new(hbuiltins::pluginscratch::Driver))?;
-        engine.register_driver(|_| Box::new(hbuiltins::plugincredential::Driver))?;
-        // Serves no targets; it exists to carry `heph.auth.*` into BUILD files.
-        engine.register_provider(|_| Box::new(hbuiltins::plugincredential::functions::Provider))?;
-        engine.register_provider(|_| Box::new(hplugin_query::pluginquery::Provider))?;
+        engine.register_plugin("group", |_| {
+            Ok(PluginParts::default().with_driver(Box::new(hbuiltins::plugingroup::Driver)))
+        })?;
+        engine.register_plugin("scratch", |_| {
+            Ok(PluginParts::default().with_driver(Box::new(hbuiltins::pluginscratch::Driver)))
+        })?;
+        // `auth.credential`, plus the provider that carries `heph.auth.*` into
+        // BUILD files (it serves no targets).
+        engine.register_plugin(hbuiltins::plugincredential::PLUGIN_NAME, |_| {
+            Ok(PluginParts::default()
+                .with_provider(Box::new(hbuiltins::plugincredential::functions::Provider))
+                .with_driver(Box::new(hbuiltins::plugincredential::Driver)))
+        })?;
+        engine.register_plugin("query", |_| {
+            Ok(
+                PluginParts::default()
+                    .with_provider(Box::new(hplugin_query::pluginquery::Provider)),
+            )
+        })?;
 
         // The `fs` provider + driver are always-on built-ins. Each builds its
         // `Ignore` from the same `PluginInit` (home + `fs.skip` dirs/globs) the
         // engine hands every plugin, so every fs glob walk prunes the same paths.
-        // The fallible variant lets a bad `fs.skip` glob surface as an error here.
-        engine.try_register_provider(|init| {
-            let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
-            Ok(Box::new(hbuiltins::pluginfs::Provider::new(
-                ignore,
-                init.walker.clone(),
-            )))
-        })?;
-        engine.try_register_driver(|init| {
-            let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
-            Ok(Box::new(hbuiltins::pluginfs::Driver::new(
-                ignore,
-                init.walker.clone(),
-            )))
+        // A bad `fs.skip` glob surfaces as an error here.
+        engine.register_plugin("fs", |init| {
+            let provider_ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
+            let driver_ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
+            Ok(PluginParts::default()
+                .with_provider(Box::new(hbuiltins::pluginfs::Provider::new(
+                    provider_ignore,
+                    init.walker.clone(),
+                )))
+                .with_driver(Box::new(hbuiltins::pluginfs::Driver::new(
+                    driver_ignore,
+                    init.walker.clone(),
+                ))))
         })?;
 
         Ok(engine)
@@ -706,81 +805,175 @@ impl Engine {
         }
     }
 
-    /// Registers an already-constructed driver. Shared by [`Self::register_driver`]
-    /// and [`Self::register_managed_driver`].
-    fn insert_driver(&mut self, driver: Box<dyn SDKDriver>) -> anyhow::Result<()> {
-        let driver = Arc::new(Driver {
-            name: driver.config(driver::ConfigRequest {})?.name,
-            driver,
+    /// Refuses `name` if it breaks the naming rule, is reserved, or is already
+    /// taken by a registered plugin or a pending builtin factory.
+    fn check_plugin_name(&self, name: &str, source: &str) -> anyhow::Result<()> {
+        validate_plugin_name(name).with_context(|| format!("registering {source}"))?;
+        let existing = self.plugins.get(name).cloned().or_else(|| {
+            self.plugin_factories
+                .contains_key(name)
+                .then(|| format!("builtin plugin {name:?} (selectable from `plugins:`)"))
         });
-
-        if self.drivers_by_name.contains_key(&driver.name) {
-            return Err(anyhow::anyhow!(
-                "driver with name '{}' already registered",
-                driver.name
-            ));
+        if let Some(existing) = existing {
+            anyhow::bail!(
+                "plugin name {name:?} is taken twice: by {existing}, and by {source}. \
+                 Plugin names are unique across builtins and cdylibs; rename one of them"
+            );
         }
-        self.drivers.push(driver.clone());
-        self.drivers_by_name.insert(driver.name.clone(), driver);
         Ok(())
     }
 
+    /// Registers an always-on builtin plugin: `build` runs now, with the
+    /// [`PluginInit`] every plugin gets, and each part it returns is named after
+    /// `name` (see [`component_name`]).
+    pub fn register_plugin(
+        &mut self,
+        name: &str,
+        build: impl FnOnce(&PluginInit) -> anyhow::Result<PluginParts>,
+    ) -> anyhow::Result<()> {
+        let source = format!("builtin plugin {name:?}");
+        self.check_plugin_name(name, &source)?;
+        let parts = build(&self.plugin_init_payload())
+            .with_context(|| format!("constructing plugin {name:?}"))?;
+        self.insert_plugin(name, source, parts)
+    }
+
+    /// The one place a plugin's parts join the engine. `name` has passed
+    /// [`Self::check_plugin_name`]; every component name is resolved and
+    /// checked before anything is registered, so a refused plugin leaves no
+    /// part behind.
+    pub(crate) fn insert_plugin(
+        &mut self,
+        name: &str,
+        source: String,
+        parts: PluginParts,
+    ) -> anyhow::Result<()> {
+        self.check_plugin_name(name, &source)?;
+        let PluginParts {
+            provider,
+            drivers,
+            hooks,
+            runners,
+        } = parts;
+
+        let provider = match provider {
+            Some(provider) => {
+                let local = provider
+                    .config(provider::ConfigRequest {})
+                    .with_context(|| format!("reading the provider config of plugin {name:?}"))?
+                    .name;
+                Some(Arc::new(Provider {
+                    name: resolve_component_name(name, &local, "provider")?,
+                    provider,
+                }))
+            }
+            None => None,
+        };
+
+        let mut resolved: Vec<Arc<Driver>> = Vec::with_capacity(drivers.len());
+        for driver in drivers {
+            let driver: Box<dyn SDKDriver> = match driver {
+                PluginDriver::Plain(d) => d,
+                PluginDriver::Managed(m) => Box::new(self.new_managed_driver(m)),
+            };
+            let local = driver
+                .config(driver::ConfigRequest {})
+                .with_context(|| format!("reading a driver config of plugin {name:?}"))?
+                .name;
+            let full = resolve_component_name(name, &local, "driver")?;
+            if resolved.iter().any(|d| d.name == full) {
+                anyhow::bail!(
+                    "plugin {name:?} has two drivers named {full:?}; give each driver of one \
+                     plugin its own local name (at most one may omit it)"
+                );
+            }
+            resolved.push(Arc::new(Driver { name: full, driver }));
+        }
+
+        // Plugin names are unique and a component name always starts with its
+        // plugin's, so these only fire for a test-only bare registration racing
+        // a component of the same name — kept as a guard, not a rule.
+        if let Some(p) = &provider
+            && self.providers_by_name.contains_key(&p.name)
+        {
+            anyhow::bail!("provider with name '{}' already registered", p.name);
+        }
+        if let Some(d) = resolved
+            .iter()
+            .find(|d| self.drivers_by_name.contains_key(&d.name))
+        {
+            anyhow::bail!("driver with name '{}' already registered", d.name);
+        }
+
+        for runner in runners {
+            self.register_exec_runner(runner)
+                .with_context(|| format!("registering an exec runner of plugin {name:?}"))?;
+        }
+        if let Some(provider) = provider {
+            self.providers.push(Arc::clone(&provider));
+            self.providers_by_name
+                .insert(provider.name.clone(), provider);
+        }
+        for driver in resolved {
+            self.drivers.push(Arc::clone(&driver));
+            self.drivers_by_name.insert(driver.name.clone(), driver);
+        }
+        self.hooks.extend(hooks);
+        self.plugins.insert(name.to_string(), source);
+        Ok(())
+    }
+
+    /// Test convenience: registers a one-component plugin named after the
+    /// provider's own reported name, which must follow the plugin naming rule.
+    /// Shipped code registers through [`Self::register_plugin`].
+    pub fn register_provider(
+        &mut self,
+        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKProvider>,
+    ) -> anyhow::Result<()> {
+        let provider = factory(&self.plugin_init_payload());
+        let name = provider
+            .config(provider::ConfigRequest {})
+            .context("reading the provider config")?
+            .name;
+        let source = format!("register_provider of provider {name:?}");
+        self.insert_plugin(
+            &name,
+            source,
+            PluginParts::default().with_provider(provider),
+        )
+    }
+
+    /// Test convenience: registers a one-driver plugin named after the
+    /// driver's own reported name. See [`Self::register_provider`].
+    pub fn register_driver(
+        &mut self,
+        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKDriver>,
+    ) -> anyhow::Result<()> {
+        let driver = factory(&self.plugin_init_payload());
+        self.insert_bare_driver(PluginDriver::Plain(driver))
+    }
+
+    /// Test convenience: registers a one-driver plugin named after the managed
+    /// driver's own reported name. See [`Self::register_provider`].
     pub fn register_managed_driver(
         &mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKManagedDriver>,
     ) -> anyhow::Result<()> {
         let managed = factory(&self.plugin_init_payload());
-        let driver = self.new_managed_driver(managed);
-        self.insert_driver(Box::new(driver))
+        self.insert_bare_driver(PluginDriver::Managed(managed))
     }
 
-    pub fn register_driver(
-        &mut self,
-        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKDriver>,
-    ) -> anyhow::Result<()> {
-        self.try_register_driver(|init| Ok(factory(init)))
-    }
-
-    /// Like [`Self::register_driver`], but the factory may fail (e.g. compiling a
-    /// glob set). The error propagates out of registration.
-    pub fn try_register_driver(
-        &mut self,
-        factory: impl FnOnce(&PluginInit) -> anyhow::Result<Box<dyn SDKDriver>>,
-    ) -> anyhow::Result<()> {
-        let driver = factory(&self.plugin_init_payload())?;
-        self.insert_driver(driver)
-    }
-
-    pub fn register_provider(
-        &mut self,
-        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKProvider>,
-    ) -> anyhow::Result<()> {
-        self.try_register_provider(|init| Ok(factory(init)))
-    }
-
-    /// Like [`Self::register_provider`], but the factory may fail (e.g. compiling
-    /// a glob set). The error propagates out of registration.
-    pub fn try_register_provider(
-        &mut self,
-        factory: impl FnOnce(&PluginInit) -> anyhow::Result<Box<dyn SDKProvider>>,
-    ) -> anyhow::Result<()> {
-        let provider = factory(&self.plugin_init_payload())?;
-
-        let provider = Arc::new(Provider {
-            name: provider.config(provider::ConfigRequest {})?.name,
-            provider,
-        });
-
-        if self.providers_by_name.contains_key(&provider.name) {
-            return Err(anyhow::anyhow!(
-                "provider with name '{}' already registered",
-                provider.name
-            ));
-        }
-        self.providers.push(provider.clone());
-        self.providers_by_name
-            .insert(provider.name.clone(), provider);
-        Ok(())
+    fn insert_bare_driver(&mut self, driver: PluginDriver) -> anyhow::Result<()> {
+        let name = match &driver {
+            PluginDriver::Plain(d) => d.config(driver::ConfigRequest {})?.name,
+            PluginDriver::Managed(m) => m.config(driver::ConfigRequest {})?.name,
+        };
+        let source = format!("register_driver of driver {name:?}");
+        let parts = PluginParts {
+            drivers: vec![driver],
+            ..Default::default()
+        };
+        self.insert_plugin(&name, source, parts)
     }
 
     /// Hand `hexecrunner` the resolver for this engine.
@@ -848,60 +1041,19 @@ impl Engine {
         }
     }
 
-    pub fn register_provider_factory(
+    /// Registers a YAML-selected builtin: `factory` runs only when a
+    /// `plugins: - { builtin: <name> }` entry selects it (see
+    /// [`Self::apply_builtin`]), with that entry's `options:`.
+    pub fn register_plugin_factory(
         &mut self,
         name: &str,
-        factory: impl FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKProvider>>
+        factory: impl FnOnce(&PluginInit, &Options) -> anyhow::Result<PluginParts>
         + Send
         + Sync
         + 'static,
     ) -> anyhow::Result<()> {
-        if self.provider_factories.contains_key(name) {
-            return Err(anyhow::anyhow!(
-                "provider factory '{name}' already registered"
-            ));
-        }
-        self.provider_factories
-            .insert(name.to_string(), Box::new(factory));
-        Ok(())
-    }
-
-    pub fn register_driver_factory(
-        &mut self,
-        name: &str,
-        factory: impl FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKDriver>>
-        + Send
-        + Sync
-        + 'static,
-    ) -> anyhow::Result<()> {
-        if self.driver_factories.contains_key(name)
-            || self.managed_driver_factories.contains_key(name)
-        {
-            return Err(anyhow::anyhow!(
-                "driver factory '{name}' already registered"
-            ));
-        }
-        self.driver_factories
-            .insert(name.to_string(), Box::new(factory));
-        Ok(())
-    }
-
-    pub fn register_managed_driver_factory(
-        &mut self,
-        name: &str,
-        factory: impl FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKManagedDriver>>
-        + Send
-        + Sync
-        + 'static,
-    ) -> anyhow::Result<()> {
-        if self.driver_factories.contains_key(name)
-            || self.managed_driver_factories.contains_key(name)
-        {
-            return Err(anyhow::anyhow!(
-                "driver factory '{name}' already registered"
-            ));
-        }
-        self.managed_driver_factories
+        self.check_plugin_name(name, &format!("builtin plugin factory {name:?}"))?;
+        self.plugin_factories
             .insert(name.to_string(), Box::new(factory));
         Ok(())
     }
@@ -944,38 +1096,19 @@ impl Engine {
     }
 
     /// Instantiate one built-in plugin by name (a `plugins: - { builtin: <name> }`
-    /// entry), looking up its registered factory (provider, then driver, then
-    /// managed driver) and registering it with `options`. Errors if `name` has no
-    /// registered factory. Factories are consumed — applying the same name twice
-    /// errors.
+    /// entry), running its registered factory with `options` and registering
+    /// the parts it returns under `name`. Errors if `name` has no registered
+    /// factory. Factories are consumed — applying the same name twice errors.
     pub fn apply_builtin(&mut self, name: &str, options: &Options) -> anyhow::Result<()> {
-        let init = self.plugin_init_payload();
-        if let Some(factory) = self.provider_factories.remove(name) {
-            let provider = factory(&init, options)?;
-            let resolved_name = provider.config(provider::ConfigRequest {})?.name;
-            if resolved_name != name {
-                return Err(anyhow::anyhow!(
-                    "provider '{name}' reported name '{resolved_name}'; config/factory name mismatch"
-                ));
+        let Some(factory) = self.plugin_factories.remove(name) else {
+            if self.plugins.contains_key(name) {
+                anyhow::bail!("builtin plugin '{name}' is already registered");
             }
-            self.register_provider(|_| provider)?;
-        } else if let Some(factory) = self.driver_factories.remove(name) {
-            let driver = factory(&init, options)?;
-            let resolved_name = driver.config(driver::ConfigRequest {})?.name;
-            if resolved_name != name {
-                return Err(anyhow::anyhow!(
-                    "driver '{name}' reported name '{resolved_name}'; config/factory name mismatch"
-                ));
-            }
-            self.insert_driver(driver)?;
-        } else if let Some(factory) = self.managed_driver_factories.remove(name) {
-            let managed = factory(&init, options)?;
-            let driver = self.new_managed_driver(managed);
-            self.insert_driver(Box::new(driver))?;
-        } else {
-            return Err(anyhow::anyhow!("unknown builtin plugin '{name}'"));
-        }
-        Ok(())
+            anyhow::bail!("unknown builtin plugin '{name}'");
+        };
+        let parts = factory(&self.plugin_init_payload(), options)
+            .with_context(|| format!("constructing builtin plugin {name:?}"))?;
+        self.insert_plugin(name, format!("builtin plugin {name:?}"), parts)
     }
 }
 
@@ -1083,5 +1216,277 @@ mod tests {
             unrelated.exists(),
             "a dir whose suffix isn't a pid must be left alone"
         );
+    }
+
+    mod plugins {
+        use super::super::*;
+        use crate::engine::driver::{
+            ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse,
+            DriverSchema, ParseRequest, ParseResponse, RunRequest, RunResponse,
+        };
+        use crate::engine::fault_provider::{FaultProvider, Faults};
+        use hcore::hasync::Cancellable;
+
+        /// A driver that only has a name: registration never runs it.
+        struct NamedDriver(&'static str);
+
+        #[async_trait::async_trait]
+        impl SDKDriver for NamedDriver {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: self.0.to_string(),
+                })
+            }
+            fn schema(&self) -> DriverSchema {
+                DriverSchema::default()
+            }
+            async fn parse(
+                &self,
+                _req: ParseRequest,
+                _ctoken: &(dyn Cancellable + Send + Sync),
+            ) -> anyhow::Result<ParseResponse> {
+                anyhow::bail!("not under test")
+            }
+            async fn apply_transitive(
+                &self,
+                _req: ApplyTransitiveRequest,
+                _ctoken: &(dyn Cancellable + Send + Sync),
+            ) -> anyhow::Result<ApplyTransitiveResponse> {
+                anyhow::bail!("not under test")
+            }
+            async fn run<'a, 'io>(
+                &self,
+                _req: RunRequest<'a, 'io>,
+                _ctoken: &(dyn Cancellable + Send + Sync),
+            ) -> anyhow::Result<RunResponse> {
+                anyhow::bail!("not under test")
+            }
+            async fn run_shell<'a, 'io>(
+                &self,
+                _req: RunRequest<'a, 'io>,
+                _ctoken: &(dyn Cancellable + Send + Sync),
+            ) -> anyhow::Result<RunResponse> {
+                anyhow::bail!("not under test")
+            }
+        }
+
+        fn provider(name: &'static str) -> Box<dyn SDKProvider> {
+            Box::new(
+                FaultProvider::new(
+                    vec![],
+                    Faults {
+                        name: Some(name),
+                        ..Default::default()
+                    },
+                )
+                .expect("fault provider"),
+            )
+        }
+
+        fn engine() -> (tempfile::TempDir, Engine) {
+            let root = tempfile::tempdir().expect("tempdir");
+            let engine = Engine::new(Config {
+                root: root.path().to_path_buf(),
+                home_dir: root.path().join(".heph"),
+                ..Default::default()
+            })
+            .expect("engine");
+            (root, engine)
+        }
+
+        fn sorted(names: impl Iterator<Item = String>) -> Vec<String> {
+            let mut v: Vec<String> = names.collect();
+            v.sort();
+            v
+        }
+
+        #[tokio::test]
+        async fn provider_and_driver_names_follow_the_plugin() {
+            let (_root, mut e) = engine();
+            e.register_plugin("mine", |_| {
+                Ok(PluginParts::default()
+                    .with_provider(provider(""))
+                    .with_driver(Box::new(NamedDriver("")))
+                    .with_driver(Box::new(NamedDriver("extra"))))
+            })
+            .expect("register");
+            assert!(
+                e.providers_by_name.contains_key("mine"),
+                "no local name → <plugin>"
+            );
+            assert!(
+                e.drivers_by_name.contains_key("mine"),
+                "no local name → <plugin>"
+            );
+            assert!(
+                e.drivers_by_name.contains_key("mine.extra"),
+                "local name → <plugin>.<name>"
+            );
+            assert!(!e.drivers_by_name.contains_key("extra"), "never bare");
+
+            // A local name equal to its plugin's is the plugin's own.
+            e.register_plugin("same", |_| {
+                Ok(PluginParts::default()
+                    .with_provider(provider("same"))
+                    .with_driver(Box::new(NamedDriver("same"))))
+            })
+            .expect("register");
+            assert!(e.providers_by_name.contains_key("same"));
+            assert!(e.drivers_by_name.contains_key("same"));
+
+            // Two drivers of one plugin that both omit the name collide, and
+            // the plugin registers nothing.
+            let err = e
+                .register_plugin("twice", |_| {
+                    Ok(PluginParts::default()
+                        .with_provider(provider(""))
+                        .with_driver(Box::new(NamedDriver("")))
+                        .with_driver(Box::new(NamedDriver(""))))
+                })
+                .expect_err("two unnamed drivers");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("plugin \"twice\""), "{msg}");
+            assert!(
+                !e.providers_by_name.contains_key("twice"),
+                "nothing half-registered"
+            );
+            assert!(!e.drivers_by_name.contains_key("twice"));
+            // Nor is the name taken: the plugin can be registered once fixed.
+            e.register_plugin("twice", |_| {
+                Ok(PluginParts::default().with_driver(Box::new(NamedDriver(""))))
+            })
+            .expect("name is still free");
+        }
+
+        #[tokio::test]
+        async fn duplicate_plugin_name_is_refused() {
+            let (_root, mut e) = engine();
+
+            // Builtin vs builtin: `fs` is registered by `Engine::new`.
+            let err = e
+                .register_plugin("fs", |_| Ok(PluginParts::default()))
+                .expect_err("second fs");
+            let msg = format!("{err:#}");
+            assert_eq!(
+                msg,
+                "plugin name \"fs\" is taken twice: by builtin plugin \"fs\", and by builtin \
+                 plugin \"fs\". Plugin names are unique across builtins and cdylibs; rename one \
+                 of them"
+            );
+
+            // A cdylib named after a builtin: both sources are named.
+            let err = e
+                .insert_plugin(
+                    "fs",
+                    "cdylib plugin /p/libfs.so (manifest /p/heph-fs-plugin.json)".to_string(),
+                    PluginParts::default().with_driver(Box::new(NamedDriver(""))),
+                )
+                .expect_err("cdylib fs");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("by builtin plugin \"fs\""), "{msg}");
+            assert!(
+                msg.contains("by cdylib plugin /p/libfs.so (manifest /p/heph-fs-plugin.json)"),
+                "{msg}"
+            );
+
+            // A pending YAML builtin holds its name too.
+            e.register_plugin_factory("lazy", |_, _| Ok(PluginParts::default()))
+                .expect("factory");
+            let err = e
+                .register_plugin("lazy", |_| Ok(PluginParts::default()))
+                .expect_err("taken by a factory");
+            assert!(format!("{err:#}").contains("selectable from `plugins:`"));
+
+            // A bare test registration is a plugin like any other.
+            let err = e
+                .register_driver(|_| Box::new(NamedDriver("group")))
+                .expect_err("group is a builtin");
+            assert!(format!("{err:#}").contains("plugin name \"group\" is taken twice"));
+        }
+
+        #[tokio::test]
+        async fn plugin_named_core_is_refused() {
+            let (_root, mut e) = engine();
+            let err = e
+                .register_plugin("core", |_| Ok(PluginParts::default()))
+                .expect_err("core is reserved");
+            assert_eq!(
+                format!("{err:#}"),
+                "registering builtin plugin \"core\": plugin name \"core\" is reserved (it is \
+                 the built-in `heph.core` namespace); choose another name"
+            );
+            assert!(!e.plugins.contains_key("core"));
+        }
+
+        #[tokio::test]
+        async fn invalid_plugin_name_is_refused() {
+            let (_root, mut e) = engine();
+            for name in ["", "a.b", "my-plugin", "Go", "1st", "a b", "é"] {
+                let err = e
+                    .register_plugin(name, |_| Ok(PluginParts::default()))
+                    .expect_err(name);
+                assert_eq!(
+                    format!("{err:#}"),
+                    format!(
+                        "registering builtin plugin {name:?}: invalid plugin name {name:?}: a \
+                         plugin name must match `[a-z_][a-z0-9_]*`, because it is the \
+                         `heph.<name>` namespace in BUILD files"
+                    )
+                );
+            }
+            // The rule's edges are accepted.
+            for name in ["_", "_x", "a1_b2"] {
+                e.register_plugin(name, |_| Ok(PluginParts::default()))
+                    .unwrap_or_else(|err| panic!("{name}: {err:#}"));
+            }
+            // A local name follows the same rule, so `<plugin>.<local>` parses.
+            let err = e
+                .register_plugin("ok", |_| {
+                    Ok(PluginParts::default().with_driver(Box::new(NamedDriver("a.b"))))
+                })
+                .expect_err("dotted local name");
+            assert!(format!("{err:#}").contains("local name \"a.b\""));
+        }
+
+        #[tokio::test]
+        async fn builtin_bundle_registers_provider_and_drivers() {
+            let (_root, mut e) = engine();
+            e.register_plugin_factory("bundle", |init, opts| {
+                // The factory sees the same init every plugin gets, and its
+                // own YAML options.
+                assert!(init.root.is_absolute());
+                let local: String =
+                    hplugin::config::decode_opt(opts, "bundle", "local")?.unwrap_or_default();
+                let local: &'static str = Box::leak(local.into_boxed_str());
+                Ok(PluginParts::default()
+                    .with_provider(provider(""))
+                    .with_driver(Box::new(NamedDriver("")))
+                    .with_driver(Box::new(NamedDriver(local))))
+            })
+            .expect("factory");
+            assert!(
+                !e.providers_by_name.contains_key("bundle"),
+                "a factory waits for config"
+            );
+
+            let opts: Options = serde_yaml::from_str("local: from_opts").expect("opts");
+            e.apply_builtin("bundle", &opts).expect("apply");
+            assert_eq!(
+                sorted(
+                    e.drivers_by_name
+                        .keys()
+                        .filter(|n| n.starts_with("bundle"))
+                        .cloned()
+                ),
+                vec!["bundle", "bundle.from_opts"]
+            );
+            assert!(e.providers_by_name.contains_key("bundle"));
+
+            let err = e.apply_builtin("bundle", &opts).expect_err("applied twice");
+            assert_eq!(
+                format!("{err:#}"),
+                "builtin plugin 'bundle' is already registered"
+            );
+        }
     }
 }

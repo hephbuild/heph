@@ -87,7 +87,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
 
     let mut drivers = stabby::vec::Vec::new();
     drivers.push(NamedDriver {
-        name: plugindevenv::DRIVER_NAME.into(),
+        name: plugindevenv::LOCAL_NAME.into(),
         driver: make_dyn_managed_driver(driver),
     });
 

@@ -91,28 +91,56 @@ fn load_dylib_plugins(
     let loaded = manifests
         .into_par_iter()
         .map(|m| -> anyhow::Result<_> {
-            let dylib = resolve_manifest_dylib(&m.identifier, m.checksum.as_deref(), root)?;
-            hplugin_stabby::load_stable::load(&dylib, &root_str, &home_str, m.options)
-                .with_context(|| format!("load plugin dylib {}", dylib.display()))
+            let resolved = resolve_manifest_dylib(&m.identifier, m.checksum.as_deref(), root)?;
+            let dylib = &resolved.dylib;
+            // The plugin's name is its manifest's: the binary reports none.
+            let (provider, drivers, hooks, runners) = hplugin_stabby::load_stable::load(
+                dylib,
+                &resolved.name,
+                &root_str,
+                &home_str,
+                m.options,
+            )
+            .with_context(|| format!("load plugin dylib {}", dylib.display()))?;
+            let mut parts = super::PluginParts {
+                provider: provider
+                    .map(|p| Box::new(p) as Box<dyn crate::engine::provider::Provider>),
+                hooks: hooks
+                    .into_iter()
+                    .map(|(_, h)| {
+                        std::sync::Arc::new(h) as std::sync::Arc<dyn crate::engine::hook::Hook>
+                    })
+                    .collect(),
+                runners,
+                ..Default::default()
+            };
+            for (_local, drv) in drivers {
+                parts = parts.with_managed_driver(Box::new(drv));
+            }
+            let source = format!(
+                "cdylib plugin {} (manifest {})",
+                dylib.display(),
+                resolved.manifest
+            );
+            Ok((resolved.name, source, parts))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    // Engine mutation is single-threaded; register the loaded components in order.
-    for (provider, drivers, hooks, runners) in loaded {
-        if let Some(p) = provider {
-            e.register_provider(|_| Box::new(p))?;
-        }
-        for (_name, drv) in drivers {
-            e.register_managed_driver(|_| Box::new(drv))?;
-        }
-        for (_name, hook) in hooks {
-            e.register_hook(std::sync::Arc::new(hook))?;
-        }
-        for runner in runners {
-            e.register_exec_runner(runner)?;
-        }
+    // Engine mutation is single-threaded; register the loaded plugins in order.
+    for (name, source, parts) in loaded {
+        e.insert_plugin(&name, source, parts)?;
     }
     Ok(())
+}
+
+/// A manifest resolved to this host's artifact: the plugin's name (the
+/// manifest's `name`, already checked against the naming rule), where the
+/// manifest came from, and the dylib to load.
+#[cfg(unix)]
+struct ResolvedManifest {
+    name: String,
+    manifest: String,
+    dylib: std::path::PathBuf,
 }
 
 #[cfg(not(unix))]
@@ -162,8 +190,8 @@ fn resolve_manifest_dylib(
     src: &config_yaml::PluginIdentifier,
     manifest_checksum: Option<&str>,
     root: &std::path::Path,
-) -> anyhow::Result<std::path::PathBuf> {
-    let (manifest_bytes, manifest_dir) = match src {
+) -> anyhow::Result<ResolvedManifest> {
+    let (manifest_bytes, manifest_dir, manifest_src) = match src {
         config_yaml::PluginIdentifier::Path(p) => {
             let mp = resolve_path(p, root);
             let bytes = std::fs::read(&mp)
@@ -172,7 +200,7 @@ fn resolve_manifest_dylib(
                 .parent()
                 .map(|d| d.to_path_buf())
                 .unwrap_or_else(|| root.to_path_buf());
-            (bytes, dir)
+            (bytes, dir, mp.display().to_string())
         }
         config_yaml::PluginIdentifier::Url(u) => {
             // Manifest json is cached under ~/.heph/plugins alongside its artifacts.
@@ -183,7 +211,7 @@ fn resolve_manifest_dylib(
                 .parent()
                 .map(|d| d.to_path_buf())
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
-            (bytes, dir)
+            (bytes, dir, u.clone())
         }
         config_yaml::PluginIdentifier::Builtin(_) => {
             anyhow::bail!("internal: builtin plugin reached manifest resolution")
@@ -198,6 +226,10 @@ fn resolve_manifest_dylib(
 
     let manifest: PluginManifest =
         serde_json::from_slice(&manifest_bytes).context("parse plugin manifest json")?;
+    // The manifest's `name` is the plugin's `heph.<name>` namespace and the
+    // prefix of every provider/driver it ships: check it before loading.
+    super::engine::validate_plugin_name(&manifest.name)
+        .with_context(|| format!("plugin manifest {manifest_src}"))?;
     let (os, arch) = host_os_arch();
     let art = manifest
         .artifacts
@@ -231,7 +263,11 @@ fn resolve_manifest_dylib(
             )
         })?;
     }
-    Ok(dylib)
+    Ok(ResolvedManifest {
+        name: manifest.name,
+        manifest: manifest_src,
+        dylib,
+    })
 }
 
 /// Verify `bytes` against an `algo:hex` checksum spec (currently only

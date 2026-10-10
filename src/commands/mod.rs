@@ -89,7 +89,7 @@ pub enum Commands {
     Version(version::Args),
     /// Sign in, and see which credentials are available here
     ///
-    /// A credential is a target (`driver = "credential"`) declaring what identity
+    /// A credential is a target (`driver = "auth.credential"`) declaring what identity
     /// a build needs and how it may be obtained. This is the preflight over them:
     /// which apply in this environment, from which source, and until when.
     ///

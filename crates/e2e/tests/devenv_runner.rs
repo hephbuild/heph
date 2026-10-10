@@ -3,7 +3,7 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-//! The `devenv_runner` driver against a **real** `devenv`.
+//! The `devenv.runner` driver against a **real** `devenv`.
 //!
 //! The unit tests prove the pieces — the env-0 parse, the fingerprint's
 //! sensitivity and stability, the mode parse. What they cannot prove is that
@@ -85,12 +85,15 @@ fn workspace() -> htestkit::Workspace {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(plugindevenv::Driver::new()))
+        .with_plugin(plugindevenv::PLUGIN_NAME, |_| {
+            Ok(heph::engine::PluginParts::default()
+                .with_managed_driver(Box::new(plugindevenv::Driver::new())))
+        })
         .build()
         .expect("build workspace")
 }
 
-/// Write the devenv files plus a `devenv_runner` target over them.
+/// Write the devenv files plus a `devenv.runner` target over them.
 fn write_env(ws: &htestkit::Workspace, mode: &str, extra: &str) {
     ws.write_file("env/devenv.nix", DEVENV_NIX);
     ws.write_file("env/devenv.yaml", DEVENV_YAML);
@@ -100,7 +103,7 @@ fn write_env(ws: &htestkit::Workspace, mode: &str, extra: &str) {
             r#"
 target(
     name = "runner",
-    driver = "devenv_runner",
+    driver = "devenv.runner",
     mode = "{mode}",
     deps = [glob("devenv.*")],
 )

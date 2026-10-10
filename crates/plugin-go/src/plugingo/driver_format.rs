@@ -216,7 +216,7 @@ impl Default for GoFormatDriver {
 impl ManagedDriver for GoFormatDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: "go_format".to_string(),
+            name: "format".to_string(),
         })
     }
 
@@ -368,7 +368,7 @@ impl Default for GoFormatCheckDriver {
 impl ManagedDriver for GoFormatCheckDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: "go_format_check".to_string(),
+            name: "format_check".to_string(),
         })
     }
 
@@ -690,7 +690,7 @@ mod tests {
             src_addrs: &["//mylib:a.go".to_string()],
             ..params(&g, None)
         });
-        assert_eq!(s.driver, "go_format");
+        assert_eq!(s.driver, "go.format");
         // Declares src outputs (parse marks them in_place).
         match s.config.get("out").unwrap() {
             Value::Map(m) => assert!(m.iter().any(|(k, _)| k == "src")),
@@ -703,7 +703,7 @@ mod tests {
     fn check_driver_name_no_outputs() {
         let g = govet();
         let s = build_format_check_spec(params(&g, None));
-        assert_eq!(s.driver, "go_format_check");
+        assert_eq!(s.driver, "go.format_check");
         assert!(!s.config.contains_key("out"));
     }
 
