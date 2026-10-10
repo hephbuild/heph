@@ -11,8 +11,9 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 
 async fn execute_async(_args: Args, _sink: LogSink, _global: GlobalOptions) -> anyhow::Result<()> {
     let (engine, _shutdown) = bootstrap::new_engine()?;
-    for (provider, _func, rendered) in engine.provider_functions() {
-        println!("{provider}.{rendered}");
+    // `<plugin>.<signature>`, sorted by plugin, then function.
+    for (plugin, _func, rendered) in engine.functions() {
+        println!("{plugin}.{rendered}");
     }
     Ok(())
 }

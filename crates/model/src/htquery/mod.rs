@@ -452,7 +452,7 @@ impl<'a> Parser<'a> {
                     if w == DRIVER_FN {
                         let Some(arg) = arg.filter(|a| !a.is_empty()) else {
                             bail!(
-                                "`driver()` needs a non-empty driver name, e.g. `driver(credential)` or `driver(\"my driver\")`"
+                                "`driver()` needs a non-empty driver name, e.g. `driver(auth.credential)` or `driver(\"my driver\")`"
                             );
                         };
                         return Ok(Matcher::Driver(arg.to_string()));

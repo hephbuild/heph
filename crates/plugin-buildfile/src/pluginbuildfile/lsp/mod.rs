@@ -7,7 +7,7 @@
 //! driver config schemas). See the submodule docs for detail.
 
 mod context;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod index;
 mod proxy;
 

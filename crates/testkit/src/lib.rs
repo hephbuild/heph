@@ -3,7 +3,8 @@ use heph::engine::driver::Driver as SDKDriver;
 use heph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use heph::engine::provider::Provider as SDKProvider;
 use heph::engine::{
-    Config, EResult, Engine, EngineTargetSpec, OutputMatcher, PluginInit, ResultOptions,
+    Config, EResult, Engine, EngineTargetSpec, OutputMatcher, PluginInit, PluginParts,
+    ResultOptions,
 };
 use heph::htaddr::{Addr, parse_addr};
 use std::path::{Path, PathBuf};
@@ -59,6 +60,20 @@ impl WorkspaceBuilder {
         self
     }
 
+    /// Register a named plugin: its parts are built with the engine's
+    /// [`PluginInit`] and named after `name` (`<name>` / `<name>.<local>`),
+    /// as a shipped builtin or cdylib is.
+    pub fn with_plugin(
+        mut self,
+        name: &'static str,
+        build: impl FnOnce(&PluginInit) -> anyhow::Result<PluginParts> + 'static,
+    ) -> Self {
+        self.setups.push(Box::new(move |e: &mut Engine| {
+            e.register_plugin(name, build)
+        }));
+        self
+    }
+
     pub fn with_managed_driver(mut self, driver: Box<dyn SDKManagedDriver>) -> Self {
         self.setups.push(Box::new(move |e: &mut Engine| {
             e.register_managed_driver(|_| driver)
@@ -97,6 +112,10 @@ impl WorkspaceBuilder {
         // Same call the CLI makes right after `Arc::new`: without it a target
         // naming a runner fails with "no runner host is installed".
         engine.install_exec_runner_host();
+        // Registration is over: seal the function registry, so a test driving
+        // a provider directly (no request, which would seal it) still sees
+        // `heph.<plugin>.<fn>`.
+        let _sealed = engine.function_registry();
         Ok(Workspace {
             dir: self.dir,
             engine,

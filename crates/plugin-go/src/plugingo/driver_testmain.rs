@@ -73,7 +73,7 @@ impl Hash for GoTestmainDef {
 impl ManagedDriver for GoTestmainDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: "go_testmain".to_string(),
+            name: "testmain".to_string(),
         })
     }
 
@@ -307,7 +307,7 @@ mod tests {
                     "testmain".to_string(),
                     Default::default(),
                 ),
-                driver: "go_testmain".to_string(),
+                driver: "go.testmain".to_string(),
                 config,
                 ..Default::default()
             }),
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn test_driver_name_is_go_testmain() {
         let resp = driver().config(ConfigRequest {}).unwrap();
-        assert_eq!(resp.name, "go_testmain");
+        assert_eq!(resp.name, "testmain");
     }
 
     #[tokio::test]
@@ -375,7 +375,7 @@ mod tests {
                     "testmain".to_string(),
                     Default::default(),
                 ),
-                driver: "go_testmain".to_string(),
+                driver: "go.testmain".to_string(),
                 config,
                 ..Default::default()
             }),
@@ -408,7 +408,7 @@ mod tests {
                     "testmain".to_string(),
                     Default::default(),
                 ),
-                driver: "go_testmain".to_string(),
+                driver: "go.testmain".to_string(),
                 config,
                 ..Default::default()
             }),

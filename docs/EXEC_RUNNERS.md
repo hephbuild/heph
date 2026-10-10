@@ -199,7 +199,7 @@ correctly share cache entries.
 ```python
 target(
     name = "runner",
-    driver = "devenv_runner",
+    driver = "devenv.runner",
     mode = "wrap",              # or "session"
     deps = glob("devenv.*"),
 )
@@ -227,9 +227,9 @@ nix store paths.
 ```python
 target(
     name = "runner",
-    driver = "oci_runner",
+    driver = "oci.runner",
     image = "myimage:dev",
-    deps = ["//svc:load"],      # the oci_load that puts it in the daemon
+    deps = ["//svc:load"],      # the oci.load that puts it in the daemon
 )
 ```
 

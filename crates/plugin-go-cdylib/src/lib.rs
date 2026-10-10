@@ -15,11 +15,11 @@ use hplugin_go::plugingo::{
     GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{
-    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
+    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
 };
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    make_dyn_managed_driver, make_dyn_provider, options_from_pb_map,
+    make_dyn_managed_driver, make_dyn_provider, make_plugin_functions, options_from_pb_map,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,8 +27,14 @@ use std::sync::Arc;
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
 /// `pb::CreateConfig` bytes, so config fields are additive across versions.
+///
+/// `_functions` is the loading engine's function registry: the go functions
+/// call no other plugin's, so it goes unused.
 #[stabby::export]
-pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginComponents {
+pub extern "C" fn heph_plugin_create(
+    cfg: stabby::vec::Vec<u8>,
+    _functions: DynFunctionRegistry,
+) -> PluginComponents {
     match build(&cfg) {
         Ok(c) => c,
         Err(e) => {
@@ -105,14 +111,18 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let go_runner = hplugin_go::plugingo::runner::read_runner_option(&options)?;
 
     let walker = Arc::new(hwalk::CachedWalker::open(&walk_db));
-    let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(Provider::from_options(
+    let provider = Provider::from_options(
         root,
         &[],
         &[],
         &options,
         walker,
         plugin_sdk::stabby::cdylib_runtime_handle(),
-    )?);
+    )?;
+    // `heph.go.*`: built from the same options as the provider, exported
+    // beside it — functions are the plugin's, not the provider's.
+    let (functions, function_handle) = make_plugin_functions(&cfg.name, provider.functions())?;
+    let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(provider);
 
     let mut drivers = stabby::vec::Vec::new();
     // The shared golist GOCACHE is no longer this plugin's to place: it is a
@@ -123,64 +133,65 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let golist: Arc<dyn ManagedDriver> =
         Arc::new(GoGolistDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
-        name: "go_golist".into(),
+        name: "golist".into(),
         driver: make_dyn_managed_driver(golist),
     });
     // Hermetic Go toolchain: downloads + extracts the pinned SDK that backs
     // every Go build/list/test target.
     let toolchain: Arc<dyn ManagedDriver> = Arc::new(GoToolchainDriver);
     drivers.push(NamedDriver {
-        name: "go_toolchain".into(),
+        name: "toolchain".into(),
         driver: make_dyn_managed_driver(toolchain),
     });
     let compile: Arc<dyn ManagedDriver> =
         Arc::new(GoCompileDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
-        name: "go_compile".into(),
+        name: "compile".into(),
         driver: make_dyn_managed_driver(compile),
     });
     let testmain: Arc<dyn ManagedDriver> = Arc::new(GoTestmainDriver);
     drivers.push(NamedDriver {
-        name: "go_testmain".into(),
+        name: "testmain".into(),
         driver: make_dyn_managed_driver(testmain),
     });
     // Per-package go/analysis (vet) with serialized facts, nogo-style.
     let lint: Arc<dyn ManagedDriver> =
         Arc::new(GoLintDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
-        name: "go_lint".into(),
+        name: "lint".into(),
         driver: make_dyn_managed_driver(lint),
     });
     // Gate: fails the build when a package's lint report has findings.
     let lint_gate: Arc<dyn ManagedDriver> = Arc::new(GoLintGateDriver::new());
     drivers.push(NamedDriver {
-        name: "go_lint_gate".into(),
+        name: "lint_gate".into(),
         driver: make_dyn_managed_driver(lint_gate),
     });
     // Fix: applies the report's suggested fixes back into source (codegen).
     let lint_fix: Arc<dyn ManagedDriver> = Arc::new(GoLintFixDriver::new());
     drivers.push(NamedDriver {
-        name: "go_lint_fix".into(),
+        name: "lint_fix".into(),
         driver: make_dyn_managed_driver(lint_fix),
     });
     // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
     let format: Arc<dyn ManagedDriver> =
         Arc::new(GoFormatDriver::new().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
-        name: "go_format".into(),
+        name: "format".into(),
         driver: make_dyn_managed_driver(format),
     });
     let format_check: Arc<dyn ManagedDriver> =
         Arc::new(GoFormatCheckDriver::new().with_default_runner(go_runner));
     drivers.push(NamedDriver {
-        name: "go_format_check".into(),
+        name: "format_check".into(),
         driver: make_dyn_managed_driver(format_check),
     });
 
     Ok(PluginComponents {
-        provider_name: "go".into(),
         provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
+        functions,
+        function_handle: function_handle.into(),
         // The go plugin exports no hooks.
         hooks: stabby::vec::Vec::new(),
         // No return-side metadata to report yet.

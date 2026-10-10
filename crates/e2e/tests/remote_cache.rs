@@ -43,6 +43,7 @@ fn build_engine(root: &Path, remote_uri: &str) -> Arc<Engine> {
         Box::new(pluginbuildfile::Provider::new(
             init.root.to_path_buf(),
             init.runtime.clone(),
+            std::sync::Arc::clone(&init.functions),
         ))
     })
     .expect("register buildfile provider");
@@ -274,6 +275,7 @@ async fn output_is_nondeterministic_without_cache() {
             Box::new(pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
                 init.runtime.clone(),
+                std::sync::Arc::clone(&init.functions),
             ))
         })
         .expect("provider");

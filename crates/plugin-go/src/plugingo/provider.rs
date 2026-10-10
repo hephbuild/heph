@@ -33,10 +33,11 @@ use hcore::htvalue::signature::{FnSignature, Param, ParamType};
 use hcore::htvalue::{Value, parse_map_string_strings, parse_strings};
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::{PkgBuf, join_rel_checked_pkg};
+use hplugin::function::{FnArgs, FnCallContext, FnOutcome, PluginFn, PluginFnDef};
 use hplugin::provider::{
-    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest,
-    GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ListedFacts,
-    Provider as ProviderTrait, ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
+    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+    ListPackagesRequest, ListRequest, ListResponse, ListedFacts, Provider as ProviderTrait,
+    ProviderExecutor, State,
 };
 use hwalk::{CachedWalker, EntryKind, Ignore};
 use parking_lot::RwLock;
@@ -508,9 +509,19 @@ impl ProviderTrait for Provider {
         self.inner.probe(req, ctoken)
     }
 
-    fn functions(&self) -> Vec<ProviderFunctionDef> {
+    fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
+        self.go_state_schema()
+    }
+}
+
+impl Provider {
+    /// The go plugin's BUILD-file functions, `heph.go.*`. Built from the same
+    /// options as the provider (the configured `gotool` is
+    /// `gocache_addr`'s default), so a function and the targets the provider
+    /// generates agree.
+    pub fn functions(&self) -> Vec<PluginFnDef> {
         vec![
-            ProviderFunctionDef {
+            PluginFnDef {
                 name: "build_addr".to_string(),
                 signature: FnSignature {
                     positional: vec![
@@ -533,7 +544,7 @@ impl ProviderTrait for Provider {
                     .to_string(),
                 func: Arc::new(BuildAddrFn),
             },
-            ProviderFunctionDef {
+            PluginFnDef {
                 name: "gocache_addr".to_string(),
                 signature: FnSignature {
                     positional: vec![],
@@ -582,14 +593,13 @@ impl ProviderTrait for Provider {
                   one it meant to share."
                     .to_string(),
                 func: Arc::new(GocacheAddrFn {
-                    workspace_root: self.inner.workspace_root.clone(),
                     default_gotool: self.inner.go_version.clone(),
                 }),
             },
         ]
     }
 
-    fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
+    fn go_state_schema(&self) -> Option<hplugin::provider::StateSchema> {
         use hplugin::provider::{StateField, StateSchema};
         let field = |name: &str, ty: ParamType, doc: &str| StateField {
             name: name.to_string(),
@@ -755,7 +765,6 @@ impl BuildAddrFn {
 /// [`FnCallContext`] gives only the calling package and root, and the module a
 /// package belongs to is a filesystem question.
 struct GocacheAddrFn {
-    workspace_root: std::path::PathBuf,
     /// The plugin's configured `gotool`, so an unqualified call agrees with what
     /// the generated Go targets in this workspace actually use.
     default_gotool: String,
@@ -794,7 +803,7 @@ impl GocacheAddrFn {
 }
 
 #[async_trait]
-impl ProviderFn for GocacheAddrFn {
+impl PluginFn for GocacheAddrFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let goos = Self::str_named(&args, "goos", hcore::htplatform::os())?;
         let goarch = Self::str_named(&args, "goarch", hcore::htplatform::arch())?;
@@ -806,9 +815,6 @@ impl ProviderFn for GocacheAddrFn {
                 anyhow::bail!("heph.go.gocache_addr: `race` must be a bool, got {other:?}")
             }
         };
-        // The workspace root from the call context, not `self`: a BUILD file is
-        // evaluated against the root that loaded it.
-        let _ = ctx.root;
         // Built through `Factors` rather than by hand, so this function and the
         // drivers cannot disagree about what a variant is.
         let factors = crate::plugingo::factors::Factors {
@@ -822,7 +828,10 @@ impl ProviderFn for GocacheAddrFn {
             race,
         };
         let key = crate::plugingo::gocache::GocacheKey {
-            module: module_of_pkg(&hmodel::htpkg::PkgBuf::from(ctx.pkg), &self.workspace_root),
+            // The workspace root from the call context, not the provider's: a
+            // BUILD file is evaluated against the root that loaded it, and a
+            // function's inputs are its arguments, `pkg` and `root` (I1).
+            module: module_of_pkg(&hmodel::htpkg::PkgBuf::from(ctx.pkg), ctx.root),
             go_version: gotool,
             goos,
             goarch,
@@ -833,7 +842,7 @@ impl ProviderFn for GocacheAddrFn {
 }
 
 #[async_trait]
-impl ProviderFn for BuildAddrFn {
+impl PluginFn for BuildAddrFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let pkg = Self::arg_str(&args, 0, "pkg")?;
         let v = Self::opt_arg_str(&args, 1, "variant")?.unwrap_or("");
@@ -867,11 +876,11 @@ impl ProviderFn for BuildAddrFn {
 const RUNNER_AWARE_DRIVERS: &[&str] = &[
     "bash",
     "exec",
-    "go_golist",
-    "go_compile",
-    "go_lint",
-    "go_format",
-    "go_format_check",
+    "go.golist",
+    "go.compile",
+    "go.lint",
+    "go.format",
+    "go.format_check",
 ];
 
 impl ProviderInner {
@@ -4063,7 +4072,7 @@ fn build_testmain_spec(
 
     hplugin::provider::TargetSpec {
         addr,
-        driver: "go_testmain".to_string(),
+        driver: "go.testmain".to_string(),
         config,
         ..Default::default()
     }
@@ -4131,9 +4140,9 @@ mod tests {
         d
     }
 
-    fn gocache_fn(root: &std::path::Path) -> GocacheAddrFn {
+    /// No root of its own: the function reads the one in its call context.
+    fn gocache_fn() -> GocacheAddrFn {
         GocacheAddrFn {
-            workspace_root: root.to_path_buf(),
             default_gotool: "1.27.0".to_string(),
         }
     }
@@ -4143,7 +4152,7 @@ mod tests {
         let mut named = HashMap::new();
         named.insert("goos".to_string(), Value::String("linux".into()));
         named.insert("goarch".to_string(), Value::String("amd64".into()));
-        match gocache_fn(root)
+        match gocache_fn()
             .call(
                 &ctx,
                 FnArgs {
@@ -4954,7 +4963,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "go_compile");
+        assert_eq!(resp.target_spec.driver, "go.compile");
     }
 
     #[tokio::test]
@@ -4994,7 +5003,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }),
         };
         let resp = p.get(req, &ctoken).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "go_golist");
+        assert_eq!(resp.target_spec.driver, "go.golist");
         let out = match resp.target_spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
@@ -5138,7 +5147,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("lib", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_compile");
+        assert_eq!(resp.target_spec.driver, "go.compile");
     }
 
     /// Records every addr handed to `ProviderExecutor::result`.
@@ -5218,7 +5227,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         // `lib` imports `fmt` and nothing else.
         let (fut, seen) = recording_get(&p, make_addr("lib", "build_lib"));
         let resp = fut.await.unwrap();
-        assert_eq!(resp.target_spec.driver, "go_compile");
+        assert_eq!(resp.target_spec.driver, "go.compile");
 
         assert!(
             std_golist_reads(&seen).is_empty(),
@@ -5288,7 +5297,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("cmd", "_lint-analyze"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_lint");
+        assert_eq!(resp.target_spec.driver, "go.lint");
 
         let deps = match resp.target_spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -5387,7 +5396,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_bare_addr("cmd", "lint-check"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_lint_gate");
+        assert_eq!(resp.target_spec.driver, "go.lint_gate");
 
         let deps = match resp.target_spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -5418,7 +5427,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_bare_addr("cmd", "lint"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_lint_fix");
+        assert_eq!(resp.target_spec.driver, "go.lint_fix");
 
         let deps = match resp.target_spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -5459,7 +5468,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let check = provider_get(&p, make_bare_addr("cmd", "format-check"))
             .await
             .unwrap();
-        assert_eq!(check.target_spec.driver, "go_format_check");
+        assert_eq!(check.target_spec.driver, "go.format_check");
         assert!(
             !check.target_spec.config.contains_key("out"),
             "check gate declares no outputs"
@@ -5468,7 +5477,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let fix = provider_get(&p, make_bare_addr("cmd", "format"))
             .await
             .unwrap();
-        assert_eq!(fix.target_spec.driver, "go_format");
+        assert_eq!(fix.target_spec.driver, "go.format");
         // Stages the heph-govet tool + the package's own sources.
         let deps = match fix.target_spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -5617,7 +5626,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         )
         .await
         .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_lint_gate");
+        assert_eq!(resp.target_spec.driver, "go.lint_gate");
 
         let reports = dep_group(&resp.target_spec, "report");
         assert_eq!(
@@ -5665,7 +5674,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             provider_get_with_states(&p, make_bare_addr("cmd", "lint"), vec![two_variant_state()])
                 .await
                 .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_lint_fix");
+        assert_eq!(resp.target_spec.driver, "go.lint_fix");
 
         let out = match resp.target_spec.config.get("out").expect("out") {
             Value::Map(m) => match m.iter().find(|(k, _)| *k == "src").map(|(_, v)| v) {
@@ -6114,7 +6123,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     #[tokio::test]
     async fn a_driver_without_a_runner_field_is_left_alone() {
         let inner = provider_with_runner(Some("//tools/devenv:runner"));
-        for driver in ["textfile", "http_fetch", "go_toolchain", "go_testmain"] {
+        for driver in ["textfile", "http_fetch", "go.toolchain", "go.testmain"] {
             let mut spec = spec_with(driver, &[]);
             inner.apply_runner(&mut spec);
             assert!(
@@ -6577,7 +6586,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("server", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_compile");
+        assert_eq!(resp.target_spec.driver, "go.compile");
         let out = match resp.target_spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!(),
@@ -7096,7 +7105,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("pkg", "build_test_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_compile");
+        assert_eq!(resp.target_spec.driver, "go.compile");
     }
 
     #[tokio::test]
@@ -7255,7 +7264,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("mod-asm");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "go_compile");
+        assert_eq!(resp.target_spec.driver, "go.compile");
     }
 
     #[tokio::test]

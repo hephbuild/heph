@@ -273,7 +273,7 @@ impl Hash for GoGolistDef {
 impl ManagedDriver for GoGolistDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: "go_golist".to_string(),
+            name: "golist".to_string(),
         })
     }
 
@@ -455,7 +455,7 @@ impl ManagedDriver for GoGolistDriver {
             &def.go_version,
             &req.inputs,
             &req.sandbox_ws_dir,
-            "go_golist",
+            "go.golist",
             runner,
             &self.host_go,
             ctoken,
@@ -887,7 +887,7 @@ mod tests {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {
                 addr: Addr::new(PkgBuf::from(pkg), "_golist".to_string(), Default::default()),
-                driver: "go_golist".to_string(),
+                driver: "go.golist".to_string(),
                 config,
                 ..Default::default()
             }),
@@ -934,7 +934,7 @@ mod tests {
     #[tokio::test]
     async fn test_driver_name_is_go_golist() {
         let resp = driver().config(ConfigRequest {}).unwrap();
-        assert_eq!(resp.name, "go_golist");
+        assert_eq!(resp.name, "golist");
     }
 
     #[tokio::test]
@@ -952,7 +952,7 @@ mod tests {
                     "_golist".to_string(),
                     Default::default(),
                 ),
-                driver: "go_golist".to_string(),
+                driver: "go.golist".to_string(),
                 ..Default::default()
             }),
         };

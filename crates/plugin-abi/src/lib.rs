@@ -21,6 +21,20 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
 ///
+/// 0.16.0: functions belong to plugins, not providers — a hard break, every
+/// plugin must be rebuilt. `PluginComponents` loses `provider_name` (the
+/// manifest names the plugin) and gains `functions` (each one's metadata as
+/// prost `FunctionDef` bytes, decoded once at load; bad metadata fails the load)
+/// plus one `DynPluginFunctions` handle per plugin, dispatched by a new
+/// `FunctionMethod` id. `heph_plugin_create` takes the engine's
+/// `DynFunctionRegistry` per instance, so two engines in one process never see
+/// each other's functions. `StableProvider::invoke_registry` is gone, and
+/// `ProviderMethod` 5, 6 and 8 (`FUNCTIONS`, `CALL_FUNCTION`,
+/// `SET_FUNCTION_REGISTRY`) are reserved. `CallRegisteredRequest.provider` is
+/// renamed `plugin` (same number). A 0.15 plugin fails stabby's structural
+/// check on the create entry, which the host reports as a plugin built against
+/// a different heph ABI.
+///
 /// 0.15.0: a provider function can declare targets and provider-state, not just
 /// return a value. `CallFunctionResponse` gained `declared_targets` /
 /// `declared_states` (2, 3) and both call requests gained
@@ -145,7 +159,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.15.0";
+pub const ABI_SEMVER: &str = "0.16.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

@@ -29,84 +29,9 @@
 use async_trait::async_trait;
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::{FnSignature, Param, ParamType};
-use hplugin::provider::{
-    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest,
-    GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
-    ProbeResponse, Provider as EProvider, ProviderFn, ProviderFunctionDef,
-};
+use hplugin::function::{FnArgs, FnCallContext, FnOutcome, PluginFn, PluginFnDef};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// The provider namespace these functions live under: `heph.auth.<fn>`.
-pub const PROVIDER_NAME: &str = "auth";
-
-/// A provider that serves no targets and exists only to carry the `heph.auth.*`
-/// functions into BUILD files.
-///
-/// The same shape `query` already uses. Functions reach BUILD files through
-/// `Provider::functions()`, and a provider is the only thing that has one — so a
-/// namespace with no targets behind it is an inert provider, not a new concept.
-pub struct Provider;
-
-impl EProvider for Provider {
-    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-        Ok(ConfigResponse {
-            name: PROVIDER_NAME.to_string(),
-        })
-    }
-
-    fn list<'a>(
-        &'a self,
-        _req: ListRequest,
-        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<
-        'a,
-        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
-    > {
-        Box::pin(async {
-            Ok(Box::new(std::iter::empty())
-                as Box<
-                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
-                >)
-        })
-    }
-
-    fn list_packages<'a>(
-        &'a self,
-        _req: ListPackagesRequest,
-        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<
-        'a,
-        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
-    > {
-        Box::pin(async {
-            Ok(Box::new(std::iter::empty())
-                as Box<
-                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
-                >)
-        })
-    }
-
-    fn get<'a>(
-        &'a self,
-        _req: GetRequest,
-        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<'a, Result<GetResponse, GetError>> {
-        Box::pin(async { Err(GetError::NotFound) })
-    }
-
-    fn probe<'a>(
-        &'a self,
-        _req: ProbeRequest,
-        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<'a, anyhow::Result<ProbeResponse>> {
-        Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
-    }
-
-    fn functions(&self) -> Vec<ProviderFunctionDef> {
-        definitions()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Signature helpers
@@ -228,7 +153,7 @@ fn positional_strings(args: &FnArgs, func: &str, what: &str) -> anyhow::Result<V
     Ok(out)
 }
 
-/// A `ProviderFn` implemented by a plain closure over `FnArgs`.
+/// A `PluginFn` implemented by a plain closure over `FnArgs`.
 ///
 /// Every function here is pure — it reads no filesystem, resolves no target, and
 /// never touches the network. That is deliberate and load-bearing: a preset that
@@ -238,7 +163,7 @@ fn positional_strings(args: &FnArgs, func: &str, what: &str) -> anyhow::Result<V
 struct PureFn(fn(&FnArgs) -> anyhow::Result<Value>);
 
 #[async_trait]
-impl ProviderFn for PureFn {
+impl PluginFn for PureFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         (self.0)(&args).map(FnOutcome::from)
     }
@@ -251,9 +176,9 @@ fn def(
     returns: ParamType,
     doc: &str,
     f: fn(&FnArgs) -> anyhow::Result<Value>,
-) -> ProviderFunctionDef {
+) -> PluginFnDef {
     named.sort_by_key(|p| p.name);
-    ProviderFunctionDef {
+    PluginFnDef {
         name: name.to_string(),
         signature: FnSignature {
             positional,
@@ -272,7 +197,7 @@ fn source_def(
     own: Vec<Param>,
     doc: &str,
     f: fn(&FnArgs) -> anyhow::Result<Value>,
-) -> ProviderFunctionDef {
+) -> PluginFnDef {
     let mut named = own;
     named.extend(common_source_params());
     def(name, positional, named, source_ty(), doc, f)
@@ -285,7 +210,7 @@ fn present_def(
     named: Vec<Param>,
     doc: &str,
     f: fn(&FnArgs) -> anyhow::Result<Value>,
-) -> ProviderFunctionDef {
+) -> PluginFnDef {
     def(name, positional, named, presentation_ty(), doc, f)
 }
 
@@ -293,7 +218,7 @@ fn present_def(
 // The functions
 // ---------------------------------------------------------------------------
 
-pub fn definitions() -> Vec<ProviderFunctionDef> {
+pub fn definitions() -> Vec<PluginFnDef> {
     vec![
         // ---- source constructors ----
         source_def(

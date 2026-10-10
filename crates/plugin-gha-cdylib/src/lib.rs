@@ -2,14 +2,14 @@
 //!
 //! Exports a single stabby `create` entry that constructs the [`GhaHook`] and
 //! hands it back as an ABI-stable handle. A hook-only plugin: it carries no
-//! provider (a no-op placeholder the host drops) and no drivers.
+//! provider, no drivers and no functions.
 
 use std::sync::Arc;
 
 use hplugin::hook::Hook;
 use hplugin_gha::GhaHook;
 use plugin_sdk::stabby::abi::{
-    DynLogSink, DynRunnerHost, DynSupervisor, NamedHook, PluginComponents,
+    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedHook, PluginComponents,
 };
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
@@ -18,9 +18,13 @@ use plugin_sdk::stabby::{
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
-/// `pb::CreateConfig` bytes.
+/// `pb::CreateConfig` bytes. A hook has no functions, so the engine's function
+/// registry goes unused.
 #[stabby::export]
-pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginComponents {
+pub extern "C" fn heph_plugin_create(
+    cfg: stabby::vec::Vec<u8>,
+    _functions: DynFunctionRegistry,
+) -> PluginComponents {
     match build(&cfg) {
         Ok(c) => c,
         Err(e) => {
@@ -75,10 +79,11 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     });
 
     Ok(PluginComponents {
-        // Hook-only: no provider, no drivers.
-        provider_name: String::new().into(),
+        // Hook-only: no provider, no drivers, no functions.
         provider: stabby::option::Option::None(),
         drivers: stabby::vec::Vec::new(),
+        functions: stabby::vec::Vec::new(),
+        function_handle: stabby::option::Option::None(),
         hooks,
         runners: stabby::vec::Vec::new(),
         meta: stabby::vec::Vec::new(),

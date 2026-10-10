@@ -57,7 +57,7 @@ COPY ${SRC_CFG} /etc/billing/config.yaml
 
 target(
     name = "image",
-    driver = "docker_build",
+    driver = "oci.docker_build",
     dockerfile = ":dockerfile",
     context = {"cfg": [":config_wrap"]},
     format = "docker",
@@ -67,7 +67,7 @@ target(
 # //execrunner:container resolves to a digest.
 target(
     name = "load",
-    driver = "oci_load",
+    driver = "oci.load",
     image = ":image",
     tag = "heph-example-billing:dev",
 )

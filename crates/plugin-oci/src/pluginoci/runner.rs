@@ -51,7 +51,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
-pub const DRIVER_NAME: &str = "oci_runner";
+/// The name BUILD files select this driver by: `<plugin>.<local>`.
+pub const DRIVER_NAME: &str = "oci.runner";
+/// Its local name inside the `oci` plugin.
+pub const LOCAL_NAME: &str = "runner";
 
 const FORMAT_VERSION: u32 = 1;
 const OUT_FILE: &str = "runner.json";
@@ -101,7 +104,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: LOCAL_NAME.to_string(),
         })
     }
 
@@ -117,7 +120,7 @@ impl ManagedDriver for Driver {
         let spec = TargetSpec::from(&req.target_spec.config)?;
         let pkg = req.target_spec.addr.package.clone();
         if spec.image.is_empty() {
-            anyhow::bail!("oci_runner: `image` must name an image reference");
+            anyhow::bail!("oci.runner: `image` must name an image reference");
         }
 
         let def = OciRunnerDef {
@@ -216,7 +219,7 @@ impl ManagedDriver for Driver {
                 .with_context(|| {
                     format!(
                         "resolving the digest of image {:?}. It must already be in the local \
-                         daemon — depend on the `oci_load` target that puts it there via `deps`, \
+                         daemon — depend on the `oci.load` target that puts it there via `deps`, \
                          so loading it is part of this runner's cache key.",
                         def.image
                     )

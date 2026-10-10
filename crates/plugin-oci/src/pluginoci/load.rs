@@ -80,7 +80,10 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 use super::{archive::Layout, basename, dep_single_file, ws_path};
 
-pub const DRIVER_NAME: &str = "oci_load";
+/// The name BUILD files select this driver by: `<plugin>.<local>`.
+pub const DRIVER_NAME: &str = "oci.load";
+/// Its local name inside the `oci` plugin.
+pub const LOCAL_NAME: &str = "load";
 
 const IMAGE_ORIGIN: &str = "image";
 
@@ -358,7 +361,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: LOCAL_NAME.to_string(),
         })
     }
 

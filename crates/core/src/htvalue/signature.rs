@@ -1,4 +1,4 @@
-//! Declarative signatures for provider-exposed functions.
+//! Declarative signatures for plugin-exposed functions.
 //!
 //! A [`FnSignature`] describes a function's typed inputs (positional + named,
 //! each required or optional-with-default) and its typed return value, using the
@@ -167,7 +167,7 @@ impl Param {
     }
 }
 
-/// The declarative signature of a provider-exposed function.
+/// The declarative signature of a plugin-exposed function.
 ///
 /// `variadic`, when set, collects any positional arguments beyond the declared
 /// `positional` ones — each is type-checked against the variadic param's type

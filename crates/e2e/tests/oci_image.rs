@@ -6,7 +6,7 @@
               indexing a parsed manifest cannot panic the way slicing a Vec can."
 )]
 
-//! End-to-end coverage for `oci_layer` + `oci_image`, through the real engine.
+//! End-to-end coverage for `oci.layer` + `oci.image`, through the real engine.
 //!
 //! **Nothing here is gated on docker being installed, and that is the point.**
 //! These drivers spawn no process, open no socket and read no host binary — a
@@ -32,12 +32,16 @@ fn workspace() -> htestkit::Workspace {
             Box::new(heph::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
                 init.runtime.clone(),
+                std::sync::Arc::clone(&init.functions),
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_managed_driver(Box::new(pluginoci::image::Driver::new()))
-        .with_managed_driver(Box::new(pluginoci::layer::Driver::new()))
-        .with_managed_driver(Box::new(pluginoci::index::Driver::new()))
+        .with_plugin(pluginoci::PLUGIN_NAME, |_| {
+            Ok(heph::engine::PluginParts::default()
+                .with_managed_driver(Box::new(pluginoci::image::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::layer::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::index::Driver::new())))
+        })
         .build()
         .expect("build workspace")
 }
@@ -118,11 +122,11 @@ fn config_of(bytes: &[u8]) -> serde_json::Value {
 const BUILD: &str = r#"
 target(name = "bin", driver = "bash", run = "echo elf > $OUT; chmod +x $OUT", out = "server")
 target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
-target(name = "app", driver = "oci_layer", srcs = [":bin"], prefix = "/usr/bin")
-target(name = "etc", driver = "oci_layer", srcs = [":conf"], prefix = "/etc")
+target(name = "app", driver = "oci.layer", srcs = [":bin"], prefix = "/usr/bin")
+target(name = "etc", driver = "oci.layer", srcs = [":conf"], prefix = "/etc")
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "oci.image",
     layers = [":app", ":etc"],
     platforms = ["linux/amd64"],
     entrypoint = ["/usr/bin/server"],
@@ -148,7 +152,7 @@ async fn test_an_image_is_assembled_from_layers_without_docker() -> anyhow::Resu
 
     let manifest = manifest_of(&bytes);
     let layers = manifest["layers"].as_array().expect("layers");
-    assert_eq!(layers.len(), 2, "one blob per oci_layer target");
+    assert_eq!(layers.len(), 2, "one blob per oci.layer target");
     for layer in layers {
         assert_eq!(
             layer["mediaType"], "application/vnd.oci.image.layer.v1.tar",
@@ -254,10 +258,10 @@ async fn test_an_image_inherits_its_base() -> anyhow::Result<()> {
         "app",
         r#"
 target(name = "libc", driver = "bash", run = "echo so > $OUT", out = "libc.so")
-target(name = "base_layer", driver = "oci_layer", srcs = [":libc"], prefix = "/lib")
+target(name = "base_layer", driver = "oci.layer", srcs = [":libc"], prefix = "/lib")
 target(
     name = "base",
-    driver = "oci_image",
+    driver = "oci.image",
     layers = [":base_layer"],
     platforms = ["linux/amd64"],
     layout = True,
@@ -266,10 +270,10 @@ target(
 )
 
 target(name = "bin", driver = "bash", run = "echo elf > $OUT; chmod +x $OUT", out = "server")
-target(name = "app", driver = "oci_layer", srcs = [":bin"], prefix = "/usr/bin")
+target(name = "app", driver = "oci.layer", srcs = [":bin"], prefix = "/usr/bin")
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "oci.image",
     base = ":base",
     layers = [":app"],
     platforms = ["linux/amd64"],
@@ -321,10 +325,10 @@ async fn test_platforms_share_one_blob_for_a_shared_layer() -> anyhow::Result<()
         "app",
         r#"
 target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
-target(name = "etc", driver = "oci_layer", srcs = [":conf"], prefix = "/etc")
+target(name = "etc", driver = "oci.layer", srcs = [":conf"], prefix = "/etc")
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "oci.image",
     layers = [":etc"],
     platforms = ["linux/amd64", "linux/arm64"],
 )
@@ -382,10 +386,10 @@ async fn test_the_docker_format_archive_has_a_manifest_json() -> anyhow::Result<
         "app",
         r#"
 target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
-target(name = "etc", driver = "oci_layer", srcs = [":conf"], prefix = "/etc")
+target(name = "etc", driver = "oci.layer", srcs = [":conf"], prefix = "/etc")
 target(
     name = "img",
-    driver = "oci_image",
+    driver = "oci.image",
     layers = [":etc"],
     platforms = ["linux/amd64"],
     format = "docker",
@@ -440,7 +444,7 @@ async fn test_an_empty_layer_fails_and_names_what_was_produced() {
 target(name = "bin", driver = "bash", run = "echo elf > $OUT", out = "server")
 target(
     name = "app",
-    driver = "oci_layer",
+    driver = "oci.layer",
     srcs = [":bin"],
     prefix = "/usr/bin",
     strip = "nowhere",
@@ -471,8 +475,8 @@ async fn test_platforms_is_required() {
         "app",
         r#"
 target(name = "conf", driver = "bash", run = "echo x > $OUT", out = "app.conf")
-target(name = "etc", driver = "oci_layer", srcs = [":conf"], prefix = "/etc")
-target(name = "img", driver = "oci_image", layers = [":etc"])
+target(name = "etc", driver = "oci.layer", srcs = [":conf"], prefix = "/etc")
+target(name = "img", driver = "oci.image", layers = [":etc"])
 "#,
     );
     let err = format!(
@@ -556,7 +560,7 @@ async fn test_the_image_digest_is_the_same_on_every_supported_target() -> anyhow
     Ok(())
 }
 
-/// `oci_index` groups images built *separately* into one multi-platform image.
+/// `oci.index` groups images built *separately* into one multi-platform image.
 ///
 /// This is the shape `docker_build` cannot express on its own: one buildx
 /// invocation means one Dockerfile for every platform, so platforms needing
@@ -564,7 +568,7 @@ async fn test_the_image_digest_is_the_same_on_every_supported_target() -> anyhow
 /// platform is its own target with its own layers, and the index makes them one
 /// image from the repo's point of view.
 ///
-/// Built out of `oci_image` rather than `docker_build` so it needs no daemon —
+/// Built out of `oci.image` rather than `docker_build` so it needs no daemon —
 /// the grouping is the same either way, and the driver takes any layout.
 #[tokio::test]
 async fn test_an_index_groups_separately_built_images() -> anyhow::Result<()> {
@@ -574,14 +578,14 @@ async fn test_an_index_groups_separately_built_images() -> anyhow::Result<()> {
         r#"
 target(name = "bin_amd64", driver = "bash", run = "echo amd > $OUT", out = "server-amd64")
 target(name = "bin_arm64", driver = "bash", run = "echo arm > $OUT", out = "server-arm64")
-target(name = "l_amd64", driver = "oci_layer", srcs = [":bin_amd64"], prefix = "/usr/bin")
-target(name = "l_arm64", driver = "oci_layer", srcs = [":bin_arm64"], prefix = "/usr/bin")
+target(name = "l_amd64", driver = "oci.layer", srcs = [":bin_amd64"], prefix = "/usr/bin")
+target(name = "l_arm64", driver = "oci.layer", srcs = [":bin_arm64"], prefix = "/usr/bin")
 
 # Deliberately different per platform: different layers, different entrypoint,
 # different env. One `docker_build` could not produce both.
 target(
     name = "amd64",
-    driver = "oci_image",
+    driver = "oci.image",
     layers = [":l_amd64"],
     platforms = ["linux/amd64"],
     entrypoint = ["/usr/bin/server-amd64"],
@@ -589,13 +593,13 @@ target(
 )
 target(
     name = "arm64",
-    driver = "oci_image",
+    driver = "oci.image",
     layers = [":l_arm64"],
     platforms = ["linux/arm64"],
     entrypoint = ["/usr/bin/server-arm64"],
 )
 
-target(name = "img", driver = "oci_index", images = [":amd64", ":arm64"])
+target(name = "img", driver = "oci.index", images = [":amd64", ":arm64"])
 "#,
     );
 
@@ -679,11 +683,11 @@ async fn test_two_images_for_one_platform_is_an_error() {
         r#"
 target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt")
 target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt")
-target(name = "la", driver = "oci_layer", srcs = [":a"], prefix = "/etc")
-target(name = "lb", driver = "oci_layer", srcs = [":b"], prefix = "/etc")
-target(name = "ia", driver = "oci_image", layers = [":la"], platforms = ["linux/amd64"])
-target(name = "ib", driver = "oci_image", layers = [":lb"], platforms = ["linux/amd64"])
-target(name = "img", driver = "oci_index", images = [":ia", ":ib"])
+target(name = "la", driver = "oci.layer", srcs = [":a"], prefix = "/etc")
+target(name = "lb", driver = "oci.layer", srcs = [":b"], prefix = "/etc")
+target(name = "ia", driver = "oci.image", layers = [":la"], platforms = ["linux/amd64"])
+target(name = "ib", driver = "oci.image", layers = [":lb"], platforms = ["linux/amd64"])
+target(name = "img", driver = "oci.index", images = [":ia", ":ib"])
 "#,
     );
     let err = format!(
@@ -709,10 +713,10 @@ async fn test_a_grouped_image_reads_back_as_one_image() -> anyhow::Result<()> {
         "app",
         r#"
 target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt")
-target(name = "la", driver = "oci_layer", srcs = [":a"], prefix = "/etc")
-target(name = "ia", driver = "oci_image", layers = [":la"], platforms = ["linux/amd64"])
-target(name = "ib", driver = "oci_image", layers = [":la"], platforms = ["linux/arm64"])
-target(name = "img", driver = "oci_index", images = [":ia", ":ib"], layout = True)
+target(name = "la", driver = "oci.layer", srcs = [":a"], prefix = "/etc")
+target(name = "ia", driver = "oci.image", layers = [":la"], platforms = ["linux/amd64"])
+target(name = "ib", driver = "oci.image", layers = [":la"], platforms = ["linux/arm64"])
+target(name = "img", driver = "oci.index", images = [":ia", ":ib"], layout = True)
 target(
     name = "show",
     driver = "bash",

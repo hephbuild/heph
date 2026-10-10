@@ -5,11 +5,12 @@ use hcore::hasync::Cancellable;
 use hcore::hmemoizer::Memoizer;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
+use hplugin::function::{FunctionRegistry, FunctionSlot};
 use hplugin::provider::GetError::NotFound;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ListedFacts, ProbeRequest, ProbeResponse,
-    Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
+    Provider as EProvider, State, TargetSpec,
 };
 use hwalk::{CachedWalker, Ignore};
 use once_cell::sync::OnceCell;
@@ -147,9 +148,9 @@ pub struct Provider {
     /// the provider (BUILD file contents don't change mid-session).
     ///
     /// Every cache here lives for one invocation, and that is load-bearing: an
-    /// evaluated package can contain targets a *provider function* declared
-    /// (`heph.<provider>.<fn>(…)`), so its content depends on the code of that
-    /// provider — a plugin that may be upgraded — and not only on the BUILD
+    /// evaluated package can contain targets a *plugin function* declared
+    /// (`heph.<plugin>.<fn>(…)`), so its content depends on the code of that
+    /// plugin — which may be upgraded — and not only on the BUILD
     /// files. Persist a package result across invocations and the declaring
     /// plugin's identity becomes part of that entry's key; keyed on BUILD
     /// content alone, an upgraded plugin's new declarations would never be seen.
@@ -178,11 +179,11 @@ pub struct Provider {
     /// Single-flights file evaluation so concurrently-evaluating packages that
     /// `load()` the same shared build-file helper evaluate it once between them.
     pub(crate) loads: Arc<crate::pluginbuildfile::run_file::LoadRegistry>,
-    /// Aggregated provider functions, injected once by the engine. Drives the
-    /// `heph.<provider>.<fn>` Starlark namespace. Empty until injected (some unit
-    /// tests run the provider without an engine).
-    pub(crate) function_registry: OnceLock<Arc<ProviderFunctionRegistry>>,
-    /// Lazily-built Starlark globals (built from `function_registry` on first eval),
+    /// Where the `heph.<plugin>.<fn>` Starlark namespace comes from: the
+    /// engine's function slot in production ([`Provider::with_functions`]), or a
+    /// finished registry (the LSP, tests).
+    pub(crate) functions: FunctionSource,
+    /// Lazily-built Starlark globals (built from `functions` on first eval),
     /// shared with every `BuildFileLoader` so the namespace is built at most once.
     pub(crate) globals: Arc<OnceLock<Globals>>,
     /// Shared cross-run filesystem-walk cache. The package-discovery walk reads
@@ -211,7 +212,7 @@ impl Provider {
             file_cache: Arc::new(Mutex::new(HashMap::new())),
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
             loads: Arc::default(),
-            function_registry: OnceLock::new(),
+            functions: FunctionSource::default(),
             globals: Arc::new(OnceLock::new()),
             walker: Arc::new(CachedWalker::disabled()),
         }
@@ -241,11 +242,35 @@ impl Default for Provider {
 }
 
 impl Provider {
-    pub fn new(root: std::path::PathBuf, runtime: tokio::runtime::Handle) -> Self {
+    /// A buildfile provider registered with an engine: `functions` is that
+    /// engine's slot (`PluginInit.functions`), from which the
+    /// `heph.<plugin>.<fn>` namespace is read on the first evaluation.
+    pub fn new(
+        root: std::path::PathBuf,
+        runtime: tokio::runtime::Handle,
+        functions: Arc<FunctionSlot>,
+    ) -> Self {
         Self {
             root,
             ..Self::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
         }
+        .with_functions(functions)
+    }
+
+    /// Read the `heph.<plugin>.<fn>` namespace from the engine's function
+    /// slot. Every engine-registered buildfile provider takes this: the slot
+    /// is read on the first evaluation, and reading it before the engine has
+    /// sealed it is an error rather than an empty namespace.
+    pub fn with_functions(mut self, slot: Arc<FunctionSlot>) -> Self {
+        self.functions = FunctionSource::Engine(slot);
+        self
+    }
+
+    /// Read the namespace from a finished registry the caller holds — for the
+    /// LSP and for tests that run the provider without an engine.
+    pub fn with_function_registry(mut self, registry: Arc<FunctionRegistry>) -> Self {
+        self.functions = FunctionSource::Fixed(registry);
+        self
     }
 
     /// Use `walker` (the shared cross-run fs-walk cache) for package discovery, so
@@ -674,12 +699,33 @@ impl EProvider for Provider {
             })
         })
     }
+}
 
-    fn set_function_registry(&self, reg: Arc<ProviderFunctionRegistry>) {
-        // First injection wins; the engine wires exactly once, so a later set
-        // (already-injected) is a harmless no-op.
-        if self.function_registry.set(reg).is_err() {
-            // Registry was already injected; keep the first one.
+/// Where a buildfile provider reads the `heph.<plugin>.<fn>` namespace from.
+#[derive(Clone)]
+pub enum FunctionSource {
+    /// The engine's slot, resolved on the first evaluation. An error before
+    /// the engine seals it — never an empty namespace cached for the
+    /// provider's life.
+    Engine(Arc<FunctionSlot>),
+    /// A finished registry the caller holds: the LSP, tests.
+    Fixed(Arc<FunctionRegistry>),
+}
+
+impl Default for FunctionSource {
+    /// No functions at all: a provider built without an engine. Every
+    /// `heph.<plugin>` reference then fails as an unknown plugin, naming
+    /// `heph inspect functions` — loudly, never as a silently empty value.
+    fn default() -> Self {
+        Self::Fixed(Arc::default())
+    }
+}
+
+impl FunctionSource {
+    pub(crate) fn registry(&self) -> anyhow::Result<Arc<FunctionRegistry>> {
+        match self {
+            Self::Engine(slot) => slot.get(),
+            Self::Fixed(registry) => Ok(Arc::clone(registry)),
         }
     }
 }

@@ -7,7 +7,7 @@ identity it got, and the cache key never knows there was one.
 
 Before this, heph had no concept of a credential, so eight places each invented a
 partial one: `pass_env` values hashed into a def, an OCI registry client silently
-degrading to anonymous, `docker_build` secrets wired to an `env=` source that
+degrading to anonymous, `oci.docker_build` secrets wired to an `env=` source that
 resolves against a cleared environment, `http_fetch` with no auth at all, private
 Go modules with no credential path anywhere, and a devenv runner capturing its
 whole environment into a cached, remotely-shippable artifact.
@@ -75,12 +75,17 @@ carry `cache = False` whether or not they use this feature.
 
 | | |
 |---|---|
-| **credential** | a target with `driver = "credential"`. Declares what is needed and how it may be obtained. Builds nothing, executes nothing, is never cached. |
+| **credential** | a target with `driver = "auth.credential"`. Declares what is needed and how it may be obtained. Builds nothing, executes nothing, is never cached. |
 | **source** | one way to obtain material. Has a *probe* (is this applicable here?) and an *acquire*; optionally a *login* and a *hint*. |
 | **chain** | the credential's ordered `sources`. The environment picks the winner, not the author. |
 | **material** | named string fields and files, plus an optional expiry. Never hashed, never in an artifact, never in an event, never in a def. |
 | **presentation** | how material reaches the sandbox: environment variables, files, or a callback helper. |
 | **reference** | `credentials = ["//auth:aws"]` on a consumer. An `Input` with `hashed: false, runtime: false` plus an annotation. |
+
+All of it is the builtin `auth` plugin: the `auth.credential` driver plus the
+`heph.auth.*` functions, and no provider. The functions are the plugin's (see
+`docs/PLUGIN_FUNCTIONS.md`), so nothing stands in for a provider to carry them;
+`auth` appears in no provider listing and takes no `provider_state`.
 
 Why a target rather than a field on the consumer: identical reasoning to
 `scratch`. Settings live in exactly one place, so two consumers cannot disagree
@@ -93,7 +98,7 @@ about which role to assume; the address gives packages, visibility and
 # //auth/BUILD
 aws = target(
     name    = "aws",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [
         # CI. Probe: the runner's OIDC endpoint is in the environment. heph mints
         # the token and writes it to a file; the AWS SDK performs the exchange
@@ -216,7 +221,7 @@ cf_fetch = target(
 
 cf_root = target(
     name    = "cf-root",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [cf_fetch],
     present = {"env": {"CLOUDFLARE_API_TOKEN": "${token}"}},
 )
@@ -418,7 +423,7 @@ only once the material has earned the right to outlive the process. An unbounded
 producer credential works for the whole run; what it does not do is leave a
 `0600` secret behind that only `heph auth logout` would collect.
 
-## Registry drivers: `oci_pull` and `oci_push`
+## Registry drivers: `oci.pull` and `oci.push`
 
 These two speak the registry protocol in-process rather than spawning a tool, so
 they cannot simply inherit a presented environment. Instead they read the one
@@ -427,15 +432,15 @@ presentation a registry client already understands, the Docker helper:
 ```python
 ghcr = target(
     name    = "ghcr",
-    driver  = "credential",
+    driver  = "auth.credential",
     # An `env` source names each field after its variable, lowercased: this
     # yields `username` and `password`, which the docker helper answers with.
     sources = [heph.auth.env(["USERNAME", "PASSWORD"])],
     present = heph.auth.docker(["ghcr.io"]),
 )
 
-oci_pull(name = "base", ref = "ghcr.io/acme/base@sha256:…", credentials = [ghcr])
-oci_push(name = "push", image = ":img", ref = "ghcr.io/acme/app:1.2", credentials = [ghcr])
+target(name = "base", driver = "oci.pull", ref = "ghcr.io/acme/base@sha256:…", credentials = [ghcr])
+target(name = "push", driver = "oci.push", image = ":img", ref = "ghcr.io/acme/app:1.2", credentials = [ghcr])
 ```
 
 The driver reads `credHelpers` from the mount's `DOCKER_CONFIG` and calls the
@@ -481,7 +486,7 @@ Docker Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`) are
 normalized, so `["docker.io"]` covers `alpine`. A credential presented as plain
 `env` is not consulted, and the error names it.
 
-`oci_pull` is cacheable, so the rule under "Two more places the naive reading
+`oci.pull` is cacheable, so the rule under "Two more places the naive reading
 breaks" applies directly. Its default is cache on for both tiers, so an
 unpinned credential-gated pull meets all three conditions of the residual risk
 on its own. The tag resolves against the caller's identity, and a registry that
@@ -493,11 +498,11 @@ A digest-pinned gated pull is remote-cached like any other. Anyone who can read
 the remote cache can read the image, so pinning restores reproducibility, not
 access control.
 
-`docker_build` does not take `credentials` yet. Its `docker buildx` reads
+`oci.docker_build` does not take `credentials` yet. Its `docker buildx` reads
 `DOCKER_CONFIG` for more than auth: contexts, builder instances, and on Docker
 Desktop the `cli-plugins` directory that buildx itself lives in. Pointing it at
 a generated directory would break the build rather than authenticate it. A
-private base image goes through `oci_pull(layout = True, credentials = [...])`
+private base image goes through `oci.pull(layout = True, credentials = [...])`
 and `bases`, which is also the hermetic way to take one.
 
 ## The CLI

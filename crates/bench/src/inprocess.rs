@@ -60,6 +60,7 @@ fn build_engine(root: &Path) -> Result<Arc<Engine>> {
         Box::new(heph::pluginbuildfile::Provider::new(
             init.root.to_path_buf(),
             init.runtime.clone(),
+            std::sync::Arc::clone(&init.functions),
         ))
     })
     .context("register pluginbuildfile provider")?;

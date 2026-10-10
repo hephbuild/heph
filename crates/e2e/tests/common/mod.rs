@@ -59,6 +59,7 @@ impl Workspace {
                 Box::new(pluginbuildfile::Provider::new(
                     init.root.to_path_buf(),
                     init.runtime.clone(),
+                    std::sync::Arc::clone(&init.functions),
                 ))
             })
             .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
@@ -117,7 +118,11 @@ impl Workspace {
         .context("reopen: build engine over the existing workspace root")?;
         engine
             .register_provider(move |init| {
-                Box::new(pluginbuildfile::Provider::new(root, init.runtime.clone()))
+                Box::new(pluginbuildfile::Provider::new(
+                    root,
+                    init.runtime.clone(),
+                    std::sync::Arc::clone(&init.functions),
+                ))
             })
             .context("reopen: register buildfile provider")?;
         engine

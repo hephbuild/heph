@@ -4382,8 +4382,9 @@ impl Engine {
         pkg: &PkgBuf,
     ) -> anyhow::Result<Arc<Vec<State>>> {
         // Single chokepoint for every provider-dispatch path (get/probe/list all
-        // route through here), so provider functions are wired before any BUILD eval.
-        self.ensure_provider_functions_wired();
+        // route through here), so the function registry is sealed before any
+        // BUILD eval reads it.
+        self.seal_functions();
         rs.data
             .mem_probe
             .once(
@@ -5522,11 +5523,14 @@ mod tests {
         Ok(())
     }
 
+    /// `heph inspect functions` prints `<plugin>.<signature>`, sorted by plugin
+    /// then function. Moving functions from providers to plugins moved no
+    /// line: every function-bearing plugin's name was its provider's.
     #[test]
-    fn provider_functions_lists_exposed_functions() {
+    fn inspect_functions_output_unchanged() {
         let root = tempdir().unwrap();
         let _rt = crate::engine::test_rt_enter();
-        // `fs` is auto-registered by `Engine::new`.
+        // `fs` and `auth` are auto-registered by `Engine::new`.
         let engine = Engine::new(Config {
             root: root.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
@@ -5534,12 +5538,38 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let fns = engine.provider_functions();
+        let lines: Vec<String> = engine
+            .functions()
+            .into_iter()
+            .map(|(plugin, _, rendered)| format!("{plugin}.{rendered}"))
+            .collect();
+        let mut sorted = lines.clone();
+        sorted.sort();
+        assert_eq!(lines, sorted, "sorted by plugin, then function");
+        let fs: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.starts_with("fs."))
+            .collect();
+        assert_eq!(
+            fs,
+            [
+                "fs.base(path: string) -> string",
+                "fs.dir(path: string) -> string",
+                "fs.glob(pattern: string) -> list[string]",
+                "fs.join(*elems: string) -> string",
+                "fs.parent(filename: string) -> string | null",
+            ]
+        );
         assert!(
-            fns.iter().any(|(p, n, sig)| p == "fs"
-                && n == "glob"
-                && sig == "glob(pattern: string) -> list[string]"),
-            "{fns:?}"
+            lines.iter().any(|l| l.starts_with("auth.env(")),
+            "the auth bundle's functions are listed: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.starts_with("fs.") || l.starts_with("auth.")),
+            "{lines:?}"
         );
     }
 
@@ -5570,6 +5600,7 @@ mod tests {
             Box::new(hplugin_buildfile::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
                 init.runtime.clone(),
+                std::sync::Arc::clone(&init.functions),
             ))
         })?;
         let engine = SArc::new(engine);
@@ -5597,10 +5628,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_wires_provider_functions_into_buildfile() -> anyhow::Result<()> {
-        // End-to-end: the engine must aggregate `fs`'s exposed `glob` function and
-        // inject it into the buildfile provider, so a BUILD calling `heph.fs.glob`
-        // resolves at spec time.
+    async fn engine_wires_plugin_functions_into_buildfile() -> anyhow::Result<()> {
+        // End-to-end: the engine's sealed registry carries the `fs` plugin's
+        // `glob` function, and the buildfile provider reads it through the slot
+        // in its `PluginInit`, so a BUILD calling `heph.fs.glob` resolves at
+        // spec time.
         let root = tempdir()?;
         std::fs::write(root.path().join("a.txt"), "")?;
         std::fs::write(root.path().join("b.txt"), "")?;
@@ -5621,6 +5653,7 @@ mod tests {
             Box::new(hplugin_buildfile::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
                 init.runtime.clone(),
+                std::sync::Arc::clone(&init.functions),
             ))
         })?;
         let engine = SArc::new(engine);
@@ -8105,7 +8138,7 @@ mod tests {
         impl crate::engine::provider::Provider for SpawnedReentrantQueryProvider {
             fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
                 Ok(ConfigResponse {
-                    name: "spawned-reentrant".to_string(),
+                    name: "spawned_reentrant".to_string(),
                 })
             }
             fn list<'a>(

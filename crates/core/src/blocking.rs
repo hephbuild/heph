@@ -546,7 +546,7 @@ mod tests {
     /// A job may itself call [`run`] and drive it to completion.
     ///
     /// Load-bearing, not hypothetical: a Starlark handler `block_on`s a
-    /// provider function from inside a package-evaluation job, and anything
+    /// plugin function from inside a package-evaluation job, and anything
     /// below that may reach [`run`] again. The old pool needed no runtime
     /// context for this; `spawn_blocking` does, and it works only because
     /// tokio propagates the runtime context into a blocking closure. It is

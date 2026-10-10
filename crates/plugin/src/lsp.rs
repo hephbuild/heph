@@ -5,16 +5,17 @@
 
 use crate::config::Options;
 use crate::driver::DriverSchema;
-use crate::provider::{ProviderFunctionRegistry, StateSchema};
+use crate::function::FunctionRegistry;
+use crate::provider::StateSchema;
 use std::path::Path;
 use std::sync::Arc;
 
 pub trait LspEngine: Send + Sync {
     /// Workspace root, for resolving BUILD-file paths.
     fn root(&self) -> &Path;
-    /// The merged provider-function registry (for completion/hover on
-    /// provider-defined functions).
-    fn provider_function_registry(&self) -> Arc<ProviderFunctionRegistry>;
+    /// The engine's sealed plugin-function registry (for completion/hover on
+    /// `heph.<plugin>.<fn>`).
+    fn function_registry(&self) -> Arc<FunctionRegistry>;
     /// Declared schema for a driver by registry name (for target-kind hovers).
     fn driver_schema(&self, name: &str) -> Option<DriverSchema>;
     /// All registered driver names, sorted (for target-kind completion).

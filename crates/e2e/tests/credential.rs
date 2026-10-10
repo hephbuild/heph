@@ -84,15 +84,44 @@ async fn a_credential_declaration_resolves_through_the_engine() -> anyhow::Resul
         r#"
 target(
     name    = "token",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [heph.auth.env(["MY_TOKEN"])],
     present = {"env": {"MY_TOKEN": "${my_token}"}},
 )
 "#,
     );
     let spec = ws.get_spec("//auth:token").await?;
-    assert_eq!(spec.driver, "credential");
+    assert_eq!(spec.driver, "auth.credential");
     heph::plugincredential::parse_declaration(&spec)?;
+    Ok(())
+}
+
+/// The `auth` plugin is a driver plus functions and nothing else: `heph.auth.*`
+/// resolves from the plugin's functions, `auth.credential` runs the
+/// declaration, and the provider listing no longer carries an inert `auth`
+/// provider that served no targets.
+#[tokio::test]
+async fn credential_driver_and_auth_functions_come_from_the_auth_bundle() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "auth",
+        r#"target(name = "t", driver = "auth.credential",
+       sources = [heph.auth.oidc("generic")],
+       present = {"env": {"TOK": "${id_token}"}})"#,
+    );
+    let spec = ws.get_spec("//auth:t").await?;
+    assert_eq!(spec.driver, "auth.credential");
+    heph::plugincredential::parse_declaration(&spec)?;
+
+    let mut providers: Vec<&str> = ws
+        .engine
+        .providers_by_name
+        .keys()
+        .map(String::as_str)
+        .collect();
+    providers.sort_unstable();
+    assert_eq!(providers, ["buildfile", "fs", "query"]);
+    assert!(ws.engine.function_registry().get("auth", "oidc").is_some());
     Ok(())
 }
 
@@ -104,7 +133,7 @@ async fn resolving_a_declaration_directly_acquires_nothing() -> anyhow::Result<(
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["ABSENT_EVERYWHERE"])],
        present = {"env": {"T": "${absent_everywhere}"}})"#,
     );
@@ -122,7 +151,7 @@ async fn an_empty_chain_fails_at_the_declaration() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential", sources = [])"#,
+        r#"target(name = "t", driver = "auth.credential", sources = [])"#,
     );
     let err = expect_err(ws.run("//auth:t").await, "an empty chain must not resolve");
     assert!(format!("{err:#}").contains("at least one"), "{err:#}");
@@ -137,7 +166,7 @@ async fn configuration_has_nowhere_to_hide_in_a_presentation() -> anyhow::Result
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["T"])],
        present = {"env": {"T": "${t}"}, "region": "eu-west-1"})"#,
     );
@@ -176,7 +205,7 @@ async fn a_literal_value_in_a_presentation_is_accepted_and_is_a_convention_not_a
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_CONV_TOKEN"])],
        present = {"env": {"TOKEN": "${heph_e2e_conv_token}",
                           "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/deployer"}})"#,
@@ -255,7 +284,7 @@ async fn referencing_a_credential_does_not_change_the_consumer_hash() -> anyhow:
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["MY_TOKEN"])],
        present = {"env": {"MY_TOKEN": "${my_token}"}})"#,
     );
@@ -295,7 +324,7 @@ async fn changing_the_declaration_does_not_rebuild_consumers() -> anyhow::Result
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["A"])],
        present = {"env": {"A": "${a}"}})"#,
     );
@@ -308,7 +337,7 @@ async fn changing_the_declaration_does_not_rebuild_consumers() -> anyhow::Result
 
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["B"]), heph.auth.env(["C"])],
        ttl     = "10m",
        present = {"env": {"TOTALLY_DIFFERENT": "${b}"}})"#,
@@ -330,7 +359,7 @@ async fn a_credential_reference_is_an_edge_the_graph_can_see() -> anyhow::Result
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["A"])], present = {"env": {"A": "${a}"}})"#,
     );
     ws.write_build_file(
@@ -367,7 +396,7 @@ async fn a_duplicate_reference_is_rejected() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["A"])], present = {"env": {"A": "${a}"}})"#,
     );
     ws.write_build_file(
@@ -388,9 +417,9 @@ async fn two_credentials_claiming_one_variable_are_refused() -> anyhow::Result<(
     ws.write_build_file(
         "auth",
         r#"
-target(name = "a", driver = "credential",
+target(name = "a", driver = "auth.credential",
        sources = [heph.auth.env(["A"])], present = {"env": {"TOKEN": "${a}"}})
-target(name = "b", driver = "credential",
+target(name = "b", driver = "auth.credential",
        sources = [heph.auth.env(["B"])], present = {"env": {"TOKEN": "${b}"}})
 "#,
     );
@@ -422,7 +451,7 @@ async fn the_first_applicable_source_wins_and_its_material_reaches_the_target() 
         r#"
 target(
     name    = "t",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [
         # Not here: there is no OIDC endpoint in a test process.
         heph.auth.oidc("github_actions", audience = "x",
@@ -454,7 +483,7 @@ async fn a_chain_that_applies_nowhere_prints_the_walk_and_the_fix() -> anyhow::R
         r#"
 target(
     name    = "t",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [
         heph.auth.oidc("github_actions", audience = "sts.amazonaws.com",
                        present = {"env": {"T": "${id_token}"}}),
@@ -503,7 +532,7 @@ async fn an_acquire_failure_does_not_fall_through_to_the_next_source() -> anyhow
             r#"
 target(
     name    = "t",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [
         heph.auth.file("{root}/secrets/creds.json", fields = {{"token": "access_token"}}),
         heph.auth.env(["HEPH_E2E_FALLBACK_TOKEN"]),
@@ -545,7 +574,7 @@ async fn when_selects_a_source_before_any_probe() -> anyhow::Result<()> {
             r#"
 target(
     name    = "t",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [
         heph.auth.env(["HEPH_E2E_LAPTOP_TOKEN"], when = "os:{other_os}",
                       present = {{"env": {{"T": "never"}}}}),
@@ -578,7 +607,7 @@ async fn a_presented_file_is_never_collected_as_an_output() -> anyhow::Result<()
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_FILE_TOKEN"])],
        present = {"files": {"tok": "${heph_e2e_file_token}"},
                   "env":   {"TOKFILE": "${file:tok}"}})"#,
@@ -626,7 +655,7 @@ async fn credential_material_is_scrubbed_from_a_targets_output() -> anyhow::Resu
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_LOUD_TOKEN"])],
        present = {"env": {"TOKEN": "${heph_e2e_loud_token}"}})"#,
     );
@@ -677,7 +706,7 @@ async fn a_secret_below_the_length_floor_is_documented_as_not_scrubbed() -> anyh
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_TINY_TOKEN"])],
        present = {"env": {"TOKEN": "${heph_e2e_tiny_token}"}})"#,
     );
@@ -721,7 +750,7 @@ async fn a_presented_file_can_name_another_presented_file() -> anyhow::Result<()
     // `adc` sorts before `token`, so a single pass in map order would fail.
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_CHAIN_TOKEN"])],
        present = {"files": {"adc": "points at ${file:token}",
                             "token": "${heph_e2e_chain_token}"},
@@ -746,7 +775,7 @@ async fn a_bad_field_in_a_presented_file_names_the_field() -> anyhow::Result<()>
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_TYPO_TOKEN"])],
        present = {"files": {"f": "${heph_e2e_typo_tokn}"},
                   "env":   {"F": "${file:f}"}})"#,
@@ -781,7 +810,7 @@ async fn a_credential_that_is_its_own_source_fails_rather_than_hanging() -> anyh
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential", sources = ["//auth:t"],
+        r#"target(name = "t", driver = "auth.credential", sources = ["//auth:t"],
        present = {"env": {"T": "${token}"}})"#,
     );
     ws.write_build_file(
@@ -809,9 +838,9 @@ async fn a_two_credential_cycle_is_named_not_hung() -> anyhow::Result<()> {
     ws.write_build_file(
         "auth",
         r#"
-target(name = "a", driver = "credential", sources = ["//auth:b"],
+target(name = "a", driver = "auth.credential", sources = ["//auth:b"],
        present = {"env": {"A": "${token}"}})
-target(name = "b", driver = "credential", sources = ["//auth:a"],
+target(name = "b", driver = "auth.credential", sources = ["//auth:a"],
        present = {"env": {"B": "${token}"}})
 "#,
     );
@@ -847,7 +876,7 @@ async fn a_passthrough_source_exposes_a_host_path_in_place() -> anyhow::Result<(
     ws.write_build_file(
         "auth",
         &format!(
-            r#"target(name = "t", driver = "credential",
+            r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.passthrough(
            paths = {{"config": "{}"}},
            env   = {{"VENDOR_CONFIG": "${{file:config}}"}})],
@@ -877,7 +906,7 @@ async fn a_passthrough_with_a_missing_path_is_skipped() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [
            heph.auth.passthrough(paths = {"c": "/nonexistent/heph/e2e"},
                                  env = {"T": "never"}),
@@ -910,7 +939,7 @@ async fn a_generic_oidc_token_is_read_from_its_file_and_trimmed() -> anyhow::Res
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.oidc("generic")],
        present = {"env": {"TOK": "${id_token}"}})"#,
     );
@@ -947,7 +976,7 @@ async fn the_aws_helper_writes_a_config_naming_the_callback() -> anyhow::Result<
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_AWS_TOKEN"])],
        present = heph.auth.aws_process())"#,
     );
@@ -969,7 +998,7 @@ async fn the_gcp_helper_writes_an_executable_sourced_external_account() -> anyho
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_GCP_TOKEN"])],
        present = {"helper": {"dialect": "gcp",
                              "audience": "//iam.googleapis.com/projects/1/x",
@@ -1010,7 +1039,7 @@ async fn the_docker_helper_writes_a_shim_and_puts_it_on_path() -> anyhow::Result
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_REG_TOKEN"])],
        present = heph.auth.docker(["ghcr.io"]))"#,
     );
@@ -1038,7 +1067,7 @@ async fn the_git_helper_is_environment_only() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_GIT_TOKEN"])],
        present = heph.auth.git(["git.corp.example"]))"#,
     );
@@ -1073,7 +1102,7 @@ async fn the_kubernetes_helper_places_the_callback_in_the_authors_document() -> 
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_K8S_TOKEN"])],
        present = {"helper": "kubernetes",
                   "files":  {"kubeconfig": "command: ${helper:command}\nargs: ${helper:args}\n"},
@@ -1097,7 +1126,7 @@ async fn material_with_no_expiry_is_never_left_at_rest() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_UNBOUNDED"])],
        present = {"env": {"T": "${heph_e2e_unbounded}"}})"#,
     );
@@ -1135,7 +1164,7 @@ async fn a_cacheable_producer_is_refused_as_a_credential_source() -> anyhow::Res
         r#"
 target(name = "fetch", driver = "bash", out = {"credential": "cred.json"},
        run = ["printf '{\"token\":\"abc\"}' > cred.json"])
-target(name = "t", driver = "credential", sources = ["//auth:fetch"],
+target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
        present = {"env": {"T": "${token}"}})
 "#,
     );
@@ -1166,7 +1195,7 @@ async fn a_target_source_yields_its_credential_group_as_fields() -> anyhow::Resu
 target(name = "fetch", driver = "bash", cache = False,
        out = {"credential": "cred.json"},
        run = ["printf '{\"token\":\"from-a-target\",\"expires_in\":600}' > cred.json"])
-target(name = "t", driver = "credential", sources = ["//auth:fetch"],
+target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
        present = {"env": {"T": "${token}"}})
 "#,
     );
@@ -1192,10 +1221,10 @@ async fn a_credential_can_delegate_to_another() -> anyhow::Result<()> {
     ws.write_build_file(
         "auth",
         r#"
-target(name = "root", driver = "credential",
+target(name = "root", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_ROOT_TOKEN"])],
        present = {"env": {"ROOT": "${heph_e2e_root_token}"}})
-target(name = "derived", driver = "credential", sources = ["//auth:root"],
+target(name = "derived", driver = "auth.credential", sources = ["//auth:root"],
        present = {"env": {"DERIVED": "${heph_e2e_root_token}"}})
 "#,
     );
@@ -1225,13 +1254,13 @@ async fn a_source_can_declare_its_own_credentials() -> anyhow::Result<()> {
     ws.write_build_file(
         "auth",
         r#"
-target(name = "vault", driver = "credential",
+target(name = "vault", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_E2E_VAULT_TOKEN"])],
        present = {"env": {"VAULT_TOKEN": "${heph_e2e_vault_token}"}})
 
 # The acquire command prints whatever identity it was handed, which is exactly
 # what a real `vault read` does with the token it was given.
-target(name = "cf", driver = "credential",
+target(name = "cf", driver = "auth.credential",
        sources = [heph.auth.exec(
            ["sh", "-c", "printf '{\"token\":\"scoped-for-%s\"}' \"$VAULT_TOKEN\""],
            fields = {"token": "token"},
@@ -1266,7 +1295,7 @@ async fn one_acquisition_serves_every_concurrent_consumer() -> anyhow::Result<()
         "auth",
         &format!(
             r#"
-target(name = "t", driver = "credential",
+target(name = "t", driver = "auth.credential",
        sources = [heph.auth.exec(["sh", "-c",
            "sleep 0.3; echo x >> {c}; printf '{{\"token\":\"once\"}}'"],
            fields = {{"token": "token"}})],
@@ -1318,7 +1347,7 @@ async fn lapsed_material_is_re_acquired_rather_than_handed_on() -> anyhow::Resul
         "auth",
         &format!(
             r#"
-target(name = "t", driver = "credential",
+target(name = "t", driver = "auth.credential",
        sources = [heph.auth.exec(["sh", "-c",
            "echo x >> {c}; printf '{{\"token\":\"v\",\"expires_in\":1}}'"],
            fields = {{"token": "token"}}, expires = "expires_in")],
@@ -1367,7 +1396,7 @@ async fn a_second_process_reuses_the_disk_tier() -> anyhow::Result<()> {
         "auth",
         &format!(
             r#"
-target(name = "t", driver = "credential",
+target(name = "t", driver = "auth.credential",
        sources = [heph.auth.exec(["sh", "-c",
            "echo x >> {c}; printf '{{\"token\":\"v\",\"expires_in\":3600}}'"],
            fields = {{"token": "token"}}, expires = "expires_in")],
@@ -1416,7 +1445,7 @@ async fn a_producers_files_are_not_left_at_rest_without_an_expiry() -> anyhow::R
 target(name = "mint", driver = "bash", cache = False,
        out = {"kubeconfig": "kc.yaml"},
        run = ["printf 'token: unbounded-producer-secret' > kc.yaml"])
-target(name = "t", driver = "credential", sources = ["//auth:mint"],
+target(name = "t", driver = "auth.credential", sources = ["//auth:mint"],
        present = {"env": {"KUBECONFIG": "${file:kubeconfig}"}})
 "#,
     );
@@ -1463,7 +1492,7 @@ async fn a_producers_files_are_kept_once_a_ttl_gives_them_a_lifetime() -> anyhow
 target(name = "mint", driver = "bash", cache = False,
        out = {"kubeconfig": "kc.yaml"},
        run = ["printf 'token: bounded-producer-secret' > kc.yaml"])
-target(name = "t", driver = "credential", sources = ["//auth:mint"],
+target(name = "t", driver = "auth.credential", sources = ["//auth:mint"],
        ttl = "6h",
        present = {"env": {"KUBECONFIG": "${file:kubeconfig}"}})
 "#,
@@ -1508,7 +1537,7 @@ async fn one_acquisition_serves_every_consumer() -> anyhow::Result<()> {
         "auth",
         &format!(
             r#"
-target(name = "t", driver = "credential",
+target(name = "t", driver = "auth.credential",
        sources = [heph.auth.exec(["sh", "-c",
            "echo x >> {c}; printf '{{\"token\":\"once\"}}'"],
            fields = {{"token": "token"}})],
@@ -1554,7 +1583,7 @@ async fn a_cache_hit_acquires_nothing() -> anyhow::Result<()> {
         "auth",
         &format!(
             r#"
-target(name = "t", driver = "credential",
+target(name = "t", driver = "auth.credential",
        sources = [heph.auth.exec(["sh", "-c",
            "echo x >> {c}; printf '{{\"token\":\"v\"}}'"],
            fields = {{"token": "token"}})],

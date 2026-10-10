@@ -48,7 +48,7 @@ pub enum Commands {
     ///
     /// Read-only introspection of the build graph. Subcommands print a target's
     /// spec, resolved def, input/output hashes, or dependencies, and list
-    /// packages or provider functions. Nothing is executed unless a provider
+    /// packages or plugin functions. Nothing is executed unless a provider
     /// must run a target to answer the query.
     ///
     /// Examples:
@@ -89,7 +89,7 @@ pub enum Commands {
     Version(version::Args),
     /// Sign in, and see which credentials are available here
     ///
-    /// A credential is a target (`driver = "credential"`) declaring what identity
+    /// A credential is a target (`driver = "auth.credential"`) declaring what identity
     /// a build needs and how it may be obtained. This is the preflight over them:
     /// which apply in this environment, from which source, and until when.
     ///

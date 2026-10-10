@@ -121,6 +121,7 @@ fn build_engine(root: &Path, remote_uri: &str, parallelism: Option<usize>) -> Ar
         Box::new(pluginbuildfile::Provider::new(
             init.root.to_path_buf(),
             init.runtime.clone(),
+            std::sync::Arc::clone(&init.functions),
         ))
     })
     .expect("register buildfile provider");

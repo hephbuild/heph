@@ -231,14 +231,19 @@ mod tests {
         })
         .expect("engine");
 
-        e.register_provider_factory("buildfile", |init, opts| {
-            Ok(Box::new(pluginbuildfile::Provider::from_options(
-                init.root.to_path_buf(),
-                &init.skip_dirs,
-                &init.skip_globs,
-                opts,
-                init.runtime.clone(),
-            )?))
+        e.register_plugin_factory("buildfile", |init, opts| {
+            Ok(
+                crate::engine::PluginParts::default().with_provider(Box::new(
+                    pluginbuildfile::Provider::from_options(
+                        init.root.to_path_buf(),
+                        &init.skip_dirs,
+                        &init.skip_globs,
+                        opts,
+                        init.runtime.clone(),
+                    )?
+                    .with_functions(std::sync::Arc::clone(&init.functions)),
+                )),
+            )
         })
         .expect("register buildfile");
 

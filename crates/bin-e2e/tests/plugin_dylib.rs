@@ -12,8 +12,8 @@ mod common;
 use common::{BASE_CONFIG, Dist, Workspace, describe, sha256_file, write_manifest};
 
 /// A shipped cdylib must load *and answer*. Merely dlopening proves little —
-/// `inspect functions` makes the host call `functions()` on the loaded provider
-/// and render the signature it returns, so a passing assertion means a real
+/// `inspect functions` renders the signatures the loaded plugin's function
+/// metadata carried across the ABI, so a passing assertion means a real
 /// round trip across the ABI seam with real data coming back.
 #[test]
 fn shipped_go_cdylib_loads_and_answers_across_the_abi() {
@@ -146,6 +146,100 @@ provider_state(
     );
 }
 
+/// **A cdylib driver can start a cold `session` runner.**
+///
+/// Plugins load on rayon workers, where there is no current tokio runtime. A
+/// loader that probed `Handle::try_current()` there always got `Err` and handed
+/// the plugin an *inline* runner host, so the host's `prepare` body ran on the
+/// plugin worker that polled it. A `wrap` runner never notices (its `prepare`
+/// touches no timer or IO), but a cold `session` start polls for the agent's
+/// socket with a host `tokio::time::sleep` — off the host runtime that is a
+/// panic, and a panic at the ABI seam is a non-unwinding abort. (The inline
+/// loader passed this on darwin/arm64: the polling thread there happened to
+/// carry the host runtime. The loader now passes the engine's handle so the
+/// outcome no longer depends on which thread polls.)
+///
+/// Nothing in-process uses the runner first, so the session is genuinely cold
+/// when the cdylib driver reaches it. The launch is a passthrough shell that
+/// drops a marker, so the marker proves the session start ran to the spawn.
+#[test]
+fn a_cdylib_driver_starts_a_cold_session_runner() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("go");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-go-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash go cdylib");
+    write_manifest(&manifest, "go", &dylib, Some(&sum)).expect("write manifest");
+
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n    options:\n      gotool: \"host\"\n      runner: \"//:runner\"\n",
+        manifest.display()
+    ))
+    .expect("write config");
+
+    // `sh -c SCRIPT ARG0 ARGS…`: the runner appends the agent invocation, so the
+    // heph binary lands in `$0` and its arguments in `$@`. Unquoted on purpose:
+    // Starlark strips backslash escapes in a triple-quoted string, and the
+    // temp paths involved carry no spaces.
+    let marker = ws.root().join("session-launched");
+    let runner_json = format!(
+        r#"{{
+  "version": 1,
+  "fingerprint": "test:cold-session",
+  "runner": "session",
+  "config": {{ "launch": ["/bin/sh", "-c", "touch {} && exec $0 $@"] }}
+}}
+"#,
+        marker.display()
+    );
+    let (goos, goarch) = common::host_os_arch();
+    ws.write(
+        "BUILD",
+        &format!(
+            r#"target(
+    name = "runner",
+    driver = "textfile",
+    text = """{runner_json}""",
+    out = "runner.json",
+)
+provider_state(
+    provider = "go",
+    variants = {{"host": {{"goos": "{goos}", "goarch": "{goarch}"}}}},
+)
+"#
+        ),
+    )
+    .expect("write BUILD");
+    ws.write("go.mod", "module example.com/seam\n\ngo 1.21\n")
+        .expect("write go.mod");
+    ws.write("cmd/main.go", "package main\n\nfunc main() {}\n")
+        .expect("write main.go");
+
+    // Whether Go is on the host is beside the point: the toolchain probe goes
+    // through the runner either way, and that is the cold start under test.
+    let out = ws.run(&dist, &["run", "//cmd:build@v=host"]).expect("run");
+    let combined = describe(&out);
+
+    assert!(
+        out.status.code().is_some(),
+        "heph died on a signal (an abort at the plugin seam): {combined}"
+    );
+    assert!(
+        !combined.contains("there is no reactor running"),
+        "the host's runner `prepare` ran off the host runtime: {combined}"
+    );
+    assert!(
+        !combined.contains("panic in a function that cannot unwind"),
+        "a panic crossed the plugin seam: {combined}"
+    );
+    assert!(
+        marker.is_file(),
+        "the cold session runner never launched: {combined}"
+    );
+}
+
 /// The second shipped cdylib, exporting a hook rather than a provider — a
 /// different export kind over the same seam, so a loader that only handles
 /// providers fails here and nowhere else.
@@ -249,7 +343,7 @@ fn shipped_go_cdylib_list_calls_back_states_under_across_the_seam() {
 /// only `go` on `PATH` here is a stub that fails, so a run that resolved even
 /// one spec would fail. `driver("nonexistent")` must therefore come back
 /// empty and green (a listed No is never resolved), and
-/// `--candidates` with `driver(go_compile)` must name the lib's compile —
+/// `--candidates` with `driver(go.compile)` must name the lib's compile —
 /// both decided from the listing alone.
 #[cfg(unix)]
 #[test]
@@ -328,13 +422,13 @@ fn shipped_go_cdylib_listed_facts_decide_without_get() {
 
     // A listed Yes is confirmed by default, which would run the stub; the
     // listing alone is `--candidates`.
-    let out = query_flags(&["--candidates"], "//lib/... && driver(go_compile)", "");
+    let out = query_flags(&["--candidates"], "//lib/... && driver(go.compile)", "");
     assert!(out.status.success(), "{}", describe(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(
         lines == ["//lib:build_lib@v=release,vp=cmd"],
-        "only the lib's compile is a go_compile target: {}",
+        "only the lib's compile is a go.compile target: {}",
         describe(&out)
     );
 }
@@ -502,7 +596,7 @@ fn shipped_oci_cdylib_parses_across_the_abi_without_aborting() {
         "pkg/BUILD",
         "target(name = \"df\", driver = \"bash\", run = \"echo 'FROM scratch' > $OUT\", \
          out = \"Dockerfile\")\n\
-         target(name = \"img\", driver = \"docker_build\", context = [\":df\"])\n",
+         target(name = \"img\", driver = \"oci.docker_build\", context = [\":df\"])\n",
     )
     .expect("write BUILD");
 
@@ -545,7 +639,7 @@ fn shipped_oci_cdylib_parses_across_the_abi_without_aborting() {
 /// proves — and an ABI mismatch in a cdylib is an abort at load, not an error a
 /// user can read.
 ///
-/// Deliberately does not run a `devenv_runner` target: that needs `devenv` and
+/// Deliberately does not run a `devenv.runner` target: that needs `devenv` and
 /// a nix evaluation, which is what `crates/e2e/tests/devenv_runner.rs` covers
 /// behind an opt-in. What is asserted here is what only the shipped artifact
 /// can answer — that the library maps, the create entry's type report matches,
@@ -565,7 +659,7 @@ fn shipped_devenv_cdylib_loads_and_registers_its_driver() {
 
     ws.write(
         "pkg/BUILD",
-        "target(name = \"runner\", driver = \"devenv_runner\", mode = \"wrap\")\n",
+        "target(name = \"runner\", driver = \"devenv.runner\", mode = \"wrap\")\n",
     )
     .expect("write BUILD");
 
@@ -587,12 +681,233 @@ fn shipped_devenv_cdylib_loads_and_registers_its_driver() {
     );
     assert!(
         !combined.contains("driver not found"),
-        "the devenv plugin loaded but did not register `devenv_runner`: {}",
+        "the devenv plugin loaded but did not register `devenv.runner`: {}",
         describe(&out)
     );
     assert!(
         out.status.success(),
-        "parsing a devenv_runner target should succeed: {}",
+        "parsing a devenv.runner target should succeed: {}",
         describe(&out)
     );
+}
+
+/// Load a shipped cdylib under manifest name `name`, with `options` (YAML
+/// lines under `options:`, already indented, or empty).
+fn load_as(ws: &Workspace, dist: &Dist, plugin: &str, name: &str, options: &str) {
+    let dylib = dist.plugin(plugin);
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+    let manifest = ws.root().join(format!("heph-{plugin}-plugin.json"));
+    let sum = sha256_file(&dylib).expect("hash cdylib");
+    write_manifest(&manifest, name, &dylib, Some(&sum)).expect("write manifest");
+    let options = if options.is_empty() {
+        String::new()
+    } else {
+        format!("    options:\n{options}")
+    };
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n{options}",
+        manifest.display()
+    ))
+    .expect("write config");
+}
+
+const GO_OPTIONS: &str = "      gotool: \"host\"\n";
+
+/// **A cdylib's namespace is its manifest's `name`.** The binary reports
+/// none: the same go cdylib loaded as `go` answers `heph.go.*`, and loaded as
+/// `gopher` answers `heph.gopher.*`. A manifest name that is not a valid
+/// `heph.<name>` segment fails the load, naming the name, the rule and the
+/// manifest.
+#[test]
+fn cdylib_namespace_is_its_manifest_name() {
+    let dist = Dist::locate();
+    for name in ["go", "gopher"] {
+        let ws = Workspace::new().expect("workspace");
+        load_as(&ws, &dist, "go", name, GO_OPTIONS);
+        let out = ws.run(&dist, &["inspect", "functions"]).expect("run");
+        assert!(out.status.success(), "{}", describe(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let build_addr: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.contains("build_addr("))
+            .collect();
+        assert_eq!(
+            build_addr.len(),
+            1,
+            "one build_addr, under the manifest name {name}: {}",
+            describe(&out)
+        );
+        assert!(
+            build_addr[0].starts_with(&format!("{name}.build_addr(")),
+            "{name}: {}",
+            describe(&out)
+        );
+    }
+
+    let ws = Workspace::new().expect("workspace");
+    load_as(&ws, &dist, "go", "my-go", GO_OPTIONS);
+    let out = ws.run(&dist, &["inspect", "functions"]).expect("run");
+    assert!(
+        !out.status.success(),
+        "loaded a plugin whose manifest name is not a namespace: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let manifest = ws.root().join("heph-go-plugin.json");
+    for want in [
+        "invalid plugin name \"my-go\"",
+        "[a-z_][a-z0-9_]*",
+        &manifest.display().to_string(),
+    ] {
+        assert!(
+            stderr.contains(want),
+            "missing {want:?}: {}",
+            describe(&out)
+        );
+    }
+}
+
+/// The cdylib rows of the spec's name map (the builtin rows are pinned in the
+/// root crate's `bootstrap` tests): each shipped driver answers to its new
+/// `<plugin>.<local>` name, and the name it had before is an unknown driver.
+#[test]
+fn shipped_names_match_the_name_map() {
+    let dist = Dist::locate();
+    /// `(plugin, options, [(new name, old name)])`.
+    type Row<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+    let rows: [Row; 3] = [
+        (
+            "go",
+            GO_OPTIONS,
+            &[
+                ("go.golist", "go_golist"),
+                ("go.toolchain", "go_toolchain"),
+                ("go.compile", "go_compile"),
+                ("go.testmain", "go_testmain"),
+                ("go.lint", "go_lint"),
+                ("go.lint_gate", "go_lint_gate"),
+                ("go.lint_fix", "go_lint_fix"),
+                ("go.format", "go_format"),
+                ("go.format_check", "go_format_check"),
+            ],
+        ),
+        (
+            "oci",
+            "",
+            &[
+                ("oci.docker_build", "docker_build"),
+                ("oci.image", "oci_image"),
+                ("oci.layer", "oci_layer"),
+                ("oci.index", "oci_index"),
+                ("oci.pull", "oci_pull"),
+                ("oci.push", "oci_push"),
+                ("oci.load", "oci_load"),
+                ("oci.builder_platform", "oci_builder_platform"),
+                ("oci.runner", "oci_runner"),
+            ],
+        ),
+        ("devenv", "", &[("devenv.runner", "devenv_runner")]),
+    ];
+    for (plugin, options, names) in rows {
+        let ws = Workspace::new().expect("workspace");
+        load_as(&ws, &dist, plugin, plugin, options);
+        // One target per name; `inspect def` reaches each driver's `parse`
+        // without running anything. A config error is fine — it came from the
+        // driver — but "driver not found" means the name is not registered.
+        let mut build = String::new();
+        for (i, (new, old)) in names.iter().enumerate() {
+            build.push_str(&format!("target(name = \"new{i}\", driver = \"{new}\")\n"));
+            build.push_str(&format!("target(name = \"old{i}\", driver = \"{old}\")\n"));
+        }
+        ws.write("pkg/BUILD", &build).expect("write BUILD");
+        for (i, (new, old)) in names.iter().enumerate() {
+            let out = ws
+                .run(&dist, &["inspect", "def", &format!("//pkg:new{i}")])
+                .expect("run");
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !combined.contains(&format!("driver not found: {new}")),
+                "{new} is not registered: {}",
+                describe(&out)
+            );
+            let out = ws
+                .run(&dist, &["inspect", "def", &format!("//pkg:old{i}")])
+                .expect("run");
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                combined.contains(&format!("driver not found: {old}")),
+                "the old name {old} must not resolve: {}",
+                describe(&out)
+            );
+        }
+    }
+}
+
+/// **A plugin built against another heph ABI is refused, saying so.**
+///
+/// No version is read at load: what refuses a skewed plugin is stabby's
+/// structural check on `heph_plugin_create`, whose `PluginComponents` layout an
+/// ABI break changes. The fixture is the smallest library that fails that check
+/// the way a 0.15 plugin does: it exports the create entry's stabby probe, and
+/// the probe answers "not my layout". It also exports `heph_plugin_set_log_sink`
+/// with a mismatched report, which the host must warn about rather than skip in
+/// silence. Built here with the system C compiler — a checked-in binary per
+/// platform, or a whole fixture crate staged with the release artifacts, would
+/// cost more than the seam it covers.
+#[test]
+fn a_plugin_from_another_abi_is_refused() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+
+    let src = ws.root().join("drift.c");
+    std::fs::write(
+        &src,
+        "void *heph_plugin_create_stabbied_v3(const void *r) { (void)r; return 0; }\n\
+         void heph_plugin_create(void) {}\n\
+         void *heph_plugin_set_log_sink_stabbied_v3(const void *r) { (void)r; return 0; }\n\
+         void heph_plugin_set_log_sink(void) {}\n",
+    )
+    .expect("write fixture source");
+    let dylib = ws
+        .root()
+        .join(format!("heph-drift-plugin.{}", common::DYLIB_EXT));
+    let cc = std::process::Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&dylib)
+        .arg(&src)
+        .output()
+        .expect("run the C compiler (the fixture needs one: set CC)");
+    assert!(cc.status.success(), "build fixture: {}", describe(&cc));
+
+    let manifest = ws.root().join("heph-drift-plugin.json");
+    write_manifest(&manifest, "drift", &dylib, None).expect("write manifest");
+    ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
+        .expect("write config");
+
+    let mut cmd = ws.cmd(&dist, &["inspect", "functions"]);
+    cmd.env("HEPH_LOG", "warn");
+    let out = cmd.output().expect("run");
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for want in [
+        "was built against a different heph ABI (host 0.16.0)",
+        "reinstall plugins from the same release",
+        &dylib.display().to_string(),
+        // The optional entry with a mismatched type is warned about.
+        "heph_plugin_set_log_sink",
+    ] {
+        assert!(
+            stderr.contains(want),
+            "missing {want:?}: {}",
+            describe(&out)
+        );
+    }
 }

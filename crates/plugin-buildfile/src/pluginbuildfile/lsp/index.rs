@@ -275,7 +275,7 @@ pub(crate) struct SharedState {
     pub root: std::path::PathBuf,
     pub patterns: Vec<glob::Pattern>,
     /// The `heph.core` builtin functions, for member completion/hover of that
-    /// static namespace (which isn't in the provider-function registry).
+    /// static namespace (which isn't in the plugin-function registry).
     pub core_members: Vec<crate::pluginbuildfile::run_file::CoreMember>,
     /// Renders hover markdown for the `target` / `provider_state` builtins — the
     /// stock server only knows their raw `*args, **kwargs` prototype. Rendered
@@ -327,7 +327,7 @@ mod tests {
             patterns.clone(),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(hplugin::provider::ProviderFunctionRegistry::default()),
+            Arc::new(hplugin::function::FunctionRegistry::default()),
             Arc::new(std::sync::OnceLock::new()),
             Arc::clone(&walker),
             Arc::new(crate::pluginbuildfile::provider::PackageList::new(

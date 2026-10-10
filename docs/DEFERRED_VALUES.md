@@ -19,7 +19,7 @@ target(
 # //auth/BUILD — where the literal used to be
 target(
     name    = "aws",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [heph.auth.oidc("github_actions", audience = WIF,
                               present = heph.auth.aws_web_identity(
                                   role = "${read://infra/aws:role-arn}"))],
@@ -337,14 +337,14 @@ the whole-driver schema gate — and `${src://…}`, whose path is filled in by 
 managed-driver layer, the only place that knows where an artifact landed (under
 FUSE the sandbox root is redirected after the host has set it). Consumers: the
 credential driver's presentation templates, the `exec` driver's `run` in
-**both exec and bash mode**, and `oci_push`'s `ref`.
+**both exec and bash mode**, and `oci.push`'s `ref`.
 
-`oci_push`'s `ref` also takes `${image_hashout}`. That one is **not** a deferred
+`oci.push`'s `ref` also takes `${image_hashout}`. That one is **not** a deferred
 value: the host does not resolve it, and it adds no edge. It is a driver-local
 variable, and the driver replaces it with the hashout of the image it pushes:
 
 ```python
-oci_push(name = "push", image = ":img", ref = "${read://infra:registry}/app:${image_hashout}")
+target(name = "push", driver = "oci.push", image = ":img", ref = "${read://infra:registry}/app:${image_hashout}")
 ```
 
 It needs no edge of its own: `image` is already a hashed input, so the value
@@ -357,7 +357,7 @@ never claims one. A host-level variable would need a kind.
 
 The hashout is heph's content hash of the image archive, **not** the registry
 digest: it is not what `docker images` or the registry reports, and it moves if
-heph's packing or hash scheme does. An `oci_push` target's output is the
+heph's packing or hash scheme does. An `oci.push` target's output is the
 reference it pushed, resolved and in full (`registry/repository:tag`, `latest`
 when `ref` named no tag), in `<name>.ref`: `heph r //app:push` prints its path,
 and `${read://app:push}` hands it to the next target.

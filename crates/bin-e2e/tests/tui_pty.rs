@@ -116,7 +116,7 @@ fn auth_status_prints_its_table_and_restores_the_terminal() {
     let ws = common::Workspace::new().expect("workspace");
     ws.write(
         "auth/BUILD",
-        r#"target(name = "ok", driver = "credential",
+        r#"target(name = "ok", driver = "auth.credential",
        sources = [heph.auth.exec(["sh", "-c", "printf 'v'"])],
        present = {"env": {"OK": "${value}"}})"#,
     )
@@ -149,11 +149,11 @@ fn auth_login_lends_the_terminal_to_each_sign_in_and_restores_it() {
     ws.write(
         "auth/BUILD",
         r#"
-target(name = "a", driver = "credential",
+target(name = "a", driver = "auth.credential",
        sources = [heph.auth.exec(["heph-e2e-no-such-tool"],
                                  login = [["sh", "-c", "echo e2e-login-a"]])],
        present = {"env": {"A": "${value}"}})
-target(name = "b", driver = "credential",
+target(name = "b", driver = "auth.credential",
        sources = [heph.auth.exec(["heph-e2e-no-such-tool"],
                                  login = [["sh", "-c", "echo e2e-login-b"]])],
        present = {"env": {"B": "${value}"}})

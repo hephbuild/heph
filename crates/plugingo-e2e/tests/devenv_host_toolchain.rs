@@ -74,7 +74,7 @@ func main() {
 
 const BUILD: &str = r#"target(
     name = "runner",
-    driver = "devenv_runner",
+    driver = "devenv.runner",
     mode = "wrap",
     root = "env",
     deps = [glob("env/devenv.*")],

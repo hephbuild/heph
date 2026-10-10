@@ -2,7 +2,9 @@
 //! implements and the engine consumes. Sits below both the engine and the
 //! plugins so neither needs to depend on the other's concrete types.
 //!
-//! - `provider` — `Provider`/`ProviderExecutor`/`ProviderFn` traits, `TargetSpec`.
+//! - `provider` — `Provider`/`ProviderExecutor` traits, `TargetSpec`.
+//! - `function` — `PluginFn` (a BUILD-file `heph.<plugin>.<fn>`), its outcome,
+//!   and the engine's `FunctionRegistry` / `FunctionSlot`.
 //! - `driver` — `Driver` trait, `TargetAddr`, the `targetdef` target-def model,
 //!   sandbox config, input/output artifact descriptors, `DriverSchema`.
 //! - `eresult` — `EResult`/`ArtifactMeta`, the execution result data.
@@ -20,6 +22,7 @@ pub mod config;
 pub mod driver;
 pub mod eresult;
 pub mod error;
+pub mod function;
 pub mod hook;
 pub mod htspec;
 pub mod lsp;
