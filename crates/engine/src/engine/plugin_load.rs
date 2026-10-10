@@ -88,6 +88,9 @@ fn load_dylib_plugins(
     }
     let root_str = root.to_string_lossy().into_owned();
     let home_str = home_dir.to_string_lossy().into_owned();
+    // Taken here, not probed inside `load`: the rayon workers below have no
+    // current tokio runtime.
+    let runtime = e.runtime.clone();
     let loaded = manifests
         .into_par_iter()
         .map(|m| -> anyhow::Result<_> {
@@ -100,6 +103,7 @@ fn load_dylib_plugins(
                 &root_str,
                 &home_str,
                 m.options,
+                runtime.clone(),
             )
             .with_context(|| format!("load plugin dylib {}", dylib.display()))?;
             let mut parts = super::PluginParts {
