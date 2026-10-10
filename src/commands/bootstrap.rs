@@ -1,11 +1,9 @@
-use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::thread::available_parallelism;
 
 use anyhow::Context;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
-use tracing::warn;
 
 use crate::engine::config::ConfigYamlExt;
 use crate::engine::config_yaml;
@@ -144,21 +142,6 @@ fn listed_facts_kill_switch(v: Option<&std::ffi::OsStr>) -> bool {
             .any(|off| s.eq_ignore_ascii_case(off)))
 }
 
-/// The default home's name before it became [`engine::DEFAULT_HOME_DIR`].
-const LEGACY_HOME_DIR: &str = ".heph3";
-
-/// `<root>/.heph3`, when the home resolved to the default and that old home is
-/// still on disk: nothing reads it any more, and it is worth one line saying so.
-/// A configured `homeDir` gets no hint — the user chose where the home is.
-fn leftover_legacy_home(root: &std::path::Path, home: &engine::HomeDir) -> Option<PathBuf> {
-    let default = engine::HomeDir::resolve(root, None).ok()?;
-    if home != &default {
-        return None;
-    }
-    let old = root.join(LEGACY_HOME_DIR);
-    old.is_dir().then_some(old)
-}
-
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -176,17 +159,6 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // in-flight report rather than in the temp-dir fallback. Every command routes
     // through here, so every command gets it.
     crate::diag::set_dump_dir(&config.home_dir);
-
-    if let Some(old) = leftover_legacy_home(&config.root, &config.home_dir) {
-        warn!(
-            old = %old.display(),
-            new = %config.home_dir.display(),
-            "heph home moved from {LEGACY_HOME_DIR} to {}; the old cache is not reused; \
-             remove it with `rm -rf {}`",
-            engine::DEFAULT_HOME_DIR,
-            old.display(),
-        );
-    }
 
     // The kill switch for listed facts: every candidate a fact would have
     // decided is resolved instead. Read here, never by the engine. It is
@@ -408,27 +380,6 @@ plugins:
         assert!(e.drivers_by_name.contains_key("exec"));
         assert!(e.drivers_by_name.contains_key("bash"));
         assert!(e.providers_by_name.contains_key("fs"));
-    }
-
-    #[test]
-    fn a_leftover_legacy_home_is_hinted_only_for_the_default_home() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        let default = engine::HomeDir::resolve(root, None).expect("home");
-        let custom =
-            engine::HomeDir::resolve(root, Some(std::path::Path::new("state"))).expect("home");
-
-        assert_eq!(leftover_legacy_home(root, &default), None, "no .heph3 yet");
-        std::fs::create_dir(root.join(".heph3")).expect("mkdir");
-        assert_eq!(
-            leftover_legacy_home(root, &default),
-            Some(root.join(".heph3"))
-        );
-        assert_eq!(
-            leftover_legacy_home(root, &custom),
-            None,
-            "a configured homeDir is the user's choice"
-        );
     }
 
     #[test]
