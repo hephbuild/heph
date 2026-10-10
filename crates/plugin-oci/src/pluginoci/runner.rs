@@ -81,8 +81,9 @@ pub struct OciRunnerDef {
 #[derive(Debug)]
 pub struct Driver {
     docker_bin: String,
-    /// heph's resolved home, mounted into the container: sandboxes and the agent
-    /// socket live under it. Handed in by the host (`CreateConfig.home` for the
+    /// This checkout's heph home, mounted into the container: the sandboxes
+    /// live under it (in a linked git worktree that is the worktree's own home,
+    /// not the shared one). Handed in by the host (`CreateConfig.home` for the
     /// cdylib, `PluginInit.home` in-process) — never derived from a sandbox
     /// path, where a package named `sandbox` would be mistaken for the home's.
     ///

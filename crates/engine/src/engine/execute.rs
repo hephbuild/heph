@@ -147,7 +147,9 @@ impl Engine {
             },
             async {
                 let sandbox_dir = {
-                    let mut dir = self.home.join("sandbox");
+                    // The checkout's own home: a sandbox is a working copy of
+                    // this checkout's inputs, never shared with a worktree.
+                    let mut dir = self.checkout_home.join("sandbox");
                     for c in addr.package.components() {
                         dir = dir.join(c);
                     }

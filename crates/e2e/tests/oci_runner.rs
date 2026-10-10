@@ -206,10 +206,11 @@ async fn the_mounted_home_is_the_resolved_one_even_in_a_package_named_sandbox() 
         .as_array()
         .map(|m| m.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    let home = ws.engine.home.to_string_lossy().into_owned();
+    // The checkout's home: it holds this checkout's sandboxes.
+    let home = ws.engine.checkout_home.to_string_lossy().into_owned();
     assert!(
         mounts.contains(&home.as_str()),
-        "the mounts must carry the resolved home {home}; got {mounts:?}"
+        "the mounts must carry the checkout's home {home}; got {mounts:?}"
     );
     Ok(())
 }

@@ -158,7 +158,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // a startup hang is likeliest — so they land beside the stall log and the
     // in-flight report rather than in the temp-dir fallback. Every command routes
     // through here, so every command gets it.
-    crate::diag::set_dump_dir(&config.home_dir);
+    crate::diag::set_dump_dir(config.homes.shared());
 
     // The kill switch for listed facts: every candidate a fact would have
     // decided is resolved instead. Read here, never by the engine. It is
@@ -173,7 +173,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend
     // kinds (scheme only — never the URIs).
-    let home_dir = config.home_dir.clone();
+    let home_dir = config.homes.shared().clone();
     let remote_cache_backends: Vec<String> = config
         .remote_caches
         .iter()
@@ -339,7 +339,7 @@ mod tests {
         let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml)?;
         let dir = tempfile::tempdir()?;
         let config = file.resolve(dir.path())?;
-        let home_dir = config.home_dir.clone();
+        let home_dir = config.homes.shared().clone();
         let mut e = engine::Engine::new(config)?;
 
         // `fs` is auto-registered by `Engine::new`.

@@ -1485,7 +1485,7 @@ impl Engine {
     }
 
     fn credential_store(&self) -> CredentialStore {
-        CredentialStore::new(&self.home)
+        CredentialStore::new(&self.shared_home)
     }
 
     /// The cross-process acquisition lock for one resolution key.

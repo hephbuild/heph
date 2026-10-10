@@ -4750,7 +4750,11 @@ mod tests {
     #[tokio::test]
     async fn guarded_artifact_forwards_the_direct_open_fast_paths() {
         let dir = tempdir().expect("tempdir");
-        let lock = SArc::new(ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()));
+        let lock = SArc::new(ResultLock::new(
+            LockBackend::Mem,
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
         let addr = Addr::new(PkgBuf::from("pkg"), "x".to_string(), BTreeMap::new());
         let read = lock
             .read(&addr, "h", &StdCancellationToken::new())
@@ -4790,7 +4794,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn guarded_artifact_holds_read_lock_until_all_handles_drop() {
         let dir = tempdir().expect("tempdir");
-        let lock = SArc::new(ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()));
+        let lock = SArc::new(ResultLock::new(
+            LockBackend::Mem,
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
         let addr = Addr::new(PkgBuf::from("pkg"), "x".to_string(), BTreeMap::new());
 
         let read = lock
@@ -6113,7 +6121,7 @@ mod tests {
         // and then cannot produce them.
         let (engine, _home) = engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
         let mut engine = engine;
-        let home = engine.home.to_path_buf();
+        let home = engine.shared_home.to_path_buf();
         Arc::get_mut(&mut engine)
             .expect("engine must not be shared yet")
             .remote_caches = crate::engine::RemoteCacheSet::with_backend(
@@ -6223,7 +6231,7 @@ mod tests {
         backend: Arc<CountingRemoteBackend>,
     ) -> Arc<Engine> {
         let mut engine = engine;
-        let home = engine.home.to_path_buf();
+        let home = engine.shared_home.to_path_buf();
         Arc::get_mut(&mut engine)
             .expect("engine must not be shared yet")
             .remote_caches = crate::engine::RemoteCacheSet::with_backend(backend, home);

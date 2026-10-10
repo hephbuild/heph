@@ -7,7 +7,9 @@ edition = "2024"
 workspace = true
 
 [features]
-# `HomeDir::for_tests`. Enabled by the engine's own `test-support`.
+# `HomeDir::for_tests`, `Homes::for_tests` and `git_checkout::test_layout`
+# (hand-built git worktree layouts). Enabled by the engine's own
+# `test-support`; never by a binary.
 test-support = []
 
 [dependencies]

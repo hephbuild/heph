@@ -28,9 +28,11 @@ use tracing::{error, warn};
 /// [`skip_globs`]: PluginInit::skip_globs
 pub struct PluginInit {
     pub root: PathBuf,
-    /// The resolved heph home — the in-process counterpart of the cdylib
-    /// `CreateConfig.home`.
-    pub home: crate::engine::HomeDir,
+    /// This checkout's own heph home — the in-process counterpart of the cdylib
+    /// `CreateConfig.home`. The checkout's, not the shared one: its one consumer
+    /// (the OCI runner) mounts it so a container sees this checkout's
+    /// sandboxes, which live there.
+    pub home: crate::engine::CheckoutHome,
     /// Absolute directories to prune by exact path: the heph home plus the
     /// literal (non-glob) `fs.skip` entries, resolved relative to the repo root.
     pub skip_dirs: Vec<PathBuf>,
@@ -102,8 +104,21 @@ pub struct Engine {
     /// Held behind an `Arc` so `install_exec_runner_host` can hand the resolver
     /// a clone.
     pub(crate) exec_runners: Arc<hexecrunner::registry::RunnerRegistry>,
-    /// The workspace's heph home, as resolved into the [`Config`].
-    pub home: crate::engine::HomeDir,
+    /// The workspace's shared heph home ([`Homes::shared`]), as resolved into
+    /// the [`Config`]: in a linked git worktree, the main checkout's. The cache,
+    /// gateway/revision locks, staged inputs, credentials, scratch, diag.
+    ///
+    /// Named for which home it is, next to `checkout_home`, so every use
+    /// chooses one.
+    ///
+    /// [`Homes::shared`]: crate::engine::Homes::shared
+    pub shared_home: crate::engine::HomeDir,
+    /// This checkout's own home ([`Homes::checkout`]): sandboxes, their FUSE
+    /// mount and execute lock, the fswalk cache, approvals. The same directory
+    /// as `shared_home` outside a linked worktree.
+    ///
+    /// [`Homes::checkout`]: crate::engine::Homes::checkout
+    pub checkout_home: crate::engine::CheckoutHome,
     /// The runtime every request's memoizers spawn their computations on.
     /// Captured once at construction — the engine is handed its runtime, the
     /// memoizers never discover one at spawn time.
@@ -443,8 +458,21 @@ fn ensure_home(home: &Path) -> anyhow::Result<()> {
 
 impl Engine {
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
-        let home = cfg.home_dir.clone();
+        let home = cfg.homes.shared().clone();
+        let checkout_home = cfg.homes.checkout().clone();
+        tracing::debug!(
+            root = %cfg.root.display(),
+            home = %home.display(),
+            checkout_home = %checkout_home.display(),
+            "engine home: {}",
+            cfg.homes.sharing()
+        );
+        // Both homes ignore themselves: in a linked worktree the checkout's is
+        // inside the worktree's tree, the shared one inside the main checkout's.
         ensure_home(&home)?;
+        if checkout_home.as_path() != home.as_path() {
+            ensure_home(&checkout_home)?;
+        }
 
         let parallelism = cfg.parallelism.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -488,14 +516,23 @@ impl Engine {
             ));
 
         // Best-effort sweep of stale `sandboxfuse<pid>` dirs from crashed runs.
-        sweep_stale_sandboxfuse_dirs(&home);
+        // The FUSE mount is where sandboxes live when it is on, so it is the
+        // checkout's, like the sandboxes themselves.
+        sweep_stale_sandboxfuse_dirs(&checkout_home);
 
-        let fuse = Arc::new(EngineFuse::new(cfg.fuse, &home)?);
+        let fuse = Arc::new(EngineFuse::new(cfg.fuse, &checkout_home)?);
 
         let lock_dir = home.join("lock");
         std::fs::create_dir_all(&lock_dir)
             .with_context(|| format!("create lock dir {lock_dir:?}"))?;
-        let result_lock = ResultLock::new(cfg.lock_backend, lock_dir.clone());
+        // The execute lock guards this checkout's sandbox path, so it lives
+        // with the sandboxes: two checkouts running one addr each own a
+        // sandbox and must not wait on each other. The gateway and revision
+        // locks guard the shared cache entry and stay in the shared home.
+        let execute_lock_dir = checkout_home.join("lock");
+        std::fs::create_dir_all(&execute_lock_dir)
+            .with_context(|| format!("create lock dir {execute_lock_dir:?}"))?;
+        let result_lock = ResultLock::new(cfg.lock_backend, lock_dir.clone(), execute_lock_dir);
         // Separate keyed lock, separate files: a scratch slot is keyed by slot id
         // and an addr's result by addr, and colliding those namespaces would let
         // one wait on the other for no reason.
@@ -520,8 +557,9 @@ impl Engine {
 
         // Shared cross-run filesystem-walk cache, handed to tree-walking plugins
         // via `PluginInit`. Its own sqlite db so it can be pruned independently.
+        // Per checkout: it caches *this* working tree's directory listings.
         let walker = Arc::new(hwalk::CachedWalker::open(
-            &home.join("cache").join("fswalk.db"),
+            &checkout_home.join("cache").join("fswalk.db"),
         ));
 
         let max_workers = 2 * parallelism;
@@ -535,7 +573,8 @@ impl Engine {
 
         let mut engine = Engine {
             cfg: cfg.clone(),
-            home: home.clone(),
+            shared_home: home.clone(),
+            checkout_home,
             runtime: runtime.clone(),
             local_cache,
             local_cache_tmp,
@@ -729,7 +768,7 @@ impl Engine {
     fn plugin_init_payload(&self) -> PluginInit {
         PluginInit {
             root: self.cfg.root.clone(),
-            home: self.home.clone(),
+            home: self.checkout_home.clone(),
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
             walker: self.walker.clone(),
@@ -947,7 +986,12 @@ impl Engine {
     }
 
     pub fn skip_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs = vec![self.home.to_path_buf()];
+        // Both homes: in a linked worktree the checkout's is inside this tree,
+        // and the shared one may be too (a worktree nested in the main checkout).
+        let mut dirs = vec![self.shared_home.to_path_buf()];
+        if self.checkout_home.as_path() != self.shared_home.as_path() {
+            dirs.push(self.checkout_home.to_path_buf());
+        }
         dirs.extend(
             self.cfg
                 .fs_skip
@@ -1057,7 +1101,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _rt = crate::engine::test_rt_enter();
         let engine = Engine::new(Config::for_tests(dir.path())).expect("engine");
-        let ignore = engine.home.join(".gitignore");
+        let ignore = engine.shared_home.join(".gitignore");
         assert_eq!(std::fs::read_to_string(&ignore).expect("read"), "*\n");
 
         // A file the user wrote is left alone.
@@ -1065,8 +1109,38 @@ mod tests {
         drop(engine);
         let engine = Engine::new(Config::for_tests(dir.path())).expect("engine");
         assert_eq!(
-            std::fs::read_to_string(engine.home.join(".gitignore")).expect("read"),
+            std::fs::read_to_string(engine.shared_home.join(".gitignore")).expect("read"),
             "custom\n"
+        );
+    }
+
+    /// In a linked worktree both homes ignore themselves: the checkout's sits
+    /// inside the worktree's tree, the shared one inside the main checkout's.
+    #[test]
+    fn both_homes_ignore_themselves_in_a_worktree() {
+        use hconfig::git_checkout::test_layout::{linked_worktree, main_checkout};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let main = base.join("main");
+        let wt = base.join("wt");
+        main_checkout(&main, "master");
+        linked_worktree(&main, &wt, "wt", "feat");
+
+        let _rt = crate::engine::test_rt_enter();
+        let engine = Engine::new(Config::for_tests(&wt)).expect("engine");
+        assert_ne!(engine.shared_home.as_path(), engine.checkout_home.as_path());
+        for home in [engine.shared_home.as_path(), engine.checkout_home.as_path()] {
+            assert_eq!(
+                std::fs::read_to_string(home.join(".gitignore")).expect("read"),
+                "*\n",
+                "{}",
+                home.display()
+            );
+        }
+        assert_eq!(
+            engine.plugin_init_payload().home.as_path(),
+            wt.join(".heph"),
+            "plugins get the checkout's home"
         );
     }
 

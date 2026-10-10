@@ -41,7 +41,9 @@ impl Engine {
             }
         }
         let root = self.cfg.root.clone();
-        let home = self.home.clone();
+        // A cdylib's `home` is for its own per-checkout state (the Go plugin's
+        // fswalk db is the only reader): the checkout's home, not the shared one.
+        let home = self.checkout_home.clone();
         load_dylib_plugins(self, &root, &home, manifests)
     }
 }

@@ -103,6 +103,8 @@ derivative = "2.2.0"
 humantime = "2.3.0"
 
 [dev-dependencies]
+# `git_checkout::test_layout` for this crate's own unit tests.
+hconfig = { package = "config", path = "../config", features = ["test-support"] }
 hplugin-buildfile = { package = "plugin-buildfile", path = "../plugin-buildfile" }
 serde-jsonlines = "0.7.0"
 tempfile = "3"

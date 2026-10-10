@@ -364,7 +364,7 @@ impl Engine {
         }
         // Recorded locally so the next publish knows its parent, and so an
         // unchanged re-publish is recognized above.
-        write_local_meta(&self.home, slot, scope, &meta);
+        write_local_meta(&self.shared_home, slot, scope, &meta);
         Ok((generation, blob.len() as u64))
     }
 }

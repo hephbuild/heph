@@ -3,7 +3,7 @@ use heph::engine::driver::Driver as SDKDriver;
 use heph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use heph::engine::provider::Provider as SDKProvider;
 use heph::engine::{
-    Config, EResult, Engine, EngineTargetSpec, HomeDir, OutputMatcher, PluginInit, ResultOptions,
+    Config, EResult, Engine, EngineTargetSpec, Homes, OutputMatcher, PluginInit, ResultOptions,
 };
 use heph::htaddr::{Addr, parse_addr};
 use std::path::{Path, PathBuf};
@@ -100,7 +100,7 @@ impl WorkspaceBuilder {
             fs_skip: self.fs_skip,
             ..Config::new(
                 self.dir.path().to_path_buf(),
-                HomeDir::resolve(self.dir.path(), None)?,
+                Homes::resolve(self.dir.path(), None, true)?,
             )
         })?;
         for setup in self.setups {

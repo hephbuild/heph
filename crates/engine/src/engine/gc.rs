@@ -7,7 +7,9 @@
 //! - [`Engine::gc_all`] — the `heph gc` sweep. For every `(addr, hashin)` group
 //!   in the cache: if the target no longer resolves (`get_spec` →
 //!   `TargetNotFoundError`) every revision is dropped; otherwise the target is
-//!   trimmed to its `cache.history` newest revisions.
+//!   trimmed to its `cache.history` newest revisions. When the home is shared
+//!   with other git worktrees the first rule is off (see
+//!   [`GcStats::orphan_sweep_skipped`]).
 //! - [`Engine::try_trim_after_write`] — the post-write trim. Non-blocking: it
 //!   trims the just-written target only if its lock is free, and never deletes
 //!   the revision that was just written. Deferred to the end of the request
@@ -21,11 +23,11 @@
 //! (`created_at_nanos`); the full artifact name list to delete comes from the
 //! same manifest.
 
-use crate::engine::Engine;
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::local_cache::{Existence, MANIFEST_V1};
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::TargetGuard;
+use crate::engine::{Engine, HomeSharing};
 use anyhow::{Context, Result};
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::{Addr, parse_addr};
@@ -149,6 +151,14 @@ pub struct GcStats {
     /// Staged read-only input entries (`<home>/stage/`) reclaimed because their
     /// content hash is no longer referenced by any surviving manifest.
     pub stage_entries_removed: usize,
+    /// Set when the orphan sweep was skipped because the home is shared with
+    /// other git checkouts (see [`HomeSharing::is_shared`]): a target that does
+    /// not resolve here may be another worktree's, so nothing is dropped for
+    /// not resolving. History trimming still ran.
+    pub orphan_sweep_skipped: Option<HomeSharing>,
+    /// Targets that did not resolve here but were kept because of
+    /// [`orphan_sweep_skipped`](Self::orphan_sweep_skipped).
+    pub orphans_kept: usize,
 }
 
 /// Per-target result of a GC pass, accumulated into [`GcStats`].
@@ -211,7 +221,7 @@ impl Engine {
     /// teardown live together in `driver-support`. Returns
     /// `(entries_removed, bytes_freed)`.
     fn gc_stage(&self) -> (usize, u64) {
-        hdriver_support::stage::clear_stage(&self.home.join("stage"))
+        hdriver_support::stage::clear_stage(&self.shared_home.join("stage"))
     }
 
     /// Trim `addr`'s revisions to the `keep` newest (by `created_at_nanos`),
@@ -615,9 +625,26 @@ impl Engine {
             ..GcStats::default()
         };
 
+        // A shared home holds other checkouts' targets too, and "does not
+        // resolve here" says nothing about them: a branch in another worktree
+        // may define it. So the orphan sweep is off; history trimming, which
+        // only ever applies a target's own `cache.history`, still runs.
+        let sharing = self.cfg.homes.sharing();
+        let keep_orphans = sharing.is_shared();
+        if keep_orphans {
+            stats.orphan_sweep_skipped = Some(sharing.clone());
+            tracing::info!(home = %self.shared_home.display(), "gc: orphan sweep skipped: home is {sharing}");
+        }
+
         let limit = self.max_workers.max(1);
         let mut set: JoinSet<(Addr, Result<TargetOutcome>)> = JoinSet::new();
         for (addr, decision) in decisions {
+            if keep_orphans && matches!(decision, Decision::Orphan) {
+                tracing::debug!(%addr, "gc: kept, does not resolve here but the home is shared");
+                stats.orphans_kept += 1;
+                emit_gc_target_swept(&rs, 0, 0);
+                continue;
+            }
             let (Decision::Orphan | Decision::Trim(_)) = decision else {
                 // Skipped target: count already recorded; advance the explored
                 // count without taking its lock.
@@ -1827,7 +1854,7 @@ mod tests {
         let (engine, _dir) = test_engine();
         let a = two_revisions(&engine, "t");
 
-        let lock_dir = engine.home.join("lock");
+        let lock_dir = engine.shared_home.join("lock");
         std::fs::remove_dir_all(&lock_dir).expect("remove lock dir");
         std::fs::write(&lock_dir, b"not a directory").expect("write file over lock dir");
 
@@ -2110,7 +2137,7 @@ mod tests {
     /// Create a stage entry `<home>/stage/<group>/<hash>/blob` plus its
     /// `<hash>.ready` witness, returning the entry dir.
     fn stage_entry(engine: &Engine, group: &str, hash: &str) -> std::path::PathBuf {
-        let gdir = engine.home.join("stage").join(group);
+        let gdir = engine.shared_home.join("stage").join(group);
         let entry = gdir.join(hash);
         std::fs::create_dir_all(&entry).expect("mkdir stage entry");
         std::fs::write(entry.join("blob"), b"staged-bytes").expect("write blob");

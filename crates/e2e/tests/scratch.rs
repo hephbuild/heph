@@ -1018,7 +1018,7 @@ async fn an_audit_leaves_the_stored_cache_untouched() -> anyhow::Result<()> {
 
     let engine = ws.reopen()?;
     let slot = engine.scratch_slots()?[0].slot.clone();
-    let head = heph::engine::scratch_remote::scope_head_dir(&engine.home, &slot, "");
+    let head = heph::engine::scratch_remote::scope_head_dir(&engine.shared_home, &slot, "");
     let before = std::fs::read_to_string(head.join("marker"))?;
     assert_eq!(before.trim(), "first");
     drop(engine);
@@ -1184,7 +1184,7 @@ async fn a_published_snapshot_warms_a_cold_machine() -> anyhow::Result<()> {
     let slots = e1.scratch_slots()?;
     assert_eq!(slots.len(), 1);
     let slot = slots[0].slot.clone();
-    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.home, &slot, "master");
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.shared_home, &slot, "master");
     let (generation, bytes) = e1
         .scratch_push(&slot, "master", &dir, None, "run-1")
         .await?;
@@ -1236,7 +1236,7 @@ async fn a_cache_dropped_over_its_cap_is_not_re_pulled() -> anyhow::Result<()> {
     let e1 = remote_engine(a.path(), &uri, "master", &[]);
     assert_eq!(build(&e1).await?, "cold");
     let slot = e1.scratch_slots()?[0].slot.clone();
-    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.home, &slot, "master");
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.shared_home, &slot, "master");
     std::fs::write(dir.join("bulk"), vec![0u8; 64 * 1024])?;
     e1.scratch_push(&slot, "master", &dir, None, "run-1")
         .await?;
@@ -1289,14 +1289,14 @@ async fn publishing_advances_the_lineage_and_skips_unchanged_contents() -> anyho
     let e = remote_engine(ws.path(), &uri, "master", &[]);
     build(&e).await?;
     let slot = e.scratch_slots()?[0].slot.clone();
-    let dir = heph::engine::scratch_remote::scope_head_dir(&e.home, &slot, "master");
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e.shared_home, &slot, "master");
 
     let (g0, _) = e.scratch_push(&slot, "master", &dir, None, "r1").await?;
     assert_eq!(g0, 0);
 
     // Nothing changed on disk, so there is nothing to say. Publishing anyway
     // would grow the chain with every no-op CI run.
-    let parent = heph::engine::scratch_remote::read_local_meta(&e.home, &slot, "master");
+    let parent = heph::engine::scratch_remote::read_local_meta(&e.shared_home, &slot, "master");
     let (g_same, bytes) = e
         .scratch_push(&slot, "master", &dir, parent.as_ref(), "r2")
         .await?;
@@ -1308,7 +1308,7 @@ async fn publishing_advances_the_lineage_and_skips_unchanged_contents() -> anyho
 
     // Change the contents, and the lineage advances.
     std::fs::write(dir.join("marker"), b"two\n")?;
-    let parent = heph::engine::scratch_remote::read_local_meta(&e.home, &slot, "master");
+    let parent = heph::engine::scratch_remote::read_local_meta(&e.shared_home, &slot, "master");
     let (g1, _) = e
         .scratch_push(&slot, "master", &dir, parent.as_ref(), "r3")
         .await?;
@@ -1343,7 +1343,7 @@ async fn a_branch_reads_from_master_and_publishes_to_itself() -> anyhow::Result<
     let em = remote_engine(m.path(), &uri, "master", &[]);
     build(&em).await?;
     let slot = em.scratch_slots()?[0].slot.clone();
-    let mdir = heph::engine::scratch_remote::scope_head_dir(&em.home, &slot, "master");
+    let mdir = heph::engine::scratch_remote::scope_head_dir(&em.shared_home, &slot, "master");
     em.scratch_push(&slot, "master", &mdir, None, "master-run")
         .await?;
 
@@ -1356,8 +1356,8 @@ async fn a_branch_reads_from_master_and_publishes_to_itself() -> anyhow::Result<
         "a branch must pick up its base's snapshot"
     );
 
-    let pdir = heph::engine::scratch_remote::scope_head_dir(&ep.home, &slot, "pr-1");
-    let parent = heph::engine::scratch_remote::read_local_meta(&ep.home, &slot, "pr-1");
+    let pdir = heph::engine::scratch_remote::scope_head_dir(&ep.shared_home, &slot, "pr-1");
+    let parent = heph::engine::scratch_remote::read_local_meta(&ep.shared_home, &slot, "pr-1");
     ep.scratch_push(&slot, "pr-1", &pdir, parent.as_ref(), "pr-run")
         .await?;
 
@@ -1404,7 +1404,7 @@ async fn the_resolution_trace_reports_every_candidate_including_the_empty_ones()
     let em = remote_engine(m.path(), &uri, "master", &[]);
     build(&em).await?;
     let slot = em.scratch_slots()?[0].slot.clone();
-    let mdir = heph::engine::scratch_remote::scope_head_dir(&em.home, &slot, "master");
+    let mdir = heph::engine::scratch_remote::scope_head_dir(&em.shared_home, &slot, "master");
     em.scratch_push(&slot, "master", &mdir, None, "ci-42")
         .await?;
 
@@ -1539,7 +1539,7 @@ async fn a_cold_machine_can_pull_what_it_has_never_built() -> anyhow::Result<()>
     let e1 = remote_engine(a.path(), &uri, "master", &[]);
     build(&e1).await?;
     let slot = e1.scratch_slots()?[0].slot.clone();
-    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.home, &slot, "master");
+    let dir = heph::engine::scratch_remote::scope_head_dir(&e1.shared_home, &slot, "master");
     e1.scratch_push(&slot, "master", &dir, None, "run-1")
         .await?;
 
@@ -1559,7 +1559,7 @@ async fn a_cold_machine_can_pull_what_it_has_never_built() -> anyhow::Result<()>
         .scratch_remote_head(&slot, "master", &[])
         .await
         .expect("a cold machine must still find the published head");
-    let dir2 = heph::engine::scratch_remote::scope_head_dir(&e2.home, &slot, "master");
+    let dir2 = heph::engine::scratch_remote::scope_head_dir(&e2.shared_home, &slot, "master");
     let bytes = e2.scratch_pull(&head, &dir2).await?;
     assert!(bytes > 0);
     assert!(dir2.join("marker").exists(), "the payload must have landed");

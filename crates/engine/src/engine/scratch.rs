@@ -474,14 +474,14 @@ impl Engine {
         let root = self
             .scratch_audit_ready
             .get_or_try_init(|| {
-                let root = crate::engine::scratch_store::audit_root(&self.home);
+                let root = crate::engine::scratch_store::audit_root(&self.shared_home);
                 // One directory per engine, not per process: see
                 // `audit_run_dir`. The counter is process-wide and only ever
                 // increments, so two engines never collide.
                 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mine = crate::engine::scratch_store::audit_run_dir(
-                    &self.home,
+                    &self.shared_home,
                     std::process::id(),
                     seq,
                 );
@@ -576,7 +576,7 @@ impl Engine {
             // without resolving the graph (see `scratch_store`). Idempotent and
             // best-effort: it is a diagnostic, not part of the build.
             crate::engine::scratch_store::write_slot_meta(
-                &self.home,
+                &self.shared_home,
                 &slot,
                 &crate::engine::scratch_store::SlotMeta {
                     format: 1,
@@ -715,7 +715,7 @@ impl Engine {
                     "pulled scratch snapshot",
                 );
                 crate::engine::scratch_remote::write_local_meta(
-                    &self.home,
+                    &self.shared_home,
                     slot,
                     &opts.scope,
                     &head.meta,
@@ -789,7 +789,7 @@ impl Engine {
                 // cache ripped out".
                 let dir = if !no_scratch {
                     let (dir, prepared) =
-                        resolve_scope_dir(&self.home, slot, &self.cfg.scratch, &r.addr)
+                        resolve_scope_dir(&self.shared_home, slot, &self.cfg.scratch, &r.addr)
                             .await
                             .with_context(|| format!("resolve scratch lineage for {}", r.addr))?;
                     cell.lock().prepared = Some(prepared);

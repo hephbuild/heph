@@ -53,6 +53,17 @@ impl App for GcApp {
             .engine
             .new_state_with_events(self.fail_fast, ctx.event_sender());
         let res = self.engine.clone().gc_all(rs.clone()).await;
+        // Not in the progress summary, which counts what was removed: this is
+        // what was deliberately *not* looked at, and why.
+        if let Ok(stats) = &res
+            && let Some(sharing) = &stats.orphan_sweep_skipped
+        {
+            println!(
+                "Orphan sweep skipped ({} target(s) that do not resolve here kept): home is {sharing}. \
+                 Set `worktree: {{ shareHome: false }}` for a per-checkout home.",
+                stats.orphans_kept
+            );
+        }
 
         // Scratch caches are swept here too, because nothing else bounds them:
         // they are keyed by a declaration rather than by an input hash, so there

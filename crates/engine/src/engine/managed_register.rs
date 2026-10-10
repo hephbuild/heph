@@ -9,8 +9,11 @@ use hdriver_support::driver_managed::ManagedDriver;
 
 impl Engine {
     pub fn new_managed_driver(&self, driver: Box<dyn ManagedDriver>) -> ManagedDriverBridge {
+        // `FuseSlot.home` is where the plain sandbox paths it redirects live —
+        // the checkout's home. The bridge's own `home` is for staged inputs,
+        // which are a shared cache.
         let fuse = self.fuse.layered_fs().map(|fs| FuseSlot {
-            home: self.home.to_path_buf(),
+            home: self.checkout_home.to_path_buf(),
             fs,
             fuse_lower: self.fuse.lower.clone(),
             fuse_upper: self.fuse.upper.clone(),
@@ -21,7 +24,7 @@ impl Engine {
             driver,
             hplugin_exec::pluginexec::Driver::default_exec_shell_fallback(),
             self.cfg.fuse.mode(),
-            self.home.to_path_buf(),
+            self.shared_home.to_path_buf(),
             fuse,
         )
     }

@@ -32,7 +32,9 @@ message Value {
 // prost bytes (not a stabby struct) so new config fields are additive — an older
 // plugin built against fewer fields still loads. `options` is the plugin's
 // `options:` map as structured data (no nested encode). `root` is the workspace
-// root; `home` is the engine's home dir for plugin state/scratch.
+// root; `home` is this checkout's own engine home, for plugin state that must
+// not be shared between checkouts (in a linked git worktree it is the
+// worktree's home, not the main checkout's shared one).
 message CreateConfig {
   string root = 1;
   string home = 2;

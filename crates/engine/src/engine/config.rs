@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::engine::HomeDir;
+use crate::engine::Homes;
 use crate::engine::RemoteCacheDef;
 use crate::engine::config_yaml::config_file_name_at;
 use crate::engine::config_yaml::{
     ConfigYaml, FuseConfig, LockBackendConfig, MemCacheConfig, ScratchConfig,
 };
+use crate::engine::git_checkout::GitCheckout;
 use crate::engine::result_lock::LockBackend;
 
 /// Expand a configured scope, resolving `${git:branch}` against `root`.
@@ -34,15 +35,14 @@ fn expand_scope(raw: &str, root: &Path) -> String {
 }
 
 /// The current branch name, or `None` outside a git checkout / on a detached
-/// HEAD. Reads `.git/HEAD` directly rather than shelling out to `git`: this runs
-/// on every engine construction, and a subprocess for one line of a file that is
-/// always there is not worth it — nor is depending on `git` being installed.
+/// HEAD (a sha is not a lineage anyone means to share, so it reads as no scope).
+/// Reads the checkout's `HEAD` directly rather than shelling out to `git`: this
+/// runs on every engine construction, and a subprocess for one line of a file
+/// that is always there is not worth it — nor is depending on `git` being
+/// installed. Found through [`GitCheckout`], so in a linked worktree it is the
+/// worktree's own `HEAD` (`<gitdir>/HEAD`), not a `.git/HEAD` that is not there.
 fn git_branch(root: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
-    // `ref: refs/heads/<branch>` on a branch; a bare sha when detached, which is
-    // not a lineage anyone means to share, so it reads as no scope.
-    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
-    (!branch.is_empty()).then(|| branch.to_string())
+    GitCheckout::discover(root).ok()?.branch()
 }
 
 /// Make a scope safe to use as one path component.
@@ -88,8 +88,9 @@ fn resolve_scratch(c: Option<&ScratchConfig>, root: &Path) -> ScratchOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub root: PathBuf,
-    /// Workspace state/cache directory, resolved once by [`HomeDir::resolve`].
-    pub home_dir: HomeDir,
+    /// Workspace state/cache directories — the shared home and this checkout's
+    /// own — resolved once by [`Homes::resolve`].
+    pub homes: Homes,
     /// Repo-root-relative directories from the config file's `fs.skip`, pruned by
     /// every plugin that walks the tree. See [`Engine::skip_dirs`].
     ///
@@ -160,13 +161,13 @@ impl Default for ScratchOptions {
 pub const DEFAULT_SPILL_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 impl Config {
-    /// A config for the workspace at `root` with home `home_dir` and every other
-    /// field at its default. There is no `Default`: a config without a resolved
-    /// home is not one the engine can run on.
-    pub fn new(root: PathBuf, home_dir: HomeDir) -> Self {
+    /// A config for the workspace at `root` with homes `homes` and every other
+    /// field at its default. There is no `Default`: a config without resolved
+    /// homes is not one the engine can run on.
+    pub fn new(root: PathBuf, homes: Homes) -> Self {
         Self {
             root,
-            home_dir,
+            homes,
             fs_skip: Vec::new(),
             parallelism: None,
             mem_cache: MemCacheOptions::default(),
@@ -182,13 +183,13 @@ impl Config {
     }
 
     /// [`Config::new`] for a workspace rooted at `root` (a test's tempdir), with
-    /// the default home under it.
+    /// the default homes under it.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn for_tests(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        let home_dir = HomeDir::resolve(&root, None).expect("resolving a test home dir");
-        Self::new(root, home_dir)
+        let homes = Homes::for_tests(&root);
+        Self::new(root, homes)
     }
 }
 
@@ -256,17 +257,18 @@ impl ConfigYamlExt for ConfigYaml {
         // compare equal to the home.
         let root = hconfig::normalize(root)
             .with_context(|| format!("normalizing workspace root {}", root.display()))?;
-        let home_dir = HomeDir::resolve(&root, self.home_dir.as_deref()).with_context(|| {
-            format!(
-                "resolving homeDir from {}",
-                root.join(config_file_name_at(&root)).display()
-            )
-        })?;
-        let defaults = Config::new(root.clone(), home_dir.clone());
+        let homes = Homes::resolve(&root, self.home_dir.as_deref(), self.share_home())
+            .with_context(|| {
+                format!(
+                    "resolving homeDir from {}",
+                    root.join(config_file_name_at(&root)).display()
+                )
+            })?;
+        let defaults = Config::new(root.clone(), homes.clone());
         let root = root.as_path();
         Ok(Config {
             root: root.to_path_buf(),
-            home_dir,
+            homes,
             fs_skip: self.fs.as_ref().map(|f| f.skip.clone()).unwrap_or_default(),
             parallelism: None,
             mem_cache: self
@@ -348,6 +350,44 @@ mod tests {
         assert_eq!(expand_scope("ci-${git:branch}", tmp.path()), "ci-feature/x");
     }
 
+    /// In a linked worktree there is no `.git/HEAD`: the branch is the
+    /// worktree's own, read from `<gitdir>/HEAD` — not the main checkout's.
+    #[test]
+    fn git_branch_in_worktree() {
+        use crate::engine::git_checkout::test_layout::{linked_worktree, main_checkout};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("main");
+        let wt = tmp.path().join("wt");
+        main_checkout(&main, "master");
+        linked_worktree(&main, &wt, "wt", "feature/wt");
+        assert_eq!(expand_scope("${git:branch}", &wt), "feature/wt");
+        assert_eq!(expand_scope("${git:branch}", &main), "master");
+    }
+
+    /// `worktree.shareHome: false` resolves to the checkout's own home even in
+    /// a linked worktree; the default shares the main checkout's.
+    #[test]
+    fn resolve_honours_share_home() {
+        use crate::engine::git_checkout::test_layout::{linked_worktree, main_checkout};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Canonical: the shared home is.
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let main = base.join("main");
+        let wt = base.join("wt");
+        main_checkout(&main, "master");
+        linked_worktree(&main, &wt, "wt", "feat");
+
+        let on = ConfigYaml::default().resolve(&wt).expect("resolve");
+        assert_eq!(on.homes.shared().as_path(), main.join(DEFAULT_HOME_DIR));
+        assert_eq!(on.homes.checkout().as_path(), wt.join(DEFAULT_HOME_DIR));
+
+        let yaml: ConfigYaml =
+            serde_yaml::from_str("worktree:\n  shareHome: false\n").expect("parse");
+        let off = yaml.resolve(&wt).expect("resolve");
+        assert_eq!(off.homes.shared().as_path(), wt.join(DEFAULT_HOME_DIR));
+        assert_eq!(off.homes.checkout().as_path(), off.homes.shared().as_path());
+    }
+
     /// A detached HEAD is a sha, not a lineage anyone means to share.
     #[test]
     fn a_detached_head_expands_to_empty() {
@@ -383,7 +423,8 @@ mod tests {
 
         let defaults = Config::for_tests(root);
         assert_eq!(cfg.root, root);
-        assert_eq!(cfg.home_dir.as_path(), root.join(DEFAULT_HOME_DIR));
+        assert_eq!(cfg.homes.shared().as_path(), root.join(DEFAULT_HOME_DIR));
+        assert_eq!(cfg.homes.checkout().as_path(), cfg.homes.shared().as_path());
         assert_eq!(cfg.mem_cache, defaults.mem_cache);
         assert_eq!(cfg.tmp_cache, defaults.tmp_cache);
         assert_eq!(cfg.lock_backend, defaults.lock_backend);
@@ -400,7 +441,13 @@ mod tests {
             .resolve(Path::new("."))
             .expect("resolve");
         assert!(cfg.root.is_absolute(), "{}", cfg.root.display());
-        assert_eq!(cfg.home_dir.as_path(), cfg.root.join(DEFAULT_HOME_DIR));
+        // The checkout's home: the cwd of this test may itself be in a linked
+        // worktree, where the shared home is the main checkout's.
+        assert_eq!(
+            cfg.homes.checkout().as_path(),
+            cfg.root.join(DEFAULT_HOME_DIR)
+        );
+        assert!(cfg.homes.shared().is_absolute());
     }
 
     #[test]
@@ -408,9 +455,9 @@ mod tests {
         let yaml: ConfigYaml = serde_yaml::from_str("homeDir: state\n").expect("parse");
         let cfg = yaml.resolve(Path::new("/w/x/../ws")).expect("resolve");
         assert_eq!(cfg.root, Path::new("/w/ws"));
-        assert_eq!(cfg.home_dir.as_path(), Path::new("/w/ws/state"));
+        assert_eq!(cfg.homes.shared().as_path(), Path::new("/w/ws/state"));
         // What the walks' exact-path prune compares.
-        assert_eq!(cfg.root.join("state"), cfg.home_dir.as_path());
+        assert_eq!(cfg.root.join("state"), cfg.homes.checkout().as_path());
     }
 
     #[test]
@@ -435,7 +482,7 @@ mod tests {
         .expect("parse");
         let cfg = yaml.resolve(Path::new("/repo")).expect("resolve");
 
-        assert_eq!(cfg.home_dir.as_path(), Path::new("/repo/.custom"));
+        assert_eq!(cfg.homes.shared().as_path(), Path::new("/repo/.custom"));
         assert_eq!(cfg.lock_backend, LockBackend::Mem);
         assert!(!cfg.telemetry_enabled);
         assert_eq!(cfg.remote_caches.len(), 1);

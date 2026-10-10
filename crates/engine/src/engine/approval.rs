@@ -244,11 +244,13 @@ impl Engine {
         Ok(out)
     }
 
-    /// Write a rendered notice under `<home>/approval/` and return its absolute
-    /// path. The file name is derived from the target addr + group name so it is
-    /// stable across runs (overwritten in place) and unique per (target, notice).
+    /// Write a rendered notice under `<checkout home>/approval/` and return its
+    /// absolute path. The file name is derived from the target addr + group name
+    /// so it is stable across runs (overwritten in place) and unique per
+    /// (target, notice). Per checkout: two worktrees prompting for the same
+    /// target at once must not overwrite each other's notice.
     fn write_notice_file(&self, addr: &Addr, name: &str, content: &str) -> anyhow::Result<String> {
-        let dir = self.home.join("approval");
+        let dir = self.checkout_home.join("approval");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create approval dir {}", dir.display()))?;
         let sanitize = |s: &str| -> String {
@@ -272,6 +274,40 @@ mod tests {
     use super::{input_in_group, read_notice_text, read_notice_text_blocking};
     use hcore::hartifactcontent::{Content, WalkEntry};
     use std::sync::Arc;
+
+    /// A linked worktree shares the main checkout's home, but a notice it writes
+    /// stays in its own: two checkouts prompting for one target at once must not
+    /// overwrite each other's file.
+    #[test]
+    fn approval_notice_stays_in_the_checkout_home() {
+        use crate::engine::git_checkout::test_layout::{linked_worktree, main_checkout};
+        use crate::engine::{Config, Engine};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let main = base.join("main");
+        let wt = base.join("wt");
+        main_checkout(&main, "master");
+        linked_worktree(&main, &wt, "wt", "feat");
+
+        let _rt = crate::engine::test_rt_enter();
+        let engine = Engine::new(Config::for_tests(&wt)).expect("engine");
+        assert_eq!(
+            engine.shared_home.as_path(),
+            main.join(".heph"),
+            "home is shared"
+        );
+
+        let addr = crate::engine::cache_test_support::addr("t");
+        let path = engine
+            .write_notice_file(&addr, "terms", "agree?")
+            .expect("write notice");
+        assert!(
+            std::path::Path::new(&path).starts_with(wt.join(".heph").join("approval")),
+            "{path}"
+        );
+        assert!(!main.join(".heph").join("approval").exists());
+    }
 
     /// A tar of `(path, bytes)` pairs, as a `Content`.
     struct TarBytes(Vec<u8>);

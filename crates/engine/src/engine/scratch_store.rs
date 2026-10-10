@@ -275,7 +275,7 @@ impl Engine {
     /// Reads no BUILD files: a slot describes itself, so a cache stays inspectable
     /// after the targets that made it are gone.
     pub fn scratch_slots(&self) -> anyhow::Result<Vec<SlotEntry>> {
-        let root = store_root(&self.home);
+        let root = store_root(&self.shared_home);
         let Ok(dir) = std::fs::read_dir(&root) else {
             // No store yet is not an error — it is an empty one.
             return Ok(Vec::new());
@@ -308,7 +308,7 @@ impl Engine {
             }
             scopes.sort();
             out.push(SlotEntry {
-                meta: read_slot_meta(&self.home, &slot),
+                meta: read_slot_meta(&self.shared_home, &slot),
                 slot,
                 scopes,
                 bytes,
@@ -336,7 +336,7 @@ impl Engine {
             if !matches {
                 continue;
             }
-            let dir = store_root(&self.home).join(&slot.slot);
+            let dir = store_root(&self.shared_home).join(&slot.slot);
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("remove scratch slot {dir:?}"))?;
             removed += 1;
@@ -362,7 +362,7 @@ impl Engine {
         // whose process is gone is litter, not a cache competing for space.
         // Swept here as well as on the next audit's first use, because a machine
         // that never audits again would otherwise keep them forever.
-        let (mut removed, mut freed) = sweep_dead_audit_dirs(&audit_root(&self.home));
+        let (mut removed, mut freed) = sweep_dead_audit_dirs(&audit_root(&self.shared_home));
         let now = SystemTime::now();
 
         if let Some(max_age) = max_age {
@@ -374,7 +374,7 @@ impl Engine {
                 if !stale {
                     return true;
                 }
-                let dir = store_root(&self.home).join(&s.slot);
+                let dir = store_root(&self.shared_home).join(&s.slot);
                 if std::fs::remove_dir_all(&dir).is_ok() {
                     removed += 1;
                     freed += s.bytes;
@@ -388,7 +388,7 @@ impl Engine {
             // `scratch_slots` is newest-first, so evict from the back.
             while total > max_bytes {
                 let Some(victim) = slots.pop() else { break };
-                let dir = store_root(&self.home).join(&victim.slot);
+                let dir = store_root(&self.shared_home).join(&victim.slot);
                 if std::fs::remove_dir_all(&dir).is_ok() {
                     removed += 1;
                     freed += victim.bytes;
@@ -575,8 +575,8 @@ mod tests {
     #[test]
     fn slots_are_listed_with_their_declaration_and_size() {
         let (engine, _tmp) = crate::engine::cache_test_support::test_engine();
-        make_slot(&engine.home, "aaa", "//build:gocache", 500);
-        make_slot(&engine.home, "bbb", "//build:cargo", 100);
+        make_slot(&engine.shared_home, "aaa", "//build:gocache", 500);
+        make_slot(&engine.shared_home, "bbb", "//build:cargo", 100);
 
         let slots = engine.scratch_slots().expect("list");
         assert_eq!(slots.len(), 2);
@@ -594,8 +594,8 @@ mod tests {
     #[test]
     fn a_slots_size_spans_all_its_scopes() {
         let (engine, _tmp) = crate::engine::cache_test_support::test_engine();
-        make_slot(&engine.home, "aaa", "//build:c", 100);
-        let other = store_root(&engine.home)
+        make_slot(&engine.shared_home, "aaa", "//build:c", 100);
+        let other = store_root(&engine.shared_home)
             .join("aaa")
             .join("feat")
             .join("head");
@@ -610,8 +610,8 @@ mod tests {
     #[test]
     fn removing_by_addr_takes_only_that_slot() {
         let (engine, _tmp) = crate::engine::cache_test_support::test_engine();
-        make_slot(&engine.home, "aaa", "//build:gocache", 500);
-        make_slot(&engine.home, "bbb", "//build:cargo", 100);
+        make_slot(&engine.shared_home, "aaa", "//build:gocache", 500);
+        make_slot(&engine.shared_home, "bbb", "//build:cargo", 100);
 
         let (n, freed) = engine.scratch_remove(Some("//build:gocache")).expect("rm");
         assert_eq!((n, freed), (1, 500));
@@ -626,13 +626,13 @@ mod tests {
     #[test]
     fn an_unnameable_slot_survives_a_named_removal_and_dies_with_the_rest() {
         let (engine, _tmp) = crate::engine::cache_test_support::test_engine();
-        let orphan = store_root(&engine.home)
+        let orphan = store_root(&engine.shared_home)
             .join("orphan")
             .join("_")
             .join("head");
         std::fs::create_dir_all(&orphan).expect("mkdir");
         std::fs::write(orphan.join("blob"), vec![0u8; 10]).expect("write");
-        make_slot(&engine.home, "aaa", "//build:c", 10);
+        make_slot(&engine.shared_home, "aaa", "//build:c", 10);
 
         assert_eq!(engine.scratch_remove(Some("//build:c")).expect("rm").0, 1);
         assert_eq!(
@@ -649,7 +649,7 @@ mod tests {
     fn the_sweep_drops_whole_slots_until_the_store_fits() {
         let (engine, _tmp) = crate::engine::cache_test_support::test_engine();
         for (slot, bytes) in [("aaa", 400), ("bbb", 400), ("ccc", 400)] {
-            make_slot(&engine.home, slot, &format!("//build:{slot}"), bytes);
+            make_slot(&engine.shared_home, slot, &format!("//build:{slot}"), bytes);
             // Distinct mtimes so LRU order is defined.
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn the_sweep_drops_stale_slots_by_age() {
         let (engine, _tmp) = crate::engine::cache_test_support::test_engine();
-        make_slot(&engine.home, "aaa", "//build:c", 10);
+        make_slot(&engine.shared_home, "aaa", "//build:c", 10);
         // Everything is younger than an hour, so nothing goes.
         assert_eq!(
             engine
@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn a_sweep_with_no_limits_removes_nothing() {
         let (engine, _tmp) = crate::engine::cache_test_support::test_engine();
-        make_slot(&engine.home, "aaa", "//build:c", 10);
+        make_slot(&engine.shared_home, "aaa", "//build:c", 10);
         assert_eq!(engine.scratch_sweep(None, None).expect("sweep"), (0, 0));
         assert_eq!(engine.scratch_slots().expect("list").len(), 1);
     }

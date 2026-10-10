@@ -1383,7 +1383,7 @@ mod tests {
             .expect("cache_locally");
         engine.upload_to_remote(&addr, "HASHTMP").await;
 
-        let tmp_dir = engine.home.join("cache").join("remote-tmp");
+        let tmp_dir = engine.shared_home.join("cache").join("remote-tmp");
         let leftovers: Vec<_> = std::fs::read_dir(&tmp_dir)
             .expect("the upload must have created the temp dir")
             .filter_map(Result::ok)

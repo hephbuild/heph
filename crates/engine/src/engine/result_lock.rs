@@ -41,8 +41,9 @@
 //! them ([`KeyedHandle`]), so exclusion holds in-process as well as across
 //! processes. The default filesystem backend serializes across *processes* via
 //! `flock(2)` lock files under `<home>/lock/` — `<addr>.outer.lock` and
-//! `<addr>.<revision>.inner.lock`; the in-memory backend serializes only within
-//! this process.
+//! `<addr>.<revision>.inner.lock`, plus `<addr>.execute.lock` under the
+//! *checkout's* home (see [`ResultLock::new`]); the in-memory backend serializes
+//! only within this process.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -304,9 +305,16 @@ pub enum ResultLock {
 }
 
 impl ResultLock {
-    /// Build the configured backend. For [`LockBackend::Fs`], `dir` must already
-    /// exist; per-key lock files are created lazily on first acquisition.
-    pub fn new(backend: LockBackend, dir: PathBuf) -> Self {
+    /// Build the configured backend. For [`LockBackend::Fs`], `dir` and
+    /// `execute_dir` must already exist; per-key lock files are created lazily
+    /// on first acquisition.
+    ///
+    /// `dir` holds the gateway and revision locks, which guard a cache entry —
+    /// the shared home's. `execute_dir` holds the execute locks, which guard a
+    /// sandbox path — the checkout's own home's, so two checkouts sharing one
+    /// cache each run their own sandbox without waiting on the other. Outside a
+    /// linked worktree the two are the same directory.
+    pub fn new(backend: LockBackend, dir: PathBuf, execute_dir: PathBuf) -> Self {
         match backend {
             LockBackend::Fs => ResultLock::Fs {
                 dir: dir.clone(),
@@ -314,10 +322,10 @@ impl ResultLock {
                     enclose::enclose!((dir) move |addr: &Addr| {
                         GatewayLock::new(outer_lock_path(&dir, addr))
                     }),
-                    enclose::enclose!((dir) move |rev: &RevisionKey| {
+                    move |rev: &RevisionKey| {
                         FRWLock::new(inner_lock_path(&dir, &rev.addr, &rev.hashin))
-                    }),
-                    move |addr: &Addr| FLock::new(execute_lock_path(&dir, addr)),
+                    },
+                    move |addr: &Addr| FLock::new(execute_lock_path(&execute_dir, addr)),
                 ),
             },
             LockBackend::Mem => ResultLock::Mem(Registries::new(
@@ -759,7 +767,11 @@ mod tests {
     }
 
     fn fs(dir: &tempfile::TempDir) -> ResultLock {
-        ResultLock::new(LockBackend::Fs, dir.path().to_path_buf())
+        ResultLock::new(
+            LockBackend::Fs,
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        )
     }
 
     /// Hold the gateway for `addr` the way another *process* would: a raw
@@ -957,7 +969,11 @@ mod tests {
     fn both(dir: &tempfile::TempDir) -> [ResultLock; 2] {
         [
             fs(dir),
-            ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()),
+            ResultLock::new(
+                LockBackend::Mem,
+                dir.path().to_path_buf(),
+                dir.path().to_path_buf(),
+            ),
         ]
     }
 
@@ -1115,6 +1131,56 @@ mod tests {
                 .await
                 .expect("free after the run");
         }
+    }
+
+    /// Two checkouts sharing one home (a main checkout and a linked worktree)
+    /// share the gateway and revision locks but each runs its own sandbox, so
+    /// their execute locks are their own: a run of one addr in each proceeds
+    /// at once. The same execute dir — one checkout — still serializes. Two
+    /// `ResultLock`s stand in for the two processes: `flock` excludes across
+    /// open file descriptions, in-process too.
+    #[tokio::test]
+    async fn sandbox_lock_is_per_checkout() {
+        let shared = tempfile::tempdir().expect("tempdir");
+        let main_home = tempfile::tempdir().expect("tempdir");
+        let wt_home = tempfile::tempdir().expect("tempdir");
+        let lock_for = |checkout: &tempfile::TempDir| {
+            ResultLock::new(
+                LockBackend::Fs,
+                shared.path().to_path_buf(),
+                checkout.path().to_path_buf(),
+            )
+        };
+        let main = lock_for(&main_home);
+        let wt = lock_for(&wt_home);
+
+        let _main_run = promptly(main.lock_execute(&addr("a"), &ct()))
+            .await
+            .expect("main runs");
+        let _wt_run = promptly(wt.lock_execute(&addr("a"), &ct()))
+            .await
+            .expect("the worktree's run does not wait for the main checkout's");
+
+        let main_again = lock_for(&main_home);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                main_again.lock_execute(&addr("a"), &ct())
+            )
+            .await
+            .is_err(),
+            "a second run in the same checkout still waits"
+        );
+
+        // The gateway is shared: a build of `a` in one checkout excludes the
+        // other's.
+        let _target = promptly(main.lock_target(&addr("a"), &ct()))
+            .await
+            .expect("target");
+        assert!(
+            wt.try_lock_target(&addr("a")).expect("probe").is_none(),
+            "the gateway lives in the shared home"
+        );
     }
 
     /// What turns "holder unknown" into "in use by another command": the probe
@@ -1454,7 +1520,11 @@ mod tests {
     #[tokio::test]
     async fn mem_holder_pid_is_current_process() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let lock = ResultLock::new(LockBackend::Mem, dir.path().to_path_buf());
+        let lock = ResultLock::new(
+            LockBackend::Mem,
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
         assert_eq!(lock.holder_pid(&addr("a")), Some(std::process::id()));
     }
 
