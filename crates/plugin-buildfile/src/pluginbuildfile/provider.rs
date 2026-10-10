@@ -612,7 +612,10 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         Box::pin(async move {
-            // A target inside a skipped subtree does not resolve.
+            // A target inside a skipped subtree does not resolve — including one
+            // under a `.heph*` dir, a name reserved for heph's own state. A plain
+            // `NotFound` rather than an error naming the reason: `NotFound` is
+            // what lets the next provider answer the address.
             if self
                 .skip
                 .prunes_package(&self.root, std::path::Path::new(req.addr.package.as_str()))

@@ -417,6 +417,11 @@ pub struct Driver {
 /// default home's name changed (`.heph3` → `.heph`), and a repo's `.gitignore`
 /// that named the old one would otherwise show the new one as untracked — this
 /// holds for any name and any `homeDir`.
+///
+/// Sandboxes live under this `.gitignore`, so a tool inside a sandbox that
+/// honours VCS ignores (git, ripgrep, many linters walking "the repo") sees the
+/// sandbox as ignored. Deliberate, and the same as before the rename: the old
+/// `.heph3` was ignored by the repos that used it too.
 fn ensure_home(home: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(home)
         .with_context(|| format!("creating heph home {}", home.display()))?;

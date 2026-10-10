@@ -85,14 +85,38 @@ pub struct Driver {
     /// socket live under it. Handed in by the host (`CreateConfig.home` for the
     /// cdylib, `PluginInit.home` in-process) — never derived from a sandbox
     /// path, where a package named `sandbox` would be mistaken for the home's.
-    home: std::path::PathBuf,
+    ///
+    /// `Err` holds why the host's home is unusable; the driver is still
+    /// registered, and fails its runs with that reason (see [`home_from_host`]).
+    home: Result<std::path::PathBuf, String>,
+}
+
+/// The home a cdylib host passed in `CreateConfig.home`, checked: the proto
+/// default is `""` (a host that predates the field, or a broken one), and a
+/// relative path would be resolved against whatever this process's cwd is.
+pub fn home_from_host(home: &str) -> Result<std::path::PathBuf, String> {
+    if home.is_empty() {
+        return Err("the host passed no heph home (CreateConfig.home is empty)".to_string());
+    }
+    let path = std::path::PathBuf::from(home);
+    if !path.is_absolute() {
+        return Err(format!(
+            "the host passed a relative heph home ({home:?}); it must be absolute"
+        ));
+    }
+    Ok(path)
 }
 
 impl Driver {
     pub fn new(home: impl Into<std::path::PathBuf>) -> Self {
+        Self::from_host_home(Ok(home.into()))
+    }
+
+    /// A driver over a home that may be unusable; see [`Self::home`].
+    pub fn from_host_home(home: Result<std::path::PathBuf, String>) -> Self {
         Self {
             docker_bin: "docker".to_string(),
-            home: home.into(),
+            home,
         }
     }
 
@@ -201,6 +225,14 @@ impl ManagedDriver for Driver {
         mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
+        // First, before asking docker anything: without the home there is no
+        // runner to describe.
+        let heph_home = self.home.as_ref().map_err(|why| {
+            anyhow::anyhow!(
+                "oci_runner cannot mount heph's home into the container: {why}. \
+                 The heph binary and the OCI plugin are likely mismatched versions."
+            )
+        })?;
         let def = req.request.target.def_de::<OciRunnerDef>().clone();
 
         // The digest, from the daemon. Resolved rather than trusted: a tag is a
@@ -245,7 +277,7 @@ impl ManagedDriver for Driver {
         let tree_root = req.request.tree_root_path.to_string_lossy().into_owned();
         // Sandboxes and the agent socket both live under heph's home, and the
         // container needs to see both at their own paths.
-        let heph_home = self.home.to_string_lossy().into_owned();
+        let heph_home = heph_home.to_string_lossy().into_owned();
 
         // Named `oci`, not `session`: this plugin implements the runner. See
         // `pluginoci::exec_runner` for why a held `docker run` was the wrong
@@ -278,5 +310,30 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("write {out:?}"))?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_absolute_host_home_is_accepted() {
+        assert_eq!(
+            home_from_host("/w/.heph").expect("home"),
+            std::path::Path::new("/w/.heph")
+        );
+    }
+
+    #[test]
+    fn an_empty_host_home_is_refused_with_the_reason() {
+        let err = home_from_host("").expect_err("empty");
+        assert!(err.contains("CreateConfig.home is empty"), "{err}");
+    }
+
+    #[test]
+    fn a_relative_host_home_is_refused() {
+        let err = home_from_host(".heph").expect_err("relative");
+        assert!(err.contains("must be absolute"), "{err}");
     }
 }

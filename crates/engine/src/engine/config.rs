@@ -250,11 +250,12 @@ impl ConfigYamlExt for ConfigYaml {
             capacity_bytes: c.capacity_bytes,
         };
 
-        // Absolute here, beside the home: the home is pruned from walks by exact
-        // path, and the walks join their paths onto this root — a relative root
-        // (`HEPH_CWD=.`) would never compare equal to the absolute home.
-        let root = std::path::absolute(root)
-            .with_context(|| format!("making workspace root {} absolute", root.display()))?;
+        // Normalized here exactly as the home is: the home is pruned from walks
+        // by exact path, and the walks join their paths onto this root — a
+        // relative root (`HEPH_CWD=.`) or one spelled with `..` would never
+        // compare equal to the home.
+        let root = hconfig::normalize(root)
+            .with_context(|| format!("normalizing workspace root {}", root.display()))?;
         let home_dir = HomeDir::resolve(&root, self.home_dir.as_deref()).with_context(|| {
             format!(
                 "resolving homeDir from {}",
@@ -400,6 +401,16 @@ mod tests {
             .expect("resolve");
         assert!(cfg.root.is_absolute(), "{}", cfg.root.display());
         assert_eq!(cfg.home_dir.as_path(), cfg.root.join(DEFAULT_HOME_DIR));
+    }
+
+    #[test]
+    fn resolve_normalizes_the_root_like_the_home() {
+        let yaml: ConfigYaml = serde_yaml::from_str("homeDir: state\n").expect("parse");
+        let cfg = yaml.resolve(Path::new("/w/x/../ws")).expect("resolve");
+        assert_eq!(cfg.root, Path::new("/w/ws"));
+        assert_eq!(cfg.home_dir.as_path(), Path::new("/w/ws/state"));
+        // What the walks' exact-path prune compares.
+        assert_eq!(cfg.root.join("state"), cfg.home_dir.as_path());
     }
 
     #[test]

@@ -7,6 +7,11 @@
 //! resolver (and a test-only one), so a hand-built `root.join(".heph")` cannot
 //! reach the engine: the place the home is decided is the only place it is.
 //!
+//! Directory names starting with [`HEPH_DIR_PREFIX`] (`.heph*`) are reserved:
+//! every tree walk prunes them by name, so they are never source, wherever they
+//! sit in the tree. The default home is one of them; a configured `homeDir`
+//! need not be, and is pruned by its exact path instead.
+//!
 //! Engine-free on purpose: it sits next to [`get_root`](crate::get_root), so
 //! everything that decides *where* a workspace lives is in one crate.
 
@@ -84,8 +89,13 @@ impl HomeDir {
 }
 
 /// [`std::path::absolute`], then resolve `.` and `..` components lexically —
-/// without touching the filesystem, so a path that does not exist yet works.
-fn normalize(path: &Path) -> anyhow::Result<PathBuf> {
+/// without touching the filesystem, so a path that does not exist yet works (and
+/// a symlink before a `..` is not followed).
+///
+/// The workspace root and the home both go through this: the home is pruned
+/// from walks by exact path against paths joined onto the root, so the two must
+/// be spelled the same way.
+pub fn normalize(path: &Path) -> anyhow::Result<PathBuf> {
     let abs =
         std::path::absolute(path).with_context(|| format!("making {} absolute", path.display()))?;
     let mut out = PathBuf::new();
