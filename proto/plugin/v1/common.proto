@@ -37,6 +37,10 @@ message CreateConfig {
   string root = 1;
   string home = 2;
   map<string, Value> options = 3;
+  // The plugin's name, from its manifest (since 0.16.0): its `heph.<name>`
+  // namespace and the prefix of its components' names. Informational — for a
+  // plugin that wants it in messages; the binary reports no name of its own.
+  string name = 4;
 }
 
 // The host's log filter, handed to a plugin (`heph_plugin_set_log_filter`) so it

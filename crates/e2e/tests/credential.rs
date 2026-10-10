@@ -96,6 +96,35 @@ target(
     Ok(())
 }
 
+/// The `auth` plugin is a driver plus functions and nothing else: `heph.auth.*`
+/// resolves from the plugin's functions, `auth.credential` runs the
+/// declaration, and the provider listing no longer carries an inert `auth`
+/// provider that served no targets.
+#[tokio::test]
+async fn credential_driver_and_auth_functions_come_from_the_auth_bundle() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "auth",
+        r#"target(name = "t", driver = "auth.credential",
+       sources = [heph.auth.oidc("generic")],
+       present = {"env": {"TOK": "${id_token}"}})"#,
+    );
+    let spec = ws.get_spec("//auth:t").await?;
+    assert_eq!(spec.driver, "auth.credential");
+    heph::plugincredential::parse_declaration(&spec)?;
+
+    let mut providers: Vec<&str> = ws
+        .engine
+        .providers_by_name
+        .keys()
+        .map(String::as_str)
+        .collect();
+    providers.sort_unstable();
+    assert_eq!(providers, ["buildfile", "fs", "query"]);
+    assert!(ws.engine.function_registry().get("auth", "oidc").is_some());
+    Ok(())
+}
+
 /// A declaration produces no artifacts, so resolving one directly yields an empty
 /// result rather than an error — and, critically, acquires nothing. Running
 /// `heph run //auth:aws` must not sign anyone in.

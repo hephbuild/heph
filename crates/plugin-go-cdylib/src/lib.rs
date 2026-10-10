@@ -15,11 +15,11 @@ use hplugin_go::plugingo::{
     GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{
-    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
+    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
 };
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    make_dyn_managed_driver, make_dyn_provider, options_from_pb_map,
+    make_dyn_managed_driver, make_dyn_provider, make_plugin_functions, options_from_pb_map,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,8 +27,14 @@ use std::sync::Arc;
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
 /// `pb::CreateConfig` bytes, so config fields are additive across versions.
+///
+/// `_functions` is the loading engine's function registry: the go functions
+/// call no other plugin's, so it goes unused.
 #[stabby::export]
-pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginComponents {
+pub extern "C" fn heph_plugin_create(
+    cfg: stabby::vec::Vec<u8>,
+    _functions: DynFunctionRegistry,
+) -> PluginComponents {
     match build(&cfg) {
         Ok(c) => c,
         Err(e) => {
@@ -105,14 +111,18 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let go_runner = hplugin_go::plugingo::runner::read_runner_option(&options)?;
 
     let walker = Arc::new(hwalk::CachedWalker::open(&walk_db));
-    let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(Provider::from_options(
+    let provider = Provider::from_options(
         root,
         &[],
         &[],
         &options,
         walker,
         plugin_sdk::stabby::cdylib_runtime_handle(),
-    )?);
+    )?;
+    // `heph.go.*`: built from the same options as the provider, exported
+    // beside it — functions are the plugin's, not the provider's.
+    let (functions, function_handle) = make_plugin_functions(&cfg.name, provider.functions())?;
+    let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(provider);
 
     let mut drivers = stabby::vec::Vec::new();
     // The shared golist GOCACHE is no longer this plugin's to place: it is a
@@ -178,9 +188,10 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     });
 
     Ok(PluginComponents {
-        provider_name: "go".into(),
         provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
+        functions,
+        function_handle: function_handle.into(),
         // The go plugin exports no hooks.
         hooks: stabby::vec::Vec::new(),
         // No return-side metadata to report yet.

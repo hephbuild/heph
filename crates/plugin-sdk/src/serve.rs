@@ -17,16 +17,16 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ConfigRequest as DriverConfigRequest, ParseRequest, RunInput,
     RunRequest, inputartifact,
 };
+use hplugin::function::{FnArgs, FnCallContext, FnOutcome, FunctionCaller, PluginFn, PluginFnDef};
 use hplugin::hook::Hook;
 use hplugin::provider::{
-    ConfigRequest, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest, ListPackagesRequest,
-    ListRequest, ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
-    ProviderFunctionRegistry,
+    ConfigRequest, GetError, GetRequest, ListPackagesRequest, ListRequest, ProbeRequest, Provider,
+    ProviderExecutor,
 };
 use hplugin_stabby::abi::{
-    DynExecutor, DynFunctionRegistry, DynItemStream, StableCancel, StableFunctionRegistryDyn,
-    StableHook, StableItemStream, StableItemStreamDyn, StableManagedDriver, StableMeta,
-    StableProvider,
+    DynExecutor, DynFunctionRegistry, DynItemStream, DynPluginFunctions, NamedFunction,
+    StableCancel, StableFunctionRegistryDyn, StableHook, StableItemStream, StableItemStreamDyn,
+    StableManagedDriver, StableMeta, StablePluginFunctions, StableProvider,
 };
 use hplugin_stabby::seam::panic_text;
 use hplugin_stabby::vtable::dynify;
@@ -572,23 +572,13 @@ async fn provider_probe(
     unary(body)
 }
 
-async fn provider_call_function(
-    provider: Arc<dyn Provider>,
+/// Serve one `FUNCTION_METHOD_CALL`: run the named handler guest-side (it is not
+/// transmissible) and answer its outcome as a `CallFunctionResp` frame.
+async fn plugin_call_function(
+    func: Arc<dyn PluginFn>,
+    name: String,
     req: pb::CallFunctionRequest,
 ) -> SVec<u8> {
-    // Re-derive the def each call (cheap; provider functions are static
-    // metadata). The handler is not transmissible, so it must be invoked
-    // here on the guest side.
-    let def = provider
-        .functions()
-        .into_iter()
-        .find(|d| d.name == req.name);
-    let Some(def) = def else {
-        return unary(err_body(format!(
-            "unknown provider function `{}`",
-            req.name
-        )));
-    };
     let ctx = FnCallContext {
         pkg: &req.pkg,
         root: std::path::Path::new(&req.root),
@@ -608,26 +598,25 @@ async fn provider_call_function(
     // Declarations ride back with the value when the host advertised that it
     // carries them; against an older host they are an error, never a silent
     // drop (see `CallFunctionRequest.accepts_declarations`).
-    let res = match def.func.call(&ctx, args).await {
+    let res = match func.call(&ctx, args).await {
         Ok(o) => {
             let n = o.targets().len() + o.states().len();
             tracing::debug!(
-                function = %req.name,
+                function = %name,
                 pkg = %req.pkg,
                 declarations = n,
-                "provider function answered"
+                "plugin function answered"
             );
             // Only the refusal path errors here, so this context is about the
             // peer: name the side that is old and what fixes it.
             convert::call_function_response(o, req.accepts_declarations).with_context(|| {
                 format!(
-                    "plugin function {:?}: the calling host does not carry declarations \
-                     (heph older than plugin ABI 0.15.0) — upgrade heph",
-                    req.name
+                    "plugin function {name:?}: the calling host does not carry declarations \
+                     (heph older than plugin ABI 0.15.0) — upgrade heph"
                 )
             })
         }
-        Err(e) => Err(e).with_context(|| format!("plugin function {:?}", req.name)),
+        Err(e) => Err(e).with_context(|| format!("plugin function {name:?}")),
     };
     let body = match res {
         Ok(resp) => Body::CallFunctionResp(resp),
@@ -637,7 +626,7 @@ async fn provider_call_function(
 }
 
 // Sync metadata helpers. Each returns the metadatum's RAW prost bytes (NOT a
-// `Frame` — matching the prior `functions()`/`state_schema()`/`config()` wire).
+// `Frame` — matching the prior `state_schema()`/`config()` wire).
 
 fn provider_config(provider: &Arc<dyn Provider>) -> SVec<u8> {
     let name = provider
@@ -645,23 +634,6 @@ fn provider_config(provider: &Arc<dyn Provider>) -> SVec<u8> {
         .map(|r| r.name)
         .unwrap_or_default();
     SVec::from(pb::ConfigResponse { name }.encode_to_vec().as_slice())
-}
-
-fn provider_functions(provider: &Arc<dyn Provider>) -> SVec<u8> {
-    let functions = provider
-        .functions()
-        .into_iter()
-        .map(|d| pb::ProviderFunctionDef {
-            name: d.name,
-            signature: Some(convert::fn_signature_to_pb(&d.signature)),
-            doc: d.doc,
-        })
-        .collect();
-    SVec::from(
-        pb::FunctionsResponse { functions }
-            .encode_to_vec()
-            .as_slice(),
-    )
 }
 
 fn provider_state_schema(provider: &Arc<dyn Provider>) -> SVec<u8> {
@@ -672,47 +644,113 @@ fn provider_state_schema(provider: &Arc<dyn Provider>) -> SVec<u8> {
     }
 }
 
-fn provider_set_registry(
-    provider: &Arc<dyn Provider>,
-    metadata: SVec<u8>,
-    reg: DynFunctionRegistry,
-) {
-    let meta = pb::FunctionRegistry::decode(&metadata[..]).unwrap_or_default();
-    // Shared across every proxy handler — each dispatches back over the host
-    // callback to invoke the actual function.
-    let reg = Arc::new(reg);
-    let mut by_provider: std::collections::HashMap<String, Vec<ProviderFunctionDef>> =
-        std::collections::HashMap::new();
-    for f in meta.functions {
-        let Some(signature) = f.signature.map(convert::fn_signature_from_pb) else {
-            continue;
-        };
-        by_provider
-            .entry(f.provider.clone())
-            .or_default()
-            .push(ProviderFunctionDef {
-                name: f.name.clone(),
-                signature,
-                doc: f.doc,
-                func: Arc::new(GuestRegisteredFn {
-                    reg: Arc::clone(&reg),
-                    provider: f.provider,
-                    name: f.name,
-                }),
-            });
+/// A plugin's functions as the ABI carries them: one [`NamedFunction`] per
+/// function (its metadata as prost `pb::FunctionDef` bytes) and the one
+/// [`DynPluginFunctions`] handle they are all called through — `None` when the
+/// plugin has no functions. Goes into `PluginComponents.functions` /
+/// `.function_handle`. `plugin` names the plugin in seam diagnostics.
+///
+/// Refuses a function name used twice: the host would refuse the plugin's
+/// load anyway, and here the author sees it at build.
+pub fn make_plugin_functions(
+    plugin: &str,
+    defs: Vec<PluginFnDef>,
+) -> Result<(SVec<NamedFunction>, Option<DynPluginFunctions>)> {
+    if defs.is_empty() {
+        return Ok((SVec::new(), None));
     }
-    let mut registry = ProviderFunctionRegistry::default();
-    for (provider_name, defs) in by_provider {
-        registry.insert_provider(&provider_name, defs);
+    let mut named = SVec::new();
+    let mut fns: HashMap<String, Arc<dyn PluginFn>> = HashMap::with_capacity(defs.len());
+    for def in defs {
+        let meta = pb::FunctionDef {
+            name: def.name.clone(),
+            signature: Some(convert::fn_signature_to_pb(&def.signature)),
+            doc: def.doc,
+        }
+        .encode_to_vec();
+        named.push(NamedFunction {
+            name: def.name.as_str().into(),
+            meta: SVec::from(meta.as_slice()),
+        });
+        if fns.insert(def.name.clone(), def.func).is_some() {
+            anyhow::bail!(
+                "plugin {plugin:?} exports two functions named {:?}",
+                def.name
+            );
+        }
     }
-    provider.set_function_registry(Arc::new(registry));
+    let handle: DynPluginFunctions = dynify(stabby::boxed::Box::new(StablePluginFunctionsImpl {
+        fns: Arc::new(fns),
+        name: seam_name(Ok(plugin.to_string())),
+    }));
+    Ok((named, Some(handle)))
+}
+
+/// Serves a plugin's functions behind its one handle.
+struct StablePluginFunctionsImpl {
+    fns: Arc<HashMap<String, Arc<dyn PluginFn>>>,
+    /// Plugin name, for seam diagnostics.
+    name: Arc<str>,
+}
+
+// Each call runs through [`spawn_seam`], like `StableProviderImpl::invoke`: the
+// host calls BUILD functions from a `block_on` inside Starlark evaluation, where
+// no plugin reactor is current — a function touching tokio there would abort
+// at the seam. On the plugin runtime it simply works.
+impl StablePluginFunctions for StablePluginFunctionsImpl {
+    extern "C" fn invoke<'a>(
+        &'a self,
+        method: u32,
+        name: stabby::string::String,
+        req: SVec<u8>,
+    ) -> DynFuture<'a, SVec<u8>> {
+        match pb::FunctionMethod::try_from(method as i32) {
+            Ok(pb::FunctionMethod::Call) => {
+                let name = name.to_string();
+                let Some(func) = self.fns.get(&name).cloned() else {
+                    let body = unary(err_body(format!(
+                        "plugin {} has no function {name:?}",
+                        self.name
+                    )));
+                    return dynify(stabby::boxed::Box::new(async move { body }));
+                };
+                let req = match pb::CallFunctionRequest::decode(&req[..]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let body = unary(err_body(format!(
+                            "decoding the call of function {name:?}: {e}"
+                        )));
+                        return dynify(stabby::boxed::Box::new(async move { body }));
+                    }
+                };
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "call_function",
+                    name.clone(),
+                    plugin_call_function(func, name, req),
+                    |m| unary(err_body(m)),
+                )))
+            }
+            _ => dynify(stabby::boxed::Box::new(
+                async move { unimplemented(method) },
+            )),
+        }
+    }
+}
+
+/// The registry handle a cdylib's create entry receives, as the
+/// [`FunctionCaller`] the plugin's own functions use to call another plugin's
+/// function by `(plugin, fn)`. Per instance: hand it to this instance's
+/// functions, never to a process-global, or a second engine in the process
+/// would call into the first one's functions.
+pub fn guest_functions(reg: DynFunctionRegistry) -> Arc<dyn FunctionCaller> {
+    Arc::new(GuestFunctions { reg })
 }
 
 impl StableMeta for StableProviderImpl {
     extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
         match pb::ProviderMethod::try_from(kind as i32) {
             Ok(pb::ProviderMethod::Config) => provider_config(&self.provider),
-            Ok(pb::ProviderMethod::Functions) => provider_functions(&self.provider),
             Ok(pb::ProviderMethod::StateSchema) => provider_state_schema(&self.provider),
             // Unknown sync metadatum: empty == "none", never a hard failure.
             _ => SVec::new(),
@@ -739,17 +777,6 @@ impl StableProvider for StableProviderImpl {
                     "probe",
                     key,
                     provider_probe(provider, req, Arc::clone(&self.cancels)),
-                    |m| unary(err_body(m)),
-                )))
-            }
-            Ok(pb::ProviderMethod::CallFunction) => {
-                let req = pb::CallFunctionRequest::decode(&req[..]).unwrap_or_default();
-                let key = req.name.clone();
-                dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
-                    "call_function",
-                    key,
-                    provider_call_function(provider, req),
                     |m| unary(err_body(m)),
                 )))
             }
@@ -861,32 +888,26 @@ impl StableProvider for StableProviderImpl {
             )),
         }
     }
-
-    extern "C" fn invoke_registry(&self, method: u32, req: SVec<u8>, reg: DynFunctionRegistry) {
-        // Only SetFunctionRegistry rides this slot today; an unknown id has no
-        // return channel, so the handle is simply dropped.
-        if let Ok(pb::ProviderMethod::SetFunctionRegistry) =
-            pb::ProviderMethod::try_from(method as i32)
-        {
-            provider_set_registry(&self.provider, req, reg);
-        }
-    }
 }
 
-/// Guest-side proxy for a function in the host's aggregate registry: dispatches
-/// `call_registered` back over the host callback, decoding the returned value.
-struct GuestRegisteredFn {
-    reg: Arc<DynFunctionRegistry>,
-    provider: String,
-    name: String,
+/// Guest side of the engine's function registry: dispatches `call_registered`
+/// back over the host callback, decoding the returned outcome.
+struct GuestFunctions {
+    reg: DynFunctionRegistry,
 }
 
 #[async_trait::async_trait]
-impl ProviderFn for GuestRegisteredFn {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<FnOutcome> {
+impl FunctionCaller for GuestFunctions {
+    async fn call(
+        &self,
+        plugin: &str,
+        name: &str,
+        ctx: &FnCallContext<'_>,
+        args: FnArgs,
+    ) -> Result<FnOutcome> {
         let pb_req = pb::CallRegisteredRequest {
-            provider: self.provider.clone(),
-            name: self.name.clone(),
+            plugin: plugin.to_string(),
+            name: name.to_string(),
             pkg: ctx.pkg.to_string(),
             root: ctx.root.to_string_lossy().into_owned(),
             positional: args.positional.iter().map(convert::value_to_pb).collect(),
@@ -1671,20 +1692,60 @@ mod tests {
     use hcore::hasync::Cancellable;
     use hcore::htvalue::Value;
     use hcore::htvalue::signature::{FnSignature, Param, ParamType};
+    use hplugin::function::{DeclaredState, DeclaredTarget, FunctionRegistry, FunctionSlot};
     use hplugin::provider::{
-        ConfigResponse, FnOutcome, GetResponse, ListPackageResponse, ListResponse, ProbeResponse,
-        ProviderFn, ProviderFunctionDef,
+        ConfigResponse, GetResponse, ListPackageResponse, ListResponse, ProbeResponse,
     };
+    use hplugin_stabby::load_stable::decode_functions;
     use std::path::Path;
 
-    // A provider exposing one function `echo(msg, times=1)` whose handler reads
-    // the call context's `pkg` — so the test proves both the call arguments and
-    // the FnCallContext cross the seam, not just the metadata.
+    // A provider with a state schema and no functions: functions are the
+    // plugin's, not the provider's.
     struct FnProvider;
+
+    /// `echo(msg, times=1)`, whose handler reads the call context's `pkg` — so
+    /// the tests prove both the call arguments and the FnCallContext cross the
+    /// seam, not just the metadata.
+    fn echo_def() -> PluginFnDef {
+        PluginFnDef {
+            name: "echo".into(),
+            signature: FnSignature {
+                positional: vec![Param::required("msg", ParamType::String)],
+                named: vec![Param::optional("times", ParamType::Int, Value::Int(1))],
+                variadic: None,
+                returns: ParamType::String,
+            },
+            doc: "Echo `msg` `times` times, prefixed by the calling package.".into(),
+            func: Arc::new(EchoFn),
+        }
+    }
+
+    /// A plugin's functions through the seam and back, as the loader sees
+    /// them: metadata crossed as `NamedFunction` bytes, decoded once, each
+    /// calling through the plugin's one handle.
+    fn through_the_seam(plugin: &str, defs: Vec<PluginFnDef>) -> Vec<PluginFnDef> {
+        let (named, handle) = make_plugin_functions(plugin, defs).expect("export");
+        decode_functions(plugin, named.into_iter().collect(), handle).expect("load")
+    }
+
+    fn call(def: &PluginFnDef, pkg: &str, positional: Vec<Value>) -> Result<FnOutcome> {
+        let root = std::path::PathBuf::from("/ws");
+        let ctx = FnCallContext {
+            pkg,
+            root: Path::new(&root),
+        };
+        futures::executor::block_on(def.func.call(
+            &ctx,
+            FnArgs {
+                positional,
+                named: Default::default(),
+            },
+        ))
+    }
 
     struct EchoFn;
     #[async_trait::async_trait]
-    impl ProviderFn for EchoFn {
+    impl PluginFn for EchoFn {
         async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<FnOutcome> {
             let msg = match args.positional.first() {
                 Some(Value::String(s)) => s.clone(),
@@ -1694,7 +1755,7 @@ mod tests {
             // seam, and against a caller that cannot carry them it must fail.
             if msg == "declare" {
                 let mut out = FnOutcome::from(Value::String("//mypkg:t".into()));
-                out.declare_target(hplugin::provider::DeclaredTarget {
+                out.declare_target(DeclaredTarget {
                     name: "t".into(),
                     driver: "exec".into(),
                     labels: vec!["gen".into()],
@@ -1717,7 +1778,7 @@ mod tests {
                     },
                     config: [("run".to_string(), Value::String("gen".into()))].into(),
                 })
-                .declare_state(hplugin::provider::DeclaredState {
+                .declare_state(DeclaredState {
                     provider: "codegen".into(),
                     args: [("toolchain".to_string(), Value::String("v1".into()))].into(),
                 });
@@ -1775,19 +1836,6 @@ mod tests {
             _ct: &'a (dyn Cancellable + Send + Sync),
         ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
             Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
-        }
-        fn functions(&self) -> Vec<ProviderFunctionDef> {
-            vec![ProviderFunctionDef {
-                name: "echo".into(),
-                signature: FnSignature {
-                    positional: vec![Param::required("msg", ParamType::String)],
-                    named: vec![Param::optional("times", ParamType::Int, Value::Int(1))],
-                    variadic: None,
-                    returns: ParamType::String,
-                },
-                doc: "Echo `msg` `times` times, prefixed by the calling package.".into(),
-                func: Arc::new(EchoFn),
-            }]
         }
         fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
             use hplugin::provider::{StateField, StateSchema};
@@ -2503,18 +2551,19 @@ mod tests {
         );
     }
 
-    // Provider functions survive the guest→host stable-ABI round trip: the host
-    // sees the same name/signature/doc, and invoking the proxied handler carries
-    // both the arguments and the FnCallContext across the seam.
+    // Plugin functions survive the guest→host stable-ABI round trip as
+    // `NamedFunction` metadata decoded once at load: the host sees the same
+    // name/signature/doc, and invoking the proxied handler carries both the
+    // arguments and the FnCallContext through the plugin's one handle (D4).
     #[test]
-    fn provider_functions_roundtrip() {
+    fn plugin_functions_roundtrip() {
         use hplugin_stabby::load_stable::StableRemoteProvider;
 
         let dynp = make_dyn_provider(Arc::new(FnProvider) as Arc<dyn Provider>);
         let host = StableRemoteProvider::new(dynp, "mock");
 
         // Metadata crosses: exactly one function, rendered as declared.
-        let defs = host.functions();
+        let defs = through_the_seam("mock", vec![echo_def()]);
         assert_eq!(defs.len(), 1);
         let def = &defs[0];
         assert_eq!(def.name, "echo");
@@ -2610,11 +2659,21 @@ mod tests {
     // `accepts_declarations`, so it decodes as false. A declaring function must
     // then fail the call: prost would skip the declaration fields, and the
     // caller would build a target-less package from a BUILD file that asked for
-    // one. The guest serve path is driven directly, since the host-side proxy
-    // always advertises support.
+    // one. The plugin's functions handle is driven directly, since the
+    // host-side proxy always advertises support.
     #[test]
     fn declarations_to_a_caller_that_cannot_carry_them_fail() {
-        let provider = Arc::new(FnProvider) as Arc<dyn Provider>;
+        use hplugin_stabby::abi::StablePluginFunctionsDyn;
+
+        let (_, handle) = make_plugin_functions("mock", vec![echo_def()]).expect("export");
+        let handle = handle.expect("a plugin with functions has a handle");
+        let invoke = |req: pb::CallFunctionRequest| {
+            futures::executor::block_on(handle.invoke(
+                pb::FunctionMethod::Call as u32,
+                "echo".into(),
+                SVec::from(req.encode_to_vec().as_slice()),
+            ))
+        };
         let req = pb::CallFunctionRequest {
             name: "echo".into(),
             pkg: "mypkg".into(),
@@ -2623,7 +2682,7 @@ mod tests {
             named: Default::default(),
             accepts_declarations: false,
         };
-        let bytes = futures::executor::block_on(provider_call_function(provider, req));
+        let bytes = invoke(req);
         match pb::Frame::decode(&bytes[..]).expect("decode frame").body {
             Some(Body::Error(e)) => {
                 // Names what was about to be lost, which side is old, and the
@@ -2649,10 +2708,7 @@ mod tests {
             named: Default::default(),
             accepts_declarations: false,
         };
-        let bytes = futures::executor::block_on(provider_call_function(
-            Arc::new(FnProvider) as Arc<dyn Provider>,
-            req,
-        ));
+        let bytes = invoke(req);
         match pb::Frame::decode(&bytes[..]).expect("decode frame").body {
             Some(Body::CallFunctionResp(r)) => assert_eq!(
                 convert::value_from_pb(r.value.unwrap_or_default()),
@@ -2660,274 +2716,223 @@ mod tests {
             ),
             other => panic!("expected a value, got {other:?}"),
         }
+
+        // An unknown method id on the handle is Unimplemented, not a crash —
+        // the same additive contract as the provider's dispatch.
+        let bytes = futures::executor::block_on(handle.invoke(9999, "echo".into(), SVec::new()));
+        match pb::Frame::decode(&bytes[..]).expect("frame").body {
+            Some(Body::Error(e)) => {
+                assert_eq!(e.kind, pb::error::Kind::Unimplemented as i32);
+            }
+            other => panic!("expected Unimplemented, got {other:?}"),
+        }
     }
 
-    // The host's aggregate function registry is injected into a dylib provider:
-    // the provider receives proxy handlers that dispatch back over the host
-    // callback, so invoking one reaches the real (host-side) function — args and
-    // FnCallContext included.
+    // D4 / D13: a guest function that touches tokio (here a timer) works when
+    // the host calls it from a plain `block_on` — exactly how Starlark
+    // evaluation calls `heph.<plugin>.<fn>`, with no plugin reactor current on
+    // the calling thread. The handle runs each call through `spawn_seam`, on
+    // the plugin's own runtime; without that, the sleep panics ("there is no
+    // reactor running") inside the extern shim and the process aborts.
     #[test]
-    fn function_registry_injection_roundtrip() {
-        use hplugin_stabby::load_stable::StableRemoteProvider;
-        use std::sync::Mutex;
-
-        // A provider that records the registry it is handed.
-        struct Recorder {
-            stored: Arc<Mutex<Option<Arc<ProviderFunctionRegistry>>>>,
-        }
-        impl Provider for Recorder {
-            fn config(&self, _req: ConfigRequest) -> Result<ConfigResponse> {
-                Ok(ConfigResponse {
-                    name: "recorder".into(),
-                })
-            }
-            fn list<'a>(
-                &'a self,
-                _req: ListRequest,
-                _ct: &'a (dyn Cancellable + Send + Sync),
-            ) -> futures::future::BoxFuture<
-                'a,
-                Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
-            > {
-                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
-            }
-            fn list_packages<'a>(
-                &'a self,
-                _req: ListPackagesRequest,
-                _ct: &'a (dyn Cancellable + Send + Sync),
-            ) -> futures::future::BoxFuture<
-                'a,
-                Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
-            > {
-                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
-            }
-            fn get<'a>(
-                &'a self,
-                _req: GetRequest,
-                _ct: &'a (dyn Cancellable + Send + Sync),
-            ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>>
-            {
-                Box::pin(async { Err(GetError::NotFound) })
-            }
-            fn probe<'a>(
-                &'a self,
-                _req: ProbeRequest,
-                _ct: &'a (dyn Cancellable + Send + Sync),
-            ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
-                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
-            }
-            fn set_function_registry(&self, reg: Arc<ProviderFunctionRegistry>) {
-                *self.stored.lock().unwrap() = Some(reg);
+    fn a_plugin_fn_touching_tokio_runs_on_the_seam() {
+        struct SleepFn;
+        #[async_trait::async_trait]
+        impl PluginFn for SleepFn {
+            async fn call(&self, _: &FnCallContext<'_>, _: FnArgs) -> Result<FnOutcome> {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                Ok(Value::String("slept".into()).into())
             }
         }
-
-        let stored = Arc::new(Mutex::new(None));
-        let recorder = Arc::new(Recorder {
-            stored: Arc::clone(&stored),
-        });
-        let dynp = make_dyn_provider(recorder as Arc<dyn Provider>);
-        let host = StableRemoteProvider::new(dynp, "recorder");
-
-        // A host-side aggregate registry holding one function under "greeter".
-        let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider(
-            "greeter",
-            vec![ProviderFunctionDef {
-                name: "echo".into(),
+        let defs = through_the_seam(
+            "sleepy",
+            vec![PluginFnDef {
+                name: "nap".into(),
                 signature: FnSignature {
-                    positional: vec![Param::required("msg", ParamType::String)],
+                    positional: vec![],
                     named: vec![],
                     variadic: None,
                     returns: ParamType::String,
                 },
-                doc: "echo".into(),
-                func: Arc::new(EchoFn),
+                doc: String::new(),
+                func: Arc::new(SleepFn),
             }],
         );
-        host.set_function_registry(Arc::new(reg));
-
-        // The recorder received a registry; its proxy resolves back to the host
-        // EchoFn, carrying both the arg and ctx.pkg across the (reverse) seam.
-        let received = stored.lock().unwrap().clone().expect("registry injected");
-        let rf = received.get("greeter", "echo").expect("echo registered");
-        let root = std::path::PathBuf::from("/ws");
-        let ctx = FnCallContext {
-            pkg: "callerpkg",
-            root: Path::new(&root),
-        };
-        let out = futures::executor::block_on(rf.func.call(
-            &ctx,
-            FnArgs {
-                positional: vec![Value::String("yo".into())],
-                named: Default::default(),
-            },
-        ))
-        .expect("call proxied echo");
-        assert_eq!(out.value(), &Value::String("callerpkg:yo".into()));
-
-        // …and the reverse seam carries a host function's declarations back to
-        // the plugin, which is what lets a plugin's rule be built out of
-        // another provider's rule.
-        let out = futures::executor::block_on(rf.func.call(
-            &ctx,
-            FnArgs {
-                positional: vec![Value::String("declare".into())],
-                named: Default::default(),
-            },
-        ))
-        .expect("call declaring host fn from a plugin");
-        assert_eq!(out.targets().len(), 1, "declaration crossed back");
-        assert_eq!(out.targets()[0].name, "t");
-        assert_eq!(out.states().len(), 1);
+        let out = call(&defs[0], "p", vec![]).expect("a tokio-touching function answers");
+        assert_eq!(out.value(), &Value::String("slept".into()));
     }
 
-    /// The chain the capability exists for: the host calls plugin A's function,
-    /// which calls provider B's function (through the injected registry, i.e.
-    /// back over the seam), and B's declared target reaches the host.
-    ///
-    /// A's obligation is the one thing no guard can enforce for it — it must
-    /// `absorb` the inner outcome instead of reading `.value`, or the
-    /// declarations stop at that hop. Here it absorbs, and the target arrives.
+    // A plugin with functions and no provider at all: its function still
+    // round-trips across the seam (the codegen-wrapper-around-`exec` shape).
     #[test]
-    fn declarations_cross_a_plugin_to_provider_chain() {
-        use hplugin_stabby::load_stable::StableRemoteProvider;
-        use std::sync::Mutex;
+    fn function_only_plugin_is_callable_from_build() {
+        let (named, handle) = make_plugin_functions("gen", vec![echo_def()]).expect("export");
+        // What a function-only cdylib's create entry returns: no provider.
+        let comps = hplugin_stabby::abi::PluginComponents {
+            provider: stabby::option::Option::None(),
+            drivers: SVec::new(),
+            functions: named,
+            function_handle: handle.into(),
+            hooks: SVec::new(),
+            runners: SVec::new(),
+            meta: SVec::new(),
+        };
+        let provider: Option<hplugin_stabby::abi::DynProvider> = comps.provider.into();
+        assert!(provider.is_none());
+        let defs = decode_functions(
+            "gen",
+            comps.functions.into_iter().collect(),
+            comps.function_handle.into(),
+        )
+        .expect("load");
+        assert_eq!(defs.len(), 1);
+        let out = call(&defs[0], "pkg", vec![Value::String("x".into())]).expect("call");
+        assert_eq!(out.value(), &Value::String("pkg:x".into()));
+    }
 
-        // Plugin A: its `relay` function calls `greeter.echo("declare")` on
-        // whatever registry the host injected, and passes the declarations on.
-        struct RelayFn {
-            reg: Arc<Mutex<Option<Arc<ProviderFunctionRegistry>>>>,
-        }
+    // I5: two plugin instances created in one process, each handed its own
+    // engine's registry, resolve their own `fs` — never the other engine's.
+    // A process-global registry export would make the second instance see the
+    // first engine's functions.
+    #[test]
+    fn two_engines_never_share_a_registry() {
+        struct ConstFn(&'static str);
         #[async_trait::async_trait]
-        impl ProviderFn for RelayFn {
-            async fn call(&self, ctx: &FnCallContext<'_>, _args: FnArgs) -> Result<FnOutcome> {
-                let reg = self
-                    .reg
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
-                    .context("no registry injected")?;
-                let inner = reg
-                    .get("greeter", "echo")
-                    .context("greeter.echo not registered")?;
-                let mut out = FnOutcome::from(Value::Null());
-                let addr = out.absorb(
-                    inner
-                        .func
-                        .call(
-                            ctx,
-                            FnArgs {
-                                positional: vec![Value::String("declare".into())],
-                                named: Default::default(),
-                            },
-                        )
-                        .await?,
-                );
-                out.set_value(addr);
-                Ok(out)
+        impl PluginFn for ConstFn {
+            async fn call(&self, _: &FnCallContext<'_>, _: FnArgs) -> Result<FnOutcome> {
+                Ok(Value::String(self.0.into()).into())
             }
         }
-
-        struct RelayProvider {
-            reg: Arc<Mutex<Option<Arc<ProviderFunctionRegistry>>>>,
-        }
-        impl Provider for RelayProvider {
-            fn config(&self, _req: ConfigRequest) -> Result<ConfigResponse> {
-                Ok(ConfigResponse { name: "a".into() })
-            }
-            fn list<'a>(
-                &'a self,
-                _req: ListRequest,
-                _ct: &'a (dyn Cancellable + Send + Sync),
-            ) -> futures::future::BoxFuture<
-                'a,
-                Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
-            > {
-                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
-            }
-            fn list_packages<'a>(
-                &'a self,
-                _req: ListPackagesRequest,
-                _ct: &'a (dyn Cancellable + Send + Sync),
-            ) -> futures::future::BoxFuture<
-                'a,
-                Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
-            > {
-                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
-            }
-            fn get<'a>(
-                &'a self,
-                _req: GetRequest,
-                _ct: &'a (dyn Cancellable + Send + Sync),
-            ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>>
-            {
-                Box::pin(async { Err(GetError::NotFound) })
-            }
-            fn probe<'a>(
-                &'a self,
-                _req: ProbeRequest,
-                _ct: &'a (dyn Cancellable + Send + Sync),
-            ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
-                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
-            }
-            fn functions(&self) -> Vec<ProviderFunctionDef> {
-                vec![ProviderFunctionDef {
-                    name: "relay".into(),
+        let engine = |answer: &'static str| {
+            let mut reg = FunctionRegistry::default();
+            reg.insert(
+                "fs",
+                vec![PluginFnDef {
+                    name: "glob".into(),
                     signature: FnSignature {
                         positional: vec![],
                         named: vec![],
                         variadic: None,
                         returns: ParamType::String,
                     },
-                    doc: "Relay a declaration from another provider.".into(),
-                    func: Arc::new(RelayFn {
-                        reg: Arc::clone(&self.reg),
-                    }),
-                }]
-            }
-            fn set_function_registry(&self, reg: Arc<ProviderFunctionRegistry>) {
-                *self.reg.lock().unwrap_or_else(|e| e.into_inner()) = Some(reg);
-            }
+                    doc: String::new(),
+                    func: Arc::new(ConstFn(answer)),
+                }],
+            )
+            .expect("insert");
+            Arc::new(reg)
+        };
+        let (reg_a, reg_b) = (engine("a"), engine("b"));
+        let plugin_in = |reg: &Arc<FunctionRegistry>| {
+            guest_functions(hplugin_stabby::host::HostFunctionRegistry::wrap_inline(
+                FunctionSlot::sealed(reg),
+            ))
+        };
+        let (a, b) = (plugin_in(&reg_a), plugin_in(&reg_b));
+        let root = std::path::PathBuf::from("/ws");
+        let ctx = FnCallContext {
+            pkg: "p",
+            root: Path::new(&root),
+        };
+        let glob = |f: &Arc<dyn FunctionCaller>| {
+            futures::executor::block_on(f.call("fs", "glob", &ctx, FnArgs::default()))
+                .expect("call fs.glob")
+                .into_value_only()
+                .expect("value")
+        };
+        assert_eq!(glob(&a), Value::String("a".into()));
+        assert_eq!(glob(&b), Value::String("b".into()));
+
+        // The handle holds its engine's registry weakly: once that engine is
+        // gone, the call says so instead of reaching anything else.
+        drop(reg_a);
+        let err = futures::executor::block_on(a.call("fs", "glob", &ctx, FnArgs::default()))
+            .expect_err("engine gone");
+        assert!(format!("{err:#}").contains("is gone"), "{err:#}");
+    }
+
+    /// Plugin A's `relay` function: calls `greeter.echo("declare")` through
+    /// the registry handle its create entry received, and passes the
+    /// declarations on with `absorb`.
+    struct RelayFn {
+        functions: Arc<dyn FunctionCaller>,
+    }
+
+    #[async_trait::async_trait]
+    impl PluginFn for RelayFn {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<FnOutcome> {
+            let mut out = FnOutcome::from(Value::Null());
+            let value = out.absorb(self.functions.call("greeter", "echo", ctx, args).await?);
+            out.set_value(value);
+            Ok(out)
         }
+    }
 
-        let slot = Arc::new(Mutex::new(None));
-        let dynp = make_dyn_provider(Arc::new(RelayProvider {
-            reg: Arc::clone(&slot),
-        }) as Arc<dyn Provider>);
-        let host = StableRemoteProvider::new(dynp, "a");
-
-        // The host registry A reaches back into: provider B's declaring fn.
-        let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider(
-            "greeter",
-            vec![ProviderFunctionDef {
-                name: "echo".into(),
+    /// What a function-only cdylib's create entry does with the registry it is
+    /// passed: hand it to its own functions, then export them.
+    fn create_relay_plugin(
+        reg: DynFunctionRegistry,
+    ) -> (SVec<NamedFunction>, Option<DynPluginFunctions>) {
+        make_plugin_functions(
+            "a",
+            vec![PluginFnDef {
+                name: "relay".into(),
                 signature: FnSignature {
                     positional: vec![Param::required("msg", ParamType::String)],
                     named: vec![],
                     variadic: None,
                     returns: ParamType::String,
                 },
-                doc: "echo".into(),
-                func: Arc::new(EchoFn),
+                doc: "Relay to greeter.echo.".into(),
+                func: Arc::new(RelayFn {
+                    functions: guest_functions(reg),
+                }),
             }],
-        );
-        host.set_function_registry(Arc::new(reg));
+        )
+        .expect("export")
+    }
 
-        let defs = host.functions();
-        let relay = defs.iter().find(|d| d.name == "relay").expect("relay");
-        let root = std::path::PathBuf::from("/ws");
-        let out = futures::executor::block_on(relay.func.call(
-            &FnCallContext {
-                pkg: "mypkg",
-                root: Path::new(&root),
-            },
-            FnArgs {
-                positional: vec![],
-                named: Default::default(),
-            },
-        ))
-        .expect("call relay");
+    /// The host side of the hop: an engine registry with `greeter.echo`.
+    fn greeter_registry() -> Arc<FunctionRegistry> {
+        let mut reg = FunctionRegistry::default();
+        reg.insert("greeter", vec![echo_def()]).expect("insert");
+        Arc::new(reg)
+    }
+
+    // The registry passed to `create` reaches a function-only plugin, and its
+    // function calls another plugin's function by `(plugin, fn)` back over the
+    // seam — args, FnCallContext and declarations included.
+    #[test]
+    fn function_registry_injection_roundtrip() {
+        let reg = greeter_registry();
+        let slot = FunctionSlot::sealed(&reg);
+        let (named, handle) = create_relay_plugin(
+            hplugin_stabby::host::HostFunctionRegistry::wrap_inline(slot),
+        );
+        let defs = decode_functions("a", named.into_iter().collect(), handle).expect("load");
+
+        let out = call(&defs[0], "callerpkg", vec![Value::String("yo".into())])
+            .expect("call relay → greeter.echo");
+        assert_eq!(out.value(), &Value::String("callerpkg:yo".into()));
+    }
+
+    /// The chain the capability exists for: the host calls plugin A's function,
+    /// which calls plugin B's function (through the registry handle, i.e. back
+    /// over the seam), and B's declared target reaches the host.
+    ///
+    /// A's obligation is the one thing no guard can enforce for it — it must
+    /// `absorb` the inner outcome instead of reading `.value`, or the
+    /// declarations stop at that hop. Here it absorbs, and the target arrives.
+    #[test]
+    fn declarations_cross_a_plugin_to_plugin_chain() {
+        let reg = greeter_registry();
+        let (named, handle) = create_relay_plugin(
+            hplugin_stabby::host::HostFunctionRegistry::wrap_inline(FunctionSlot::sealed(&reg)),
+        );
+        let defs = decode_functions("a", named.into_iter().collect(), handle).expect("load");
+
+        let out =
+            call(&defs[0], "mypkg", vec![Value::String("declare".into())]).expect("call relay");
 
         // Two seam crossings later, B's target is here for the host to merge.
         assert_eq!(out.value(), &Value::String("//mypkg:t".into()));

@@ -33,10 +33,11 @@ use hcore::htvalue::signature::{FnSignature, Param, ParamType};
 use hcore::htvalue::{Value, parse_map_string_strings, parse_strings};
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::{PkgBuf, join_rel_checked_pkg};
+use hplugin::function::{FnArgs, FnCallContext, FnOutcome, PluginFn, PluginFnDef};
 use hplugin::provider::{
-    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest,
-    GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ListedFacts,
-    Provider as ProviderTrait, ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
+    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+    ListPackagesRequest, ListRequest, ListResponse, ListedFacts, Provider as ProviderTrait,
+    ProviderExecutor, State,
 };
 use hwalk::{CachedWalker, EntryKind, Ignore};
 use parking_lot::RwLock;
@@ -508,9 +509,19 @@ impl ProviderTrait for Provider {
         self.inner.probe(req, ctoken)
     }
 
-    fn functions(&self) -> Vec<ProviderFunctionDef> {
+    fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
+        self.go_state_schema()
+    }
+}
+
+impl Provider {
+    /// The go plugin's BUILD-file functions, `heph.go.*`. Built from the same
+    /// options as the provider (the configured `gotool` is
+    /// `gocache_addr`'s default), so a function and the targets the provider
+    /// generates agree.
+    pub fn functions(&self) -> Vec<PluginFnDef> {
         vec![
-            ProviderFunctionDef {
+            PluginFnDef {
                 name: "build_addr".to_string(),
                 signature: FnSignature {
                     positional: vec![
@@ -533,7 +544,7 @@ impl ProviderTrait for Provider {
                     .to_string(),
                 func: Arc::new(BuildAddrFn),
             },
-            ProviderFunctionDef {
+            PluginFnDef {
                 name: "gocache_addr".to_string(),
                 signature: FnSignature {
                     positional: vec![],
@@ -582,14 +593,13 @@ impl ProviderTrait for Provider {
                   one it meant to share."
                     .to_string(),
                 func: Arc::new(GocacheAddrFn {
-                    workspace_root: self.inner.workspace_root.clone(),
                     default_gotool: self.inner.go_version.clone(),
                 }),
             },
         ]
     }
 
-    fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
+    fn go_state_schema(&self) -> Option<hplugin::provider::StateSchema> {
         use hplugin::provider::{StateField, StateSchema};
         let field = |name: &str, ty: ParamType, doc: &str| StateField {
             name: name.to_string(),
@@ -755,7 +765,6 @@ impl BuildAddrFn {
 /// [`FnCallContext`] gives only the calling package and root, and the module a
 /// package belongs to is a filesystem question.
 struct GocacheAddrFn {
-    workspace_root: std::path::PathBuf,
     /// The plugin's configured `gotool`, so an unqualified call agrees with what
     /// the generated Go targets in this workspace actually use.
     default_gotool: String,
@@ -794,7 +803,7 @@ impl GocacheAddrFn {
 }
 
 #[async_trait]
-impl ProviderFn for GocacheAddrFn {
+impl PluginFn for GocacheAddrFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let goos = Self::str_named(&args, "goos", hcore::htplatform::os())?;
         let goarch = Self::str_named(&args, "goarch", hcore::htplatform::arch())?;
@@ -806,9 +815,6 @@ impl ProviderFn for GocacheAddrFn {
                 anyhow::bail!("heph.go.gocache_addr: `race` must be a bool, got {other:?}")
             }
         };
-        // The workspace root from the call context, not `self`: a BUILD file is
-        // evaluated against the root that loaded it.
-        let _ = ctx.root;
         // Built through `Factors` rather than by hand, so this function and the
         // drivers cannot disagree about what a variant is.
         let factors = crate::plugingo::factors::Factors {
@@ -822,7 +828,10 @@ impl ProviderFn for GocacheAddrFn {
             race,
         };
         let key = crate::plugingo::gocache::GocacheKey {
-            module: module_of_pkg(&hmodel::htpkg::PkgBuf::from(ctx.pkg), &self.workspace_root),
+            // The workspace root from the call context, not the provider's: a
+            // BUILD file is evaluated against the root that loaded it, and a
+            // function's inputs are its arguments, `pkg` and `root` (I1).
+            module: module_of_pkg(&hmodel::htpkg::PkgBuf::from(ctx.pkg), ctx.root),
             go_version: gotool,
             goos,
             goarch,
@@ -833,7 +842,7 @@ impl ProviderFn for GocacheAddrFn {
 }
 
 #[async_trait]
-impl ProviderFn for BuildAddrFn {
+impl PluginFn for BuildAddrFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let pkg = Self::arg_str(&args, 0, "pkg")?;
         let v = Self::opt_arg_str(&args, 1, "variant")?.unwrap_or("");
@@ -4131,9 +4140,9 @@ mod tests {
         d
     }
 
-    fn gocache_fn(root: &std::path::Path) -> GocacheAddrFn {
+    /// No root of its own: the function reads the one in its call context.
+    fn gocache_fn() -> GocacheAddrFn {
         GocacheAddrFn {
-            workspace_root: root.to_path_buf(),
             default_gotool: "1.27.0".to_string(),
         }
     }
@@ -4143,7 +4152,7 @@ mod tests {
         let mut named = HashMap::new();
         named.insert("goos".to_string(), Value::String("linux".into()));
         named.insert("goarch".to_string(), Value::String("amd64".into()));
-        match gocache_fn(root)
+        match gocache_fn()
             .call(
                 &ctx,
                 FnArgs {

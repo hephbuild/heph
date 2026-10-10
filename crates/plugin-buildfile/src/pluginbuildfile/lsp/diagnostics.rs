@@ -80,7 +80,7 @@ pub(crate) fn validate(ast: &AstModule, engine: &dyn LspEngine) -> Vec<Diagnosti
 }
 
 /// Visit `e` and every expression nested within it.
-fn walk_expr<'a>(e: &'a AstExpr, f: &mut impl FnMut(&'a AstExpr)) {
+pub(crate) fn walk_expr<'a>(e: &'a AstExpr, f: &mut impl FnMut(&'a AstExpr)) {
     f(e);
     // `Expr::visit_expr` is one level deep; recurse to reach the whole subtree.
     e.visit_expr(|child| walk_expr(child, f));
@@ -101,7 +101,7 @@ fn walk_stmt<'a>(s: &'a AstStmt, f: &mut impl FnMut(&'a AstStmt)) {
 /// module's rule for anything it cannot resolve exactly, and the alternative
 /// (a real scope analysis) would buy nothing: a buffer that defines its own
 /// `target` almost certainly means it at every call site.
-fn bound_names(ast: &AstModule) -> HashSet<&str> {
+pub(crate) fn bound_names(ast: &AstModule) -> HashSet<&str> {
     let mut names = HashSet::new();
     walk_stmt(ast.statement(), &mut |s| match &s.node {
         Stmt::Def(def) => {
@@ -416,10 +416,8 @@ mod tests {
         fn root(&self) -> &Path {
             Path::new("/ws")
         }
-        fn provider_function_registry(
-            &self,
-        ) -> std::sync::Arc<hplugin::provider::ProviderFunctionRegistry> {
-            std::sync::Arc::new(hplugin::provider::ProviderFunctionRegistry::default())
+        fn function_registry(&self) -> std::sync::Arc<hplugin::function::FunctionRegistry> {
+            std::sync::Arc::new(hplugin::function::FunctionRegistry::default())
         }
         fn driver_schema(&self, name: &str) -> Option<DriverSchema> {
             match name {

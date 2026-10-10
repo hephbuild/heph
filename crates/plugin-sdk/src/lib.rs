@@ -12,7 +12,7 @@
 //! - (future) proto/shm, wasm — sibling features, same author surface.
 
 /// Re-export of the author-facing contract so a plugin depends only on the SDK.
-pub use hplugin::{driver, eresult, hook, provider};
+pub use hplugin::{driver, eresult, function, hook, provider};
 
 #[cfg(feature = "stabby")]
 mod guest;
@@ -40,7 +40,8 @@ pub mod stabby {
     pub use crate::logsink::{install_log_filter, install_log_sink};
     pub use crate::runnerhost::{install_runner_host, make_dyn_runner};
     pub use crate::serve::{
-        cdylib_runtime_handle, make_dyn_hook, make_dyn_managed_driver, make_dyn_provider,
+        cdylib_runtime_handle, guest_functions, make_dyn_hook, make_dyn_managed_driver,
+        make_dyn_provider, make_plugin_functions,
     };
     pub use crate::supervisor::{install_supervisor, supervisor_sink};
 

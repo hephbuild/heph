@@ -20,7 +20,8 @@
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_oci::pluginoci;
 use plugin_sdk::stabby::abi::{
-    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, NamedRunner, PluginComponents,
+    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, NamedRunner,
+    PluginComponents,
 };
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
@@ -31,14 +32,18 @@ use std::sync::Arc;
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
 /// `pb::CreateConfig` bytes; this plugin reads the resolved heph `home` out of
-/// it (the `oci_runner` driver mounts it into the container).
+/// it (the `oci.runner` driver mounts it into the container). The oci plugin
+/// exports no functions, so the engine's function registry goes unused.
 ///
 /// A config that does not decode, or carries no usable home, does not abort:
 /// the log sink is not installed yet, so an abort here would kill the host with
-/// a bare `SIGABRT` and no message. Only `oci_runner` needs the home, so it is
+/// a bare `SIGABRT` and no message. Only `oci.runner` needs the home, so it is
 /// the one driver that fails — at run, with the reason.
 #[stabby::export]
-pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginComponents {
+pub extern "C" fn heph_plugin_create(
+    cfg: stabby::vec::Vec<u8>,
+    _functions: DynFunctionRegistry,
+) -> PluginComponents {
     let home = match create_config_from_bytes(&cfg) {
         Ok(cfg) => pluginoci::runner::home_from_host(&cfg.home),
         Err(e) => Err(format!(
@@ -162,9 +167,10 @@ fn build(home: Result<std::path::PathBuf, String>) -> PluginComponents {
     });
 
     PluginComponents {
-        provider_name: "oci".into(),
         provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
+        functions: stabby::vec::Vec::new(),
+        function_handle: stabby::option::Option::None(),
         hooks: stabby::vec::Vec::new(),
         runners,
         meta: stabby::vec::Vec::new(),

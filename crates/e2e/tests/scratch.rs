@@ -1127,6 +1127,7 @@ fn remote_engine(
         Box::new(heph::pluginbuildfile::Provider::new(
             init.root.to_path_buf(),
             init.runtime.clone(),
+            std::sync::Arc::clone(&init.functions),
         ))
     })
     .expect("provider");

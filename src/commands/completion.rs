@@ -237,7 +237,8 @@ mod tests {
                         &init.skip_globs,
                         opts,
                         init.runtime.clone(),
-                    )?,
+                    )?
+                    .with_functions(std::sync::Arc::clone(&init.functions)),
                 )),
             )
         })

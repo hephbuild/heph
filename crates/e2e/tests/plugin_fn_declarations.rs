@@ -3,10 +3,12 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-//! A provider function that *declares* a target, reached the way a cdylib plugin
-//! is reached: through `make_dyn_provider` + `StableRemoteProvider`, so the call
-//! crosses the real stable-ABI dispatch and the declaration is encoded and
-//! decoded by the `CallFunction` codec.
+//! A plugin function that *declares* a target, reached the way a cdylib
+//! plugin's function is reached: exported with `make_plugin_functions` and
+//! loaded with `decode_functions`, so every call crosses the real stable-ABI
+//! function handle and the declaration is encoded and decoded by the
+//! `CallFunction` codec. The plugins here have functions and nothing else — no
+//! provider — which is the shape functions-belong-to-plugins exists for.
 //!
 //! The unit tests either side of this prove their own half — `plugin-sdk` that a
 //! declaration survives the seam into an `FnOutcome`, `plugin-buildfile` that an
@@ -14,19 +16,17 @@
 //! declaration made behind the ABI becomes a target the engine resolves and
 //! builds, which is the sentence the feature ships.
 //!
-//! Not `bin-e2e`: the declarations ride inside the existing prost payload over
-//! unchanged vtable slots, so `dlopen` has nothing new to reject and a separate
+//! Not `bin-e2e`: the declarations ride inside the prost payload over the
+//! function handle, so `dlopen` has nothing new to reject and a separate
 //! process would buy nothing (see `.claude/testing.md`).
 
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::{FnSignature, Param, ParamType};
-use heph::engine::provider::{
-    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
-    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
-    ProbeResponse, Provider, ProviderFn, ProviderFunctionDef,
+use heph::engine::PluginParts;
+use hplugin::function::{
+    DeclaredState, DeclaredTarget, FnArgs, FnCallContext, FnOutcome, FunctionCaller, PluginFn,
+    PluginFnDef,
 };
-use heph::hasync::Cancellable;
-use hplugin::provider::{DeclaredState, DeclaredTarget, FnOutcome};
 use std::sync::Arc;
 
 /// `heph.codegen.rule(name = …)`: declares a `bash` target that writes the
@@ -34,7 +34,7 @@ use std::sync::Arc;
 struct RuleFn;
 
 #[async_trait::async_trait]
-impl ProviderFn for RuleFn {
+impl PluginFn for RuleFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let name = match args.named.get("name") {
             Some(Value::String(s)) => s.clone(),
@@ -65,83 +65,65 @@ impl ProviderFn for RuleFn {
     }
 }
 
-/// A provider that exposes nothing but that one function.
-struct CodegenProvider;
+/// `heph.wrapper.rule(name = …)`: calls `heph.codegen.rule` through the
+/// registry handle its plugin was created with, and relays what it declared.
+struct WrapperFn {
+    functions: Arc<dyn FunctionCaller>,
+}
 
-impl Provider for CodegenProvider {
-    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-        Ok(ConfigResponse {
-            name: "codegen".to_string(),
-        })
-    }
-    fn list<'a>(
-        &'a self,
-        _req: ListRequest,
-        _ct: &'a (dyn Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<
-        'a,
-        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
-    > {
-        Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
-    }
-    fn list_packages<'a>(
-        &'a self,
-        _req: ListPackagesRequest,
-        _ct: &'a (dyn Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<
-        'a,
-        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
-    > {
-        Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
-    }
-    fn get<'a>(
-        &'a self,
-        _req: GetRequest,
-        _ct: &'a (dyn Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<'a, Result<GetResponse, GetError>> {
-        Box::pin(async { Err(GetError::NotFound) })
-    }
-    fn probe<'a>(
-        &'a self,
-        _req: ProbeRequest,
-        _ct: &'a (dyn Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<'a, anyhow::Result<ProbeResponse>> {
-        Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
-    }
-    fn functions(&self) -> Vec<ProviderFunctionDef> {
-        vec![ProviderFunctionDef {
-            name: "rule".to_string(),
-            signature: FnSignature {
-                positional: vec![],
-                named: vec![Param::required("name", ParamType::String)],
-                variadic: None,
-                returns: ParamType::String,
-            },
-            doc: "Declare a generated file target.".to_string(),
-            func: Arc::new(RuleFn),
-        }]
+#[async_trait::async_trait]
+impl PluginFn for WrapperFn {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+        let mut out = FnOutcome::from(Value::Null());
+        let addr = out.absorb(self.functions.call("codegen", "rule", ctx, args).await?);
+        out.set_value(addr);
+        Ok(out)
     }
 }
 
-#[tokio::test]
-async fn a_declaration_from_behind_the_plugin_abi_becomes_a_package_target() -> anyhow::Result<()> {
-    let ws = htestkit::WorkspaceBuilder::new()?
+fn rule_def(func: Arc<dyn PluginFn>) -> PluginFnDef {
+    PluginFnDef {
+        name: "rule".to_string(),
+        signature: FnSignature {
+            positional: vec![],
+            named: vec![Param::required("name", ParamType::String)],
+            variadic: None,
+            returns: ParamType::String,
+        },
+        doc: "Declare a generated file target.".to_string(),
+        func,
+    }
+}
+
+/// `defs` as a cdylib exports them and the host loads them: every call encodes
+/// a `CallFunctionRequest` and decodes a `CallFunctionResponse`.
+fn behind_the_abi(plugin: &str, defs: Vec<PluginFnDef>) -> anyhow::Result<Vec<PluginFnDef>> {
+    let (named, handle) = hplugin_sdk::stabby::make_plugin_functions(plugin, defs)?;
+    hplugin_stabby::load_stable::decode_functions(plugin, named.into_iter().collect(), handle)
+}
+
+fn workspace(builder: htestkit::WorkspaceBuilder) -> anyhow::Result<htestkit::Workspace> {
+    builder
         .with_provider(|init| {
             Box::new(heph::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
                 init.runtime.clone(),
-            ))
-        })
-        // Reached exactly as a loaded cdylib is: every call to `rule` encodes a
-        // `CallFunctionRequest` and decodes a `CallFunctionResponse`.
-        .with_provider(|_| {
-            Box::new(hplugin_stabby::load_stable::StableRemoteProvider::new(
-                hplugin_sdk::stabby::make_dyn_provider(Arc::new(CodegenProvider)),
-                "codegen",
+                std::sync::Arc::clone(&init.functions),
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .build()?;
+        .build()
+}
+
+#[tokio::test]
+async fn a_declaration_from_behind_the_plugin_abi_becomes_a_package_target() -> anyhow::Result<()> {
+    // A function-only plugin: no provider, one function, behind the ABI.
+    let ws = workspace(
+        htestkit::WorkspaceBuilder::new()?.with_plugin("codegen", |_| {
+            Ok(PluginParts::default()
+                .with_functions(behind_the_abi("codegen", vec![rule_def(Arc::new(RuleFn))])?))
+        }),
+    )?;
 
     // The BUILD file writes no `target()` of its own — the plugin declares it.
     ws.write_build_file("p", r#"gen = heph.codegen.rule(name = "gen")"#);
@@ -154,6 +136,47 @@ async fn a_declaration_from_behind_the_plugin_abi_becomes_a_package_target() -> 
 
     // …and it builds, which is the whole point: a plugin paved a tool without
     // shipping a provider or driver of its own.
+    let result = ws.run("//p:gen").await?;
+    assert_eq!(htestkit::artifact_string(&result).trim(), "generated");
+    Ok(())
+}
+
+/// I5 end to end: function-only plugin `wrapper` calls function-only plugin
+/// `codegen` through the registry its create entry was handed — by
+/// `(plugin, fn)`, back over the seam — and `codegen`'s declared target lands
+/// in the calling package because `wrapper` absorbs it.
+#[tokio::test]
+async fn declarations_absorbed_across_a_plugin_hop() -> anyhow::Result<()> {
+    let ws = workspace(
+        htestkit::WorkspaceBuilder::new()?
+            .with_plugin("codegen", |_| {
+                Ok(PluginParts::default()
+                    .with_functions(behind_the_abi("codegen", vec![rule_def(Arc::new(RuleFn))])?))
+            })
+            .with_plugin("wrapper", |init| {
+                // What a cdylib's create entry receives: this engine's registry,
+                // as an ABI handle, resolved through the engine's slot.
+                let functions = hplugin_sdk::stabby::guest_functions(
+                    hplugin_stabby::host::HostFunctionRegistry::wrap(
+                        Arc::clone(&init.functions),
+                        init.runtime.clone(),
+                    ),
+                );
+                Ok(PluginParts::default().with_functions(behind_the_abi(
+                    "wrapper",
+                    vec![rule_def(Arc::new(WrapperFn { functions }))],
+                )?))
+            }),
+    )?;
+
+    ws.write_build_file("p", r#"gen = heph.wrapper.rule(name = "gen")"#);
+
+    let spec = ws.get_spec("//p:gen").await?;
+    assert_eq!(
+        spec.driver, "bash",
+        "codegen's declaration crossed two hops"
+    );
+    assert_eq!(spec.labels, vec!["codegen".to_string()]);
     let result = ws.run("//p:gen").await?;
     assert_eq!(htestkit::artifact_string(&result).trim(), "generated");
     Ok(())

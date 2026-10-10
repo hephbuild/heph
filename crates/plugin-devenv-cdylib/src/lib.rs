@@ -13,7 +13,7 @@
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_devenv::plugindevenv;
 use plugin_sdk::stabby::abi::{
-    DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
+    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
 };
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
@@ -23,9 +23,13 @@ use std::sync::Arc;
 
 /// Stable ABI create entry. `cfg` is prost-encoded `pb::CreateConfig`; the
 /// `bin:` option is read out of it so a workspace can pin which `devenv` it
-/// resolves against rather than taking whatever is on `PATH`.
+/// resolves against rather than taking whatever is on `PATH`. The plugin has no
+/// functions, so the engine's function registry goes unused.
 #[stabby::export]
-pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginComponents {
+pub extern "C" fn heph_plugin_create(
+    cfg: stabby::vec::Vec<u8>,
+    _functions: DynFunctionRegistry,
+) -> PluginComponents {
     match build(&cfg) {
         Ok(c) => c,
         Err(e) => {
@@ -36,9 +40,10 @@ pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginCompone
             // act on.
             tracing::error!(error = %format!("{e:#}"), "devenv plugin: bad configuration");
             PluginComponents {
-                provider_name: "".into(),
                 provider: stabby::option::Option::None(),
                 drivers: stabby::vec::Vec::new(),
+                functions: stabby::vec::Vec::new(),
+                function_handle: stabby::option::Option::None(),
                 hooks: stabby::vec::Vec::new(),
                 runners: stabby::vec::Vec::new(),
                 meta: stabby::vec::Vec::new(),
@@ -92,9 +97,10 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     });
 
     Ok(PluginComponents {
-        provider_name: "".into(),
         provider: stabby::option::Option::None(),
         drivers,
+        functions: stabby::vec::Vec::new(),
+        function_handle: stabby::option::Option::None(),
         hooks: stabby::vec::Vec::new(),
         runners: stabby::vec::Vec::new(),
         meta: stabby::vec::Vec::new(),

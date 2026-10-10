@@ -12,8 +12,8 @@ mod common;
 use common::{BASE_CONFIG, Dist, Workspace, describe, sha256_file, write_manifest};
 
 /// A shipped cdylib must load *and answer*. Merely dlopening proves little —
-/// `inspect functions` makes the host call `functions()` on the loaded provider
-/// and render the signature it returns, so a passing assertion means a real
+/// `inspect functions` renders the signatures the loaded plugin's function
+/// metadata carried across the ABI, so a passing assertion means a real
 /// round trip across the ABI seam with real data coming back.
 #[test]
 fn shipped_go_cdylib_loads_and_answers_across_the_abi() {
@@ -848,5 +848,66 @@ fn shipped_names_match_the_name_map() {
                 describe(&out)
             );
         }
+    }
+}
+
+/// **A plugin built against another heph ABI is refused, saying so.**
+///
+/// No version is read at load: what refuses a skewed plugin is stabby's
+/// structural check on `heph_plugin_create`, whose `PluginComponents` layout an
+/// ABI break changes. The fixture is the smallest library that fails that check
+/// the way a 0.15 plugin does: it exports the create entry's stabby probe, and
+/// the probe answers "not my layout". It also exports `heph_plugin_set_log_sink`
+/// with a mismatched report, which the host must warn about rather than skip in
+/// silence. Built here with the system C compiler — a checked-in binary per
+/// platform, or a whole fixture crate staged with the release artifacts, would
+/// cost more than the seam it covers.
+#[test]
+fn a_plugin_from_another_abi_is_refused() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+
+    let src = ws.root().join("drift.c");
+    std::fs::write(
+        &src,
+        "void *heph_plugin_create_stabbied_v3(const void *r) { (void)r; return 0; }\n\
+         void heph_plugin_create(void) {}\n\
+         void *heph_plugin_set_log_sink_stabbied_v3(const void *r) { (void)r; return 0; }\n\
+         void heph_plugin_set_log_sink(void) {}\n",
+    )
+    .expect("write fixture source");
+    let dylib = ws
+        .root()
+        .join(format!("heph-drift-plugin.{}", common::DYLIB_EXT));
+    let cc = std::process::Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&dylib)
+        .arg(&src)
+        .output()
+        .expect("run the C compiler (the fixture needs one: set CC)");
+    assert!(cc.status.success(), "build fixture: {}", describe(&cc));
+
+    let manifest = ws.root().join("heph-drift-plugin.json");
+    write_manifest(&manifest, "drift", &dylib, None).expect("write manifest");
+    ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
+        .expect("write config");
+
+    let mut cmd = ws.cmd(&dist, &["inspect", "functions"]);
+    cmd.env("HEPH_LOG", "warn");
+    let out = cmd.output().expect("run");
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for want in [
+        "was built against a different heph ABI (host 0.16.0)",
+        "reinstall plugins from the same release",
+        &dylib.display().to_string(),
+        // The optional entry with a mismatched type is warned about.
+        "heph_plugin_set_log_sink",
+    ] {
+        assert!(
+            stderr.contains(want),
+            "missing {want:?}: {}",
+            describe(&out)
+        );
     }
 }

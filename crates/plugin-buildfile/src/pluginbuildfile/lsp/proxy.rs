@@ -536,7 +536,7 @@ fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) ->
             .find(|m| m.name == func)
             .map(|m| m.doc.clone());
     }
-    let registry = shared.engine.provider_function_registry();
+    let registry = shared.engine.function_registry();
     let rf = registry.get(&provider, &func)?;
     let sig = &rf.signature;
 
@@ -698,12 +698,12 @@ fn provider_member_completions(prefix: &str, shared: &SharedState) -> Vec<Comple
     let Some(base) = completion_member_base(prefix) else {
         return vec![];
     };
-    let registry = shared.engine.provider_function_registry();
+    let registry = shared.engine.function_registry();
     match base.as_slice() {
         // `heph.` → namespace names. `core` is a static builtin namespace, the
         // rest come from the providers that registered functions.
         ["heph"] => {
-            let mut names: Vec<String> = registry.providers().map(|(p, _)| p.to_string()).collect();
+            let mut names: Vec<String> = registry.plugins().map(|(p, _)| p.to_string()).collect();
             names.push("core".to_string());
             names.sort();
             names.dedup();
@@ -738,7 +738,7 @@ fn provider_member_completions(prefix: &str, shared: &SharedState) -> Vec<Comple
             .collect(),
         // `heph.<provider>.` → that provider's functions.
         ["heph", provider] => registry
-            .providers()
+            .plugins()
             .find(|(p, _)| p == provider)
             .map(|(_, fns)| {
                 let mut items: Vec<CompletionItem> = fns
@@ -1248,16 +1248,14 @@ mod tests {
 
     struct FakeEngine {
         root: std::path::PathBuf,
-        registry: std::sync::Arc<hplugin::provider::ProviderFunctionRegistry>,
+        registry: std::sync::Arc<hplugin::function::FunctionRegistry>,
     }
 
     impl hplugin::lsp::LspEngine for FakeEngine {
         fn root(&self) -> &Path {
             &self.root
         }
-        fn provider_function_registry(
-            &self,
-        ) -> std::sync::Arc<hplugin::provider::ProviderFunctionRegistry> {
+        fn function_registry(&self) -> std::sync::Arc<hplugin::function::FunctionRegistry> {
             std::sync::Arc::clone(&self.registry)
         }
         fn driver_schema(&self, name: &str) -> Option<hplugin::driver::DriverSchema> {
@@ -1312,7 +1310,7 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         let tmp = tempfile::tempdir().unwrap();
-        let registry = Arc::new(hplugin::provider::ProviderFunctionRegistry::default());
+        let registry = Arc::new(hplugin::function::FunctionRegistry::default());
         let patterns = vec![glob::Pattern::new("BUILD").unwrap()];
         let walker = Arc::new(hwalk::CachedWalker::disabled());
         let loader = BuildFileLoader::new(
