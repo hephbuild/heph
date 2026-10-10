@@ -82,6 +82,15 @@ what keeps this from being a plugin-only feature.
 `version` is checked by exact match. `fingerprint` is required — see below, it
 is the field the correctness of the whole feature rests on.
 
+A hand-written runner whose `runner.json` embeds a checkout's paths — anything
+built from `$WORKSPACE_ROOT`, a sandbox path, or the heph home — must be
+`cache = {"remote": False}`. A remote-eligible entry lives in the store every
+linked git worktree shares (see [HOME_DIR.md](HOME_DIR.md)), under a key every
+checkout computes the same, so a worktree would be served the main checkout's
+paths, which may well exist and quietly run the wrong tree. A `remote: False`
+entry is stored per checkout. The builtin runner drivers (devenv, nix,
+`oci_runner`) already are.
+
 ### The builtin runners
 
 | name | what it does | needs |

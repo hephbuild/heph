@@ -180,6 +180,33 @@ struct TargetOutcome {
 /// keep, and the revision just written (never deleted).
 pub(crate) type TrimItem = (CacheScope, Addr, u32, String);
 
+/// How old a revision pin's sidecar must be before `heph tool gc` may remove
+/// the pin.
+///
+/// The locks alone do not cover a build's tail. A build commits its manifest
+/// into the sqlite write-behind queue (`SqliteCacheWriter::commit` only
+/// enqueues) and then lets go of the gateway and, when its request ends, of
+/// its riding read, without waiting for the writer thread's batch commit. A gc
+/// in another process cannot see that queued write, so in that window it finds
+/// the revision absent, takes both locks, and would remove the pin of a
+/// revision about to land. The driver rewrites the sidecar on every build of
+/// the revision, so a pin this young belongs to a build that may still be
+/// writing. An hour is far past any queue drain; a pin of a revision that
+/// really is gone waits one more `gc` at most.
+const PIN_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// Whether `sidecar` was written less than [`PIN_GRACE`] ago. Unreadable
+/// metadata, or an mtime in the future, counts as young: keeping a pin is
+/// always safe.
+fn pin_is_young(sidecar: &std::path::Path) -> bool {
+    let Ok(mtime) = std::fs::metadata(sidecar).and_then(|m| m.modified()) else {
+        return true;
+    };
+    std::time::SystemTime::now()
+        .duration_since(mtime)
+        .map_or(true, |age| age < PIN_GRACE)
+}
+
 /// What phase 1 decided for a target; applied under its lock in phase 2.
 #[derive(Debug, Clone, Copy)]
 enum Decision {
@@ -368,8 +395,13 @@ impl Engine {
     /// Remove `pin` if its revision is no longer cached. `Ok(false)` when it is
     /// kept: the revision is cached, or is being built (the target's gateway is
     /// held — the build may be about to write it) or read (its revision lock
-    /// is), the same lock-skipping as [`gc_revision`](Self::gc_revision).
+    /// is), the same lock-skipping as [`gc_revision`](Self::gc_revision). A pin
+    /// younger than [`PIN_GRACE`] is kept whatever the cache says (see there).
     fn gc_revision_pin(&self, pin: &hdriver_support::revision_pin::Pin) -> Result<bool> {
+        if pin_is_young(&pin.paths.sidecar) {
+            tracing::debug!(addr = %pin.addr, hashin = %pin.hashin, "gc: revision pin kept, too recent");
+            return Ok(false);
+        }
         // Unlocked first: a pin of a cached revision — the steady state — is
         // kept without taking any lock.
         if self.revision_cached(&pin.addr, &pin.hashin)? {
@@ -2209,13 +2241,14 @@ mod tests {
             p
         };
         // Sidecars are written through the driver's API, so the test reads
-        // what a driver writes.
+        // what a driver writes, then aged past `PIN_GRACE`.
         let sidecar = |p: &revision_pin::PinPaths, a: &Addr, h: &str| {
             let (p, a, h) = (p.clone(), a.clone(), h.to_string());
             async move {
                 revision_pin::write_sidecar(&p, &a, &h)
                     .await
-                    .expect("sidecar")
+                    .expect("sidecar");
+                backdate(&p.sidecar);
             }
         };
 
@@ -2280,6 +2313,7 @@ mod tests {
         revision_pin::write_sidecar(&p, &a, "h1")
             .await
             .expect("sidecar");
+        backdate(&p.sidecar);
         std::fs::write(&p.pin, "").expect("pin");
         let listed = revision_pin::list(dir.path()).expect("list");
         assert_eq!(listed.len(), 1);
@@ -2294,6 +2328,40 @@ mod tests {
         drop(riding);
         assert!(engine.gc_revision_pin(&listed[0]).expect("gc pin"));
         assert!(!p.pin.exists() && !p.sidecar.exists());
+    }
+
+    /// Age a sidecar past [`PIN_GRACE`].
+    fn backdate(sidecar: &std::path::Path) {
+        let then = std::time::SystemTime::now() - PIN_GRACE - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(sidecar)
+            .expect("open sidecar")
+            .set_modified(then)
+            .expect("backdate sidecar");
+    }
+
+    /// A pin younger than `PIN_GRACE` is kept even when its revision is
+    /// uncached and nothing holds a lock: its build may have released its
+    /// locks with the manifest still in the write-behind queue, invisible to
+    /// another process's gc.
+    #[tokio::test]
+    async fn a_young_revision_pin_is_kept() {
+        use hdriver_support::revision_pin;
+        let (engine, dir) = test_engine();
+        let a = addr("t");
+        let p = revision_pin::paths(dir.path(), &a, "h1");
+        revision_pin::write_sidecar(&p, &a, "h1")
+            .await
+            .expect("sidecar");
+        std::fs::write(&p.pin, "").expect("pin");
+        let listed = revision_pin::list(dir.path()).expect("list");
+        assert!(!engine.gc_revision_pin(&listed[0]).expect("gc pin"));
+        assert!(p.pin.exists() && p.sidecar.exists());
+
+        backdate(&p.sidecar);
+        assert!(engine.gc_revision_pin(&listed[0]).expect("gc pin"));
+        assert!(!p.pin.exists());
     }
 
     #[tokio::test]

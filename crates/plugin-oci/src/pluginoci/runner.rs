@@ -90,9 +90,10 @@ pub struct Driver {
     /// `Err` holds why the host's home is unusable; the driver is still
     /// registered, and fails its runs with that reason (see [`home_from_host`]).
     home: Result<std::path::PathBuf, String>,
-    /// The home every checkout shares, mounted too: a sandbox holds symlinks
-    /// into its `scratch/`, which would dangle in the container otherwise. The
-    /// same directory as `home` outside a linked worktree (then mounted once).
+    /// The home every checkout shares. Its `scratch/` is mounted too (only
+    /// that): a sandbox holds symlinks into it, which would dangle in the
+    /// container otherwise. The same directory as `home` outside a linked
+    /// worktree, where `home`'s mount already covers it.
     /// `Ok(None)` from a host that predates `CreateConfig.shared_home`; `Err`
     /// fails runs like `home`'s (see [`shared_home_from_host`]).
     shared_home: Result<Option<std::path::PathBuf>, String>,
@@ -116,18 +117,26 @@ pub fn shared_home_from_host(shared_home: &str) -> Result<Option<std::path::Path
 }
 
 /// What the runner's container mounts, each at its own path: the workspace
-/// tree, this checkout's home (its sandboxes), and the shared home when it is
-/// a different directory (the scratch caches a sandbox links to).
+/// tree, this checkout's home (its sandboxes), and the shared home's
+/// `scratch/` when it is not already under one of those.
+///
+/// Only `scratch/` of the shared home: a sandbox's scratch mounts are the one
+/// thing in a sandbox that points into it (staged inputs are in the checkout's
+/// home, presented credential files in the sandbox). Mounting the whole shared
+/// home would hand the container the main checkout's cache, credentials and
+/// locks for nothing. Outside a linked worktree the shared home is `home`, so
+/// the mounts are `[tree, home]`.
 fn container_mounts(
     tree_root: &std::path::Path,
     home: &std::path::Path,
     shared_home: Option<&std::path::Path>,
 ) -> Vec<String> {
-    let mut mounts = vec![tree_root, home];
-    if let Some(shared) = shared_home
-        && !mounts.contains(&shared)
-    {
-        mounts.push(shared);
+    let mut mounts = vec![tree_root.to_path_buf(), home.to_path_buf()];
+    if let Some(shared) = shared_home {
+        let scratch = shared.join("scratch");
+        if !mounts.iter().any(|m| scratch.starts_with(m)) {
+            mounts.push(scratch);
+        }
     }
     mounts
         .into_iter()
@@ -345,8 +354,8 @@ impl ManagedDriver for Driver {
         //
         // Sandboxes and the agent socket both live under this checkout's
         // home, and the container needs to see both at their own paths. A
-        // sandbox's scratch mounts are symlinks into the *shared* home, so in
-        // a linked worktree that is mounted too.
+        // sandbox's scratch mounts are symlinks into the *shared* home's
+        // `scratch/`, so in a linked worktree that directory is mounted too.
         let mounts = container_mounts(&req.request.tree_root_path, heph_home, shared_home);
 
         // Named `oci`, not `session`: this plugin implements the runner. See
@@ -423,10 +432,11 @@ mod tests {
     #[test]
     fn mounts_both_homes_once_each() {
         let p = std::path::Path::new;
-        // A linked worktree: the tree, its own home, and the shared one.
+        // A linked worktree: the tree, its own home, and the shared home's
+        // scratch store — not the rest of the shared home.
         assert_eq!(
             container_mounts(p("/wt"), p("/wt/.heph"), Some(p("/main/.heph"))),
-            ["/wt", "/wt/.heph", "/main/.heph"]
+            ["/wt", "/wt/.heph", "/main/.heph/scratch"]
         );
         // Outside a worktree the homes are one directory: mounted once.
         assert_eq!(

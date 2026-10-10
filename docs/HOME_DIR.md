@@ -86,8 +86,11 @@ remote-eligible target (`cache/cache.db`, `cache/blobs/`), `cache/remote-tmp/`,
 `auth/`, `scratch/`, the gateway, revision and rebuild locks, and `diag/`.
 
 The OCI runner mounts the workspace tree, the checkout's home (its sandboxes)
-and the shared home (a sandbox's scratch mounts are symlinks into it) into its
-container. A plugin gets the shared home as `CreateConfig.shared_home` /
+and the shared home's `scratch/` into its container — only `scratch/`: a
+sandbox's scratch mounts are symlinks into it, and nothing else in a sandbox
+points into the shared home (staged inputs are in the checkout's home,
+presented credential files in the sandbox). Outside a linked worktree
+`scratch/` is inside the one home, so the mounts are the tree and the home. A plugin gets the shared home as `CreateConfig.shared_home` /
 `PluginInit.shared_home`.
 
 ### Costs of sharing
@@ -96,15 +99,32 @@ container. A plugin gets the shared home as `CreateConfig.shared_home` /
   the shared home, so a build of `//p:a` in one checkout waits for a build of
   `//p:a` in another — whichever revision each is building. Different targets
   never wait on each other.
-- **The shared cache grows with the number of worktrees.** The shared store
-  holds every checkout's revisions of a target, so when the home is shared it
-  keeps up to `history × checkouts` revisions per target instead of `history`.
-  `checkouts` is the main checkout plus each linked worktree that still exists
-  on disk (a registered worktree whose tree is gone does not count), counted
-  once when heph starts. Two checkouts building different revisions of one
-  target (a branch that changed its sources) then keep both rather than
-  evicting each other's. The checkout's own store (`remote: false` entries)
-  keeps plain `history`, and so does an unshared home.
+- **The shared cache grows with the number of worktrees, up to 4×.** The
+  shared store holds every checkout's revisions of a target, so when the home
+  is shared it keeps up to `history × min(checkouts, 4)` revisions per target
+  instead of `history`. `checkouts` is the main checkout plus each linked
+  worktree that still exists on disk (a registered worktree whose tree is gone
+  does not count), counted once when heph starts. Two checkouts building
+  different revisions of one target (a branch that changed its sources) then
+  keep both rather than evicting each other's. The cap of 4 covers the main
+  checkout plus a few branches in flight, and keeps disk bounded when a
+  repository has many worktrees (agents spawn dozens); past 4 checkouts,
+  worktrees building different revisions of one target evict each other again.
+  The checkout's own store (`remote: false` entries) keeps plain `history`, and
+  so does an unshared home.
+- **A `remote: False` target is stored once per worktree.** Its entries are
+  per checkout (above), so N checkouts that build it hold N copies: N × its
+  output size, and N builds.
+- **A worktree's nix gcroots are swept only by that worktree's `gc`.** They
+  live in its own home, next to the revisions they pin; a `gc` in the main
+  checkout or another worktree does not see them. They go away with the
+  worktree's directory (`git worktree remove`), after which
+  `nix-collect-garbage` can reclaim their store paths.
+- **Detection costs a few syscalls per registered worktree.** Every heph
+  process reads `.git/worktrees/` and, per registered worktree, its `gitdir`
+  file and a stat of the path it names: about 4–5 syscalls each. Negligible
+  for a handful; it grows linearly with stale registrations, which
+  `git worktree prune` removes.
 - **A worktree on another filesystem** pays a byte copy for each blob it writes
   into the shared cache: the write is a rename where the filesystems agree and
   falls back to a copy where they do not.
@@ -125,16 +145,14 @@ Check, in order:
    reason is one of the list above (not a heph workspace in the main checkout,
    a different `homeDir`, an unwritable main home, a submodule, a broken
    `.git`, …).
-4. **The old `.heph3` home.** The default home moved from `.heph3` to `.heph`;
-   heph hints at a leftover `.heph3` in the checkout's root. Its cache is not
-   read.
-5. **The target is `remote: false`.** Its entries are per checkout (above), so
+4. **The target is `remote: false`.** Its entries are per checkout (above), so
    the first build in each worktree is a miss by design.
-6. **`cache.history` evicted it.** The shared store keeps `history × checkouts`
-   revisions of a target (above), so this takes more new revisions than that
-   budget across all checkouts, for example one checkout building several
-   revisions in a row.
-7. **An `oci_runner` consumer.** Its key includes host paths (the runner's
+5. **`cache.history` evicted it.** The shared store keeps
+   `history × min(checkouts, 4)` revisions of a target (above), so this takes
+   more new revisions than that budget across all checkouts: one checkout
+   building several revisions in a row, or more than 4 checkouts building
+   different revisions of the target.
+6. **An `oci_runner` consumer.** Its key includes host paths (the runner's
    mounts carry the checkout's absolute paths), so it differs per checkout.
    This predates sharing and is known.
 
@@ -149,8 +167,8 @@ whenever the home is or may be shared:
 - it runs in a main checkout whose repository has any linked worktrees
   (`.git/worktrees/*`), whatever its own `shareHome` says.
 
-History trimming (`cache.history`, scaled by the number of checkouts in the
-shared store; see "Costs of sharing") still runs. The checkout's own store
+History trimming (`cache.history`, scaled in the shared store by the number
+of checkouts, at most 4×; see "Costs of sharing") still runs. The checkout's own store
 (`remote: false` entries) belongs to this checkout alone, so it always gets the
 full sweep. `gc` prints why it skipped, e.g. `Orphan sweep skipped: the home is
 shared with 2 linked worktree(s), so 3 target(s) that do not resolve here were
@@ -171,8 +189,19 @@ caches, so `nix-collect-garbage` can reclaim the store paths. The nix driver
 keeps one root per cached revision, with a sidecar file naming that revision,
 in `<checkout home>/nix-driver/nix-gcroots/`. A root is kept while its
 revision is in either of this checkout's stores, while its target is being
-built, and while its revision is being read. A root with no sidecar names no
-revision and is never removed.
+built, while its revision is being read, and for an hour after its sidecar
+was written (a build releases its locks before its cache write has landed on
+disk, so a younger root may belong to a revision about to appear). A root with
+no sidecar names no revision and is never removed.
+
+Roots written before this scheme are named `<16-hex addr hash>` alone, with
+no `.rev` sidecar, in the same `nix-driver/nix-gcroots/` of the home heph
+used then (each checkout had its own). `gc` never removes them. Deleting them by hand lets `nix-collect-garbage`
+collect their store paths. A target whose cached revision used such a path
+then does **not** rebuild on its own: the cache hit serves the cached
+wrapper, a `#!/bin/sh` script that `exec`s the store path, and running it
+fails loudly (`exec: /nix/store/…: not found`, exit 127). Clean the target
+(`heph tool clean //pkg:target`) or run with `--force` to rebuild it.
 
 ## `${git:branch}`
 

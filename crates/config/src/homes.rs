@@ -49,6 +49,17 @@ impl AsRef<Path> for CheckoutHome {
     }
 }
 
+/// The most checkouts the shared store's `cache.history` scales by
+/// ([`HomeSharing::shared_history`]).
+///
+/// Sized for the common shape: the main checkout plus a few branches in
+/// flight at once, each keeping its own revisions. Past that, scaling would
+/// stop paying for itself: a repository with dozens of agent worktrees would
+/// multiply every target's footprint in the shared cache by dozens, so disk
+/// stays bounded at this many times `history`, and the worktrees beyond it
+/// evict each other as they did before scaling.
+pub const MAX_HISTORY_CHECKOUTS: u32 = 4;
+
 /// Whether, and with whom, the shared home is shared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HomeSharing {
@@ -101,13 +112,14 @@ impl HomeSharing {
     }
 
     /// The `cache.history` the **shared** store enforces for a target declaring
-    /// `history`: `history × checkouts`. In the shared store a target's
-    /// revisions are every checkout's, so a per-target budget of `history`
-    /// would let two checkouts building different revisions evict each other;
-    /// scaled, each keeps roughly its own `history`. Unchanged when the home is
-    /// not shared. A checkout's own store keeps plain `history`.
+    /// `history`: `history × min(checkouts, MAX_HISTORY_CHECKOUTS)`. In the
+    /// shared store a target's revisions are every checkout's, so a per-target
+    /// budget of `history` would let two checkouts building different revisions
+    /// evict each other; scaled, each keeps roughly its own `history`, up to
+    /// the cap. Unchanged when the home is not shared. A checkout's own store
+    /// keeps plain `history`.
     pub fn shared_history(&self, history: u32) -> u32 {
-        history.saturating_mul(self.checkouts())
+        history.saturating_mul(self.checkouts().min(MAX_HISTORY_CHECKOUTS))
     }
 
     /// "N registered worktree(s) no longer exist; run `git worktree prune`",
@@ -491,6 +503,19 @@ mod tests {
         );
 
         assert_eq!(main.shared_history(u32::MAX), u32::MAX, "saturates");
+
+        // Capped at `MAX_HISTORY_CHECKOUTS`, however many worktrees there are.
+        let many = HomeSharing::Main {
+            worktrees: wts(10, 0),
+        };
+        assert_eq!(many.checkouts(), 11);
+        assert_eq!(many.shared_history(1), MAX_HISTORY_CHECKOUTS);
+        assert_eq!(many.shared_history(1), 4);
+        assert_eq!(many.shared_history(2), 8);
+        let at_cap = HomeSharing::Main {
+            worktrees: wts(3, 0),
+        };
+        assert_eq!(at_cap.shared_history(1), 4, "main + 3 is exactly the cap");
     }
 
     /// A worktree removed without `git worktree prune` stops counting, as
@@ -822,7 +847,10 @@ mod tests {
         let as_root = std::fs::write(&probe, "").is_ok();
         if as_root {
             set(&main, 0o755);
-            eprintln!("skipping: running as root");
+            eprintln!(
+                "skipping main_home_not_writable_keeps_own: running as root, which ignores \
+                 mode bits, so an unwritable main home cannot be set up"
+            );
             return;
         }
 

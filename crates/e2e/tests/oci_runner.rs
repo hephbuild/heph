@@ -222,10 +222,11 @@ async fn the_mounted_home_is_the_resolved_one_even_in_a_package_named_sandbox() 
 }
 
 /// In a linked git worktree the checkout's home and the shared home are two
-/// directories, and the container mounts both: the sandboxes are under the
-/// worktree's own home, and their scratch symlinks point into the shared one
-/// (the main checkout's). Outside a worktree the two are one directory, so the
-/// test above cannot tell a runner that mounts both from one that mounts one.
+/// directories, and the container mounts the first and the second's
+/// `scratch/`: the sandboxes are under the worktree's own home, and their
+/// scratch symlinks point into the shared one (the main checkout's), which is
+/// the only thing in it a sandbox reaches. Outside a worktree the two are one
+/// directory, so the test above cannot tell these mounts apart.
 ///
 /// No daemon needed: `docker` is a stub that reports a digest.
 #[cfg(unix)]
@@ -287,14 +288,16 @@ async fn a_worktree_runner_mounts_both_homes() -> anyhow::Result<()> {
         .as_array()
         .map(|m| m.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
+    let scratch = main.join(".heph").join("scratch");
     assert_eq!(
         mounts,
         [
             wt.to_string_lossy().as_ref(),
             checkout.as_str(),
-            shared.as_str()
+            scratch.to_string_lossy().as_ref()
         ],
-        "the tree, the worktree's own home and the shared home, once each"
+        "the tree, the worktree's own home and the shared home's scratch store, once each \
+         (not the rest of the shared home: {shared})"
     );
     Ok(())
 }

@@ -49,10 +49,32 @@ pub fn paths(dir: &Path, addr: &Addr, hashin: &str) -> PinPaths {
 }
 
 /// Record which revision `paths` pins. Call before creating the pin.
+///
+/// Atomic: written to a temp file in the same directory, then renamed over the
+/// sidecar, so gc never reads a half-written one. The temp name does not end
+/// in `.rev`, so [`list`] never takes it for a sidecar.
 pub async fn write_sidecar(paths: &PinPaths, addr: &Addr, hashin: &str) -> anyhow::Result<()> {
-    tokio::fs::write(&paths.sidecar, sidecar_contents(addr, hashin))
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = paths.sidecar.clone().into_os_string();
+    tmp.push(format!(".{}-{seq}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    tokio::fs::write(&tmp, sidecar_contents(addr, hashin))
         .await
-        .with_context(|| format!("write revision pin sidecar {}", paths.sidecar.display()))
+        .with_context(|| format!("write revision pin sidecar {}", tmp.display()))?;
+    if let Err(e) = tokio::fs::rename(&tmp, &paths.sidecar).await {
+        // Best-effort: the rename's error is the one worth reporting.
+        if let Err(rm) = tokio::fs::remove_file(&tmp).await {
+            tracing::debug!(tmp = %tmp.display(), error = %rm, "removing a sidecar temp file");
+        }
+        return Err(e).with_context(|| {
+            format!(
+                "rename revision pin sidecar into {}",
+                paths.sidecar.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 fn sidecar_contents(addr: &Addr, hashin: &str) -> String {

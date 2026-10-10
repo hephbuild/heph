@@ -328,6 +328,61 @@ async fn local_only_entries_are_per_checkout() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `heph tool clean` in a worktree reaches both of its stores: a `remote:
+/// False` target's entry goes from the worktree's own store, a shared
+/// target's from the shared store — so the main checkout rebuilds it too.
+#[tokio::test]
+async fn clean_in_a_worktree_cleans_both_stores() -> anyhow::Result<()> {
+    use heph::htmatcher::Matcher;
+    async fn clean(root: &Path, addr: &str) -> anyhow::Result<heph::engine::CleanStats> {
+        let e = engine_at(root)?;
+        e.clone()
+            .clean(
+                e.new_state(),
+                &Matcher::Addr(parse_addr(addr)?),
+                heph::engine::Discovery::Complete,
+            )
+            .await
+    }
+    let r = repo();
+    let build = format!("{STAMPED}\n{LOCAL_ONLY}\n");
+    write_build(&r.main, "p", &build);
+    write_build(&r.wt, "p", &build);
+
+    let wt_lo = run_and_settle(&engine_at(&r.wt)?, "//p:lo").await?;
+    let shared_a = run_and_settle(&engine_at(&r.wt)?, "//p:a").await?;
+    assert_eq!(
+        run_and_settle(&engine_at(&r.main)?, "//p:a").await?,
+        shared_a,
+        "main hits the worktree's shared entry"
+    );
+
+    let stats = clean(&r.wt, "//p:lo").await?;
+    assert_eq!(
+        (stats.targets_cleaned, stats.revisions_removed),
+        (1, 1),
+        "{stats:?}"
+    );
+    assert_ne!(
+        run_and_settle(&engine_at(&r.wt)?, "//p:lo").await?,
+        wt_lo,
+        "gone from the worktree's own store, so it rebuilt"
+    );
+
+    let stats = clean(&r.wt, "//p:a").await?;
+    assert_eq!(
+        (stats.targets_cleaned, stats.revisions_removed),
+        (1, 1),
+        "{stats:?}"
+    );
+    assert_ne!(
+        run_and_settle(&engine_at(&r.main)?, "//p:a").await?,
+        shared_a,
+        "gone from the shared store, so the main checkout rebuilt it too"
+    );
+    Ok(())
+}
+
 /// Same BUILD, different source bytes: the worktree's key differs, so it
 /// misses and builds its own entry; the main checkout's entry survives and
 /// still hits.
@@ -457,7 +512,10 @@ async fn per_checkout_wiring_in_a_worktree() -> anyhow::Result<()> {
         .iter()
         .any(|n| n.starts_with("sandboxfuse"))
     {
-        eprintln!("FUSE unavailable here: its placement is not observed");
+        eprintln!(
+            "per_checkout_wiring_in_a_worktree: skipping the FUSE placement check: FUSE is \
+             unavailable here, so no sandboxfuse mount was made to observe"
+        );
     }
     Ok(())
 }

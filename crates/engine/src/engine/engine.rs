@@ -514,26 +514,46 @@ impl StoreOptions {
     }
 }
 
-/// The checkout's own durable store ([`CacheScope::Checkout`]), opened on
-/// first use.
+/// The checkout's own durable store ([`CacheScope::Checkout`]): opened at
+/// construction when its database exists (the steady state), created on first
+/// use otherwise.
 ///
 /// [`CacheScope::Checkout`]: crate::engine::local_cache::CacheScope::Checkout
 pub(crate) struct CheckoutCacheStore {
     dir: PathBuf,
     opts: StoreOptions,
     store: std::sync::OnceLock<Arc<dyn LocalCache>>,
-    /// Serializes the open, so two first users cannot both open the sqlite db.
+    /// Serializes the first-use creation, so two first users cannot both open
+    /// the sqlite db.
     opening: Mutex<()>,
 }
 
 impl CheckoutCacheStore {
-    fn new(dir: PathBuf, opts: StoreOptions) -> Self {
-        Self {
+    /// Opens the store now when its database is already on disk, so the
+    /// steady state never opens sqlite lazily — on a runtime worker, under
+    /// `opening`, parking every other worker that needs the store meanwhile.
+    /// Only the very first local-only build of a checkout pays that, once.
+    fn new(dir: PathBuf, opts: StoreOptions) -> anyhow::Result<Self> {
+        let store = if dir.join("cache.db").exists() {
+            std::sync::OnceLock::from(
+                opts.open(&dir)
+                    .with_context(|| format!("opening the checkout's cache {}", dir.display()))?,
+            )
+        } else {
+            std::sync::OnceLock::new()
+        };
+        Ok(Self {
             dir,
             opts,
-            store: std::sync::OnceLock::new(),
+            store,
             opening: Mutex::new(()),
-        }
+        })
+    }
+
+    /// Whether the store is open (tests).
+    #[cfg(test)]
+    fn is_open(&self) -> bool {
+        self.store.get().is_some()
     }
 
     fn get(&self) -> anyhow::Result<Arc<dyn LocalCache>> {
@@ -625,10 +645,12 @@ impl Engine {
         };
         let local_cache = store_opts.open(&home.join("cache"))?;
         // The checkout's own store, for the entries that must not be shared
-        // (see `CacheScope`). Opened on first use: most worktrees build no
+        // (see `CacheScope`). Opened here when it already exists, like the
+        // shared one; created on first use otherwise: most worktrees build no
         // local-only target and never need it.
         let checkout_cache = (checkout_home.as_path() != home.as_path())
-            .then(|| CheckoutCacheStore::new(checkout_home.join("cache"), store_opts));
+            .then(|| CheckoutCacheStore::new(checkout_home.join("cache"), store_opts))
+            .transpose()?;
 
         // Mem-only tier for tmp/uncacheable revisions; spills oversized or
         // over-budget entries to the durable cache so a reader never misses.
@@ -1362,6 +1384,38 @@ mod tests {
             .map(|(s, _)| s)
             .collect();
         assert_eq!(scopes, [CacheScope::Shared, CacheScope::Checkout]);
+    }
+
+    /// Once a checkout store exists on disk, the next engine opens it at
+    /// construction, so no request opens sqlite lazily on a runtime worker.
+    #[test]
+    fn an_existing_checkout_store_is_opened_eagerly() {
+        use crate::engine::local_cache::CacheScope;
+        use hconfig::git_checkout::test_layout::{linked_worktree, main_checkout};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let (main, wt) = (base.join("main"), base.join("wt"));
+        main_checkout(&main, "master");
+        linked_worktree(&main, &wt, "wt", "feat");
+        let _rt = crate::engine::test_rt_enter();
+
+        let first = Engine::new(Config::for_tests_detected(&wt)).expect("engine");
+        let store = first.checkout_cache.as_ref().expect("a worktree");
+        assert!(!store.is_open(), "no database yet: created on first use");
+        first
+            .local_cache_for(CacheScope::Checkout)
+            .expect("create it");
+        drop(first);
+
+        let second = Engine::new(Config::for_tests_detected(&wt)).expect("engine");
+        assert!(
+            second
+                .checkout_cache
+                .as_ref()
+                .expect("a worktree")
+                .is_open(),
+            "the database exists, so it is open after Engine::new"
+        );
     }
 
     // Names the dir after pid 1 (init/launchd): always alive, always owned by
