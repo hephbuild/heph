@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Target spec/def wire types. Mirrors crates/plugin/src/driver.rs.
 package heph.plugin.v1;

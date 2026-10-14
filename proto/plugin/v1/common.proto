@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Shared value/address/sandbox types for the heph external-plugin ABI.
 // Mirrors the in-process contract types in crates/plugin and crates/model so
@@ -103,7 +103,7 @@ message Addr {
 // A reference to (an output of) a target. Mirrors driver::TargetAddr.
 message TargetAddr {
   Addr ref = 1;
-  optional string output = 2;
+  string output = 2;
   repeated string filters = 3;
 }
 

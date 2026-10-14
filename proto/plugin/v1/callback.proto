@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Host-exported callback surface (the AbiHost). The plugin calls back into the
 // host while serving get()/parse(). Carries the bidirectional hot path.

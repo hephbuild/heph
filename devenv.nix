@@ -52,6 +52,50 @@ let
     installPhase = "install -Dm755 kache $out/bin/kache";
   };
 
+  # buffa — the protobuf codegen behind `gen` (see `buf.gen.yaml`). It replaced
+  # prost, which cannot read an editions file (`unknown syntax: editions`). Not
+  # in nixpkgs; the release binaries are self-contained (static-pie on Linux,
+  # libSystem-only Mach-O on darwin), so fetch them the same way as kache.
+  #
+  # Bumping: change `buffaVersion` to match the `buffa` crate in
+  # `proto/Cargo.toml.tpl` (generated code and runtime are released together),
+  # then re-derive each hash from the release's `checksums-sha256.txt` with
+  #   nix hash convert --hash-algo sha256 --to sri <hex>
+  buffaVersion = "0.9.2";
+  buffaAssets = {
+    aarch64-darwin = {
+      os = "darwin-aarch64";
+      gen = "sha256-ZU9KXVghKvvbPex0ddmda8bLosEIB8N1FlLNOAbPWl0=";
+      packaging = "sha256-fyIT67PeYDYbXvnJGqduCS9hxwvZsMtjEwL+z2d/eOw=";
+    };
+    x86_64-linux = {
+      os = "linux-x86_64";
+      gen = "sha256-6Nh7DMNL61Ukg1iI2mlJAd7uzK79g0/VwDMAN1tilog=";
+      packaging = "sha256-ll5bey72hH9ll9MlZUaKCT1wq4LudMMm/1OXsE1BkWE=";
+    };
+    aarch64-linux = {
+      os = "linux-aarch64";
+      gen = "sha256-FPgoXMVY8TaqqKQB6ALw6eemVehtv4Xe14QfNf32K0I=";
+      packaging = "sha256-N6UancnWLbYHDyAvEumgvZqL83z6Stv+tgPPq+D5/1g=";
+    };
+  };
+  buffaAsset =
+    buffaAssets.${pkgs.stdenv.hostPlatform.system}
+      or (throw "buffa: no prebuilt plugin for ${pkgs.stdenv.hostPlatform.system}");
+  buffaPlugin = name: hash: pkgs.stdenvNoCC.mkDerivation {
+    pname = name;
+    version = buffaVersion;
+    src = pkgs.fetchurl {
+      url = "https://github.com/anthropics/buffa/releases/download/v${buffaVersion}/${name}-v${buffaVersion}-${buffaAsset.os}";
+      inherit hash;
+    };
+    dontUnpack = true;
+    dontBuild = true;
+    dontPatchELF = true;
+    dontStrip = true;
+    installPhase = "install -Dm755 $src $out/bin/${name}";
+  };
+
   binLocation = "$HOME/.local/bin/heph3";
   qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p execrunner -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-devenv -p plugin-devenv-cdylib -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p fetch -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
 in
@@ -73,9 +117,8 @@ in
     # unaffected by this; only the `host` toolchain reads it.
     pkgs.go
     pkgs.buf
-    pkgs.protoc-gen-prost
-    pkgs.protoc-gen-prost-serde
-    pkgs.protoc-gen-prost-crate
+    (buffaPlugin "protoc-gen-buffa" buffaAsset.gen)
+    (buffaPlugin "protoc-gen-buffa-packaging" buffaAsset.packaging)
     pkgs.zig
     pkgs.cargo-zigbuild
     pkgs.tokio-console
@@ -159,7 +202,12 @@ in
 
   # https://devenv.sh/scripts/
   scripts.gen-proto.exec = "buf generate";
-  scripts.gen.exec = "rm -rf gen && gen-proto";
+  scripts.gen.exec = ''
+    set -e
+    rm -rf gen
+    gen-proto
+    cp proto/Cargo.toml.tpl gen/proto/Cargo.toml
+  '';
   scripts.gen-go-large.exec = ''
     rm -rf $DEVENV_ROOT/example/go/large
     cd $DEVENV_ROOT/tools/gorepogen

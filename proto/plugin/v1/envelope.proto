@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Transport framing + handshake. One mux loop per connection: every Frame
 // carries a correlation id; bodies are either host->plugin calls, plugin->host
@@ -76,7 +76,7 @@ message StreamItem {
   bytes item = 1;
 }
 message StreamEnd {
-  optional Error error = 1;
+  Error error = 1;
 }
 
 message Frame {

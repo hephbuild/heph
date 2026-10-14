@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Provider-exported methods. Mirrors the hplugin::Provider trait. BUILD-file
 // functions are not a provider's: they belong to the plugin (function.proto).
@@ -21,7 +21,7 @@ enum ProviderMethod {
   // 0.16.0 moved functions from the provider to the plugin (function.proto):
   // these numbers and names are never reused.
   reserved 5, 6, 8;
-  reserved "PROVIDER_METHOD_FUNCTIONS", "PROVIDER_METHOD_CALL_FUNCTION", "PROVIDER_METHOD_SET_FUNCTION_REGISTRY";
+  reserved PROVIDER_METHOD_FUNCTIONS, PROVIDER_METHOD_CALL_FUNCTION, PROVIDER_METHOD_SET_FUNCTION_REGISTRY;
   PROVIDER_METHOD_UNSPECIFIED = 0;
   PROVIDER_METHOD_LIST = 1;
   PROVIDER_METHOD_LIST_PACKAGES = 2;
@@ -53,16 +53,16 @@ message ListedFacts {
   // The spec's labels, compared as a set. Present and empty = no labels.
   StringSet labels = 1;
   // The spec's driver. Absent, "" or over 256 bytes = unknown.
-  optional string driver = 2;
+  string driver = 2;
   // Whether any path in def.outputs has codegen mode != NONE. Absent = unknown.
-  optional bool has_codegen = 3;
+  bool has_codegen = 3;
 }
 
 message ListResponse {
   Addr addr = 1;
   // 0.11.0's per-target labels, superseded by `facts`. Never reuse.
   reserved 2, 3;
-  reserved "labels", "labels_known";
+  reserved labels, labels_known;
   // Absent = every field unknown (an old plugin, or `addr_only`).
   ListedFacts facts = 4;
 }

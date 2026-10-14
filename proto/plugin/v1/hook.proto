@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Hook-exported methods. A hook is a build-event consumer: the host
 // client-streams the engine's `BuildEvent`s into the plugin, which processes each

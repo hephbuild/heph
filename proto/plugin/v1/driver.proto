@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Driver-exported methods. Mirrors the hplugin::Driver trait.
 // NOTE: schema() (DriverSchema) is not yet modeled; added when needed.
@@ -160,7 +160,7 @@ message ManagedRunInput {
   // Where this input was unpacked on the shared filesystem.
   string unpack_root = 6;
   // List file for Dep inputs (absent for Support inputs).
-  optional string list_path = 7;
+  string list_path = 7;
   // The artifact's hashout: the value the consumer's hashin folded in for it.
   // Empty when the host could not read one; an old host never sends it.
   string hashout = 8;

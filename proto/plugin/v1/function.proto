@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // BUILD-file functions: `heph.<plugin>.<fn>(…)`. A function is a component of a
 // plugin (next to its provider, drivers, hooks and runners), not a method on a
@@ -27,14 +27,14 @@ enum FunctionMethod {
 message Param {
   string name = 1;
   ParamType ty = 2;
-  optional Value default = 3;
+  Value default = 3;
 }
 
 // Mirrors signature::FnSignature.
 message FnSignature {
   repeated Param positional = 1;
   repeated Param named = 2;
-  optional Param variadic = 3;
+  Param variadic = 3;
   ParamType returns = 4;
 }
 
