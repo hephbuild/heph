@@ -45,11 +45,12 @@ pub mod stabby {
     };
     pub use crate::supervisor::{install_supervisor, supervisor_sink};
 
-    /// Decode the cdylib create-entry config (`pb::CreateConfig`) from its prost
-    /// bytes, and convert its structured `options` map into a plugin `options:`
-    /// map. Authors then read typed values via [`hplugin::config::decode_opt`],
-    /// exactly as in-process plugins do.
-    pub use plugin_abi::convert::{create_config_from_bytes, options_from_pb_map};
+    /// The cdylib create-entry config, and its decoder from the bytes the host
+    /// hands `heph_plugin_create`. `root`, `home` and `name` are required; the
+    /// `options` map is the plugin's `options:`, which authors read via
+    /// [`hplugin::config::decode_opt`], exactly as in-process plugins do. The
+    /// wire form stays inside the SDK.
+    pub use plugin_abi::convert::{CreateConfig, create_config_from_bytes};
 
     /// The ABI version this transport builds against.
     pub use plugin_abi::ABI_SEMVER;

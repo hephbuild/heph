@@ -34,7 +34,9 @@ stabby_pin_files=(
   "crates/plugin-sdk/Cargo.toml"
   "crates/plugin-go-cdylib/Cargo.toml"
 )
-# Cold-path wire messages: prost is lenient, additive changes are minor. We warn
+# Cold-path wire messages: protobuf skips unknown fields, so a new field whose
+# absence reads as the safe default is minor (a new *required* field is not —
+# see ABI_VERSIONING.md). We warn
 # (don't fail) so doc/comment proto edits stay quiet but real edits get a nudge.
 soft_glob="proto/plugin/v1/"
 

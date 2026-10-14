@@ -8,12 +8,15 @@ import "plugin/v1/common.proto";
 // Host-side approval gate. When `required`, the target's execution pauses for an
 // explicit user decision (interactive Y/N or `--auto-approve`). `notice` lists
 // input group names whose contents are shown to the user before they decide.
+// An absent `Approval` is no gate; a present one must set `required` (a dropped
+// flag read as false would skip the gate).
 message Approval {
   bool required = 1;
   repeated string notice = 2;
 }
 
-// Provider output. Mirrors driver::TargetSpec.
+// Provider output. Mirrors driver::TargetSpec. `addr` and `driver` are
+// required; an absent `transitive` is the empty sandbox.
 message TargetSpec {
   Addr addr = 1;
   string driver = 2;
@@ -25,7 +28,9 @@ message TargetSpec {
 
 // Opaque driver-specific config blob. The host never inspects this; it is
 // produced and consumed only by the originating driver (which both parse()s
-// and run()s the target). Mirrors the erased TargetDef::raw_def.
+// and run()s the target). Mirrors the erased TargetDef::raw_def. `format` (only
+// JSON is read) and `data` are required; `driver` is left unset — the request
+// carrying the blob already names it.
 message RawDefBlob {
   enum Format {
     FORMAT_UNSPECIFIED = 0;
@@ -44,6 +49,8 @@ enum InputMode {
   INPUT_MODE_TOOL = 3;
 }
 
+// `ref`, `mode` (not UNSPECIFIED), `hashed` and `runtime` are required: either
+// flag read as false when dropped would change what the cache key covers.
 message Input {
   TargetAddr ref = 1;
   InputMode mode = 2;
@@ -60,7 +67,8 @@ enum CodegenMode {
   CODEGEN_MODE_IN_PLACE = 3;
 }
 
-// Mirrors driver::path::Path + path::Content.
+// Mirrors driver::path::Path + path::Content. `content` and `codegen_tree`
+// (not UNSPECIFIED) are required.
 message Path {
   oneof content {
     string file_path = 1;
@@ -76,13 +84,16 @@ message Output {
   repeated Path paths = 2;
 }
 
+// Every field is required: no zero is a safe stand-in (`history = 0` keeps no
+// revision at all).
 message CacheConfig {
   bool enabled = 1;
   bool remote_enabled = 2;
   uint32 history = 3;
 }
 
-// Driver parsed form. Mirrors driver::targetdef::TargetDef.
+// Driver parsed form. Mirrors driver::targetdef::TargetDef. `addr`, `raw_def`,
+// `cache` and `hash` are required.
 message TargetDef {
   Addr addr = 1;
   repeated string labels = 2;
@@ -108,18 +119,21 @@ enum ArtifactType {
   ARTIFACT_TYPE_SUPPORT_FILE = 3;
 }
 
+// `source_path` and `out_path` are required.
 message ContentFile {
   string source_path = 1;
   string out_path = 2;
   bool x = 3;
 }
 
+// `path` is required; absent `data` is empty content.
 message ContentRaw {
   bytes data = 1;
   string path = 2;
   bool x = 3;
 }
 
+// `name`, `type` (not UNSPECIFIED) and `content` are required.
 message OutputArtifactRef {
   string group = 1;
   string name = 2;
@@ -130,5 +144,6 @@ message OutputArtifactRef {
     string tar_path = 6;
     string cpio_path = 7;
   }
+  // Absent = none computed (the host computes it). Never present-empty.
   string hashout = 8;
 }

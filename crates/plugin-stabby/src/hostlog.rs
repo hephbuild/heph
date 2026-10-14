@@ -190,7 +190,7 @@ static LOG_FILTER: RwLock<Option<Vec<u8>>> = RwLock::new(None);
 /// is the `EnvFilter` directive string in effect, `max` that filter's
 /// `max_level_hint`. Plugins already loaded are not re-sent it.
 pub fn set_plugin_log_filter(directives: &str, max: Option<LevelFilter>) {
-    use prost::Message;
+    use buffa::Message;
     let bytes = log_filter(directives, max).encode_to_vec();
     *LOG_FILTER.write().unwrap_or_else(PoisonError::into_inner) = Some(bytes);
 }
@@ -210,8 +210,8 @@ pub(crate) fn plugin_log_filter() -> Option<Vec<u8>> {
 /// over-forwarding is the safe direction, since the host filters again.
 fn log_filter(directives: &str, max: Option<LevelFilter>) -> pb::LogFilter {
     plain_directives(directives).unwrap_or_else(|| pb::LogFilter {
-        default_level: pb_level(max.unwrap_or(LevelFilter::TRACE)).into(),
-        directives: Vec::new(),
+        default_level: Some(pb_level(max.unwrap_or(LevelFilter::TRACE)).into()),
+        ..Default::default()
     })
 }
 
@@ -256,16 +256,18 @@ fn plain_directives(directives: &str) -> Option<pb::LogFilter> {
         }
     }
     Some(pb::LogFilter {
-        default_level: pb_level(default.unwrap_or(LevelFilter::OFF)).into(),
+        default_level: Some(pb_level(default.unwrap_or(LevelFilter::OFF)).into()),
         directives: targets
             .into_iter()
             .filter_map(|(target, level)| {
                 Some(pb::log_filter::Directive {
-                    target_prefix: target.to_string(),
-                    level: pb_level(level?).into(),
+                    target_prefix: Some(target.to_string()),
+                    level: Some(pb_level(level?).into()),
+                    ..Default::default()
                 })
             })
             .collect(),
+        ..Default::default()
     })
 }
 
@@ -289,9 +291,14 @@ mod filter_tests {
 
     fn dir(prefix: &str, level: L) -> Directive {
         Directive {
-            target_prefix: prefix.to_string(),
-            level: level.into(),
+            target_prefix: Some(prefix.to_string()),
+            level: Some(level.into()),
+            ..Default::default()
         }
+    }
+
+    fn level(l: L) -> Option<buffa::EnumValue<L>> {
+        Some(l.into())
     }
 
     #[test]
@@ -302,7 +309,7 @@ mod filter_tests {
         );
         f.directives
             .sort_by(|a, b| a.target_prefix.cmp(&b.target_prefix));
-        assert_eq!(f.default_level, i32::from(L::Info));
+        assert_eq!(f.default_level, level(L::Info));
         assert_eq!(
             f.directives,
             vec![dir("fuser", L::Error), dir("oci_client", L::Debug)]
@@ -313,33 +320,35 @@ mod filter_tests {
     #[test]
     fn no_default_level_is_off() {
         let f = log_filter("oci_client=debug", Some(LevelFilter::DEBUG));
-        assert_eq!(f.default_level, i32::from(L::Off));
+        assert_eq!(f.default_level, level(L::Off));
     }
 
     /// A span directive cannot be evaluated by a plugin: send only the maximum.
     #[test]
     fn span_directive_falls_back_to_the_maximum() {
         let f = log_filter("info,[build]=trace", Some(LevelFilter::TRACE));
-        assert_eq!(f.default_level, i32::from(L::Trace));
+        assert_eq!(f.default_level, level(L::Trace));
         assert_eq!(f.directives, vec![]);
     }
 
     /// The proto's matching rule, written out independently of `Targets`: the
     /// longest matching prefix decides, else the default.
     fn admits(filter: &pb::LogFilter, target: &str, level: tracing::Level) -> bool {
-        let to_filter = |l: i32| match L::try_from(l) {
-            Ok(L::Off) => LevelFilter::OFF,
-            Ok(L::Error) => LevelFilter::ERROR,
-            Ok(L::Warn) => LevelFilter::WARN,
-            Ok(L::Info) => LevelFilter::INFO,
-            Ok(L::Debug) => LevelFilter::DEBUG,
+        // Absent, unspecified or unknown: TRACE, admit everything.
+        let to_filter = |l: Option<buffa::EnumValue<L>>| match l.and_then(|l| l.as_known()) {
+            Some(L::Off) => LevelFilter::OFF,
+            Some(L::Error) => LevelFilter::ERROR,
+            Some(L::Warn) => LevelFilter::WARN,
+            Some(L::Info) => LevelFilter::INFO,
+            Some(L::Debug) => LevelFilter::DEBUG,
             _ => LevelFilter::TRACE,
         };
+        let prefix = |d: &Directive| d.target_prefix.clone().unwrap_or_default();
         let allowed = filter
             .directives
             .iter()
-            .filter(|d| target.starts_with(d.target_prefix.as_str()))
-            .max_by_key(|d| d.target_prefix.len())
+            .filter(|d| target.starts_with(prefix(d).as_str()))
+            .max_by_key(|d| prefix(d).len())
             .map_or(filter.default_level, |d| d.level);
         level <= to_filter(allowed)
     }

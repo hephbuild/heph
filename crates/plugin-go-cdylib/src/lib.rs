@@ -7,7 +7,7 @@
 //! no serialization on the hot path, no IPC (see ai-docs/PERFORMANCE.md).
 //!
 //! Plugin-specific settings are read from the environment; only the workspace
-//! root crosses in [`CreateConfig`].
+//! root crosses in [`plugin_sdk::stabby::CreateConfig`].
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
@@ -19,14 +19,14 @@ use plugin_sdk::stabby::abi::{
 };
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    make_dyn_managed_driver, make_dyn_provider, make_plugin_functions, options_from_pb_map,
+    make_dyn_managed_driver, make_dyn_provider, make_plugin_functions,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
-/// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
-/// `pb::CreateConfig` bytes, so config fields are additive across versions.
+/// host's `get_stabbied` checks for ABI compatibility. `cfg` is the encoded
+/// create config (protobuf), so config fields are additive across versions.
 ///
 /// `_functions` is the loading engine's function registry: the go functions
 /// call no other plugin's, so it goes unused.
@@ -55,7 +55,7 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);
 }
 
-/// Stable ABI log-filter entry: the host's filter as prost `pb::LogFilter` bytes,
+/// Stable ABI log-filter entry: the host's filter as protobuf `LogFilter` bytes,
 /// so events it would discard are dropped here instead of forwarded.
 #[stabby::export]
 pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
@@ -83,12 +83,11 @@ pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
 
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let cfg = create_config_from_bytes(cfg)?;
-    let root = PathBuf::from(cfg.root);
-    let home = PathBuf::from(cfg.home);
-
-    // Tunables come from the plugin's `options:` map (config yaml), carried as
-    // structured CreateConfig data — read the same way an in-process plugin does.
-    let mut options = options_from_pb_map(cfg.options);
+    let root = cfg.root;
+    let home = cfg.home;
+    // Tunables come from the plugin's `options:` map (config yaml) — read the
+    // same way an in-process plugin does.
+    let mut options = cfg.options;
     // The walker db lives in the engine's home dir (e.g. `.heph`), not the repo
     // root — `home` comes from the engine, never hardcoded. It's this cdylib's own
     // option — consume it so it's kept out of the provider's map, whose

@@ -3,16 +3,19 @@
 //! This crate is the raw wire layer the plugin transport shares. Plugin authors
 //! do NOT use it directly — they use the SDK (`plugin-sdk`), which sits on top.
 //!
-//! - [`pb`] re-exports the prost-generated message types (source of truth,
+//! - [`pb`] re-exports the buffa-generated message types (source of truth,
 //!   generated from `proto/plugin/v1/*.proto` via `buf`).
 //! - [`convert`] holds the conversions between the [`pb`] wire types and the
-//!   in-process `hplugin`/`hmodel`/`hcore` types.
+//!   in-process `hplugin`/`hmodel`/`hcore` types, and the presence rules every
+//!   decoder follows (see its module docs).
 //!
 //! The cold, low-volume Provider/Driver methods cross the cdylib boundary as
-//! prost-encoded [`pb`] bytes; the hot `ProviderExecutor` callbacks cross as
+//! protobuf-encoded [`pb`] bytes; the hot `ProviderExecutor` callbacks cross as
 //! native stabby vtable calls (see `plugin-stabby`).
 
-/// The prost-generated wire message types (`heph.plugin.v1`).
+/// The buffa-generated wire message types (`heph.plugin.v1`). Every singular
+/// field has explicit presence (edition 2024): `Option<T>` for scalars, strings,
+/// bytes and enums, `MessageField<T>` for messages.
 pub use hproto_gen::heph::plugin::v1 as pb;
 
 /// ABI semantic version. Not read at runtime — no handshake or negotiation
@@ -20,6 +23,24 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// stabby's structural `get_stabbied` check and aborts. This constant is
 /// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
 /// without a bump, so the version history documents *why* a break happened.
+///
+/// 0.17.0: the wire stays protobuf — same messages, same field numbers and
+/// types — but the protos are edition 2024 with explicit presence on every
+/// singular field, and the codegen is buffa instead of prost. A field the
+/// sender did not set is now absent rather than its zero value, and the
+/// decoders tell the two apart: a field the receiver cannot do without (an
+/// addr's package and name, a spec's driver, a dep's `hash`, a def's cache
+/// config, a request id, a create config's root) fails the decode with
+/// `missing field Message.field`, and the old "zero means unknown" sentinels
+/// (an empty listed driver, an empty declared driver, an empty hashout, an
+/// unspecified log level) are spelled as absence. See `convert`'s module docs.
+///
+/// A hard break, though stabby cannot see it: the frozen surface did not move,
+/// so a 0.16 plugin still loads. Its prost encoder omits every zero-valued
+/// field, and this host reads an omitted required field as missing — a 0.16
+/// plugin listing a root-package target, or declaring an unhashed dep, fails
+/// the call with `missing field …` rather than being misread. Loud, never a
+/// wrong build; rebuild every plugin against this ABI, as for 0.16.0.
 ///
 /// 0.16.0: functions belong to plugins, not providers — a hard break, every
 /// plugin must be rebuilt. `PluginComponents` loses `provider_name` (the
@@ -159,7 +180,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.16.0";
+pub const ABI_SEMVER: &str = "0.17.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

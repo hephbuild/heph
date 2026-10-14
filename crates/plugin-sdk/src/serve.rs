@@ -1,13 +1,14 @@
 //! Guest side of the native (mux-free) stable transport: wrap an author's
 //! `Provider` / `ManagedDriver` as [`StableProvider`] / [`StableManagedDriver`].
 //!
-//! Cold requests/responses cross as prost `pb::Frame` bytes (the response `Body`
+//! Cold requests/responses cross as protobuf `pb::Frame` bytes (the response `Body`
 //! the mux serve loop would have sent, returned directly instead). `get` receives
 //! the host executor natively ([`DynExecutor`]) so the plugin's hot callbacks are
 //! direct calls — no mux, no channels, no task spawn (see ai-docs/PERFORMANCE.md).
 
 use crate::guest::GuestExecutor;
 use anyhow::{Context, Result};
+use buffa::Message;
 use hcore::hartifactcontent::tar::TarPacker;
 use hcore::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
 use hcore::hasync::StdCancellationToken;
@@ -31,9 +32,9 @@ use hplugin_stabby::abi::{
 use hplugin_stabby::seam::panic_text;
 use hplugin_stabby::vtable::dynify;
 use plugin_abi::convert;
+use plugin_abi::convert::{absent_not_empty, required, required_msg};
 use plugin_abi::pb;
 use plugin_abi::pb::frame::Body;
-use prost::Message;
 use stabby::future::DynFutureUnsync as DynFuture;
 use stabby::vec::Vec as SVec;
 use std::collections::{HashMap, HashSet};
@@ -173,26 +174,47 @@ fn seam_name(configured: Result<String>) -> Arc<str> {
 /// Render a pb addr for seam diagnostics (no full `Addr` reconstruction).
 fn pb_addr_key(a: Option<&pb::Addr>) -> String {
     match a {
-        Some(a) => format!("//{}:{}", a.package, a.name),
+        Some(a) => format!(
+            "//{}:{}",
+            a.package.as_deref().unwrap_or_default(),
+            a.name.as_deref().unwrap_or_default()
+        ),
         None => String::new(),
     }
 }
 
+/// A dispatch method id as the generated enum. `Err` for an id this build
+/// does not know, which the dispatch answers with `Error{Unimplemented}`.
+fn method_id<E: buffa::Enumeration>(method: u32) -> std::result::Result<E, ()> {
+    i32::try_from(method).ok().and_then(E::from_i32).ok_or(())
+}
+
+/// Decode a request, naming it on failure. A request that does not decode is
+/// an error frame — never a defaulted request run as if the host had sent it.
+fn decode_req<M: buffa::Message>(bytes: &[u8], what: &str) -> Result<M> {
+    M::decode_from_slice(bytes).with_context(|| format!("decoding {what}"))
+}
+
 fn unary(body: Body) -> SVec<u8> {
-    let f = pb::Frame {
-        id: 0,
-        body: Some(body),
-    };
-    SVec::from(f.encode_to_vec().as_slice())
+    SVec::from(frame_bytes(body).as_slice())
 }
 
 /// Encode one `pb::Frame` carrying `body` (one frame per stream `next`).
 fn frame_bytes(body: Body) -> Vec<u8> {
     pb::Frame {
-        id: 0,
+        id: Some(0),
         body: Some(body),
+        ..Default::default()
     }
     .encode_to_vec()
+}
+
+fn wire_error(kind: pb::error::Kind, message: String) -> pb::Error {
+    pb::Error {
+        kind: Some(kind.into()),
+        message: Some(message),
+        ..Default::default()
+    }
 }
 
 /// Guest-side response stream: pulls items from a provider iterator lazily and
@@ -233,8 +255,9 @@ fn frame_iter<T: 'static>(
             return None;
         }
         match iter.next() {
-            Some(Ok(t)) => Some(frame_bytes(Body::StreamItem(pb::StreamItem {
-                item: encode_item(t).into(),
+            Some(Ok(t)) => Some(frame_bytes(Body::from(pb::StreamItem {
+                item: Some(encode_item(t)),
+                ..Default::default()
             }))),
             Some(Err(e)) => {
                 done = true;
@@ -257,20 +280,19 @@ fn error_item_stream(msg: String) -> DynItemStream {
 /// counterpart of [`unimplemented`], carrying `Error{Unimplemented}` so a newer
 /// host falls back instead of failing hard.
 fn unimplemented_item_stream(method: u32) -> DynItemStream {
-    let body = Body::StreamEnd(pb::StreamEnd {
-        error: Some(pb::Error {
-            kind: pb::error::Kind::Unimplemented as i32,
-            message: format!("dispatch method {method} not implemented"),
-        }),
+    let body = Body::from(pb::StreamEnd {
+        error: wire_error(
+            pb::error::Kind::Unimplemented,
+            format!("dispatch method {method} not implemented"),
+        )
+        .into(),
+        ..Default::default()
     });
     make_item_stream(Box::new(std::iter::once(frame_bytes(body))))
 }
 
 fn err_body(message: String) -> Body {
-    Body::Error(pb::Error {
-        kind: pb::error::Kind::Other as i32,
-        message,
-    })
+    Body::from(wire_error(pb::error::Kind::Other, message))
 }
 
 /// Serialize an error for transmission across the ABI boundary. Uses anyhow's
@@ -484,10 +506,10 @@ impl StableCancel for StableProviderImpl {
 /// calling a method this (older) plugin predates gets this back and falls back —
 /// the mechanism that keeps added dispatch methods additive (see ABI_VERSIONING.md).
 fn unimplemented(method: u32) -> SVec<u8> {
-    unary(Body::Error(pb::Error {
-        kind: pb::error::Kind::Unimplemented as i32,
-        message: format!("dispatch method {method} not implemented"),
-    }))
+    unary(Body::from(wire_error(
+        pb::error::Kind::Unimplemented,
+        format!("dispatch method {method} not implemented"),
+    )))
 }
 
 // ---- Provider RPC bodies (moved verbatim out of the old per-method vtable slots
@@ -505,17 +527,24 @@ async fn provider_list_stream(
 ) -> DynItemStream {
     let tok = StdCancellationToken::new();
     let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
-    let lreq = ListRequest {
-        request_id: req.request_id,
-        package: PkgBuf::from(req.package),
-        states: req.states.into_iter().map(convert::state_from_pb).collect(),
-        executor,
+    let lreq = (|| -> Result<ListRequest> {
+        Ok(ListRequest {
+            request_id: required(req.request_id, "ListRequest.request_id")?,
+            package: PkgBuf::from(required(req.package, "ListRequest.package")?),
+            states: convert::states_from_pb(req.states)?,
+            executor,
+        })
+    })();
+    let lreq = match lreq {
+        Ok(r) => r,
+        Err(e) => return error_item_stream(err_message(&e)),
     };
     match provider.list(lreq, &tok).await {
         Ok(iter) => make_item_stream(frame_iter(iter, |lr| {
             pb::ListResponse {
-                addr: Some(convert::addr_to_pb(&lr.addr)),
-                facts: convert::listed_facts_to_pb(&lr.facts),
+                addr: convert::addr_to_pb(&lr.addr).into(),
+                facts: convert::listed_facts_to_pb(&lr.facts).into(),
+                ..Default::default()
             }
             .encode_to_vec()
         })),
@@ -528,13 +557,18 @@ async fn provider_list_packages_stream(
     req: pb::ListPackagesRequest,
 ) -> DynItemStream {
     let tok = StdCancellationToken::new();
+    let prefix = match required(req.prefix, "ListPackagesRequest.prefix") {
+        Ok(p) => p,
+        Err(e) => return error_item_stream(err_message(&e)),
+    };
     let lreq = ListPackagesRequest {
-        prefix: PkgBuf::from(req.prefix),
+        prefix: PkgBuf::from(prefix),
     };
     match provider.list_packages(lreq, &tok).await {
         Ok(iter) => make_item_stream(frame_iter(iter, |lpr| {
             pb::ListPackageResponse {
-                pkg: lpr.pkg.as_str().to_string(),
+                pkg: Some(lpr.pkg.as_str().to_string()),
+                ..Default::default()
             }
             .encode_to_vec()
         })),
@@ -549,27 +583,36 @@ async fn provider_get(
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
     let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
-    let guard = cancels.enter(&req.request_id);
-    let greq = GetRequest {
-        request_id: req.request_id,
-        addr: convert::addr_from_pb(req.addr.unwrap_or_default()),
-        states: req.states.into_iter().map(convert::state_from_pb).collect(),
-        executor,
+    let greq = (|| -> Result<GetRequest> {
+        Ok(GetRequest {
+            request_id: required(req.request_id, "GetRequest.request_id")?,
+            addr: convert::addr_field(req.addr, "GetRequest.addr")?,
+            states: convert::states_from_pb(req.states)?,
+            executor,
+        })
+    })();
+    let greq = match greq {
+        Ok(r) => r,
+        Err(e) => return unary(get_err(pb::get_error::Kind::Other, err_message(&e))),
     };
+    let guard = cancels.enter(&greq.request_id);
     let body = match provider.get(greq, guard.token()).await {
-        Ok(gr) => Body::GetResp(pb::GetResponse {
-            target_spec: Some(convert::target_spec_to_pb(&gr.target_spec)),
+        Ok(gr) => Body::from(pb::GetResponse {
+            target_spec: convert::target_spec_to_pb(&gr.target_spec).into(),
+            ..Default::default()
         }),
-        Err(GetError::NotFound) => Body::GetErr(pb::GetError {
-            kind: pb::get_error::Kind::NotFound as i32,
-            message: String::new(),
-        }),
-        Err(GetError::Other(e)) => Body::GetErr(pb::GetError {
-            kind: get_error_kind(&e) as i32,
-            message: err_message(&e),
-        }),
+        Err(GetError::NotFound) => get_err(pb::get_error::Kind::NotFound, String::new()),
+        Err(GetError::Other(e)) => get_err(get_error_kind(&e), err_message(&e)),
     };
     unary(body)
+}
+
+fn get_err(kind: pb::get_error::Kind, message: String) -> Body {
+    Body::from(pb::GetError {
+        kind: Some(kind.into()),
+        message: Some(message),
+        ..Default::default()
+    })
 }
 
 async fn provider_probe(
@@ -577,14 +620,21 @@ async fn provider_probe(
     req: pb::ProbeRequest,
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
-    let guard = cancels.enter(&req.request_id);
-    let preq = ProbeRequest {
-        request_id: req.request_id,
-        package: PkgBuf::from(req.package),
+    let preq = (|| -> Result<ProbeRequest> {
+        Ok(ProbeRequest {
+            request_id: required(req.request_id, "ProbeRequest.request_id")?,
+            package: PkgBuf::from(required(req.package, "ProbeRequest.package")?),
+        })
+    })();
+    let preq = match preq {
+        Ok(r) => r,
+        Err(e) => return unary(err_body(err_message(&e))),
     };
+    let guard = cancels.enter(&preq.request_id);
     let body = match provider.probe(preq, guard.token()).await {
-        Ok(pr) => Body::ProbeResp(pb::ProbeResponse {
+        Ok(pr) => Body::from(pb::ProbeResponse {
             states: pr.states.iter().map(convert::state_to_pb).collect(),
+            ..Default::default()
         }),
         Err(e) => err_body(err_message(&e)),
     };
@@ -598,37 +648,33 @@ async fn plugin_call_function(
     name: String,
     req: pb::CallFunctionRequest,
 ) -> SVec<u8> {
-    let ctx = FnCallContext {
-        pkg: &req.pkg,
-        root: std::path::Path::new(&req.root),
+    let call = match FunctionCall::from_pb(req) {
+        Ok(c) => c,
+        Err(e) => {
+            return unary(err_body(err_message(
+                &e.context(format!("the call of plugin function {name:?}")),
+            )));
+        }
     };
-    let args = FnArgs {
-        positional: req
-            .positional
-            .into_iter()
-            .map(convert::value_from_pb)
-            .collect(),
-        named: req
-            .named
-            .into_iter()
-            .map(|(k, v)| (k, convert::value_from_pb(v)))
-            .collect(),
+    let ctx = FnCallContext {
+        pkg: &call.pkg,
+        root: &call.root,
     };
     // Declarations ride back with the value when the host advertised that it
     // carries them; against an older host they are an error, never a silent
     // drop (see `CallFunctionRequest.accepts_declarations`).
-    let res = match func.call(&ctx, args).await {
+    let res = match func.call(&ctx, call.args).await {
         Ok(o) => {
             let n = o.targets().len() + o.states().len();
             tracing::debug!(
                 function = %name,
-                pkg = %req.pkg,
+                pkg = %call.pkg,
                 declarations = n,
                 "plugin function answered"
             );
             // Only the refusal path errors here, so this context is about the
             // peer: name the side that is old and what fixes it.
-            convert::call_function_response(o, req.accepts_declarations).with_context(|| {
+            convert::call_function_response(o, call.accepts_declarations).with_context(|| {
                 format!(
                     "plugin function {name:?}: the calling host does not carry declarations \
                      (heph older than plugin ABI 0.15.0) — upgrade heph"
@@ -638,21 +684,66 @@ async fn plugin_call_function(
         Err(e) => Err(e).with_context(|| format!("plugin function {name:?}")),
     };
     let body = match res {
-        Ok(resp) => Body::CallFunctionResp(resp),
+        Ok(resp) => Body::from(resp),
         Err(e) => err_body(err_message(&e)),
     };
     unary(body)
 }
 
-// Sync metadata helpers. Each returns the metadatum's RAW prost bytes (NOT a
+/// A `CallFunctionRequest`, decoded. `pkg` and `root` are required — a
+/// defaulted `""` root would resolve the function's paths against the plugin's
+/// cwd. An absent `accepts_declarations` is an older host, which cannot carry
+/// declarations: `false`.
+struct FunctionCall {
+    pkg: String,
+    root: std::path::PathBuf,
+    args: FnArgs,
+    accepts_declarations: bool,
+}
+
+impl FunctionCall {
+    fn from_pb(req: pb::CallFunctionRequest) -> Result<Self> {
+        Ok(Self {
+            pkg: required(req.pkg, "CallFunctionRequest.pkg")?,
+            root: required(req.root, "CallFunctionRequest.root")?.into(),
+            args: FnArgs {
+                positional: req
+                    .positional
+                    .into_iter()
+                    .map(convert::value_from_pb)
+                    .collect::<Result<_>>()?,
+                named: req
+                    .named
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let v = convert::value_from_pb(v).with_context(|| format!("arg {k:?}"))?;
+                        Ok((k, v))
+                    })
+                    .collect::<Result<_>>()?,
+            },
+            accepts_declarations: req.accepts_declarations.unwrap_or(false),
+        })
+    }
+}
+
+// Sync metadata helpers. Each returns the metadatum's RAW protobuf bytes (NOT a
 // `Frame` — matching the prior `state_schema()`/`config()` wire).
 
+/// A `ConfigResponse` whose `name` is absent when `config()` failed, rather
+/// than an empty name that reads as one.
+fn config_response(name: Result<String>) -> SVec<u8> {
+    SVec::from(
+        pb::ConfigResponse {
+            name: name.ok(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .as_slice(),
+    )
+}
+
 fn provider_config(provider: &Arc<dyn Provider>) -> SVec<u8> {
-    let name = provider
-        .config(ConfigRequest {})
-        .map(|r| r.name)
-        .unwrap_or_default();
-    SVec::from(pb::ConfigResponse { name }.encode_to_vec().as_slice())
+    config_response(provider.config(ConfigRequest {}).map(|r| r.name))
 }
 
 fn provider_state_schema(provider: &Arc<dyn Provider>) -> SVec<u8> {
@@ -664,7 +755,7 @@ fn provider_state_schema(provider: &Arc<dyn Provider>) -> SVec<u8> {
 }
 
 /// A plugin's functions as the ABI carries them: one [`NamedFunction`] per
-/// function (its metadata as prost `pb::FunctionDef` bytes) and the one
+/// function (its metadata as protobuf `pb::FunctionDef` bytes) and the one
 /// [`DynPluginFunctions`] handle they are all called through — `None` when the
 /// plugin has no functions. Goes into `PluginComponents.functions` /
 /// `.function_handle`. `plugin` names the plugin in seam diagnostics.
@@ -682,9 +773,10 @@ pub fn make_plugin_functions(
     let mut fns: HashMap<String, Arc<dyn PluginFn>> = HashMap::with_capacity(defs.len());
     for def in defs {
         let meta = pb::FunctionDef {
-            name: def.name.clone(),
-            signature: Some(convert::fn_signature_to_pb(&def.signature)),
-            doc: def.doc,
+            name: Some(def.name.clone()),
+            signature: convert::fn_signature_to_pb(&def.signature).into(),
+            doc: Some(def.doc),
+            ..Default::default()
         }
         .encode_to_vec();
         named.push(NamedFunction {
@@ -723,7 +815,7 @@ impl StablePluginFunctions for StablePluginFunctionsImpl {
         name: stabby::string::String,
         req: SVec<u8>,
     ) -> DynFuture<'a, SVec<u8>> {
-        match pb::FunctionMethod::try_from(method as i32) {
+        match method_id::<pb::FunctionMethod>(method) {
             Ok(pb::FunctionMethod::Call) => {
                 let name = name.to_string();
                 let Some(func) = self.fns.get(&name).cloned() else {
@@ -733,15 +825,16 @@ impl StablePluginFunctions for StablePluginFunctionsImpl {
                     )));
                     return dynify(stabby::boxed::Box::new(async move { body }));
                 };
-                let req = match pb::CallFunctionRequest::decode(&req[..]) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let body = unary(err_body(format!(
-                            "decoding the call of function {name:?}: {e}"
-                        )));
-                        return dynify(stabby::boxed::Box::new(async move { body }));
-                    }
-                };
+                let req =
+                    match decode_req::<pb::CallFunctionRequest>(&req[..], "CallFunctionRequest") {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let body = unary(err_body(format!(
+                                "decoding the call of function {name:?}: {e:#}"
+                            )));
+                            return dynify(stabby::boxed::Box::new(async move { body }));
+                        }
+                    };
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
                     "call_function",
@@ -768,7 +861,7 @@ pub fn guest_functions(reg: DynFunctionRegistry) -> Arc<dyn FunctionCaller> {
 
 impl StableMeta for StableProviderImpl {
     extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
-        match pb::ProviderMethod::try_from(kind as i32) {
+        match method_id::<pb::ProviderMethod>(kind) {
             Ok(pb::ProviderMethod::Config) => provider_config(&self.provider),
             Ok(pb::ProviderMethod::StateSchema) => provider_state_schema(&self.provider),
             // Unknown sync metadatum: empty == "none", never a hard failure.
@@ -787,10 +880,16 @@ impl StableMeta for StableProviderImpl {
 impl StableProvider for StableProviderImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
-        match pb::ProviderMethod::try_from(method as i32) {
+        match method_id::<pb::ProviderMethod>(method) {
             Ok(pb::ProviderMethod::Probe) => {
-                let req = pb::ProbeRequest::decode(&req[..]).unwrap_or_default();
-                let key = req.package.clone();
+                let req = match decode_req::<pb::ProbeRequest>(&req[..], "ProbeRequest") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let body = unary(err_body(err_message(&e)));
+                        return dynify(stabby::boxed::Box::new(async move { body }));
+                    }
+                };
+                let key = req.package.clone().unwrap_or_default();
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
                     "probe",
@@ -811,11 +910,18 @@ impl StableProvider for StableProviderImpl {
         req: SVec<u8>,
     ) -> DynFuture<'a, DynItemStream> {
         let provider = Arc::clone(&self.provider);
-        match pb::ProviderMethod::try_from(method as i32) {
+        match method_id::<pb::ProviderMethod>(method) {
             // `List` rides `invoke_exec_server_stream` (it needs an executor).
             Ok(pb::ProviderMethod::ListPackages) => {
-                let req = pb::ListPackagesRequest::decode(&req[..]).unwrap_or_default();
-                let key = req.prefix.clone();
+                let req =
+                    match decode_req::<pb::ListPackagesRequest>(&req[..], "ListPackagesRequest") {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let stream = error_item_stream(err_message(&e));
+                            return dynify(stabby::boxed::Box::new(async move { stream }));
+                        }
+                    };
+                let key = req.prefix.clone().unwrap_or_default();
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
                     "list_packages",
@@ -837,10 +943,16 @@ impl StableProvider for StableProviderImpl {
         exec: DynExecutor,
     ) -> DynFuture<'a, DynItemStream> {
         let provider = Arc::clone(&self.provider);
-        match pb::ProviderMethod::try_from(method as i32) {
+        match method_id::<pb::ProviderMethod>(method) {
             Ok(pb::ProviderMethod::List) => {
-                let req = pb::ListRequest::decode(&req[..]).unwrap_or_default();
-                let key = req.package.clone();
+                let req = match decode_req::<pb::ListRequest>(&req[..], "ListRequest") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let stream = error_item_stream(err_message(&e));
+                        return dynify(stabby::boxed::Box::new(async move { stream }));
+                    }
+                };
+                let key = req.package.clone().unwrap_or_default();
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
                     "list",
@@ -883,10 +995,16 @@ impl StableProvider for StableProviderImpl {
         exec: DynExecutor,
     ) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
-        match pb::ProviderMethod::try_from(method as i32) {
+        match method_id::<pb::ProviderMethod>(method) {
             Ok(pb::ProviderMethod::Get) => {
-                let req = pb::GetRequest::decode(&req[..]).unwrap_or_default();
-                let key = pb_addr_key(req.addr.as_ref());
+                let req = match decode_req::<pb::GetRequest>(&req[..], "GetRequest") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let body = unary(get_err(pb::get_error::Kind::Other, err_message(&e)));
+                        return dynify(stabby::boxed::Box::new(async move { body }));
+                    }
+                };
+                let key = pb_addr_key(req.addr.as_option());
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
                     "get",
@@ -894,12 +1012,7 @@ impl StableProvider for StableProviderImpl {
                     provider_get(provider, req, exec, Arc::clone(&self.cancels)),
                     // A panic/abort is a GetErr (not a bare Error) so the host's
                     // `get` decode surfaces the message as-is.
-                    |m| {
-                        unary(Body::GetErr(pb::GetError {
-                            kind: pb::get_error::Kind::Other as i32,
-                            message: m,
-                        }))
-                    },
+                    |m| unary(get_err(pb::get_error::Kind::Other, m)),
                 )))
             }
             _ => dynify(stabby::boxed::Box::new(
@@ -925,10 +1038,10 @@ impl FunctionCaller for GuestFunctions {
         args: FnArgs,
     ) -> Result<FnOutcome> {
         let pb_req = pb::CallRegisteredRequest {
-            plugin: plugin.to_string(),
-            name: name.to_string(),
-            pkg: ctx.pkg.to_string(),
-            root: ctx.root.to_string_lossy().into_owned(),
+            plugin: Some(plugin.to_string()),
+            name: Some(name.to_string()),
+            pkg: Some(ctx.pkg.to_string()),
+            root: Some(ctx.root.to_string_lossy().into_owned()),
             positional: args.positional.iter().map(convert::value_to_pb).collect(),
             named: args
                 .named
@@ -939,27 +1052,26 @@ impl FunctionCaller for GuestFunctions {
             // carry declarations. Whether they reach the package is then up to
             // the calling function: it must `FnOutcome::absorb` them into its
             // own outcome, not read `.value` and drop the rest.
-            accepts_declarations: true,
+            accepts_declarations: Some(true),
+            ..Default::default()
         }
         .encode_to_vec();
         let bytes = self
             .reg
             .call_registered(SVec::from(pb_req.as_slice()))
             .await;
-        match pb::Frame::decode(&bytes[..])?.body {
-            Some(Body::CallFunctionResp(r)) => Ok(convert::fn_outcome_from_pb(r)),
-            Some(Body::Error(e)) => anyhow::bail!("{}", e.message),
+        match decode_req::<pb::Frame>(&bytes[..], "the call_registered reply")?.body {
+            Some(Body::CallFunctionResp(r)) => convert::fn_outcome_from_pb(*r),
+            Some(Body::Error(e)) => anyhow::bail!("{}", e.message.unwrap_or_default()),
             other => anyhow::bail!("unexpected call_registered response: {other:?}"),
         }
     }
 }
 
 fn stream_err(message: String) -> Body {
-    Body::StreamEnd(pb::StreamEnd {
-        error: Some(pb::Error {
-            kind: pb::error::Kind::Other as i32,
-            message,
-        }),
+    Body::from(pb::StreamEnd {
+        error: wire_error(pb::error::Kind::Other, message).into(),
+        ..Default::default()
     })
 }
 
@@ -978,11 +1090,7 @@ impl StableCancel for StableManagedDriverImpl {
 }
 
 fn driver_config(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
-    let name = driver
-        .config(DriverConfigRequest {})
-        .map(|r| r.name)
-        .unwrap_or_default();
-    SVec::from(pb::ConfigResponse { name }.encode_to_vec().as_slice())
+    config_response(driver.config(DriverConfigRequest {}).map(|r| r.name))
 }
 
 fn driver_schema(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
@@ -1030,18 +1138,27 @@ async fn driver_parse(
     req: pb::ParseRequest,
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
-    let guard = cancels.enter(&req.request_id);
-    let preq = ParseRequest {
-        request_id: req.request_id,
-        target_spec: Arc::new(convert::target_spec_from_pb(
-            req.target_spec.unwrap_or_default(),
-        )),
+    // `driver` is informational: each driver has its own handle.
+    let preq = (|| -> Result<ParseRequest> {
+        Ok(ParseRequest {
+            request_id: required(req.request_id, "ParseRequest.request_id")?,
+            target_spec: Arc::new(convert::target_spec_from_pb(required_msg(
+                req.target_spec,
+                "ParseRequest.target_spec",
+            )?)?),
+        })
+    })();
+    let preq = match preq {
+        Ok(r) => r,
+        Err(e) => return unary(err_body(err_message(&e))),
     };
+    let guard = cancels.enter(&preq.request_id);
     on_plugin_runtime(guard, move |guard| async move {
         match driver.parse(preq, guard.token()).await {
             Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
-                Ok(td) => Body::ParseResp(pb::ParseResponse {
-                    target_def: Some(td),
+                Ok(td) => Body::from(pb::ParseResponse {
+                    target_def: td.into(),
+                    ..Default::default()
                 }),
                 Err(e) => err_body(err_message(&e)),
             },
@@ -1056,21 +1173,32 @@ async fn driver_apply_transitive(
     req: pb::ApplyTransitiveRequest,
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
-    let guard = cancels.enter(&req.request_id);
-    let target_def = match convert::target_def_from_pb(req.target_def.unwrap_or_default()) {
-        Ok(td) => td,
+    // `sandbox` is required too: an absent one would apply nothing and read as
+    // success.
+    let areq = (|| -> Result<ApplyTransitiveRequest> {
+        Ok(ApplyTransitiveRequest {
+            request_id: required(req.request_id, "ApplyTransitiveRequest.request_id")?,
+            target_def: convert::target_def_from_pb(required_msg(
+                req.target_def,
+                "ApplyTransitiveRequest.target_def",
+            )?)?,
+            sandbox: convert::sandbox_from_pb(required_msg(
+                req.sandbox,
+                "ApplyTransitiveRequest.sandbox",
+            )?)?,
+        })
+    })();
+    let areq = match areq {
+        Ok(r) => r,
         Err(e) => return unary(err_body(err_message(&e))),
     };
-    let areq = ApplyTransitiveRequest {
-        request_id: req.request_id,
-        target_def,
-        sandbox: convert::sandbox_from_pb(req.sandbox.unwrap_or_default()),
-    };
+    let guard = cancels.enter(&areq.request_id);
     on_plugin_runtime(guard, move |guard| async move {
         match driver.apply_transitive(areq, guard.token()).await {
             Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
-                Ok(td) => Body::ApplyTransitiveResp(pb::ApplyTransitiveResponse {
-                    target_def: Some(td),
+                Ok(td) => Body::from(pb::ApplyTransitiveResponse {
+                    target_def: td.into(),
+                    ..Default::default()
                 }),
                 Err(e) => err_body(err_message(&e)),
             },
@@ -1082,7 +1210,7 @@ async fn driver_apply_transitive(
 
 impl StableMeta for StableManagedDriverImpl {
     extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
-        match pb::DriverMethod::try_from(kind as i32) {
+        match method_id::<pb::DriverMethod>(kind) {
             Ok(pb::DriverMethod::Config) => driver_config(&self.driver),
             Ok(pb::DriverMethod::Schema) => driver_schema(&self.driver),
             _ => SVec::new(),
@@ -1096,10 +1224,16 @@ impl StableMeta for StableManagedDriverImpl {
 impl StableManagedDriver for StableManagedDriverImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let driver = Arc::clone(&self.driver);
-        match pb::DriverMethod::try_from(method as i32) {
+        match method_id::<pb::DriverMethod>(method) {
             Ok(pb::DriverMethod::Parse) => {
-                let req = pb::ParseRequest::decode(&req[..]).unwrap_or_default();
-                let key = pb_addr_key(req.target_spec.as_ref().and_then(|t| t.addr.as_ref()));
+                let req = match decode_req::<pb::ParseRequest>(&req[..], "ParseRequest") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let body = unary(err_body(err_message(&e)));
+                        return dynify(stabby::boxed::Box::new(async move { body }));
+                    }
+                };
+                let key = pb_addr_key(req.target_spec.as_option().and_then(|t| t.addr.as_option()));
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
                     "parse",
@@ -1109,8 +1243,17 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 )))
             }
             Ok(pb::DriverMethod::ApplyTransitive) => {
-                let req = pb::ApplyTransitiveRequest::decode(&req[..]).unwrap_or_default();
-                let key = pb_addr_key(req.target_def.as_ref().and_then(|t| t.addr.as_ref()));
+                let req = match decode_req::<pb::ApplyTransitiveRequest>(
+                    &req[..],
+                    "ApplyTransitiveRequest",
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let body = unary(err_body(err_message(&e)));
+                        return dynify(stabby::boxed::Box::new(async move { body }));
+                    }
+                };
+                let key = pb_addr_key(req.target_def.as_option().and_then(|t| t.addr.as_option()));
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
                     "apply_transitive",
@@ -1156,7 +1299,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
         let driver = Arc::clone(&self.driver);
         let cancels = Arc::clone(&self.cancels);
         dynify(stabby::boxed::Box::new(async move {
-            match pb::DriverMethod::try_from(method as i32) {
+            match method_id::<pb::DriverMethod>(method) {
                 Ok(pb::DriverMethod::Run) => run_bidi(driver, req, cancels).await,
                 _ => unimplemented_item_stream(method),
             }
@@ -1190,6 +1333,7 @@ fn make_channel_item_stream(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> DynItem
 fn run_out_err(msg: String) -> pb::RunOutFrame {
     pb::RunOutFrame {
         msg: Some(pb::run_out_frame::Msg::Error(msg)),
+        ..Default::default()
     }
 }
 
@@ -1198,15 +1342,19 @@ fn run_error_stream(msg: String) -> DynItemStream {
     make_item_stream(Box::new(std::iter::once(run_out_err(msg).encode_to_vec())))
 }
 
-/// Pull the first request-stream item: the run request (`RunInFrame{start}`).
-fn pull_run_start(req: &DynItemStream) -> Option<pb::ManagedRunRequest> {
+/// Pull the first request-stream item: the run request (`RunInFrame{start}`),
+/// with its `request_id` — required, since it is what a cancel names.
+fn pull_run_start(req: &DynItemStream) -> Result<(String, pb::ManagedRunRequest)> {
     let bytes = req.next();
     if bytes.is_empty() {
-        return None;
+        anyhow::bail!("run: missing start frame");
     }
-    match pb::RunInFrame::decode(&bytes[..]).ok()?.msg {
-        Some(pb::run_in_frame::Msg::Start(s)) => Some(s),
-        _ => None,
+    match decode_req::<pb::RunInFrame>(&bytes[..], "the run start frame")?.msg {
+        Some(pb::run_in_frame::Msg::Start(mut s)) => {
+            let id = required(s.request_id.take(), "ManagedRunRequest.request_id")?;
+            Ok((id, *s))
+        }
+        other => anyhow::bail!("run: the first frame is not a start frame: {other:?}"),
     }
 }
 
@@ -1215,8 +1363,9 @@ async fn run_bidi(
     req: DynItemStream,
     cancels: Arc<CancelRegistry>,
 ) -> DynItemStream {
-    let Some(start) = pull_run_start(&req) else {
-        return run_error_stream("run: missing start frame".into());
+    let (request_id, start) = match pull_run_start(&req) {
+        Ok(s) => s,
+        Err(e) => return run_error_stream(err_message(&e)),
     };
     // The run shells out via the reactor — execute on the cdylib's own runtime,
     // feeding RunOutFrames into a channel the host drains. (Live stdin/stdout will
@@ -1225,10 +1374,10 @@ async fn run_bidi(
     // caller's memoizer frame chain for cycle detection.
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     hcore::hmemoizer::spawn_on_with_cycle_ctx(cdylib_runtime().handle(), async move {
-        let guard = cancels.enter(&start.request_id);
+        let guard = cancels.enter(&request_id);
         // `tx` carries both the live output frames and the terminal one, in that
         // order, so the host sees the log before the result that ends the stream.
-        let out = run_once(driver, start, &tx, guard.token()).await;
+        let out = run_once(driver, request_id, start, &tx, guard.token()).await;
         // Host gone => receiver dropped; ignore send failure.
         drop(tx.send(out.encode_to_vec()).await);
     });
@@ -1274,11 +1423,15 @@ impl tokio::io::AsyncWrite for FrameSink {
             std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Ok(buf.len())),
             std::task::Poll::Ready(Ok(())) => {
                 let msg = if self.stderr {
-                    pb::run_out_frame::Msg::StderrChunk(buf.to_vec().into())
+                    pb::run_out_frame::Msg::StderrChunk(buf.to_vec())
                 } else {
-                    pb::run_out_frame::Msg::StdoutChunk(buf.to_vec().into())
+                    pb::run_out_frame::Msg::StdoutChunk(buf.to_vec())
                 };
-                let frame = pb::RunOutFrame { msg: Some(msg) }.encode_to_vec();
+                let frame = pb::RunOutFrame {
+                    msg: Some(msg),
+                    ..Default::default()
+                }
+                .encode_to_vec();
                 drop(self.tx.send_item(frame));
                 std::task::Poll::Ready(Ok(buf.len()))
             }
@@ -1300,36 +1453,107 @@ impl tokio::io::AsyncWrite for FrameSink {
     }
 }
 
+/// The decoded parts of a `ManagedRunRequest`. The target, `hashin` and every
+/// path are required: a defaulted `""` sandbox dir would run the target in the
+/// plugin's cwd, and a defaulted `hashin` would key it as nothing. `shell` is
+/// off unless said. `driver` is informational (each driver has its own handle).
+struct RunStart {
+    shell: bool,
+    target: hplugin::driver::targetdef::TargetDef,
+    hashin: String,
+    tree_root_path: PathBuf,
+    sandbox_dir: PathBuf,
+    sandbox_ws_dir: PathBuf,
+    sandbox_pkg_dir: PathBuf,
+    inputs: Vec<ManagedRunInput>,
+    credentials: Vec<hplugin::driver::CredentialMount>,
+    scratch: Vec<hplugin::driver::ScratchMount>,
+    deferred: std::collections::BTreeMap<String, hplugin::driver::DeferredValue>,
+}
+
+impl RunStart {
+    fn from_pb(req: pb::ManagedRunRequest) -> Result<Self> {
+        let path = |v: Option<String>, field| required(v, field).map(PathBuf::from);
+        Ok(Self {
+            shell: req.shell.unwrap_or(false),
+            target: convert::target_def_from_pb(required_msg(
+                req.target,
+                "ManagedRunRequest.target",
+            )?)?,
+            hashin: required(req.hashin, "ManagedRunRequest.hashin")?,
+            tree_root_path: path(req.tree_root_path, "ManagedRunRequest.tree_root_path")?,
+            sandbox_dir: path(req.sandbox_dir, "ManagedRunRequest.sandbox_dir")?,
+            sandbox_ws_dir: path(req.sandbox_ws_dir, "ManagedRunRequest.sandbox_ws_dir")?,
+            sandbox_pkg_dir: path(req.sandbox_pkg_dir, "ManagedRunRequest.sandbox_pkg_dir")?,
+            inputs: req
+                .inputs
+                .into_iter()
+                .map(managed_input_from_pb)
+                .collect::<Result<_>>()
+                .context("decoding the run's inputs")?,
+            // Fallible and never lossy: a credential dropped here would leave the
+            // target with no identity, which fails much later somewhere else — or
+            // succeeds against whatever ambient identity the host happened to have.
+            credentials: req
+                .credentials
+                .into_iter()
+                .map(convert::credential_mount_from_pb)
+                .collect::<Result<_>>()?,
+            scratch: req
+                .scratch
+                .into_iter()
+                .filter_map(convert::scratch_mount_from_pb)
+                .collect(),
+            // The wire carries finished values and nothing else: a `NeedsSandbox`
+            // is completed host-side before serialization, and `load_stable`
+            // refuses to serialize one that is not. So every entry arriving here
+            // is `Ready` by construction rather than by assumption.
+            deferred: req
+                .deferred
+                .into_iter()
+                .map(|(k, v)| (k, hplugin::driver::DeferredValue::Ready(v)))
+                .collect(),
+        })
+    }
+}
+
+/// A second handle on a decoded input: the run request and the managed layer
+/// each own one, over the same on-disk content.
+fn duplicate_input(i: &RunInput) -> RunInput {
+    RunInput {
+        artifact: inputartifact::InputArtifact {
+            r#type: match i.artifact.r#type {
+                inputartifact::Type::Dep => inputartifact::Type::Dep,
+                inputartifact::Type::Support => inputartifact::Type::Support,
+            },
+            origin_id: i.artifact.origin_id.clone(),
+            content: Arc::clone(&i.artifact.content),
+        },
+        origin_id: i.origin_id.clone(),
+        source_addr: i.source_addr.clone(),
+        filters: i.filters.clone(),
+        annotations: i.annotations.clone(),
+    }
+}
+
 async fn run_once(
     driver: Arc<dyn ManagedDriver>,
+    request_id: String,
     req: pb::ManagedRunRequest,
     out: &tokio::sync::mpsc::Sender<Vec<u8>>,
     ct: &StdCancellationToken,
 ) -> pb::RunOutFrame {
+    let start = match RunStart::from_pb(req) {
+        Ok(s) => s,
+        Err(e) => return run_out_err(err_message(&e)),
+    };
     // `shell` selects run_shell over run; it rides the request.
-    let shell = req.shell;
-    let target = match convert::target_def_from_pb(req.target.unwrap_or_default()) {
-        Ok(t) => t,
-        Err(e) => return run_out_err(err_message(&e)),
-    };
-    let request_id = req.request_id;
-    let hashin = req.hashin;
-    let sandbox_dir = PathBuf::from(req.sandbox_dir);
-    // Fallible and never lossy: a credential dropped here would leave the target
-    // with no identity, which fails much later somewhere else — or succeeds
-    // against whatever ambient identity the host happened to have.
-    let credentials = match req
-        .credentials
-        .into_iter()
-        .map(convert::credential_mount_from_pb)
-        .collect::<anyhow::Result<Vec<_>>>()
-    {
-        Ok(c) => c,
-        Err(e) => return run_out_err(err_message(&e)),
-    };
-    let run_inputs: Vec<RunInput> = req.inputs.iter().map(run_input_from_pb).collect();
-    let managed_inputs: Vec<ManagedRunInput> =
-        req.inputs.into_iter().map(managed_input_from_pb).collect();
+    let shell = start.shell;
+    let run_inputs: Vec<RunInput> = start
+        .inputs
+        .iter()
+        .map(|mi| duplicate_input(&mi.input))
+        .collect();
     // The driver's subprocess output rides the response stream back to the host,
     // which re-attaches it to the target's stdio. Handing it `None` here is what
     // made a cdylib driver's build log disappear.
@@ -1337,36 +1561,24 @@ async fn run_once(
     let mut stderr_sink = FrameSink::new(out, true);
     let rr = RunRequest {
         request_id: &request_id,
-        target: &target,
-        tree_root_path: PathBuf::from(req.tree_root_path),
+        target: &start.target,
+        tree_root_path: start.tree_root_path,
         inputs: run_inputs,
-        hashin: hashin.as_str(),
+        hashin: start.hashin.as_str(),
         stdin: None,
         stdout: Some(&mut stdout_sink),
         stderr: Some(&mut stderr_sink),
-        sandbox_dir: sandbox_dir.clone(),
-        scratch: req
-            .scratch
-            .into_iter()
-            .filter_map(convert::scratch_mount_from_pb)
-            .collect(),
-        credentials,
-        // The wire carries finished values and nothing else: a `NeedsSandbox`
-        // is completed host-side before serialization, and `load_stable` refuses
-        // to serialize one that is not. So every entry arriving here is `Ready`
-        // by construction rather than by assumption.
-        deferred: req
-            .deferred
-            .into_iter()
-            .map(|(k, v)| (k, hplugin::driver::DeferredValue::Ready(v)))
-            .collect(),
+        sandbox_dir: start.sandbox_dir.clone(),
+        scratch: start.scratch,
+        credentials: start.credentials,
+        deferred: start.deferred,
     };
     let mrr = ManagedRunRequest {
         request: rr,
-        sandbox_dir,
-        sandbox_ws_dir: PathBuf::from(req.sandbox_ws_dir),
-        sandbox_pkg_dir: PathBuf::from(req.sandbox_pkg_dir),
-        inputs: managed_inputs,
+        sandbox_dir: start.sandbox_dir,
+        sandbox_ws_dir: start.sandbox_ws_dir,
+        sandbox_pkg_dir: start.sandbox_pkg_dir,
+        inputs: start.inputs,
     };
     let result = if shell {
         driver.run_shell(mrr, ct).await
@@ -1381,9 +1593,11 @@ async fn run_once(
             .collect::<anyhow::Result<Vec<_>>>()
         {
             Ok(artifacts) => pb::RunOutFrame {
-                msg: Some(pb::run_out_frame::Msg::Response(pb::ManagedRunResponse {
+                msg: Some(pb::run_out_frame::Msg::from(pb::ManagedRunResponse {
                     artifacts,
+                    ..Default::default()
                 })),
+                ..Default::default()
             },
             Err(e) => run_out_err(err_message(&e)),
         },
@@ -1391,44 +1605,46 @@ async fn run_once(
     }
 }
 
-fn run_input_from_pb(mi: &pb::ManagedRunInput) -> RunInput {
-    let ty = match pb::InputArtifactType::try_from(mi.r#type).unwrap_or(pb::InputArtifactType::Dep)
-    {
+/// A managed run input, decoded. `type`, `source_addr` and `unpack_root` are
+/// required; an absent `list_path` is a Support input (which has none) and an
+/// absent `hashout` is one the host could not read — the in-process content
+/// reports that as `""`, as it always has.
+fn managed_input_from_pb(mi: pb::ManagedRunInput) -> Result<ManagedRunInput> {
+    let ty = match convert::required_enum(mi.r#type, "ManagedRunInput.type")? {
+        pb::InputArtifactType::Dep => inputartifact::Type::Dep,
         pb::InputArtifactType::Support => inputartifact::Type::Support,
-        _ => inputartifact::Type::Dep,
+        pb::InputArtifactType::Unspecified => {
+            anyhow::bail!("field ManagedRunInput.type is INPUT_ARTIFACT_TYPE_UNSPECIFIED")
+        }
     };
-    RunInput {
+    let unpack_root = PathBuf::from(required(mi.unpack_root, "ManagedRunInput.unpack_root")?);
+    let list_path = absent_not_empty(mi.list_path, "ManagedRunInput.list_path")?.map(PathBuf::from);
+    let origin_id = mi.origin_id.unwrap_or_default();
+    let input = RunInput {
         artifact: inputartifact::InputArtifact {
             r#type: ty,
-            origin_id: mi.origin_id.clone(),
+            origin_id: origin_id.clone(),
             // The host already materialized this input onto the shared filesystem
             // before invoking the driver. Back the content by those on-disk files
             // so a driver may read it (`walk`/`reader`) just like in-process —
             // no bytes are re-shipped over the boundary.
             content: Arc::new(DiskInputContent {
-                unpack_root: PathBuf::from(&mi.unpack_root),
-                list_path: mi.list_path.clone().map(PathBuf::from),
-                hashout: mi.hashout.clone(),
+                unpack_root: unpack_root.clone(),
+                list_path: list_path.clone(),
+                hashout: absent_not_empty(mi.hashout, "ManagedRunInput.hashout")?
+                    .unwrap_or_default(),
             }),
         },
-        origin_id: mi.origin_id.clone(),
-        source_addr: convert::addr_from_pb(mi.source_addr.clone().unwrap_or_default()),
-        filters: mi.filters.clone(),
-        annotations: mi
-            .annotations
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    }
-}
-
-fn managed_input_from_pb(mi: pb::ManagedRunInput) -> ManagedRunInput {
-    let input = run_input_from_pb(&mi);
-    ManagedRunInput {
+        origin_id,
+        source_addr: convert::addr_field(mi.source_addr, "ManagedRunInput.source_addr")?,
+        filters: mi.filters,
+        annotations: mi.annotations.into_iter().collect(),
+    };
+    Ok(ManagedRunInput {
         input,
-        list_path: mi.list_path.map(PathBuf::from),
-        unpack_root: PathBuf::from(mi.unpack_root),
-    }
+        list_path,
+        unpack_root,
+    })
 }
 
 /// [`Content`] for a managed run input, backed by the files the host already
@@ -1560,14 +1776,8 @@ pub struct StableHookImpl {
 
 impl StableMeta for StableHookImpl {
     extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
-        match pb::HookMethod::try_from(kind as i32) {
-            Ok(pb::HookMethod::Config) => SVec::from(
-                pb::ConfigResponse {
-                    name: self.hook.name(),
-                }
-                .encode_to_vec()
-                .as_slice(),
-            ),
+        match method_id::<pb::HookMethod>(kind) {
+            Ok(pb::HookMethod::Config) => config_response(Ok(self.hook.name())),
             // Unknown sync metadatum: empty == "none", never a hard failure.
             _ => SVec::new(),
         }
@@ -1582,7 +1792,7 @@ impl StableHook for StableHookImpl {
     ) -> DynFuture<'a, SVec<u8>> {
         let hook = Arc::clone(&self.hook);
         dynify(stabby::boxed::Box::new(async move {
-            match pb::HookMethod::try_from(method as i32) {
+            match method_id::<pb::HookMethod>(method) {
                 Ok(pb::HookMethod::OnEvents) => hook_on_events(hook, req).await,
                 _ => unimplemented(method),
             }
@@ -1595,8 +1805,8 @@ impl StableHook for StableHookImpl {
 /// inside `StreamItem.item` — the `BuildEvent` type is already serde, so there is
 /// no parallel proto mirror to keep in lockstep.
 fn decode_event_frame(bytes: &[u8]) -> Option<hcore::events::BuildEvent> {
-    match pb::Frame::decode(bytes).ok()?.body? {
-        Body::StreamItem(si) => serde_json::from_slice(&si.item).ok(),
+    match pb::Frame::decode_from_slice(bytes).ok()?.body? {
+        Body::StreamItem(si) => serde_json::from_slice(si.item.as_deref()?).ok(),
         _ => None,
     }
 }
@@ -1633,18 +1843,154 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::Write as _;
 
+    /// A target def with every required field, for tests that must get past
+    /// decoding (an empty raw_def blob fails JSON parse, so a trivial `{}`).
+    fn wire_target() -> pb::TargetDef {
+        pb::TargetDef {
+            addr: convert::addr_to_pb(&hmodel::htaddr::Addr::new(
+                PkgBuf::from("p"),
+                "t".into(),
+                Default::default(),
+            ))
+            .into(),
+            raw_def: pb::RawDefBlob {
+                format: Some(pb::raw_def_blob::Format::Json.into()),
+                data: Some(b"{}".to_vec()),
+                ..Default::default()
+            }
+            .into(),
+            cache: pb::CacheConfig {
+                enabled: Some(true),
+                remote_enabled: Some(false),
+                history: Some(1),
+                ..Default::default()
+            }
+            .into(),
+            hash: Some(vec![1]),
+            ..Default::default()
+        }
+    }
+
+    /// A run request with every required field.
+    fn wire_run(target: pb::TargetDef) -> pb::ManagedRunRequest {
+        pb::ManagedRunRequest {
+            request_id: Some("r".into()),
+            target: target.into(),
+            tree_root_path: Some("/ws".into()),
+            hashin: Some("h".into()),
+            sandbox_dir: Some("/sb".into()),
+            sandbox_ws_dir: Some("/sb/ws".into()),
+            sandbox_pkg_dir: Some("/sb/ws/p".into()),
+            ..Default::default()
+        }
+    }
+
+    fn start_frame(req: pb::ManagedRunRequest) -> Vec<u8> {
+        pb::RunInFrame {
+            msg: Some(pb::run_in_frame::Msg::from(req)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// A run request missing a required field fails the run naming it — it
+    /// used to default, and a `""` sandbox dir ran the target in the plugin's
+    /// cwd.
+    #[test]
+    fn a_run_request_missing_a_path_is_refused() {
+        use hcore::hasync::Cancellable;
+        use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        struct Unreached;
+        #[async_trait::async_trait]
+        impl ManagedDriver for Unreached {
+            fn config(
+                &self,
+                _r: hplugin::driver::ConfigRequest,
+            ) -> Result<hplugin::driver::ConfigResponse> {
+                anyhow::bail!("unused")
+            }
+            fn schema(&self) -> hplugin::driver::DriverSchema {
+                hplugin::driver::DriverSchema::default()
+            }
+            async fn parse(
+                &self,
+                _r: hplugin::driver::ParseRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ParseResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn apply_transitive(
+                &self,
+                _r: hplugin::driver::ApplyTransitiveRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn run<'a, 'io>(
+                &self,
+                _r: ManagedRunRequest<'a, 'io>,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<ManagedRunResponse> {
+                panic!("a malformed request must not reach the driver")
+            }
+        }
+        let mut req = wire_run(wire_target());
+        req.sandbox_dir = None;
+        let frame = futures::executor::block_on(run_once(
+            Arc::new(Unreached) as Arc<dyn ManagedDriver>,
+            "r".into(),
+            req,
+            &out_tx,
+            &StdCancellationToken::new(),
+        ));
+        match frame.msg {
+            Some(pb::run_out_frame::Msg::Error(msg)) => assert!(
+                msg.contains("missing field ManagedRunRequest.sandbox_dir"),
+                "{msg}"
+            ),
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
     // A managed input's content is readable from the files the host materialized
     // under unpack_root, scoped to this input's files via the list file.
     /// A guest driver reads the hashout the host sent, not an empty string:
     /// `oci_push`'s `${image_hashout}` runs on the far side of this seam.
     #[test]
     fn a_run_input_carries_the_hosts_hashout() {
-        let input = run_input_from_pb(&pb::ManagedRunInput {
-            origin_id: "image".to_string(),
-            hashout: "abc123".to_string(),
+        let wire = |hashout: Option<&str>| pb::ManagedRunInput {
+            r#type: Some(pb::InputArtifactType::Dep.into()),
+            origin_id: Some("image".to_string()),
+            source_addr: convert::addr_to_pb(
+                &hmodel::htaddr::parse_addr("//app:img").expect("addr"),
+            )
+            .into(),
+            unpack_root: Some("/unused".to_string()),
+            hashout: hashout.map(str::to_string),
             ..Default::default()
-        });
-        assert_eq!(input.artifact.content.hashout().expect("hashout"), "abc123");
+        };
+        let input = managed_input_from_pb(wire(Some("abc123"))).expect("decode");
+        assert_eq!(
+            input.input.artifact.content.hashout().expect("hashout"),
+            "abc123"
+        );
+        // Absent is "the host could not read one", which the content reports
+        // as `""`; a present empty one is no longer a way to say that.
+        let none = managed_input_from_pb(wire(None)).expect("decode");
+        assert_eq!(none.input.artifact.content.hashout().expect("hashout"), "");
+        assert!(managed_input_from_pb(wire(Some(""))).is_err());
+        // A Dep input with no `source_addr` is malformed, not `//:`.
+        let mut no_addr = wire(None);
+        no_addr.source_addr = buffa::MessageField::none();
+        let err = managed_input_from_pb(no_addr)
+            .err()
+            .expect("no source_addr");
+        assert!(
+            format!("{err:#}").contains("missing field ManagedRunInput.source_addr"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1881,10 +2227,13 @@ mod tests {
         let dynp = make_dyn_provider(Arc::new(FnProvider) as Arc<dyn Provider>);
         // 9999 is not a ProviderMethod value (none assigned).
         let bytes = futures::executor::block_on(dynp.invoke(9999, SVec::new()));
-        match pb::Frame::decode(&bytes[..]).expect("frame").body {
+        match pb::Frame::decode_from_slice(&bytes[..])
+            .expect("frame")
+            .body
+        {
             Some(Body::Error(e)) => assert_eq!(
                 e.kind,
-                pb::error::Kind::Unimplemented as i32,
+                Some(pb::error::Kind::Unimplemented.into()),
                 "unknown method must report Unimplemented"
             ),
             other => panic!("expected Unimplemented error, got {other:?}"),
@@ -1990,11 +2339,11 @@ mod tests {
                 .items
                 .iter()
                 .map(|it| match it {
-                    Ok(name) => Ok(ListResponse::addr_only(convert::addr_from_pb(pb::Addr {
-                        package: "p".into(),
-                        name: (*name).into(),
-                        args: Default::default(),
-                    }))),
+                    Ok(name) => Ok(ListResponse::addr_only(hmodel::htaddr::Addr::new(
+                        PkgBuf::from("p"),
+                        (*name).to_string(),
+                        Default::default(),
+                    ))),
                     Err(msg) => Err(anyhow::anyhow!("{msg}")),
                 })
                 .collect();
@@ -2115,26 +2464,14 @@ mod tests {
             }
         }
 
-        // A minimally-valid target so run_once gets past target conversion and
-        // actually invokes the driver (raw_def needs parseable JSON bytes).
-        let target = pb::TargetDef {
-            raw_def: Some(pb::RawDefBlob {
-                driver: String::new(),
-                format: pb::raw_def_blob::Format::Json as i32,
-                data: b"null".to_vec().into(),
-            }),
-            ..Default::default()
-        };
-        // The output channel goes nowhere here: this test is about the terminal
-        // error frame, not about live output.
+        // A valid request so run_once gets past decoding and actually invokes
+        // the driver. The output channel goes nowhere here: this test is about
+        // the terminal error frame, not about live output.
         let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let frame = futures::executor::block_on(run_once(
             Arc::new(FailDriver) as Arc<dyn ManagedDriver>,
-            pb::ManagedRunRequest {
-                request_id: "r".into(),
-                target: Some(target),
-                ..Default::default()
-            },
+            "r".into(),
+            wire_run(wire_target()),
             &out_tx,
             &StdCancellationToken::new(),
         ));
@@ -2200,13 +2537,7 @@ mod tests {
         }
 
         let dynd = make_dyn_managed_driver(Arc::new(NoopDriver) as Arc<dyn ManagedDriver>);
-        let start = pb::RunInFrame {
-            msg: Some(pb::run_in_frame::Msg::Start(pb::ManagedRunRequest {
-                request_id: "r".into(),
-                ..Default::default()
-            })),
-        }
-        .encode_to_vec();
+        let start = start_frame(wire_run(wire_target()));
         let req_stream = make_item_stream(Box::new(std::iter::once(start)));
 
         let resp =
@@ -2227,10 +2558,9 @@ mod tests {
         .expect("drain thread");
 
         assert_eq!(frames.len(), 1, "exactly one terminal RunOutFrame then end");
-        let frame = pb::RunOutFrame::decode(&frames[0][..]).expect("decode RunOutFrame");
+        let frame = pb::RunOutFrame::decode_from_slice(&frames[0][..]).expect("decode RunOutFrame");
         // A terminal frame (Response or Error) — proves the request was consumed and
-        // the run task's output crossed the response stream. (The default target
-        // fails conversion, so this run terminates as Error; the plumbing is the point.)
+        // the run task's output crossed the response stream; the plumbing is the point.
         assert!(
             matches!(
                 frame.msg,
@@ -2295,28 +2625,8 @@ mod tests {
         }
 
         let dynd = make_dyn_managed_driver(Arc::new(ChainErrDriver) as Arc<dyn ManagedDriver>);
-        // A valid target so conversion succeeds and `driver.run` is reached. An
-        // empty raw_def blob fails JSON parse, so supply a trivial `{}` object.
-        let target = pb::TargetDef {
-            addr: Some(convert::addr_to_pb(&hmodel::htaddr::Addr::new(
-                PkgBuf::from("p"),
-                "t".into(),
-                Default::default(),
-            ))),
-            raw_def: Some(pb::RawDefBlob {
-                data: b"{}".to_vec().into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let start = pb::RunInFrame {
-            msg: Some(pb::run_in_frame::Msg::Start(pb::ManagedRunRequest {
-                request_id: "r".into(),
-                target: Some(target),
-                ..Default::default()
-            })),
-        }
-        .encode_to_vec();
+        // A valid request so decoding succeeds and `driver.run` is reached.
+        let start = start_frame(wire_run(wire_target()));
         let req_stream = make_item_stream(Box::new(std::iter::once(start)));
 
         let resp =
@@ -2335,7 +2645,7 @@ mod tests {
         .join()
         .expect("drain thread");
 
-        let frame = pb::RunOutFrame::decode(&frames[0][..]).expect("decode RunOutFrame");
+        let frame = pb::RunOutFrame::decode_from_slice(&frames[0][..]).expect("decode RunOutFrame");
         let msg = match frame.msg {
             Some(pb::run_out_frame::Msg::Error(e)) => e,
             other => panic!("expected an Error frame, got {other:?}"),
@@ -2675,11 +2985,11 @@ mod tests {
     }
 
     // A caller that predates the capability (ABI < 0.15.0) sends no
-    // `accepts_declarations`, so it decodes as false. A declaring function must
-    // then fail the call: prost would skip the declaration fields, and the
-    // caller would build a target-less package from a BUILD file that asked for
-    // one. The plugin's functions handle is driven directly, since the
-    // host-side proxy always advertises support.
+    // `accepts_declarations`, which reads as false. A declaring function must
+    // then fail the call: the old caller would skip the declaration fields, and
+    // build a target-less package from a BUILD file that asked for one. The
+    // plugin's functions handle is driven directly, since the host-side proxy
+    // always advertises support.
     #[test]
     fn declarations_to_a_caller_that_cannot_carry_them_fail() {
         use hplugin_stabby::abi::StablePluginFunctionsDyn;
@@ -2693,55 +3003,72 @@ mod tests {
                 SVec::from(req.encode_to_vec().as_slice()),
             ))
         };
-        let req = pb::CallFunctionRequest {
-            name: "echo".into(),
-            pkg: "mypkg".into(),
-            root: "/ws".into(),
-            positional: vec![convert::value_to_pb(&Value::String("declare".into()))],
-            named: Default::default(),
-            accepts_declarations: false,
+        // An older caller: no `accepts_declarations` on the wire at all.
+        let call = |arg: &str| pb::CallFunctionRequest {
+            name: Some("echo".into()),
+            pkg: Some("mypkg".into()),
+            root: Some("/ws".into()),
+            positional: vec![convert::value_to_pb(&Value::String(arg.into()))],
+            ..Default::default()
         };
-        let bytes = invoke(req);
-        match pb::Frame::decode(&bytes[..]).expect("decode frame").body {
+        let bytes = invoke(call("declare"));
+        match pb::Frame::decode_from_slice(&bytes[..])
+            .expect("decode frame")
+            .body
+        {
             Some(Body::Error(e)) => {
+                let msg = e.message.unwrap_or_default();
                 // Names what was about to be lost, which side is old, and the
                 // remedy — the plugin author cannot fix the host's version.
-                assert!(e.message.contains("declared 1 target"), "{}", e.message);
+                assert!(msg.contains("declared 1 target"), "{msg}");
                 assert!(
-                    e.message
-                        .contains("the calling host does not carry declarations"),
-                    "{}",
-                    e.message
+                    msg.contains("the calling host does not carry declarations"),
+                    "{msg}"
                 );
-                assert!(e.message.contains("upgrade heph"), "{}", e.message);
+                assert!(msg.contains("upgrade heph"), "{msg}");
             }
             other => panic!("expected an error, got {other:?}"),
         }
 
         // The same function, same caller, not declaring: unaffected.
-        let req = pb::CallFunctionRequest {
-            name: "echo".into(),
-            pkg: "mypkg".into(),
-            root: "/ws".into(),
-            positional: vec![convert::value_to_pb(&Value::String("hi".into()))],
-            named: Default::default(),
-            accepts_declarations: false,
-        };
-        let bytes = invoke(req);
-        match pb::Frame::decode(&bytes[..]).expect("decode frame").body {
+        let bytes = invoke(call("hi"));
+        match pb::Frame::decode_from_slice(&bytes[..])
+            .expect("decode frame")
+            .body
+        {
             Some(Body::CallFunctionResp(r)) => assert_eq!(
-                convert::value_from_pb(r.value.unwrap_or_default()),
+                convert::value_from_pb(r.value.into_option().expect("a value")).expect("decode"),
                 Value::String("mypkg:hi".into())
             ),
             other => panic!("expected a value, got {other:?}"),
         }
 
+        // A call that does not say its root is refused, naming the field.
+        let mut no_root = call("hi");
+        no_root.root = None;
+        match pb::Frame::decode_from_slice(&invoke(no_root)[..])
+            .expect("decode frame")
+            .body
+        {
+            Some(Body::Error(e)) => {
+                let msg = e.message.unwrap_or_default();
+                assert!(
+                    msg.contains("missing field CallFunctionRequest.root"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+
         // An unknown method id on the handle is Unimplemented, not a crash —
         // the same additive contract as the provider's dispatch.
         let bytes = futures::executor::block_on(handle.invoke(9999, "echo".into(), SVec::new()));
-        match pb::Frame::decode(&bytes[..]).expect("frame").body {
+        match pb::Frame::decode_from_slice(&bytes[..])
+            .expect("frame")
+            .body
+        {
             Some(Body::Error(e)) => {
-                assert_eq!(e.kind, pb::error::Kind::Unimplemented as i32);
+                assert_eq!(e.kind, Some(pb::error::Kind::Unimplemented.into()));
             }
             other => panic!("expected Unimplemented, got {other:?}"),
         }
@@ -3325,8 +3652,9 @@ mod tests {
         }) as Arc<dyn Provider>);
 
         let req = pb::ProbeRequest {
-            request_id: String::new(),
-            package: "p".into(),
+            request_id: Some(String::new()),
+            package: Some("p".into()),
+            ..Default::default()
         }
         .encode_to_vec();
         let fut = dynp.invoke(pb::ProviderMethod::Probe as u32, SVec::from(req.as_slice()));
@@ -3393,8 +3721,9 @@ mod tests {
         for i in 0..100 {
             let id = format!("rq-{i}");
             let req = pb::ProbeRequest {
-                request_id: id.clone(),
-                package: "p".into(),
+                request_id: Some(id.clone()),
+                package: Some("p".into()),
+                ..Default::default()
             }
             .encode_to_vec();
             // Spawn (eager) ...

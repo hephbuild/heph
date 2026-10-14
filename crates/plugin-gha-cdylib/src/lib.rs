@@ -13,12 +13,12 @@ use plugin_sdk::stabby::abi::{
 };
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    make_dyn_hook, options_from_pb_map,
+    make_dyn_hook,
 };
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
-/// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
-/// `pb::CreateConfig` bytes. A hook has no functions, so the engine's function
+/// host's `get_stabbied` checks for ABI compatibility. `cfg` is the encoded
+/// create config. A hook has no functions, so the engine's function
 /// registry goes unused.
 #[stabby::export]
 pub extern "C" fn heph_plugin_create(
@@ -42,7 +42,7 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);
 }
 
-/// Stable ABI log-filter entry: the host's filter as prost `pb::LogFilter` bytes,
+/// Stable ABI log-filter entry: the host's filter as protobuf `LogFilter` bytes,
 /// so events it would discard are dropped here instead of forwarded.
 #[stabby::export]
 pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
@@ -68,8 +68,7 @@ pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
 }
 
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
-    let cfg = create_config_from_bytes(cfg)?;
-    let options = options_from_pb_map(cfg.options);
+    let options = create_config_from_bytes(cfg)?.options;
     let hook: Arc<dyn Hook> = Arc::new(GhaHook::from_options(&options)?);
 
     let mut hooks = stabby::vec::Vec::new();

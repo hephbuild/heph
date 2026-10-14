@@ -10,12 +10,12 @@ use super::Engine;
 use super::config_yaml;
 
 /// One resolved `path:`/`url:` plugin entry awaiting dylib load: its source, the
-/// optional manifest checksum (`url:` only), and the structured options for the
-/// cdylib's create entry.
+/// optional manifest checksum (`url:` only), and the options for the cdylib's
+/// create entry.
 struct ManifestPlugin {
     identifier: config_yaml::PluginIdentifier,
     checksum: Option<String>,
-    options: std::collections::HashMap<String, hplugin_abi::pb::Value>,
+    options: config_yaml::Options,
 }
 
 impl Engine {
@@ -31,12 +31,12 @@ impl Engine {
                 config_yaml::PluginIdentifier::Builtin(name) => self
                     .apply_builtin(name, &spec.options)
                     .with_context(|| format!("apply builtin plugin `{name}`"))?,
-                // Manifest plugin: carry the options as structured pb map data for
-                // the cdylib's create entry (pb::CreateConfig), resolve + load below.
+                // Manifest plugin: carry the options to the cdylib's create entry,
+                // resolve + load below.
                 _ => manifests.push(ManifestPlugin {
                     identifier: spec.identifier.clone(),
                     checksum: spec.checksum.clone(),
-                    options: hplugin_abi::convert::options_to_pb_map(&spec.options),
+                    options: spec.options.clone(),
                 }),
             }
         }
@@ -86,8 +86,6 @@ fn load_dylib_plugins(
     if manifests.is_empty() {
         return Ok(());
     }
-    let root_str = root.to_string_lossy().into_owned();
-    let home_str = home_dir.to_string_lossy().into_owned();
     // Taken here, not probed inside `load`: the rayon workers below have no
     // current tokio runtime.
     let runtime = e.runtime.clone();
@@ -108,10 +106,12 @@ fn load_dylib_plugins(
                 runners,
             } = hplugin_stabby::load_stable::load(
                 dylib,
-                &resolved.name,
-                &root_str,
-                &home_str,
-                m.options,
+                &hplugin_abi::convert::CreateConfig {
+                    root: root.to_path_buf(),
+                    home: home_dir.to_path_buf(),
+                    name: resolved.name.clone(),
+                    options: m.options,
+                },
                 runtime.clone(),
                 std::sync::Arc::clone(&functions),
             )

@@ -9,7 +9,7 @@
 //!
 //! Scoping: only the hot callback path is native. The cold, low-volume
 //! Provider/Driver methods (config/list/get/parse/run, ~2k calls ≈ 130ms total)
-//! cross as prost bytes — cheap, and lenient via protobuf — so the gnarly
+//! cross as protobuf bytes — cheap, and additive — so the gnarly
 //! `TargetSpec`/`TargetDef`/`raw_def` types need no stabby mirror.
 //!
 //! `Addr` crosses as its canonical `//pkg:name` string (parsed at the seam;

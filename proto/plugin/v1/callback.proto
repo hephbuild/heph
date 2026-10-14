@@ -15,7 +15,7 @@ message ArtifactHandle {
   string group = 2;
   string name = 3;
   string hashout = 4;
-  uint64 byte_size = 5; // 0 if the backing can't answer cheaply
+  uint64 byte_size = 5; // absent if the backing can't answer cheaply
   bool support = 6;     // support_artifact vs primary artifact
 }
 
