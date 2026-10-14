@@ -324,6 +324,25 @@ pub fn make_dyn_managed_driver(
     }))
 }
 
+/// Export a managed driver for a cdylib's `PluginComponents.drivers`, under the
+/// local name its own `config()` reports — the name the host registers it by
+/// (prefixed with the plugin's). The driver states its name once; a cdylib
+/// never repeats it as a literal beside the driver.
+///
+/// Fails, naming the driver's type, when its `config()` does.
+pub fn named_managed_driver<D: ManagedDriver + 'static>(
+    driver: D,
+) -> Result<hplugin_stabby::abi::NamedDriver> {
+    let name = driver
+        .config(DriverConfigRequest {})
+        .with_context(|| format!("config of driver {}", std::any::type_name::<D>()))?
+        .name;
+    Ok(hplugin_stabby::abi::NamedDriver {
+        name: name.as_str().into(),
+        driver: make_dyn_managed_driver(Arc::new(driver)),
+    })
+}
+
 /// In-flight calls keyed by `request_id`, so [`StableCancel::cancel`] can trip the
 /// token a running call handed the provider/driver. A cancel that races ahead of
 /// its call (arrives before the call registers) is parked in `precancelled` and
@@ -3011,52 +3030,85 @@ mod tests {
     // `--shell` on any external managed driver (e.g. go_compile) failed.
     #[test]
     fn remote_managed_driver_reports_no_native_shell() {
-        use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
         use hplugin_stabby::load_stable::StableRemoteManagedDriver;
 
-        struct BareDriver;
-        #[async_trait::async_trait]
-        impl ManagedDriver for BareDriver {
-            fn config(
-                &self,
-                _req: hplugin::driver::ConfigRequest,
-            ) -> Result<hplugin::driver::ConfigResponse> {
-                Ok(hplugin::driver::ConfigResponse {
-                    name: "bare".into(),
-                })
-            }
-            fn schema(&self) -> hplugin::driver::DriverSchema {
-                hplugin::driver::DriverSchema::default()
-            }
-            async fn parse(
-                &self,
-                _req: hplugin::driver::ParseRequest,
-                _ct: &(dyn Cancellable + Send + Sync),
-            ) -> Result<hplugin::driver::ParseResponse> {
-                anyhow::bail!("unused")
-            }
-            async fn apply_transitive(
-                &self,
-                _req: hplugin::driver::ApplyTransitiveRequest,
-                _ct: &(dyn Cancellable + Send + Sync),
-            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
-                anyhow::bail!("unused")
-            }
-            async fn run<'a, 'io>(
-                &self,
-                _req: ManagedRunRequest<'a, 'io>,
-                _ct: &(dyn Cancellable + Send + Sync),
-            ) -> Result<ManagedRunResponse> {
-                anyhow::bail!("unused")
-            }
-        }
-
-        let dynd = make_dyn_managed_driver(Arc::new(BareDriver) as Arc<dyn ManagedDriver>);
+        let dynd =
+            make_dyn_managed_driver(Arc::new(BareDriver(Some("bare"))) as Arc<dyn ManagedDriver>);
         let host = StableRemoteManagedDriver::new(dynd, "bare");
         assert!(
             !host.supports_shell(),
             "remote proxy must defer --shell to the host pluginexec fallback"
         );
+    }
+
+    /// A managed driver whose `config()` reports `.0` as its name, or fails
+    /// when it is `None`. Every other method is unused.
+    struct BareDriver(Option<&'static str>);
+
+    #[async_trait::async_trait]
+    impl ManagedDriver for BareDriver {
+        fn config(
+            &self,
+            _req: hplugin::driver::ConfigRequest,
+        ) -> Result<hplugin::driver::ConfigResponse> {
+            let name = self.0.context("config deliberately fails")?;
+            Ok(hplugin::driver::ConfigResponse { name: name.into() })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            hplugin::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _req: hplugin::driver::ParseRequest,
+            _ct: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ParseResponse> {
+            anyhow::bail!("unused")
+        }
+        async fn apply_transitive(
+            &self,
+            _req: hplugin::driver::ApplyTransitiveRequest,
+            _ct: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+            anyhow::bail!("unused")
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _req: hdriver_support::driver_managed::ManagedRunRequest<'a, 'io>,
+            _ct: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hdriver_support::driver_managed::ManagedRunResponse> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    /// A cdylib states a driver's local name once, in its `config()`: what the
+    /// host registers is that name, carried by the exported `NamedDriver`.
+    #[test]
+    fn an_exported_driver_is_registered_under_its_config_name() {
+        let nd = named_managed_driver(BareDriver(Some("layer"))).expect("export");
+        let mut host = hplugin_stabby::load_stable::decode_drivers([nd]);
+        assert_eq!(host.len(), 1);
+        let (local, drv) = host.remove(0);
+        assert_eq!(local, "layer");
+        let name = drv
+            .config(hplugin::driver::ConfigRequest {})
+            .expect("host config")
+            .name;
+        assert_eq!(
+            name, "layer",
+            "the host-side driver reports the exported name"
+        );
+    }
+
+    /// A driver whose `config()` fails is not exported under some placeholder:
+    /// the export fails, naming the driver's type so the cdylib's log says which.
+    #[test]
+    fn exporting_a_driver_whose_config_fails_names_the_driver() {
+        let Err(err) = named_managed_driver(BareDriver(None)) else {
+            panic!("a failing config must fail the export");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("BareDriver"), "{msg}");
+        assert!(msg.contains("config deliberately fails"), "{msg}");
     }
 
     // ---- CancelRegistry: deterministic coverage of the enter/cancel/drop

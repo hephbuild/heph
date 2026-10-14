@@ -4125,7 +4125,6 @@ name = "plugin-devenv-cdylib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "driver-support",
  "plugin",
  "plugin-devenv",
  "plugin-sdk",
@@ -4311,7 +4310,6 @@ name = "plugin-oci-cdylib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "driver-support",
  "plugin",
  "plugin-oci",
  "plugin-sdk",

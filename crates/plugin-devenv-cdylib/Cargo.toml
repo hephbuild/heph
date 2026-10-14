@@ -12,7 +12,6 @@ workspace = true
 [dependencies]
 hplugin-devenv = { package = "plugin-devenv", path = "../plugin-devenv" }
 hplugin = { package = "plugin", path = "../plugin" }
-hdriver-support = { package = "driver-support", path = "../driver-support" }
 plugin-sdk = { path = "../plugin-sdk", features = ["stabby"] }
 stabby = "72.1.8"
 anyhow = "1.0.102"

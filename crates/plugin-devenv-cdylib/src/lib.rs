@@ -10,16 +10,14 @@
 //! manage, and devenv does not: a held shell is exactly what `session` already
 //! is.
 
-use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_devenv::plugindevenv;
 use plugin_sdk::stabby::abi::{
-    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
+    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, PluginComponents,
 };
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    make_dyn_managed_driver, options_from_pb_map,
+    named_managed_driver, options_from_pb_map,
 };
-use std::sync::Arc;
 
 /// Stable ABI create entry. `cfg` is prost-encoded `pb::CreateConfig`; the
 /// `bin:` option is read out of it so a workspace can pin which `devenv` it
@@ -88,13 +86,10 @@ pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let cfg = create_config_from_bytes(cfg)?;
     let opts = options_from_pb_map(cfg.options);
-    let driver: Arc<dyn ManagedDriver> = Arc::new(plugindevenv::Driver::from_options(&opts)?);
-
     let mut drivers = stabby::vec::Vec::new();
-    drivers.push(NamedDriver {
-        name: "runner".into(),
-        driver: make_dyn_managed_driver(driver),
-    });
+    drivers.push(named_managed_driver(plugindevenv::Driver::from_options(
+        &opts,
+    )?)?);
 
     Ok(PluginComponents {
         provider: stabby::option::Option::None(),

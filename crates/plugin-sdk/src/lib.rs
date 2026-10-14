@@ -41,7 +41,7 @@ pub mod stabby {
     pub use crate::runnerhost::{install_runner_host, make_dyn_runner};
     pub use crate::serve::{
         cdylib_runtime_handle, guest_functions, make_dyn_hook, make_dyn_managed_driver,
-        make_dyn_provider, make_plugin_functions,
+        make_dyn_provider, make_plugin_functions, named_managed_driver,
     };
     pub use crate::supervisor::{install_supervisor, supervisor_sink};
 

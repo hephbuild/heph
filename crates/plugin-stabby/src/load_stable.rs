@@ -6,10 +6,11 @@
 
 use crate::abi::{
     CREATE_SYMBOL, CreateFn, DynExecutor, DynHook, DynItemStream, DynManagedDriver,
-    DynPluginFunctions, DynProvider, NamedFunction, SET_LOG_FILTER_SYMBOL, SET_LOG_SINK_SYMBOL,
-    SET_RUNNER_HOST_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogFilterFn, SetLogSinkFn, SetRunnerHostFn,
-    SetSupervisorFn, StableCancelDyn, StableHookDyn, StableItemStream, StableItemStreamDyn,
-    StableManagedDriverDyn, StableMetaDyn, StablePluginFunctionsDyn, StableProviderDyn,
+    DynPluginFunctions, DynProvider, NamedDriver, NamedFunction, SET_LOG_FILTER_SYMBOL,
+    SET_LOG_SINK_SYMBOL, SET_RUNNER_HOST_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogFilterFn,
+    SetLogSinkFn, SetRunnerHostFn, SetSupervisorFn, StableCancelDyn, StableHookDyn,
+    StableItemStream, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
+    StablePluginFunctionsDyn, StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use crate::vtable::dynify;
@@ -114,6 +115,24 @@ fn optional_entry<'l, T: stabby::IStable>(
             None
         }
     }
+}
+
+/// A plugin's exported drivers as host-side drivers, each under the local name
+/// it was exported with — the name the engine registers it by (prefixed with
+/// the plugin's). The plugin-side driver's own `config()` is never asked.
+pub fn decode_drivers(
+    drivers: impl IntoIterator<Item = NamedDriver>,
+) -> Vec<(String, StableRemoteManagedDriver)> {
+    drivers
+        .into_iter()
+        .map(|nd| {
+            let name = nd.name.to_string();
+            (
+                name.clone(),
+                StableRemoteManagedDriver::new(nd.driver, name),
+            )
+        })
+        .collect()
 }
 
 /// Decode a plugin's exported function metadata into host-side defs, each
@@ -289,14 +308,7 @@ pub fn load(
     let provider: std::option::Option<DynProvider> = provider.into();
     let host_provider = provider.map(|p| StableRemoteProvider::new(p, name));
 
-    let mut host_drivers = Vec::new();
-    for nd in drivers {
-        let name = nd.name.to_string();
-        host_drivers.push((
-            name.clone(),
-            StableRemoteManagedDriver::new(nd.driver, name),
-        ));
-    }
+    let host_drivers = decode_drivers(drivers);
 
     let mut host_hooks = Vec::new();
     for nh in hooks {
