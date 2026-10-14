@@ -49,8 +49,6 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 use super::ws_path;
 
-pub const DRIVER_NAME: &str = "oci_pull";
-
 /// Config for an `oci_pull` target.
 #[derive(Spec)]
 struct OciPullSpec {
@@ -202,7 +200,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: "pull".to_string(),
         })
     }
 
@@ -431,7 +429,7 @@ mod tests {
             request_id: "test".to_string(),
             target_spec: Arc::new(TargetSpec {
                 addr: parse_addr(addr).expect("addr"),
-                driver: DRIVER_NAME.to_string(),
+                driver: "oci.pull".to_string(),
                 config,
                 ..Default::default()
             }),

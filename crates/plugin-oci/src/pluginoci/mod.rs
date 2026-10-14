@@ -275,7 +275,7 @@ pub(crate) fn layout_path(
     anyhow::bail!(
         "{attr} is neither an OCI layout directory nor a single archive: no `oci-layout` file \
          among {} staged path(s), the first being {:?}. Produce it with \
-         `oci_pull(layout = True)`, `oci_image(...)` or `docker_build(...)`.",
+         an `oci.pull` target with `layout = True`, an `oci.image` or an `oci.docker_build`.",
         paths.len(),
         paths.first()
     )

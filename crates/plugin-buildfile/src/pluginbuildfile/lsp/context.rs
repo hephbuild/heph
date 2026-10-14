@@ -13,10 +13,9 @@ use crate::pluginbuildfile::run_file::{
 use hcore::hasync::StdCancellationToken;
 use hcore::hmemoizer::Memoizer;
 use hmodel::htpkg::PkgBuf;
+use hplugin::function::FunctionRegistry;
 use hplugin::lsp::LspEngine;
-use hplugin::provider::{
-    ListPackagesRequest, ListRequest, Provider as EProvider, ProviderFunctionRegistry,
-};
+use hplugin::provider::{ListPackagesRequest, ListRequest, Provider as EProvider};
 use starlark::docs::DocModule;
 use starlark::environment::Globals;
 use starlark::errors::EvalMessage;
@@ -38,7 +37,7 @@ const LISTING_TTL: Duration = Duration::from_secs(2);
 
 pub(crate) struct HephLspContext {
     root: PathBuf,
-    registry: Arc<ProviderFunctionRegistry>,
+    registry: Arc<FunctionRegistry>,
     /// Docs for the heph globals; drives `starlark_lsp`'s builtin completion/hover.
     doc_globals: DocModule,
     /// Lazily-built Starlark globals, shared across per-buffer evaluations.
@@ -59,7 +58,7 @@ pub(crate) struct HephLspContext {
 impl HephLspContext {
     pub(crate) fn new(engine: Arc<dyn LspEngine>) -> HephLspContext {
         let root = engine.root().to_path_buf();
-        let registry = engine.provider_function_registry();
+        let registry = engine.function_registry();
         let doc_globals = build_globals(&registry).documentation();
         let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
         let builtin_hovers = crate::pluginbuildfile::run_file::BuiltinHovers::new(&doc_globals);
@@ -229,15 +228,15 @@ fn first_build_file(dir: &Path, patterns: &[glob::Pattern]) -> Option<PathBuf> {
 fn build_listing_provider(
     root: &Path,
     patterns: &[glob::Pattern],
-    registry: &Arc<ProviderFunctionRegistry>,
+    registry: &Arc<FunctionRegistry>,
     runtime: tokio::runtime::Handle,
 ) -> Arc<Provider> {
     let provider = Provider {
         root: root.to_path_buf(),
         build_file_patterns: patterns.to_vec(),
         ..Provider::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
-    };
-    provider.set_function_registry(Arc::clone(registry));
+    }
+    .with_function_registry(Arc::clone(registry));
     Arc::new(provider)
 }
 
@@ -459,8 +458,9 @@ mod tests {
     use super::{HephLspContext, LspContext as _, first_build_file};
     use hplugin::config::Options;
     use hplugin::driver::DriverSchema;
+    use hplugin::function::FunctionRegistry;
     use hplugin::lsp::LspEngine;
-    use hplugin::provider::{ProviderFunctionRegistry, StateSchema};
+    use hplugin::provider::StateSchema;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -474,7 +474,7 @@ mod tests {
         fn root(&self) -> &Path {
             &self.root
         }
-        fn provider_function_registry(&self) -> Arc<ProviderFunctionRegistry> {
+        fn function_registry(&self) -> Arc<FunctionRegistry> {
             Arc::default()
         }
         fn driver_schema(&self, _name: &str) -> Option<DriverSchema> {

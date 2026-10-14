@@ -383,7 +383,7 @@ fn enrich_hover(
     // Index positions are 1-based.
     let mut md = existing_hover_markdown(resp);
 
-    // Hovering a provider function reference (`heph.<provider>.<fn>`, e.g.
+    // Hovering a plugin function reference (`heph.<plugin>.<fn>`, e.g.
     // `heph.fs.join`) → its rendered signature + doc, pulled from the function
     // registry. Authoritative for these, so it replaces any stock hover (the
     // stock server has no docs for the engine-injected native functions).
@@ -504,8 +504,8 @@ fn builtin_call_hover(source: &str, line: u32, col: u32, shared: &SharedState) -
     })
 }
 
-/// Hover markdown for a provider-function reference under the cursor, or `None`
-/// if the cursor is not on a `heph.<provider>.<fn>` whose function is registered.
+/// Hover markdown for a plugin-function reference under the cursor, or `None`
+/// if the cursor is not on a `heph.<plugin>.<fn>` whose function is registered.
 ///
 /// This can't be left to the stock `starlark_lsp`: its hover resolves top-level
 /// globals and `load()`-ed symbols, but not a member of a *global namespace*
@@ -536,7 +536,7 @@ fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) ->
             .find(|m| m.name == func)
             .map(|m| m.doc.clone());
     }
-    let registry = shared.engine.provider_function_registry();
+    let registry = shared.engine.function_registry();
     let rf = registry.get(&provider, &func)?;
     let sig = &rf.signature;
 
@@ -618,9 +618,9 @@ fn default_repr(v: &hcore::htvalue::Value) -> String {
 }
 
 /// If the identifier at byte offset `col` on `line` is the final segment of a
-/// `heph.<provider>.<fn>` dotted path, return `(provider, fn)`. The cursor may
+/// `heph.<plugin>.<fn>` dotted path, return `(plugin, fn)`. The cursor may
 /// sit anywhere within the function identifier. Only ASCII identifiers (the
-/// namespace/provider/function names) and `.` separators are walked.
+/// namespace/plugin/function names) and `.` separators are walked.
 fn provider_fn_at(line: &str, col: usize) -> Option<(String, String)> {
     let b = line.as_bytes();
     let is_ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
@@ -656,8 +656,8 @@ fn provider_fn_at(line: &str, col: usize) -> Option<(String, String)> {
     }
     segments.reverse();
 
-    // Exactly `heph.<provider>.<fn>`; the `heph.core.*` builtins live in a
-    // different namespace and aren't in the provider registry.
+    // Exactly `heph.<plugin>.<fn>`; the `heph.core.*` builtins live in a
+    // different namespace and aren't in the function registry.
     match segments.as_slice() {
         ["heph", provider, func] => Some((provider.to_string(), func.to_string())),
         _ => None,
@@ -691,19 +691,19 @@ fn marked_string_text(s: MarkedString) -> String {
 }
 
 /// Completion items for a `heph` namespace member access whose dotted base ends
-/// just before the cursor. `heph.` → the provider namespaces (`fs`, `go`, …) plus
-/// `core`; `heph.<provider>.` → that provider's functions, with their signature
+/// just before the cursor. `heph.` → the plugin namespaces (`fs`, `go`, …) plus
+/// `core`; `heph.<plugin>.` → that plugin's functions, with their signature
 /// as detail and doc as the popup. Empty when the cursor isn't on such a member.
 fn provider_member_completions(prefix: &str, shared: &SharedState) -> Vec<CompletionItem> {
     let Some(base) = completion_member_base(prefix) else {
         return vec![];
     };
-    let registry = shared.engine.provider_function_registry();
+    let registry = shared.engine.function_registry();
     match base.as_slice() {
         // `heph.` → namespace names. `core` is a static builtin namespace, the
         // rest come from the providers that registered functions.
         ["heph"] => {
-            let mut names: Vec<String> = registry.providers().map(|(p, _)| p.to_string()).collect();
+            let mut names: Vec<String> = registry.plugins().map(|(p, _)| p.to_string()).collect();
             names.push("core".to_string());
             names.sort();
             names.dedup();
@@ -736,9 +736,9 @@ fn provider_member_completions(prefix: &str, shared: &SharedState) -> Vec<Comple
                 ..Default::default()
             })
             .collect(),
-        // `heph.<provider>.` → that provider's functions.
+        // `heph.<plugin>.` → that plugin's functions.
         ["heph", provider] => registry
-            .providers()
+            .plugins()
             .find(|(p, _)| p == provider)
             .map(|(_, fns)| {
                 let mut items: Vec<CompletionItem> = fns
@@ -1162,8 +1162,8 @@ fn enrich_completion(
         .get(..(col as usize).min(line_text.len()))
         .unwrap_or("");
 
-    // Member access on the `heph` namespace (`heph.` → providers, `heph.<provider>.`
-    // → that provider's functions) takes priority — the stock server can't
+    // Member access on the `heph` namespace (`heph.` → plugins, `heph.<plugin>.`
+    // → that plugin's functions) takes priority — the stock server can't
     // complete namespace members at all.
     let member = provider_member_completions(prefix, shared);
 
@@ -1248,16 +1248,14 @@ mod tests {
 
     struct FakeEngine {
         root: std::path::PathBuf,
-        registry: std::sync::Arc<hplugin::provider::ProviderFunctionRegistry>,
+        registry: std::sync::Arc<hplugin::function::FunctionRegistry>,
     }
 
     impl hplugin::lsp::LspEngine for FakeEngine {
         fn root(&self) -> &Path {
             &self.root
         }
-        fn provider_function_registry(
-            &self,
-        ) -> std::sync::Arc<hplugin::provider::ProviderFunctionRegistry> {
+        fn function_registry(&self) -> std::sync::Arc<hplugin::function::FunctionRegistry> {
             std::sync::Arc::clone(&self.registry)
         }
         fn driver_schema(&self, name: &str) -> Option<hplugin::driver::DriverSchema> {
@@ -1312,7 +1310,7 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         let tmp = tempfile::tempdir().unwrap();
-        let registry = Arc::new(hplugin::provider::ProviderFunctionRegistry::default());
+        let registry = Arc::new(hplugin::function::FunctionRegistry::default());
         let patterns = vec![glob::Pattern::new("BUILD").unwrap()];
         let walker = Arc::new(hwalk::CachedWalker::disabled());
         let loader = BuildFileLoader::new(

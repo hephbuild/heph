@@ -15,12 +15,12 @@ use hplugin::driver::{
         path::{CodegenMode, Content as PathContent, Path},
     },
 };
+use hplugin::function::{FnArgs, FnCallContext, FnOutcome, PluginFn, PluginFnDef};
 use hplugin::htspec::Spec;
 use hplugin::provider::{
-    ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, FnArgs,
-    FnCallContext, FnOutcome, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
-    Provider as EProvider, ProviderFn, ProviderFunctionDef, TargetSpec,
+    ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, GetError,
+    GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse,
+    ProbeRequest, ProbeResponse, Provider as EProvider, TargetSpec,
 };
 use hwalk::{CachedWalker, Ignore};
 use parking_lot::RwLock;
@@ -142,19 +142,10 @@ pub fn is_fs_addr(addr: &Addr) -> bool {
 
 // ─── Provider ────────────────────────────────────────────────────────────────
 
+/// The `fs` provider: the source-file targets under `//@heph/fs`. Its BUILD
+/// functions are the plugin's, not its own — see [`functions`].
 #[derive(Default)]
-pub struct Provider {
-    /// Dirs the `glob` provider function must prune, shared with the driver.
-    skip: Arc<Ignore>,
-    /// Shared cross-run filesystem-walk cache, used by the `glob` function.
-    walker: Arc<CachedWalker>,
-}
-
-impl Provider {
-    pub fn new(skip: Arc<Ignore>, walker: Arc<CachedWalker>) -> Self {
-        Self { skip, walker }
-    }
-}
+pub struct Provider;
 
 impl EProvider for Provider {
     fn config(&self, _req: ProviderConfigRequest) -> anyhow::Result<ProviderConfigResponse> {
@@ -237,8 +228,17 @@ impl EProvider for Provider {
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move { Ok(ProbeResponse { states: vec![] }) })
     }
+}
 
-    fn functions(&self) -> Vec<ProviderFunctionDef> {
+/// The `fs` plugin's BUILD-file functions, `heph.fs.*`. `glob` walks with
+/// `skip` and `walker` — the same `Ignore` and walker as the `fs` provider, so
+/// BUILD-time expansion prunes exactly what the provider and driver prune.
+///
+/// `glob` and `parent` read the tree under the root (the documented
+/// tree-reading exemption of `PluginFn`'s purity contract); the rest are pure
+/// string handling.
+pub fn functions(skip: &Arc<Ignore>, walker: &Arc<CachedWalker>) -> Vec<PluginFnDef> {
+    {
         // A single required string positional, returning a string.
         let one_path = || FnSignature {
             positional: vec![Param::required("path", ParamType::String)],
@@ -247,7 +247,7 @@ impl EProvider for Provider {
             returns: ParamType::String,
         };
         vec![
-            ProviderFunctionDef {
+            PluginFnDef {
                 name: "glob".to_string(),
                 signature: FnSignature {
                     positional: vec![Param::required("pattern", ParamType::String)],
@@ -260,11 +260,11 @@ impl EProvider for Provider {
                       build-managed directories are skipped."
                     .to_string(),
                 func: Arc::new(GlobFn {
-                    skip: self.skip.clone(),
-                    walker: self.walker.clone(),
+                    skip: Arc::clone(skip),
+                    walker: Arc::clone(walker),
                 }),
             },
-            ProviderFunctionDef {
+            PluginFnDef {
                 name: "join".to_string(),
                 // Variadic `join(a, b, c)` — Go `path.Join` style.
                 signature: FnSignature {
@@ -279,7 +279,7 @@ impl EProvider for Provider {
                     .to_string(),
                 func: Arc::new(JoinFn),
             },
-            ProviderFunctionDef {
+            PluginFnDef {
                 name: "dir".to_string(),
                 signature: one_path(),
                 doc: "The directory portion of `path` (everything up to the last \
@@ -287,7 +287,7 @@ impl EProvider for Provider {
                     .to_string(),
                 func: Arc::new(DirFn),
             },
-            ProviderFunctionDef {
+            PluginFnDef {
                 name: "base".to_string(),
                 signature: one_path(),
                 doc: "The final element of `path` (everything after the last `/`), \
@@ -295,7 +295,7 @@ impl EProvider for Provider {
                     .to_string(),
                 func: Arc::new(BaseFn),
             },
-            ProviderFunctionDef {
+            PluginFnDef {
                 name: "parent".to_string(),
                 signature: FnSignature {
                     positional: vec![Param::required("filename", ParamType::String)],
@@ -331,7 +331,7 @@ struct GlobFn {
 }
 
 #[async_trait]
-impl ProviderFn for GlobFn {
+impl PluginFn for GlobFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         // Arg shape is enforced by the declared signature before we get here.
         let pattern = str_arg("heph.fs.glob", &args)?;
@@ -448,7 +448,7 @@ fn str_arg<'a>(fn_name: &str, args: &'a FnArgs) -> anyhow::Result<&'a str> {
 struct JoinFn;
 
 #[async_trait]
-impl ProviderFn for JoinFn {
+impl PluginFn for JoinFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         // Signature: `join(*elems: string) -> string`. The variadic shape (each
         // element a string) is enforced by the declared signature before we get
@@ -467,7 +467,7 @@ impl ProviderFn for JoinFn {
 struct DirFn;
 
 #[async_trait]
-impl ProviderFn for DirFn {
+impl PluginFn for DirFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         Ok(Value::String(path_dir(str_arg("heph.fs.dir", &args)?)).into())
     }
@@ -476,7 +476,7 @@ impl ProviderFn for DirFn {
 struct BaseFn;
 
 #[async_trait]
-impl ProviderFn for BaseFn {
+impl PluginFn for BaseFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         Ok(Value::String(path_base(str_arg("heph.fs.base", &args)?)).into())
     }
@@ -491,7 +491,7 @@ impl ProviderFn for BaseFn {
 struct ParentFn;
 
 #[async_trait]
-impl ProviderFn for ParentFn {
+impl PluginFn for ParentFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let filename = str_arg("heph.fs.parent", &args)?;
         // A bare name is required — a nested path would make "closest parent"
@@ -1292,7 +1292,7 @@ mod tests {
 
     // ─── Path helper (join/dir/base) tests ─────────────────────────────────
 
-    fn call_path_fn(f: &dyn ProviderFn, args: Vec<&str>) -> String {
+    fn call_path_fn(f: &dyn PluginFn, args: Vec<&str>) -> String {
         let root = std::path::Path::new("/");
         let ctx = FnCallContext { pkg: "", root };
         let args = FnArgs {
@@ -1472,7 +1472,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_wrong_package_not_found() {
-        let p = Provider::default();
+        let p = Provider;
         let result = p
             .get(make_get_req("//other/pkg:file@f=foo.txt"), &ctoken())
             .await;
@@ -1481,7 +1481,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_wrong_name_not_found() {
-        let p = Provider::default();
+        let p = Provider;
         let result = p
             .get(
                 make_get_req(&format!("//{PKG}:unknown@f=foo.txt")),
@@ -1493,7 +1493,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_file_returns_spec() {
-        let p = Provider::default();
+        let p = Provider;
         let result = p
             .get(make_get_req(&format!("//{PKG}:file@f=foo.txt")), &ctoken())
             .await
@@ -1508,7 +1508,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_glob_returns_spec() {
-        let p = Provider::default();
+        let p = Provider;
         let result = p
             .get(make_get_req(&format!("//{PKG}:glob@p=src/*.rs")), &ctoken())
             .await
@@ -2299,7 +2299,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_accepts_file_addr() {
-        let p = Provider::default();
+        let p = Provider;
         let addr = file_addr("README.md");
         let result = p
             .get(
@@ -2835,7 +2835,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_accepts_glob_addr() {
-        let p = Provider::default();
+        let p = Provider;
         let addr = glob_addr("**/*.rs", &[]);
         let result = p
             .get(

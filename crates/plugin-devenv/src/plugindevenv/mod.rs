@@ -65,8 +65,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
-pub const DRIVER_NAME: &str = "devenv_runner";
-
 /// Bump to re-derive every runner this driver produced, when the shape of what
 /// it writes changes.
 ///
@@ -254,7 +252,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: "runner".to_string(),
         })
     }
 

@@ -82,7 +82,7 @@ It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run i
 
 ### Credentials
 
-`docs/CREDENTIALS.md`. A credential is a target (`driver = "credential"`)
+`docs/CREDENTIALS.md`. A credential is a target (`driver = "auth.credential"`)
 declaring an identity, an ordered chain of ways to obtain it, and the shape it is
 presented in; a consumer names it with `credentials = [...]`.
 

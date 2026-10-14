@@ -134,24 +134,57 @@ pub trait StableExecutor {
 /// plugin's `get`/`parse`.
 pub type DynExecutor = stabby::dynptr!(stabby::boxed::Box<dyn StableExecutor + Send + Sync>);
 
-/// The host's provider-function registry, called by a plugin that was handed the
-/// aggregate registry (via `set_function_registry`) and wants to invoke one of
-/// the functions in it. Mirrors a lookup + [`hplugin::provider::ProviderFn::call`]
-/// on the host side. `req` is raw `pb::CallRegisteredRequest` bytes; the reply is
-/// a `pb::Frame` carrying `CallFunctionResp` — the returned value, plus any
-/// targets / provider-state the host function declared, when the calling plugin
-/// set `accepts_declarations` — or `Error`.
+/// The engine's plugin-function registry, called by a plugin function that
+/// calls **another** plugin's function by `(plugin, fn)`. Mirrors a lookup +
+/// [`hplugin::function::PluginFn::call`] on the host side, resolved through the
+/// engine's `FunctionSlot` on each call. `req` is raw `pb::CallRegisteredRequest`
+/// bytes; the reply is a `pb::Frame` carrying `CallFunctionResp` — the returned
+/// value, plus any targets / provider-state the host function declared, when
+/// the calling plugin set `accepts_declarations` — or `Error` (also before the
+/// registry is sealed, and for an unknown `(plugin, fn)`).
 #[stabby::stabby]
 pub trait StableFunctionRegistry {
     extern "C" fn call_registered<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
 }
 
-/// An owned, ABI-stable handle to the host's function registry — what the host
-/// passes into the plugin's `set_function_registry`.
+/// An owned, ABI-stable handle to the engine's function registry — what the
+/// host passes to each plugin instance's `heph_plugin_create`. Per instance,
+/// never a process-global: two engines in one process never see each other's
+/// functions.
 pub type DynFunctionRegistry =
     stabby::dynptr!(stabby::boxed::Box<dyn StableFunctionRegistry + Send + Sync>);
 
-/// Static, request-less plugin metadata (config name, provider `functions` /
+/// A plugin's BUILD-file functions, behind ONE handle per plugin. `method` is a
+/// `pb::FunctionMethod` (an unknown id answers `Error{Unimplemented}`), `name`
+/// the function's bare name, `req` the method's prost request
+/// (`FUNCTION_METHOD_CALL`: `pb::CallFunctionRequest`); the reply is a
+/// `pb::Frame` (`CallFunctionResp` or `Error`). The guest runs each call on its
+/// own runtime, so a function touching tokio works under a host `block_on`.
+#[stabby::stabby]
+pub trait StablePluginFunctions {
+    extern "C" fn invoke<'a>(
+        &'a self,
+        method: u32,
+        name: SString,
+        req: SVec<u8>,
+    ) -> DynFuture<'a, SVec<u8>>;
+}
+
+/// An owned, ABI-stable handle to a plugin's functions.
+pub type DynPluginFunctions =
+    stabby::dynptr!(stabby::boxed::Box<dyn StablePluginFunctions + Send + Sync>);
+
+/// One function a plugin exports: its bare name (no `heph.<plugin>.` prefix)
+/// and its metadata as prost `pb::FunctionDef` bytes (name, signature, doc),
+/// decoded once at load. Undecodable metadata, or a missing signature, fails
+/// the plugin's load. Called through [`PluginComponents::function_handle`].
+#[stabby::stabby]
+pub struct NamedFunction {
+    pub name: SString,
+    pub meta: SVec<u8>,
+}
+
+/// Static, request-less plugin metadata (config name, provider
 /// `state_schema`, driver `schema`), kept in its OWN sync trait so the evolvable
 /// RPC dispatch surface ([`StableProvider`] / [`StableManagedDriver`]) stays
 /// purely the async method dispatch. Composed into both handle types. `kind` is a
@@ -190,8 +223,8 @@ pub type DynItemStream = stabby::dynptr!(stabby::boxed::Box<dyn StableItemStream
 /// makes the cold surface evolvable without an ABI break (see ABI_VERSIONING.md).
 ///
 /// The slots cover the four RPC cardinalities (request × response, each unary or
-/// streaming) plus the native-handle carriers (a `DynExecutor` / `DynFunctionRegistry`
-/// cannot ride prost bytes, so the method carrying one gets its own frozen slot):
+/// streaming) plus the native-handle carriers (a `DynExecutor` cannot ride prost
+/// bytes, so the method carrying one gets its own frozen slot):
 /// - [`invoke`](StableProvider::invoke) — unary → unary.
 /// - [`invoke_server_stream`](StableProvider::invoke_server_stream) — unary →
 ///   stream (`list`, `list_packages`): the reply is pulled lazily, never buffered.
@@ -199,8 +232,6 @@ pub type DynItemStream = stabby::dynptr!(stabby::boxed::Box<dyn StableItemStream
 /// - [`invoke_bidi`](StableProvider::invoke_bidi) — stream → stream.
 /// - [`invoke_exec`](StableProvider::invoke_exec) — unary → unary + native
 ///   [`DynExecutor`] (`get`, whose resolution makes hot callbacks).
-/// - [`invoke_registry`](StableProvider::invoke_registry) — unary → void + native
-///   [`DynFunctionRegistry`] (`set_function_registry`).
 #[stabby::stabby]
 pub trait StableProvider {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
@@ -235,7 +266,6 @@ pub trait StableProvider {
         req: SVec<u8>,
         exec: DynExecutor,
     ) -> DynFuture<'a, DynItemStream>;
-    extern "C" fn invoke_registry(&self, method: u32, req: SVec<u8>, reg: DynFunctionRegistry);
 }
 
 /// The cold managed-driver surface, same frozen-dispatch contract and the same
@@ -365,9 +395,12 @@ pub struct NamedRunner {
 }
 
 /// What a cdylib's create entry returns: an optional provider + named drivers +
-/// named hooks, all as owned ABI-stable handles that the host wraps with
-/// [`crate::load_stable`]. A plugin populates only what it exports — a hook-only
-/// (or driver-only) bundle leaves `provider` `None`.
+/// functions + named hooks + runners, all as owned ABI-stable handles that the
+/// host wraps with [`crate::load_stable`]. A plugin populates only what it
+/// exports — a hook-only (or function-only) bundle leaves `provider` `None`.
+///
+/// The plugin reports no name: its manifest names it, and every component is
+/// reachable under that name (`heph.<name>.<fn>`, driver `<name>.<local>`).
 ///
 /// `meta` is reserved, prost-encoded return-side metadata (empty today). It exists
 /// so a plugin can later report additive descriptive data (capabilities, abi
@@ -376,14 +409,17 @@ pub struct NamedRunner {
 /// live native vtables); only the data rides prost.
 #[stabby::stabby]
 pub struct PluginComponents {
-    /// The exported provider's name (empty when `provider` is `None`).
-    pub provider_name: SString,
-    /// The exported provider, or `None` for a hook-only / driver-only plugin.
+    /// The exported provider, or `None` for a plugin without one.
     pub provider: stabby::option::Option<DynProvider>,
     pub drivers: SVec<NamedDriver>,
-    /// Named build-event hooks the plugin exports. Empty for provider/driver-only
-    /// plugins. A hook-only plugin leaves `provider_name` empty (its `provider` is
-    /// a no-op the host drops) and carries its hooks here.
+    /// The BUILD-file functions the plugin exports, as metadata. Each is called
+    /// through [`function_handle`](Self::function_handle), which must be `Some`
+    /// whenever this is non-empty.
+    pub functions: SVec<NamedFunction>,
+    /// The one handle every function of this plugin is called through.
+    pub function_handle: stabby::option::Option<DynPluginFunctions>,
+    /// Named build-event hooks the plugin exports. Empty for plugins without
+    /// hooks.
     pub hooks: SVec<NamedHook>,
     /// Exec runners the plugin *implements*. Empty for a plugin that only names
     /// a builtin in its `runner.json` — see [`StableRunner`] for which is which.
@@ -499,5 +535,7 @@ pub type SetSupervisorFn = extern "C" fn(DynSupervisor);
 
 /// The create entry's function-pointer type. The config crosses as prost-encoded
 /// `pb::CreateConfig` bytes (not a stabby struct), so adding config fields is an
-/// additive change that does not break older plugins.
-pub type CreateFn = extern "C" fn(SVec<u8>) -> PluginComponents;
+/// additive change that does not break older plugins. The second argument is
+/// the engine's function registry for this instance — the only way the
+/// plugin's functions reach another plugin's.
+pub type CreateFn = extern "C" fn(SVec<u8>, DynFunctionRegistry) -> PluginComponents;

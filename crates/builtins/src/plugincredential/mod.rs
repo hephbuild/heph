@@ -46,7 +46,9 @@ use xxhash_rust::xxh3::Xxh3;
 pub use present::{Dialect, Helper, Presentation};
 pub use source::{SourceDecl, SourceKind, When};
 
-pub const DRIVER_NAME: &str = "credential";
+/// The name BUILD files select the credential driver by: local name
+/// `credential` in the builtin `auth` plugin (which also ships `heph.auth.*`).
+pub const DRIVER_NAME: &str = "auth.credential";
 
 /// A parsed credential declaration.
 ///
@@ -205,7 +207,7 @@ pub struct Driver;
 impl hplugin::driver::Driver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: "credential".to_string(),
         })
     }
 

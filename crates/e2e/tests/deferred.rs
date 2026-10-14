@@ -280,7 +280,7 @@ async fn a_src_reference_in_a_credential_is_refused() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [heph.auth.env(["T"])],
        present = {"env": {"T": "${src://infra:cfg}"}})"#,
     );
@@ -818,7 +818,7 @@ async fn a_credential_presentation_reads_its_role_from_terraform() -> anyhow::Re
         r#"
 target(
     name    = "aws",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [heph.auth.env(["HEPH_E2E_DEFERRED_TOKEN"],
                              present = {"env": {
                                  "TOKEN": "${heph_e2e_deferred_token}",
@@ -870,7 +870,7 @@ async fn a_credentials_deferred_value_reaches_its_consumers_key() -> anyhow::Res
     );
     ws.write_build_file(
         "auth",
-        r#"target(name = "aws", driver = "credential",
+        r#"target(name = "aws", driver = "auth.credential",
        sources = [heph.auth.env(["T"], present = {"env": {
            "AWS_ROLE_ARN": "${read://infra:role-arn}"}})])"#,
     );
@@ -899,7 +899,7 @@ async fn a_credential_change_with_no_deferred_value_still_rebuilds_nothing() -> 
     let ws = Workspace::new();
     ws.write_build_file(
         "auth",
-        r#"target(name = "aws", driver = "credential",
+        r#"target(name = "aws", driver = "auth.credential",
        sources = [heph.auth.env(["A"])], present = {"env": {"T": "${a}"}})"#,
     );
     ws.write_build_file(
@@ -911,7 +911,7 @@ async fn a_credential_change_with_no_deferred_value_still_rebuilds_nothing() -> 
 
     ws.write_build_file(
         "auth",
-        r#"target(name = "aws", driver = "credential",
+        r#"target(name = "aws", driver = "auth.credential",
        sources = [heph.auth.env(["B"]), heph.auth.env(["C"])],
        ttl = "10m", present = {"env": {"TOTALLY_DIFFERENT": "${b}"}})"#,
     );

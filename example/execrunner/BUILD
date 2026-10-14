@@ -20,7 +20,7 @@
 # starts, state under .devenv/ — and one shell is held open for the build.
 target(
     name = "devenv_wrap",
-    driver = "devenv_runner",
+    driver = "devenv.runner",
     mode = "wrap",
     # What the environment is made of. The fingerprint is NOT derived from
     # these — devenv.nix can import files nobody declared — but they are what
@@ -29,7 +29,7 @@ target(
 )
 target(
     name = "devenv_session",
-    driver = "devenv_runner",
+    driver = "devenv.runner",
     mode = "session",
     # What the environment is made of. The fingerprint is NOT derived from
     # these — devenv.nix can import files nobody declared — but they are what
@@ -43,11 +43,11 @@ target(
 # runtime rather than against the developer's machine. Needs a docker daemon.
 #
 # `image` must already be in the daemon, which is what the `deps` on the
-# `oci_load` target below arranges — and, because that load is a hashed dep, a
+# `oci.load` target below arranges — and, because that load is a hashed dep, a
 # rebuilt image re-derives this runner and re-keys everything that ran in it.
 target(
     name = "container",
-    driver = "oci_runner",
+    driver = "oci.runner",
     image = "heph-example-billing:dev",
     deps = ["//execrunner/app:load"],
 )

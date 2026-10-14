@@ -29,7 +29,7 @@ fn fixture(dest: &std::path::Path) -> String {
         r#"
 target(
     name    = "cred",
-    driver  = "credential",
+    driver  = "auth.credential",
     sources = [heph.auth.exec(
         ["sh", "-c", "printf '{{\"token\":\"bin-e2e-material\",\"username\":\"u\",\"expires_in\":3600}}'"],
         fields  = {{"token": "token", "username": "username"}},
@@ -191,10 +191,10 @@ fn auth_status_exits_non_zero_when_a_credential_is_unavailable() {
     ws.write(
         "auth/BUILD",
         r#"
-target(name = "ok", driver = "credential",
+target(name = "ok", driver = "auth.credential",
        sources = [heph.auth.exec(["sh", "-c", "printf 'v'"])],
        present = {"env": {"OK": "${value}"}})
-target(name = "missing", driver = "credential",
+target(name = "missing", driver = "auth.credential",
        sources = [heph.auth.env(["HEPH_BIN_E2E_SURELY_UNSET"])],
        present = {"env": {"M": "${heph_bin_e2e_surely_unset}"}})
 "#,
@@ -236,7 +236,7 @@ fn auth_status_exits_zero_when_every_credential_applies() {
     let ws = Workspace::new().expect("workspace");
     ws.write(
         "auth/BUILD",
-        r#"target(name = "ok", driver = "credential",
+        r#"target(name = "ok", driver = "auth.credential",
        sources = [heph.auth.exec(["sh", "-c", "printf 'v'"])],
        present = {"env": {"OK": "${value}"}})"#,
     )
@@ -275,7 +275,7 @@ fn auth_explain_prints_the_walk_and_fails_when_nothing_applies() {
     let ws = Workspace::new().expect("workspace");
     ws.write(
         "auth/BUILD",
-        r#"target(name = "t", driver = "credential",
+        r#"target(name = "t", driver = "auth.credential",
        sources = [
            heph.auth.oidc("github_actions", audience = "x"),
            heph.auth.env(["HEPH_BIN_E2E_SURELY_UNSET"]),

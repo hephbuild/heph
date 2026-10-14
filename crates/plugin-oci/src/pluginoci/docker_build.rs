@@ -173,8 +173,6 @@ impl<'io> ToolIo<'io> {
     }
 }
 
-pub const DRIVER_NAME: &str = "docker_build";
-
 /// Builds a container image from a Dockerfile with `docker buildx`. Requires a
 /// running docker daemon and a builder that can export to a file, and is not
 /// fully hermetic (see `builder`, `secrets`, and the module docs).
@@ -779,7 +777,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: "docker_build".to_string(),
         })
     }
 
@@ -1681,7 +1679,7 @@ exit 0
             request_id: "test".to_string(),
             target_spec: Arc::new(TargetSpec {
                 addr: parse_addr(addr).expect("addr"),
-                driver: DRIVER_NAME.to_string(),
+                driver: "oci.docker_build".to_string(),
                 config,
                 ..Default::default()
             }),

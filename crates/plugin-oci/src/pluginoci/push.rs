@@ -34,8 +34,6 @@ use xxhash_rust::xxh3::Xxh3Default;
 use super::auth::RegistryCredentials;
 use super::{archive::Layout, dep_input, dep_single_file, registry};
 
-pub const DRIVER_NAME: &str = "oci_push";
-
 /// The `origin_id` of the single image-archive dep input.
 const IMAGE_ORIGIN: &str = "image";
 
@@ -212,7 +210,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: "push".to_string(),
         })
     }
 
@@ -355,7 +353,7 @@ mod tests {
             request_id: "test".to_string(),
             target_spec: Arc::new(TargetSpec {
                 addr: parse_addr(addr).expect("addr"),
-                driver: DRIVER_NAME.to_string(),
+                driver: "oci.push".to_string(),
                 config,
                 ..Default::default()
             }),

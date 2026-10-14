@@ -13,7 +13,8 @@ use anyhow::Context;
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
-use hplugin::provider::{FnArgs, FnCallContext, ProviderExecutor, ProviderFunctionRegistry};
+use hplugin::function::{FnArgs, FnCallContext, FunctionSlot};
+use hplugin::provider::ProviderExecutor;
 use plugin_abi::pb::frame::Body;
 use plugin_abi::{convert, pb};
 use prost::Message;
@@ -301,40 +302,43 @@ impl SeamSpawn {
     }
 }
 
-/// Wraps the host's aggregate function registry; handed to a plugin as a
-/// [`DynFunctionRegistry`] so it can invoke any registered function.
+/// The engine's function registry, handed to one plugin instance's create entry
+/// as a [`DynFunctionRegistry`] so its functions can call any other plugin's.
+///
+/// It holds the engine's [`FunctionSlot`], not a registry: the slot is resolved
+/// on each call (an error before the engine seals it), and holds the registry
+/// weakly, so this handle — which lives inside the plugin — keeps no registry
+/// and no plugin alive. One per instance: a second engine in the same process
+/// gets its own slot, and so its own functions.
 pub struct HostFunctionRegistry {
-    inner: Arc<ProviderFunctionRegistry>,
+    slot: Arc<FunctionSlot>,
     seam: SeamSpawn,
 }
 
 impl HostFunctionRegistry {
     /// The span callback bodies run under. Purpose-made rather than
-    /// `Span::current()`: the registry is wired once per process, so capturing
+    /// `Span::current()`: the handle is built once per plugin load, so capturing
     /// the ambient span would attribute every later call to whichever request
-    /// happened to wire it first — and pin that request's span for the process
-    /// lifetime.
+    /// happened to load it — and pin that span for the process lifetime.
     fn span() -> tracing::Span {
-        tracing::info_span!("provider_functions")
+        tracing::info_span!("plugin_functions")
     }
 
-    /// Wrap the aggregate registry as an ABI-stable [`DynFunctionRegistry`],
-    /// spawning callback bodies on `handle` — see [`SeamSpawn`].
-    pub fn wrap(
-        inner: Arc<ProviderFunctionRegistry>,
-        handle: tokio::runtime::Handle,
-    ) -> DynFunctionRegistry {
+    /// Wrap the engine's slot as an ABI-stable [`DynFunctionRegistry`],
+    /// spawning callback bodies on `handle` (the engine's runtime) — see
+    /// [`SeamSpawn`].
+    pub fn wrap(slot: Arc<FunctionSlot>, handle: tokio::runtime::Handle) -> DynFunctionRegistry {
         dynify(stabby::boxed::Box::new(HostFunctionRegistry {
-            inner,
+            slot,
             seam: SeamSpawn::on(handle, Self::span()),
         }))
     }
 
     /// Runtime-less variant for in-process test harnesses: callback bodies run
     /// inline on the polling thread, which is the caller's own driver.
-    pub fn wrap_inline(inner: Arc<ProviderFunctionRegistry>) -> DynFunctionRegistry {
+    pub fn wrap_inline(slot: Arc<FunctionSlot>) -> DynFunctionRegistry {
         dynify(stabby::boxed::Box::new(HostFunctionRegistry {
-            inner,
+            slot,
             seam: SeamSpawn::inline(Self::span()),
         }))
     }
@@ -349,15 +353,30 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                 return dynify(stabby::boxed::Box::new(async move { body }));
             }
         };
-        let key = format!("{}.{}", req.provider, req.name);
-        let inner = Arc::clone(&self.inner);
+        let key = format!("{}.{}", req.plugin, req.name);
+        let slot = Arc::clone(&self.slot);
         let fut = async move {
-            let Some(rf) = inner.get(&req.provider, &req.name) else {
-                return unary(err_body(format!(
-                    "unknown registered function `{}.{}`",
-                    req.provider, req.name
-                )));
+            let registry = match slot.get() {
+                Ok(r) => r,
+                Err(e) => {
+                    return unary(err_body(format!(
+                        "calling `heph.{}.{}` from a plugin: {e:#}",
+                        req.plugin, req.name
+                    )));
+                }
             };
+            let rf = match registry.resolve(&req.plugin, &req.name) {
+                Ok(rf) => rf.clone(),
+                Err(e) => {
+                    return unary(err_body(format!(
+                        "calling `heph.{}.{}` from a plugin: {e:#}",
+                        req.plugin, req.name
+                    )));
+                }
+            };
+            // Released before the call: a function holding the registry across
+            // its own await would keep it alive past its engine.
+            drop(registry);
             let root = std::path::PathBuf::from(req.root);
             let ctx = FnCallContext {
                 pkg: &req.pkg,
@@ -382,7 +401,7 @@ impl StableFunctionRegistry for HostFunctionRegistry {
             let res = match rf.func.call(&ctx, args).await {
                 Ok(o) => {
                     tracing::debug!(
-                        provider = %req.provider,
+                        plugin = %req.plugin,
                         function = %req.name,
                         pkg = %req.pkg,
                         declarations = o.targets().len() + o.states().len(),
@@ -395,14 +414,14 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                             "host function `{}.{}`: the calling plugin does not carry \
                              declarations (built against plugin ABI older than 0.15.0) \
                              — rebuild the plugin",
-                            req.provider, req.name
+                            req.plugin, req.name
                         )
                     })
                 }
                 Err(e) => Err(e).with_context(|| {
                     format!(
                         "host function `{}.{}` called from a plugin",
-                        req.provider, req.name
+                        req.plugin, req.name
                     )
                 }),
             };
@@ -696,16 +715,16 @@ mod tests {
         use crate::abi::StableFunctionRegistryDyn;
         use hcore::htvalue::Value;
         use hcore::htvalue::signature::{FnSignature, ParamType};
-        use hplugin::provider::{
-            DeclaredTarget, FnArgs, FnCallContext, FnOutcome, ProviderFn, ProviderFunctionDef,
-            ProviderFunctionRegistry,
+        use hplugin::function::{
+            DeclaredTarget, FnArgs, FnCallContext, FnOutcome, FunctionRegistry, FunctionSlot,
+            PluginFn, PluginFnDef,
         };
         use prost::Message;
         use std::sync::Arc;
 
         struct DeclaringFn;
         #[async_trait::async_trait]
-        impl ProviderFn for DeclaringFn {
+        impl PluginFn for DeclaringFn {
             async fn call(
                 &self,
                 _ctx: &FnCallContext<'_>,
@@ -721,10 +740,10 @@ mod tests {
             }
         }
 
-        let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider(
+        let mut reg = FunctionRegistry::default();
+        reg.insert(
             "codegen",
-            vec![ProviderFunctionDef {
+            vec![PluginFnDef {
                 name: "rule".into(),
                 signature: FnSignature {
                     positional: vec![],
@@ -735,13 +754,15 @@ mod tests {
                 doc: String::new(),
                 func: Arc::new(DeclaringFn),
             }],
-        );
-        let host = super::HostFunctionRegistry::wrap_inline(Arc::new(reg));
+        )
+        .expect("insert");
+        let reg = Arc::new(reg);
+        let host = super::HostFunctionRegistry::wrap_inline(FunctionSlot::sealed(&reg));
 
         let request = |accepts_declarations: bool| {
             SVec::from(
                 plugin_abi::pb::CallRegisteredRequest {
-                    provider: "codegen".into(),
+                    plugin: "codegen".into(),
                     name: "rule".into(),
                     pkg: "p".into(),
                     root: "/ws".into(),
@@ -785,6 +806,48 @@ mod tests {
             }
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    /// `call_registered` for an unknown `(plugin, fn)` — and before the engine
+    /// sealed its registry — answers an error frame naming the call, never a
+    /// panic across the seam and never an empty value.
+    #[test]
+    fn unknown_registered_function_is_an_error() {
+        use crate::abi::StableFunctionRegistryDyn;
+        use hplugin::function::{FunctionRegistry, FunctionSlot};
+        use prost::Message;
+        use std::sync::Arc;
+
+        let call = |host: &crate::abi::DynFunctionRegistry, plugin: &str, name: &str| {
+            let req = plugin_abi::pb::CallRegisteredRequest {
+                plugin: plugin.into(),
+                name: name.into(),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let bytes = futures::executor::block_on(host.call_registered(SVec::from(&req[..])));
+            match plugin_abi::pb::Frame::decode(&bytes[..])
+                .expect("decode frame")
+                .body
+            {
+                Some(plugin_abi::pb::frame::Body::Error(e)) => e.message,
+                other => panic!("expected an error, got {other:?}"),
+            }
+        };
+
+        // Before the seal: an error, not an empty namespace.
+        let slot = FunctionSlot::new();
+        let host = super::HostFunctionRegistry::wrap_inline(Arc::clone(&slot));
+        let msg = call(&host, "fs", "glob");
+        assert!(msg.contains("heph.fs.glob"), "{msg}");
+        assert!(msg.contains("before every plugin was registered"), "{msg}");
+
+        // After: an unknown plugin and an unknown function each say so.
+        let reg = Arc::new(FunctionRegistry::default());
+        slot.seal(&reg);
+        let msg = call(&host, "nope", "x");
+        assert!(msg.contains("heph.nope.x"), "{msg}");
+        assert!(msg.contains("no plugin named \"nope\""), "{msg}");
     }
 
     /// `Content` naming a path the seam has to render as a `SString`.

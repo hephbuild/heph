@@ -8,9 +8,8 @@ use hmodel::htaddr;
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::{DriverSchema, TargetAddr};
-use hplugin::provider::{
-    Approval, FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
-};
+use hplugin::function::{FnArgs, FnCallContext, FunctionRegistry, PluginFn};
+use hplugin::provider::{Approval, ProvenanceFrame};
 use hwalk::{CachedWalker, EntryKind};
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
@@ -289,20 +288,20 @@ fn render_builtin_hover(
     md
 }
 
-pub(crate) fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
+pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
     let mut builder = GlobalsBuilder::standard();
     builder = builder.with(starlark_module);
     builder
         .with_namespace("heph", |hb| {
             // Static `heph.core` host/platform builtins.
             hb.namespace("core", heph_core_module);
-            // One `heph.<provider>` namespace per provider; each function becomes a
-            // native callable bridging into its async `ProviderFn`.
-            for (provider, fns) in registry.providers() {
+            // One `heph.<plugin>` namespace per plugin with functions; each
+            // function becomes a native callable bridging into its async `PluginFn`.
+            for (provider, fns) in registry.plugins() {
                 hb.namespace(provider, |nb| {
                     for (name, rf) in fns {
-                        // Each provider function carries per-fn state (its async
-                        // `ProviderFn` + declared signature), so it's registered as a
+                        // Each plugin function carries per-fn state (its async
+                        // `PluginFn` + declared signature), so it's registered as a
                         // custom callable value rather than `set_function` (whose
                         // 0.14 `NativeFuncFn` is a stateless `fn` pointer). The
                         // engine-side validator in `invoke` is the canonical guard
@@ -347,7 +346,7 @@ pub(crate) fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
 }
 
 /// A `heph.<provider>.<fn>` callable: a custom Starlark value holding the
-/// provider's async [`ProviderFn`] and declared signature. Registered via
+/// provider's async [`PluginFn`] and declared signature. Registered via
 /// `GlobalsBuilder::set` — 0.14's `set_function` takes a stateless `fn` pointer
 /// that can't carry this per-function state. The Starlark eval is synchronous,
 /// so the async handler is driven with `futures::executor::block_on` —
@@ -359,7 +358,7 @@ struct ProviderNativeFn {
     #[allocative(skip)]
     signature: Arc<FnSignature>,
     #[allocative(skip)]
-    func: Arc<dyn ProviderFn>,
+    func: Arc<dyn PluginFn>,
 }
 
 impl std::fmt::Debug for ProviderNativeFn {
@@ -388,13 +387,13 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
     ) -> starlark::Result<Value<'v>> {
         let extra = eval
             .extra
-            .expect("evaluator extra must be set before calling a provider function")
+            .expect("evaluator extra must be set before calling a plugin function")
             .downcast_ref::<Extra>()
             .expect("evaluator extra must be of type Extra");
 
         // No public accessor returns an arbitrary positional slice; read up to a
         // fixed cap and let the signature validator enforce the real arity. Eight
-        // is far beyond any provider function (the widest takes one positional);
+        // is far beyond any plugin function (the widest takes one positional);
         // more than that trips Starlark's own too-many-args error first.
         //
         // The `_kwargs` variant, deliberately: the plain `parse_positional`
@@ -439,7 +438,7 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
         let outcome = futures::executor::block_on(self.func.call(&ctx, fn_args))
             .map_err(starlark::Error::new_other)?;
 
-        // A provider function may declare targets / provider-state (a "build-file
+        // A plugin function may declare targets / provider-state (a "build-file
         // plugin" wrapping a driver). Everything is checked before anything is
         // merged, so a call either lands whole or not at all. Declarations go
         // through the same checks and sinks as the `target()` / `provider_state()`
@@ -573,7 +572,7 @@ fn rust_to_starlark<'v>(heap: starlark::values::Heap<'v>, v: &htvalue::Value) ->
 const TARGET_RESERVED_KEYS: &[&str] = &["name", "driver", "labels", "transitive", "approval"];
 
 /// The check a provider_state must pass, whether a BUILD file wrote
-/// `provider_state()` or a provider function declared it.
+/// `provider_state()` or a plugin function declared it.
 fn validate_state_decl(provider: &str) -> anyhow::Result<()> {
     if provider.is_empty() {
         anyhow::bail!("provider_state: missing provider");
@@ -582,7 +581,7 @@ fn validate_state_decl(provider: &str) -> anyhow::Result<()> {
 }
 
 /// The checks a target must pass before it reaches the package, whether a
-/// BUILD file wrote `target()` or a provider function declared it — a declared
+/// BUILD file wrote `target()` or a plugin function declared it — a declared
 /// target must not be able to carry what a hand-written one cannot.
 fn validate_target_decl(name: &str, labels: &[String]) -> anyhow::Result<()> {
     if name.is_empty() {
@@ -1385,7 +1384,10 @@ impl Provider {
         let patterns = self.build_file_patterns.clone();
         let file_cache = self.file_cache.clone();
         let dir_cache = self.dir_cache.clone();
-        let registry = self.function_registry.get().cloned().unwrap_or_default();
+        let registry = self
+            .functions
+            .registry()
+            .context("building the `heph.<plugin>.<fn>` namespace for BUILD evaluation")?;
         let globals = self.globals.clone();
         let walker = self.walker.clone();
         let packages = self.packages();
@@ -1450,8 +1452,9 @@ pub(crate) struct BuildFileLoader {
     dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
     /// Files/dirs currently being evaluated on this call chain — guards against `load()` cycles.
     in_flight: Mutex<HashSet<PathBuf>>,
-    /// Provider functions exposed as `heph.<provider>.<fn>`. Used to build `globals`.
-    registry: Arc<ProviderFunctionRegistry>,
+    /// Plugin functions exposed as `heph.<plugin>.<fn>`. Used to build `globals`,
+    /// and to check every `heph.<plugin>.<fn>` a BUILD file names.
+    registry: Arc<FunctionRegistry>,
     /// Lazily-built, provider-lifetime Starlark globals (shared across loaders so
     /// the registry-driven namespace is built at most once).
     globals: Arc<OnceLock<Globals>>,
@@ -1479,7 +1482,7 @@ impl BuildFileLoader {
         patterns: Vec<glob::Pattern>,
         file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
         dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
-        registry: Arc<ProviderFunctionRegistry>,
+        registry: Arc<FunctionRegistry>,
         globals: Arc<OnceLock<Globals>>,
         walker: Arc<CachedWalker>,
         packages: Arc<PackageList>,
@@ -1900,12 +1903,108 @@ pub(crate) fn eval_source(
     eval_ast(ast, pkg, loader, true)
 }
 
+/// The name closest to `name` among `candidates`, if any is a plausible typo.
+fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    candidates
+        .map(|c| (strsim::levenshtein(name, c), c))
+        .filter(|(d, c)| *d <= 2.max(name.len().max(c.len()) / 3))
+        .min()
+        .map(|(_, c)| c)
+}
+
+/// Every `heph.<plugin>.<fn>` a BUILD file names must exist. Checked against the
+/// registry before evaluation, so an unknown plugin or function fails with the
+/// file and line and what does exist — an agent recovers from the text alone,
+/// instead of reading Starlark's "object has no attribute". `heph.core.*` is the
+/// static namespace, not a plugin's; a file that binds `heph` itself is left
+/// alone.
+pub(crate) fn check_function_refs(
+    ast: &AstModule,
+    registry: &FunctionRegistry,
+) -> anyhow::Result<()> {
+    use crate::pluginbuildfile::lsp::diagnostics::{bound_names, walk_expr};
+    use starlark::syntax::ast::Expr;
+
+    if bound_names(ast).contains("heph") {
+        return Ok(());
+    }
+    // `heph.<plugin>` → the plugin; `heph.<plugin>.<fn>` → also the function.
+    fn plugin_ref(e: &starlark::syntax::ast::AstExpr) -> Option<&str> {
+        match &e.node {
+            Expr::Dot(inner, plugin) => match &inner.node {
+                Expr::Identifier(id) if id.node.ident == "heph" => Some(plugin.node.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let mut problem: Option<String> = None;
+    ast.statement().visit_expr(|top| {
+        walk_expr(top, &mut |e| {
+            if problem.is_some() {
+                return;
+            }
+            let (plugin, func, span) = match &e.node {
+                Expr::Dot(inner, func) if plugin_ref(inner).is_some() => {
+                    (plugin_ref(inner), Some(func.node.as_str()), e.span)
+                }
+                _ => (plugin_ref(e), None, e.span),
+            };
+            let Some(plugin) = plugin else {
+                return;
+            };
+            if plugin == "core" {
+                return;
+            }
+            let at = ast.file_span(span);
+            let display = match func {
+                Some(f) => format!("heph.{plugin}.{f}"),
+                None => format!("heph.{plugin}"),
+            };
+            let Some((_, fns)) = registry.plugins().find(|(p, _)| *p == plugin) else {
+                let known: Vec<&str> = registry.plugins().map(|(p, _)| p).collect();
+                let hint = closest(plugin, known.iter().copied())
+                    .map(|c| format!(" (did you mean \"{c}\"?)"))
+                    .unwrap_or_default();
+                problem = Some(format!(
+                    "{at}: {display}: no plugin named \"{plugin}\"{hint}; plugins with \
+                     functions: {}. See `heph inspect functions`",
+                    if known.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ));
+                return;
+            };
+            if let Some(func) = func
+                && !fns.contains_key(func)
+            {
+                let known: Vec<&str> = fns.keys().map(String::as_str).collect();
+                let hint = closest(func, known.iter().copied())
+                    .map(|c| format!(" Did you mean \"{c}\"?"))
+                    .unwrap_or_default();
+                problem = Some(format!(
+                    "{at}: {display}: plugin \"{plugin}\" has no function \"{func}\"; \
+                     available: {}.{hint}",
+                    known.join(", ")
+                ));
+            }
+        });
+    });
+    match problem {
+        Some(p) => Err(anyhow::anyhow!(p)),
+        None => Ok(()),
+    }
+}
+
 fn eval_ast(
     ast: AstModule,
     pkg: &str,
     loader: &BuildFileLoader,
     capture_provenance: bool,
 ) -> anyhow::Result<RunResult> {
+    check_function_refs(&ast, &loader.registry)?;
     let globals = loader.globals();
 
     let targets = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
@@ -1976,13 +2075,14 @@ fn eval_ast(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pluginbuildfile::provider::FunctionSource;
     use hcore::htvalue::signature::Param;
-    use hplugin::provider::{DeclaredState, DeclaredTarget, FnOutcome};
+    use hplugin::function::{DeclaredState, DeclaredTarget, FnOutcome};
     use std::fs;
     use tempfile::tempdir;
 
     fn hovers() -> BuiltinHovers {
-        BuiltinHovers::new(&build_globals(&ProviderFunctionRegistry::default()).documentation())
+        BuiltinHovers::new(&build_globals(&FunctionRegistry::default()).documentation())
     }
 
     #[test]
@@ -2278,11 +2378,7 @@ mod tests {
     }
 
     fn run_pkg_blocking(provider: &Provider, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
-        let registry = provider
-            .function_registry
-            .get()
-            .cloned()
-            .unwrap_or_default();
+        let registry = provider.functions.registry()?;
         let loader = BuildFileLoader::new(
             provider.root.clone(),
             provider.build_file_patterns.clone(),
@@ -2299,12 +2395,18 @@ mod tests {
         loader.load_pkg(pkg)
     }
 
-    /// Registry exposing the real `fs` provider functions, so `heph.fs.glob` works
+    /// Registry exposing the real `fs` plugin functions, so `heph.fs.glob` works
     /// in these unit tests (which run the buildfile provider without an engine).
-    fn fs_registry() -> Arc<ProviderFunctionRegistry> {
-        use hplugin::provider::Provider as _;
-        let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider("fs", hbuiltins::pluginfs::Provider::default().functions());
+    fn fs_registry() -> Arc<FunctionRegistry> {
+        let mut reg = FunctionRegistry::default();
+        reg.insert(
+            "fs",
+            hbuiltins::pluginfs::functions(
+                &Arc::new(hwalk::Ignore::default()),
+                &Arc::new(CachedWalker::disabled()),
+            ),
+        )
+        .expect("register the fs functions");
         Arc::new(reg)
     }
 
@@ -2316,7 +2418,7 @@ mod tests {
             patterns.clone(),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(ProviderFunctionRegistry::default()),
+            Arc::new(FunctionRegistry::default()),
             Arc::new(OnceLock::new()),
             Arc::clone(&walker),
             Arc::new(PackageList::new(
@@ -2552,12 +2654,12 @@ target(
     }
 
     fn make_provider(tmp_dir: &tempfile::TempDir) -> Provider {
-        let p = Provider {
+        let mut p = Provider {
             root: tmp_dir.path().to_path_buf(),
             ..Provider::default()
         };
         // Wire the fs provider's functions so `heph.fs.glob` resolves in tests.
-        assert!(p.function_registry.set(fs_registry()).is_ok());
+        p.functions = FunctionSource::Fixed(fs_registry());
         p
     }
 
@@ -4065,7 +4167,7 @@ target(name = "t_in_app", driver = SHARED)
 
     struct EchoFn;
     #[async_trait::async_trait]
-    impl ProviderFn for EchoFn {
+    impl PluginFn for EchoFn {
         async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
             let arg = match args.positional.first() {
                 Some(htvalue::Value::String(s)) => s.clone(),
@@ -4086,14 +4188,14 @@ target(name = "t_in_app", driver = SHARED)
         )
         .unwrap();
 
-        let provider = Provider {
+        let mut provider = Provider {
             root: tmp_dir.path().to_path_buf(),
             ..Provider::default()
         };
-        let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider(
+        let mut reg = FunctionRegistry::default();
+        reg.insert(
             "myprov",
-            vec![hplugin::provider::ProviderFunctionDef {
+            vec![hplugin::function::PluginFnDef {
                 name: "echo".to_string(),
                 signature: FnSignature {
                     positional: vec![Param::required("v", ParamType::String)],
@@ -4104,8 +4206,9 @@ target(name = "t_in_app", driver = SHARED)
                 doc: String::new(),
                 func: Arc::new(EchoFn),
             }],
-        );
-        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+        )
+        .expect("insert");
+        provider.functions = FunctionSource::Fixed(Arc::new(reg));
 
         let result = run_pkg_blocking(&provider, "mypkg").unwrap();
         match result.targets[0].config.get("v") {
@@ -4120,7 +4223,7 @@ target(name = "t_in_app", driver = SHARED)
     /// of a cdylib.
     struct CodegenFn;
     #[async_trait::async_trait]
-    impl ProviderFn for CodegenFn {
+    impl PluginFn for CodegenFn {
         async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
             let name = match args.named.get("name") {
                 Some(htvalue::Value::String(s)) => s.clone(),
@@ -4154,19 +4257,15 @@ target(name = "t_in_app", driver = SHARED)
         }
     }
 
-    fn provider_with_fn(
-        tmp_dir: &tempfile::TempDir,
-        name: &str,
-        f: Arc<dyn ProviderFn>,
-    ) -> Provider {
-        let provider = Provider {
+    fn provider_with_fn(tmp_dir: &tempfile::TempDir, name: &str, f: Arc<dyn PluginFn>) -> Provider {
+        let mut provider = Provider {
             root: tmp_dir.path().to_path_buf(),
             ..Provider::default()
         };
-        let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider(
+        let mut reg = FunctionRegistry::default();
+        reg.insert(
             "codegen",
-            vec![hplugin::provider::ProviderFunctionDef {
+            vec![hplugin::function::PluginFnDef {
                 name: name.to_string(),
                 signature: FnSignature {
                     positional: vec![],
@@ -4177,8 +4276,9 @@ target(name = "t_in_app", driver = SHARED)
                 doc: String::new(),
                 func: f,
             }],
-        );
-        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+        )
+        .expect("insert");
+        provider.functions = FunctionSource::Fixed(Arc::new(reg));
         provider
     }
 
@@ -4225,7 +4325,7 @@ target(name = "use", driver = "d", dep = a)"#,
     /// A declaring function whose whole outcome is fixed by the test.
     struct DeclareFn(fn() -> FnOutcome);
     #[async_trait::async_trait]
-    impl ProviderFn for DeclareFn {
+    impl PluginFn for DeclareFn {
         async fn call(&self, _ctx: &FnCallContext<'_>, _args: FnArgs) -> anyhow::Result<FnOutcome> {
             Ok((self.0)())
         }
@@ -4428,7 +4528,7 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
         );
     }
 
-    /// A provider function's declared **named** parameters must actually be
+    /// A plugin function's declared **named** parameters must actually be
     /// callable.
     ///
     /// They were not: the dispatch began with Starlark's `no_named_args()`, which
@@ -4441,7 +4541,7 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
     fn a_provider_function_accepts_its_declared_named_arguments() {
         struct SuffixFn;
         #[async_trait::async_trait]
-        impl ProviderFn for SuffixFn {
+        impl PluginFn for SuffixFn {
             async fn call(
                 &self,
                 _ctx: &FnCallContext<'_>,
@@ -4468,14 +4568,14 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
         )
         .unwrap();
 
-        let provider = Provider {
+        let mut provider = Provider {
             root: tmp_dir.path().to_path_buf(),
             ..Provider::default()
         };
-        let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider(
+        let mut reg = FunctionRegistry::default();
+        reg.insert(
             "myprov",
-            vec![hplugin::provider::ProviderFunctionDef {
+            vec![hplugin::function::PluginFnDef {
                 name: "tag".to_string(),
                 signature: FnSignature {
                     positional: vec![Param::required("base", ParamType::String)],
@@ -4490,8 +4590,9 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
                 doc: String::new(),
                 func: Arc::new(SuffixFn),
             }],
-        );
-        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+        )
+        .expect("insert");
+        provider.functions = FunctionSource::Fixed(Arc::new(reg));
 
         let result = run_pkg_blocking(&provider, "mypkg").unwrap();
         match result.targets[0].config.get("v") {
@@ -4514,14 +4615,14 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
         )
         .unwrap();
 
-        let provider = Provider {
+        let mut provider = Provider {
             root: tmp_dir.path().to_path_buf(),
             ..Provider::default()
         };
-        let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider(
+        let mut reg = FunctionRegistry::default();
+        reg.insert(
             "myprov",
-            vec![hplugin::provider::ProviderFunctionDef {
+            vec![hplugin::function::PluginFnDef {
                 name: "echo".to_string(),
                 signature: FnSignature {
                     positional: vec![Param::required("v", ParamType::String)],
@@ -4532,8 +4633,9 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
                 doc: String::new(),
                 func: Arc::new(EchoFn),
             }],
-        );
-        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+        )
+        .expect("insert");
+        provider.functions = FunctionSource::Fixed(Arc::new(reg));
 
         let err = run_pkg_blocking(&provider, "mypkg").unwrap_err();
         let msg = format!("{err:#}");

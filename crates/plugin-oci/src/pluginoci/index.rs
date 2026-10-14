@@ -71,8 +71,6 @@ use xxhash_rust::xxh3::Xxh3Default;
 use super::archive::{self, Blobs, Layout};
 use super::{ImageFormat, layout_path, ws_path};
 
-pub const DRIVER_NAME: &str = "oci_index";
-
 fn image_origin(i: usize) -> String {
     format!("images|{i}")
 }
@@ -209,7 +207,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: "index".to_string(),
         })
     }
 
@@ -237,7 +235,7 @@ impl ManagedDriver for Driver {
         anyhow::ensure!(
             !matches!(format, ImageFormat::Docker),
             "`format = \"docker\"` holds a single image, which is the one thing an oci_index does \
-             not produce. Use the default `format = \"oci\"`, and `oci_load` to put one instance \
+             not produce. Use the default `format = \"oci\"`, and `oci.load` to put one instance \
              of it in a daemon."
         );
 
@@ -477,7 +475,7 @@ mod tests {
                     request_id: "test".to_string(),
                     target_spec: Arc::new(TargetSpec {
                         addr: parse_addr(addr).expect("addr"),
-                        driver: DRIVER_NAME.to_string(),
+                        driver: "oci.index".to_string(),
                         config,
                         ..Default::default()
                     }),

@@ -246,7 +246,7 @@ impl Hash for GoCompileDef {
 impl ManagedDriver for GoCompileDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: "go_compile".to_string(),
+            name: "compile".to_string(),
         })
     }
 
@@ -480,7 +480,7 @@ impl ManagedDriver for GoCompileDriver {
             &def.go_version,
             &req.inputs,
             &req.sandbox_ws_dir,
-            "go_compile",
+            "go.compile",
             runner,
             &self.host_go,
             ctoken,
