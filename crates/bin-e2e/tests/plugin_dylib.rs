@@ -980,7 +980,8 @@ fn a_plugin_reporting_another_abi_is_refused() {
 
 /// **A plugin whose version is accepted but whose layout is not is refused,
 /// saying so.** The version check passes (the fixture reports the host's own
-/// ABI); stabby's structural check on `heph_plugin_create` then refuses it.
+/// ABI, then a newer patch of it); stabby's structural check on
+/// `heph_plugin_create` then refuses it.
 /// The log-sink entry with a mismatched report is warned about rather than
 /// skipped in silence.
 #[test]
@@ -999,5 +1000,22 @@ fn a_plugin_from_another_abi_is_refused() {
             // The optional entry with a mismatched type is warned about.
             "heph_plugin_set_log_sink",
         ],
+    );
+
+    // A newer *patch* is additive: the version check lets it through (so it
+    // reaches the same layout refusal), never "newer than this heph".
+    let mut parts = host.split('.');
+    let (major, minor) = (parts.next().expect("major"), parts.next().expect("minor"));
+    let patch = format!("{major}.{minor}.99");
+    let (_ws, _, stderr) = load_refused_fixture(&dist, &fixture_source(Some(&patch)));
+    assert_contains_all(
+        &stderr,
+        &[&format!(
+            "was built against a different heph ABI (host {host})"
+        )],
+    );
+    assert!(
+        !stderr.contains("newer than this heph"),
+        "a newer patch is in the lane: {stderr}"
     );
 }

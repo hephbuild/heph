@@ -113,22 +113,28 @@ fn plugin_abi_version(lib: &libloading::Library) -> Option<String> {
     Some(reported.to_string_lossy().into_owned())
 }
 
+/// The plugin ABI versions this host loads: `^MIN_PLUGIN_ABI`. Pre-1.0 that is
+/// one minor's lane (`^0.17.0` = `>=0.17.0, <0.18.0`): a patch is additive, so
+/// a plugin a few patches newer or older than the host loads; a minor is a
+/// break, which raises `MIN_PLUGIN_ABI` to the new `x.y.0`.
+pub fn accepted_plugin_abi() -> anyhow::Result<semver::VersionReq> {
+    use anyhow::Context as _;
+    semver::VersionReq::parse(&format!("^{}", plugin_abi::MIN_PLUGIN_ABI))
+        .context("parsing MIN_PLUGIN_ABI")
+}
+
 /// Refuse a plugin whose reported ABI version (`None`: it reports none, so it
-/// predates 0.17.0, when the version started being read) is outside
-/// `MIN_PLUGIN_ABI..=ABI_SEMVER`. Versions compare as semver, never as strings.
+/// predates 0.17.0, when the version started being read) does not match
+/// [`accepted_plugin_abi`]. Versions compare as semver, never as strings.
 ///
-/// A newer plugin is refused like an older one: this host cannot know what a
-/// later ABI changed.
+/// A plugin from a later minor is refused like an older one: this host cannot
+/// know what that break changed.
 pub fn check_plugin_abi(path: &std::path::Path, reported: Option<&str>) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use semver::Version;
     let host = Version::parse(plugin_abi::ABI_SEMVER).context("parsing the host's ABI_SEMVER")?;
-    let min = Version::parse(plugin_abi::MIN_PLUGIN_ABI).context("parsing MIN_PLUGIN_ABI")?;
-    let accepts = if min == host {
-        format!("host {host}, which loads {host} only")
-    } else {
-        format!("host {host}, which loads {min} through {host}")
-    };
+    let req = accepted_plugin_abi()?;
+    let accepts = format!("host {host}, which loads {req}");
     let Some(reported) = reported else {
         anyhow::bail!(abi_refusal(
             path,
@@ -142,19 +148,19 @@ pub fn check_plugin_abi(path: &std::path::Path, reported: Option<&str>) -> anyho
             format_args!("it reports ABI version {reported:?}, which is not a version; {accepts}")
         )),
     };
+    if req.matches(&plugin) {
+        return Ok(());
+    }
     if plugin > host {
         anyhow::bail!(abi_refusal(
             path,
             format_args!("plugin {plugin}, newer than this heph, which is unsupported; {accepts}")
         ));
     }
-    if plugin < min {
-        anyhow::bail!(abi_refusal(
-            path,
-            format_args!("plugin {plugin}; {accepts}")
-        ));
-    }
-    Ok(())
+    anyhow::bail!(abi_refusal(
+        path,
+        format_args!("plugin {plugin}; {accepts}")
+    ))
 }
 
 /// An optional entry point. `None`, silently, when the plugin does not export
@@ -1298,19 +1304,50 @@ mod tests {
         )
     }
 
+    /// The host's own version is in its lane. A break that bumps the minor
+    /// without raising `MIN_PLUGIN_ABI` (or raises MIN past the host) fails
+    /// here, rather than shipping a host that refuses its own plugins.
     #[test]
-    fn the_host_and_min_abi_parse_and_are_ordered() {
+    fn the_host_abi_is_in_its_own_lane() {
         let host = semver::Version::parse(plugin_abi::ABI_SEMVER).expect("ABI_SEMVER");
+        let req = accepted_plugin_abi().expect("MIN_PLUGIN_ABI");
+        assert!(req.matches(&host), "ABI_SEMVER {host} does not match {req}");
         let min = semver::Version::parse(plugin_abi::MIN_PLUGIN_ABI).expect("MIN_PLUGIN_ABI");
-        assert!(min <= host, "MIN_PLUGIN_ABI {min} above ABI_SEMVER {host}");
+        assert_eq!(min.patch, 0, "MIN_PLUGIN_ABI is the break's x.y.0");
     }
 
+    /// Patches are additive: any patch in the host's minor loads, older or
+    /// newer than the host.
     #[test]
-    fn a_plugin_in_the_accepted_range_loads() {
+    fn a_plugin_in_the_accepted_lane_loads() {
         let path = std::path::Path::new("/p/libok.so");
-        for v in [plugin_abi::ABI_SEMVER, plugin_abi::MIN_PLUGIN_ABI] {
-            check_plugin_abi(path, Some(v)).expect("in range");
+        let host = semver::Version::parse(plugin_abi::ABI_SEMVER).expect("ABI_SEMVER");
+        let newer_patch = format!("{}.{}.{}", host.major, host.minor, host.patch + 7);
+        for v in [
+            plugin_abi::ABI_SEMVER,
+            plugin_abi::MIN_PLUGIN_ABI,
+            &newer_patch,
+        ] {
+            check_plugin_abi(path, Some(v)).unwrap_or_else(|e| panic!("{v} in lane: {e:#}"));
         }
+    }
+
+    /// A later minor is a break: refused, as newer than this heph.
+    #[test]
+    fn a_plugin_from_the_next_minor_is_refused() {
+        let host = semver::Version::parse(plugin_abi::ABI_SEMVER).expect("ABI_SEMVER");
+        let next = format!("{}.{}.0", host.major, host.minor + 1);
+        let msg = refusal(Some(&next));
+        assert!(
+            msg.contains(&format!(
+                "plugin {next}, newer than this heph, which is unsupported"
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("which loads ^{}", plugin_abi::MIN_PLUGIN_ABI)),
+            "{msg}"
+        );
     }
 
     #[test]

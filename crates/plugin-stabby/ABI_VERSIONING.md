@@ -6,27 +6,49 @@ codegen, edition 2024 with explicit presence on every field). Host and
 plugin are compiled separately and linked at load time. Two gates run at load,
 in order:
 
-1. **The version check** (since 0.17.0). The plugin exports
+1. **The version check** (since 0.17.0; see the convention below). The plugin exports
    `heph_plugin_abi_semver` — a plain C function returning its `ABI_SEMVER` as a
    `'static` NUL-terminated string, deliberately *not* a stabby export so it
    reads the same whatever layout either side has. The host reads it before
-   calling anything else in the plugin and accepts versions in
-   `MIN_PLUGIN_ABI..=ABI_SEMVER` (both in `crates/plugin-abi/src/lib.rs`),
-   compared as semver. A plugin without the symbol predates 0.17.0 and is
-   refused the same way. A plugin **newer** than the host is unsupported and
-   refused: the host cannot know what a later ABI changed.
+   calling anything else in the plugin and accepts exactly the versions
+   matching the caret requirement `^MIN_PLUGIN_ABI` (`crates/plugin-abi/src/lib.rs`;
+   pre-1.0, `^0.17.0` = `>=0.17.0, <0.18.0`), compared as semver. A plugin
+   without the symbol predates 0.17.0 and is refused the same way. A plugin
+   from a **later minor** is unsupported and refused: the host cannot know
+   what that break changed. A later *patch* loads.
 2. **stabby's `get_stabbied`**: it verifies the plugin's type report (every type
    reachable from `CreateFn`) against the host's and **hard-fails on any
    difference**.
 
+## The convention: patch = additive, minor = break (pre-1.0)
+
+From 0.17.0 on:
+
+- An **additive** change — one every older and newer peer in the lane still
+  reads correctly — bumps the **patch**. Host and plugin may then differ in
+  patch either way.
+- A **break** bumps the **minor** *and* raises `MIN_PLUGIN_ABI` to the new
+  `x.y.0`, which takes every plugin from the old minor out of the lane. A unit
+  test (`the_host_abi_is_in_its_own_lane`) holds `ABI_SEMVER` inside
+  `^MIN_PLUGIN_ABI`, so bumping one without the other fails.
+
+The 0.14.0 and 0.15.0 history entries (additive changes bumped as minors)
+predate the convention, and the version check with it.
+
+A **wire-only** break done in place cannot use the `ABI-BREAK-ACK` escape hatch
+below: nothing would detect it — stabby's check passes, and without a minor bump
+and a raised `MIN_PLUGIN_ABI` the version check passes too, so the old plugin
+loads and fails (or misreads) call by call.
+
 So the frozen stabby surface in `crates/plugin-stabby/src/abi.rs` must not drift
 without `ABI_SEMVER` moving, and a break the structural check cannot see — a
 **wire-only** break, like 0.17.0's — must also raise `MIN_PLUGIN_ABI` to the new
-version, or the version check lets the old plugin through to fail call by call.
+`x.y.0`, or the version check lets the old plugin through to fail call by call.
 
 `scripts/abi-check.sh` (the `abi` job in `.github/workflows/heph.yml`, run on every
-PR) enforces this mechanically: if the frozen surface changes without `ABI_SEMVER`
-moving, the check fails.
+PR) enforces the first half mechanically: if the frozen surface changes without
+`ABI_SEMVER` moving, the check fails. A `proto/plugin/v1/` edit only warns,
+pointing here — whether it is additive or a break is the author's call.
 
 ## The dispatch model — most growth is additive, no bump
 
@@ -46,11 +68,15 @@ vtable**:
   `plugin-abi`'s `convert` docs) fails every call from an older peer, and is a
   break, not an addition.
 
-**None of these need an `ABI_SEMVER` bump** and none touch `abi.rs`. This additive
-lane is the whole point of the dispatch collapse — grow capability without breaking
-old plugins. (Bump the minor only if you want to *signal* the new capability.)
+**None of these need a break** and none touch `abi.rs`. This additive lane is the
+whole point of the dispatch collapse — grow capability without breaking old
+plugins. Bump the **patch** to record the addition; `MIN_PLUGIN_ABI` stays, so
+every plugin in the minor keeps loading.
 
-## When `ABI_SEMVER` MUST be bumped (major) — the frozen surface changed
+## When `ABI_SEMVER` MUST take a breaking bump — the frozen surface changed
+
+A break: the minor (pre-1.0; the major from 1.0) moves and `MIN_PLUGIN_ABI`
+is raised to the new `x.y.0`.
 
 Any change to the native stabby surface in `crates/plugin-stabby/src/abi.rs`, i.e.
 anything `get_stabbied` would reject:
@@ -146,13 +172,17 @@ An **unknown `Matcher` arm** is a decode error on the host (since 0.13.0), not a
 silent `Or[]`: a plugin built against a newer schema fails the call loudly
 instead of matching nothing, or everything under `Not`. An old host still
 reads a new arm as an empty matcher (its decoder leaves the `oneof` unset); that is
-why a new arm is a minor bump the host must reach before plugins send it.
+why a new arm is a bump the host must reach before plugins send it (a minor
+before 0.17.0; under the convention, a patch — though a plugin a patch ahead of
+its host can then send an arm that host misreads, so a new arm is safer as a
+break).
 
-## A new optional load-time symbol: a minor bump
+## A new optional load-time symbol: an additive bump
 
 Adding a `SET_*_SYMBOL` (0.4.0 the supervisor, 0.14.0 the log filter) edits
-`abi.rs`, so `scripts/abi-check.sh` wants `ABI_SEMVER` to move — but a **minor**
-is enough, because each pairing still works: a new host skips a symbol an old
+`abi.rs`, so `scripts/abi-check.sh` wants `ABI_SEMVER` to move — but an additive
+bump (a **patch**, since 0.17.0; those two were minors) is enough, because each
+pairing still works: a new host skips a symbol an old
 plugin lacks (`get_stabbied` errs, the call is skipped), an old host never
 looks for a new plugin's extra export, and the plugin must behave sensibly
 without the call (the log filter: forward everything).
@@ -173,6 +203,10 @@ released against it). To land a frozen-surface change without moving `ABI_SEMVER
 put `ABI-BREAK-ACK: <reason>` in a commit message on the PR — the guard treats that
 as an acknowledged break and passes. (Past 1.0, bump instead.)
 
+This covers only a break stabby's structural check will refuse anyway. A
+**wire-only** break cannot be landed in place: nothing would detect it, so it
+always takes the minor bump and the raised `MIN_PLUGIN_ABI`.
+
 When in doubt, bump. A false bump is cheap; a missed real break ships a host/plugin
 pair that mismatches at load and aborts the plugin.
 
@@ -180,8 +214,8 @@ pair that mismatches at load and aborts the plugin.
 
 A plugin from an ABI the host does not load is refused once, at load, naming
 the plugin and both versions: "plugin <path> was built against a different heph
-ABI (plugin <its version>; host <ABI_SEMVER>, which loads <MIN_PLUGIN_ABI>
-through <ABI_SEMVER>); rebuild it against this heph, or reinstall plugins from
+ABI (plugin <its version>; host <ABI_SEMVER>, which loads ^<MIN_PLUGIN_ABI>);
+rebuild it against this heph, or reinstall plugins from
 the same release as this heph" — "it reports no ABI version, so it predates
 0.17.0" for a plugin without the symbol. A plugin whose version is accepted but
 whose create entry still mismatches is not an abort either: the host wraps
@@ -210,8 +244,10 @@ skipped in silence.
   omits every zero, which this host reads as missing required fields, call by
   call. So 0.17.0 also starts the **load-time version check**: the new required
   `heph_plugin_abi_semver` entry (`ABI_SEMVER_SYMBOL`), and `MIN_PLUGIN_ABI` =
-  0.17.0. A 0.16 plugin exports no version and is refused once, at load, as
-  predating 0.17.0. Every plugin must be rebuilt, as for 0.16.0.
+  0.17.0, accepting `^0.17.0`. A 0.16 plugin exports no version and is refused
+  once, at load, as predating 0.17.0. Every plugin must be rebuilt, as for
+  0.16.0. From here on: additive = patch, break = minor + raised
+  `MIN_PLUGIN_ABI` (see "The convention" above).
 - **0.16.0** — functions belong to plugins. `PluginComponents` lost
   `provider_name` (the manifest names the plugin) and gained `functions`
   (`NamedFunction`: name + `FunctionDef` metadata, decoded once at load; bad

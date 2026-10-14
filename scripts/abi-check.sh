@@ -131,10 +131,14 @@ else
   echo "abi-check: no hard ABI surface change. OK"
 fi
 
-# Soft surface: any proto/plugin/v1 edit. Non-fatal — but if it added/removed a
-# wire field, the author should bump at least the minor (see the doc).
+# Soft surface: any proto/plugin/v1 edit. Non-fatal — but a wire change needs a
+# bump under the convention (see the doc): additive = patch; a break (a field
+# made required, removed, retyped or its meaning changed) = minor AND raise
+# MIN_PLUGIN_ABI to the new x.y.0. Only MIN_PLUGIN_ABI refuses an old plugin
+# across a wire-only break — stabby cannot see it, and ABI-BREAK-ACK does not
+# cover it.
 if grep -q "^${soft_glob}" <<<"$changed"; then
-  echo "::warning::proto/plugin/v1 changed — if a wire field was added/removed, bump ABI_SEMVER minor (see $doc)" >&2
+  echo "::warning::proto/plugin/v1 changed — additive: bump ABI_SEMVER patch; a break: bump the minor AND raise MIN_PLUGIN_ABI (crates/plugin-abi/src/lib.rs) to the new x.y.0 — stabby cannot see a wire-only break (see $doc)" >&2
 fi
 
 # Event stream: see the note by `event_paths`.

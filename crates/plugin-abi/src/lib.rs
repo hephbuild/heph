@@ -21,11 +21,16 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// ABI semantic version. Since 0.17.0 it is read at load: a plugin exports it
 /// (`heph_plugin_abi_semver`, a plain C symbol, so it reads the same whatever
 /// stabby layout the plugin was built with), and the host refuses a plugin
-/// outside [`MIN_PLUGIN_ABI`]`..=ABI_SEMVER` before calling anything else in
+/// that does not match `^`[`MIN_PLUGIN_ABI`] before calling anything else in
 /// it. stabby's structural `get_stabbied` check still guards the frozen
 /// surface on top of that. `scripts/abi-check.sh` fails CI if the ABI surface
 /// changed without a bump, so the version history documents *why* a break
 /// happened.
+///
+/// The convention, from 0.17.0 on (pre-1.0): an **additive** change bumps the
+/// **patch**; a **break** bumps the **minor** and raises `MIN_PLUGIN_ABI` to
+/// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
+/// additive minors, and there was no version check to read them.
 ///
 /// 0.17.0: the wire stays protobuf — same messages, same field numbers and
 /// types — but the protos are edition 2024 with explicit presence on every
@@ -47,7 +52,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// host would read as missing required fields. So 0.17.0 also adds the
 /// load-time version check: the plugin exports `heph_plugin_abi_semver`, and
 /// the host refuses a plugin that does not (it predates 0.17.0) or that reports
-/// a version outside [`MIN_PLUGIN_ABI`]`..=ABI_SEMVER` — once, at load, naming
+/// a version not matching `^`[`MIN_PLUGIN_ABI`] (`>=0.17.0, <0.18.0`) — once, at load, naming
 /// the plugin and both versions — instead of failing each call with a bare
 /// `missing field …`. Rebuild every plugin against this ABI, as for 0.16.0.
 ///
@@ -191,15 +196,17 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// must be rebuilt against this ABI.
 pub const ABI_SEMVER: &str = "0.17.0";
 
-/// The oldest plugin ABI this host loads. A plugin reporting a version in
-/// `MIN_PLUGIN_ABI..=ABI_SEMVER` is accepted; anything else is refused at load.
+/// The start of the ABI lane this host loads: a plugin is accepted iff its
+/// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
+/// minor (`^0.17.0` = `>=0.17.0, <0.18.0`). A patch is additive, so host and
+/// plugin may differ in patch either way; a plugin from a later minor is a
+/// break the host cannot know and is refused.
 ///
-/// Raise it to the new [`ABI_SEMVER`] on every break the load-time version
-/// check is the only thing to catch — a wire-only break such as 0.17.0's,
-/// where stabby's structural check still passes. A break stabby does see may
-/// raise it too, for the clearer message. A plugin *newer* than the host is
-/// unsupported, whatever its version: the host cannot know what a later ABI
-/// changed.
+/// On every break, bump [`ABI_SEMVER`]'s minor and raise this to the new
+/// `x.y.0` — a wire-only break such as 0.17.0's above all, since stabby's
+/// structural check passes it and nothing but this check refuses the old
+/// plugin. A test holds `ABI_SEMVER` inside `^MIN_PLUGIN_ABI`, so bumping one
+/// without the other fails.
 pub const MIN_PLUGIN_ABI: &str = "0.17.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
