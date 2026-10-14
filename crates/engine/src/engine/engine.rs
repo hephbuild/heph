@@ -722,7 +722,7 @@ impl Engine {
         })?;
         // `auth.credential` plus the `heph.auth.*` functions — no provider: the
         // functions are the plugin's, so nothing has to stand in for one.
-        engine.register_plugin(hbuiltins::plugincredential::PLUGIN_NAME, |_| {
+        engine.register_plugin("auth", |_| {
             Ok(PluginParts::default()
                 .with_driver(Box::new(hbuiltins::plugincredential::Driver))
                 .with_functions(hbuiltins::plugincredential::functions::definitions()))

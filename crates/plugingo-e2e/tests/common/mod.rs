@@ -476,7 +476,7 @@ fn make_workspace_ordered_runner(
 
     b.with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
-        .with_plugin(hplugin_devenv::plugindevenv::PLUGIN_NAME, |_| {
+        .with_plugin("devenv", |_| {
             Ok(PluginParts::default()
                 .with_managed_driver(Box::new(hplugin_devenv::plugindevenv::Driver::new())))
         })

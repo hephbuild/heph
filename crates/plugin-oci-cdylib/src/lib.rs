@@ -11,11 +11,12 @@
 //! explicit `platforms` depends on, so that platform reaches the cache key as an
 //! input hash rather than as a parse-time side effect. No hooks.
 //!
-//! The one thing read from [`CreateConfig`] is the resolved heph `home`, which
-//! the `oci_runner` driver mounts into its container. Otherwise `docker_build`
-//! and the platform probe take the `docker` binary from `PATH`, the same host
-//! capability the in-process build used, and `oci_push` / `oci_pull` need no
-//! host binary at all.
+//! Two things are read from [`CreateConfig`]: the plugin's `name` (its
+//! manifest's), under which the platform probe target names its driver, and the
+//! resolved heph `home`, which the `oci.runner` driver mounts into its
+//! container. Otherwise `docker_build` and the platform probe take the `docker`
+//! binary from `PATH`, the same host capability the in-process build used, and
+//! `oci.push` / `oci.pull` need no host binary at all.
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_oci::pluginoci;
@@ -31,26 +32,38 @@ use std::sync::Arc;
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
-/// `pb::CreateConfig` bytes; this plugin reads the resolved heph `home` out of
-/// it (the `oci.runner` driver mounts it into the container). The oci plugin
-/// exports no functions, so the engine's function registry goes unused.
+/// `pb::CreateConfig` bytes; this plugin reads its `name` and the resolved heph
+/// `home` out of it. The oci plugin exports no functions, so the engine's
+/// function registry goes unused.
 ///
-/// A config that does not decode, or carries no usable home, does not abort:
-/// the log sink is not installed yet, so an abort here would kill the host with
-/// a bare `SIGABRT` and no message. Only `oci.runner` needs the home, so it is
-/// the one driver that fails — at run, with the reason.
+/// Nothing here aborts: the log sink is not installed yet, so an abort would
+/// kill the host with a bare `SIGABRT` and no message. A `home` that is not
+/// usable fails only `oci.runner`, the one driver that needs it — at run, with
+/// the reason.
 #[stabby::export]
 pub extern "C" fn heph_plugin_create(
     cfg: stabby::vec::Vec<u8>,
     _functions: DynFunctionRegistry,
 ) -> PluginComponents {
-    let home = match create_config_from_bytes(&cfg) {
-        Ok(cfg) => pluginoci::runner::home_from_host(&cfg.home),
-        Err(e) => Err(format!(
-            "the host's CreateConfig could not be decoded: {e:#}"
-        )),
-    };
-    build(home)
+    match create_config_from_bytes(&cfg) {
+        Ok(cfg) => build(&cfg.name, pluginoci::runner::home_from_host(&cfg.home)),
+        Err(e) => {
+            // The create entry cannot fail across the ABI, and a panic here is a
+            // non-unwinding abort. Hand back an empty bundle: the first `oci.*`
+            // target then fails with "unknown driver". (The log sink is not
+            // installed yet, so this event only reaches a test subscriber.)
+            tracing::error!(error = %format!("{e:#}"), "oci plugin: bad create config");
+            PluginComponents {
+                provider: stabby::option::Option::None(),
+                drivers: stabby::vec::Vec::new(),
+                functions: stabby::vec::Vec::new(),
+                function_handle: stabby::option::Option::None(),
+                hooks: stabby::vec::Vec::new(),
+                runners: stabby::vec::Vec::new(),
+                meta: stabby::vec::Vec::new(),
+            }
+        }
+    }
 }
 
 /// Stable ABI log-sink entry: the host calls this right after `create` to hand
@@ -92,54 +105,56 @@ pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
     install_runner_host(host);
 }
 
-fn build(home: Result<std::path::PathBuf, String>) -> PluginComponents {
+/// `plugin` is this plugin's name, from its manifest; `home` is the host's
+/// resolved heph home, or why it is not usable.
+fn build(plugin: &str, home: Result<std::path::PathBuf, String>) -> PluginComponents {
     let mut drivers = stabby::vec::Vec::new();
 
     // Assembles target outputs into an image. No daemon, no execution.
     let image: Arc<dyn ManagedDriver> = Arc::new(pluginoci::image::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::image::LOCAL_NAME.into(),
+        name: "image".into(),
         driver: make_dyn_managed_driver(image),
     });
     let layer: Arc<dyn ManagedDriver> = Arc::new(pluginoci::layer::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::layer::LOCAL_NAME.into(),
+        name: "layer".into(),
         driver: make_dyn_managed_driver(layer),
     });
     // Groups per-platform images into one multi-platform image.
     let index: Arc<dyn ManagedDriver> = Arc::new(pluginoci::index::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::index::LOCAL_NAME.into(),
+        name: "index".into(),
         driver: make_dyn_managed_driver(index),
     });
     // Builds a Dockerfile + context into a cacheable image archive.
     let docker: Arc<dyn ManagedDriver> = Arc::new(pluginoci::docker_build::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::docker_build::LOCAL_NAME.into(),
+        name: "docker_build".into(),
         driver: make_dyn_managed_driver(docker),
     });
     // Pulls a base image into a cacheable archive (or OCI layout).
     let pull: Arc<dyn ManagedDriver> = Arc::new(pluginoci::pull::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::pull::LOCAL_NAME.into(),
+        name: "pull".into(),
         driver: make_dyn_managed_driver(pull),
     });
     // Actions — uncached, they mutate a registry or the local daemon.
     let push: Arc<dyn ManagedDriver> = Arc::new(pluginoci::push::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::push::LOCAL_NAME.into(),
+        name: "push".into(),
         driver: make_dyn_managed_driver(push),
     });
     let load: Arc<dyn ManagedDriver> = Arc::new(pluginoci::load::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::load::LOCAL_NAME.into(),
+        name: "load".into(),
         driver: make_dyn_managed_driver(load),
     });
     // Asks buildx which platform it would build by default. Depended on, never
     // named by a user.
     let platform: Arc<dyn ManagedDriver> = Arc::new(pluginoci::platform::Driver::new());
     drivers.push(NamedDriver {
-        name: pluginoci::platform::LOCAL_NAME.into(),
+        name: "builder_platform".into(),
         driver: make_dyn_managed_driver(platform),
     });
 
@@ -149,11 +164,12 @@ fn build(home: Result<std::path::PathBuf, String>) -> PluginComponents {
     // no runner implementation of its own.
     let runner: Arc<dyn ManagedDriver> = Arc::new(pluginoci::runner::Driver::from_host_home(home));
     drivers.push(NamedDriver {
-        name: pluginoci::runner::LOCAL_NAME.into(),
+        name: "runner".into(),
         driver: make_dyn_managed_driver(runner),
     });
 
-    let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(pluginoci::platform::Provider);
+    let provider: Arc<dyn hplugin::provider::Provider> =
+        Arc::new(pluginoci::platform::Provider::new(plugin));
 
     // The runner this plugin *implements*, as opposed to the `oci_runner`
     // driver above, which only writes the `runner.json` naming it. Registered

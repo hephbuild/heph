@@ -61,11 +61,6 @@ use xxhash_rust::xxh3::Xxh3Default;
 use super::archive::{self, Blob, Blobs};
 use super::{ImageFormat, dep_files, layout_path, normalize_platform, split_platform, ws_path};
 
-/// The name BUILD files select this driver by: `<plugin>.<local>`.
-pub const DRIVER_NAME: &str = "oci.image";
-/// Its local name inside the `oci` plugin.
-pub const LOCAL_NAME: &str = "image";
-
 /// Media type of an uncompressed layer. See [`super::layer`] for why layers are
 /// not gzipped.
 const LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
@@ -439,7 +434,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: LOCAL_NAME.to_string(),
+            name: "image".to_string(),
         })
     }
 

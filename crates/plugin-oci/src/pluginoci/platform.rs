@@ -65,10 +65,6 @@ pub const PKG: &str = "@heph/oci";
 pub const TARGET: &str = "platform";
 /// Addr arg naming the buildx builder to ask. Absent means the current one.
 pub const BUILDER_ARG: &str = "builder";
-/// The name targets select this driver by: `<plugin>.<local>`.
-pub const DRIVER_NAME: &str = "oci.builder_platform";
-/// Its local name inside the `oci` plugin.
-pub const LOCAL_NAME: &str = "builder_platform";
 
 /// The shared registry blob store's target name, in [`PKG`].
 ///
@@ -132,12 +128,28 @@ pub(crate) fn addr_for(builder: Option<&str>) -> String {
 
 /// Declares `//@heph/oci:platform`. Nothing else — the `oci_*` drivers are
 /// selected from BUILD files by the workspace's own provider.
-pub struct Provider;
+pub struct Provider {
+    /// The full name the probe target selects [`Driver`] by:
+    /// `<plugin>.builder_platform`. The plugin's name is its registration key
+    /// or manifest `name`, not something this crate decides, so it is handed in.
+    driver: String,
+}
+
+impl Provider {
+    /// `plugin` is the name of the plugin this provider and [`Driver`] are
+    /// registered under (`PluginInit.name`, or a cdylib's `CreateConfig.name`).
+    pub fn new(plugin: &str) -> Self {
+        Provider {
+            driver: format!("{plugin}.builder_platform"),
+        }
+    }
+}
 
 impl EProvider for Provider {
     fn config(&self, _req: ProviderConfigRequest) -> anyhow::Result<ProviderConfigResponse> {
+        // Empty local name: the provider is reachable as the plugin itself.
         Ok(ProviderConfigResponse {
-            name: super::PLUGIN_NAME.to_string(),
+            name: String::new(),
         })
     }
 
@@ -230,7 +242,7 @@ impl EProvider for Provider {
             Ok(GetResponse {
                 target_spec: TargetSpec {
                     addr: req.addr,
-                    driver: DRIVER_NAME.to_string(),
+                    driver: self.driver.clone(),
                     ..Default::default()
                 },
             })
@@ -280,7 +292,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: LOCAL_NAME.to_string(),
+            name: "builder_platform".to_string(),
         })
     }
 
@@ -412,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn the_blobs_spec_parses_as_a_declaration() {
         let addr = hmodel::htaddr::parse_addr(&blobs_addr()).expect("addr");
-        let resp = Provider
+        let resp = Provider::new("oci")
             .get(
                 GetRequest {
                     request_id: "req".to_string(),
@@ -426,6 +438,28 @@ mod tests {
             .expect("the provider serves the blob store");
         hbuiltins::pluginscratch::parse_declaration(&resp.target_spec)
             .expect("the blobs spec must parse as a scratch declaration");
+    }
+
+    /// The probe target names its driver under the plugin's *actual* name. A
+    /// workspace that loads this plugin under another manifest `name` registers
+    /// the driver as `<that>.builder_platform`; a hardcoded `oci.` prefix would
+    /// leave the probe naming a driver that does not exist.
+    #[tokio::test]
+    async fn the_probe_names_its_driver_under_the_plugin_name() {
+        let addr = hmodel::htaddr::parse_addr(&addr_for(None)).expect("addr");
+        let resp = Provider::new("containers")
+            .get(
+                GetRequest {
+                    request_id: "req".to_string(),
+                    addr,
+                    states: vec![],
+                    executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
+                },
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("the provider serves the probe");
+        assert_eq!(resp.target_spec.driver, "containers.builder_platform");
     }
 
     #[test]
@@ -445,7 +479,7 @@ mod tests {
                     request_id: "req".to_string(),
                     target_spec: Arc::new(TargetSpec {
                         addr,
-                        driver: DRIVER_NAME.to_string(),
+                        driver: "oci.builder_platform".to_string(),
                         config: HashMap::new(),
                         labels: vec![],
                         ..Default::default()

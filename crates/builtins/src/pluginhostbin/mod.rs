@@ -19,8 +19,9 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
 const PKG: &str = "@heph/bin";
-const DRIVER_NAME: &str = "hostbin";
-/// The builtin plugin the hostbin provider and driver ship in.
+/// The builtin plugin the hostbin provider and driver ship in. Both report it
+/// as their local name too, so each is reachable as plain `hostbin` — which
+/// is also the driver name the provider's targets select.
 pub const PLUGIN_NAME: &str = "hostbin";
 
 fn find_binary(name: &str) -> anyhow::Result<String> {
@@ -86,7 +87,7 @@ impl EProvider for Provider {
             Ok(GetResponse {
                 target_spec: TargetSpec {
                     addr: req.addr,
-                    driver: DRIVER_NAME.to_string(),
+                    driver: PLUGIN_NAME.to_string(),
                     ..Default::default()
                 },
             })
@@ -113,7 +114,7 @@ pub struct Driver;
 impl hplugin::driver::Driver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: DRIVER_NAME.to_string(),
+            name: PLUGIN_NAME.to_string(),
         })
     }
 
@@ -258,7 +259,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.target_spec.driver, DRIVER_NAME);
+        assert_eq!(result.target_spec.driver, PLUGIN_NAME);
         assert_eq!(result.target_spec.addr.name, "definitely_not_installed_xyz");
     }
 
@@ -306,7 +307,7 @@ mod tests {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {
                 addr: parse_addr(&format!("//@heph/bin:{}", bin_name)).unwrap(),
-                driver: DRIVER_NAME.to_string(),
+                driver: PLUGIN_NAME.to_string(),
                 ..Default::default()
             }),
         }

@@ -80,11 +80,6 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 use super::{archive::Layout, basename, dep_single_file, ws_path};
 
-/// The name BUILD files select this driver by: `<plugin>.<local>`.
-pub const DRIVER_NAME: &str = "oci.load";
-/// Its local name inside the `oci` plugin.
-pub const LOCAL_NAME: &str = "load";
-
 const IMAGE_ORIGIN: &str = "image";
 
 /// Config for an `oci_load` target.
@@ -361,7 +356,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: LOCAL_NAME.to_string(),
+            name: "load".to_string(),
         })
     }
 
@@ -563,7 +558,7 @@ mod tests {
             request_id: "test".to_string(),
             target_spec: Arc::new(TargetSpec {
                 addr: parse_addr(addr).expect("addr"),
-                driver: DRIVER_NAME.to_string(),
+                driver: "oci.load".to_string(),
                 config,
                 ..Default::default()
             }),

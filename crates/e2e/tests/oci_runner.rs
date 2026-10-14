@@ -144,7 +144,7 @@ fn workspace() -> htestkit::Workspace {
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
         // The runner is what the cdylib hands the host through `NamedRunner`;
         // an in-process harness puts it in the plugin's parts directly.
-        .with_plugin(pluginoci::PLUGIN_NAME, |init| {
+        .with_plugin("oci", |init| {
             let mut parts = heph::engine::PluginParts::default().with_managed_driver(Box::new(
                 pluginoci::runner::Driver::new(init.home.to_path_buf()),
             ));
@@ -195,7 +195,7 @@ async fn the_mounted_home_is_the_resolved_one_even_in_a_package_named_sandbox() 
                 init.runtime.clone(),
             ))
         })
-        .with_plugin(pluginoci::PLUGIN_NAME, move |init| {
+        .with_plugin("oci", move |init| {
             Ok(
                 heph::engine::PluginParts::default().with_managed_driver(Box::new(
                     pluginoci::runner::Driver::new(init.home.to_path_buf())

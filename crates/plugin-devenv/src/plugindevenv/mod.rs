@@ -65,13 +65,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
-/// The plugin this driver ships in (its cdylib manifest's `name`).
-pub const PLUGIN_NAME: &str = "devenv";
-/// The name BUILD files select this driver by: `<plugin>.<local>`.
-pub const DRIVER_NAME: &str = "devenv.runner";
-/// Its local name inside the `devenv` plugin.
-pub const LOCAL_NAME: &str = "runner";
-
 /// Bump to re-derive every runner this driver produced, when the shape of what
 /// it writes changes.
 ///
@@ -259,7 +252,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: LOCAL_NAME.to_string(),
+            name: "runner".to_string(),
         })
     }
 

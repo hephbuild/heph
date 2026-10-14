@@ -58,11 +58,6 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 use super::{dep_files, ws_path};
 
-/// The name BUILD files select this driver by: `<plugin>.<local>`.
-pub const DRIVER_NAME: &str = "oci.layer";
-/// Its local name inside the `oci` plugin.
-pub const LOCAL_NAME: &str = "layer";
-
 /// Origin id prefix of a `srcs` dep input. The index is in the id so a
 /// `HEPH_DEBUG_HASH` trace names the entry rather than "a src".
 fn src_origin(i: usize) -> String {
@@ -297,7 +292,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: LOCAL_NAME.to_string(),
+            name: "layer".to_string(),
         })
     }
 

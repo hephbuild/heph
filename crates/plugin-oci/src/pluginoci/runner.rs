@@ -51,11 +51,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
-/// The name BUILD files select this driver by: `<plugin>.<local>`.
-pub const DRIVER_NAME: &str = "oci.runner";
-/// Its local name inside the `oci` plugin.
-pub const LOCAL_NAME: &str = "runner";
-
 const FORMAT_VERSION: u32 = 1;
 const OUT_FILE: &str = "runner.json";
 
@@ -134,7 +129,7 @@ impl Driver {
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: LOCAL_NAME.to_string(),
+            name: "runner".to_string(),
         })
     }
 

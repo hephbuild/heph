@@ -35,10 +35,6 @@ pub mod push;
 pub mod registry;
 pub mod runner;
 
-/// The plugin these drivers ship in (its cdylib manifest's `name`); every
-/// driver here is selected as `oci.<local>`.
-pub const PLUGIN_NAME: &str = "oci";
-
 /// Archive format an image is built/consumed as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ImageFormat {

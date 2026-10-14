@@ -31,9 +31,9 @@ fn workspace() -> htestkit::Workspace {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_plugin(pluginoci::PLUGIN_NAME, |_| {
+        .with_plugin("oci", |init| {
             Ok(heph::engine::PluginParts::default()
-                .with_provider(Box::new(pluginoci::platform::Provider))
+                .with_provider(Box::new(pluginoci::platform::Provider::new(&init.name)))
                 .with_managed_driver(Box::new(pluginoci::layer::Driver::new()))
                 .with_managed_driver(Box::new(pluginoci::image::Driver::new()))
                 .with_managed_driver(Box::new(pluginoci::push::Driver::new()))

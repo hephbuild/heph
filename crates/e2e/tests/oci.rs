@@ -109,9 +109,9 @@ fn workspace_with_fake(fake: &Fake) -> htestkit::Workspace {
         // `docker_build` without explicit `platforms` depends on
         // `//@heph/oci:platform`, so the probe's provider and driver have to be
         // registered for the graph to resolve at all.
-        .with_plugin(pluginoci::PLUGIN_NAME, move |_| {
+        .with_plugin("oci", move |init| {
             Ok(heph::engine::PluginParts::default()
-                .with_provider(Box::new(pluginoci::platform::Provider))
+                .with_provider(Box::new(pluginoci::platform::Provider::new(&init.name)))
                 .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
                     bin.clone(),
                 )))
@@ -493,11 +493,11 @@ async fn test_docker_build_build_failure_surfaces_the_builder_error() -> anyhow:
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
-        .with_plugin(pluginoci::PLUGIN_NAME, {
+        .with_plugin("oci", {
             let bin = bin.to_string_lossy().into_owned();
-            move |_| {
+            move |init| {
                 Ok(heph::engine::PluginParts::default()
-                    .with_provider(Box::new(pluginoci::platform::Provider))
+                    .with_provider(Box::new(pluginoci::platform::Provider::new(&init.name)))
                     .with_managed_driver(Box::new(pluginoci::docker_build::Driver::with_binary(
                         bin.clone(),
                     )))
