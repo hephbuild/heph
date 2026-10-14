@@ -9,9 +9,9 @@ edition = "2021"
 path = "src/mod.rs"
 
 [dependencies]
-# Keep in step with `buffaVersion` in devenv.nix: the plugin and the runtime are
-# released together.
-buffa = "0.9.2"
+# The workspace pins it exactly, in step with `buffaVersion` in devenv.nix: the
+# plugin and the runtime are released together.
+buffa = { workspace = true }
 
 [lints.clippy]
 all = "allow"

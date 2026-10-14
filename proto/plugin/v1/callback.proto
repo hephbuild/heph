@@ -15,7 +15,10 @@ message ArtifactHandle {
   string group = 2;
   string name = 3;
   string hashout = 4;
-  uint64 byte_size = 5; // absent if the backing can't answer cheaply
+  // Absent if the backing can't answer cheaply. (No Rust code sends this
+  // message today: the stabby surface carries the same handle natively, where
+  // `StableArtifactContent::byte_size` spells "unknown" as `u64::MAX`.)
+  uint64 byte_size = 5;
   bool support = 6;     // support_artifact vs primary artifact
 }
 

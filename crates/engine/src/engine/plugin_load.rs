@@ -106,12 +106,12 @@ fn load_dylib_plugins(
                 runners,
             } = hplugin_stabby::load_stable::load(
                 dylib,
-                &hplugin_abi::convert::CreateConfig {
-                    root: root.to_path_buf(),
-                    home: home_dir.to_path_buf(),
-                    name: resolved.name.clone(),
-                    options: m.options,
-                },
+                &hplugin_abi::convert::CreateConfig::new(
+                    root,
+                    home_dir.to_path_buf(),
+                    resolved.name.clone(),
+                    m.options,
+                ),
                 runtime.clone(),
                 std::sync::Arc::clone(&functions),
             )

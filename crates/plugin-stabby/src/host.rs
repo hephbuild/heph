@@ -208,28 +208,12 @@ struct RegisteredCall {
 impl RegisteredCall {
     fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
         use convert::required;
-        let req = pb::CallRegisteredRequest::decode_from_slice(bytes)
+        let req = plugin_abi::decode::<pb::CallRegisteredRequest>(bytes)
             .context("decoding CallRegisteredRequest")?;
         let plugin = required(req.plugin, "CallRegisteredRequest.plugin")?;
         let name = required(req.name, "CallRegisteredRequest.name")?;
-        let args = (|| -> anyhow::Result<FnArgs> {
-            Ok(FnArgs {
-                positional: req
-                    .positional
-                    .into_iter()
-                    .map(convert::value_from_pb)
-                    .collect::<anyhow::Result<_>>()?,
-                named: req
-                    .named
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let v = convert::value_from_pb(v).with_context(|| format!("arg {k:?}"))?;
-                        Ok((k, v))
-                    })
-                    .collect::<anyhow::Result<_>>()?,
-            })
-        })()
-        .with_context(|| format!("the arguments of `heph.{plugin}.{name}`"))?;
+        let args = convert::fn_args_from_pb(req.positional, req.named)
+            .with_context(|| format!("the arguments of `heph.{plugin}.{name}`"))?;
         Ok(Self {
             pkg: required(req.pkg, "CallRegisteredRequest.pkg")?,
             root: required(req.root, "CallRegisteredRequest.root")?.into(),
@@ -465,7 +449,7 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                 }),
             };
             match res {
-                Ok(resp) => unary(Body::CallFunctionResp(Box::new(resp))),
+                Ok(resp) => unary(Body::from(resp)),
                 Err(e) => unary(err_body(format!("{e:#}"))),
             }
         };
@@ -664,7 +648,7 @@ impl StableExecutor for HostExecutor {
     ) -> DynFuture<'a, QueryOutcome> {
         let inner = Arc::clone(&self.inner);
         let fut = async move {
-            let matcher = match plugin_abi::pb::Matcher::decode_from_slice(&matcher_pb[..])
+            let matcher = match plugin_abi::decode::<plugin_abi::pb::Matcher>(&matcher_pb[..])
                 .map_err(anyhow::Error::from)
                 .and_then(plugin_abi::convert::matcher_from_pb)
             {

@@ -105,6 +105,7 @@ p/BUILD:2:57-70: heph.fss.glob: no plugin named "fss" (did you mean "fs"?); plug
 p/BUILD:1:8-19: heph.fs.glb: plugin "fs" has no function "glb"; available: base, dir, glob, join, parent. Did you mean "glob"?
 ```
 
-A cdylib built against another heph ABI is refused at load: "plugin <path> was
-built against a different heph ABI (host 0.16.0); reinstall plugins from the same
-release as this heph".
+A cdylib built against another heph ABI is refused at load, once, before any of
+its functions is registered: "plugin <path> was built against a different heph
+ABI (plugin <its version>; host <this heph's>, which loads …); rebuild it against
+this heph, or reinstall plugins from the same release as this heph".

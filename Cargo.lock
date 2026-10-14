@@ -4086,6 +4086,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tracing",
 ]
 
 [[package]]
@@ -4396,6 +4397,7 @@ dependencies = [
  "plugin",
  "plugin-abi",
  "proc",
+ "semver",
  "serde_json",
  "stabby",
  "tokio",

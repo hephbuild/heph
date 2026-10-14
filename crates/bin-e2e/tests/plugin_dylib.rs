@@ -851,31 +851,36 @@ fn shipped_names_match_the_name_map() {
     }
 }
 
-/// **A plugin built against another heph ABI is refused, saying so.**
-///
-/// No version is read at load: what refuses a skewed plugin is stabby's
-/// structural check on `heph_plugin_create`, whose `PluginComponents` layout an
-/// ABI break changes. The fixture is the smallest library that fails that check
-/// the way a 0.15 plugin does: it exports the create entry's stabby probe, and
-/// the probe answers "not my layout". It also exports `heph_plugin_set_log_sink`
-/// with a mismatched report, which the host must warn about rather than skip in
-/// silence. Built here with the system C compiler — a checked-in binary per
-/// platform, or a whole fixture crate staged with the release artifacts, would
-/// cost more than the seam it covers.
-#[test]
-fn a_plugin_from_another_abi_is_refused() {
-    let dist = Dist::locate();
-    let ws = Workspace::new().expect("workspace");
+/// The C body of a skewed plugin's create and log-sink entries: each exports
+/// its stabby probe, and the probe answers "not my layout" — what a plugin
+/// built against another `PluginComponents` layout looks like to the host.
+const SKEWED_ENTRIES: &str = "void *heph_plugin_create_stabbied_v3(const void *r) { (void)r; return 0; }\n\
+     void heph_plugin_create(void) {}\n\
+     void *heph_plugin_set_log_sink_stabbied_v3(const void *r) { (void)r; return 0; }\n\
+     void heph_plugin_set_log_sink(void) {}\n";
 
+/// The C source of a fixture reporting ABI `version` (none when `None`).
+fn fixture_source(version: Option<&str>) -> String {
+    match version {
+        Some(v) => {
+            format!(
+                "{SKEWED_ENTRIES}const char *heph_plugin_abi_semver(void) {{ return \"{v}\"; }}\n"
+            )
+        }
+        None => SKEWED_ENTRIES.to_string(),
+    }
+}
+
+/// Build `source` with the system C compiler as plugin `drift`, load it, and
+/// return the dylib's path and the run's stderr. The load must fail (exit 1).
+///
+/// The system C compiler, because a checked-in binary per platform, or a whole
+/// fixture crate staged with the release artifacts, would cost more than the
+/// seam it covers.
+fn load_refused_fixture(dist: &Dist, source: &str) -> (Workspace, std::path::PathBuf, String) {
+    let ws = Workspace::new().expect("workspace");
     let src = ws.root().join("drift.c");
-    std::fs::write(
-        &src,
-        "void *heph_plugin_create_stabbied_v3(const void *r) { (void)r; return 0; }\n\
-         void heph_plugin_create(void) {}\n\
-         void *heph_plugin_set_log_sink_stabbied_v3(const void *r) { (void)r; return 0; }\n\
-         void heph_plugin_set_log_sink(void) {}\n",
-    )
-    .expect("write fixture source");
+    std::fs::write(&src, source).expect("write fixture source");
     let dylib = ws
         .root()
         .join(format!("heph-drift-plugin.{}", common::DYLIB_EXT));
@@ -892,22 +897,107 @@ fn a_plugin_from_another_abi_is_refused() {
     ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
         .expect("write config");
 
-    let mut cmd = ws.cmd(&dist, &["inspect", "functions"]);
+    let mut cmd = ws.cmd(dist, &["inspect", "functions"]);
     cmd.env("HEPH_LOG", "warn");
     let out = cmd.output().expect("run");
     assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    for want in [
-        "was built against a different heph ABI (host 0.16.0)",
-        "reinstall plugins from the same release",
-        &dylib.display().to_string(),
-        // The optional entry with a mismatched type is warned about.
-        "heph_plugin_set_log_sink",
-    ] {
-        assert!(
-            stderr.contains(want),
-            "missing {want:?}: {}",
-            describe(&out)
-        );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    (ws, dylib, stderr)
+}
+
+/// The host's ABI version, as its refusal names it (`; host X.Y.Z`). This crate
+/// links no workspace crate, so the version is learned from the binary.
+fn host_abi(stderr: &str) -> String {
+    assert!(stderr.contains("; host "), "no host version in: {stderr}");
+    let (_, rest) = stderr.split_once("; host ").expect("checked above");
+    let version: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    assert!(
+        version.split('.').count() == 3,
+        "host version {version:?} in: {stderr}"
+    );
+    version
+}
+
+fn assert_contains_all(stderr: &str, wants: &[&str]) {
+    for want in wants {
+        assert!(stderr.contains(want), "missing {want:?}: {stderr}");
     }
+}
+
+/// **A plugin that reports no ABI version is refused at load, before anything
+/// in it is called.** Every plugin since 0.17.0 exports
+/// `heph_plugin_abi_semver`; one without it predates the check, and the skew it
+/// carries may be one stabby cannot see (0.17.0's was wire-only). Its log-sink
+/// entry is never probed: no warning about it means the version check ran
+/// first.
+#[test]
+fn a_plugin_without_an_abi_version_is_refused() {
+    let dist = Dist::locate();
+    let (_ws, dylib, stderr) = load_refused_fixture(&dist, &fixture_source(None));
+    assert_contains_all(
+        &stderr,
+        &[
+            "was built against a different heph ABI (it reports no ABI version, so it \
+             predates 0.17.0; host ",
+            "rebuild it against this heph",
+            &dylib.display().to_string(),
+        ],
+    );
+    assert!(
+        !stderr.contains("heph_plugin_set_log_sink"),
+        "the refused plugin's entries must not be probed: {stderr}"
+    );
+}
+
+/// **A plugin reporting an ABI outside the host's range is refused at load**,
+/// naming both versions — older and newer alike.
+#[test]
+fn a_plugin_reporting_another_abi_is_refused() {
+    let dist = Dist::locate();
+    let (_ws, dylib, stderr) = load_refused_fixture(&dist, &fixture_source(Some("0.1.0")));
+    assert_contains_all(
+        &stderr,
+        &[
+            "was built against a different heph ABI (plugin 0.1.0; host ",
+            "rebuild it against this heph",
+            &dylib.display().to_string(),
+        ],
+    );
+    let (_ws, _, stderr) = load_refused_fixture(&dist, &fixture_source(Some("999.0.0")));
+    assert_contains_all(
+        &stderr,
+        &["(plugin 999.0.0, newer than this heph, which is unsupported; host "],
+    );
+    let (_ws, _, stderr) = load_refused_fixture(&dist, &fixture_source(Some("0.17")));
+    assert_contains_all(
+        &stderr,
+        &["reports ABI version \"0.17\", which is not a version"],
+    );
+}
+
+/// **A plugin whose version is accepted but whose layout is not is refused,
+/// saying so.** The version check passes (the fixture reports the host's own
+/// ABI); stabby's structural check on `heph_plugin_create` then refuses it.
+/// The log-sink entry with a mismatched report is warned about rather than
+/// skipped in silence.
+#[test]
+fn a_plugin_from_another_abi_is_refused() {
+    let dist = Dist::locate();
+    let (_ws, _, probe) = load_refused_fixture(&dist, &fixture_source(Some("0.1.0")));
+    let host = host_abi(&probe);
+
+    let (_ws, dylib, stderr) = load_refused_fixture(&dist, &fixture_source(Some(&host)));
+    assert_contains_all(
+        &stderr,
+        &[
+            &format!("was built against a different heph ABI (host {host})"),
+            "reinstall plugins from the same release",
+            &dylib.display().to_string(),
+            // The optional entry with a mismatched type is warned about.
+            "heph_plugin_set_log_sink",
+        ],
+    );
 }

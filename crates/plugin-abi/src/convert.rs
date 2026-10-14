@@ -21,7 +21,7 @@
 
 use crate::pb;
 use anyhow::{Context as _, bail};
-use buffa::{EnumValue, Enumeration, Message as _};
+use buffa::{EnumValue, Enumeration};
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::{ListedFacts, Matcher};
@@ -29,7 +29,7 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::targetdef::{RawDef, RawDefBytes};
-use hplugin::function::{DeclaredState, DeclaredTarget, FnOutcome};
+use hplugin::function::{DeclaredState, DeclaredTarget, FnArgs, FnOutcome};
 use hplugin::provider::{Approval, State, TargetSpec};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -511,7 +511,11 @@ fn options_from_pb_map(
 
 /// The config a plugin cdylib's create entry receives, decoded. The wire form
 /// (`pb::CreateConfig`) stays inside the SDK; a plugin reads these fields.
+/// `#[non_exhaustive]`: a field the host adds later must not break a plugin
+/// that reads the others, so outside this crate it is built with
+/// [`CreateConfig::new`] and destructured with `..`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CreateConfig {
     /// The workspace root.
     pub root: std::path::PathBuf,
@@ -523,6 +527,22 @@ pub struct CreateConfig {
     /// The plugin's `options:` map, read with `hplugin::config::decode_opt`
     /// exactly as an in-process plugin reads its own.
     pub options: BTreeMap<String, serde_yaml::Value>,
+}
+
+impl CreateConfig {
+    pub fn new(
+        root: impl Into<std::path::PathBuf>,
+        home: impl Into<std::path::PathBuf>,
+        name: impl Into<String>,
+        options: BTreeMap<String, serde_yaml::Value>,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            home: home.into(),
+            name: name.into(),
+            options,
+        }
+    }
 }
 
 pub fn create_config_to_pb(c: &CreateConfig) -> pb::CreateConfig {
@@ -539,7 +559,7 @@ pub fn create_config_to_pb(c: &CreateConfig) -> pb::CreateConfig {
 /// `home` and `name` are required: a plugin handed a defaulted `""` root would
 /// resolve every path against its own cwd.
 pub fn create_config_from_bytes(bytes: &[u8]) -> anyhow::Result<CreateConfig> {
-    let c = pb::CreateConfig::decode_from_slice(bytes).context("decoding CreateConfig")?;
+    let c = crate::decode::<pb::CreateConfig>(bytes).context("decoding CreateConfig")?;
     Ok(CreateConfig {
         root: required(c.root, "CreateConfig.root")?.into(),
         home: required(c.home, "CreateConfig.home")?.into(),
@@ -884,6 +904,36 @@ pub fn fn_outcome_from_pb(r: pb::CallFunctionResponse) -> anyhow::Result<FnOutco
     ))
 }
 
+/// A call's arguments as their two wire fields, `(positional, named)` — the
+/// same pair on `CallFunctionRequest` and `CallRegisteredRequest`.
+pub fn fn_args_to_pb<N: FromIterator<(String, pb::Value)>>(args: &FnArgs) -> (Vec<pb::Value>, N) {
+    (
+        args.positional.iter().map(value_to_pb).collect(),
+        values_to_pb(&args.named),
+    )
+}
+
+/// Decode a call's arguments. A failing value names its position or key.
+pub fn fn_args_from_pb(
+    positional: Vec<pb::Value>,
+    named: impl IntoIterator<Item = (String, pb::Value)>,
+) -> anyhow::Result<FnArgs> {
+    Ok(FnArgs {
+        positional: positional
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| value_from_pb(v).with_context(|| format!("positional argument {i}")))
+            .collect::<anyhow::Result<_>>()?,
+        named: named
+            .into_iter()
+            .map(|(k, v)| {
+                let v = value_from_pb(v).with_context(|| format!("argument {k:?}"))?;
+                Ok((k, v))
+            })
+            .collect::<anyhow::Result<_>>()?,
+    })
+}
+
 // ---- Matcher ----
 
 pub fn matcher_to_pb(m: &Matcher) -> pb::Matcher {
@@ -1140,13 +1190,40 @@ pub fn scratch_mount_to_pb(m: &hplugin::driver::ScratchMount) -> pb::ScratchMoun
 /// is only a diagnostic, but a mount with a wrong one would misattribute a
 /// failure to some other target, and a defaulted path, env or dir would mount
 /// somewhere nobody declared. A scratch that silently does not mount costs a
-/// cold cache — never a wrong build (`docs/SCRATCH.md`, "The contract").
+/// cold cache — never a wrong build (`docs/SCRATCH.md`, "The contract"). The
+/// drop is a `warn!` naming the mount and the missing field, so a cold cache
+/// that should have been warm is explainable.
 pub fn scratch_mount_from_pb(m: pb::ScratchMount) -> Option<hplugin::driver::ScratchMount> {
+    let addr = m.addr.into_option().map(addr_from_pb);
+    let label = match &addr {
+        Some(Ok(a)) => a.format(),
+        _ => "<unknown target>".to_string(),
+    };
+    let dropped = |field: &str| {
+        tracing::warn!(
+            scratch = %label,
+            field,
+            "dropping a malformed scratch mount; the run goes without it (a cold cache, not a wrong build)"
+        );
+        None
+    };
+    let Some(Ok(addr)) = addr else {
+        return dropped("ScratchMount.addr");
+    };
+    let Some(path) = m.path else {
+        return dropped("ScratchMount.path");
+    };
+    let Some(env) = m.env else {
+        return dropped("ScratchMount.env");
+    };
+    let Some(dir) = m.dir else {
+        return dropped("ScratchMount.dir");
+    };
     Some(hplugin::driver::ScratchMount {
-        addr: addr_from_pb(m.addr.into_option()?).ok()?,
-        path: m.path?,
-        env: m.env?,
-        dir: std::path::PathBuf::from(m.dir?),
+        addr,
+        path,
+        env,
+        dir: std::path::PathBuf::from(dir),
     })
 }
 
@@ -1403,73 +1480,61 @@ pub fn raw_def_from_blob(blob: &pb::RawDefBlob) -> anyhow::Result<Arc<dyn RawDef
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa::Message as _;
     use std::collections::HashMap;
 
     /// The field numbers present at the top level of an encoded message, in
-    /// order. Enough of a wire reader to pin what a peer built against another
-    /// schema would see, without generating that schema.
-    fn field_numbers(mut b: &[u8]) -> Vec<u32> {
-        fn varint(b: &mut &[u8]) -> u64 {
-            let mut v = 0u64;
-            for shift in (0..64).step_by(7) {
-                let (byte, rest) = b.split_first().expect("truncated varint");
-                *b = rest;
-                v |= u64::from(byte & 0x7F) << shift;
-                if byte & 0x80 == 0 {
-                    break;
-                }
-            }
-            v
-        }
-        let mut out = Vec::new();
-        while !b.is_empty() {
-            let tag = varint(&mut b);
-            out.push(u32::try_from(tag >> 3).expect("field number"));
-            match tag & 7 {
-                0 => {
-                    varint(&mut b);
-                }
-                2 => {
-                    let len = usize::try_from(varint(&mut b)).expect("len");
-                    b = b.get(len..).expect("truncated field");
-                }
-                1 => b = b.get(8..).expect("truncated fixed64"),
-                5 => b = b.get(4..).expect("truncated fixed32"),
-                w => panic!("unexpected wire type {w}"),
-            }
-        }
-        out
+    /// order — what a peer built against another schema would see, read with
+    /// buffa's own schema-less decoder.
+    fn field_numbers(b: &[u8]) -> Vec<u32> {
+        buffa::UnknownFields::decode_from_slice(b)
+            .expect("well-formed wire bytes")
+            .iter()
+            .map(|f| f.number)
+            .collect()
     }
 
-    fn tag(field: u32, wire: u8, out: &mut Vec<u8>) {
-        let mut v = (u64::from(field) << 3) | u64::from(wire);
-        loop {
-            let byte = (v & 0x7F) as u8;
-            v >>= 7;
-            if v == 0 {
-                out.push(byte);
-                break;
-            }
-            out.push(byte | 0x80);
-        }
-    }
+    // Hand-built wire bytes for a peer on another schema, written with buffa's
+    // own encoders so lengths and tags are real varints.
+    use buffa::encoding::{Tag, WireType};
 
     fn string_field(field: u32, s: &str, out: &mut Vec<u8>) {
-        tag(field, 2, out);
-        out.push(u8::try_from(s.len()).expect("short string"));
-        out.extend_from_slice(s.as_bytes());
+        Tag::new(field, WireType::LengthDelimited).encode(out);
+        buffa::types::encode_string(s, out);
     }
 
     fn bool_field(field: u32, v: bool, out: &mut Vec<u8>) {
-        tag(field, 0, out);
-        out.push(u8::from(v));
+        Tag::new(field, WireType::Varint).encode(out);
+        buffa::types::encode_bool(v, out);
     }
 
     fn message_field(field: u32, m: &impl buffa::Message, out: &mut Vec<u8>) {
         let bytes = m.encode_to_vec();
-        tag(field, 2, out);
-        out.push(u8::try_from(bytes.len()).expect("short message"));
+        buffa::types::put_len_delimited_header(field, bytes.len() as u64, out);
         out.extend_from_slice(&bytes);
+    }
+
+    /// A string longer than 127 bytes needs a two-byte length varint; the
+    /// helpers must produce bytes the generated decoder agrees with.
+    #[test]
+    fn the_wire_helpers_write_real_varints() {
+        let long = "x".repeat(200);
+        let mut b = Vec::new();
+        string_field(1, "p", &mut b);
+        string_field(2, &long, &mut b);
+        let a = crate::decode::<pb::Addr>(&b).expect("decodes");
+        assert_eq!(a.name.as_deref(), Some(long.as_str()));
+
+        let mut b = Vec::new();
+        string_field(2, "out", &mut b);
+        message_field(1, &pb_addr("p", &long), &mut b);
+        assert_eq!(field_numbers(&b), vec![2, 1]);
+        let t = crate::decode::<pb::TargetAddr>(&b).expect("decodes");
+        assert_eq!(t.output.as_deref(), Some("out"));
+        assert_eq!(
+            addr_field(t.r#ref, "TargetAddr.ref").expect("addr").name,
+            long
+        );
     }
 
     fn pb_addr(pkg: &str, name: &str) -> pb::Addr {
@@ -1914,7 +1979,9 @@ mod tests {
     #[test]
     fn unknown_matcher_arm_is_decode_error() {
         // Field 99 is no arm of `Matcher`: what a newer peer's arm looks like here.
-        let unknown = [0xFA, 0x06, 0x01, b'x'];
+        let mut unknown = Vec::new();
+        string_field(99, "x", &mut unknown);
+        assert_eq!(field_numbers(&unknown), vec![99]);
         let decoded = pb::Matcher::decode_from_slice(&unknown).expect("unknown fields are kept");
         assert!(decoded.kind.is_none());
         matcher_from_pb(decoded.clone()).expect_err("an empty matcher must not decode");
@@ -2103,7 +2170,11 @@ mod tests {
         message_field(1, &pb_addr("p", "t"), &mut wire);
         // Field 4 (`facts`), two bytes long: `has_codegen`'s tag, then a varint
         // whose continuation bit runs past the end of the message.
-        wire.extend_from_slice(&[0x22, 0x02, 0x18, 0xFF]);
+        let mut facts = Vec::new();
+        Tag::new(3, WireType::Varint).encode(&mut facts);
+        facts.push(0xFF);
+        buffa::types::put_len_delimited_header(4, facts.len() as u64, &mut wire);
+        wire.extend_from_slice(&facts);
         pb::ListResponse::decode_from_slice(&wire)
             .expect_err("a malformed `facts` must fail the item");
     }
@@ -2160,5 +2231,756 @@ nested: { a: 1, b: [x, y] }
                 .expect("decode")
                 .is_empty()
         );
+    }
+
+    // ---- Presence, field by field ----
+
+    /// Encode, then decode the bytes: what a peer actually receives.
+    fn via_bytes<M: buffa::Message>(m: &M) -> M {
+        crate::decode(&m.encode_to_vec()).expect("decode bytes")
+    }
+
+    fn enum_field(field: u32, v: i32, out: &mut Vec<u8>) {
+        Tag::new(field, WireType::Varint).encode(out);
+        buffa::types::encode_int32(v, out);
+    }
+
+    fn target_addr(pkg: &str, name: &str) -> TargetAddr {
+        TargetAddr {
+            r#ref: addr(pkg, name),
+            output: Some("out".to_string()),
+            filters: vec!["f".to_string()],
+        }
+    }
+
+    fn input(mode: InputMode, hashed: bool, runtime: bool) -> Input {
+        Input {
+            r#ref: target_addr("//d", "x"),
+            mode,
+            origin_id: "o".to_string(),
+            annotations: BTreeMap::from([("k".to_string(), "v".to_string())]),
+            hashed,
+            runtime,
+        }
+    }
+
+    fn path(content: PathContent, codegen_tree: CodegenMode, collect: bool) -> Path {
+        Path {
+            content,
+            codegen_tree,
+            collect,
+        }
+    }
+
+    /// A def touching every field the wire carries, every input mode, every
+    /// path kind and codegen mode, and non-default flags.
+    fn full_target_def() -> TargetDef {
+        TargetDef {
+            addr: addr("//p", "t"),
+            labels: vec!["a".to_string(), "b".to_string()],
+            raw_def: Arc::new(serde_json::json!({"cmd": "echo"})) as Arc<dyn RawDef>,
+            inputs: vec![
+                input(InputMode::Standard, true, true),
+                input(InputMode::Link, false, true),
+                input(InputMode::Tool, true, false),
+            ],
+            outputs: vec![
+                Output {
+                    group: String::new(),
+                    paths: vec![path(
+                        PathContent::FilePath("f".to_string()),
+                        CodegenMode::None,
+                        false,
+                    )],
+                },
+                Output {
+                    group: "g".to_string(),
+                    paths: vec![
+                        path(
+                            PathContent::DirPath("d".to_string()),
+                            CodegenMode::Copy,
+                            true,
+                        ),
+                        path(
+                            PathContent::Glob("*.go".to_string()),
+                            CodegenMode::InPlace,
+                            false,
+                        ),
+                    ],
+                },
+            ],
+            support_files: vec![path(
+                PathContent::FilePath("s".to_string()),
+                CodegenMode::None,
+                true,
+            )],
+            cache: CacheConfig {
+                enabled: false,
+                remote_enabled: false,
+                history: 3,
+            },
+            pty: true,
+            hash: vec![0xde, 0xad, 0, 1],
+            transparent: true,
+        }
+    }
+
+    fn full_target_def_pb() -> pb::TargetDef {
+        target_def_to_pb(&full_target_def()).expect("encode")
+    }
+
+    #[test]
+    fn a_full_target_def_round_trips_through_bytes() {
+        let wire = full_target_def_pb();
+        let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+        assert_eq!(target_def_to_pb(&back).expect("re-encode"), wire);
+        assert!(back.pty && back.transparent);
+        assert_eq!(
+            (
+                back.cache.enabled,
+                back.cache.remote_enabled,
+                back.cache.history
+            ),
+            (false, false, 3)
+        );
+        assert_eq!(back.hash, vec![0xde, 0xad, 0, 1]);
+        assert!(!back.inputs[1].hashed && !back.inputs[2].runtime);
+    }
+
+    /// buffa's default decode budget (32 MiB of elements, charged at their
+    /// in-memory size) refuses a legitimate def this size; the seam's own
+    /// `decode` does not.
+    #[test]
+    fn a_target_def_with_many_inputs_decodes() {
+        let mut td = full_target_def();
+        td.inputs = (0..130_000)
+            .map(|i| Input {
+                r#ref: TargetAddr {
+                    r#ref: addr("//d", &format!("x{i}")),
+                    output: None,
+                    filters: vec![],
+                },
+                ..input(InputMode::Standard, true, true)
+            })
+            .collect();
+        let bytes = target_def_to_pb(&td).expect("encode").encode_to_vec();
+        assert!(
+            pb::TargetDef::decode_from_slice(&bytes).is_err(),
+            "the default budget refuses this def — the case `decode` exists for"
+        );
+        let back =
+            target_def_from_pb(crate::decode(&bytes).expect("decode bytes")).expect("decode");
+        assert_eq!(back.inputs.len(), 130_000);
+    }
+
+    fn artifact(content: OaContent) -> OutputArtifact {
+        OutputArtifact {
+            group: "g".to_string(),
+            name: "n".to_string(),
+            r#type: OaType::Output,
+            content,
+            hashout: "h".to_string(),
+        }
+    }
+
+    fn file_content() -> OaContent {
+        OaContent::File(ContentFile {
+            source_path: "/s".to_string(),
+            out_path: "o".to_string(),
+            x: true,
+            passthrough: false,
+        })
+    }
+
+    fn raw_content() -> OaContent {
+        OaContent::Raw(ContentRaw {
+            data: b"d".to_vec(),
+            path: "p".to_string(),
+            x: true,
+        })
+    }
+
+    #[test]
+    fn every_output_artifact_content_kind_round_trips_through_bytes() {
+        for content in [
+            file_content(),
+            raw_content(),
+            OaContent::TarPath(ContentPath::borrowed("/t.tar")),
+            OaContent::CpioPath(ContentPath::borrowed("/c.cpio")),
+        ] {
+            let wire = output_artifact_to_pb(&artifact(content)).expect("encode");
+            let back = output_artifact_from_pb(via_bytes(&wire)).expect("decode");
+            assert_eq!(output_artifact_to_pb(&back).expect("re-encode"), wire);
+        }
+        for ty in [OaType::Output, OaType::Log, OaType::SupportFile] {
+            let wire = output_artifact_to_pb(&OutputArtifact {
+                r#type: ty,
+                ..artifact(file_content())
+            })
+            .expect("encode");
+            let back = output_artifact_from_pb(via_bytes(&wire)).expect("decode");
+            assert_eq!(output_artifact_to_pb(&back).expect("re-encode"), wire);
+        }
+    }
+
+    /// Explicit presence keeps a real zero on the wire: each of these used to be
+    /// indistinguishable from "not sent", and now decodes as the zero it is.
+    #[test]
+    fn present_zeros_survive_the_bytes() {
+        let root = Addr::new(PkgBuf::from(""), "t".to_string(), BTreeMap::new());
+        assert_eq!(
+            addr_from_pb(via_bytes(&addr_to_pb(&root))).expect("root addr"),
+            root
+        );
+
+        let dep = Dep {
+            r#ref: target_addr("//d", "x"),
+            mode: Mode::None,
+            group: String::new(),
+            runtime: false,
+            hash: false,
+            id: String::new(),
+        };
+        let back = dep_from_pb(via_bytes(&dep_to_pb(&dep))).expect("dep");
+        assert!(!back.hash && !back.runtime);
+
+        let back = input_from_pb(via_bytes(&input_to_pb(&input(
+            InputMode::Standard,
+            false,
+            true,
+        ))))
+        .expect("input");
+        assert!(!back.hashed);
+
+        let env = Env {
+            value: EnvValue::Literal(String::new()),
+            hash: false,
+            append: false,
+            append_prefix: String::new(),
+        };
+        let back = env_from_pb(via_bytes(&env_to_pb(&env))).expect("env");
+        assert!(!back.hash);
+        assert!(matches!(back.value, EnvValue::Literal(ref s) if s.is_empty()));
+
+        let cache = CacheConfig {
+            enabled: true,
+            remote_enabled: true,
+            history: 0,
+        };
+        assert_eq!(
+            cache_config_from_pb(via_bytes(&cache_config_to_pb(&cache)))
+                .expect("cache")
+                .history,
+            0
+        );
+
+        let approval = Approval {
+            required: false,
+            notice: vec![],
+        };
+        assert_eq!(
+            approval_from_pb(via_bytes(&approval_to_pb(&approval))).expect("approval"),
+            approval
+        );
+
+        let raw = artifact(OaContent::Raw(ContentRaw {
+            data: vec![],
+            path: "p".to_string(),
+            x: false,
+        }));
+        let wire = via_bytes(&output_artifact_to_pb(&raw).expect("encode"));
+        let Some(pb::output_artifact_ref::Content::Raw(r)) = &wire.content else {
+            panic!("raw content");
+        };
+        assert_eq!((r.data.as_deref(), r.x), (Some(&[][..]), Some(false)));
+        let OaContent::Raw(back) = output_artifact_from_pb(wire).expect("decode").content else {
+            panic!("raw content");
+        };
+        assert!(back.data.is_empty() && !back.x);
+
+        for v in [
+            Value::Int(0),
+            Value::Bool(false),
+            Value::String(String::new()),
+        ] {
+            assert_eq!(
+                value_from_pb(via_bytes(&value_to_pb(&v))).expect("value"),
+                v
+            );
+        }
+    }
+
+    /// What a pre-0.17 (prost) peer sends: every zero omitted. Each omission of
+    /// a required field reads as missing, never as the zero it meant.
+    #[test]
+    fn a_prost_peers_omitted_zeros_read_as_missing() {
+        // A root-package addr: prost drops the empty package (1).
+        let mut b = Vec::new();
+        string_field(2, "t", &mut b);
+        let err = addr_from_pb(crate::decode(&b).expect("bytes")).expect_err("no package");
+        assert!(
+            format!("{err:#}").contains("missing field Addr.package"),
+            "{err:#}"
+        );
+
+        // An unhashed dep: prost drops `hash = false` (5).
+        let mut target = Vec::new();
+        message_field(1, &pb_addr("p", "t"), &mut target);
+        let mut b = Vec::new();
+        buffa::types::put_len_delimited_header(1, target.len() as u64, &mut b);
+        b.extend_from_slice(&target);
+        enum_field(2, pb::DepMode::Link as i32, &mut b);
+        bool_field(4, true, &mut b);
+        assert_eq!(field_numbers(&b), vec![1, 2, 4]);
+        let err = dep_from_pb(crate::decode(&b).expect("bytes")).expect_err("no hash");
+        assert!(
+            format!("{err:#}").contains("missing field Dep.hash"),
+            "{err:#}"
+        );
+    }
+
+    /// Rule 2, every site: each required field, stripped from an otherwise
+    /// complete message, fails the decode naming itself.
+    #[test]
+    fn every_required_field_names_itself() {
+        use buffa::MessageField;
+        use pb::output_artifact_ref::Content as Oc;
+        use pb::param_type::Kind;
+
+        let td = |m: fn(&mut pb::TargetDef)| {
+            let mut p = full_target_def_pb();
+            m(&mut p);
+            target_def_from_pb(p).map(drop)
+        };
+        let tool = |m: fn(&mut pb::Tool)| {
+            let mut p = tool_to_pb(&Tool {
+                r#ref: target_addr("//t", "x"),
+                group: "g".to_string(),
+                hash: true,
+                id: "i".to_string(),
+            });
+            m(&mut p);
+            tool_from_pb(p).map(drop)
+        };
+        let env = |m: fn(&mut pb::Env)| {
+            let mut p = env_to_pb(&Env {
+                value: EnvValue::Pass,
+                hash: true,
+                append: false,
+                append_prefix: String::new(),
+            });
+            m(&mut p);
+            env_from_pb(p).map(drop)
+        };
+        let oa = |content: fn() -> OaContent, m: fn(&mut pb::OutputArtifactRef)| {
+            let mut p = output_artifact_to_pb(&artifact(content())).expect("encode");
+            m(&mut p);
+            output_artifact_from_pb(p).map(drop)
+        };
+        let param = |m: fn(&mut pb::Param)| {
+            let mut p = param_to_pb(&Param::required("a", ParamType::String));
+            m(&mut p);
+            param_from_pb(p).map(drop)
+        };
+        let schema_field = |m: fn(&mut pb::SchemaField)| {
+            let mut p = schema_field_to_pb("n", &ParamType::String, "", false);
+            m(&mut p);
+            schema_field_from_pb(p).map(drop)
+        };
+        let strukt = |m: fn(&mut pb::param_type::r#struct::Field)| {
+            let mut p = param_type_to_pb(&ParamType::strukt(vec![("a", ParamType::String)]));
+            if let Some(Kind::Struct(s)) = p.kind.as_mut() {
+                m(&mut s.fields[0]);
+            }
+            param_type_from_pb(p).map(drop)
+        };
+        let state = |m: fn(&mut pb::State)| {
+            let mut p = state_to_pb(&State {
+                package: PkgBuf::from("p"),
+                provider: "go".to_string(),
+                state: HashMap::new(),
+            });
+            m(&mut p);
+            state_from_pb(p).map(drop)
+        };
+
+        let cases: Vec<(&str, anyhow::Result<()>)> = vec![
+            ("TargetDef.addr", td(|p| p.addr = MessageField::none())),
+            (
+                "TargetDef.raw_def",
+                td(|p| p.raw_def = MessageField::none()),
+            ),
+            ("TargetDef.cache", td(|p| p.cache = MessageField::none())),
+            ("TargetDef.hash", td(|p| p.hash = None)),
+            (
+                "CacheConfig.enabled",
+                td(|p| p.cache.get_or_insert_default().enabled = None),
+            ),
+            (
+                "CacheConfig.remote_enabled",
+                td(|p| p.cache.get_or_insert_default().remote_enabled = None),
+            ),
+            (
+                "CacheConfig.history",
+                td(|p| p.cache.get_or_insert_default().history = None),
+            ),
+            (
+                "RawDefBlob.data",
+                td(|p| p.raw_def.get_or_insert_default().data = None),
+            ),
+            (
+                "RawDefBlob.format",
+                td(|p| p.raw_def.get_or_insert_default().format = None),
+            ),
+            (
+                "Input.ref",
+                td(|p| p.inputs[0].r#ref = MessageField::none()),
+            ),
+            (
+                "TargetAddr.ref",
+                td(|p| p.inputs[0].r#ref.get_or_insert_default().r#ref = MessageField::none()),
+            ),
+            ("Input.mode", td(|p| p.inputs[0].mode = None)),
+            ("Input.hashed", td(|p| p.inputs[0].hashed = None)),
+            ("Input.runtime", td(|p| p.inputs[0].runtime = None)),
+            ("Path.content", td(|p| p.outputs[0].paths[0].content = None)),
+            (
+                "Path.codegen_tree",
+                td(|p| p.support_files[0].codegen_tree = None),
+            ),
+            ("Tool.ref", tool(|p| p.r#ref = MessageField::none())),
+            ("Tool.hash", tool(|p| p.hash = None)),
+            ("Env.value", env(|p| p.value = None)),
+            ("Env.hash", env(|p| p.hash = None)),
+            (
+                "OutputArtifactRef.name",
+                oa(file_content, |p| p.name = None),
+            ),
+            (
+                "OutputArtifactRef.type",
+                oa(file_content, |p| p.r#type = None),
+            ),
+            (
+                "OutputArtifactRef.content",
+                oa(file_content, |p| p.content = None),
+            ),
+            (
+                "ContentFile.source_path",
+                oa(file_content, |p| {
+                    if let Some(Oc::File(f)) = p.content.as_mut() {
+                        f.source_path = None;
+                    }
+                }),
+            ),
+            (
+                "ContentFile.out_path",
+                oa(file_content, |p| {
+                    if let Some(Oc::File(f)) = p.content.as_mut() {
+                        f.out_path = None;
+                    }
+                }),
+            ),
+            (
+                "ContentRaw.path",
+                oa(raw_content, |p| {
+                    if let Some(Oc::Raw(r)) = p.content.as_mut() {
+                        r.path = None;
+                    }
+                }),
+            ),
+            ("Param.name", param(|p| p.name = None)),
+            ("Param.ty", param(|p| p.ty = MessageField::none())),
+            ("SchemaField.name", schema_field(|p| p.name = None)),
+            (
+                "SchemaField.ty",
+                schema_field(|p| p.ty = MessageField::none()),
+            ),
+            (
+                "FnSignature.returns",
+                fn_signature_from_pb(pb::FnSignature::default()).map(drop),
+            ),
+            ("ParamType.Struct.Field.name", strukt(|f| f.name = None)),
+            (
+                "ParamType.Struct.Field.ty",
+                strukt(|f| f.ty = MessageField::none()),
+            ),
+            ("State.package", state(|p| p.package = None)),
+            ("State.provider", state(|p| p.provider = None)),
+            (
+                "DeclaredState.provider",
+                declared_state_from_pb(pb::DeclaredState::default()).map(drop),
+            ),
+            (
+                "DeclaredTarget.name",
+                declared_target_from_pb(pb::DeclaredTarget::default()).map(drop),
+            ),
+            (
+                "CredentialMount.addr",
+                credential_mount_from_pb(pb::CredentialMount::default()).map(drop),
+            ),
+            (
+                "Dep.mode",
+                dep_from_pb(pb::Dep {
+                    r#ref: target_addr_to_pb(&target_addr("//d", "x")).into(),
+                    hash: Some(true),
+                    ..Default::default()
+                })
+                .map(drop),
+            ),
+            (
+                "Dep.ref",
+                dep_from_pb(pb::Dep {
+                    mode: Some(pb::DepMode::Link.into()),
+                    hash: Some(true),
+                    ..Default::default()
+                })
+                .map(drop),
+            ),
+        ];
+        for (field, r) in cases {
+            let msg = format!(
+                "{:#}",
+                r.err()
+                    .unwrap_or_else(|| panic!("{field}: must not decode"))
+            );
+            assert!(
+                msg.contains(&format!("missing field {field}")),
+                "{field}: {msg}"
+            );
+        }
+
+        // A zero enum is not a value, and JSON is the only raw_def format.
+        let unspecified: Vec<(&str, anyhow::Result<()>)> = vec![
+            (
+                "Input.mode is INPUT_MODE_UNSPECIFIED",
+                td(|p| p.inputs[0].mode = Some(pb::InputMode::Unspecified.into())),
+            ),
+            (
+                "Path.codegen_tree is CODEGEN_MODE_UNSPECIFIED",
+                td(|p| {
+                    p.outputs[0].paths[0].codegen_tree = Some(pb::CodegenMode::Unspecified.into());
+                }),
+            ),
+            (
+                "OutputArtifactRef.type is ARTIFACT_TYPE_UNSPECIFIED",
+                oa(file_content, |p| {
+                    p.r#type = Some(pb::ArtifactType::Unspecified.into());
+                }),
+            ),
+            (
+                "ParamType.scalar is SCALAR_UNSPECIFIED",
+                param_type_from_pb(pb::ParamType {
+                    kind: Some(Kind::Scalar(pb::param_type::Scalar::Unspecified.into())),
+                    ..Default::default()
+                })
+                .map(drop),
+            ),
+            (
+                "RawDefBlob.format is",
+                td(|p| {
+                    p.raw_def.get_or_insert_default().format =
+                        Some(pb::raw_def_blob::Format::Msgpack.into());
+                }),
+            ),
+        ];
+        for (needle, r) in unspecified {
+            let msg = format!(
+                "{:#}",
+                r.err()
+                    .unwrap_or_else(|| panic!("{needle}: must not decode"))
+            );
+            assert!(msg.contains(needle), "{needle}: {msg}");
+        }
+    }
+
+    /// An enum value this build does not know — a newer peer's variant — is an
+    /// error naming the field, never mapped to some known variant.
+    #[test]
+    fn an_unknown_enum_value_is_an_error_naming_the_field() {
+        use pb::param_type::Kind;
+        let td = |m: fn(&mut pb::TargetDef)| {
+            let mut p = full_target_def_pb();
+            m(&mut p);
+            target_def_from_pb(p).map(drop)
+        };
+        let cases: Vec<(&str, anyhow::Result<()>)> = vec![
+            (
+                "Dep.mode",
+                dep_from_pb(pb::Dep {
+                    r#ref: target_addr_to_pb(&target_addr("//d", "x")).into(),
+                    mode: Some(EnumValue::Unknown(99)),
+                    hash: Some(true),
+                    ..Default::default()
+                })
+                .map(drop),
+            ),
+            (
+                "Input.mode",
+                td(|p| p.inputs[0].mode = Some(EnumValue::Unknown(99))),
+            ),
+            (
+                "Path.codegen_tree",
+                td(|p| p.outputs[1].paths[0].codegen_tree = Some(EnumValue::Unknown(99))),
+            ),
+            (
+                "RawDefBlob.format",
+                td(|p| p.raw_def.get_or_insert_default().format = Some(EnumValue::Unknown(99))),
+            ),
+            ("OutputArtifactRef.type", {
+                let mut p = output_artifact_to_pb(&artifact(file_content())).expect("encode");
+                p.r#type = Some(EnumValue::Unknown(99));
+                output_artifact_from_pb(p).map(drop)
+            }),
+            (
+                "ParamType.scalar",
+                param_type_from_pb(pb::ParamType {
+                    kind: Some(Kind::Scalar(EnumValue::Unknown(99))),
+                    ..Default::default()
+                })
+                .map(drop),
+            ),
+        ];
+        for (field, r) in cases {
+            let msg = format!(
+                "{:#}",
+                r.err()
+                    .unwrap_or_else(|| panic!("{field}: must not decode"))
+            );
+            assert!(
+                msg.contains(&format!("field {field} has value 99")),
+                "{field}: {msg}"
+            );
+        }
+    }
+
+    /// A scratch mount crosses whole, or — any field missing — is dropped (and
+    /// warned about): a cold cache, never a mount somewhere nobody declared.
+    #[test]
+    fn a_scratch_mount_crosses_whole_or_is_dropped() {
+        let mount = hplugin::driver::ScratchMount {
+            addr: addr("//p", "cache"),
+            path: ".cache".to_string(),
+            env: "CACHE_DIR".to_string(),
+            dir: std::path::PathBuf::from("/h/scratch/abc"),
+        };
+        let back = scratch_mount_from_pb(via_bytes(&scratch_mount_to_pb(&mount))).expect("whole");
+        assert_eq!(
+            (back.addr, back.path, back.env, back.dir),
+            (
+                mount.addr.clone(),
+                mount.path.clone(),
+                mount.env.clone(),
+                mount.dir.clone()
+            )
+        );
+
+        type Strip = fn(&mut pb::ScratchMount);
+        let strips: [(&str, Strip); 5] = [
+            ("addr", |m| m.addr = buffa::MessageField::none()),
+            ("addr.name", |m| m.addr.get_or_insert_default().name = None),
+            ("path", |m| m.path = None),
+            ("env", |m| m.env = None),
+            ("dir", |m| m.dir = None),
+        ];
+        for (field, strip) in strips {
+            let mut m = scratch_mount_to_pb(&mount);
+            strip(&mut m);
+            assert!(scratch_mount_from_pb(m).is_none(), "{field} stripped");
+        }
+    }
+
+    /// Rule 3: a field whose zero is an honest default decodes `None` as it.
+    #[test]
+    fn minimal_messages_decode_to_the_documented_defaults() {
+        let ta = || target_addr_to_pb(&target_addr("//d", "x"));
+        let tool = tool_from_pb(pb::Tool {
+            r#ref: ta().into(),
+            hash: Some(true),
+            ..Default::default()
+        })
+        .expect("tool");
+        assert!(tool.group.is_empty() && tool.id.is_empty());
+
+        let dep = dep_from_pb(pb::Dep {
+            r#ref: ta().into(),
+            mode: Some(pb::DepMode::None.into()),
+            hash: Some(true),
+            ..Default::default()
+        })
+        .expect("dep");
+        assert!(!dep.runtime && dep.group.is_empty() && dep.id.is_empty());
+
+        let env = env_from_pb(pb::Env {
+            value: Some(pb::env::Value::Pass(true)),
+            hash: Some(true),
+            ..Default::default()
+        })
+        .expect("env");
+        assert!(!env.append && env.append_prefix.is_empty());
+
+        let p = path_from_pb(pb::Path {
+            content: Some(pb::path::Content::Glob("*".to_string())),
+            codegen_tree: Some(pb::CodegenMode::None.into()),
+            ..Default::default()
+        })
+        .expect("path");
+        assert!(!p.collect);
+
+        let o = output_from_pb(pb::Output::default()).expect("output");
+        assert!(o.group.is_empty() && o.paths.is_empty());
+
+        let mut def = full_target_def_pb();
+        def.pty = None;
+        def.transparent = None;
+        let def = target_def_from_pb(def).expect("def");
+        assert!(!def.pty && !def.transparent);
+
+        let minimal = |content: pb::output_artifact_ref::Content| pb::OutputArtifactRef {
+            name: Some("n".to_string()),
+            r#type: Some(pb::ArtifactType::Output.into()),
+            content: Some(content),
+            ..Default::default()
+        };
+        let a = output_artifact_from_pb(minimal(pb::output_artifact_ref::Content::from(
+            pb::ContentFile {
+                source_path: Some("/s".to_string()),
+                out_path: Some("o".to_string()),
+                ..Default::default()
+            },
+        )))
+        .expect("file");
+        assert!(a.group.is_empty() && a.hashout.is_empty());
+        let OaContent::File(f) = a.content else {
+            panic!("file content");
+        };
+        assert!(!f.x);
+        let a = output_artifact_from_pb(minimal(pb::output_artifact_ref::Content::from(
+            pb::ContentRaw {
+                path: Some("p".to_string()),
+                ..Default::default()
+            },
+        )))
+        .expect("raw");
+        let OaContent::Raw(r) = a.content else {
+            panic!("raw content");
+        };
+        assert!(!r.x && r.data.is_empty());
+
+        let (_, _, doc, required) = schema_field_from_pb(pb::SchemaField {
+            name: Some("n".to_string()),
+            ty: param_type_to_pb(&ParamType::String).into(),
+            ..Default::default()
+        })
+        .expect("schema field");
+        assert!(doc.is_empty() && !required);
+
+        let spec = target_spec_from_pb(pb::TargetSpec {
+            addr: pb_addr("p", "t").into(),
+            driver: Some("exec".to_string()),
+            ..Default::default()
+        })
+        .expect("spec");
+        assert!(spec.transitive.deps.is_empty() && spec.transitive.tools.is_empty());
+        assert_eq!(spec.approval, Approval::default());
     }
 }

@@ -183,16 +183,16 @@ fn pb_addr_key(a: Option<&pb::Addr>) -> String {
     }
 }
 
-/// A dispatch method id as the generated enum. `Err` for an id this build
+/// A dispatch method id as the generated enum. `None` for an id this build
 /// does not know, which the dispatch answers with `Error{Unimplemented}`.
-fn method_id<E: buffa::Enumeration>(method: u32) -> std::result::Result<E, ()> {
-    i32::try_from(method).ok().and_then(E::from_i32).ok_or(())
+fn method_id<E: buffa::Enumeration>(method: u32) -> Option<E> {
+    i32::try_from(method).ok().and_then(E::from_i32)
 }
 
 /// Decode a request, naming it on failure. A request that does not decode is
 /// an error frame — never a defaulted request run as if the host had sent it.
 fn decode_req<M: buffa::Message>(bytes: &[u8], what: &str) -> Result<M> {
-    M::decode_from_slice(bytes).with_context(|| format!("decoding {what}"))
+    plugin_abi::decode::<M>(bytes).with_context(|| format!("decoding {what}"))
 }
 
 fn unary(body: Body) -> SVec<u8> {
@@ -706,21 +706,7 @@ impl FunctionCall {
         Ok(Self {
             pkg: required(req.pkg, "CallFunctionRequest.pkg")?,
             root: required(req.root, "CallFunctionRequest.root")?.into(),
-            args: FnArgs {
-                positional: req
-                    .positional
-                    .into_iter()
-                    .map(convert::value_from_pb)
-                    .collect::<Result<_>>()?,
-                named: req
-                    .named
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let v = convert::value_from_pb(v).with_context(|| format!("arg {k:?}"))?;
-                        Ok((k, v))
-                    })
-                    .collect::<Result<_>>()?,
-            },
+            args: convert::fn_args_from_pb(req.positional, req.named)?,
             accepts_declarations: req.accepts_declarations.unwrap_or(false),
         })
     }
@@ -816,7 +802,7 @@ impl StablePluginFunctions for StablePluginFunctionsImpl {
         req: SVec<u8>,
     ) -> DynFuture<'a, SVec<u8>> {
         match method_id::<pb::FunctionMethod>(method) {
-            Ok(pb::FunctionMethod::Call) => {
+            Some(pb::FunctionMethod::Call) => {
                 let name = name.to_string();
                 let Some(func) = self.fns.get(&name).cloned() else {
                     let body = unary(err_body(format!(
@@ -862,8 +848,8 @@ pub fn guest_functions(reg: DynFunctionRegistry) -> Arc<dyn FunctionCaller> {
 impl StableMeta for StableProviderImpl {
     extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
         match method_id::<pb::ProviderMethod>(kind) {
-            Ok(pb::ProviderMethod::Config) => provider_config(&self.provider),
-            Ok(pb::ProviderMethod::StateSchema) => provider_state_schema(&self.provider),
+            Some(pb::ProviderMethod::Config) => provider_config(&self.provider),
+            Some(pb::ProviderMethod::StateSchema) => provider_state_schema(&self.provider),
             // Unknown sync metadatum: empty == "none", never a hard failure.
             _ => SVec::new(),
         }
@@ -881,7 +867,7 @@ impl StableProvider for StableProviderImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
         match method_id::<pb::ProviderMethod>(method) {
-            Ok(pb::ProviderMethod::Probe) => {
+            Some(pb::ProviderMethod::Probe) => {
                 let req = match decode_req::<pb::ProbeRequest>(&req[..], "ProbeRequest") {
                     Ok(r) => r,
                     Err(e) => {
@@ -912,7 +898,7 @@ impl StableProvider for StableProviderImpl {
         let provider = Arc::clone(&self.provider);
         match method_id::<pb::ProviderMethod>(method) {
             // `List` rides `invoke_exec_server_stream` (it needs an executor).
-            Ok(pb::ProviderMethod::ListPackages) => {
+            Some(pb::ProviderMethod::ListPackages) => {
                 let req =
                     match decode_req::<pb::ListPackagesRequest>(&req[..], "ListPackagesRequest") {
                         Ok(r) => r,
@@ -944,7 +930,7 @@ impl StableProvider for StableProviderImpl {
     ) -> DynFuture<'a, DynItemStream> {
         let provider = Arc::clone(&self.provider);
         match method_id::<pb::ProviderMethod>(method) {
-            Ok(pb::ProviderMethod::List) => {
+            Some(pb::ProviderMethod::List) => {
                 let req = match decode_req::<pb::ListRequest>(&req[..], "ListRequest") {
                     Ok(r) => r,
                     Err(e) => {
@@ -996,7 +982,7 @@ impl StableProvider for StableProviderImpl {
     ) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
         match method_id::<pb::ProviderMethod>(method) {
-            Ok(pb::ProviderMethod::Get) => {
+            Some(pb::ProviderMethod::Get) => {
                 let req = match decode_req::<pb::GetRequest>(&req[..], "GetRequest") {
                     Ok(r) => r,
                     Err(e) => {
@@ -1037,17 +1023,14 @@ impl FunctionCaller for GuestFunctions {
         ctx: &FnCallContext<'_>,
         args: FnArgs,
     ) -> Result<FnOutcome> {
+        let (positional, named) = convert::fn_args_to_pb(&args);
         let pb_req = pb::CallRegisteredRequest {
             plugin: Some(plugin.to_string()),
             name: Some(name.to_string()),
             pkg: Some(ctx.pkg.to_string()),
             root: Some(ctx.root.to_string_lossy().into_owned()),
-            positional: args.positional.iter().map(convert::value_to_pb).collect(),
-            named: args
-                .named
-                .iter()
-                .map(|(k, v)| (k.clone(), convert::value_to_pb(v)))
-                .collect(),
+            positional,
+            named,
             // This proxy hands the whole outcome back to its caller, so it can
             // carry declarations. Whether they reach the package is then up to
             // the calling function: it must `FnOutcome::absorb` them into its
@@ -1211,8 +1194,8 @@ async fn driver_apply_transitive(
 impl StableMeta for StableManagedDriverImpl {
     extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
         match method_id::<pb::DriverMethod>(kind) {
-            Ok(pb::DriverMethod::Config) => driver_config(&self.driver),
-            Ok(pb::DriverMethod::Schema) => driver_schema(&self.driver),
+            Some(pb::DriverMethod::Config) => driver_config(&self.driver),
+            Some(pb::DriverMethod::Schema) => driver_schema(&self.driver),
             _ => SVec::new(),
         }
     }
@@ -1225,7 +1208,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let driver = Arc::clone(&self.driver);
         match method_id::<pb::DriverMethod>(method) {
-            Ok(pb::DriverMethod::Parse) => {
+            Some(pb::DriverMethod::Parse) => {
                 let req = match decode_req::<pb::ParseRequest>(&req[..], "ParseRequest") {
                     Ok(r) => r,
                     Err(e) => {
@@ -1242,7 +1225,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
                     |m| unary(err_body(m)),
                 )))
             }
-            Ok(pb::DriverMethod::ApplyTransitive) => {
+            Some(pb::DriverMethod::ApplyTransitive) => {
                 let req = match decode_req::<pb::ApplyTransitiveRequest>(
                     &req[..],
                     "ApplyTransitiveRequest",
@@ -1300,7 +1283,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
         let cancels = Arc::clone(&self.cancels);
         dynify(stabby::boxed::Box::new(async move {
             match method_id::<pb::DriverMethod>(method) {
-                Ok(pb::DriverMethod::Run) => run_bidi(driver, req, cancels).await,
+                Some(pb::DriverMethod::Run) => run_bidi(driver, req, cancels).await,
                 _ => unimplemented_item_stream(method),
             }
         }))
@@ -1354,7 +1337,16 @@ fn pull_run_start(req: &DynItemStream) -> Result<(String, pb::ManagedRunRequest)
             let id = required(s.request_id.take(), "ManagedRunRequest.request_id")?;
             Ok((id, *s))
         }
-        other => anyhow::bail!("run: the first frame is not a start frame: {other:?}"),
+        // Named, not Debug-printed: a stdin chunk is the target's input bytes,
+        // which have no place in an error message.
+        Some(pb::run_in_frame::Msg::StdinChunk(c)) => anyhow::bail!(
+            "run: the first frame is a stdin chunk ({} bytes), not a start frame",
+            c.len()
+        ),
+        Some(pb::run_in_frame::Msg::StdinClose(_)) => {
+            anyhow::bail!("run: the first frame is a stdin close, not a start frame")
+        }
+        None => anyhow::bail!("run: the first frame is empty, not a start frame"),
     }
 }
 
@@ -1517,25 +1509,6 @@ impl RunStart {
     }
 }
 
-/// A second handle on a decoded input: the run request and the managed layer
-/// each own one, over the same on-disk content.
-fn duplicate_input(i: &RunInput) -> RunInput {
-    RunInput {
-        artifact: inputartifact::InputArtifact {
-            r#type: match i.artifact.r#type {
-                inputartifact::Type::Dep => inputartifact::Type::Dep,
-                inputartifact::Type::Support => inputartifact::Type::Support,
-            },
-            origin_id: i.artifact.origin_id.clone(),
-            content: Arc::clone(&i.artifact.content),
-        },
-        origin_id: i.origin_id.clone(),
-        source_addr: i.source_addr.clone(),
-        filters: i.filters.clone(),
-        annotations: i.annotations.clone(),
-    }
-}
-
 async fn run_once(
     driver: Arc<dyn ManagedDriver>,
     request_id: String,
@@ -1549,11 +1522,9 @@ async fn run_once(
     };
     // `shell` selects run_shell over run; it rides the request.
     let shell = start.shell;
-    let run_inputs: Vec<RunInput> = start
-        .inputs
-        .iter()
-        .map(|mi| duplicate_input(&mi.input))
-        .collect();
+    // The run request and the managed layer each own a handle on the same
+    // on-disk content.
+    let run_inputs: Vec<RunInput> = start.inputs.iter().map(|mi| mi.input.clone()).collect();
     // The driver's subprocess output rides the response stream back to the host,
     // which re-attaches it to the target's stdio. Handing it `None` here is what
     // made a cdylib driver's build log disappear.
@@ -1777,7 +1748,7 @@ pub struct StableHookImpl {
 impl StableMeta for StableHookImpl {
     extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
         match method_id::<pb::HookMethod>(kind) {
-            Ok(pb::HookMethod::Config) => config_response(Ok(self.hook.name())),
+            Some(pb::HookMethod::Config) => config_response(Ok(self.hook.name())),
             // Unknown sync metadatum: empty == "none", never a hard failure.
             _ => SVec::new(),
         }
@@ -1793,7 +1764,7 @@ impl StableHook for StableHookImpl {
         let hook = Arc::clone(&self.hook);
         dynify(stabby::boxed::Box::new(async move {
             match method_id::<pb::HookMethod>(method) {
-                Ok(pb::HookMethod::OnEvents) => hook_on_events(hook, req).await,
+                Some(pb::HookMethod::OnEvents) => hook_on_events(hook, req).await,
                 _ => unimplemented(method),
             }
         }))
@@ -1805,7 +1776,7 @@ impl StableHook for StableHookImpl {
 /// inside `StreamItem.item` — the `BuildEvent` type is already serde, so there is
 /// no parallel proto mirror to keep in lockstep.
 fn decode_event_frame(bytes: &[u8]) -> Option<hcore::events::BuildEvent> {
-    match pb::Frame::decode_from_slice(bytes).ok()?.body? {
+    match plugin_abi::decode::<pb::Frame>(bytes).ok()?.body? {
         Body::StreamItem(si) => serde_json::from_slice(si.item.as_deref()?).ok(),
         _ => None,
     }
@@ -1842,6 +1813,54 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::io::Write as _;
+
+    /// `list_path` is absent for a Support input (which has none) and names
+    /// the file list for a Dep one; a present-but-empty one is malformed, not a
+    /// second spelling of "none".
+    #[test]
+    fn a_managed_input_list_path_is_absent_or_real_never_empty() {
+        let base = |ty: pb::InputArtifactType| pb::ManagedRunInput {
+            r#type: Some(ty.into()),
+            source_addr: convert::addr_to_pb(
+                &hmodel::htaddr::parse_addr("//app:img").expect("addr"),
+            )
+            .into(),
+            unpack_root: Some("/u".into()),
+            ..Default::default()
+        };
+        let support = managed_input_from_pb(base(pb::InputArtifactType::Support)).expect("support");
+        assert_eq!(support.list_path, None);
+
+        let mut dep = base(pb::InputArtifactType::Dep);
+        dep.list_path = Some("/u/list".into());
+        let dep = managed_input_from_pb(dep).expect("dep");
+        assert_eq!(dep.list_path, Some(PathBuf::from("/u/list")));
+
+        let mut empty = base(pb::InputArtifactType::Support);
+        empty.list_path = Some(String::new());
+        let err = managed_input_from_pb(empty)
+            .err()
+            .expect("present-empty list_path");
+        assert!(
+            format!("{err:#}").contains("ManagedRunInput.list_path is present but empty"),
+            "{err:#}"
+        );
+    }
+
+    /// The first run frame must be the start frame; a stdin chunk there is
+    /// refused without its bytes reaching the error.
+    #[test]
+    fn a_stdin_chunk_before_the_start_frame_is_refused_without_its_bytes() {
+        let frame = pb::RunInFrame {
+            msg: Some(pb::run_in_frame::Msg::StdinChunk(b"s3cr3t".to_vec())),
+            ..Default::default()
+        };
+        let stream = make_item_stream(Box::new(std::iter::once(frame.encode_to_vec())));
+        let err = pull_run_start(&stream).expect_err("not a start frame");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stdin chunk (6 bytes)"), "{msg}");
+        assert!(!msg.contains("s3cr3t") && !msg.contains("115"), "{msg}");
+    }
 
     /// A target def with every required field, for tests that must get past
     /// decoding (an empty raw_def blob fails JSON parse, so a trivial `{}`).
@@ -2298,7 +2317,8 @@ mod tests {
             }
         }
 
-        let host = StableRemoteProvider::new(make_dyn_provider(Arc::new(BlockingProbe)), "blocker");
+        let host = StableRemoteProvider::new(make_dyn_provider(Arc::new(BlockingProbe)), "blocker")
+            .expect("load");
         let ct = StdCancellationToken::new();
         let preq = ProbeRequest {
             request_id: "rq-1".into(),
@@ -2382,7 +2402,7 @@ mod tests {
         use hplugin_stabby::load_stable::StableRemoteProvider;
 
         let dynp = make_dyn_provider(Arc::new(ListProvider { items }) as Arc<dyn Provider>);
-        let host = StableRemoteProvider::new(dynp, "lister");
+        let host = StableRemoteProvider::new(dynp, "lister").expect("load");
         let tok = StdCancellationToken::new();
         let iter = futures::executor::block_on(host.list(
             ListRequest {
@@ -2889,7 +2909,7 @@ mod tests {
         use hplugin_stabby::load_stable::StableRemoteProvider;
 
         let dynp = make_dyn_provider(Arc::new(FnProvider) as Arc<dyn Provider>);
-        let host = StableRemoteProvider::new(dynp, "mock");
+        let host = StableRemoteProvider::new(dynp, "mock").expect("load");
 
         // Metadata crosses: exactly one function, rendered as declared.
         let defs = through_the_seam("mock", vec![echo_def()]);
@@ -3341,7 +3361,7 @@ mod tests {
         }
 
         let dynd = make_dyn_managed_driver(Arc::new(SchemaDriver) as Arc<dyn ManagedDriver>);
-        let host = StableRemoteManagedDriver::new(dynd, "mockdrv");
+        let host = StableRemoteManagedDriver::new(dynd, "mockdrv").expect("load");
         let schema = host.schema();
         assert_eq!(schema.fields.len(), 1);
         assert_eq!(schema.fields[0].name, "args");
@@ -3361,7 +3381,7 @@ mod tests {
 
         let dynd =
             make_dyn_managed_driver(Arc::new(BareDriver(Some("bare"))) as Arc<dyn ManagedDriver>);
-        let host = StableRemoteManagedDriver::new(dynd, "bare");
+        let host = StableRemoteManagedDriver::new(dynd, "bare").expect("load");
         assert!(
             !host.supports_shell(),
             "remote proxy must defer --shell to the host pluginexec fallback"
@@ -3412,7 +3432,7 @@ mod tests {
     #[test]
     fn an_exported_driver_is_registered_under_its_config_name() {
         let nd = named_managed_driver(BareDriver(Some("layer"))).expect("export");
-        let mut host = hplugin_stabby::load_stable::decode_drivers([nd]);
+        let mut host = hplugin_stabby::load_stable::decode_drivers([nd]).expect("load");
         assert_eq!(host.len(), 1);
         let (local, drv) = host.remove(0);
         assert_eq!(local, "layer");
@@ -3578,7 +3598,8 @@ mod tests {
             }
         }
 
-        let host = StableRemoteProvider::new(make_dyn_provider(Arc::new(Boomer)), "boomer");
+        let host =
+            StableRemoteProvider::new(make_dyn_provider(Arc::new(Boomer)), "boomer").expect("load");
         let ct = StdCancellationToken::new();
         let msg = match futures::executor::block_on(host.probe(
             ProbeRequest {
@@ -3826,7 +3847,8 @@ mod tests {
         let host = StableRemoteProvider::new(
             make_dyn_provider(Arc::new(Nester) as Arc<dyn Provider>),
             "nester",
-        );
+        )
+        .expect("load");
         let exec = Arc::new(NestedExec {
             host: OnceLock::new(),
         });

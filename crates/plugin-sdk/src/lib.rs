@@ -54,4 +54,20 @@ pub mod stabby {
 
     /// The ABI version this transport builds against.
     pub use plugin_abi::ABI_SEMVER;
+
+    /// The body of a cdylib's required `heph_plugin_abi_semver` entry: a
+    /// pointer to [`ABI_SEMVER`], NUL-terminated and `'static`. The host reads
+    /// it before calling anything else and refuses a plugin from an ABI it does
+    /// not load — or one that does not export the entry at all. Export it as a
+    /// plain C function, not a `#[stabby::export]`:
+    ///
+    /// ```ignore
+    /// #[unsafe(no_mangle)]
+    /// pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
+    ///     plugin_sdk::stabby::abi_semver()
+    /// }
+    /// ```
+    pub fn abi_semver() -> *const std::ffi::c_char {
+        plugin_abi::ABI_SEMVER_C.as_ptr()
+    }
 }

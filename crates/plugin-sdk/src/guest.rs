@@ -123,7 +123,7 @@ impl ProviderExecutor for GuestExecutor {
             if r.ok {
                 let mut out = Vec::with_capacity(r.states.len());
                 for b in r.states.iter() {
-                    let pb = plugin_abi::pb::State::decode_from_slice(&b[..])
+                    let pb = plugin_abi::decode::<plugin_abi::pb::State>(&b[..])
                         .context("decoding pb::State from host states_under callback")?;
                     out.push(
                         plugin_abi::convert::state_from_pb(pb)

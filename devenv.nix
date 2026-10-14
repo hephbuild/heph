@@ -57,8 +57,9 @@ let
   # in nixpkgs; the release binaries are self-contained (static-pie on Linux,
   # libSystem-only Mach-O on darwin), so fetch them the same way as kache.
   #
-  # Bumping: change `buffaVersion` to match the `buffa` crate in
-  # `proto/Cargo.toml.tpl` (generated code and runtime are released together),
+  # Bumping: change `buffaVersion` to match the exact `buffa` pin in the root
+  # `Cargo.toml`'s `[workspace.dependencies]` (generated code and runtime are
+  # released together, and the generated code uses `buffa::__private`),
   # then re-derive each hash from the release's `checksums-sha256.txt` with
   #   nix hash convert --hash-algo sha256 --to sri <hex>
   buffaVersion = "0.9.2";
@@ -201,12 +202,15 @@ in
   # services.postgres.enable = true;
 
   # https://devenv.sh/scripts/
-  scripts.gen-proto.exec = "buf generate";
+  scripts.gen-proto.exec = ''
+    cd "$DEVENV_ROOT"
+    buf generate
+  '';
   scripts.gen.exec = ''
     set -e
-    rm -rf gen
+    rm -rf "$DEVENV_ROOT/gen"
     gen-proto
-    cp proto/Cargo.toml.tpl gen/proto/Cargo.toml
+    cp "$DEVENV_ROOT/proto/Cargo.toml.tpl" "$DEVENV_ROOT/gen/proto/Cargo.toml"
   '';
   scripts.gen-go-large.exec = ''
     rm -rf $DEVENV_ROOT/example/go/large

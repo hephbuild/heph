@@ -75,15 +75,86 @@ pub struct LoadedComponents {
 
 /// The text a create entry that fails stabby's structural check gets: the
 /// plugin was built against a different `PluginComponents` / `CreateFn` layout,
-/// which is what an ABI break changes. No version is read at load; the layout
-/// is the check.
+/// which is what an ABI break changes. The version check ([`check_plugin_abi`])
+/// runs first; this catches a plugin whose reported version is accepted but
+/// whose layout still differs.
 pub fn abi_mismatch_hint(path: &std::path::Path) -> String {
+    abi_refusal(path, format_args!("host {}", plugin_abi::ABI_SEMVER))
+}
+
+/// The one shape every ABI refusal takes, so a user learns the same fix
+/// whichever check caught the plugin.
+fn abi_refusal(path: &std::path::Path, detail: std::fmt::Arguments<'_>) -> String {
     format!(
-        "plugin {} was built against a different heph ABI (host {}); reinstall plugins \
-         from the same release as this heph",
+        "plugin {} was built against a different heph ABI ({detail}); rebuild it against \
+         this heph, or reinstall plugins from the same release as this heph",
         path.display(),
-        plugin_abi::ABI_SEMVER
     )
+}
+
+/// The ABI version this plugin exported, or `None` when it exports none.
+///
+/// Called before anything else in the plugin: the symbol is a plain C function
+/// precisely so that reading it trusts no stabby layout.
+fn plugin_abi_version(lib: &libloading::Library) -> Option<String> {
+    use crate::abi::{ABI_SEMVER_SYMBOL, AbiSemverFn};
+    // SAFETY: `ABI_SEMVER_SYMBOL`'s type is fixed by contract (never renamed or
+    // retyped, see `abi.rs`): `unsafe extern "C" fn() -> *const c_char`.
+    let entry = unsafe { lib.get::<AbiSemverFn>(ABI_SEMVER_SYMBOL) }.ok()?;
+    // SAFETY: the entry takes no arguments and returns a pointer to a
+    // `'static` string, by the same contract.
+    let ptr = unsafe { entry() };
+    if ptr.is_null() {
+        return Some(String::new());
+    }
+    // SAFETY: non-null, and NUL-terminated and `'static` by contract; copied out
+    // before anything else runs.
+    let reported = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    Some(reported.to_string_lossy().into_owned())
+}
+
+/// Refuse a plugin whose reported ABI version (`None`: it reports none, so it
+/// predates 0.17.0, when the version started being read) is outside
+/// `MIN_PLUGIN_ABI..=ABI_SEMVER`. Versions compare as semver, never as strings.
+///
+/// A newer plugin is refused like an older one: this host cannot know what a
+/// later ABI changed.
+pub fn check_plugin_abi(path: &std::path::Path, reported: Option<&str>) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use semver::Version;
+    let host = Version::parse(plugin_abi::ABI_SEMVER).context("parsing the host's ABI_SEMVER")?;
+    let min = Version::parse(plugin_abi::MIN_PLUGIN_ABI).context("parsing MIN_PLUGIN_ABI")?;
+    let accepts = if min == host {
+        format!("host {host}, which loads {host} only")
+    } else {
+        format!("host {host}, which loads {min} through {host}")
+    };
+    let Some(reported) = reported else {
+        anyhow::bail!(abi_refusal(
+            path,
+            format_args!("it reports no ABI version, so it predates 0.17.0; {accepts}")
+        ));
+    };
+    let plugin = match Version::parse(reported) {
+        Ok(v) => v,
+        Err(_) => anyhow::bail!(abi_refusal(
+            path,
+            format_args!("it reports ABI version {reported:?}, which is not a version; {accepts}")
+        )),
+    };
+    if plugin > host {
+        anyhow::bail!(abi_refusal(
+            path,
+            format_args!("plugin {plugin}, newer than this heph, which is unsupported; {accepts}")
+        ));
+    }
+    if plugin < min {
+        anyhow::bail!(abi_refusal(
+            path,
+            format_args!("plugin {plugin}; {accepts}")
+        ));
+    }
+    Ok(())
 }
 
 /// An optional entry point. `None`, silently, when the plugin does not export
@@ -120,18 +191,17 @@ fn optional_entry<'l, T: stabby::IStable>(
 
 /// A plugin's exported drivers as host-side drivers, each under the local name
 /// it was exported with — the name the engine registers it by (prefixed with
-/// the plugin's). The plugin-side driver's own `config()` is never asked.
+/// the plugin's). The plugin-side driver's own `config()` is never asked. Fails
+/// on a driver whose schema does not decode.
 pub fn decode_drivers(
     drivers: impl IntoIterator<Item = NamedDriver>,
-) -> Vec<(String, StableRemoteManagedDriver)> {
+) -> anyhow::Result<Vec<(String, StableRemoteManagedDriver)>> {
     drivers
         .into_iter()
         .map(|nd| {
             let name = nd.name.to_string();
-            (
-                name.clone(),
-                StableRemoteManagedDriver::new(nd.driver, name),
-            )
+            let driver = StableRemoteManagedDriver::new(nd.driver, name.clone())?;
+            Ok((name, driver))
         })
         .collect()
 }
@@ -160,7 +230,7 @@ pub fn decode_functions(
         .into_iter()
         .map(|nf| {
             let name = nf.name.to_string();
-            let def = pb::FunctionDef::decode_from_slice(&nf.meta[..])
+            let def = plugin_abi::decode::<pb::FunctionDef>(&nf.meta[..])
                 .with_context(|| format!("decoding the metadata of function {plugin}.{name}"))?;
             let def_name = required(def.name, "FunctionDef.name")
                 .with_context(|| format!("function {plugin}.{name}"))?;
@@ -226,6 +296,12 @@ pub fn load(
     // controlled config. The ABI of what we call is checked below via get_stabbied.
     let lib = unsafe { libloading::Library::new(path) }
         .with_context(|| format!("dlopen plugin {}", path.display()))?;
+
+    // The plugin's ABI version, before anything else in it is called: a plugin
+    // from another ABI is refused here, once, rather than failing each call
+    // with whatever the skew happens to break (a wire-only break passes
+    // stabby's structural check below).
+    check_plugin_abi(path, plugin_abi_version(&lib).as_deref())?;
 
     // Scope the symbol borrow so the library can be leaked after the call.
     let comps: PluginComponents = {
@@ -301,9 +377,13 @@ pub fn load(
     )?;
     // `provider` is optional: hook-only / driver-only plugins export `None`.
     let provider: std::option::Option<DynProvider> = provider.into();
-    let host_provider = provider.map(|p| StableRemoteProvider::new(p, name));
+    let host_provider = provider
+        .map(|p| StableRemoteProvider::new(p, name))
+        .transpose()
+        .with_context(|| format!("loading plugin {name:?}"))?;
 
-    let host_drivers = decode_drivers(drivers);
+    let host_drivers =
+        decode_drivers(drivers).with_context(|| format!("loading plugin {name:?}"))?;
 
     let mut host_hooks = Vec::new();
     for nh in hooks {
@@ -328,7 +408,8 @@ pub fn load(
 
 fn decode_unary(bytes: &[u8]) -> anyhow::Result<Body> {
     use anyhow::Context as _;
-    let frame = pb::Frame::decode_from_slice(bytes).context("decoding a stable response frame")?;
+    let frame =
+        plugin_abi::decode::<pb::Frame>(bytes).context("decoding a stable response frame")?;
     required(frame.body, "Frame.body")
 }
 
@@ -362,7 +443,7 @@ impl<T, D: FnMut(&[u8]) -> anyhow::Result<T>> Iterator for ItemStreamIter<D> {
             self.done = true;
             return None;
         }
-        let frame = match pb::Frame::decode_from_slice(&bytes[..]) {
+        let frame = match plugin_abi::decode::<pb::Frame>(&bytes[..]) {
             Ok(f) => f,
             Err(e) => {
                 self.done = true;
@@ -419,7 +500,7 @@ fn decode_list_item(
     intern: &mut impl FnMut(String) -> Arc<str>,
 ) -> anyhow::Result<ListResponse> {
     use anyhow::Context as _;
-    let lr = pb::ListResponse::decode_from_slice(b).context("decoding a listed target")?;
+    let lr = plugin_abi::decode::<pb::ListResponse>(b).context("decoding a listed target")?;
     let addr = convert::addr_field(lr.addr, "ListResponse.addr")?;
     let facts = convert::listed_facts_from_pb(lr.facts.into_option(), intern)
         .with_context(|| format!("the listed facts of {}", addr.format()))?;
@@ -428,7 +509,8 @@ fn decode_list_item(
 
 fn decode_list_package_item(b: &[u8]) -> anyhow::Result<ListPackageResponse> {
     use anyhow::Context as _;
-    let lpr = pb::ListPackageResponse::decode_from_slice(b).context("decoding a listed package")?;
+    let lpr =
+        plugin_abi::decode::<pb::ListPackageResponse>(b).context("decoding a listed package")?;
     Ok(ListPackageResponse {
         pkg: PkgBuf::from(required(lpr.pkg, "ListPackageResponse.pkg")?),
     })
@@ -482,7 +564,7 @@ fn drain_run(
         }
         let frame = {
             use anyhow::Context as _;
-            pb::RunOutFrame::decode_from_slice(&bytes[..]).context("decoding a run frame")?
+            plugin_abi::decode::<pb::RunOutFrame>(&bytes[..]).context("decoding a run frame")?
         };
         match frame.msg {
             Some(pb::run_out_frame::Msg::Response(r)) => {
@@ -548,14 +630,29 @@ fn driver_cancel(inner: &Arc<DynManagedDriver>, request_id: &str) -> impl FnOnce
 pub struct StableRemoteProvider {
     inner: Arc<DynProvider>,
     name: String,
+    /// Decoded once, at load: `state_schema` has no error channel, and the
+    /// plugin's answer never changes.
+    state_schema: Option<Arc<StateSchema>>,
 }
 
 impl StableRemoteProvider {
-    pub fn new(inner: DynProvider, name: impl Into<String>) -> Self {
-        Self {
+    /// Wrap a loaded provider, reading its state schema. A schema that does not
+    /// decode fails here — at load, naming the provider — like undecodable
+    /// function metadata, rather than reading as "no schema" on every call.
+    pub fn new(inner: DynProvider, name: impl Into<String>) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let name = name.into();
+        // An empty SVec encodes `None`; any encoded `Schema` (even fields-empty)
+        // encodes `Some`.
+        let state_schema =
+            decode_state_schema(&inner.meta(pb::ProviderMethod::StateSchema as u32)[..])
+                .with_context(|| format!("decoding the state schema of provider {name:?}"))?
+                .map(Arc::new);
+        Ok(Self {
             inner: Arc::new(inner),
-            name: name.into(),
-        }
+            name,
+            state_schema,
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -714,25 +811,7 @@ impl Provider for StableRemoteProvider {
     }
 
     fn state_schema(&self) -> Option<StateSchema> {
-        // An empty SVec encodes `None`; any encoded `Schema` (even fields-empty)
-        // encodes `Some`.
-        let bytes = self.inner.meta(pb::ProviderMethod::StateSchema as u32);
-        if bytes.is_empty() {
-            return None;
-        }
-        // `state_schema` has no error channel. A schema that does not decode is
-        // reported and treated as none — it only feeds the LSP — rather than
-        // half-read.
-        match pb::Schema::decode_from_slice(&bytes[..])
-            .map_err(anyhow::Error::from)
-            .and_then(convert::state_schema_from_pb)
-        {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::error!(provider = %self.name, error = %format!("{e:#}"), "undecodable state schema");
-                None
-            }
-        }
+        self.state_schema.as_deref().cloned()
     }
 }
 
@@ -750,16 +829,13 @@ struct StableRemoteFn {
 #[async_trait]
 impl PluginFn for StableRemoteFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+        let (positional, named) = convert::fn_args_to_pb(&args);
         let pb_req = pb::CallFunctionRequest {
             name: Some(self.name.clone()),
             pkg: Some(ctx.pkg.to_string()),
             root: Some(ctx.root.to_string_lossy().into_owned()),
-            positional: args.positional.iter().map(convert::value_to_pb).collect(),
-            named: args
-                .named
-                .iter()
-                .map(|(k, v)| (k.clone(), convert::value_to_pb(v)))
-                .collect(),
+            positional,
+            named,
             // The host merges declarations into the package being evaluated.
             accepts_declarations: Some(true),
             ..Default::default()
@@ -787,15 +863,41 @@ impl PluginFn for StableRemoteFn {
 pub struct StableRemoteManagedDriver {
     inner: Arc<DynManagedDriver>,
     name: String,
+    /// Decoded once, at load: `schema` has no error channel, and the plugin's
+    /// answer never changes.
+    schema: Arc<DriverSchema>,
 }
 
 impl StableRemoteManagedDriver {
-    pub fn new(inner: DynManagedDriver, name: impl Into<String>) -> Self {
-        Self {
+    /// Wrap a loaded driver, reading its config schema. A schema that does not
+    /// decode fails here — at load, naming the driver — rather than reading as
+    /// the empty schema on every call, which would flag each of the driver's
+    /// keys as unknown.
+    pub fn new(inner: DynManagedDriver, name: impl Into<String>) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let name = name.into();
+        let schema = decode_driver_schema(&inner.meta(pb::DriverMethod::Schema as u32)[..])
+            .with_context(|| format!("decoding the schema of driver {name:?}"))?;
+        Ok(Self {
             inner: Arc::new(inner),
-            name: name.into(),
-        }
+            name,
+            schema: Arc::new(schema),
+        })
     }
+}
+
+/// A provider's `StateSchema` meta answer. Empty bytes are "no schema"; any
+/// encoded `Schema` (even fields-empty) is one.
+fn decode_state_schema(bytes: &[u8]) -> anyhow::Result<Option<StateSchema>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    convert::state_schema_from_pb(plugin_abi::decode::<pb::Schema>(bytes)?).map(Some)
+}
+
+/// A driver's `Schema` meta answer.
+fn decode_driver_schema(bytes: &[u8]) -> anyhow::Result<DriverSchema> {
+    convert::driver_schema_from_pb(plugin_abi::decode::<pb::Schema>(bytes)?)
 }
 
 #[async_trait]
@@ -807,17 +909,7 @@ impl ManagedDriver for StableRemoteManagedDriver {
     }
 
     fn schema(&self) -> DriverSchema {
-        let bytes = self.inner.meta(pb::DriverMethod::Schema as u32);
-        // `schema` has no error channel. One that does not decode is reported
-        // and replaced by the empty schema, which refuses deferred values — the
-        // safe direction.
-        pb::Schema::decode_from_slice(&bytes[..])
-            .map_err(anyhow::Error::from)
-            .and_then(convert::driver_schema_from_pb)
-            .unwrap_or_else(|e| {
-                tracing::error!(driver = %self.name, error = %format!("{e:#}"), "undecodable driver schema");
-                DriverSchema::default()
-            })
+        DriverSchema::clone(&self.schema)
     }
 
     async fn parse(
@@ -1198,6 +1290,117 @@ fn managed_input_to_pb(mi: &ManagedRunInput) -> pb::ManagedRunInput {
 mod tests {
     use super::*;
 
+    fn refusal(reported: Option<&str>) -> String {
+        let path = std::path::Path::new("/p/libdrift.so");
+        format!(
+            "{:#}",
+            check_plugin_abi(path, reported).expect_err("must be refused")
+        )
+    }
+
+    #[test]
+    fn the_host_and_min_abi_parse_and_are_ordered() {
+        let host = semver::Version::parse(plugin_abi::ABI_SEMVER).expect("ABI_SEMVER");
+        let min = semver::Version::parse(plugin_abi::MIN_PLUGIN_ABI).expect("MIN_PLUGIN_ABI");
+        assert!(min <= host, "MIN_PLUGIN_ABI {min} above ABI_SEMVER {host}");
+    }
+
+    #[test]
+    fn a_plugin_in_the_accepted_range_loads() {
+        let path = std::path::Path::new("/p/libok.so");
+        for v in [plugin_abi::ABI_SEMVER, plugin_abi::MIN_PLUGIN_ABI] {
+            check_plugin_abi(path, Some(v)).expect("in range");
+        }
+    }
+
+    #[test]
+    fn a_plugin_without_a_version_is_refused_as_predating_the_check() {
+        let msg = refusal(None);
+        for want in [
+            "plugin /p/libdrift.so was built against a different heph ABI",
+            "it reports no ABI version, so it predates 0.17.0",
+            &format!("host {}", plugin_abi::ABI_SEMVER),
+            "rebuild it against this heph",
+        ] {
+            assert!(msg.contains(want), "missing {want:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn an_older_or_newer_plugin_is_refused_naming_both_versions() {
+        let msg = refusal(Some("0.16.0"));
+        for want in [
+            "plugin /p/libdrift.so",
+            "(plugin 0.16.0; host ",
+            plugin_abi::ABI_SEMVER,
+            "rebuild it against this heph",
+        ] {
+            assert!(msg.contains(want), "missing {want:?}: {msg}");
+        }
+        let msg = refusal(Some("1.0.0"));
+        assert!(
+            msg.contains("plugin 1.0.0, newer than this heph, which is unsupported"),
+            "{msg}"
+        );
+    }
+
+    /// Semver, not strings: "0.9.0" sorts after "0.17.0" as text, and a
+    /// pre-release of the minimum is below it.
+    #[test]
+    fn versions_compare_as_semver() {
+        assert!(refusal(Some("0.9.0")).contains("(plugin 0.9.0; host "));
+        let pre = format!("{}-rc.1", plugin_abi::MIN_PLUGIN_ABI);
+        assert!(refusal(Some(&pre)).contains(&format!("(plugin {pre}; host ")));
+    }
+
+    /// A schema is decoded once, at load, and one that does not decode fails
+    /// the load instead of reading as "no schema" (every driver key unknown).
+    #[test]
+    fn an_undecodable_schema_is_an_error_not_a_default() {
+        let string =
+            || convert::param_type_to_pb(&hcore::htvalue::signature::ParamType::String).into();
+        let unnamed_field = pb::Schema {
+            fields: vec![pb::SchemaField {
+                ty: string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for bytes in [&[0xff][..], &unnamed_field[..]] {
+            decode_driver_schema(bytes).expect_err("driver schema");
+            decode_state_schema(bytes).expect_err("state schema");
+        }
+        assert!(decode_state_schema(&[]).expect("empty").is_none());
+        let named = pb::Schema {
+            fields: vec![pb::SchemaField {
+                name: Some("args".into()),
+                ty: string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(
+            decode_driver_schema(&named).expect("decodes").fields.len(),
+            1
+        );
+        assert!(decode_state_schema(&named).expect("decodes").is_some());
+    }
+
+    #[test]
+    fn an_unparsable_version_is_refused() {
+        for bad in ["", "0.17", "v0.17.0", "zero"] {
+            let msg = refusal(Some(bad));
+            assert!(
+                msg.contains(&format!(
+                    "reports ABI version {bad:?}, which is not a version"
+                )),
+                "{msg}"
+            );
+        }
+    }
+
     /// A functions handle no test calls: D11 fails before any call.
     struct NeverCalled;
 
@@ -1316,7 +1519,11 @@ mod tests {
             list_path: None,
             unpack_root: std::path::PathBuf::from("/unused"),
         };
-        assert_eq!(managed_input_to_pb(&mi).hashout.as_deref(), Some("abc123"));
+        let wire = managed_input_to_pb(&mi);
+        assert_eq!(wire.hashout.as_deref(), Some("abc123"));
+        // No file list (a Support input's shape) crosses as absent, not `""`,
+        // which the guest refuses as malformed.
+        assert_eq!(wire.list_path, None);
     }
 
     fn addr() -> pb::Addr {
@@ -1371,10 +1578,17 @@ mod tests {
     fn malformed_listed_facts_fails_the_item() {
         // Field 1 (`addr`), then field 4 (`facts`) two bytes long:
         // `has_codegen`'s tag, then a varint running past the message's end.
+        use buffa::encoding::{Tag, WireType};
+        use buffa::types::put_len_delimited_header;
         let addr = addr().encode_to_vec();
-        let mut wire = vec![0x0A, u8::try_from(addr.len()).expect("short addr")];
+        let mut wire = Vec::new();
+        put_len_delimited_header(1, addr.len() as u64, &mut wire);
         wire.extend_from_slice(&addr);
-        wire.extend_from_slice(&[0x22, 0x02, 0x18, 0xFF]);
+        let mut facts = Vec::new();
+        Tag::new(3, WireType::Varint).encode(&mut facts);
+        facts.push(0xFF); // a continuation bit with nothing after it
+        put_len_delimited_header(4, facts.len() as u64, &mut wire);
+        wire.extend_from_slice(&facts);
         assert!(list_item_decoder()(&wire).is_err());
     }
 

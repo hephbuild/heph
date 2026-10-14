@@ -3,11 +3,26 @@
 The in-process stable-ABI plugin transport (`plugin-stabby`) crosses the cdylib
 boundary as native stabby vtables (hot path) + protobuf bytes (cold path, buffa
 codegen, edition 2024 with explicit presence on every field). Host and
-plugin are compiled separately and linked at load time. The compatibility gate is
-stabby's `get_stabbied`: it verifies the plugin's type report (every type reachable
-from `CreateFn`) against the host's at load and **hard-fails on any difference**.
-So the frozen stabby surface in `crates/plugin-stabby/src/abi.rs` must not drift —
-that is what `ABI_SEMVER` (`crates/plugin-abi/src/lib.rs`) tracks.
+plugin are compiled separately and linked at load time. Two gates run at load,
+in order:
+
+1. **The version check** (since 0.17.0). The plugin exports
+   `heph_plugin_abi_semver` — a plain C function returning its `ABI_SEMVER` as a
+   `'static` NUL-terminated string, deliberately *not* a stabby export so it
+   reads the same whatever layout either side has. The host reads it before
+   calling anything else in the plugin and accepts versions in
+   `MIN_PLUGIN_ABI..=ABI_SEMVER` (both in `crates/plugin-abi/src/lib.rs`),
+   compared as semver. A plugin without the symbol predates 0.17.0 and is
+   refused the same way. A plugin **newer** than the host is unsupported and
+   refused: the host cannot know what a later ABI changed.
+2. **stabby's `get_stabbied`**: it verifies the plugin's type report (every type
+   reachable from `CreateFn`) against the host's and **hard-fails on any
+   difference**.
+
+So the frozen stabby surface in `crates/plugin-stabby/src/abi.rs` must not drift
+without `ABI_SEMVER` moving, and a break the structural check cannot see — a
+**wire-only** break, like 0.17.0's — must also raise `MIN_PLUGIN_ABI` to the new
+version, or the version check lets the old plugin through to fail call by call.
 
 `scripts/abi-check.sh` (the `abi` job in `.github/workflows/heph.yml`, run on every
 PR) enforces this mechanically: if the frozen surface changes without `ABI_SEMVER`
@@ -60,6 +75,12 @@ anything `get_stabbied` would reject:
   reject a mismatch and a plugin would misparse a `prepare` instead of failing
   to load. It is frozen with this contract for exactly that reason.
 - Rename or retype `CREATE_SYMBOL` or `CreateFn` — the entry point.
+- Rename or retype `ABI_SEMVER_SYMBOL` / `AbiSemverFn` — never: the version
+  entry is how every later host tells this plugin's ABI, so it stays a plain C
+  `fn() -> *const c_char` for good.
+- Any wire-only break (a field made required, a meaning changed) — and raise
+  `MIN_PLUGIN_ABI` to the new version with it, since only the version check can
+  refuse the old plugin at load.
 - Rename or retype an optional load-time symbol: `SET_LOG_SINK_SYMBOL`,
   `SET_SUPERVISOR_SYMBOL`, `SET_RUNNER_HOST_SYMBOL`, `SET_LOG_FILTER_SYMBOL`.
   *Adding* one is additive — the host tolerates its absence — but changing one
@@ -157,9 +178,15 @@ pair that mismatches at load and aborts the plugin.
 
 ## A refused plugin says why
 
-A mismatched create entry is not an abort: the host wraps `get_stabbied`'s failure
-as "plugin <path> was built against a different heph ABI (host <ABI_SEMVER>);
-reinstall plugins from the same release as this heph". An *optional* entry
+A plugin from an ABI the host does not load is refused once, at load, naming
+the plugin and both versions: "plugin <path> was built against a different heph
+ABI (plugin <its version>; host <ABI_SEMVER>, which loads <MIN_PLUGIN_ABI>
+through <ABI_SEMVER>); rebuild it against this heph, or reinstall plugins from
+the same release as this heph" — "it reports no ABI version, so it predates
+0.17.0" for a plugin without the symbol. A plugin whose version is accepted but
+whose create entry still mismatches is not an abort either: the host wraps
+`get_stabbied`'s failure as "… different heph ABI (host <ABI_SEMVER>); rebuild it
+against this heph, …". An *optional* entry
 (`SET_*_SYMBOL`) the plugin exports with a mismatched type is skipped with a
 `warn!` naming the symbol — only a plugin that does not export it at all is
 skipped in silence.
@@ -176,11 +203,15 @@ skipped in silence.
   fails the decode with `missing field Message.field`; the zero-value sentinels
   (an empty listed driver = unknown, an empty declared driver = the provider
   default, an empty hashout = none, `LEVEL_UNSPECIFIED`) are spelled as absence,
-  and a present empty value there is malformed. Frozen stabby surface unchanged,
-  so `get_stabbied` still accepts a 0.16 plugin — but its prost encoder omits
-  every zero, and this host reads an omitted required field as missing. Skew
-  therefore fails loudly per call (`missing field …`), never as a misread
-  value. Every plugin must be rebuilt, as for 0.16.0.
+  and a present empty value there is malformed. A present-empty
+  `ListedFacts.driver` is the one message a 0.16 peer could validly send that
+  this host now rejects. The frozen create surface did not move, so
+  `get_stabbied` alone would still accept a 0.16 plugin — whose prost encoder
+  omits every zero, which this host reads as missing required fields, call by
+  call. So 0.17.0 also starts the **load-time version check**: the new required
+  `heph_plugin_abi_semver` entry (`ABI_SEMVER_SYMBOL`), and `MIN_PLUGIN_ABI` =
+  0.17.0. A 0.16 plugin exports no version and is refused once, at load, as
+  predating 0.17.0. Every plugin must be rebuilt, as for 0.16.0.
 - **0.16.0** — functions belong to plugins. `PluginComponents` lost
   `provider_name` (the manifest names the plugin) and gained `functions`
   (`NamedFunction`: name + `FunctionDef` metadata, decoded once at load; bad

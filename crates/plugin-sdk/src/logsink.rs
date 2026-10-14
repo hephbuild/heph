@@ -182,8 +182,7 @@ pub fn install_log_sink(sink: DynLogSink) {
 /// filter as it was — over-forwarding is the safe failure, since the host
 /// filters again.
 pub fn install_log_filter(bytes: &[u8]) {
-    use buffa::Message;
-    let targets = plugin_abi::pb::LogFilter::decode_from_slice(bytes)
+    let targets = plugin_abi::decode::<plugin_abi::pb::LogFilter>(bytes)
         .map_err(anyhow::Error::from)
         .and_then(|f| targets(&f));
     match targets {

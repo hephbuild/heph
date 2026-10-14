@@ -494,6 +494,20 @@ pub type DynRunnerHost = stabby::dynptr!(stabby::boxed::Box<dyn StableRunnerHost
 /// loaded host-side with `get_stabbied`).
 pub const CREATE_SYMBOL: &[u8] = b"heph_plugin_create";
 
+/// Required cdylib symbol (since 0.17.0): the plugin's `ABI_SEMVER`. The host
+/// reads it before calling anything else in the plugin, and refuses a plugin
+/// that lacks it or reports a version outside `MIN_PLUGIN_ABI..=ABI_SEMVER`.
+///
+/// Deliberately a plain C function, not a `#[stabby::export]`: the version is
+/// what tells the host which layout to expect, so it must be readable whatever
+/// stabby (and stabby version) the plugin was built with. It returns a pointer
+/// to a NUL-terminated, `'static` string (`plugin_abi::ABI_SEMVER_C`); the host
+/// copies it out at once. Never renamed or retyped.
+pub const ABI_SEMVER_SYMBOL: &[u8] = b"heph_plugin_abi_semver";
+
+/// The ABI-version entry's function-pointer type.
+pub type AbiSemverFn = unsafe extern "C" fn() -> *const std::ffi::c_char;
+
 /// Optional cdylib symbol: install a host [`DynLogSink`] so the plugin's `tracing`
 /// events reach the host. The host calls it right after load if present; a plugin
 /// that does not export it simply gets no log forwarding.

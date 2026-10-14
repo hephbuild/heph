@@ -57,6 +57,14 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);
 }
 
+/// ABI version entry: the host reads it before anything else and refuses this
+/// plugin if it was built for an ABI the host does not load. A plain C symbol,
+/// so it reads the same whatever stabby layout either side has.
+#[unsafe(no_mangle)]
+pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
+    plugin_sdk::stabby::abi_semver()
+}
+
 /// Stable ABI log-filter entry: the host's filter as protobuf `LogFilter` bytes,
 /// so events it would discard are dropped here instead of forwarded.
 #[stabby::export]
