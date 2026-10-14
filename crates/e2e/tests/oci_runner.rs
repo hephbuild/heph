@@ -193,6 +193,7 @@ async fn the_mounted_home_is_the_resolved_one_even_in_a_package_named_sandbox() 
             Box::new(heph::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
                 init.runtime.clone(),
+                std::sync::Arc::clone(&init.functions),
             ))
         })
         .with_plugin("oci", move |init| {

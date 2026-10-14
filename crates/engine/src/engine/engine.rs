@@ -1421,12 +1421,7 @@ mod tests {
 
         fn engine() -> (tempfile::TempDir, Engine) {
             let root = tempfile::tempdir().expect("tempdir");
-            let engine = Engine::new(Config {
-                root: root.path().to_path_buf(),
-                home_dir: root.path().join(".heph"),
-                ..Default::default()
-            })
-            .expect("engine");
+            let engine = Engine::new(Config::for_tests(root.path())).expect("engine");
             (root, engine)
         }
 

@@ -29,6 +29,7 @@ async fn run_with_config(root: &Path, home_dir: Option<PathBuf>) -> Arc<Engine> 
         Box::new(pluginbuildfile::Provider::new(
             init.root.to_path_buf(),
             init.runtime.clone(),
+            Arc::clone(&init.functions),
         ))
     })
     .expect("provider");
