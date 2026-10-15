@@ -10,6 +10,7 @@ use crate::abi::{
 use crate::seam::panic_text;
 use crate::vtable::dynify;
 use anyhow::Context;
+use buffa::Message;
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
@@ -17,7 +18,6 @@ use hplugin::function::{FnArgs, FnCallContext, FunctionSlot};
 use hplugin::provider::ProviderExecutor;
 use plugin_abi::pb::frame::Body;
 use plugin_abi::{convert, pb};
-use prost::Message;
 use stabby::future::DynFutureUnsync as DynFuture;
 use stabby::string::String as SString;
 use stabby::vec::Vec as SVec;
@@ -174,8 +174,9 @@ impl StableSupervisor for HostSupervisor {
 fn unary(body: Body) -> SVec<u8> {
     SVec::from(
         pb::Frame {
-            id: 0,
+            id: Some(0),
             body: Some(body),
+            ..Default::default()
         }
         .encode_to_vec()
         .as_slice(),
@@ -183,10 +184,45 @@ fn unary(body: Body) -> SVec<u8> {
 }
 
 fn err_body(message: String) -> Body {
-    Body::Error(pb::Error {
-        kind: pb::error::Kind::Other as i32,
-        message,
+    Body::from(pb::Error {
+        kind: Some(pb::error::Kind::Other.into()),
+        message: Some(message),
+        ..Default::default()
     })
+}
+
+/// A `CallRegisteredRequest`, decoded. Every addressing field is required —
+/// a defaulted `""` plugin or root would resolve some other function, or the
+/// right one against the host's cwd. `accepts_declarations` reads absent as
+/// `false`: an older plugin cannot carry declarations, and a declaring function
+/// then fails rather than dropping them.
+struct RegisteredCall {
+    plugin: String,
+    name: String,
+    pkg: String,
+    root: std::path::PathBuf,
+    args: FnArgs,
+    accepts_declarations: bool,
+}
+
+impl RegisteredCall {
+    fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        use convert::required;
+        let req = plugin_abi::decode::<pb::CallRegisteredRequest>(bytes)
+            .context("decoding CallRegisteredRequest")?;
+        let plugin = required(req.plugin, "CallRegisteredRequest.plugin")?;
+        let name = required(req.name, "CallRegisteredRequest.name")?;
+        let args = convert::fn_args_from_pb(req.positional, req.named)
+            .with_context(|| format!("the arguments of `heph.{plugin}.{name}`"))?;
+        Ok(Self {
+            pkg: required(req.pkg, "CallRegisteredRequest.pkg")?,
+            root: required(req.root, "CallRegisteredRequest.root")?.into(),
+            accepts_declarations: req.accepts_declarations.unwrap_or(false),
+            args,
+            plugin,
+            name,
+        })
+    }
 }
 
 /// The host-side mirror of the guest's spawn-at-the-seam shape.
@@ -346,10 +382,10 @@ impl HostFunctionRegistry {
 
 impl StableFunctionRegistry for HostFunctionRegistry {
     extern "C" fn call_registered<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
-        let req = match pb::CallRegisteredRequest::decode(&req[..]) {
+        let req = match RegisteredCall::decode(&req[..]) {
             Ok(r) => r,
             Err(e) => {
-                let body = unary(err_body(format!("call_registered decode: {e}")));
+                let body = unary(err_body(format!("call_registered decode: {e:#}")));
                 return dynify(stabby::boxed::Box::new(async move { body }));
             }
         };
@@ -377,28 +413,15 @@ impl StableFunctionRegistry for HostFunctionRegistry {
             // Released before the call: a function holding the registry across
             // its own await would keep it alive past its engine.
             drop(registry);
-            let root = std::path::PathBuf::from(req.root);
             let ctx = FnCallContext {
                 pkg: &req.pkg,
-                root: Path::new(&root),
-            };
-            let args = FnArgs {
-                positional: req
-                    .positional
-                    .into_iter()
-                    .map(convert::value_from_pb)
-                    .collect(),
-                named: req
-                    .named
-                    .into_iter()
-                    .map(|(k, v)| (k, convert::value_from_pb(v)))
-                    .collect(),
+                root: Path::new(&req.root),
             };
             // A plugin called this host function. Its declarations ride back in
             // the reply when the calling plugin says it carries them; otherwise
             // they are an error, not a drop.
             let accepts = req.accepts_declarations;
-            let res = match rf.func.call(&ctx, args).await {
+            let res = match rf.func.call(&ctx, req.args).await {
                 Ok(o) => {
                     tracing::debug!(
                         plugin = %req.plugin,
@@ -426,7 +449,7 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                 }),
             };
             match res {
-                Ok(resp) => unary(Body::CallFunctionResp(resp)),
+                Ok(resp) => unary(Body::from(resp)),
                 Err(e) => unary(err_body(format!("{e:#}"))),
             }
         };
@@ -625,7 +648,7 @@ impl StableExecutor for HostExecutor {
     ) -> DynFuture<'a, QueryOutcome> {
         let inner = Arc::clone(&self.inner);
         let fut = async move {
-            let matcher = match plugin_abi::pb::Matcher::decode(&matcher_pb[..])
+            let matcher = match plugin_abi::decode::<plugin_abi::pb::Matcher>(&matcher_pb[..])
                 .map_err(anyhow::Error::from)
                 .and_then(plugin_abi::convert::matcher_from_pb)
             {
@@ -633,7 +656,7 @@ impl StableExecutor for HostExecutor {
                 Err(e) => {
                     return QueryOutcome {
                         ok: false,
-                        message: format!("matcher decode: {e}").into(),
+                        message: format!("matcher decode: {e:#}").into(),
                         addrs: SVec::new(),
                     };
                 }
@@ -713,13 +736,13 @@ mod tests {
     #[test]
     fn a_host_functions_declarations_need_the_callers_say_so() {
         use crate::abi::StableFunctionRegistryDyn;
+        use buffa::Message;
         use hcore::htvalue::Value;
         use hcore::htvalue::signature::{FnSignature, ParamType};
         use hplugin::function::{
             DeclaredTarget, FnArgs, FnCallContext, FnOutcome, FunctionRegistry, FunctionSlot,
             PluginFn, PluginFnDef,
         };
-        use prost::Message;
         use std::sync::Arc;
 
         struct DeclaringFn;
@@ -762,20 +785,20 @@ mod tests {
         let request = |accepts_declarations: bool| {
             SVec::from(
                 plugin_abi::pb::CallRegisteredRequest {
-                    plugin: "codegen".into(),
-                    name: "rule".into(),
-                    pkg: "p".into(),
-                    root: "/ws".into(),
-                    positional: vec![],
-                    named: Default::default(),
-                    accepts_declarations,
+                    plugin: Some("codegen".into()),
+                    name: Some("rule".into()),
+                    pkg: Some("p".into()),
+                    root: Some("/ws".into()),
+                    // An older plugin sends no flag at all.
+                    accepts_declarations: accepts_declarations.then_some(true),
+                    ..Default::default()
                 }
                 .encode_to_vec()
                 .as_slice(),
             )
         };
         let body = |bytes: SVec<u8>| {
-            plugin_abi::pb::Frame::decode(&bytes[..])
+            plugin_abi::pb::Frame::decode_from_slice(&bytes[..])
                 .expect("decode frame")
                 .body
         };
@@ -785,7 +808,7 @@ mod tests {
         match body(bytes) {
             Some(plugin_abi::pb::frame::Body::CallFunctionResp(r)) => {
                 assert_eq!(r.declared_targets.len(), 1);
-                assert_eq!(r.declared_targets[0].name, "t");
+                assert_eq!(r.declared_targets[0].name.as_deref(), Some("t"));
             }
             other => panic!("expected a reply with declarations, got {other:?}"),
         }
@@ -794,15 +817,12 @@ mod tests {
         let bytes = futures::executor::block_on(host.call_registered(request(false)));
         match body(bytes) {
             Some(plugin_abi::pb::frame::Body::Error(e)) => {
-                assert!(e.message.contains("codegen.rule"), "{}", e.message);
+                let msg = e.message.unwrap_or_default();
+                assert!(msg.contains("codegen.rule"), "{msg}");
                 // The old side here is the plugin that called in, and the
                 // remedy is the plugin author's, not the user's.
-                assert!(
-                    e.message.contains("the calling plugin does not carry"),
-                    "{}",
-                    e.message
-                );
-                assert!(e.message.contains("rebuild the plugin"), "{}", e.message);
+                assert!(msg.contains("the calling plugin does not carry"), "{msg}");
+                assert!(msg.contains("rebuild the plugin"), "{msg}");
             }
             other => panic!("expected an error, got {other:?}"),
         }
@@ -814,26 +834,53 @@ mod tests {
     #[test]
     fn unknown_registered_function_is_an_error() {
         use crate::abi::StableFunctionRegistryDyn;
+        use buffa::Message;
         use hplugin::function::{FunctionRegistry, FunctionSlot};
-        use prost::Message;
         use std::sync::Arc;
 
         let call = |host: &crate::abi::DynFunctionRegistry, plugin: &str, name: &str| {
             let req = plugin_abi::pb::CallRegisteredRequest {
-                plugin: plugin.into(),
-                name: name.into(),
+                plugin: Some(plugin.into()),
+                name: Some(name.into()),
+                pkg: Some("p".into()),
+                root: Some("/ws".into()),
                 ..Default::default()
             }
             .encode_to_vec();
             let bytes = futures::executor::block_on(host.call_registered(SVec::from(&req[..])));
-            match plugin_abi::pb::Frame::decode(&bytes[..])
+            match plugin_abi::pb::Frame::decode_from_slice(&bytes[..])
                 .expect("decode frame")
                 .body
             {
-                Some(plugin_abi::pb::frame::Body::Error(e)) => e.message,
+                Some(plugin_abi::pb::frame::Body::Error(e)) => e.message.unwrap_or_default(),
                 other => panic!("expected an error, got {other:?}"),
             }
         };
+
+        // A request that does not say which root to call against is refused
+        // at decode, naming the field — not run against the host's cwd.
+        let unsealed = super::HostFunctionRegistry::wrap_inline(FunctionSlot::new());
+        let req = plugin_abi::pb::CallRegisteredRequest {
+            plugin: Some("fs".into()),
+            name: Some("glob".into()),
+            pkg: Some("p".into()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let bytes = futures::executor::block_on(unsealed.call_registered(SVec::from(&req[..])));
+        match plugin_abi::pb::Frame::decode_from_slice(&bytes[..])
+            .expect("decode frame")
+            .body
+        {
+            Some(plugin_abi::pb::frame::Body::Error(e)) => {
+                let msg = e.message.unwrap_or_default();
+                assert!(
+                    msg.contains("missing field CallRegisteredRequest.root"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
 
         // Before the seal: an error, not an empty namespace.
         let slot = FunctionSlot::new();

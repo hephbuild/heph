@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Provider-exported methods. Mirrors the hplugin::Provider trait. BUILD-file
 // functions are not a provider's: they belong to the plugin (function.proto).
@@ -21,7 +21,7 @@ enum ProviderMethod {
   // 0.16.0 moved functions from the provider to the plugin (function.proto):
   // these numbers and names are never reused.
   reserved 5, 6, 8;
-  reserved "PROVIDER_METHOD_FUNCTIONS", "PROVIDER_METHOD_CALL_FUNCTION", "PROVIDER_METHOD_SET_FUNCTION_REGISTRY";
+  reserved PROVIDER_METHOD_FUNCTIONS, PROVIDER_METHOD_CALL_FUNCTION, PROVIDER_METHOD_SET_FUNCTION_REGISTRY;
   PROVIDER_METHOD_UNSPECIFIED = 0;
   PROVIDER_METHOD_LIST = 1;
   PROVIDER_METHOD_LIST_PACKAGES = 2;
@@ -31,6 +31,8 @@ enum ProviderMethod {
   PROVIDER_METHOD_CONFIG = 9; // sync metadata (StableMeta::meta)
 }
 
+// Every request's `request_id` (what a cancel names) and addressing fields
+// (`package`, `prefix`, `addr`) are required; so is every response's payload.
 message ListRequest {
   string request_id = 1;
   string package = 2;
@@ -46,23 +48,24 @@ message StringSet {
 // Every field is either unknown (absent) or exact for this listed addr, under the
 // state chain `list` received. Only absence means unknown: a present field is
 // known, including `has_codegen = false` and an empty `labels` set, so a
-// provider leaves a field it does not know unset rather than zero. An empty
-// `driver` is the one present value read as unknown.
+// provider leaves a field it does not know unset rather than zero.
 // Verified by `heph validate`; a listed "no" is trusted by the engine's walks.
 message ListedFacts {
   // The spec's labels, compared as a set. Present and empty = no labels.
   StringSet labels = 1;
-  // The spec's driver. Absent, "" or over 256 bytes = unknown.
-  optional string driver = 2;
+  // The spec's driver. Absent = unknown. A present driver is exact and never
+  // empty — a present "" fails the listing; over 256 bytes is stored as unknown.
+  string driver = 2;
   // Whether any path in def.outputs has codegen mode != NONE. Absent = unknown.
-  optional bool has_codegen = 3;
+  bool has_codegen = 3;
 }
 
 message ListResponse {
+  // Required.
   Addr addr = 1;
   // 0.11.0's per-target labels, superseded by `facts`. Never reuse.
   reserved 2, 3;
-  reserved "labels", "labels_known";
+  reserved labels, labels_known;
   // Absent = every field unknown (an old plugin, or `addr_only`).
   ListedFacts facts = 4;
 }
@@ -84,7 +87,8 @@ message GetRequest {
 message GetResponse {
   TargetSpec target_spec = 1;
 }
-// Mirrors provider::GetError { NotFound, Other(_) }.
+// Mirrors provider::GetError { NotFound, Other(_) }. `kind` is required; an
+// absent or unknown one is an error carrying `message`, never NOT_FOUND.
 message GetError {
   enum Kind {
     KIND_UNSPECIFIED = 0;
@@ -106,7 +110,9 @@ message ProbeResponse {
 }
 
 // Mirrors hcore::htvalue::signature::ParamType (recursive). Shared by function
-// signatures (function.proto) and schemas (below).
+// signatures (function.proto) and schemas (below). `kind` is required, and a
+// scalar is never SCALAR_UNSPECIFIED; a struct field's `name` and `ty` are
+// required.
 message ParamType {
   enum Scalar {
     SCALAR_UNSPECIFIED = 0;
@@ -144,7 +150,8 @@ message ParamType {
 // (the args of `provider_state(provider=…, …)`) and driver `schema()` (the
 // driver-specific kwargs of a `target(...)`). Consumed by the BUILD-file LSP.
 
-// Mirrors provider::StateField / driver::DriverField.
+// Mirrors provider::StateField / driver::DriverField. `name` and `ty` are
+// required; an absent `doc` is none and an absent `required` is false.
 message SchemaField {
   string name = 1;
   ParamType ty = 2;
@@ -166,8 +173,8 @@ message Schema {
   // What is genuinely left is the mixed-version case: a plugin built before this
   // feature carries an old `String` decoder that rejects nothing, decodes
   // "${read://infra:role-arn}" as a literal, and runs the target with the
-  // reference text as the value. prost decodes an absent field as `false`, so an
-  // old plugin's schema refuses references — loudly, at parse — rather than
+  // reference text as the value. An absent field reads as `false`, so an old
+  // plugin's schema refuses references — loudly, at parse — rather than
   // silently misinterpreting one.
   bool accepts_deferred = 2;
 }

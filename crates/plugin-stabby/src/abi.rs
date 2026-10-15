@@ -95,13 +95,13 @@ pub struct QueryOutcome {
 }
 
 /// Outcome of a `states_under` call. `State` has no canonical string form, so
-/// each state crosses as prost-encoded `pb::State` bytes — mirroring how
+/// each state crosses as protobuf-encoded `pb::State` bytes — mirroring how
 /// `query`'s matcher crosses as `SVec<u8>`.
 #[stabby::stabby]
 pub struct StatesOutcome {
     pub ok: bool,
     pub message: SString,
-    /// Each entry is a prost-encoded `pb::State`.
+    /// Each entry is a protobuf-encoded `pb::State`.
     pub states: SVec<SVec<u8>>,
 }
 
@@ -112,7 +112,7 @@ pub struct StatesOutcome {
 /// no serialization, no message-passing.
 ///
 /// `addr` is the canonical `//pkg:name` string; `query`'s matcher crosses as
-/// prost bytes (query is rare/zero on the hot path).
+/// protobuf bytes (query is rare/zero on the hot path).
 #[stabby::stabby]
 pub trait StableExecutor {
     /// Synchronous: registering a dep edge is a `DepDag` insert (no real await),
@@ -156,7 +156,7 @@ pub type DynFunctionRegistry =
 
 /// A plugin's BUILD-file functions, behind ONE handle per plugin. `method` is a
 /// `pb::FunctionMethod` (an unknown id answers `Error{Unimplemented}`), `name`
-/// the function's bare name, `req` the method's prost request
+/// the function's bare name, `req` the method's protobuf request
 /// (`FUNCTION_METHOD_CALL`: `pb::CallFunctionRequest`); the reply is a
 /// `pb::Frame` (`CallFunctionResp` or `Error`). The guest runs each call on its
 /// own runtime, so a function touching tokio works under a host `block_on`.
@@ -175,7 +175,7 @@ pub type DynPluginFunctions =
     stabby::dynptr!(stabby::boxed::Box<dyn StablePluginFunctions + Send + Sync>);
 
 /// One function a plugin exports: its bare name (no `heph.<plugin>.` prefix)
-/// and its metadata as prost `pb::FunctionDef` bytes (name, signature, doc),
+/// and its metadata as protobuf `pb::FunctionDef` bytes (name, signature, doc),
 /// decoded once at load. Undecodable metadata, or a missing signature, fails
 /// the plugin's load. Called through [`PluginComponents::function_handle`].
 #[stabby::stabby]
@@ -189,7 +189,7 @@ pub struct NamedFunction {
 /// RPC dispatch surface ([`StableProvider`] / [`StableManagedDriver`]) stays
 /// purely the async method dispatch. Composed into both handle types. `kind` is a
 /// `pb::ProviderMethod` / `pb::DriverMethod` selecting which metadatum; the reply
-/// is that metadatum's prost bytes (an EMPTY `SVec` encodes "none", e.g. a
+/// is that metadatum's protobuf bytes (an EMPTY `SVec` encodes "none", e.g. a
 /// provider with no `state_schema`). Sync because it is read once during registry
 /// wiring, never on a hot path. Same append-only contract as the async dispatch.
 #[stabby::stabby]
@@ -198,7 +198,7 @@ pub trait StableMeta {
 }
 
 /// A pull stream of items across the seam (the streaming counterpart of the unary
-/// `SVec<u8>` reply). Each `next` yields one prost length-delimited `pb::Frame`
+/// `SVec<u8>` reply). Each `next` yields one protobuf length-delimited `pb::Frame`
 /// (`StreamItem` for an item, or `StreamEnd{error}` to end with failure); an EMPTY
 /// `SVec` means the stream is exhausted cleanly. Used for BOTH directions — a
 /// request stream (host → plugin) and a response stream (plugin → host). `&self`
@@ -215,7 +215,7 @@ pub trait StableItemStream {
 pub type DynItemStream = stabby::dynptr!(stabby::boxed::Box<dyn StableItemStream + Send + Sync>);
 
 /// The cold provider surface as a FROZEN generic dispatch. The `method` id
-/// (`pb::ProviderMethod`) selects an RPC; payloads cross as prost-encoded
+/// (`pb::ProviderMethod`) selects an RPC; payloads cross as protobuf-encoded
 /// `pb::Frame` bytes (cheap, low-volume, lenient via protobuf). Adding an RPC is a
 /// new method id + a new guest match arm — the vtable is UNTOUCHED, so an older
 /// plugin and a newer host still load (stabby's type report is unchanged) and the
@@ -223,7 +223,7 @@ pub type DynItemStream = stabby::dynptr!(stabby::boxed::Box<dyn StableItemStream
 /// makes the cold surface evolvable without an ABI break (see ABI_VERSIONING.md).
 ///
 /// The slots cover the four RPC cardinalities (request × response, each unary or
-/// streaming) plus the native-handle carriers (a `DynExecutor` cannot ride prost
+/// streaming) plus the native-handle carriers (a `DynExecutor` cannot ride protobuf
 /// bytes, so the method carrying one gets its own frozen slot):
 /// - [`invoke`](StableProvider::invoke) — unary → unary.
 /// - [`invoke_server_stream`](StableProvider::invoke_server_stream) — unary →
@@ -273,7 +273,7 @@ pub trait StableProvider {
 /// `run` rides [`invoke_bidi`](StableManagedDriver::invoke_bidi): the request
 /// stream carries the run request then live stdin (`pb::RunInFrame`), the response
 /// stream carries live stdout/stderr then the result (`pb::RunOutFrame`). No
-/// dedicated stdio slot — live IO is modeled as prost frames on the bidi stream,
+/// dedicated stdio slot — live IO is modeled as protobuf frames on the bidi stream,
 /// so wiring stdin/stdout/stderr later is additive (see ABI_VERSIONING.md).
 #[stabby::stabby]
 pub trait StableManagedDriver {
@@ -402,11 +402,11 @@ pub struct NamedRunner {
 /// The plugin reports no name: its manifest names it, and every component is
 /// reachable under that name (`heph.<name>.<fn>`, driver `<name>.<local>`).
 ///
-/// `meta` is reserved, prost-encoded return-side metadata (empty today). It exists
+/// `meta` is reserved, protobuf-encoded return-side metadata (empty today). It exists
 /// so a plugin can later report additive descriptive data (capabilities, abi
 /// minor, …) without changing this struct's layout — a layout change would break
 /// loading of older plugins. The handle fields must stay stabby (they carry the
-/// live native vtables); only the data rides prost.
+/// live native vtables); only the data rides protobuf.
 #[stabby::stabby]
 pub struct PluginComponents {
     /// The exported provider, or `None` for a plugin without one.
@@ -494,6 +494,20 @@ pub type DynRunnerHost = stabby::dynptr!(stabby::boxed::Box<dyn StableRunnerHost
 /// loaded host-side with `get_stabbied`).
 pub const CREATE_SYMBOL: &[u8] = b"heph_plugin_create";
 
+/// Required cdylib symbol (since 0.17.0): the plugin's `ABI_SEMVER`. The host
+/// reads it before calling anything else in the plugin, and refuses a plugin
+/// that lacks it or reports a version outside `MIN_PLUGIN_ABI..=ABI_SEMVER`.
+///
+/// Deliberately a plain C function, not a `#[stabby::export]`: the version is
+/// what tells the host which layout to expect, so it must be readable whatever
+/// stabby (and stabby version) the plugin was built with. It returns a pointer
+/// to a NUL-terminated, `'static` string (`plugin_abi::ABI_SEMVER_C`); the host
+/// copies it out at once. Never renamed or retyped.
+pub const ABI_SEMVER_SYMBOL: &[u8] = b"heph_plugin_abi_semver";
+
+/// The ABI-version entry's function-pointer type.
+pub type AbiSemverFn = unsafe extern "C" fn() -> *const std::ffi::c_char;
+
 /// Optional cdylib symbol: install a host [`DynLogSink`] so the plugin's `tracing`
 /// events reach the host. The host calls it right after load if present; a plugin
 /// that does not export it simply gets no log forwarding.
@@ -502,7 +516,7 @@ pub const SET_LOG_SINK_SYMBOL: &[u8] = b"heph_plugin_set_log_sink";
 /// The set-log-sink entry's function-pointer type.
 pub type SetLogSinkFn = extern "C" fn(DynLogSink);
 
-/// Optional cdylib symbol: hand the plugin the host's log filter as prost-encoded
+/// Optional cdylib symbol: hand the plugin the host's log filter as protobuf-encoded
 /// `pb::LogFilter` bytes, so it can drop events the host would discard instead of
 /// forwarding every one over the [`DynLogSink`]. The semantics live in the proto
 /// (`proto/plugin/v1/common.proto`), not in any Rust type, so a plugin in another
@@ -533,7 +547,7 @@ pub type SetRunnerHostFn = extern "C" fn(DynRunnerHost);
 /// The set-supervisor entry's function-pointer type.
 pub type SetSupervisorFn = extern "C" fn(DynSupervisor);
 
-/// The create entry's function-pointer type. The config crosses as prost-encoded
+/// The create entry's function-pointer type. The config crosses as protobuf-encoded
 /// `pb::CreateConfig` bytes (not a stabby struct), so adding config fields is an
 /// additive change that does not break older plugins. The second argument is
 /// the engine's function registry for this instance — the only way the

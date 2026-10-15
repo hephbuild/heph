@@ -16,7 +16,7 @@
 //! declaration made behind the ABI becomes a target the engine resolves and
 //! builds, which is the sentence the feature ships.
 //!
-//! Not `bin-e2e`: the declarations ride inside the prost payload over the
+//! Not `bin-e2e`: the declarations ride inside the protobuf payload over the
 //! function handle, so `dlopen` has nothing new to reject and a separate
 //! process would buy nothing (see `.claude/testing.md`).
 

@@ -6,6 +6,13 @@ edition = "2024"
 [workspace]
 members = ["gen/proto", "crates/e2e", "crates/bin-e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/config", "crates/walk", "crates/proc", "crates/execrunner", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-stabby", "crates/plugin-sdk", "crates/plugin-go-cdylib", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/driver-bridge", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-devenv", "crates/plugin-devenv-cdylib", "crates/plugin-http", "crates/plugin-oci", "crates/plugin-query", "crates/plugin-go", "crates/plugin-gha", "crates/plugin-gha-cdylib", "crates/plugin-oci-cdylib", "crates/telemetry", "crates/tui", "crates/lock", "crates/fetch", "crates/selfupdate", "crates/engine", "crates/xstarlark-fmt", "crates/bench-corpus", "crates/bench"]
 
+[workspace.dependencies]
+# Pinned exactly: the generated code in `gen/proto` reaches into
+# `::buffa::__private`, which carries no semver promise, so the runtime must be
+# the very release `protoc-gen-buffa` came from (`buffaVersion` in devenv.nix).
+# Bump both together.
+buffa = "=0.9.2"
+
 [profile.profiling]
 inherits = "release"
 debug = true
@@ -105,7 +112,7 @@ clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
-hproto-gen = { package = "proto-gen", path = "gen/proto", features = ["proto_full"] }
+hproto-gen = { package = "proto-gen", path = "gen/proto" }
 hcore = { package = "core", path = "crates/core" }
 hwalk = { package = "walk", path = "crates/walk" }
 hproc = { package = "proc", path = "crates/proc" }

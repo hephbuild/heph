@@ -3,14 +3,15 @@ name = "proto-gen"
 version = "0.1.0"
 edition = "2021"
 
+# `protoc-gen-buffa-packaging` emits the module tree as `mod.rs`; `gen` copies
+# this file next to it.
+[lib]
+path = "src/mod.rs"
+
 [dependencies]
-prost = "0.14"
-prost-types = "0.14"
-serde = { version = "1.0", features = ["derive"] }
-pbjson = "0.9"
+# The workspace pins it exactly, in step with `buffaVersion` in devenv.nix: the
+# plugin and the runtime are released together.
+buffa = { workspace = true }
 
 [lints.clippy]
 all = "allow"
-
-[features]
-# @@protoc_insertion_point(features)

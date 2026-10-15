@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Shared value/address/sandbox types for the heph external-plugin ABI.
 // Mirrors the in-process contract types in crates/plugin and crates/model so
@@ -8,6 +8,8 @@ package heph.plugin.v1;
 
 // Dynamic config value. Mirrors hcore::htvalue::Value. Kept distinct from
 // google.protobuf.Value because heph distinguishes Int/Uint/Float and Null.
+// `kind` is required: null has its own arm, so no arm is malformed (or a newer
+// peer's kind), never null.
 message Value {
   message Null {}
   message Map {
@@ -29,10 +31,17 @@ message Value {
 }
 
 // Config handed to a cdylib's create entry (`heph_plugin_create`). Crosses as
-// prost bytes (not a stabby struct) so new config fields are additive — an older
-// plugin built against fewer fields still loads. `options` is the plugin's
+// protobuf bytes (not a stabby struct) so new config fields are additive — an
+// older plugin built against fewer fields still loads. `options` is the plugin's
 // `options:` map as structured data (no nested encode). `root` is the workspace
-// root; `home` is the engine's home dir for plugin state/scratch.
+// root; `home` is the engine's home dir for plugin state/scratch. `root`, `home`
+// and `name` are required: a plugin refuses a config without them.
+//
+// Presence, here and in every message of this package: every singular field has
+// explicit presence (edition 2024), so absent means "the sender did not say" and
+// a present zero is a real zero. A field the receiver cannot do without fails the
+// decode when absent (`missing field Message.field`); where "unset" has a
+// meaning, it is spelled as absence, never as a zero value.
 message CreateConfig {
   string root = 1;
   string home = 2;
@@ -73,9 +82,10 @@ message CreateConfig {
 message LogFilter {
   // A level admits itself and everything less verbose (INFO admits ERROR, WARN
   // and INFO). The order is the one declared below, OFF through TRACE — not the
-  // numeric values. A reader treats a value it does not know, and UNSPECIFIED,
-  // as TRACE (admit everything), so a missing or newer level never drops an
-  // event; a sender must not rely on an old reader understanding a new level.
+  // numeric values. A reader treats an absent level, a value it does not know,
+  // and UNSPECIFIED as TRACE (admit everything), so a missing or newer level
+  // never drops an event; a sender must not rely on an old reader understanding
+  // a new level. A sender says "no level" by leaving the field unset.
   enum Level {
     LEVEL_UNSPECIFIED = 0;
     LEVEL_OFF = 1;
@@ -86,6 +96,8 @@ message LogFilter {
     LEVEL_TRACE = 6;
   }
   message Directive {
+    // Required. A directive without one is malformed, and a reader ignores the
+    // whole filter rather than read it as `""` (every target).
     string target_prefix = 1;
     Level level = 2;
   }
@@ -94,6 +106,7 @@ message LogFilter {
 }
 
 // Target address. Mirrors hmodel::Addr (package //pkg : name @args).
+// `package` and `name` are required; the root package is a present `""`.
 message Addr {
   string package = 1;
   string name = 2;
@@ -101,13 +114,15 @@ message Addr {
 }
 
 // A reference to (an output of) a target. Mirrors driver::TargetAddr.
+// `ref` is required; an absent `output` is the target's default output.
 message TargetAddr {
   Addr ref = 1;
-  optional string output = 2;
+  string output = 2;
   repeated string filters = 3;
 }
 
 // Provider-emitted state attached to a package. Mirrors provider::State.
+// `package` and `provider` are required.
 message State {
   string package = 1;
   string provider = 2;
@@ -142,6 +157,8 @@ enum DepMode {
   DEP_MODE_LINK = 2;
 }
 
+// `ref` and `hash` are required: a dropped `hash` read as false would take the
+// tool out of the cache key.
 message Tool {
   TargetAddr ref = 1;
   string group = 2;
@@ -149,6 +166,8 @@ message Tool {
   string id = 4;
 }
 
+// `ref`, `mode` (not UNSPECIFIED) and `hash` are required; `runtime` is off
+// unless set.
 message Dep {
   TargetAddr ref = 1;
   DepMode mode = 2;
@@ -158,6 +177,7 @@ message Dep {
   string id = 6;
 }
 
+// `value` and `hash` are required.
 message Env {
   // EnvValue: literal string, or "pass" (inherit from host env).
   oneof value {

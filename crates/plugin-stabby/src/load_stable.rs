@@ -15,6 +15,7 @@ use crate::abi::{
 use crate::host::HostExecutor;
 use crate::vtable::dynify;
 use async_trait::async_trait;
+use buffa::Message;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{
@@ -33,9 +34,9 @@ use hplugin::provider::{
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
     StateSchema,
 };
+use plugin_abi::convert::{required, required_enum, required_msg};
 use plugin_abi::pb::frame::Body;
 use plugin_abi::{convert, pb};
-use prost::Message;
 use stabby::vec::Vec as SVec;
 use std::sync::Arc;
 
@@ -74,15 +75,92 @@ pub struct LoadedComponents {
 
 /// The text a create entry that fails stabby's structural check gets: the
 /// plugin was built against a different `PluginComponents` / `CreateFn` layout,
-/// which is what an ABI break changes. No version is read at load; the layout
-/// is the check.
+/// which is what an ABI break changes. The version check ([`check_plugin_abi`])
+/// runs first; this catches a plugin whose reported version is accepted but
+/// whose layout still differs.
 pub fn abi_mismatch_hint(path: &std::path::Path) -> String {
+    abi_refusal(path, format_args!("host {}", plugin_abi::ABI_SEMVER))
+}
+
+/// The one shape every ABI refusal takes, so a user learns the same fix
+/// whichever check caught the plugin.
+fn abi_refusal(path: &std::path::Path, detail: std::fmt::Arguments<'_>) -> String {
     format!(
-        "plugin {} was built against a different heph ABI (host {}); reinstall plugins \
-         from the same release as this heph",
+        "plugin {} was built against a different heph ABI ({detail}); rebuild it against \
+         this heph, or reinstall plugins from the same release as this heph",
         path.display(),
-        plugin_abi::ABI_SEMVER
     )
+}
+
+/// The ABI version this plugin exported, or `None` when it exports none.
+///
+/// Called before anything else in the plugin: the symbol is a plain C function
+/// precisely so that reading it trusts no stabby layout.
+fn plugin_abi_version(lib: &libloading::Library) -> Option<String> {
+    use crate::abi::{ABI_SEMVER_SYMBOL, AbiSemverFn};
+    // SAFETY: `ABI_SEMVER_SYMBOL`'s type is fixed by contract (never renamed or
+    // retyped, see `abi.rs`): `unsafe extern "C" fn() -> *const c_char`.
+    let entry = unsafe { lib.get::<AbiSemverFn>(ABI_SEMVER_SYMBOL) }.ok()?;
+    // SAFETY: the entry takes no arguments and returns a pointer to a
+    // `'static` string, by the same contract.
+    let ptr = unsafe { entry() };
+    if ptr.is_null() {
+        return Some(String::new());
+    }
+    // SAFETY: non-null, and NUL-terminated and `'static` by contract; copied out
+    // before anything else runs.
+    let reported = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    Some(reported.to_string_lossy().into_owned())
+}
+
+/// The plugin ABI versions this host loads: `^MIN_PLUGIN_ABI`. Pre-1.0 that is
+/// one minor's lane (`^0.17.0` = `>=0.17.0, <0.18.0`): a patch is additive, so
+/// a plugin a few patches newer or older than the host loads; a minor is a
+/// break, which raises `MIN_PLUGIN_ABI` to the new `x.y.0`.
+pub fn accepted_plugin_abi() -> anyhow::Result<semver::VersionReq> {
+    use anyhow::Context as _;
+    semver::VersionReq::parse(&format!("^{}", plugin_abi::MIN_PLUGIN_ABI))
+        .context("parsing MIN_PLUGIN_ABI")
+}
+
+/// Refuse a plugin whose reported ABI version (`None`: it reports none, so it
+/// predates 0.17.0, when the version started being read) does not match
+/// [`accepted_plugin_abi`]. Versions compare as semver, never as strings.
+///
+/// A plugin from a later minor is refused like an older one: this host cannot
+/// know what that break changed.
+pub fn check_plugin_abi(path: &std::path::Path, reported: Option<&str>) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use semver::Version;
+    let host = Version::parse(plugin_abi::ABI_SEMVER).context("parsing the host's ABI_SEMVER")?;
+    let req = accepted_plugin_abi()?;
+    let accepts = format!("host {host}, which loads {req}");
+    let Some(reported) = reported else {
+        anyhow::bail!(abi_refusal(
+            path,
+            format_args!("it reports no ABI version, so it predates 0.17.0; {accepts}")
+        ));
+    };
+    let plugin = match Version::parse(reported) {
+        Ok(v) => v,
+        Err(_) => anyhow::bail!(abi_refusal(
+            path,
+            format_args!("it reports ABI version {reported:?}, which is not a version; {accepts}")
+        )),
+    };
+    if req.matches(&plugin) {
+        return Ok(());
+    }
+    if plugin > host {
+        anyhow::bail!(abi_refusal(
+            path,
+            format_args!("plugin {plugin}, newer than this heph, which is unsupported; {accepts}")
+        ));
+    }
+    anyhow::bail!(abi_refusal(
+        path,
+        format_args!("plugin {plugin}; {accepts}")
+    ))
 }
 
 /// An optional entry point. `None`, silently, when the plugin does not export
@@ -119,18 +197,17 @@ fn optional_entry<'l, T: stabby::IStable>(
 
 /// A plugin's exported drivers as host-side drivers, each under the local name
 /// it was exported with — the name the engine registers it by (prefixed with
-/// the plugin's). The plugin-side driver's own `config()` is never asked.
+/// the plugin's). The plugin-side driver's own `config()` is never asked. Fails
+/// on a driver whose schema does not decode.
 pub fn decode_drivers(
     drivers: impl IntoIterator<Item = NamedDriver>,
-) -> Vec<(String, StableRemoteManagedDriver)> {
+) -> anyhow::Result<Vec<(String, StableRemoteManagedDriver)>> {
     drivers
         .into_iter()
         .map(|nd| {
             let name = nd.name.to_string();
-            (
-                name.clone(),
-                StableRemoteManagedDriver::new(nd.driver, name),
-            )
+            let driver = StableRemoteManagedDriver::new(nd.driver, name.clone())?;
+            Ok((name, driver))
         })
         .collect()
 }
@@ -159,20 +236,21 @@ pub fn decode_functions(
         .into_iter()
         .map(|nf| {
             let name = nf.name.to_string();
-            let def = pb::FunctionDef::decode(&nf.meta[..])
+            let def = plugin_abi::decode::<pb::FunctionDef>(&nf.meta[..])
                 .with_context(|| format!("decoding the metadata of function {plugin}.{name}"))?;
-            if def.name != name {
+            let def_name = required(def.name, "FunctionDef.name")
+                .with_context(|| format!("function {plugin}.{name}"))?;
+            if def_name != name {
                 anyhow::bail!(
-                    "plugin {plugin:?} exports function {name:?} whose metadata names {:?}",
-                    def.name
+                    "plugin {plugin:?} exports function {name:?} whose metadata names {def_name:?}"
                 );
             }
-            let signature = def.signature.ok_or_else(|| {
-                anyhow::anyhow!("function {plugin}.{name} has no signature in its metadata")
-            })?;
+            let signature = required_msg(def.signature, "FunctionDef.signature")
+                .and_then(convert::fn_signature_from_pb)
+                .with_context(|| format!("the signature of function {plugin}.{name}"))?;
             Ok(PluginFnDef {
-                signature: convert::fn_signature_from_pb(signature),
-                doc: def.doc,
+                signature,
+                doc: def.doc.unwrap_or_default(),
                 func: Arc::new(StableRemoteFn {
                     handle: Arc::clone(&handle),
                     name: name.clone(),
@@ -191,8 +269,9 @@ pub fn decode_functions(
 /// trait objects' vtables live in the dylib's code, which must stay mapped for
 /// the process lifetime.
 ///
-/// `name` is the plugin's name, from its manifest. Its provider and functions
-/// are named after it; the binary reports no name.
+/// `cfg` is what the plugin's create entry receives. Its `name` is the plugin's
+/// name, from its manifest: its provider and functions are named after it; the
+/// binary reports no name.
 ///
 /// `runtime` is the engine's: host-side bodies the plugin calls into (the
 /// runner host's `prepare`, the function registry's `call_registered`) are
@@ -206,10 +285,7 @@ pub fn decode_functions(
 /// engines in one process never see each other's functions.
 pub fn load(
     path: &std::path::Path,
-    name: &str,
-    root: &str,
-    home: &str,
-    options: std::collections::HashMap<String, pb::Value>,
+    cfg: &convert::CreateConfig,
     runtime: tokio::runtime::Handle,
     functions: Arc<FunctionSlot>,
 ) -> anyhow::Result<LoadedComponents> {
@@ -217,20 +293,21 @@ pub fn load(
     use anyhow::Context;
     use stabby::libloading::StabbyLibrary;
 
-    // The create config crosses as prost bytes so its fields are additive; build it
-    // once here from the structured options (no nested encode).
-    let cfg = pb::CreateConfig {
-        root: root.to_string(),
-        home: home.to_string(),
-        options,
-        name: name.to_string(),
-    }
-    .encode_to_vec();
+    let name = cfg.name.as_str();
+    // The create config crosses as protobuf bytes so its fields are additive;
+    // the options ride it as structured values (no nested encode).
+    let cfg = convert::create_config_to_pb(cfg).encode_to_vec();
 
     // SAFETY: loading a plugin dylib runs its initializers; the path is operator-
     // controlled config. The ABI of what we call is checked below via get_stabbied.
     let lib = unsafe { libloading::Library::new(path) }
         .with_context(|| format!("dlopen plugin {}", path.display()))?;
+
+    // The plugin's ABI version, before anything else in it is called: a plugin
+    // from another ABI is refused here, once, rather than failing each call
+    // with whatever the skew happens to break (a wire-only break passes
+    // stabby's structural check below).
+    check_plugin_abi(path, plugin_abi_version(&lib).as_deref())?;
 
     // Scope the symbol borrow so the library can be leaked after the call.
     let comps: PluginComponents = {
@@ -306,9 +383,13 @@ pub fn load(
     )?;
     // `provider` is optional: hook-only / driver-only plugins export `None`.
     let provider: std::option::Option<DynProvider> = provider.into();
-    let host_provider = provider.map(|p| StableRemoteProvider::new(p, name));
+    let host_provider = provider
+        .map(|p| StableRemoteProvider::new(p, name))
+        .transpose()
+        .with_context(|| format!("loading plugin {name:?}"))?;
 
-    let host_drivers = decode_drivers(drivers);
+    let host_drivers =
+        decode_drivers(drivers).with_context(|| format!("loading plugin {name:?}"))?;
 
     let mut host_hooks = Vec::new();
     for nh in hooks {
@@ -332,9 +413,16 @@ pub fn load(
 }
 
 fn decode_unary(bytes: &[u8]) -> anyhow::Result<Body> {
-    pb::Frame::decode(bytes)?
-        .body
-        .ok_or_else(|| anyhow::anyhow!("empty stable response frame"))
+    use anyhow::Context as _;
+    let frame =
+        plugin_abi::decode::<pb::Frame>(bytes).context("decoding a stable response frame")?;
+    required(frame.body, "Frame.body")
+}
+
+/// The text of a wire `Error`. A missing message is an error with no text — an
+/// honest default, unlike a missing kind.
+fn error_text(e: pb::Error) -> String {
+    e.message.unwrap_or_default()
 }
 
 /// Host-side lazy adapter over a plugin response stream: each `next` pulls one
@@ -361,7 +449,7 @@ impl<T, D: FnMut(&[u8]) -> anyhow::Result<T>> Iterator for ItemStreamIter<D> {
             self.done = true;
             return None;
         }
-        let frame = match pb::Frame::decode(&bytes[..]) {
+        let frame = match plugin_abi::decode::<pb::Frame>(&bytes[..]) {
             Ok(f) => f,
             Err(e) => {
                 self.done = true;
@@ -369,14 +457,22 @@ impl<T, D: FnMut(&[u8]) -> anyhow::Result<T>> Iterator for ItemStreamIter<D> {
             }
         };
         match frame.body {
-            Some(Body::StreamItem(si)) => Some((self.decode)(&si.item)),
+            Some(Body::StreamItem(si)) => match si.item {
+                Some(item) => Some((self.decode)(&item)),
+                None => {
+                    self.done = true;
+                    Some(Err(anyhow::anyhow!("missing field StreamItem.item")))
+                }
+            },
             Some(Body::StreamEnd(se)) => {
                 self.done = true;
-                se.error.map(|e| Err(anyhow::anyhow!("{}", e.message)))
+                se.error
+                    .into_option()
+                    .map(|e| Err(anyhow::anyhow!("{}", error_text(e))))
             }
             Some(Body::Error(e)) => {
                 self.done = true;
-                Some(Err(anyhow::anyhow!("{}", e.message)))
+                Some(Err(anyhow::anyhow!("{}", error_text(*e))))
             }
             _ => {
                 self.done = true;
@@ -402,25 +498,27 @@ fn list_item_decoder() -> impl FnMut(&[u8]) -> anyhow::Result<ListResponse> + Se
 }
 
 /// A malformed `ListedFacts` fails the whole item, and so the provider's
-/// `list` — prost decodes nested messages eagerly. An absent one (a plugin
-/// older than ABI 0.13, or `addr_only`) is every fact unknown, never a prune.
+/// `list` — nested messages decode eagerly. An absent one (a plugin older than
+/// ABI 0.13, or `addr_only`) is every fact unknown, never a prune. A missing
+/// `addr` fails the item too: there is no target to list.
 fn decode_list_item(
     b: &[u8],
     intern: &mut impl FnMut(String) -> Arc<str>,
 ) -> anyhow::Result<ListResponse> {
     use anyhow::Context as _;
-    let lr = pb::ListResponse::decode(b).context("decoding a listed target")?;
-    let addr = convert::addr_from_pb(lr.addr.unwrap_or_default());
-    Ok(ListResponse::with_facts(
-        addr,
-        convert::listed_facts_from_pb(lr.facts, intern),
-    ))
+    let lr = plugin_abi::decode::<pb::ListResponse>(b).context("decoding a listed target")?;
+    let addr = convert::addr_field(lr.addr, "ListResponse.addr")?;
+    let facts = convert::listed_facts_from_pb(lr.facts.into_option(), intern)
+        .with_context(|| format!("the listed facts of {}", addr.format()))?;
+    Ok(ListResponse::with_facts(addr, facts))
 }
 
 fn decode_list_package_item(b: &[u8]) -> anyhow::Result<ListPackageResponse> {
-    let lpr = pb::ListPackageResponse::decode(b)?;
+    use anyhow::Context as _;
+    let lpr =
+        plugin_abi::decode::<pb::ListPackageResponse>(b).context("decoding a listed package")?;
     Ok(ListPackageResponse {
-        pkg: PkgBuf::from(lpr.pkg),
+        pkg: PkgBuf::from(required(lpr.pkg, "ListPackageResponse.pkg")?),
     })
 }
 
@@ -470,24 +568,28 @@ fn drain_run(
         if bytes.is_empty() {
             anyhow::bail!("run stream ended without a result");
         }
-        match pb::RunOutFrame::decode(&bytes[..])?.msg {
+        let frame = {
+            use anyhow::Context as _;
+            plugin_abi::decode::<pb::RunOutFrame>(&bytes[..]).context("decoding a run frame")?
+        };
+        match frame.msg {
             Some(pb::run_out_frame::Msg::Response(r)) => {
                 return Ok(ManagedRunResponse {
                     artifacts: r
                         .artifacts
                         .into_iter()
                         .map(convert::output_artifact_from_pb)
-                        .collect(),
+                        .collect::<anyhow::Result<_>>()?,
                 });
             }
             Some(pb::run_out_frame::Msg::Error(e)) => anyhow::bail!("{e}"),
             // A dropped receiver means the caller stopped reading; keep draining
             // so the run still reaches its result.
             Some(pb::run_out_frame::Msg::StdoutChunk(b)) => {
-                drop(chunks.send(Chunk::Stdout(b.to_vec())));
+                drop(chunks.send(Chunk::Stdout(b)));
             }
             Some(pb::run_out_frame::Msg::StderrChunk(b)) => {
-                drop(chunks.send(Chunk::Stderr(b.to_vec())));
+                drop(chunks.send(Chunk::Stderr(b)));
             }
             None => {}
         }
@@ -534,14 +636,29 @@ fn driver_cancel(inner: &Arc<DynManagedDriver>, request_id: &str) -> impl FnOnce
 pub struct StableRemoteProvider {
     inner: Arc<DynProvider>,
     name: String,
+    /// Decoded once, at load: `state_schema` has no error channel, and the
+    /// plugin's answer never changes.
+    state_schema: Option<Arc<StateSchema>>,
 }
 
 impl StableRemoteProvider {
-    pub fn new(inner: DynProvider, name: impl Into<String>) -> Self {
-        Self {
+    /// Wrap a loaded provider, reading its state schema. A schema that does not
+    /// decode fails here — at load, naming the provider — like undecodable
+    /// function metadata, rather than reading as "no schema" on every call.
+    pub fn new(inner: DynProvider, name: impl Into<String>) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let name = name.into();
+        // An empty SVec encodes `None`; any encoded `Schema` (even fields-empty)
+        // encodes `Some`.
+        let state_schema =
+            decode_state_schema(&inner.meta(pb::ProviderMethod::StateSchema as u32)[..])
+                .with_context(|| format!("decoding the state schema of provider {name:?}"))?
+                .map(Arc::new);
+        Ok(Self {
             inner: Arc::new(inner),
-            name: name.into(),
-        }
+            name,
+            state_schema,
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -564,9 +681,10 @@ impl Provider for StableRemoteProvider {
     {
         Box::pin(async move {
             let pb_req = pb::ListRequest {
-                request_id: req.request_id,
-                package: req.package.as_str().to_string(),
+                request_id: Some(req.request_id),
+                package: Some(req.package.as_str().to_string()),
                 states: req.states.iter().map(convert::state_to_pb).collect(),
+                ..Default::default()
             }
             .encode_to_vec();
             // Server-streaming **with** the executor, so the plugin's `list` can
@@ -598,7 +716,8 @@ impl Provider for StableRemoteProvider {
     > {
         Box::pin(async move {
             let pb_req = pb::ListPackagesRequest {
-                prefix: req.prefix.as_str().to_string(),
+                prefix: Some(req.prefix.as_str().to_string()),
+                ..Default::default()
             }
             .encode_to_vec();
             let stream = self
@@ -623,9 +742,10 @@ impl Provider for StableRemoteProvider {
     ) -> BoxFuture<'a, std::result::Result<GetResponse, GetError>> {
         Box::pin(async move {
             let pb_req = pb::GetRequest {
-                request_id: req.request_id.clone(),
-                addr: Some(convert::addr_to_pb(&req.addr)),
+                request_id: Some(req.request_id.clone()),
+                addr: convert::addr_to_pb(&req.addr).into(),
                 states: req.states.iter().map(convert::state_to_pb).collect(),
+                ..Default::default()
             }
             .encode_to_vec();
             let exec: DynExecutor = wrap_executor(&req.executor);
@@ -637,22 +757,30 @@ impl Provider for StableRemoteProvider {
             let body = decode_unary(&bytes).map_err(GetError::Other)?;
             match body {
                 Body::GetResp(gr) => Ok(GetResponse {
-                    target_spec: convert::target_spec_from_pb(gr.target_spec.unwrap_or_default()),
+                    target_spec: required_msg(gr.target_spec, "GetResponse.target_spec")
+                        .and_then(convert::target_spec_from_pb)
+                        .map_err(GetError::Other)?,
                 }),
-                Body::GetErr(ge) => match pb::get_error::Kind::try_from(ge.kind)
-                    .unwrap_or(pb::get_error::Kind::Other)
-                {
-                    pb::get_error::Kind::NotFound => Err(GetError::NotFound),
-                    pb::get_error::Kind::Cycle => Err(GetError::Other(anyhow::Error::new(
+                // A missing or unknown kind is an error with the plugin's message:
+                // never `NotFound`, which would read as "no such target".
+                Body::GetErr(ge) => match required_enum(ge.kind, "GetError.kind") {
+                    Ok(pb::get_error::Kind::NotFound) => Err(GetError::NotFound),
+                    Ok(pb::get_error::Kind::Cycle) => Err(GetError::Other(anyhow::Error::new(
                         hplugin::error::CycleError {
                             from: req.addr.clone(),
                             to: req.addr.clone(),
                         },
                     ))),
-                    pb::get_error::Kind::Cancelled => Err(GetError::Other(anyhow::Error::new(
+                    Ok(pb::get_error::Kind::Cancelled) => Err(GetError::Other(anyhow::Error::new(
                         hplugin::error::CancelledError,
                     ))),
-                    _ => Err(GetError::Other(anyhow::anyhow!("{}", ge.message))),
+                    Ok(_) => Err(GetError::Other(anyhow::anyhow!(
+                        "{}",
+                        ge.message.unwrap_or_default()
+                    ))),
+                    Err(kind) => Err(GetError::Other(
+                        kind.context(ge.message.unwrap_or_default()),
+                    )),
                 },
                 other => Err(GetError::Other(anyhow::anyhow!(
                     "unexpected get response: {other:?}"
@@ -669,8 +797,9 @@ impl Provider for StableRemoteProvider {
         Box::pin(async move {
             let request_id = req.request_id.clone();
             let pb_req = pb::ProbeRequest {
-                request_id: req.request_id,
-                package: req.package.as_str().to_string(),
+                request_id: Some(req.request_id),
+                package: Some(req.package.as_str().to_string()),
+                ..Default::default()
             }
             .encode_to_vec();
             let fut = self
@@ -679,24 +808,16 @@ impl Provider for StableRemoteProvider {
             let bytes = await_with_cancel(ct, provider_cancel(&self.inner, &request_id), fut).await;
             match decode_unary(&bytes)? {
                 Body::ProbeResp(pr) => Ok(ProbeResponse {
-                    states: pr.states.into_iter().map(convert::state_from_pb).collect(),
+                    states: convert::states_from_pb(pr.states)?,
                 }),
-                Body::Error(e) => anyhow::bail!("{}", e.message),
+                Body::Error(e) => anyhow::bail!("{}", error_text(*e)),
                 other => anyhow::bail!("unexpected probe response: {other:?}"),
             }
         })
     }
 
     fn state_schema(&self) -> Option<StateSchema> {
-        // An empty SVec encodes `None`; any encoded `Schema` (even fields-empty)
-        // encodes `Some`.
-        let bytes = self.inner.meta(pb::ProviderMethod::StateSchema as u32);
-        if bytes.is_empty() {
-            return None;
-        }
-        pb::Schema::decode(&bytes[..])
-            .ok()
-            .map(convert::state_schema_from_pb)
+        self.state_schema.as_deref().cloned()
     }
 }
 
@@ -714,18 +835,16 @@ struct StableRemoteFn {
 #[async_trait]
 impl PluginFn for StableRemoteFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+        let (positional, named) = convert::fn_args_to_pb(&args);
         let pb_req = pb::CallFunctionRequest {
-            name: self.name.clone(),
-            pkg: ctx.pkg.to_string(),
-            root: ctx.root.to_string_lossy().into_owned(),
-            positional: args.positional.iter().map(convert::value_to_pb).collect(),
-            named: args
-                .named
-                .iter()
-                .map(|(k, v)| (k.clone(), convert::value_to_pb(v)))
-                .collect(),
+            name: Some(self.name.clone()),
+            pkg: Some(ctx.pkg.to_string()),
+            root: Some(ctx.root.to_string_lossy().into_owned()),
+            positional,
+            named,
             // The host merges declarations into the package being evaluated.
-            accepts_declarations: true,
+            accepts_declarations: Some(true),
+            ..Default::default()
         }
         .encode_to_vec();
         let bytes = self
@@ -737,8 +856,8 @@ impl PluginFn for StableRemoteFn {
             )
             .await;
         match decode_unary(&bytes)? {
-            Body::CallFunctionResp(r) => Ok(convert::fn_outcome_from_pb(r)),
-            Body::Error(e) => anyhow::bail!("{}", e.message),
+            Body::CallFunctionResp(r) => convert::fn_outcome_from_pb(*r),
+            Body::Error(e) => anyhow::bail!("{}", error_text(*e)),
             other => anyhow::bail!("unexpected call_function response: {other:?}"),
         }
     }
@@ -750,15 +869,41 @@ impl PluginFn for StableRemoteFn {
 pub struct StableRemoteManagedDriver {
     inner: Arc<DynManagedDriver>,
     name: String,
+    /// Decoded once, at load: `schema` has no error channel, and the plugin's
+    /// answer never changes.
+    schema: Arc<DriverSchema>,
 }
 
 impl StableRemoteManagedDriver {
-    pub fn new(inner: DynManagedDriver, name: impl Into<String>) -> Self {
-        Self {
+    /// Wrap a loaded driver, reading its config schema. A schema that does not
+    /// decode fails here — at load, naming the driver — rather than reading as
+    /// the empty schema on every call, which would flag each of the driver's
+    /// keys as unknown.
+    pub fn new(inner: DynManagedDriver, name: impl Into<String>) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let name = name.into();
+        let schema = decode_driver_schema(&inner.meta(pb::DriverMethod::Schema as u32)[..])
+            .with_context(|| format!("decoding the schema of driver {name:?}"))?;
+        Ok(Self {
             inner: Arc::new(inner),
-            name: name.into(),
-        }
+            name,
+            schema: Arc::new(schema),
+        })
     }
+}
+
+/// A provider's `StateSchema` meta answer. Empty bytes are "no schema"; any
+/// encoded `Schema` (even fields-empty) is one.
+fn decode_state_schema(bytes: &[u8]) -> anyhow::Result<Option<StateSchema>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    convert::state_schema_from_pb(plugin_abi::decode::<pb::Schema>(bytes)?).map(Some)
+}
+
+/// A driver's `Schema` meta answer.
+fn decode_driver_schema(bytes: &[u8]) -> anyhow::Result<DriverSchema> {
+    convert::driver_schema_from_pb(plugin_abi::decode::<pb::Schema>(bytes)?)
 }
 
 #[async_trait]
@@ -770,10 +915,7 @@ impl ManagedDriver for StableRemoteManagedDriver {
     }
 
     fn schema(&self) -> DriverSchema {
-        let bytes = self.inner.meta(pb::DriverMethod::Schema as u32);
-        pb::Schema::decode(&bytes[..])
-            .map(convert::driver_schema_from_pb)
-            .unwrap_or_default()
+        DriverSchema::clone(&self.schema)
     }
 
     async fn parse(
@@ -783,9 +925,10 @@ impl ManagedDriver for StableRemoteManagedDriver {
     ) -> anyhow::Result<ParseResponse> {
         let request_id = req.request_id.clone();
         let pb_req = pb::ParseRequest {
-            request_id: req.request_id,
-            target_spec: Some(convert::target_spec_to_pb(req.target_spec.as_ref())),
-            driver: self.name.clone(),
+            request_id: Some(req.request_id),
+            target_spec: convert::target_spec_to_pb(req.target_spec.as_ref()).into(),
+            driver: Some(self.name.clone()),
+            ..Default::default()
         }
         .encode_to_vec();
         let fut = self
@@ -794,9 +937,12 @@ impl ManagedDriver for StableRemoteManagedDriver {
         let bytes = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), fut).await;
         match decode_unary(&bytes)? {
             Body::ParseResp(pr) => Ok(ParseResponse {
-                target_def: convert::target_def_from_pb(pr.target_def.unwrap_or_default())?,
+                target_def: convert::target_def_from_pb(required_msg(
+                    pr.target_def,
+                    "ParseResponse.target_def",
+                )?)?,
             }),
-            Body::Error(e) => anyhow::bail!("{}", e.message),
+            Body::Error(e) => anyhow::bail!("{}", error_text(*e)),
             other => anyhow::bail!("unexpected parse response: {other:?}"),
         }
     }
@@ -808,10 +954,11 @@ impl ManagedDriver for StableRemoteManagedDriver {
     ) -> anyhow::Result<ApplyTransitiveResponse> {
         let request_id = req.request_id.clone();
         let pb_req = pb::ApplyTransitiveRequest {
-            request_id: req.request_id,
-            target_def: Some(convert::target_def_to_pb(&req.target_def)?),
-            sandbox: Some(convert::sandbox_to_pb(&req.sandbox)),
-            driver: self.name.clone(),
+            request_id: Some(req.request_id),
+            target_def: convert::target_def_to_pb(&req.target_def)?.into(),
+            sandbox: convert::sandbox_to_pb(&req.sandbox).into(),
+            driver: Some(self.name.clone()),
+            ..Default::default()
         }
         .encode_to_vec();
         let fut = self
@@ -820,9 +967,12 @@ impl ManagedDriver for StableRemoteManagedDriver {
         let bytes = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), fut).await;
         match decode_unary(&bytes)? {
             Body::ApplyTransitiveResp(r) => Ok(ApplyTransitiveResponse {
-                target_def: convert::target_def_from_pb(r.target_def.unwrap_or_default())?,
+                target_def: convert::target_def_from_pb(required_msg(
+                    r.target_def,
+                    "ApplyTransitiveResponse.target_def",
+                )?)?,
             }),
-            Body::Error(e) => anyhow::bail!("{}", e.message),
+            Body::Error(e) => anyhow::bail!("{}", error_text(*e)),
             other => anyhow::bail!("unexpected apply_transitive response: {other:?}"),
         }
     }
@@ -866,16 +1016,16 @@ impl StableRemoteManagedDriver {
         let request_id = req.request.request_id.clone();
         let deferred = convert::deferred_to_pb(&req.request.deferred)?;
         let pmrr = pb::ManagedRunRequest {
-            request_id: req.request.request_id.clone(),
-            target: Some(convert::target_def_to_pb(req.request.target)?),
-            tree_root_path: req.request.tree_root_path.to_string_lossy().into_owned(),
-            hashin: req.request.hashin.to_string(),
-            sandbox_dir: req.sandbox_dir.to_string_lossy().into_owned(),
-            sandbox_ws_dir: req.sandbox_ws_dir.to_string_lossy().into_owned(),
-            sandbox_pkg_dir: req.sandbox_pkg_dir.to_string_lossy().into_owned(),
+            request_id: Some(req.request.request_id.clone()),
+            target: convert::target_def_to_pb(req.request.target)?.into(),
+            tree_root_path: Some(req.request.tree_root_path.to_string_lossy().into_owned()),
+            hashin: Some(req.request.hashin.to_string()),
+            sandbox_dir: Some(req.sandbox_dir.to_string_lossy().into_owned()),
+            sandbox_ws_dir: Some(req.sandbox_ws_dir.to_string_lossy().into_owned()),
+            sandbox_pkg_dir: Some(req.sandbox_pkg_dir.to_string_lossy().into_owned()),
             inputs: req.inputs.iter().map(managed_input_to_pb).collect(),
-            shell,
-            driver: self.name.clone(),
+            shell: Some(shell),
+            driver: Some(self.name.clone()),
             scratch: req
                 .request
                 .scratch
@@ -889,11 +1039,13 @@ impl StableRemoteManagedDriver {
                 .map(convert::credential_mount_to_pb)
                 .collect(),
             deferred,
+            ..Default::default()
         };
         // `run` is bidi: the request stream carries the run request (RunInFrame),
         // the response stream carries the result (RunOutFrame). `shell` rides pmrr.
         let in_frame = pb::RunInFrame {
-            msg: Some(pb::run_in_frame::Msg::Start(pmrr)),
+            msg: Some(pb::run_in_frame::Msg::from(pmrr)),
+            ..Default::default()
         }
         .encode_to_vec();
         let resp_stream = self
@@ -986,8 +1138,12 @@ fn host_channel_item_stream(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> DynItemSt
 fn event_frame(ev: &hcore::events::BuildEvent) -> Vec<u8> {
     let item = serde_json::to_vec(ev).unwrap_or_default();
     pb::Frame {
-        id: 0,
-        body: Some(Body::StreamItem(pb::StreamItem { item: item.into() })),
+        id: Some(0),
+        body: Some(Body::from(pb::StreamItem {
+            item: Some(item),
+            ..Default::default()
+        })),
+        ..Default::default()
     }
     .encode_to_vec()
 }
@@ -1044,7 +1200,7 @@ impl Hook for StableRemoteHook {
         }
         // Encode BEFORE taking the lock. This is the engine's emit chokepoint —
         // every event of every target passes through it — and `event_frame` is a
-        // serde-JSON render plus a prost encode. Holding the state mutex across
+        // serde-JSON render plus a protobuf encode. Holding the state mutex across
         // that serializes all emitters behind the slowest one, which is exactly
         // what `hplugin::hook`'s contract says a hook must not do. The lock only
         // guards the lazily-opened stream handle; it does not order frames (the
@@ -1107,9 +1263,9 @@ fn managed_input_to_pb(mi: &ManagedRunInput) -> pb::ManagedRunInput {
         inputartifact::Type::Support => pb::InputArtifactType::Support,
     };
     pb::ManagedRunInput {
-        r#type: ty as i32,
-        origin_id: mi.input.origin_id.clone(),
-        source_addr: Some(convert::addr_to_pb(&mi.input.source_addr)),
+        r#type: Some(ty.into()),
+        origin_id: Some(mi.input.origin_id.clone()),
+        source_addr: convert::addr_to_pb(&mi.input.source_addr).into(),
         filters: mi.input.filters.clone(),
         annotations: mi
             .input
@@ -1117,21 +1273,170 @@ fn managed_input_to_pb(mi: &ManagedRunInput) -> pb::ManagedRunInput {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        unpack_root: mi.unpack_root.to_string_lossy().into_owned(),
+        unpack_root: Some(mi.unpack_root.to_string_lossy().into_owned()),
         list_path: mi
             .list_path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
-        // Empty on error rather than failing the run: most drivers never read
-        // it, and one that does must refuse an empty hashout anyway, since an
-        // old host sends none at all.
-        hashout: mi.input.artifact.content.hashout().unwrap_or_default(),
+        // Absent when the host could not read one (or the artifact has none),
+        // rather than failing the run: most drivers never read it, and one that
+        // does must refuse a missing hashout anyway.
+        hashout: mi
+            .input
+            .artifact
+            .content
+            .hashout()
+            .ok()
+            .and_then(|h| convert::absent_if_empty(&h)),
+        ..Default::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refusal(reported: Option<&str>) -> String {
+        let path = std::path::Path::new("/p/libdrift.so");
+        format!(
+            "{:#}",
+            check_plugin_abi(path, reported).expect_err("must be refused")
+        )
+    }
+
+    /// The host's own version is in its lane. A break that bumps the minor
+    /// without raising `MIN_PLUGIN_ABI` (or raises MIN past the host) fails
+    /// here, rather than shipping a host that refuses its own plugins.
+    #[test]
+    fn the_host_abi_is_in_its_own_lane() {
+        let host = semver::Version::parse(plugin_abi::ABI_SEMVER).expect("ABI_SEMVER");
+        let req = accepted_plugin_abi().expect("MIN_PLUGIN_ABI");
+        assert!(req.matches(&host), "ABI_SEMVER {host} does not match {req}");
+        let min = semver::Version::parse(plugin_abi::MIN_PLUGIN_ABI).expect("MIN_PLUGIN_ABI");
+        assert_eq!(min.patch, 0, "MIN_PLUGIN_ABI is the break's x.y.0");
+    }
+
+    /// Patches are additive: any patch in the host's minor loads, older or
+    /// newer than the host.
+    #[test]
+    fn a_plugin_in_the_accepted_lane_loads() {
+        let path = std::path::Path::new("/p/libok.so");
+        let host = semver::Version::parse(plugin_abi::ABI_SEMVER).expect("ABI_SEMVER");
+        let newer_patch = format!("{}.{}.{}", host.major, host.minor, host.patch + 7);
+        for v in [
+            plugin_abi::ABI_SEMVER,
+            plugin_abi::MIN_PLUGIN_ABI,
+            &newer_patch,
+        ] {
+            check_plugin_abi(path, Some(v)).unwrap_or_else(|e| panic!("{v} in lane: {e:#}"));
+        }
+    }
+
+    /// A later minor is a break: refused, as newer than this heph.
+    #[test]
+    fn a_plugin_from_the_next_minor_is_refused() {
+        let host = semver::Version::parse(plugin_abi::ABI_SEMVER).expect("ABI_SEMVER");
+        let next = format!("{}.{}.0", host.major, host.minor + 1);
+        let msg = refusal(Some(&next));
+        assert!(
+            msg.contains(&format!(
+                "plugin {next}, newer than this heph, which is unsupported"
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("which loads ^{}", plugin_abi::MIN_PLUGIN_ABI)),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_plugin_without_a_version_is_refused_as_predating_the_check() {
+        let msg = refusal(None);
+        for want in [
+            "plugin /p/libdrift.so was built against a different heph ABI",
+            "it reports no ABI version, so it predates 0.17.0",
+            &format!("host {}", plugin_abi::ABI_SEMVER),
+            "rebuild it against this heph",
+        ] {
+            assert!(msg.contains(want), "missing {want:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn an_older_or_newer_plugin_is_refused_naming_both_versions() {
+        let msg = refusal(Some("0.16.0"));
+        for want in [
+            "plugin /p/libdrift.so",
+            "(plugin 0.16.0; host ",
+            plugin_abi::ABI_SEMVER,
+            "rebuild it against this heph",
+        ] {
+            assert!(msg.contains(want), "missing {want:?}: {msg}");
+        }
+        let msg = refusal(Some("1.0.0"));
+        assert!(
+            msg.contains("plugin 1.0.0, newer than this heph, which is unsupported"),
+            "{msg}"
+        );
+    }
+
+    /// Semver, not strings: "0.9.0" sorts after "0.17.0" as text, and a
+    /// pre-release of the minimum is below it.
+    #[test]
+    fn versions_compare_as_semver() {
+        assert!(refusal(Some("0.9.0")).contains("(plugin 0.9.0; host "));
+        let pre = format!("{}-rc.1", plugin_abi::MIN_PLUGIN_ABI);
+        assert!(refusal(Some(&pre)).contains(&format!("(plugin {pre}; host ")));
+    }
+
+    /// A schema is decoded once, at load, and one that does not decode fails
+    /// the load instead of reading as "no schema" (every driver key unknown).
+    #[test]
+    fn an_undecodable_schema_is_an_error_not_a_default() {
+        let string =
+            || convert::param_type_to_pb(&hcore::htvalue::signature::ParamType::String).into();
+        let unnamed_field = pb::Schema {
+            fields: vec![pb::SchemaField {
+                ty: string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for bytes in [&[0xff][..], &unnamed_field[..]] {
+            decode_driver_schema(bytes).expect_err("driver schema");
+            decode_state_schema(bytes).expect_err("state schema");
+        }
+        assert!(decode_state_schema(&[]).expect("empty").is_none());
+        let named = pb::Schema {
+            fields: vec![pb::SchemaField {
+                name: Some("args".into()),
+                ty: string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(
+            decode_driver_schema(&named).expect("decodes").fields.len(),
+            1
+        );
+        assert!(decode_state_schema(&named).expect("decodes").is_some());
+    }
+
+    #[test]
+    fn an_unparsable_version_is_refused() {
+        for bad in ["", "0.17", "v0.17.0", "zero"] {
+            let msg = refusal(Some(bad));
+            assert!(
+                msg.contains(&format!(
+                    "reports ABI version {bad:?}, which is not a version"
+                )),
+                "{msg}"
+            );
+        }
+    }
 
     /// A functions handle no test calls: D11 fails before any call.
     struct NeverCalled;
@@ -1187,22 +1492,22 @@ mod tests {
     #[test]
     fn function_without_signature_fails_load() {
         let meta = pb::FunctionDef {
-            name: "rule".into(),
-            signature: None,
-            doc: String::new(),
+            name: Some("rule".into()),
+            ..Default::default()
         }
         .encode_to_vec();
         let err = decode_functions("gen", vec![named("rule", &meta)], handle())
             .err()
             .expect("a missing signature must fail the load");
         let msg = format!("{err:#}");
-        assert!(msg.contains("gen.rule has no signature"), "{msg}");
+        assert!(msg.contains("gen.rule"), "{msg}");
+        assert!(msg.contains("missing field FunctionDef.signature"), "{msg}");
 
         // Functions without a handle to call them through fail as well.
         let meta = pb::FunctionDef {
-            name: "rule".into(),
-            signature: Some(signature()),
-            doc: String::new(),
+            name: Some("rule".into()),
+            signature: signature().into(),
+            ..Default::default()
         }
         .encode_to_vec();
         let err = decode_functions("gen", vec![named("rule", &meta)], None)
@@ -1251,14 +1556,18 @@ mod tests {
             list_path: None,
             unpack_root: std::path::PathBuf::from("/unused"),
         };
-        assert_eq!(managed_input_to_pb(&mi).hashout, "abc123");
+        let wire = managed_input_to_pb(&mi);
+        assert_eq!(wire.hashout.as_deref(), Some("abc123"));
+        // No file list (a Support input's shape) crosses as absent, not `""`,
+        // which the guest refuses as malformed.
+        assert_eq!(wire.list_path, None);
     }
 
     fn addr() -> pb::Addr {
         pb::Addr {
-            package: "p".into(),
-            name: "t".into(),
-            args: Default::default(),
+            package: Some("p".into()),
+            name: Some("t".into()),
+            ..Default::default()
         }
     }
 
@@ -1270,19 +1579,22 @@ mod tests {
     fn old_plugin_listing_decodes_unknown_and_drivers_are_interned() {
         let mut decode = list_item_decoder();
         let old = pb::ListResponse {
-            addr: Some(addr()),
-            facts: None,
+            addr: addr().into(),
+            ..Default::default()
         };
         let item = decode(&old.encode_to_vec()).expect("decoding a ListResponse");
         assert!(item.facts.is_unknown());
 
         let with = |driver: &str| pb::ListResponse {
-            addr: Some(addr()),
-            facts: Some(pb::ListedFacts {
-                labels: Some(pb::StringSet { values: vec![] }),
+            addr: addr().into(),
+            facts: pb::ListedFacts {
+                labels: pb::StringSet::default().into(),
                 driver: Some(driver.to_string()),
                 has_codegen: Some(false),
-            }),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
         };
         let a = decode(&with("bash").encode_to_vec()).expect("decode");
         let b = decode(&with("bash").encode_to_vec()).expect("decode");
@@ -1301,9 +1613,32 @@ mod tests {
     /// C33: a malformed nested `ListedFacts` fails the item, so the `list`.
     #[test]
     fn malformed_listed_facts_fails_the_item() {
+        // Field 1 (`addr`), then field 4 (`facts`) two bytes long:
+        // `has_codegen`'s tag, then a varint running past the message's end.
+        use buffa::encoding::{Tag, WireType};
+        use buffa::types::put_len_delimited_header;
+        let addr = addr().encode_to_vec();
         let mut wire = Vec::new();
-        prost::encoding::message::encode(1, &addr(), &mut wire);
-        wire.extend_from_slice(&[0x22, 0x02, 0x18, 0xFF]);
+        put_len_delimited_header(1, addr.len() as u64, &mut wire);
+        wire.extend_from_slice(&addr);
+        let mut facts = Vec::new();
+        Tag::new(3, WireType::Varint).encode(&mut facts);
+        facts.push(0xFF); // a continuation bit with nothing after it
+        put_len_delimited_header(4, facts.len() as u64, &mut wire);
+        wire.extend_from_slice(&facts);
         assert!(list_item_decoder()(&wire).is_err());
+    }
+
+    /// A listing with no `addr` lists no target: an error, not the root
+    /// package's empty-named target.
+    #[test]
+    fn a_listing_without_an_addr_fails_the_item() {
+        let err = list_item_decoder()(&pb::ListResponse::default().encode_to_vec())
+            .err()
+            .expect("no addr");
+        assert!(
+            format!("{err:#}").contains("missing field ListResponse.addr"),
+            "{err:#}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // BUILD-file functions: `heph.<plugin>.<fn>(…)`. A function is a component of a
 // plugin (next to its provider, drivers, hooks and runners), not a method on a
@@ -24,31 +24,32 @@ enum FunctionMethod {
 }
 
 // Mirrors signature::Param. An unset `default` means the parameter is required.
+// `name` and `ty` are required (as is `FnSignature.returns`).
 message Param {
   string name = 1;
   ParamType ty = 2;
-  optional Value default = 3;
+  Value default = 3;
 }
 
 // Mirrors signature::FnSignature.
 message FnSignature {
   repeated Param positional = 1;
   repeated Param named = 2;
-  optional Param variadic = 3;
+  Param variadic = 3;
   ParamType returns = 4;
 }
 
 // Mirrors function::PluginFnDef sans its handler (which stays guest-side and is
 // reached through the plugin's functions handle). Carried as the `meta` bytes
-// of a `NamedFunction`; a missing `signature` fails the plugin's load.
+// of a `NamedFunction`; a missing `name` or `signature` fails the plugin's load.
 message FunctionDef {
   string name = 1;
   FnSignature signature = 2;
   string doc = 3;
 }
 
-// Invoke a function by name. `pkg`/`root` reconstruct the FnCallContext;
-// `positional`/`named` are the call arguments.
+// Invoke a function by name. `pkg`/`root` reconstruct the FnCallContext and
+// are required; `positional`/`named` are the call arguments.
 message CallFunctionRequest {
   string name = 1;
   string pkg = 2;
@@ -61,11 +62,12 @@ message CallFunctionRequest {
   // Load-bearing, not informational. An older caller does not send the field,
   // so it decodes as `false` — "cannot carry them" — and a callee that declared
   // must fail the call rather than answer with the value alone, which would
-  // drop the declarations silently (prost skips fields the reader doesn't know).
+  // drop the declarations silently (a reader skips fields it doesn't know).
   // The flag, not the ABI version, is what a callee tests.
   bool accepts_declarations = 6;
 }
 message CallFunctionResponse {
+  // Required: a function always returns a value, null included.
   Value value = 1;
   // What the call declared, merged by the host into the package being
   // evaluated. Only ever non-empty when the request set
@@ -78,8 +80,10 @@ message CallFunctionResponse {
 // `target()` builtin. The host merges it into the package being evaluated, as
 // if that BUILD file had written the `target(...)` call itself.
 message DeclaredTarget {
+  // Required.
   string name = 1;
-  // Empty falls back to the package's provider default, same as `target()`.
+  // Absent falls back to the package's provider default, same as `target()`
+  // without one. A present driver is never empty: "" fails the declaration.
   string driver = 2;
   repeated string labels = 3;
   // The *unparsed* `transitive = {…}` map, parsed host-side by the same code
@@ -94,14 +98,15 @@ message DeclaredTarget {
 }
 
 // Package-level provider state a plugin function declared, mirroring the
-// `provider_state(provider=…, **args)` builtin.
+// `provider_state(provider=…, **args)` builtin. `provider` is required.
 message DeclaredState {
   string provider = 1;
   map<string, Value> args = 2;
 }
 
 // Invoke another plugin's function through the host registry (the inverse of
-// CallFunctionRequest: the addressing carries the owning `plugin`).
+// CallFunctionRequest: the addressing carries the owning `plugin`). `plugin`,
+// `name`, `pkg` and `root` are required.
 message CallRegisteredRequest {
   // Was `provider` before 0.16.0; same number, so the wire is unchanged.
   string plugin = 1;

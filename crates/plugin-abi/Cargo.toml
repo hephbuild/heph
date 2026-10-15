@@ -7,7 +7,10 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-hproto-gen = { package = "proto-gen", path = "../../gen/proto", features = ["proto_full"] }
+hproto-gen = { package = "proto-gen", path = "../../gen/proto" }
+# The generated code's runtime, already linked through `hproto-gen`; named here
+# for `decode`'s options.
+buffa = { workspace = true }
 anyhow = "1.0.102"
 # convert feature: conversions between pb wire types and the in-process
 # hplugin/hmodel/hcore types. Optional so the bare wire crate stays light.
@@ -16,10 +19,11 @@ hmodel = { package = "model", path = "../model", optional = true }
 hcore = { package = "core", path = "../core", optional = true }
 serde_json = { version = "1.0", optional = true }
 serde_yaml = { version = "0.9", optional = true }
-prost = { version = "0.14", optional = true }
+# A decoder that drops something (a malformed scratch mount) says so.
+tracing = { version = "0.1", optional = true }
 
 [features]
-convert = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:serde_json", "dep:serde_yaml", "dep:prost"]
+convert = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:serde_json", "dep:serde_yaml", "dep:tracing"]
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

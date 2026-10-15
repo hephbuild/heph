@@ -16,11 +16,11 @@ use plugin_sdk::stabby::abi::{
 };
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    named_managed_driver, options_from_pb_map,
+    named_managed_driver,
 };
 
-/// Stable ABI create entry. `cfg` is prost-encoded `pb::CreateConfig`; the
-/// `bin:` option is read out of it so a workspace can pin which `devenv` it
+/// Stable ABI create entry. `cfg` is the encoded create config; the `bin:`
+/// option is read out of it so a workspace can pin which `devenv` it
 /// resolves against rather than taking whatever is on `PATH`. The plugin has no
 /// functions, so the engine's function registry goes unused.
 #[stabby::export]
@@ -57,7 +57,15 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);
 }
 
-/// Stable ABI log-filter entry: the host's filter as prost `pb::LogFilter` bytes,
+/// ABI version entry: the host reads it before anything else and refuses this
+/// plugin if it was built for an ABI the host does not load. A plain C symbol,
+/// so it reads the same whatever stabby layout either side has.
+#[unsafe(no_mangle)]
+pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
+    plugin_sdk::stabby::abi_semver()
+}
+
+/// Stable ABI log-filter entry: the host's filter as protobuf `LogFilter` bytes,
 /// so events it would discard are dropped here instead of forwarded.
 #[stabby::export]
 pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
@@ -84,8 +92,7 @@ pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
 }
 
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
-    let cfg = create_config_from_bytes(cfg)?;
-    let opts = options_from_pb_map(cfg.options);
+    let opts = create_config_from_bytes(cfg)?.options;
     let mut drivers = stabby::vec::Vec::new();
     drivers.push(named_managed_driver(plugindevenv::Driver::from_options(
         &opts,

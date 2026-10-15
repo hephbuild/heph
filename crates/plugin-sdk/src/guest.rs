@@ -3,6 +3,7 @@
 //! are direct stabby vtable dispatch into the host, no serialization.
 
 use anyhow::{Context, Result};
+use buffa::Message;
 use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry};
 use hmodel::htaddr::Addr;
@@ -14,7 +15,6 @@ use hplugin_stabby::abi::{
     DynArtifact, DynExecutor, DynRead, StableAddr, StableArtifactContentDyn, StableExecutorDyn,
     StableReadDyn,
 };
-use prost::Message;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -123,9 +123,12 @@ impl ProviderExecutor for GuestExecutor {
             if r.ok {
                 let mut out = Vec::with_capacity(r.states.len());
                 for b in r.states.iter() {
-                    let pb = plugin_abi::pb::State::decode(&b[..])
+                    let pb = plugin_abi::decode::<plugin_abi::pb::State>(&b[..])
                         .context("decoding pb::State from host states_under callback")?;
-                    out.push(plugin_abi::convert::state_from_pb(pb));
+                    out.push(
+                        plugin_abi::convert::state_from_pb(pb)
+                            .context("decoding a state from the host states_under callback")?,
+                    );
                 }
                 Ok(out)
             } else {

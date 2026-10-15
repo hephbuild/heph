@@ -174,22 +174,21 @@ pub fn install_log_sink(sink: DynLogSink) {
     drop(subscriber.try_init());
 }
 
-/// Apply the host's log filter: prost-encoded `pb::LogFilter` bytes, as the host
-/// hands them to `heph_plugin_set_log_filter`. Events it rejects are dropped here
-/// instead of being formatted and sent to a host that would discard them. May be
-/// called again (the latest wins), before or after [`install_log_sink`]. Bytes that
-/// do not decode leave the filter as it was — over-forwarding is the safe failure,
-/// since the host filters again.
+/// Apply the host's log filter: protobuf-encoded `pb::LogFilter` bytes, as the
+/// host hands them to `heph_plugin_set_log_filter`. Events it rejects are dropped
+/// here instead of being formatted and sent to a host that would discard them.
+/// May be called again (the latest wins), before or after [`install_log_sink`].
+/// Bytes that do not decode, or a directive with no `target_prefix`, leave the
+/// filter as it was — over-forwarding is the safe failure, since the host
+/// filters again.
 pub fn install_log_filter(bytes: &[u8]) {
-    use prost::Message;
-    let filter = match plugin_abi::pb::LogFilter::decode(bytes) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "ignoring undecodable host log filter");
-            return;
-        }
-    };
-    set_filter(&HOST_FILTER, targets(&filter));
+    let targets = plugin_abi::decode::<plugin_abi::pb::LogFilter>(bytes)
+        .map_err(anyhow::Error::from)
+        .and_then(|f| targets(&f));
+    match targets {
+        Ok(t) => set_filter(&HOST_FILTER, t),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "ignoring undecodable host log filter"),
+    }
 }
 
 fn set_filter(slot: &HostFilter, targets: Targets) {
@@ -204,32 +203,37 @@ fn set_filter(slot: &HostFilter, targets: Targets) {
 }
 
 /// `pb::LogFilter` as a `Targets`, whose matching is the proto's: the longest
-/// target prefix wins, else the default. An unspecified or unknown level reads as
-/// TRACE, and a prefix sent twice keeps its more verbose level — forward rather
-/// than drop.
-fn targets(filter: &plugin_abi::pb::LogFilter) -> Targets {
+/// target prefix wins, else the default. An absent, unspecified or unknown level
+/// reads as TRACE, and a prefix sent twice keeps its more verbose level — forward
+/// rather than drop. A directive with no prefix is malformed: reading it as `""`
+/// (every target) could narrow what is forwarded.
+fn targets(filter: &plugin_abi::pb::LogFilter) -> anyhow::Result<Targets> {
     let mut merged: std::collections::HashMap<&str, LevelFilter> = Default::default();
     for d in &filter.directives {
         let level = level_filter(d.level);
+        let prefix = d
+            .target_prefix
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("missing field LogFilter.Directive.target_prefix"))?;
         merged
-            .entry(d.target_prefix.as_str())
+            .entry(prefix)
             .and_modify(|l| *l = (*l).max(level))
             .or_insert(level);
     }
-    Targets::new()
+    Ok(Targets::new()
         .with_default(level_filter(filter.default_level))
-        .with_targets(merged.into_iter().map(|(t, l)| (t.to_string(), l)))
+        .with_targets(merged.into_iter().map(|(t, l)| (t.to_string(), l))))
 }
 
-fn level_filter(level: i32) -> LevelFilter {
+fn level_filter(level: Option<buffa::EnumValue<plugin_abi::pb::log_filter::Level>>) -> LevelFilter {
     use plugin_abi::pb::log_filter::Level as L;
-    match L::try_from(level) {
-        Ok(L::Off) => LevelFilter::OFF,
-        Ok(L::Error) => LevelFilter::ERROR,
-        Ok(L::Warn) => LevelFilter::WARN,
-        Ok(L::Info) => LevelFilter::INFO,
-        Ok(L::Debug) => LevelFilter::DEBUG,
-        Ok(L::Trace | L::Unspecified) | Err(_) => LevelFilter::TRACE,
+    match level.and_then(|l| l.as_known()) {
+        Some(L::Off) => LevelFilter::OFF,
+        Some(L::Error) => LevelFilter::ERROR,
+        Some(L::Warn) => LevelFilter::WARN,
+        Some(L::Info) => LevelFilter::INFO,
+        Some(L::Debug) => LevelFilter::DEBUG,
+        Some(L::Trace | L::Unspecified) | None => LevelFilter::TRACE,
     }
 }
 
@@ -290,20 +294,22 @@ mod tests {
     /// A filter as a host in any language would send it.
     fn pb_filter(default: L, directives: &[(&str, L)]) -> pb::LogFilter {
         pb::LogFilter {
-            default_level: default.into(),
+            default_level: Some(default.into()),
             directives: directives
                 .iter()
                 .map(|(prefix, level)| pb::log_filter::Directive {
-                    target_prefix: (*prefix).to_string(),
-                    level: (*level).into(),
+                    target_prefix: Some((*prefix).to_string()),
+                    level: Some((*level).into()),
+                    ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
     fn slot_with(filter: &pb::LogFilter) -> &'static HostFilter {
         let slot = new_slot();
-        set_filter(slot, targets(filter));
+        set_filter(slot, targets(filter).expect("well-formed filter"));
         slot
     }
 
@@ -359,8 +365,14 @@ mod tests {
     fn unknown_or_unspecified_level_forwards() {
         let mut filter = pb_filter(L::Unspecified, &[]);
         filter.directives.push(pb::log_filter::Directive {
-            target_prefix: "future".to_string(),
-            level: 99,
+            target_prefix: Some("future".to_string()),
+            level: Some(99.into()),
+            ..Default::default()
+        });
+        // …and a directive that names no level at all.
+        filter.directives.push(pb::log_filter::Directive {
+            target_prefix: Some("silent".to_string()),
+            ..Default::default()
         });
         let seen = forwarded_through(slot_with(&filter), || {
             tracing::trace!(target: "anything", "kept");
@@ -379,7 +391,10 @@ mod tests {
         let emit = || tracing::debug!(target: "late_filter_test", "hello");
         let seen = forwarded_through(slot, || {
             emit();
-            set_filter(slot, targets(&pb_filter(L::Info, &[])));
+            set_filter(
+                slot,
+                targets(&pb_filter(L::Info, &[])).expect("well-formed filter"),
+            );
             emit();
         });
         assert_eq!(seen.len(), 1);
@@ -411,8 +426,15 @@ mod tests {
     /// The exported entry: valid bytes set the filter; garbage leaves it alone.
     #[test]
     fn install_log_filter_decodes_and_ignores_garbage() {
-        use prost::Message;
+        use buffa::Message;
         install_log_filter(&[0xff, 0xff, 0xff]);
+        assert!(HOST_FILTER.read().expect("lock").is_none());
+        // A directive with no prefix is malformed, not "every target".
+        let mut no_prefix = pb_filter(L::Warn, &[]);
+        no_prefix
+            .directives
+            .push(pb::log_filter::Directive::default());
+        install_log_filter(&no_prefix.encode_to_vec());
         assert!(HOST_FILTER.read().expect("lock").is_none());
         install_log_filter(&pb_filter(L::Warn, &[]).encode_to_vec());
         let set = HOST_FILTER.read().expect("lock").clone();

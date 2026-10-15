@@ -29,10 +29,10 @@ use plugin_sdk::stabby::{
 use std::sync::Arc;
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
-/// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
-/// `pb::CreateConfig` bytes; this plugin reads its `name` and the resolved heph
-/// `home` out of it. The oci plugin exports no functions, so the engine's
-/// function registry goes unused.
+/// host's `get_stabbied` checks for ABI compatibility. `cfg` is the encoded
+/// create config; this plugin reads its `name` and the resolved heph `home` out
+/// of it. The oci plugin exports no functions, so the engine's function
+/// registry goes unused.
 ///
 /// Nothing here aborts: the log sink is not installed yet, so an abort would
 /// kill the host with a bare `SIGABRT` and no message. A `home` that is not
@@ -74,7 +74,15 @@ pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);
 }
 
-/// Stable ABI log-filter entry: the host's filter as prost `pb::LogFilter` bytes,
+/// ABI version entry: the host reads it before anything else and refuses this
+/// plugin if it was built for an ABI the host does not load. A plain C symbol,
+/// so it reads the same whatever stabby layout either side has.
+#[unsafe(no_mangle)]
+pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
+    plugin_sdk::stabby::abi_semver()
+}
+
+/// Stable ABI log-filter entry: the host's filter as protobuf `LogFilter` bytes,
 /// so events it would discard — reqwest/hyper's chatter under every pull — are
 /// dropped here instead of forwarded.
 #[stabby::export]
@@ -108,7 +116,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // The plugin's name, from its manifest.
     let plugin = cfg.name;
     // The host's resolved heph home, or why it is not usable.
-    let home = pluginoci::runner::home_from_host(&cfg.home);
+    let home = pluginoci::runner::home_from_host(&cfg.home.to_string_lossy());
 
     // Each driver is exported under the local name its `config()` reports.
     let mut drivers = stabby::vec::Vec::new();

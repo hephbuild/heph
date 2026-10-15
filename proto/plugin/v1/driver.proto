@@ -1,4 +1,4 @@
-syntax = "proto3";
+edition = "2024";
 
 // Driver-exported methods. Mirrors the hplugin::Driver trait.
 // NOTE: schema() (DriverSchema) is not yet modeled; added when needed.
@@ -20,11 +20,15 @@ enum DriverMethod {
   DRIVER_METHOD_CONFIG = 5; // sync metadata (StableMeta::meta)
 }
 
+// `request_id` and the target are required in every driver request; so is
+// `ApplyTransitiveRequest.sandbox`, and the target def in every response.
 message ParseRequest {
   string request_id = 1;
   TargetSpec target_spec = 2;
-  // Selects which driver on the plugin handles this (a plugin may expose
-  // several named drivers over one connection). Empty => the sole driver.
+  // The name of the driver the host dispatched to. Informational: each driver
+  // a plugin exports has its own handle, so nothing selects on it. The host
+  // always sends it; absent means unnamed (never ""), here and in
+  // `ApplyTransitiveRequest`/`ManagedRunRequest`.
   string driver = 3;
 }
 message ParseResponse {
@@ -58,6 +62,10 @@ message RunInput {
 // `dir` is the canonical slot path, not the in-sandbox mount: tools bake absolute
 // paths into their cache entries, so every consumer must see one stable string
 // for the same cache or it restores and is inert.
+//
+// A mount missing any field is dropped by the plugin, never defaulted: a
+// missing scratch costs a cold cache, a defaulted one mounts somewhere nobody
+// declared.
 message ScratchMount {
   Addr addr = 1;
   string path = 2;
@@ -151,6 +159,7 @@ enum InputArtifactType {
   INPUT_ARTIFACT_TYPE_SUPPORT = 2;
 }
 
+// `type` (not UNSPECIFIED), `source_addr` and `unpack_root` are required.
 message ManagedRunInput {
   InputArtifactType type = 1;
   string origin_id = 2;
@@ -159,13 +168,17 @@ message ManagedRunInput {
   map<string, string> annotations = 5;
   // Where this input was unpacked on the shared filesystem.
   string unpack_root = 6;
-  // List file for Dep inputs (absent for Support inputs).
-  optional string list_path = 7;
+  // List file for Dep inputs (absent for Support inputs). Never present-empty.
+  string list_path = 7;
   // The artifact's hashout: the value the consumer's hashin folded in for it.
-  // Empty when the host could not read one; an old host never sends it.
+  // Absent when the host could not read one (or the artifact has none); an old
+  // host never sends it. Never present-empty.
   string hashout = 8;
 }
 
+// `tree_root_path`, `hashin` and the three sandbox dirs are required: a
+// defaulted "" would run the target in the plugin's cwd. `shell` is off unless
+// set.
 message ManagedRunRequest {
   string request_id = 1;
   TargetDef target = 2;
@@ -194,7 +207,7 @@ message ManagedRunResponse {
 // (driver -> host) carries live stdout/stderr, then the terminal result. Each
 // rides one StreamItem (its `item` is an encoded RunInFrame / RunOutFrame). The
 // stdio variants are reserved — unused until live streaming is wired — so adding
-// them is an additive, prost-only change (no ABI break).
+// them is an additive, wire-only change (no ABI break).
 message RunInFrame {
   oneof msg {
     ManagedRunRequest start = 1; // first item: the run request

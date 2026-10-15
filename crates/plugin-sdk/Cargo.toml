@@ -29,7 +29,7 @@ hproc = { package = "proc", path = "../proc", optional = true }
 stabby = { version = "72.1.8", optional = true }
 async-trait = { version = "0.1.89", optional = true }
 futures = { version = "0.3.32", optional = true }
-prost = { version = "0.14", optional = true }
+buffa = { workspace = true, optional = true }
 # Hook events cross the seam as serde-JSON (the BuildEvent type is already serde,
 # so it stays the single source of truth — no parallel proto mirror to maintain).
 serde_json = { version = "1", optional = true }
@@ -64,7 +64,7 @@ stabby = [
     "dep:stabby",
     "dep:async-trait",
     "dep:futures",
-    "dep:prost",
+    "dep:buffa",
     "dep:serde_json",
     "dep:tokio",
     "dep:tokio-util",

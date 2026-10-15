@@ -45,12 +45,29 @@ pub mod stabby {
     };
     pub use crate::supervisor::{install_supervisor, supervisor_sink};
 
-    /// Decode the cdylib create-entry config (`pb::CreateConfig`) from its prost
-    /// bytes, and convert its structured `options` map into a plugin `options:`
-    /// map. Authors then read typed values via [`hplugin::config::decode_opt`],
-    /// exactly as in-process plugins do.
-    pub use plugin_abi::convert::{create_config_from_bytes, options_from_pb_map};
+    /// The cdylib create-entry config, and its decoder from the bytes the host
+    /// hands `heph_plugin_create`. `root`, `home` and `name` are required; the
+    /// `options` map is the plugin's `options:`, which authors read via
+    /// [`hplugin::config::decode_opt`], exactly as in-process plugins do. The
+    /// wire form stays inside the SDK.
+    pub use plugin_abi::convert::{CreateConfig, create_config_from_bytes};
 
     /// The ABI version this transport builds against.
     pub use plugin_abi::ABI_SEMVER;
+
+    /// The body of a cdylib's required `heph_plugin_abi_semver` entry: a
+    /// pointer to [`ABI_SEMVER`], NUL-terminated and `'static`. The host reads
+    /// it before calling anything else and refuses a plugin from an ABI it does
+    /// not load — or one that does not export the entry at all. Export it as a
+    /// plain C function, not a `#[stabby::export]`:
+    ///
+    /// ```ignore
+    /// #[unsafe(no_mangle)]
+    /// pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
+    ///     plugin_sdk::stabby::abi_semver()
+    /// }
+    /// ```
+    pub fn abi_semver() -> *const std::ffi::c_char {
+        plugin_abi::ABI_SEMVER_C.as_ptr()
+    }
 }

@@ -3,23 +3,58 @@
 //! This crate is the raw wire layer the plugin transport shares. Plugin authors
 //! do NOT use it directly — they use the SDK (`plugin-sdk`), which sits on top.
 //!
-//! - [`pb`] re-exports the prost-generated message types (source of truth,
+//! - [`pb`] re-exports the buffa-generated message types (source of truth,
 //!   generated from `proto/plugin/v1/*.proto` via `buf`).
 //! - [`convert`] holds the conversions between the [`pb`] wire types and the
-//!   in-process `hplugin`/`hmodel`/`hcore` types.
+//!   in-process `hplugin`/`hmodel`/`hcore` types, and the presence rules every
+//!   decoder follows (see its module docs).
 //!
 //! The cold, low-volume Provider/Driver methods cross the cdylib boundary as
-//! prost-encoded [`pb`] bytes; the hot `ProviderExecutor` callbacks cross as
+//! protobuf-encoded [`pb`] bytes; the hot `ProviderExecutor` callbacks cross as
 //! native stabby vtable calls (see `plugin-stabby`).
 
-/// The prost-generated wire message types (`heph.plugin.v1`).
+/// The buffa-generated wire message types (`heph.plugin.v1`). Every singular
+/// field has explicit presence (edition 2024): `Option<T>` for scalars, strings,
+/// bytes and enums, `MessageField<T>` for messages.
 pub use hproto_gen::heph::plugin::v1 as pb;
 
-/// ABI semantic version. Not read at runtime — no handshake or negotiation
-/// happens; a mismatched host/plugin pair just mismatches at `dlopen` load via
-/// stabby's structural `get_stabbied` check and aborts. This constant is
-/// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
-/// without a bump, so the version history documents *why* a break happened.
+/// ABI semantic version. Since 0.17.0 it is read at load: a plugin exports it
+/// (`heph_plugin_abi_semver`, a plain C symbol, so it reads the same whatever
+/// stabby layout the plugin was built with), and the host refuses a plugin
+/// that does not match `^`[`MIN_PLUGIN_ABI`] before calling anything else in
+/// it. stabby's structural `get_stabbied` check still guards the frozen
+/// surface on top of that. `scripts/abi-check.sh` fails CI if the ABI surface
+/// changed without a bump, so the version history documents *why* a break
+/// happened.
+///
+/// The convention, from 0.17.0 on (pre-1.0): an **additive** change bumps the
+/// **patch**; a **break** bumps the **minor** and raises `MIN_PLUGIN_ABI` to
+/// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
+/// additive minors, and there was no version check to read them.
+///
+/// 0.17.0: the wire stays protobuf — same messages, same field numbers and
+/// types — but the protos are edition 2024 with explicit presence on every
+/// singular field, and the codegen is buffa instead of prost. A field the
+/// sender did not set is now absent rather than its zero value, and the
+/// decoders tell the two apart: a field the receiver cannot do without (an
+/// addr's package and name, a spec's driver, a dep's `hash`, a def's cache
+/// config, a request id, a create config's root) fails the decode with
+/// `missing field Message.field`, and the old "zero means unknown" sentinels
+/// (an empty listed driver, an empty declared driver, an empty hashout, an
+/// unspecified log level) are spelled as absence. See `convert`'s module docs.
+///
+/// A present-but-empty `ListedFacts.driver` is the one message a 0.16 peer
+/// could validly send that this host now rejects (it used to mean "unknown",
+/// which is absence now).
+///
+/// A hard break, though stabby cannot see it: the frozen surface did not move,
+/// and a 0.16 plugin's prost encoder omits every zero-valued field, which this
+/// host would read as missing required fields. So 0.17.0 also adds the
+/// load-time version check: the plugin exports `heph_plugin_abi_semver`, and
+/// the host refuses a plugin that does not (it predates 0.17.0) or that reports
+/// a version not matching `^`[`MIN_PLUGIN_ABI`] (`>=0.17.0, <0.18.0`) — once, at load, naming
+/// the plugin and both versions — instead of failing each call with a bare
+/// `missing field …`. Rebuild every plugin against this ABI, as for 0.16.0.
 ///
 /// 0.16.0: functions belong to plugins, not providers — a hard break, every
 /// plugin must be rebuilt. `PluginComponents` loses `provider_name` (the
@@ -159,7 +194,46 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.16.0";
+pub const ABI_SEMVER: &str = "0.17.0";
+
+/// The start of the ABI lane this host loads: a plugin is accepted iff its
+/// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
+/// minor (`^0.17.0` = `>=0.17.0, <0.18.0`). A patch is additive, so host and
+/// plugin may differ in patch either way; a plugin from a later minor is a
+/// break the host cannot know and is refused.
+///
+/// On every break, bump [`ABI_SEMVER`]'s minor and raise this to the new
+/// `x.y.0` — a wire-only break such as 0.17.0's above all, since stabby's
+/// structural check passes it and nothing but this check refuses the old
+/// plugin. A test holds `ABI_SEMVER` inside `^MIN_PLUGIN_ABI`, so bumping one
+/// without the other fails.
+pub const MIN_PLUGIN_ABI: &str = "0.17.0";
+
+/// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
+/// entry returns a pointer to. Bumped with it; a test holds the two equal.
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.17.0";
+
+/// Decode a wire message from a trusted peer.
+///
+/// buffa's default decode budgets element memory at 32 MiB, charged at the
+/// in-memory size of every repeated element; a legitimate `TargetDef` with
+/// ~120k inputs (under 2 MB on the wire) exceeds it. Both sides of the seam
+/// are heph's own code in one process, so the budget is lifted; the recursion
+/// limit, which guards the stack rather than the heap, is kept. Every decode
+/// across the seam goes through here.
+pub fn decode<M: buffa::Message>(bytes: &[u8]) -> Result<M, buffa::DecodeError> {
+    buffa::DecodeOptions::new()
+        .with_element_memory_limit(usize::MAX)
+        .decode_from_slice(bytes)
+}
 
 #[cfg(feature = "convert")]
 pub mod convert;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_c_version_is_the_version() {
+        assert_eq!(super::ABI_SEMVER_C.to_str(), Ok(super::ABI_SEMVER));
+    }
+}

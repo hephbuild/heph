@@ -814,18 +814,31 @@ pub mod inputartifact {
     use hcore::hartifactcontent::Content;
     use std::sync::Arc;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Type {
         Dep,
         Support,
     }
 
+    /// `Clone` is a second handle on the same content, not a copy of it.
+    #[derive(Clone)]
     pub struct InputArtifact {
         pub r#type: Type,
         pub origin_id: String,
         pub content: Arc<dyn Content>,
     }
+
+    impl std::fmt::Debug for InputArtifact {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("InputArtifact")
+                .field("type", &self.r#type)
+                .field("origin_id", &self.origin_id)
+                .finish_non_exhaustive()
+        }
+    }
 }
 
+#[derive(Clone, Debug)]
 pub struct RunInput {
     pub artifact: inputartifact::InputArtifact,
     pub origin_id: String,
