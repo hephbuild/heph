@@ -28,7 +28,7 @@ enum PluginKind {
 
 enum PayloadEncoding {
   PAYLOAD_ENCODING_UNSPECIFIED = 0;
-  PAYLOAD_ENCODING_PROST = 1; // protobuf; the name predates the buffa codegen
+  PAYLOAD_ENCODING_PROTOBUF = 1;
   PAYLOAD_ENCODING_RKYV = 2;  // Rust zero-copy fast path (shm)
   PAYLOAD_ENCODING_CAPNP = 3; // polyglot zero-copy (shm, e.g. Go)
 }
