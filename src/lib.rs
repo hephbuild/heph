@@ -21,7 +21,7 @@ extern crate core;
 // monolith.
 pub use hbuiltins::{
     plugincredential, pluginfs, plugingroup, pluginhostbin, pluginscratch, pluginstatictarget,
-    plugintextfile,
+    plugintemplate, plugintextfile,
 };
 pub use hcore::{
     debug_hash, defer, hartifactcontent, hasync, hmemoizer, htplatform, htvalue, version,
