@@ -12,16 +12,16 @@ use std::sync::OnceLock;
 
 const MAX_ARG_STRLEN: usize = 131072;
 
+/// This system's `ARG_MAX`, straight from `sysconf(3)` — the same value
+/// `getconf ARG_MAX` prints, without forking a process to read it (which cost
+/// a fork+exec on the first exec target of every run). `None` when the limit is
+/// indeterminate (`-1`), which leaves `env` unfiltered exactly as a failed
+/// `getconf` did.
 fn detect_max_args() -> Option<i64> {
-    let out = std::process::Command::new("getconf")
-        .arg("ARG_MAX")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = std::str::from_utf8(&out.stdout).ok()?.trim();
-    s.parse::<i64>().ok()
+    // SAFETY: sysconf has no preconditions; it reads a system constant.
+    let v = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+    // `c_long` is `i64` on every supported (64-bit) target.
+    (v > 0).then_some(v)
 }
 
 fn max_args() -> Option<i64> {
@@ -100,6 +100,12 @@ fn filter_impl(
 ///
 /// If the protected set alone does not fit, the target fails rather than
 /// spawning.
+///
+/// Which non-protected entries get evicted depends on the host's `ARG_MAX`,
+/// and that value is not part of any cache key: two hosts with different
+/// limits can run the same target with different environments under the same
+/// key. This predates reading the limit from `sysconf` and is documented here,
+/// not fixed.
 pub fn filter_long_env(
     mut env: Vec<(String, String)>,
     args: &[OsString],
@@ -126,6 +132,36 @@ mod tests {
 
     fn protect(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The limit comes from `sysconf`, and it is the one `getconf ARG_MAX`
+    /// reports — the source this replaced. A `None` or a value that disagrees
+    /// would silently change which env entries a target keeps.
+    #[test]
+    fn arg_max_is_read_from_sysconf_and_matches_getconf() {
+        let got = detect_max_args().expect("ARG_MAX is determinate on every supported target");
+        assert!(got > 0, "{got}");
+        assert_eq!(max_args(), Some(got), "the cached limit is the sysconf one");
+        // The cross-check needs `getconf`; a host without it on PATH (a
+        // minimal container) skips that half rather than failing.
+        let out = match std::process::Command::new("getconf")
+            .arg("ARG_MAX")
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping the getconf cross-check: getconf is not on PATH");
+                return;
+            }
+            Err(e) => panic!("run getconf: {e}"),
+        };
+        assert!(out.status.success(), "getconf ARG_MAX failed");
+        let want: i64 = std::str::from_utf8(&out.stdout)
+            .expect("utf8")
+            .trim()
+            .parse()
+            .expect("getconf prints an integer");
+        assert_eq!(got, want);
     }
 
     #[test]
