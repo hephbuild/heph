@@ -337,7 +337,9 @@ the whole-driver schema gate — and `${src://…}`, whose path is filled in by 
 managed-driver layer, the only place that knows where an artifact landed (under
 FUSE the sandbox root is redirected after the host has set it). Consumers: the
 credential driver's presentation templates, the `exec` driver's `run` in
-**both exec and bash mode**, and `oci.push`'s `ref`.
+**both exec and bash mode**, `oci.push`'s `ref`, and the `template` driver's
+`vars` (`${read:}` only — it renders without a sandbox, so `${src:}` is refused at
+parse; see [TEMPLATE.md](TEMPLATE.md)).
 
 `oci.push`'s `ref` also takes `${image_hashout}`. That one is **not** a deferred
 value: the host does not resolve it, and it adds no edge. It is a driver-local
