@@ -446,12 +446,33 @@ async fn prepare(
     if let Some(provided) = provided {
         append_path(&mut spec.env, std::iter::once(provided));
     }
-    // Last, behind the environment the target asked to run in. Only for a
-    // runner that left the environment in `spec.env`: one that carried it out
-    // of band is holding a copy this never touches, which is the intended
-    // outcome — see [`PathPolicy::suffix`].
-    append_path(&mut spec.env, path.suffix.iter().cloned());
+    finish_suffix(&mut spec.env, path, supplies_environment);
     Ok(())
+}
+
+/// Put [`PathPolicy::suffix`] last, behind the environment the target runs in.
+///
+/// For a runner that left that environment in `spec.env`, it is already here,
+/// so the suffix is appended. For one that supplies its own, it is not: an
+/// agent's `PATH` lives in the agent, and appending here would land the suffix
+/// *ahead* of it once the agent joins the two — heph's `sed` shadowing the one
+/// a devenv pinned. So it travels under [`agent::PATH_SUFFIX_ENV`] and the
+/// agent appends it after its own `PATH`. A runner that carried the
+/// environment out of band (`oci`) has already taken its copy and never sees
+/// this, which is the intended outcome — see [`PathPolicy::suffix`].
+fn finish_suffix(
+    env: &mut Vec<(OsString, OsString)>,
+    path: &PathPolicy,
+    supplies_environment: bool,
+) {
+    if !supplies_environment {
+        append_path(env, path.suffix.iter().cloned());
+        return;
+    }
+    env.retain(|(k, _)| k != agent::PATH_SUFFIX_ENV);
+    if let Some(suffix) = join_path(path.suffix.iter().cloned()) {
+        env.push((OsString::from(agent::PATH_SUFFIX_ENV), suffix));
+    }
 }
 
 /// `prefix ++ declared`, plus the fallback when `use_fallback` and nothing else
@@ -758,6 +779,31 @@ mod tests {
             path_of(&spec.env).as_deref(),
             Some("/sandbox/bin:/declared:/heph/coreutils/bin")
         );
+    }
+
+    /// For a runner whose environment lives elsewhere, the suffix cannot be
+    /// placed behind that environment from here — this process never sees it.
+    /// Appending it to `PATH` put heph's builtins *ahead* of an agent's own
+    /// `PATH`, so it travels separately and the agent puts it last.
+    #[test]
+    fn a_runner_that_supplies_an_environment_gets_the_suffix_separately() {
+        let policy = policy_with_suffix(&["/sandbox/bin"], &["/heph/coreutils/bin"]);
+        let mut env = vec![(os("PATH"), os("/sandbox/bin"))];
+        finish_suffix(&mut env, &policy, true);
+        assert_eq!(path_of(&env).as_deref(), Some("/sandbox/bin"));
+        assert_eq!(
+            get_env(&env, agent::PATH_SUFFIX_ENV),
+            Some(os("/heph/coreutils/bin"))
+        );
+
+        // One that left the environment in place composes it directly.
+        let mut env = vec![(os("PATH"), os("/sandbox/bin:/runner/bin"))];
+        finish_suffix(&mut env, &policy, false);
+        assert_eq!(
+            path_of(&env).as_deref(),
+            Some("/sandbox/bin:/runner/bin:/heph/coreutils/bin")
+        );
+        assert_eq!(get_env(&env, agent::PATH_SUFFIX_ENV), None);
     }
 
     /// The suffix is not part of what a runner carries. Those entries are host

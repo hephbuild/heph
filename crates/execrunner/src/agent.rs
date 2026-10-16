@@ -62,12 +62,24 @@ use std::sync::Arc;
 
 /// Environment variable carrying the agent socket path to the client.
 ///
-/// The **only** control value that rides the environment. Everything else —
-/// cwd, the ctty flag, argv — travels in the request frame, so the agent's
-/// strip is one exact key rather than a prefix scan. A prefix scan would
-/// silently rob a target of a legitimately-named variable, and the target's
-/// environment would then differ from the one its cache key describes.
+/// One of exactly two control values that ride the environment, with
+/// [`PATH_SUFFIX_ENV`]. Everything else — cwd, the ctty flag, argv — travels in
+/// the request frame, so the agent's strip is exact keys rather than a prefix
+/// scan. A prefix scan would silently rob a target of a legitimately-named
+/// variable, and the target's environment would then differ from the one its
+/// cache key describes.
 pub const SOCK_ENV: &str = "HEPH_RUNNER_SOCK";
+
+/// Environment variable carrying the `PATH` entries that go **behind** the
+/// agent's own — heph's builtin utilities.
+///
+/// The client cannot place them: it does not know the agent's `PATH`, and
+/// anything on the `PATH` it forwards leads the agent's. So they ride
+/// separately and [`agent_environment`] appends them last. Rides the
+/// environment rather than the request frame because the host composes it
+/// after the runner has prepared the spec, and the environment is the one part
+/// of the spec that reaches the client unchanged.
+pub const PATH_SUFFIX_ENV: &str = "HEPH_RUNNER_PATH_SUFFIX";
 
 /// The `heph __runner-agent` subcommand name.
 pub const AGENT_SUBCOMMAND: &str = "__runner-agent";
@@ -730,24 +742,28 @@ async fn handle_conn(conn: UnixStream, fds: [OwnedFd; 3]) {
 /// target's half is `request`, which is the client's `environ` and therefore
 /// exactly the environment heph built for the target.
 ///
-/// Two keys are the agent's own business rather than either side's:
-/// [`SOCK_ENV`], which is how the client found this agent, and `PATH`, which is
-/// a list both sides legitimately contribute to — the target's entries (its
-/// tools, then anything it declared) lead, the environment's follow. The client
-/// has already composed its half in that order, so this is one join.
+/// Three keys are the agent's own business rather than either side's:
+/// [`SOCK_ENV`], which is how the client found this agent; `PATH`, which is a
+/// list both sides legitimately contribute to — the target's entries (its
+/// tools, then anything it declared) lead, the environment's follow; and
+/// [`PATH_SUFFIX_ENV`], what heph supplies, which goes behind both.
 fn agent_environment(request: Vec<(OsString, OsString)>) -> Vec<(OsString, OsString)> {
-    let target_path = request
-        .iter()
-        .find(|(k, _)| k == "PATH")
-        .map(|(_, v)| v.clone());
+    let find = |key: &str| {
+        request
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let target_path = find("PATH");
+    let suffix = find(PATH_SUFFIX_ENV);
 
     let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(k, _)| k != SOCK_ENV && k != "PATH")
+        .filter(|(k, _)| k != SOCK_ENV && k != PATH_SUFFIX_ENV && k != "PATH")
         .collect();
     let runner_path = std::env::var_os("PATH");
 
     for (k, v) in request {
-        if k == "PATH" || k == SOCK_ENV {
+        if k == "PATH" || k == SOCK_ENV || k == PATH_SUFFIX_ENV {
             continue;
         }
         match env.iter_mut().find(|(existing, _)| *existing == k) {
@@ -756,7 +772,7 @@ fn agent_environment(request: Vec<(OsString, OsString)>) -> Vec<(OsString, OsStr
         }
     }
 
-    if let Some(path) = crate::join_path(target_path.into_iter().chain(runner_path)) {
+    if let Some(path) = crate::join_path(target_path.into_iter().chain(runner_path).chain(suffix)) {
         env.push((OsString::from("PATH"), path));
     }
     env
@@ -977,5 +993,38 @@ mod tests {
         assert!(!r.env.iter().any(|(k, _)| k == SOCK_ENV));
         // SAFETY: as above.
         unsafe { std::env::remove_var(SOCK_ENV) };
+    }
+
+    fn path_of(env: &[(OsString, OsString)]) -> Option<OsString> {
+        env.iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+    }
+
+    /// The order a devenv or nix runner must produce: the target's own entries,
+    /// then the environment's, then heph's builtins. The builtins used to arrive
+    /// on the target's `PATH`, ahead of the agent's — so heph's `sed` shadowed
+    /// the one the environment pinned on purpose, inside a cache key claiming
+    /// that environment.
+    #[test]
+    fn heph_builtins_follow_the_agents_own_path() {
+        let env = agent_environment(vec![
+            (OsString::from("PATH"), OsString::from("/sandbox/bin")),
+            (
+                OsString::from(PATH_SUFFIX_ENV),
+                OsString::from("/heph/coreutils/bin"),
+            ),
+        ]);
+        let expected = crate::join_path(
+            [OsString::from("/sandbox/bin")]
+                .into_iter()
+                .chain(std::env::var_os("PATH"))
+                .chain([OsString::from("/heph/coreutils/bin")]),
+        );
+        assert_eq!(path_of(&env), expected);
+        assert!(
+            !env.iter().any(|(k, _)| k == PATH_SUFFIX_ENV),
+            "a control value must not reach the target"
+        );
     }
 }
