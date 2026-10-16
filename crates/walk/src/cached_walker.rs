@@ -186,7 +186,13 @@ pub struct CachedWalker {
     /// When set, all caching is skipped: every call reads straight from disk.
     /// Transparent to consumers — the API is identical, only slower.
     bypass: bool,
-    store: Option<FsWalkStore>,
+    /// The durable store's db, opened on first use — `None` for a walker with no
+    /// durable store at all (disabled, bypassing).
+    store_path: Option<PathBuf>,
+    /// The durable store, once opened. Holds `None` when the open failed: the
+    /// walker then degrades to re-reading from disk for the rest of its life,
+    /// exactly as an eager open failure did.
+    store: std::sync::OnceLock<Option<FsWalkStore>>,
     /// In-process front for directory listings, validated against live mtime.
     dirs: Mutex<FxHashMap<PathBuf, (i64, Arc<DirListing>)>>,
     /// In-process front for file hashes, validated against live (size, mtime).
@@ -198,7 +204,8 @@ pub struct CachedWalker {
 }
 
 impl CachedWalker {
-    /// Open (or create) the walker backed by the sqlite db at `db_path`. On any
+    /// The walker backed by the sqlite db at `db_path`, opened (or created) on
+    /// first use — a command that never walks a tree never opens it. On any
     /// db-open failure the walker still works — it just degrades to always
     /// re-reading from disk (no cross-run cache).
     pub fn open(db_path: &Path) -> Self {
@@ -208,16 +215,10 @@ impl CachedWalker {
             );
             return Self::bypassing();
         }
-        let store = match FsWalkStore::open(db_path) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "fswalk cache disabled");
-                None
-            }
-        };
         Self {
             bypass: false,
-            store,
+            store_path: Some(db_path.to_path_buf()),
+            store: std::sync::OnceLock::new(),
             dirs: Mutex::new(FxHashMap::default()),
             files: Mutex::new(FxHashMap::default()),
             touched_dirs: Mutex::new(Vec::new()),
@@ -230,7 +231,8 @@ impl CachedWalker {
     pub fn disabled() -> Self {
         Self {
             bypass: false,
-            store: None,
+            store_path: None,
+            store: std::sync::OnceLock::new(),
             dirs: Mutex::new(FxHashMap::default()),
             files: Mutex::new(FxHashMap::default()),
             touched_dirs: Mutex::new(Vec::new()),
@@ -243,12 +245,34 @@ impl CachedWalker {
     pub fn bypassing() -> Self {
         Self {
             bypass: true,
-            store: None,
+            store_path: None,
+            store: std::sync::OnceLock::new(),
             dirs: Mutex::new(FxHashMap::default()),
             files: Mutex::new(FxHashMap::default()),
             touched_dirs: Mutex::new(Vec::new()),
             touched_files: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The durable store, opened on the first call. `None` when this walker has
+    /// none, or when opening it failed (logged once).
+    fn store(&self) -> Option<&FsWalkStore> {
+        let path = self.store_path.as_deref()?;
+        self.store
+            .get_or_init(|| match FsWalkStore::open(path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fswalk cache disabled");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// Whether the durable store has been opened (successfully or not).
+    #[cfg(test)]
+    fn store_opened(&self) -> bool {
+        self.store.get().is_some()
     }
 
     /// The cached listing of directory `dir` (absolute). A missing directory
@@ -279,7 +303,7 @@ impl CachedWalker {
 
         // Durable store: reuse while the recorded mtime matches.
         if let Some(mt) = live_mtime
-            && let Some(store) = self.store.as_ref()
+            && let Some(store) = self.store()
             && let Some((stored_mtime, blob)) = store.get_dir(dir)
             && stored_mtime == mt
             && let Ok(listing) = borsh::from_slice::<DirListing>(&blob)
@@ -294,7 +318,7 @@ impl CachedWalker {
 
         // Miss: read the directory and cache it.
         let listing = Arc::new(read_dir_uncached(dir)?);
-        if let (Some(mt), Some(store)) = (live_mtime, self.store.as_ref()) {
+        if let (Some(mt), Some(store)) = (live_mtime, self.store()) {
             if let Ok(blob) = borsh::to_vec(&*listing) {
                 store.put_dir(dir, mt, &blob, now_ns());
             }
@@ -337,7 +361,7 @@ impl CachedWalker {
 
         // Durable store.
         if let Some(mt) = live_mtime
-            && let Some(store) = self.store.as_ref()
+            && let Some(store) = self.store()
             && let Some(fh) = store.get_file(file)
             && fh.size == size
             && fh.mtime_ns == mt
@@ -356,7 +380,7 @@ impl CachedWalker {
             exec,
             hashout,
         });
-        if let (Some(_mt), Some(store)) = (live_mtime, self.store.as_ref()) {
+        if let (Some(_mt), Some(store)) = (live_mtime, self.store()) {
             store.put_file(file, &fh, now_ns());
             self.files.lock().insert(file.to_path_buf(), fh.clone());
         }
@@ -366,7 +390,7 @@ impl CachedWalker {
     /// Drop rows untouched for longer than `ttl`, and (when `check_orphans`)
     /// rows whose path no longer exists on disk. Returns the number removed.
     pub fn prune(&self, ttl: std::time::Duration, check_orphans: bool) -> Result<usize> {
-        match self.store.as_ref() {
+        match self.store() {
             Some(store) => store.prune(ttl, check_orphans),
             None => Ok(0),
         }
@@ -375,12 +399,16 @@ impl CachedWalker {
     /// Flush this process's accumulated last-access stamps. Called on drop;
     /// exposed for tests.
     fn flush_touches(&self) {
-        let Some(store) = self.store.as_ref() else {
+        let dirs = std::mem::take(&mut *self.touched_dirs.lock());
+        let files = std::mem::take(&mut *self.touched_files.lock());
+        // Nothing touched: never open the store just to write nothing.
+        if dirs.is_empty() && files.is_empty() {
+            return;
+        }
+        let Some(store) = self.store() else {
             return;
         };
         let now = now_ns();
-        let dirs = std::mem::take(&mut *self.touched_dirs.lock());
-        let files = std::mem::take(&mut *self.touched_files.lock());
         if !dirs.is_empty() {
             store.touch("dirs", &dirs, now);
         }
@@ -503,11 +531,81 @@ impl FsWalkStore {
             //   synchronous affects only crash durability, never concurrent-access
             //   correctness, so multi-process behavior is unchanged.
             .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA busy_timeout = 10000;
+                "PRAGMA busy_timeout = 10000;
                  PRAGMA synchronous = OFF;
                  PRAGMA temp_store = MEMORY;
-                 PRAGMA mmap_size = 268435456;
+                 PRAGMA mmap_size = 268435456;",
+            )
+            .context("configuring the fswalk write connection")?;
+        let version: i64 = write
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("reading the fswalk schema version")?;
+        if version < FSWALK_SCHEMA_VERSION {
+            migrate_fswalk_schema(db_path, &write)?;
+        }
+
+        let manager = SqliteConnectionManager::file(db_path)
+            .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_init(|c| {
+                c.execute_batch(
+                    "PRAGMA busy_timeout = 10000;
+                     PRAGMA temp_store = MEMORY;
+                     PRAGMA mmap_size = 268435456;",
+                )
+            });
+        // Its helper thread exits with the pool; see `hsqlite`.
+        let read_pool = hsqlite::pool_builder()
+            .max_size(16)
+            // Zero: the store is opened by its first use, and that use opens
+            // the read connection it needs rather than one more up front.
+            .min_idle(Some(0))
+            .build(manager)
+            .context("building fswalk read pool")?;
+
+        Ok(Self {
+            read_pool,
+            write: Mutex::new(write),
+        })
+    }
+}
+
+/// The fswalk schema's version, in the db's `PRAGMA user_version`. A db at this
+/// version has both tables with every column, so opening it runs no DDL; a db
+/// below it (fresh, or from before the version existed) goes through
+/// [`migrate_fswalk_schema`]. Bump it, and extend the migration, with any schema
+/// change. Older heph ignores the value and re-runs its own idempotent DDL.
+const FSWALK_SCHEMA_VERSION: i64 = 1;
+
+/// Bring the fswalk db up to [`FSWALK_SCHEMA_VERSION`] on `write`.
+///
+/// Serialized across processes on an exclusive `flock` of
+/// `<db>-migrate.lock`, re-reading the version under it, because switching a
+/// fresh db to WAL takes its exclusive lock without the busy handler: two
+/// processes creating it at once failed one of them (which then ran with the
+/// durable cache disabled). DDL and version stamp commit in one transaction.
+fn migrate_fswalk_schema(db_path: &Path, write: &Connection) -> Result<()> {
+    let mut lock_path = db_path.as_os_str().to_owned();
+    lock_path.push("-migrate.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening fswalk migration lock {lock_path:?}"))?;
+    lock.lock()
+        .with_context(|| format!("locking fswalk migration lock {lock_path:?}"))?;
+    let version: i64 = write
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .context("re-reading the fswalk schema version")?;
+    if version >= FSWALK_SCHEMA_VERSION {
+        return Ok(());
+    }
+    write
+        .execute_batch("PRAGMA journal_mode = WAL;")
+        .context("switching the fswalk db to WAL")?;
+    write
+        .execute_batch(
+            "BEGIN IMMEDIATE;
                  CREATE TABLE IF NOT EXISTS dirs (
                      path        TEXT PRIMARY KEY,
                      mtime_ns    INTEGER NOT NULL,
@@ -523,52 +621,39 @@ impl FsWalkStore {
                      hashout     TEXT NOT NULL,
                      accessed_ns INTEGER NOT NULL
                  );",
+        )
+        .context("initialising fswalk schema")?;
+    // Migration for a db created before `listing_version` existed. Probed
+    // rather than attempted-and-ignored: on a fresh db the `CREATE TABLE`
+    // above already declares the column, so an unconditional `ALTER` fails
+    // every time and swallowing that failure would also swallow a real one —
+    // and a real one leaves `get_dir`/`put_dir` unable to prepare, which
+    // disables the durable listing cache silently and forever.
+    let mut cols = write
+        .prepare("PRAGMA table_info(dirs)")
+        .context("inspecting the fswalk dirs schema")?;
+    let has_listing_version = cols
+        .query_map([], |r| r.get::<_, String>(1))
+        .context("reading the fswalk dirs columns")?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == "listing_version");
+    drop(cols);
+    if !has_listing_version {
+        write
+            .execute_batch(
+                "ALTER TABLE dirs ADD COLUMN listing_version INTEGER NOT NULL DEFAULT 0;",
             )
-            .context("initialising fswalk schema")?;
-        // Migration for a db created before `listing_version` existed. Probed
-        // rather than attempted-and-ignored: on a fresh db the `CREATE TABLE`
-        // above already declares the column, so an unconditional `ALTER` fails
-        // every time and swallowing that failure would also swallow a real one —
-        // and a real one leaves `get_dir`/`put_dir` unable to prepare, which
-        // disables the durable listing cache silently and forever.
-        let mut cols = write
-            .prepare("PRAGMA table_info(dirs)")
-            .context("inspecting the fswalk dirs schema")?;
-        let has_listing_version = cols
-            .query_map([], |r| r.get::<_, String>(1))
-            .context("reading the fswalk dirs columns")?
-            .filter_map(std::result::Result::ok)
-            .any(|name| name == "listing_version");
-        drop(cols);
-        if !has_listing_version {
-            write
-                .execute_batch(
-                    "ALTER TABLE dirs ADD COLUMN listing_version INTEGER NOT NULL DEFAULT 0;",
-                )
-                .context("adding listing_version to the fswalk dirs table")?;
-        }
-
-        let manager = SqliteConnectionManager::file(db_path)
-            .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_init(|c| {
-                c.execute_batch(
-                    "PRAGMA busy_timeout = 10000;
-                     PRAGMA temp_store = MEMORY;
-                     PRAGMA mmap_size = 268435456;",
-                )
-            });
-        let read_pool = hsqlite::pool_builder()
-            .max_size(16)
-            .min_idle(Some(1))
-            .build(manager)
-            .context("building fswalk read pool")?;
-
-        Ok(Self {
-            read_pool,
-            write: Mutex::new(write),
-        })
+            .context("adding listing_version to the fswalk dirs table")?;
     }
+    write
+        .execute_batch(&format!(
+            "PRAGMA user_version = {FSWALK_SCHEMA_VERSION}; COMMIT;"
+        ))
+        .context("committing the fswalk schema")?;
+    Ok(())
+}
 
+impl FsWalkStore {
     fn get_dir(&self, path: &Path) -> Option<(i64, Vec<u8>)> {
         let conn = self.read_pool.get().ok()?;
         let mut stmt = conn
@@ -705,6 +790,90 @@ mod tests {
 
     fn walker(dir: &Path) -> CachedWalker {
         CachedWalker::open(&dir.join("fswalk.db"))
+    }
+
+    fn table_exists(db: &Path, name: &str) -> bool {
+        Connection::open(db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    }
+
+    fn fswalk_version(db: &Path) -> i64 {
+        Connection::open(db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Opening a walker opens no database, and a walker that never walked
+    /// writes nothing at drop either.
+    #[test]
+    fn the_store_opens_on_first_use_not_at_construction() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("fswalk.db");
+        let w = walker(tmp.path());
+        assert!(!w.store_opened());
+        drop(w);
+        assert!(!db.exists(), "an unused walker must not create its db");
+
+        let w = walker(tmp.path());
+        w.read_dir(tmp.path()).unwrap();
+        assert!(w.store_opened());
+        assert_eq!(fswalk_version(&db), FSWALK_SCHEMA_VERSION);
+    }
+
+    /// At the current version opening runs no DDL (a table dropped by hand stays
+    /// dropped); below it the DDL runs again and stamps the version.
+    #[test]
+    fn fswalk_ddl_runs_only_when_the_schema_version_is_behind() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("fswalk.db");
+        walker(tmp.path()).read_dir(tmp.path()).unwrap();
+
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("DROP TABLE files;")
+            .unwrap();
+        walker(tmp.path()).read_dir(tmp.path()).unwrap();
+        assert!(!table_exists(&db, "files"), "DDL must be skipped when current");
+
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 0;")
+            .unwrap();
+        walker(tmp.path()).read_dir(tmp.path()).unwrap();
+        assert!(table_exists(&db, "files"), "DDL must run on an older db");
+        assert_eq!(fswalk_version(&db), FSWALK_SCHEMA_VERSION);
+    }
+
+    /// Walkers in several processes creating the same fresh db at once all get
+    /// a working durable store. Switching to WAL skips the busy handler, so
+    /// without the migration lock one of them lost the store.
+    #[test]
+    fn concurrent_first_opens_of_a_fresh_fswalk_db_all_get_a_store() {
+        const N: usize = 8;
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let threads: Vec<_> = (0..N)
+            .map(|_| {
+                let (root, barrier) = (root.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    let w = walker(&root);
+                    barrier.wait();
+                    w.store().is_some()
+                })
+            })
+            .collect();
+        for t in threads {
+            assert!(t.join().unwrap(), "every walker must open the durable store");
+        }
     }
 
     /// Create a file whose name is the raw byte sequence `raw`, or `None` when
