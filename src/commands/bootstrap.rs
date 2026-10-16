@@ -92,6 +92,21 @@ pub fn telemetry_enabled_from_config() -> bool {
         .unwrap_or(true)
 }
 
+/// How the exec/bash drivers get the builtin-utility shim directory.
+///
+/// The heph home is the host's knowledge, and materializing the shims is the
+/// `coreutils` crate's — so the driver is handed a closure and needs neither.
+/// Deferred rather than eager so a command that never runs a target (`query`,
+/// `inspect`) never touches the filesystem for it.
+fn coreutils_shims(home_dir: &std::path::Path) -> pluginexec::CoreutilsShims {
+    let home = home_dir.to_path_buf();
+    Arc::new(move || {
+        let exe = std::env::current_exe()
+            .context("locate the heph binary the builtin-utility shims point at")?;
+        hcoreutils::shim_dir(&home, &exe)
+    })
+}
+
 /// Build the engine for this invocation.
 ///
 /// Takes nothing from the CLI. Everything a *run* can switch — `--force`,
@@ -134,7 +149,10 @@ pub fn register_builtin_plugins(
 ///
 /// Public so a config generated elsewhere (`heph-bench`'s Tier B corpus) can be
 /// checked against the set the binary actually accepts.
-pub fn register_builtin_factories(e: &mut engine::Engine) -> anyhow::Result<()> {
+pub fn register_builtin_factories(
+    e: &mut engine::Engine,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<()> {
     use engine::PluginParts;
     e.register_plugin_factory("buildfile", |init, opts| {
         Ok(PluginParts::default().with_provider(Box::new(
@@ -151,13 +169,22 @@ pub fn register_builtin_factories(e: &mut engine::Engine) -> anyhow::Result<()> 
             .with_functions(Arc::clone(&init.functions)),
         )))
     })?;
-    e.register_plugin_factory("exec", |_init, opts| {
-        Ok(PluginParts::default()
-            .with_managed_driver(Box::new(pluginexec::Driver::from_options_exec(opts)?)))
+    // The exec and bash drivers take a closure rather than the path itself, so
+    // `plugin-exec` — which most of the workspace links — does not have to
+    // depend on the forty utility crates to know it has a directory to put on
+    // PATH. Resolved lazily, so a `heph query` never touches the filesystem.
+    let (coreutils_exec, coreutils_bash) = (coreutils_shims(home_dir), coreutils_shims(home_dir));
+    e.register_plugin_factory("exec", move |_init, opts| {
+        Ok(PluginParts::default().with_managed_driver(Box::new(
+            pluginexec::Driver::from_options_exec(opts)?
+                .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_exec.clone()),
+        )))
     })?;
-    e.register_plugin_factory("bash", |_init, opts| {
-        Ok(PluginParts::default()
-            .with_managed_driver(Box::new(pluginexec::Driver::from_options_bash(opts)?)))
+    e.register_plugin_factory("bash", move |_init, opts| {
+        Ok(PluginParts::default().with_managed_driver(Box::new(
+            pluginexec::Driver::from_options_bash(opts)?
+                .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_bash.clone()),
+        )))
     })?;
     Ok(())
 }
@@ -227,7 +254,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the
     // engine's own skip dirs. The remaining built-ins have no config.
     register_builtin_plugins(&mut e, &home_dir)?;
-    register_builtin_factories(&mut e)?;
+    register_builtin_factories(&mut e, &home_dir)?;
 
     // Apply every `plugins:` entry: a `builtin:` instantiates the matching
     // factory above; a `path:`/`url:` resolves a manifest, loads the cdylib, and
@@ -367,7 +394,7 @@ mod tests {
 
         // `fs` is auto-registered by `Engine::new`.
         register_builtin_plugins(&mut e, &home_dir)?;
-        register_builtin_factories(&mut e)?;
+        register_builtin_factories(&mut e, &home_dir)?;
 
         // The helper exercises built-in plugins only (no cdylib loading).
         for spec in &file.plugins {
