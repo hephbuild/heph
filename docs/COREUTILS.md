@@ -70,6 +70,10 @@ environment provides:
 PATH = the target's tools  ++  what the target declared  ++  the runner's PATH  ++  heph coreutils
 ```
 
+The full picture — every source of every variable, in order, and which `PATH`
+tiers exist under each runner — is drawn in `EXEC_RUNNERS.md`, "The environment
+a target actually gets".
+
 **The host's directories are not on that list.** A target sees what it declares
 plus heph's builtins, and nothing else: a recipe that reaches for an undeclared
 host binary is reaching outside its own cache key, and it now fails with
