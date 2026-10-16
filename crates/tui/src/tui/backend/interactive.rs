@@ -82,7 +82,7 @@ pub async fn run<A: App + 'static>(
     // future resolves AND this drains, so the run visibly stays up while
     // background cleanups finish during exit (and the process doesn't tear the
     // cleaner thread out mid-rmdir).
-    let bg_pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bg_pending = hcore::pending::Pending::new_counter();
     let ctx = AppContext::with_control(
         sink.clone(),
         control_tx,
@@ -122,7 +122,7 @@ pub async fn run<A: App + 'static>(
     let result: anyhow::Result<A::Output> = loop {
         // App finished and the background queue is empty — decide whether to exit.
         if let Some(r) = app_result.take() {
-            if bg_pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            if bg_drained(&bg_pending) {
                 if held {
                     // Held open after finish — exit only on explicit quit.
                     if quit {
@@ -368,6 +368,9 @@ pub async fn run<A: App + 'static>(
                     None => build_events = None,
                 }
             }
+            // The app is done and only background work is holding the exit:
+            // wake on the last decrement instead of the next `TICK`.
+            () = exit_drain_wake(app_result.is_some(), &bg_pending) => {}
             _ = ticker.tick() => {
                 // Deliberately NOT gated on `!paused`. While paused, the tick
                 // draws nothing — the terminal belongs to the interactive
@@ -496,6 +499,25 @@ pub async fn run<A: App + 'static>(
 /// A failed `tcgetattr` (stderr is not a tty — output redirected) records
 /// nothing, so a non-interactive run's hard abort stays a no-op: no stray
 /// escape bytes land in redirected output.
+/// Whether background work no longer holds the exit: the loop's break
+/// predicate once the app has finished.
+fn bg_drained(bg_pending: &hcore::pending::Pending) -> bool {
+    bg_pending.load(std::sync::atomic::Ordering::Acquire) == 0
+}
+
+/// The run loop's drain arm: resolves on the decrement that drains the
+/// background work, but only once the app has finished and work is still
+/// outstanding. Otherwise it never resolves, so a held viewport (count
+/// already zero, waiting for `q`) does not spin the loop and a running app
+/// is not woken by every drain mid-run.
+async fn exit_drain_wake(app_done: bool, bg_pending: &hcore::pending::Pending) {
+    if app_done && !bg_drained(bg_pending) {
+        bg_pending.wait_drained().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 fn record_raw_mode_restore() {
     let fd = io::stderr().as_raw_fd();
     let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -709,7 +731,7 @@ fn flip_sink_to_direct_draining_the_gap(sink: &LogSink, rx: &mut mpsc::Unbounded
 
 #[cfg(test)]
 mod tests {
-    use super::{IntoText, TICK, rows_needed};
+    use super::{IntoText, TICK, bg_drained, exit_drain_wake, rows_needed};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -831,23 +853,29 @@ mod tests {
     }
 
     /// The exit loop must not break the moment the app future resolves: it keeps
-    /// rendering until the shared background-cleanup counter drains to zero. This
-    /// mirrors the break condition in `run` (app done AND bg_pending == 0) without
-    /// a real terminal.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// rendering until the shared background-cleanup counter drains to zero. It
+    /// drives the same break predicate (`bg_drained`) and drain arm
+    /// (`exit_drain_wake`) that `run` uses, without a real terminal.
+    ///
+    /// It also exits on the decrement itself rather than on the next `TICK`:
+    /// under paused time the loop returns at exactly the drain instant (120 ms),
+    /// where waiting for the ticker would return at 160 ms.
+    #[tokio::test(start_paused = true)]
     async fn loop_stays_open_until_bg_pending_drains() {
-        use std::sync::atomic::AtomicUsize;
+        const DRAIN_AT: Duration = Duration::from_millis(120);
         // App finishes immediately, but leaves 1 unit of background work that a
         // separate task clears after a delay.
-        let bg_pending = Arc::new(AtomicUsize::new(1));
+        let bg_pending = hcore::pending::Pending::new_counter();
+        bg_pending.fetch_add(1, Ordering::AcqRel);
         let app = tokio::spawn(async { 7u8 });
         tokio::pin!(app);
 
+        let started = tokio::time::Instant::now();
         let drainer = {
             let bg = Arc::clone(&bg_pending);
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(120)).await;
-                bg.store(0, Ordering::Release);
+                tokio::time::sleep(DRAIN_AT).await;
+                bg.fetch_sub(1, Ordering::AcqRel);
             })
         };
 
@@ -858,7 +886,7 @@ mod tests {
 
         let result = loop {
             if let Some(r) = app_result.take() {
-                if bg_pending.load(Ordering::Acquire) == 0 {
+                if bg_drained(&bg_pending) {
                     break r;
                 }
                 app_result = Some(r);
@@ -867,6 +895,7 @@ mod tests {
                 res = &mut app, if app_result.is_none() => {
                     app_result = Some(res.expect("app task"));
                 }
+                () = exit_drain_wake(app_result.is_some(), &bg_pending) => {}
                 _ = interval.tick() => {
                     if app_result.is_some() {
                         ticks_after_app += 1;
@@ -881,6 +910,52 @@ mod tests {
             ticks_after_app >= 1,
             "loop must keep rendering after the app finished while bg work drains; got {ticks_after_app} ticks"
         );
+        assert_eq!(
+            started.elapsed(),
+            DRAIN_AT,
+            "the loop must exit on the drain, not on the next tick"
+        );
+    }
+
+    /// The drain arm stays silent unless it has something to wake for: not
+    /// while the app is still running (even with work outstanding), and not
+    /// once the count is already zero (a held viewport would otherwise spin).
+    #[tokio::test(start_paused = true)]
+    async fn drain_arm_only_resolves_after_the_app_with_work_outstanding() {
+        let silent = Duration::from_secs(5);
+        let bg = hcore::pending::Pending::new_counter();
+
+        // Count zero, app done: a held viewport — must not resolve.
+        assert!(
+            tokio::time::timeout(silent, exit_drain_wake(true, &bg))
+                .await
+                .is_err(),
+            "a zero count with the app done must not wake the loop"
+        );
+
+        bg.fetch_add(1, Ordering::AcqRel);
+        // App still running: a drain mid-run is not an exit wake.
+        let running = exit_drain_wake(false, &bg);
+        tokio::pin!(running);
+        assert!(
+            tokio::time::timeout(silent, running.as_mut())
+                .await
+                .is_err(),
+            "the arm must stay silent while the app runs"
+        );
+
+        // App done, work outstanding: resolves exactly at the decrement.
+        let started = tokio::time::Instant::now();
+        let drainer = {
+            let bg = Arc::clone(&bg);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                bg.fetch_sub(1, Ordering::AcqRel);
+            })
+        };
+        exit_drain_wake(true, &bg).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(30));
+        drainer.await.expect("drainer");
     }
 
     /// Mirrors the held-viewport logic in `interactive::run`: when the app
