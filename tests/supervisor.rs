@@ -429,3 +429,293 @@ fn supervisor_reaps_grandchildren_via_pgid_kill() {
     );
     drop(supervisor.wait());
 }
+
+/// Env var that turns this test binary into the "heph" process of
+/// [`lazy_supervisor_reaps_children_spawned_at_startup_on_sigkill`].
+const LAZY_CHILD_ENV: &str = "HEPH_TEST_LAZY_SUPERVISOR_CHILD";
+/// How many children the child process spawns at once, racing the start.
+const LAZY_CHILDREN: usize = 4;
+
+/// The child half of the test below; a no-op under a normal test run.
+///
+/// Behaves like heph does at startup, with the supervisor now lazy: `init`
+/// (no supervisor process yet — it reports that), then several threads spawn a
+/// session-leader `sleep` through `proc_exec` at the same instant, so they race
+/// each other into the supervisor's start. It prints every pid and SIGKILLs
+/// itself the moment the spawns return — no clean exit, no destructor, no
+/// chance for anything but the supervisor to reap them.
+#[test]
+fn lazy_supervisor_child_process() {
+    if std::env::var_os(LAZY_CHILD_ENV).is_none() {
+        return;
+    }
+    heph::process_supervisor::init_with_exe(heph_bin()).expect("init");
+    println!(
+        "SIDECAR_AT_INIT {}",
+        heph::process_supervisor::sidecar_pid().map_or(-1, |p| p)
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(LAZY_CHILDREN));
+    let threads: Vec<_> = (0..LAZY_CHILDREN)
+        .map(|_| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                heph::proc_exec::spawn(heph::proc_exec::Spec {
+                    program: PathBuf::from("/bin/sleep"),
+                    args: vec!["120".into()],
+                    env: vec![],
+                    cwd: PathBuf::from("/"),
+                    stdin: heph::proc_exec::StdioSpec::Null,
+                    stdout: heph::proc_exec::StdioSpec::Null,
+                    stderr: heph::proc_exec::StdioSpec::Null,
+                    setsid: true,
+                    ctty: false,
+                })
+                .expect("spawn sleep")
+            })
+        })
+        .collect();
+    // Keep every handle: dropping one would kill its child ourselves.
+    let handles: Vec<_> = threads
+        .into_iter()
+        .map(|t| t.join().expect("spawn thread"))
+        .collect();
+    for h in &handles {
+        println!("CHILD {}", h.pid());
+    }
+    println!(
+        "SIDECAR {}",
+        heph::process_supervisor::sidecar_pid().map_or(-1, |p| p)
+    );
+    std::io::stdout().flush().expect("flush");
+    let me = i32::try_from(std::process::id()).expect("pid fits");
+    // SAFETY: kill(2) on our own pid; nothing after this runs.
+    unsafe {
+        libc::kill(me, libc::SIGKILL);
+    }
+}
+
+/// Env var naming the scratch dir of
+/// [`failed_supervisor_start_spawns_nothing_and_a_later_spawn_retries`].
+const RETRY_CHILD_ENV: &str = "HEPH_TEST_SUPERVISOR_RETRY_CHILD";
+
+/// A spec that, if it ever ran, would leave `marker` behind.
+fn touch_spec(marker: &std::path::Path) -> heph::proc_exec::Spec {
+    heph::proc_exec::Spec {
+        program: PathBuf::from("/bin/sh"),
+        args: vec!["-c".into(), format!("touch '{}'", marker.display()).into()],
+        env: vec![],
+        cwd: PathBuf::from("/"),
+        stdin: heph::proc_exec::StdioSpec::Null,
+        stdout: heph::proc_exec::StdioSpec::Null,
+        stderr: heph::proc_exec::StdioSpec::Null,
+        setsid: true,
+        ctty: false,
+    }
+}
+
+/// The child half of the test below; a no-op under a normal test run.
+///
+/// `init` points at a binary that does not exist yet — the replaced-binary
+/// case: the supervisor is executed at the first child, not at startup. The
+/// first spawn must fail without running its command. Then the binary appears,
+/// and a later spawn (once the backoff has passed) must start the supervisor
+/// and spawn. Prints what it saw and SIGKILLs itself with that child alive.
+#[test]
+fn supervisor_retry_child_process() {
+    let Some(dir) = std::env::var_os(RETRY_CHILD_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let exe = dir.join("heph-installed-later");
+    heph::process_supervisor::init_with_exe(exe.clone()).expect("init");
+
+    let marker = dir.join("ran");
+    let err = heph::proc_exec::spawn(touch_spec(&marker))
+        .err()
+        .expect("no supervisor binary: the spawn must fail");
+    println!(
+        "FIRST_ERR_HAS_HINT {}",
+        u8::from(err.to_string().contains("ulimit"))
+    );
+    println!(
+        "FIRST_ERR_IS_NOT_NOTFOUND {}",
+        u8::from(err.kind() != std::io::ErrorKind::NotFound)
+    );
+    // Long enough for a `touch` that did run to have landed.
+    std::thread::sleep(Duration::from_millis(300));
+    println!("MARKER_PRESENT {}", u8::from(marker.exists()));
+    println!(
+        "SIDECAR_AFTER_FAILURE {}",
+        heph::process_supervisor::sidecar_pid().map_or(-1, |p| p)
+    );
+
+    std::os::unix::fs::symlink(heph_bin(), &exe).expect("install the binary");
+    let deadline = Instant::now() + REAP_TIMEOUT;
+    let handle = loop {
+        match heph::proc_exec::spawn(heph::proc_exec::Spec {
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["120".into()],
+            ..touch_spec(&marker)
+        }) {
+            Ok(h) => break h,
+            // Inside the backoff window: the latched error, no new attempt.
+            Err(e) if Instant::now() < deadline => {
+                drop(e);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("the supervisor start was never retried: {e}"),
+        }
+    };
+    println!("CHILD {}", handle.pid());
+    println!(
+        "SIDECAR {}",
+        heph::process_supervisor::sidecar_pid().map_or(-1, |p| p)
+    );
+    std::io::stdout().flush().expect("flush");
+    let me = i32::try_from(std::process::id()).expect("pid fits");
+    // SAFETY: kill(2) on our own pid; nothing after this runs.
+    unsafe {
+        libc::kill(me, libc::SIGKILL);
+    }
+}
+
+/// A failed supervisor start is not sticky. The first spawn fails — with a
+/// hint, and without running its command — and once the binary is there a
+/// later spawn starts the supervisor over the same socket: the child it spawns
+/// is reaped when the process is SIGKILLed.
+#[test]
+fn failed_supervisor_start_spawns_nothing_and_a_later_spawn_retries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = {
+        let _gate = spawn_gate();
+        Command::new(exe)
+            .args([
+                "--exact",
+                "supervisor_retry_child_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(RETRY_CHILD_ENV, dir.path())
+            .env_remove("heph_DISABLE_REAPER")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child process")
+    };
+    let mut out = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().expect("stdout"), &mut out)
+        .expect("read child stdout");
+    let status = child.wait().expect("wait child");
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the child must die by SIGKILL; stdout:\n{out}"
+        );
+    }
+
+    let tokens: Vec<&str> = out.split_whitespace().collect();
+    let field = |key: &str| -> Vec<i64> {
+        tokens
+            .windows(2)
+            .filter(|w| w.first() == Some(&key))
+            .filter_map(|w| w.get(1)?.parse().ok())
+            .collect()
+    };
+    assert_eq!(field("FIRST_ERR_HAS_HINT"), vec![1], "stdout:\n{out}");
+    assert_eq!(
+        field("FIRST_ERR_IS_NOT_NOTFOUND"),
+        vec![1],
+        "stdout:\n{out}"
+    );
+    assert_eq!(
+        field("MARKER_PRESENT"),
+        vec![0],
+        "a spawn whose supervisor failed to start must not run; stdout:\n{out}"
+    );
+    assert_eq!(field("SIDECAR_AFTER_FAILURE"), vec![-1], "stdout:\n{out}");
+    let sidecar = field("SIDECAR");
+    assert!(
+        sidecar.len() == 1 && sidecar[0] > 0,
+        "the retry must have started the supervisor; stdout:\n{out}"
+    );
+    let children = field("CHILD");
+    assert_eq!(children.len(), 1, "stdout:\n{out}");
+    let pid = u32::try_from(children[0]).expect("pid");
+    assert!(
+        await_pid_gone(pid, REAP_TIMEOUT),
+        "child {pid}, spawned after a retried supervisor start, survived heph's SIGKILL"
+    );
+}
+
+/// The supervisor starts lazily, but every child still dies with heph — the
+/// race the deferral could have opened. The child process reports no
+/// supervisor after `init` (a command that spawns nothing never starts one),
+/// then spawns several children concurrently, racing the start, and is
+/// SIGKILLed as soon as they exist. Every one must be reaped.
+#[test]
+fn lazy_supervisor_reaps_children_spawned_at_startup_on_sigkill() {
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = {
+        let _gate = spawn_gate();
+        Command::new(exe)
+            .args([
+                "--exact",
+                "lazy_supervisor_child_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LAZY_CHILD_ENV, "1")
+            .env_remove("heph_DISABLE_REAPER")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child process")
+    };
+    let mut out = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().expect("stdout"), &mut out)
+        .expect("read child stdout");
+    let status = child.wait().expect("wait child");
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the child must die by SIGKILL; stdout:\n{out}"
+        );
+    }
+
+    // Token pairs, not line prefixes: the harness prints the test name on the
+    // same line as the first `println!`.
+    let tokens: Vec<&str> = out.split_whitespace().collect();
+    let field = |key: &str| -> Vec<i64> {
+        tokens
+            .windows(2)
+            .filter(|w| w.first() == Some(&key))
+            .filter_map(|w| w.get(1)?.parse().ok())
+            .collect()
+    };
+    assert_eq!(
+        field("SIDECAR_AT_INIT"),
+        vec![-1],
+        "init must not start the supervisor; stdout:\n{out}"
+    );
+    let sidecar = field("SIDECAR");
+    assert!(
+        sidecar.len() == 1 && sidecar[0] > 0,
+        "the first spawn must have started the supervisor; stdout:\n{out}"
+    );
+    let children = field("CHILD");
+    assert_eq!(children.len(), LAZY_CHILDREN, "stdout:\n{out}");
+    for pid in children {
+        let pid = u32::try_from(pid).expect("pid");
+        assert!(
+            await_pid_gone(pid, REAP_TIMEOUT),
+            "child {pid}, spawned while the supervisor started, survived heph's SIGKILL"
+        );
+    }
+}

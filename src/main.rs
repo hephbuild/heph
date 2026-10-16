@@ -124,8 +124,11 @@ fn main() -> ExitCode {
         Err(e) => e.exit(),
     };
 
-    // Fork the supervisor sidecar that will SIGKILL every tracked child
+    // Set up the supervisor sidecar that will SIGKILL every tracked child
     // process group when this binary exits — including hard-kill scenarios.
+    // Only its socketpair is made here, while still single-threaded; the
+    // sidecar process itself is spawned before the first child (or cdylib
+    // plugin load), so a command that spawns nothing never pays for it.
     if let Err(e) = heph::process_supervisor::init() {
         error!(error = %format!("{e:#}"), "Failed to start process supervisor");
         return ExitCode::FAILURE;
