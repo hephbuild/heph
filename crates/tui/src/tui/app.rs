@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::log_sink::LogSink;
 use hcore::events::{BuildEvent, EventSender};
-type PendingCounter = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+use hcore::pending::PendingCounter;
 
 pub(crate) enum Control {
     Pause(oneshot::Sender<()>, PauseFor),

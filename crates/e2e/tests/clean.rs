@@ -21,7 +21,7 @@ use heph::htaddr::parse_addr;
 use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 /// Build `addr` through a *fresh* engine over `ws`'s root — the next `heph run`'s
 /// view of the same on-disk cache — and don't return until the run's background
@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 async fn run_and_settle(ws: &Workspace, addr_str: &str) -> anyhow::Result<String> {
     let addr = parse_addr(addr_str)?;
     let engine = ws.reopen()?;
-    let bg: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let bg = hcore::pending::Pending::shared();
     let rs = engine.new_state_full(
         true,
         None,

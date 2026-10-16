@@ -62,7 +62,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::{io, thread};
 
 /// `remove_dir_all` that recovers from `PermissionDenied`. The Go module
@@ -87,8 +87,9 @@ pub type SandboxCleanupJob = Box<dyn FnOnce() -> io::Result<()> + Send + 'static
 /// and is carried alongside each job so the global cleaner thread can decrement
 /// the right request's counter once the job has run. The shutdown path keeps
 /// the TUI open — and the process alive — until this drains to zero, so we never
-/// exit out from under an in-progress rmdir.
-pub type PendingCounter = Arc<AtomicUsize>;
+/// exit out from under an in-progress rmdir — and wakes that wait on the last
+/// decrement rather than having it poll (see [`hcore::pending`]).
+pub use hcore::pending::PendingCounter;
 
 /// Queue entry: a failure `label`, the job, and the request counter to
 /// decrement when it completes.
@@ -519,7 +520,7 @@ mod tests {
     }
 
     fn counter() -> PendingCounter {
-        Arc::new(AtomicUsize::new(0))
+        hcore::pending::Pending::shared()
     }
 
     /// Opens a gate on drop, so a failing assertion cannot leave a lane's worker
