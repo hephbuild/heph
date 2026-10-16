@@ -147,16 +147,10 @@ fn addr_cell(addr: &str) -> String {
     truncate_chars(addr, MAX_ADDR_CHARS)
 }
 
-/// `4m12s`, `58s`, `1h04m`.
+/// `58s`, `4m12s`, `1h04m`, `2d03h` — heph's one duration format
+/// ([`hcore::units::human_duration`]), so the job summary reads like the TUI.
 pub(crate) fn fmt_duration(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    if secs < 3_600 {
-        return format!("{}m{:02}s", secs / 60, secs % 60);
-    }
-    format!("{}h{:02}m", secs / 3_600, (secs % 3_600) / 60)
+    hcore::units::human_duration(std::time::Duration::from_millis(ms))
 }
 
 /// `1,412` — thousands separators, because the difference between 4117 and 41171
@@ -1205,6 +1199,8 @@ mod tests {
         assert_eq!(fmt_duration(8_200), "8s");
         assert_eq!(fmt_duration(252_000), "4m12s");
         assert_eq!(fmt_duration(3_930_000), "1h05m");
+        // Past a day it rolls into days, as everywhere else in heph — not `25h00m`.
+        assert_eq!(fmt_duration(90_000_000), "1d01h");
         assert_eq!(fmt_count(4_117), "4,117");
         assert_eq!(fmt_count(20_140), "20,140");
         assert_eq!(fmt_count(7), "7");

@@ -64,6 +64,25 @@ fn main() -> ExitCode {
         commands::auth_helper::run(inv);
     }
 
+    // The detached telemetry flusher (`heph __telemetry-flush [--opt-out]
+    // [<root>]`), spawned by a command whose spool came due, or by an
+    // opted-out command with a spool left over (`--opt-out`). Dispatched here
+    // for the same reason: it is a background helper with no terminal, so it
+    // must not parse a command line with clap, start logging, fork the
+    // supervisor or self-upgrade. It re-checks the spawning workspace's config
+    // opt-out (the optional `<root>`), sends the spool and exits; opted out, it
+    // deletes the spool after that one send.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == heph::telemetry::FLUSH_SUBCOMMAND)
+    {
+        heph::telemetry::flush_main(|root| {
+            heph::engine::config_yaml::load_from_root(root)
+                .map(|f| f.telemetry_enabled())
+                .unwrap_or(true)
+        });
+    }
+
     // Dynamic shell completion. A no-op unless the `COMPLETE` env var is set
     // (a tab press or `heph tool completions` registration), in which case it
     // emits candidates / the registration script and exits the process. Runs
@@ -142,10 +161,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Telemetry decision is taken up front (config read), but the flush happens
-    // at exit: this run's event is spooled, then we try to send it (plus any
-    // backlog) within a short post-work budget. On CI the runner — and its
-    // spool — is ephemeral, so there is no "next run" to defer to.
+    // Telemetry decision is taken up front (config read), but the event is
+    // recorded at exit: spooled, and handed to a detached flusher when the
+    // spool is due — never waited on. On CI the runner — and its spool — is
+    // ephemeral and kills detached processes, so CI sends synchronously.
     let telemetry_on =
         heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config());
     // Warm the repo fingerprint off the hot path: the git root walk runs on a
@@ -190,15 +209,21 @@ fn main() -> ExitCode {
         }
     };
 
-    // Best-effort, opt-out usage telemetry: record this invocation's event and
-    // try to send it (bounded; CI blocks). Never changes the exit code.
+    // Best-effort, opt-out usage telemetry: spool this invocation's event and,
+    // when due, spawn the detached flusher (CI sends inline). Opted out, record
+    // nothing; a spool left from before the opt-out is sent once by a detached
+    // `__telemetry-flush --opt-out` (inline on CI) and then deleted, sent or
+    // not. Never changes the exit code.
     if telemetry_on {
         heph::telemetry::record_invocation(
             &matches,
             &Cli::command(),
             exec_result.as_ref().err(),
             started_at.elapsed(),
+            heph::engine::get_root().ok().as_deref(),
         );
+    } else {
+        heph::telemetry::flush_on_opt_out();
     }
 
     // Flush the final (filtered) report and stop the watcher.

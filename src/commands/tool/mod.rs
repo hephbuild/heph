@@ -9,6 +9,7 @@ mod gen_gitignore;
 mod plugins;
 mod resolve_plugins;
 mod scratch;
+mod telemetry;
 
 use clap::{Args, Subcommand};
 
@@ -133,6 +134,12 @@ pub enum ToolCommands {
     ///
     /// Example: `heph tool plugins --json`
     Plugins(plugins::Args),
+    /// Inspect anonymous usage telemetry
+    ///
+    /// What heph reports, and how to turn it off, is in docs/TELEMETRY.md.
+    ///
+    /// Example: `heph tool telemetry status`
+    Telemetry(telemetry::TelemetryArgs),
 }
 
 impl ToolArgs {
@@ -159,6 +166,7 @@ impl ToolCommands {
             ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, global),
             ToolCommands::ResolvePlugins(args) => resolve_plugins::execute(args, sink, global),
             ToolCommands::Plugins(args) => plugins::execute(args, sink, global),
+            ToolCommands::Telemetry(args) => args.execute(),
         }
     }
 }

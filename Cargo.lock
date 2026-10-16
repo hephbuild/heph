@@ -7173,6 +7173,7 @@ dependencies = [
  "clap",
  "core",
  "hex",
+ "libc",
  "plugin",
  "posthog-rs",
  "reqwest",

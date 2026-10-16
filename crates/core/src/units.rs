@@ -183,10 +183,56 @@ pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(total))
 }
 
+/// Format a duration the way a person reads an elapsed time or an age: the
+/// coarsest two units, truncated, never rounded — `0s`, `59s`, `1m05s`,
+/// `1h05m`, `2d03h`.
+///
+/// Sub-second precision is dropped: this is for "how long ago / how long
+/// until", where `12.4s` is noise. The output parses back with
+/// [`parse_duration`] (to the precision shown).
+pub fn human_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else if secs < 86_400 {
+        format!("{}h{:02}m", secs / 3_600, (secs % 3_600) / 60)
+    } else {
+        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3_600)
+    }
+}
+
 #[cfg(test)]
 mod duration_tests {
-    use super::parse_duration;
+    use super::{human_duration, parse_duration};
     use std::time::Duration;
+
+    #[test]
+    fn human_duration_shows_the_two_coarsest_units_at_each_boundary() {
+        let h = |s: u64| human_duration(Duration::from_secs(s));
+        assert_eq!(h(0), "0s");
+        assert_eq!(human_duration(Duration::from_millis(999)), "0s");
+        assert_eq!(h(59), "59s");
+        assert_eq!(human_duration(Duration::from_millis(59_999)), "59s");
+        assert_eq!(h(60), "1m00s");
+        assert_eq!(h(65), "1m05s");
+        assert_eq!(h(3_599), "59m59s");
+        assert_eq!(h(3_600), "1h00m");
+        assert_eq!(h(86_399), "23h59m");
+        assert_eq!(h(86_400), "1d00h");
+        assert_eq!(h(86_400 * 3 + 3_600 * 5 + 59), "3d05h");
+        // No overflow at the top of the range.
+        assert_eq!(human_duration(Duration::MAX), "213503982334601d07h");
+    }
+
+    #[test]
+    fn human_duration_parses_back() {
+        for s in [0, 59, 65, 3_600 + 5 * 60, 86_400 * 2 + 3 * 3_600] {
+            let d = Duration::from_secs(s);
+            assert_eq!(parse_duration(&human_duration(d)).expect("parse"), d);
+        }
+    }
 
     #[test]
     fn a_bare_number_is_seconds() {
