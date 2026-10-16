@@ -29,6 +29,10 @@ const WRITE_BATCH_MAX: usize = 64;
 /// cleared turns into a failed build.
 const READ_POOL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the schema check waits for its pooled read connection — see
+/// [`LocalCacheSQLite::check_schema`].
+const SCHEMA_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Read connections to keep beyond the pipe budget, for the callers that take one
 /// with **no** pipe permit.
 ///
@@ -383,10 +387,47 @@ impl WriterGate {
     }
 }
 
+/// The cache schema's version, stored in the database's `PRAGMA user_version`.
+///
+/// A database at this version (or newer) has the tables and indexes below and
+/// its persistent settings (WAL; 8 KiB pages if it was created at this version)
+/// applied,
+/// so opening it runs no DDL: before this, every process re-ran the whole
+/// `CREATE … IF NOT EXISTS` batch, which parses the schema on a read-write
+/// connection on the startup path of every command. A database below it — a
+/// fresh file, or one written before the version existed (`0`) — is brought up
+/// by [`migrate_schema`], which is idempotent and serialized across processes.
+///
+/// Bump it, and extend [`migrate_schema`], with any schema change. An older heph
+/// opening a newer database re-runs its own `IF NOT EXISTS` DDL unconditionally
+/// and never reads this value, so a bump does not lock older binaries out.
+const SCHEMA_VERSION: i64 = 1;
+
+/// The writer thread and the channel that feeds it, spawned on the first write.
+struct Writer {
+    tx: mpsc::Sender<WriterCmd>,
+    handle: JoinHandle<()>,
+}
+
+/// The local SQLite cache.
+///
+/// Nothing is opened at construction. The schema is checked (and, if needed,
+/// migrated) before the first connection of either kind; read connections are
+/// opened by the pool as reads need them; the read-write connection and its
+/// writer thread exist only once something is written. A command that reads
+/// the cache and writes nothing never opens a read-write connection, and so
+/// never pays the checkpoint-and-unlink a read-write connection's close costs.
 pub struct LocalCacheSQLite {
+    db_path: PathBuf,
+    /// The outcome of this process's one schema check (and migration, if one
+    /// was needed). A failure is latched as its rendered chain: every later
+    /// use returns the same error at once instead of re-running the check, its
+    /// lock wait and its pool retries on every read.
+    schema: std::sync::OnceLock<Result<(), String>>,
     read_pool: r2d2::Pool<SqliteConnectionManager>,
-    writer_tx: Option<mpsc::Sender<WriterCmd>>,
-    writer_handle: Option<JoinHandle<()>>,
+    /// The writer, spawned by the first write; a failed spawn is latched like
+    /// [`Self::schema`].
+    writer: std::sync::OnceLock<Result<Writer, String>>,
     pending: Arc<PendingTracker>,
     pipe_sem: Arc<PipeSemaphore>,
     inline_threshold: usize,
@@ -425,35 +466,6 @@ impl LocalCacheSQLite {
         let read_pool_size = u32::try_from(pipe_limit.saturating_add(headroom))
             .unwrap_or(u32::MAX)
             .max(1);
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating sqlite cache dir {parent:?}"))?;
-        }
-
-        let mut write_conn = Connection::open(&db_path)
-            .with_context(|| format!("opening sqlite cache at {db_path:?}"))?;
-
-        write_conn
-            .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA busy_timeout = 10000;
-                 PRAGMA synchronous = NORMAL;
-                 PRAGMA foreign_keys = ON;
-                 PRAGMA temp_store = MEMORY;
-                 PRAGMA auto_vacuum = INCREMENTAL;
-                 PRAGMA page_size = 8192;
-                 PRAGMA cache_size = -64000;
-                 PRAGMA mmap_size = 268435456;
-                 CREATE TABLE IF NOT EXISTS artifacts (
-                     addr   TEXT NOT NULL,
-                     hashin TEXT NOT NULL,
-                     name   TEXT NOT NULL,
-                     data   BLOB NOT NULL,
-                     PRIMARY KEY (addr, hashin, name)
-                 );
-                 CREATE INDEX IF NOT EXISTS idx_artifacts_addr_hashin ON artifacts (addr, hashin);",
-            )
-            .context("initialising sqlite cache schema")?;
 
         let manager = SqliteConnectionManager::file(&db_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -469,7 +481,16 @@ impl LocalCacheSQLite {
 
         let read_pool = r2d2::Pool::builder()
             .max_size(read_pool_size)
-            .min_idle(Some(1))
+            // Zero, so building the pool opens nothing: a connection is opened
+            // by the first read that needs one (after the schema check), not at
+            // engine construction for every command whether it reads or not.
+            .min_idle(Some(0))
+            // Once opened, a connection stays: with `min_idle` 0 the default
+            // 10-minute idle timeout would reap every idle connection, and the
+            // next read would have to open one again — the open that stalls for
+            // the whole connection timeout if the db file has gone since (see
+            // `check_schema`).
+            .idle_timeout(None)
             // Explicit rather than inherited: this bound is load-bearing for the
             // stall it converts into an error, and it should not move because
             // r2d2 changed a default.
@@ -483,36 +504,116 @@ impl LocalCacheSQLite {
             .build(manager)
             .context("building sqlite read connection pool")?;
 
-        let pending = Arc::new(PendingTracker::default());
-        let (writer_tx, writer_rx) = mpsc::channel::<WriterCmd>();
-        let pending_bg = pending.clone();
-        #[cfg(test)]
-        let gate = Arc::new(WriterGate::default());
-        #[cfg(test)]
-        let gate_bg = gate.clone();
-        let writer_handle = std::thread::Builder::new()
-            .name("heph-sqlite-writer".to_string())
-            .spawn(move || {
-                writer_loop(
-                    &mut write_conn,
-                    &writer_rx,
-                    &pending_bg,
-                    #[cfg(test)]
-                    &gate_bg,
-                )
-            })
-            .context("spawning sqlite writer thread")?;
-
         Ok(Self {
+            db_path,
+            schema: std::sync::OnceLock::new(),
             read_pool,
-            writer_tx: Some(writer_tx),
-            writer_handle: Some(writer_handle),
-            pending,
+            writer: std::sync::OnceLock::new(),
+            pending: Arc::new(PendingTracker::default()),
             pipe_sem: PipeSemaphore::new(pipe_limit),
             inline_threshold,
             #[cfg(test)]
-            gate,
+            gate: Arc::new(WriterGate::default()),
         })
+    }
+
+    /// Make sure the schema is at [`SCHEMA_VERSION`] before any connection
+    /// uses it. Once per process; free after the first call, and a failure is
+    /// returned again, at once, to every later caller (see [`Self::schema`]).
+    fn ensure_schema(&self) -> Result<()> {
+        self.schema
+            .get_or_init(|| self.check_schema().map_err(|e| format!("{e:#}")))
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("sqlite cache {:?} is unavailable: {e}", self.db_path))
+    }
+
+    /// The schema check behind [`Self::ensure_schema`].
+    ///
+    /// It reads `user_version` on a pooled read connection — the one the first
+    /// read needed anyway — and only a database below the current version is
+    /// opened read-write for [`migrate_schema`]. A missing file goes straight
+    /// to the migration: a read-only open of it would fail. So does one the
+    /// check cannot read — the migration's read-write open then reports the
+    /// real error, and a database another process is creating at this moment
+    /// is waited for under the migration lock rather than failed.
+    ///
+    /// The check's connection wait is [`SCHEMA_CHECK_TIMEOUT`], not the pool's:
+    /// nothing else holds a connection yet, so the only way to wait at all is
+    /// an open that fails, which r2d2 retries until the timeout — 30 s of
+    /// stall per process for a database it cannot open.
+    fn check_schema(&self) -> Result<()> {
+        let current = self.db_path.exists()
+            && self
+                .read_pool
+                .get_timeout(SCHEMA_CHECK_TIMEOUT)
+                .ok()
+                .and_then(|conn| {
+                    conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                        .ok()
+                })
+                .is_some_and(|version| version >= SCHEMA_VERSION);
+        if !current {
+            migrate_schema(&self.db_path)?;
+            // Leave one read connection idle in the pool, as the check above
+            // does for a database that was already current. Without it, the
+            // first read after the db file vanished (a cache dir removed
+            // mid-run, a test's tempdir dropped under a queued trim) has to
+            // open one, and r2d2 retries that failing open for the pool's full
+            // 30 s timeout. A held connection keeps reading the unlinked file,
+            // as the eager pool before lazy opening did.
+            drop(
+                self.read_pool
+                    .get_timeout(SCHEMA_CHECK_TIMEOUT)
+                    .with_context(|| format!("opening a read connection to {:?}", self.db_path))?,
+            );
+        }
+        Ok(())
+    }
+
+    /// The writer channel, spawning the writer thread (and opening the
+    /// read-write connection) on first use.
+    fn writer_tx(&self) -> Result<&mpsc::Sender<WriterCmd>> {
+        self.ensure_schema()?;
+        self.writer
+            .get_or_init(|| self.spawn_writer().map_err(|e| format!("{e:#}")))
+            .as_ref()
+            .map(|w| &w.tx)
+            .map_err(|e| anyhow::anyhow!("sqlite cache {:?} cannot be written: {e}", self.db_path))
+    }
+
+    fn spawn_writer(&self) -> Result<Writer> {
+        let mut conn = Connection::open(&self.db_path)
+            .with_context(|| format!("opening sqlite cache at {:?}", self.db_path))?;
+        // Per-connection settings only; the persistent ones (journal mode,
+        // auto-vacuum, page size) are the schema's, applied by `migrate_schema`.
+        conn.execute_batch(
+            "PRAGMA busy_timeout = 10000;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -64000;
+             PRAGMA mmap_size = 268435456;",
+        )
+        .context("configuring sqlite cache write connection")?;
+
+        let (tx, rx) = mpsc::channel::<WriterCmd>();
+        let pending = Arc::clone(&self.pending);
+        #[cfg(test)]
+        let gate = Arc::clone(&self.gate);
+        let handle = std::thread::Builder::new()
+            .name("heph-sqlite-writer".to_string())
+            .spawn(move || {
+                writer_loop(
+                    &mut conn,
+                    &rx,
+                    &pending,
+                    #[cfg(test)]
+                    &gate,
+                )
+            })
+            .context("spawning sqlite writer thread")?;
+        Ok(Writer { tx, handle })
     }
 
     fn key(addr: &Addr) -> String {
@@ -527,18 +628,13 @@ impl LocalCacheSQLite {
     /// the source, which is what distinguishes "waited and nothing freed up" from
     /// "could not open a connection at all".
     fn read_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        self.ensure_schema()?;
         self.read_pool.get().with_context(|| {
             format!(
                 "acquiring a sqlite read connection: pool of {} exhausted",
                 self.read_pool.max_size(),
             )
         })
-    }
-
-    fn writer_tx(&self) -> Result<&mpsc::Sender<WriterCmd>> {
-        self.writer_tx
-            .as_ref()
-            .context("sqlite cache writer thread has shut down")
     }
 
     /// The presence of a key in the *committed* state, with no regard for the
@@ -562,13 +658,81 @@ impl LocalCacheSQLite {
 
 impl Drop for LocalCacheSQLite {
     fn drop(&mut self) {
-        // Close the channel so the writer thread observes a Disconnected and exits cleanly.
-        self.writer_tx = None;
-        if let Some(handle) = self.writer_handle.take() {
+        // Nothing to do when nothing was ever written: no writer was spawned.
+        if let Some(Ok(Writer { tx, handle })) = self.writer.take() {
+            // Close the channel so the writer thread observes a Disconnected,
+            // finishes its queue and exits cleanly.
+            drop(tx);
             // If join fails (panic in bg thread), there's nothing useful to do here.
             drop(handle.join());
         }
     }
+}
+
+/// Bring the database at `db_path` up to [`SCHEMA_VERSION`], creating it (and
+/// its directory) if needed.
+///
+/// Safe against other processes doing the same at the same moment. Migrators
+/// serialize on an exclusive `flock` of `<db>-migrate.lock` (waiting at most
+/// [`MIGRATE_LOCK_TIMEOUT`](hwalk::migrate_lock::MIGRATE_LOCK_TIMEOUT)) and re-read the
+/// version under it, so only the first one does any work. The lock is not
+/// belt-and-braces: switching a database to WAL takes its exclusive lock
+/// *without* consulting the busy handler, so two processes creating the same
+/// fresh database used to fail one of them with "database is locked" — under
+/// the old open-time DDL just as much as here. The DDL and the version stamp
+/// still commit in one `BEGIN IMMEDIATE` transaction, so a migrator from an
+/// older heph (which takes no lock) can only ever find the objects present.
+fn migrate_schema(db_path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating sqlite cache dir {parent:?}"))?;
+    }
+    let _lock =
+        hwalk::migrate_lock::lock_migration(db_path, hwalk::migrate_lock::MIGRATE_LOCK_TIMEOUT)
+            .context("serializing the sqlite cache schema migration")?;
+
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("opening sqlite cache at {db_path:?}"))?;
+    conn.busy_timeout(Duration::from_secs(10))
+        .context("setting sqlite cache busy timeout")?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("reading sqlite cache schema version")?;
+    if version >= SCHEMA_VERSION {
+        // Another process migrated while this one waited for the lock.
+        return Ok(());
+    }
+    // Outside the transaction: neither can change inside one. Both persist in
+    // the file, and the order is load-bearing: the page size only takes effect
+    // on a database whose header is not written yet, and switching to WAL
+    // writes it — WAL first left every database at the 4 KiB default, which is
+    // what every pre-versioning database has. On such a database (version 0,
+    // already WAL) the page size is a silent no-op, which is harmless: it is a
+    // per-file setting every sqlite reads.
+    //
+    // No `auto_vacuum`: nothing ever runs `incremental_vacuum`, so INCREMENTAL
+    // would only add pointer-map pages, and no existing database has it — the
+    // old open-time batch set it after WAL too, where it never took effect.
+    conn.execute_batch(
+        "PRAGMA page_size = 8192;
+         PRAGMA journal_mode = WAL;",
+    )
+    .context("setting sqlite cache persistent pragmas")?;
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS artifacts (
+             addr   TEXT NOT NULL,
+             hashin TEXT NOT NULL,
+             name   TEXT NOT NULL,
+             data   BLOB NOT NULL,
+             PRIMARY KEY (addr, hashin, name)
+         );
+         CREATE INDEX IF NOT EXISTS idx_artifacts_addr_hashin ON artifacts (addr, hashin);
+         PRAGMA user_version = {SCHEMA_VERSION};
+         COMMIT;"
+    ))
+    .context("initialising sqlite cache schema")?;
+    Ok(())
 }
 
 /// Releases every slot still registered when the writer thread goes away, so that
@@ -1085,6 +1249,307 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use tempfile::tempdir;
+
+    fn open(path: &std::path::Path) -> Result<LocalCacheSQLite> {
+        LocalCacheSQLite::with_pipe_limit(path.to_path_buf(), 1024, 4)
+    }
+
+    fn put(cache: &LocalCacheSQLite, addr: &Addr, name: &str, data: &[u8]) -> Result<()> {
+        let mut w = cache.writer(addr, "h", name)?;
+        w.write_all(data)?;
+        w.commit()
+    }
+
+    fn user_version(path: &std::path::Path) -> Result<i64> {
+        Ok(Connection::open(path)?.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+    }
+
+    fn has_index(path: &std::path::Path) -> Result<bool> {
+        Ok(Connection::open(path)?.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'idx_artifacts_addr_hashin'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? == 1)
+    }
+
+    /// Construction opens nothing, and a cache that is only read never opens the
+    /// read-write connection or spawns the writer thread.
+    #[test]
+    fn nothing_opens_until_used_and_reads_never_spawn_the_writer() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("sub").join("cache.db");
+        {
+            let cache = open(&path)?;
+            assert!(!path.exists(), "construction must not create the database");
+            put(&cache, &make_addr("pkg", "t"), "a", b"x")?;
+        }
+        let cache = open(&path)?;
+        assert!(cache.exists(&make_addr("pkg", "t"), "h", "a")?);
+        assert!(!cache.exists(&make_addr("pkg", "t"), "h", "b")?);
+        assert!(
+            cache.writer.get().is_none(),
+            "a read-only use must not spawn the writer"
+        );
+        Ok(())
+    }
+
+    /// A fresh database is created at the current schema version.
+    #[test]
+    fn a_fresh_database_is_stamped_with_the_schema_version() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open(&path)?;
+        assert!(!cache.exists(&make_addr("pkg", "t"), "h", "a")?);
+        assert_eq!(user_version(&path)?, SCHEMA_VERSION);
+        assert!(has_index(&path)?);
+        Ok(())
+    }
+
+    /// At the current version the DDL is skipped: an object it would recreate
+    /// stays absent. Below it — a database from before the version existed — the
+    /// DDL runs again and the version is stamped.
+    #[test]
+    fn ddl_runs_only_when_the_schema_version_is_behind() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let addr = make_addr("pkg", "t");
+        put(&open(&path)?, &addr, "a", b"x")?;
+
+        // Current version, index removed by hand: reopening must not notice.
+        Connection::open(&path)?.execute_batch("DROP INDEX idx_artifacts_addr_hashin;")?;
+        let cache = open(&path)?;
+        assert!(cache.exists(&addr, "h", "a")?);
+        put(&cache, &addr, "b", b"y")?;
+        drop(cache);
+        assert!(
+            !has_index(&path)?,
+            "DDL must be skipped at the current version"
+        );
+
+        // An older database (version 0): the DDL is applied and the version set.
+        Connection::open(&path)?.execute_batch("PRAGMA user_version = 0;")?;
+        let cache = open(&path)?;
+        assert!(cache.exists(&addr, "h", "b")?, "migration keeps the data");
+        drop(cache);
+        assert!(has_index(&path)?, "DDL must run on an older database");
+        assert_eq!(user_version(&path)?, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    /// Several caches opening the same fresh database at the same instant — the
+    /// shape of concurrent heph processes on a new home — all succeed, and every
+    /// write lands.
+    #[test]
+    fn concurrent_first_opens_of_a_fresh_database_all_succeed() -> Result<()> {
+        const N: usize = 8;
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let threads: Vec<_> = (0..N)
+            .map(|i| {
+                let (path, barrier) = (path.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || -> Result<()> {
+                    let cache = open(&path)?;
+                    let addr = make_addr("pkg", &format!("t{i}"));
+                    barrier.wait();
+                    // Half start with a read, half with a write.
+                    if i % 2 == 0 {
+                        assert!(!cache.exists(&addr, "h", "a")?);
+                    }
+                    put(&cache, &addr, "a", b"x")?;
+                    assert!(cache.exists(&addr, "h", "a")?);
+                    Ok(())
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("thread")?;
+        }
+        let cache = open(&path)?;
+        for i in 0..N {
+            assert!(cache.exists(&make_addr("pkg", &format!("t{i}")), "h", "a")?);
+        }
+        assert_eq!(user_version(&path)?, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    fn pragma<T: rusqlite::types::FromSql>(path: &std::path::Path, name: &str) -> Result<T> {
+        Ok(Connection::open(path)?.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))?)
+    }
+
+    /// The persistent pragmas take effect on a fresh database: the page size is
+    /// set before the switch to WAL writes the header (WAL first silently left
+    /// it at 4096), and auto-vacuum is deliberately left off.
+    #[test]
+    fn a_fresh_database_gets_its_persistent_pragmas() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        assert!(!open(&path)?.exists(&make_addr("pkg", "t"), "h", "a")?);
+        assert_eq!(pragma::<i64>(&path, "page_size")?, 8192);
+        assert_eq!(pragma::<String>(&path, "journal_mode")?, "wal");
+        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0, "auto_vacuum NONE");
+        Ok(())
+    }
+
+    /// Asserts that a use of a broken cache fails promptly — well under the
+    /// migration lock's and the pool's waits — with an error naming the db, and
+    /// that the failure is latched: a second use returns the same error again,
+    /// promptly, without re-running the check.
+    fn assert_fails_promptly_naming(cache: &LocalCacheSQLite, path: &std::path::Path) {
+        let addr = make_addr("pkg", "t");
+        let start = std::time::Instant::now();
+        let err = cache.exists(&addr, "h", "a").expect_err("must fail");
+        let took = start.elapsed();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("{path:?}")), "{msg}");
+        assert!(took < Duration::from_secs(3), "took {took:?}: {msg}");
+
+        let start = std::time::Instant::now();
+        let again = format!("{:#}", cache.exists(&addr, "h", "a").expect_err("latched"));
+        assert!(start.elapsed() < Duration::from_millis(100), "not latched");
+        assert_eq!(again, msg);
+        let Err(err) = cache.writer(&addr, "h", "a") else {
+            panic!("a write must fail the same way")
+        };
+        assert_eq!(format!("{err:#}"), msg);
+    }
+
+    /// The cache dir vanishing after first use (a concurrent clean, or a test's
+    /// tempdir dropped while a deferred trim is still queued) must not turn the
+    /// next read into a 30 s stall: the first use leaves a read connection in
+    /// the pool, on a fresh database as on an existing one, and that
+    /// connection keeps answering. Before, the pool opened nothing for a fresh
+    /// db, the next read had to open the vanished file, and r2d2 retried that
+    /// for its whole timeout — which parked the bookkeeping lane under the
+    /// sandbox-cleaner tests.
+    #[test]
+    fn reads_stay_prompt_after_the_cache_dir_vanishes() -> Result<()> {
+        for existing in [false, true] {
+            let dir = tempdir()?;
+            let path = dir.path().join("cache.db");
+            let addr = make_addr("pkg", "t");
+            if existing {
+                put(&open(&path)?, &addr, "a", b"x")?;
+            }
+            let cache = open(&path)?;
+            put(&cache, &addr, "b", b"y")?;
+            drop(dir);
+            assert!(!path.exists());
+            let start = std::time::Instant::now();
+            let res = cache.exists(&addr, "h", "b");
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "existing={existing}: took {:?} ({res:?})",
+                start.elapsed()
+            );
+            assert!(res?, "existing={existing}: the held connection still reads");
+        }
+        Ok(())
+    }
+
+    /// A cache file that is not a database.
+    #[test]
+    fn a_corrupt_database_fails_promptly_naming_it() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        std::fs::write(&path, b"definitely not a sqlite database\n".repeat(64))?;
+        assert_fails_promptly_naming(&open(&path)?, &path);
+        Ok(())
+    }
+
+    /// A cache dir this process cannot write, with no database in it yet.
+    #[test]
+    fn an_unwritable_cache_dir_fails_promptly_naming_it() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir()?;
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro)?;
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555))?;
+        if std::fs::write(ro.join("probe"), b"").is_ok() {
+            eprintln!("skipping: the read-only dir is writable here (running as root?)");
+            return Ok(());
+        }
+        let path = ro.join("cache.db");
+        assert_fails_promptly_naming(&open(&path)?, &path);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    /// A database this process cannot open at all. r2d2 retries a failing
+    /// open until the pool's 30 s timeout, which the schema check used to wait
+    /// out in full.
+    #[test]
+    fn an_unopenable_database_fails_promptly_naming_it() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        put(&open(&path)?, &make_addr("pkg", "t"), "a", b"x")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+        if std::fs::File::open(&path).is_ok() {
+            eprintln!("skipping: a mode-000 file is readable here (running as root?)");
+            return Ok(());
+        }
+        let cache = open(&path)?;
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_fails_promptly_naming(&cache, &path);
+        }));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        if let Err(panic) = res {
+            std::panic::resume_unwind(panic);
+        }
+        Ok(())
+    }
+
+    /// The open-time batch the previous binary (before `user_version`,
+    /// 372319d9) ran on every open, verbatim.
+    const PRE_VERSIONING_DDL: &str = "PRAGMA journal_mode = WAL;
+                 PRAGMA busy_timeout = 10000;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA temp_store = MEMORY;
+                 PRAGMA auto_vacuum = INCREMENTAL;
+                 PRAGMA page_size = 8192;
+                 PRAGMA cache_size = -64000;
+                 PRAGMA mmap_size = 268435456;
+                 CREATE TABLE IF NOT EXISTS artifacts (
+                     addr   TEXT NOT NULL,
+                     hashin TEXT NOT NULL,
+                     name   TEXT NOT NULL,
+                     data   BLOB NOT NULL,
+                     PRIMARY KEY (addr, hashin, name)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_artifacts_addr_hashin ON artifacts (addr, hashin);";
+
+    /// A current database opened by the previous binary in between (a
+    /// downgrade and back) keeps its version, settings and rows, and the next
+    /// open migrates nothing: it never takes the migration lock.
+    #[test]
+    fn a_database_reopened_by_the_previous_binary_is_still_current() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let addr = make_addr("pkg", "t");
+        put(&open(&path)?, &addr, "a", b"payload")?;
+
+        Connection::open(&path)?.execute_batch(PRE_VERSIONING_DDL)?;
+        assert_eq!(user_version(&path)?, SCHEMA_VERSION);
+        assert_eq!(pragma::<i64>(&path, "page_size")?, 8192);
+        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0);
+
+        let lock = hwalk::migrate_lock::migrate_lock_path(&path);
+        std::fs::remove_file(&lock)?;
+        let cache = open(&path)?;
+        assert!(cache.exists(&addr, "h", "a")?, "row intact");
+        let mut data = Vec::new();
+        cache
+            .reader(&addr, "h", "a")?
+            .reader
+            .read_to_end(&mut data)?;
+        assert_eq!(data, b"payload");
+        drop(cache);
+        assert!(!lock.exists(), "a current database must not be migrated");
+        assert_eq!(user_version(&path)?, SCHEMA_VERSION);
+        Ok(())
+    }
 
     /// A write command of a declared size. The spool is empty — `collect_batch`
     /// only reads `size`, which is what the real writer records too.

@@ -32,9 +32,23 @@ use std::sync::Arc;
 use wax::{Any, Glob, Program as _};
 
 pub mod cached_walker;
+pub mod migrate_lock;
 pub use cached_walker::{CachedWalker, DirEntry, DirListing, EntryKind, FileHash, file_hashout};
 
 /// Directory + glob ignore rules for a filesystem walk. See the module docs.
+///
+/// The glob matchers are compiled on first use, not at construction. Compiling
+/// is regex construction — several hundred microseconds per ignore set, on the
+/// startup path of every command, which built three of them — and a command
+/// that never walks a tree (a cached `run`, `version`) never needs one.
+/// Construction still *validates* every glob (parse and rule check, no regex),
+/// so a bad `fs.skip` entry fails where it always did.
+///
+/// What validation cannot catch is a set that parses but whose regex exceeds
+/// the regex crate's compiled-size limit. That surfaces from
+/// [`Self::ensure_compiled`], which every walk entry point calls before its
+/// first match, so the walk fails with the error instead of walking with a
+/// partial ignore set.
 #[derive(Debug, Clone)]
 pub struct Ignore {
     /// Absolute directories pruned by exact path.
@@ -42,6 +56,15 @@ pub struct Ignore {
     /// The raw ignore globs, kept so callers can chain them with a target's own
     /// excludes when compiling a per-target matcher.
     globs: Vec<String>,
+    /// The compiled matchers, built from `globs` on first use. A failure is
+    /// latched (as its rendered chain) so every later caller gets the same
+    /// error without recompiling.
+    compiled: std::sync::OnceLock<Result<Compiled, String>>,
+}
+
+/// The compiled form of an [`Ignore`]'s globs.
+#[derive(Debug, Clone)]
+struct Compiled {
     /// Compiled `globs` — matches a workspace-relative file path that is excluded.
     file_any: Arc<Any<'static>>,
     /// Compiled directory matchers derived from the recursive (`…/**`, `…/**/*`)
@@ -84,27 +107,59 @@ impl Ignore {
 
     /// Builds an ignore set from absolute `dirs` (exact-path prune) and
     /// workspace-relative `globs`.
+    ///
+    /// Every glob — and every directory prefix derived from one — is validated
+    /// here; the matchers themselves are compiled on first use (see the type
+    /// docs).
     pub fn new(dirs: &[PathBuf], globs: &[String]) -> anyhow::Result<Self> {
-        let file_any = compile_any(globs.iter().map(String::as_str))?;
-        // A directory is pruned when a glob names directories of that path —
-        // i.e. its final component is a literal (`foo/**/bar` prunes every `bar`
-        // dir under `foo`) — OR when it matches the prefix of a recursive glob
-        // (`**/node_modules/**`, which only matches *files* under node_modules,
-        // still prunes the dir via its `**/node_modules` prefix). A glob whose
-        // last component is a wildcard (`some/*.go`) is file-only and never prunes.
-        let dir_globs: Vec<&str> = globs
-            .iter()
-            .map(String::as_str)
-            .filter(|g| names_directory(g))
-            .chain(globs.iter().filter_map(|g| prune_prefix(g)))
-            .collect();
-        let dir_any = compile_any(dir_globs.into_iter())?;
+        for g in globs.iter().map(String::as_str).chain(dir_globs(globs)) {
+            check_pattern(g).with_context(|| format!("invalid ignore pattern '{g}'"))?;
+        }
         Ok(Self {
             dirs: dirs.to_vec(),
             globs: globs.to_vec(),
-            file_any,
-            dir_any,
+            compiled: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Compile the matchers if they are not yet, and report whether they
+    /// compiled. Every walk entry point calls this (directly, or through
+    /// [`Self::file_matcher`]) before its first [`Self::prune_dir`] /
+    /// [`Self::exclude_file`], and propagates the error.
+    ///
+    /// On input [`Self::new`] accepted, compilation fails only by exceeding the
+    /// regex size limit; the error names the offending pattern, or the set when
+    /// it is their union that is too big.
+    pub fn ensure_compiled(&self) -> anyhow::Result<()> {
+        self.compiled().map(drop)
+    }
+
+    /// The compiled matchers, built on the first call; the first failure is
+    /// returned to every caller.
+    fn compiled(&self) -> anyhow::Result<&Compiled> {
+        self.compiled
+            .get_or_init(|| {
+                let compile = || -> anyhow::Result<Compiled> {
+                    Ok(Compiled {
+                        file_any: compile_any(self.globs.iter().map(String::as_str))?,
+                        dir_any: compile_any(dir_globs(&self.globs))?,
+                    })
+                };
+                compile().map_err(|e| format!("{e:#}"))
+            })
+            .as_ref()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "compiling the {} fs.skip ignore glob(s): {e}",
+                    self.globs.len()
+                )
+            })
+    }
+
+    /// Whether the matchers have been compiled yet.
+    #[cfg(test)]
+    fn is_compiled(&self) -> bool {
+        self.compiled.get().is_some()
     }
 
     /// True if the directory at absolute `abs` (workspace-relative `rel`) must be
@@ -121,6 +176,10 @@ impl Ignore {
     ///
     /// The walk root itself (`rel == ""`) is never name- or glob-pruned — you are
     /// explicitly walking it — only exact-`dirs` pruning applies.
+    ///
+    /// Infallible by signature, so a caller must have checked
+    /// [`Self::ensure_compiled`]: if the matchers did not compile, nothing is
+    /// glob-pruned (exact-path and `.heph*` pruning still apply).
     pub fn prune_dir(&self, abs: &Path, rel: &Path) -> bool {
         if self.dirs.iter().any(|d| d == abs) {
             return true;
@@ -128,12 +187,16 @@ impl Ignore {
         if rel.as_os_str().is_empty() {
             return false;
         }
-        is_heph_dir_name(abs) || self.dir_any.is_match(rel)
+        is_heph_dir_name(abs) || self.compiled().is_ok_and(|c| c.dir_any.is_match(rel))
     }
 
     /// True if the file at workspace-relative `rel` is excluded by an ignore glob.
+    ///
+    /// Like [`Self::prune_dir`], it matches nothing by glob if the matchers did
+    /// not compile — a state a walk that called [`Self::ensure_compiled`] first
+    /// never reaches.
     pub fn exclude_file(&self, rel: &Path) -> bool {
-        self.file_any.is_match(rel)
+        self.compiled().is_ok_and(|c| c.file_any.is_match(rel))
     }
 
     /// True if the package at workspace-relative `pkg` lies inside a pruned
@@ -152,6 +215,14 @@ impl Ignore {
         false
     }
 
+    /// [`Self::prunes_package`] after [`Self::ensure_compiled`]: the form for a
+    /// provider's `get`/`list`, so a skip set that cannot compile fails the
+    /// lookup instead of pruning nothing by glob.
+    pub fn try_prunes_package(&self, root: &Path, pkg: &Path) -> anyhow::Result<bool> {
+        self.ensure_compiled()?;
+        Ok(self.prunes_package(root, pkg))
+    }
+
     /// The raw ignore globs, for chaining with a target's own exclude patterns.
     pub fn globs(&self) -> &[String] {
         &self.globs
@@ -159,8 +230,10 @@ impl Ignore {
 
     /// The compiled file-exclude matcher, reused directly as the "no extra
     /// excludes" matcher by callers that compile per-target exclude unions.
-    pub fn file_matcher(&self) -> &Arc<Any<'static>> {
-        &self.file_any
+    /// Compiles the whole set on first use, so `Ok` also means
+    /// [`Self::ensure_compiled`] holds.
+    pub fn file_matcher(&self) -> anyhow::Result<&Arc<Any<'static>>> {
+        Ok(&self.compiled()?.file_any)
     }
 }
 
@@ -191,19 +264,47 @@ fn prune_prefix(pattern: &str) -> Option<&str> {
     None
 }
 
+/// The directory-pruning patterns derived from `globs`.
+///
+/// A directory is pruned when a glob names directories of that path — i.e. its
+/// final component is a literal (`foo/**/bar` prunes every `bar` dir under
+/// `foo`) — OR when it matches the prefix of a recursive glob
+/// (`**/node_modules/**`, which only matches *files* under node_modules, still
+/// prunes the dir via its `**/node_modules` prefix). A glob whose last component
+/// is a wildcard (`some/*.go`) is file-only and never prunes.
+fn dir_globs(globs: &[String]) -> impl Iterator<Item = &str> {
+    globs
+        .iter()
+        .map(String::as_str)
+        .filter(|g| names_directory(g))
+        .chain(globs.iter().filter_map(|g| prune_prefix(g)))
+}
+
+/// Parse and rule-check one glob without compiling it to a regex — the part of
+/// [`Glob::new`] that rejects a malformed pattern, at a fraction of the cost.
+/// Generic so the conversion `wax::any` uses internally can be reached through
+/// the public [`wax::Pattern`] bound without naming wax's private checked-tree
+/// type.
+fn check_pattern<'t, P: wax::Pattern<'t>>(pattern: P) -> Result<(), wax::BuildError> {
+    pattern.try_into().map(drop).map_err(Into::into)
+}
+
 /// Compiles glob patterns into one `wax::Any`. An empty set yields an `Any` that
 /// matches nothing.
 fn compile_any<'a>(patterns: impl Iterator<Item = &'a str>) -> anyhow::Result<Arc<Any<'static>>> {
     let globs = patterns
         .map(|s| {
-            Glob::new(s)
-                .map(Glob::into_owned)
-                .with_context(|| format!("invalid ignore pattern '{s}'"))
+            // On a pattern `check_pattern` accepted, the only failure is the
+            // regex size limit.
+            Glob::new(s).map(Glob::into_owned).with_context(|| {
+                format!("ignore pattern '{s}' exceeds the regex size limit; shorten or split it")
+            })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(Arc::new(
-        wax::any(globs).context("compiling ignore patterns")?,
-    ))
+    Ok(Arc::new(wax::any(globs).context(
+        "the union of the ignore patterns exceeds the regex size limit; use fewer or simpler \
+         patterns",
+    )?))
 }
 
 #[cfg(test)]
@@ -346,5 +447,74 @@ mod tests {
         assert_eq!(prune_prefix("foo/*"), None);
         // Whole-tree patterns have no dir prefix to prune.
         assert_eq!(prune_prefix("**"), None);
+    }
+
+    /// Construction validates but does not compile: an ignore set nobody walks
+    /// with costs no regex construction. The first match compiles it.
+    #[test]
+    fn matchers_compile_on_first_use_not_at_construction() {
+        let ig = Ignore::new(&[], &["**/node_modules/**".to_string()]).unwrap();
+        assert!(!ig.is_compiled(), "new() must not compile the matchers");
+        assert!(ig.prune_dir(p("/ws/node_modules"), p("node_modules")));
+        assert!(ig.is_compiled());
+        // A clone taken after compiling shares the compiled matchers.
+        assert!(ig.clone().is_compiled());
+    }
+
+    /// Validation stays at construction, so a bad `fs.skip` glob still fails
+    /// where it always did — naming the pattern — rather than at first use.
+    #[test]
+    fn a_malformed_glob_is_rejected_at_construction() {
+        for bad in ["a/**b", "{unclosed", "x/{a,**}/y"] {
+            assert!(Glob::new(bad).is_err(), "{bad:?} is not actually invalid");
+            let err = Ignore::new(&[], &[bad.to_string()])
+                .expect_err(&format!("{bad:?} must be rejected"));
+            assert!(format!("{err:#}").contains(bad), "{err:#}");
+        }
+    }
+
+    /// A set that parses but whose regex is over the size limit is not a set
+    /// that silently ignores nothing: `ensure_compiled` (and `file_matcher`)
+    /// return the error, naming the pattern and the limit, and keep returning it.
+    #[test]
+    fn an_oversized_glob_set_is_an_error_not_an_empty_set() {
+        let huge = "*a".repeat(20_000);
+        let ig = Ignore::new(&[], &[GIT_SKIP_GLOB.to_string(), huge]).expect("it parses");
+        let msg = format!("{:#}", ig.ensure_compiled().expect_err("must not compile"));
+        assert!(msg.contains("2 fs.skip ignore glob(s)"), "{msg}");
+        assert!(msg.contains("ignore pattern '*a*a*a"), "{msg}");
+        assert!(msg.contains("regex size limit"), "{msg}");
+        // Latched: the same error again, and through `file_matcher` too.
+        let again = format!("{:#}", ig.ensure_compiled().expect_err("latched"));
+        assert_eq!(again, msg);
+        ig.file_matcher().expect_err("latched for file_matcher too");
+        // And a provider's lookup fails rather than pruning nothing by glob.
+        let err = ig
+            .try_prunes_package(Path::new("/ws"), Path::new("pkg"))
+            .expect_err("a provider lookup must fail too");
+        assert_eq!(format!("{err:#}"), msg);
+    }
+
+    /// The parse-only check agrees with a full compile on what is valid.
+    #[test]
+    fn check_pattern_agrees_with_glob_new() {
+        for g in [
+            "**/.git/**",
+            "vendor/**/*",
+            "*.{go,rs}",
+            "a/**b",
+            "{unclosed",
+            "[z-a]",
+            "",
+            "**",
+            "a//b",
+            "/abs/**",
+        ] {
+            assert_eq!(
+                check_pattern(g).is_ok(),
+                Glob::new(g).is_ok(),
+                "{g:?}: parse-only check disagrees with Glob::new"
+            );
+        }
     }
 }

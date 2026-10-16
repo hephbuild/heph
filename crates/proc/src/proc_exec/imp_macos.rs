@@ -615,6 +615,10 @@ fn spawn_with(spec: Spec, capacity: DrainCapacity) -> io::Result<Handle> {
         }
     }
 
+    // The supervisor must be up before the child exists, or a hard kill of heph
+    // in between would leave it unreaped (it starts lazily; see
+    // `process_supervisor::init`).
+    super::ensure_supervisor_for(&program)?;
     let mut child = cmd.spawn()?;
     let pid = child.id() as i32;
 

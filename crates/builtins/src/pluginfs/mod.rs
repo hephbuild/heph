@@ -719,9 +719,16 @@ fn compile_glob(
 ) -> anyhow::Result<CompiledGlob> {
     let glob = cached_glob(pattern).with_context(|| format!("invalid glob pattern '{pattern}'"))?;
 
+    // Compiles the engine's ignore set on first use. Every fs walk (the driver's
+    // and `heph.fs.glob`'s) gets its `CompiledGlob` here, so a set that does not
+    // compile fails the glob instead of `walk_glob` pruning nothing by glob.
+    let ignore_any = skip
+        .file_matcher()
+        .with_context(|| format!("expanding glob '{pattern}'"))?;
+
     // No user excludes: reuse the ignore's prebuilt file matcher directly.
     let not = if exclude.is_empty() {
-        skip.file_matcher().clone()
+        ignore_any.clone()
     } else {
         cached_exclude_any(skip, request_id, exclude)?
     };
@@ -1590,6 +1597,44 @@ mod tests {
             msg.contains("invalid glob pattern"),
             "unexpected error: {msg}"
         );
+    }
+
+    /// An `fs.skip` set that parses but exceeds the regex size limit fails every
+    /// fs walk — the driver's glob, with and without user excludes, and
+    /// `heph.fs.glob` — naming the limit, rather than walking with nothing
+    /// pruned by glob.
+    #[tokio::test]
+    async fn test_an_uncompilable_skip_set_fails_the_glob() {
+        let tmp = tempdir().unwrap();
+        let skip = Arc::new(Ignore::new(&[], &["*a".repeat(20_000)]).expect("it parses"));
+        let driver = Driver::new(Arc::clone(&skip), Arc::new(CachedWalker::disabled()));
+        for exclude in [None, Some("x/**")] {
+            let mut config =
+                std::collections::HashMap::from([("p".to_string(), Value::String("**/*".into()))]);
+            if let Some(e) = exclude {
+                config.insert("e".to_string(), Value::String(e.into()));
+            }
+            let Err(err) = driver.parse(make_parse_req(config), &ctoken()).await else {
+                panic!("exclude {exclude:?}: expected the glob to fail")
+            };
+            let msg = format!("{err:#}");
+            assert!(msg.contains("expanding glob '**/*'"), "{msg}");
+            assert!(msg.contains("regex size limit"), "{msg}");
+        }
+
+        let ctx = FnCallContext {
+            pkg: "",
+            root: tmp.path(),
+        };
+        let args = FnArgs {
+            positional: vec![Value::String("**/*".to_string())],
+            named: Default::default(),
+        };
+        let walker = Arc::new(CachedWalker::disabled());
+        let Err(err) = GlobFn { skip, walker }.call(&ctx, args).await else {
+            panic!("heph.fs.glob: expected the glob to fail")
+        };
+        assert!(format!("{err:#}").contains("regex size limit"), "{err:#}");
     }
 
     #[tokio::test]
@@ -2625,7 +2670,7 @@ mod tests {
         let skip = Arc::new(Ignore::default());
         let compiled = compile_glob(&skip, "req-test", "**/*.rs", &[]).unwrap();
         assert!(
-            Arc::ptr_eq(&compiled.not, skip.file_matcher()),
+            Arc::ptr_eq(&compiled.not, skip.file_matcher().unwrap()),
             "empty-exclude path must reuse the ignore's prebuilt file matcher"
         );
     }

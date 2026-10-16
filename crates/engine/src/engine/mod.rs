@@ -21,7 +21,7 @@ pub use hconfig::{DEFAULT_HOME_DIR, HomeDir};
 pub use hconfig as config_yaml;
 pub use hconfig::{FuseConfig, FuseMode, get_cwd, get_root};
 mod plugin_load;
-pub use plugin_load::clear_plugin_cache;
+pub use plugin_load::{clear_plugin_cache, sweep_checksum_stamps};
 pub mod approval;
 pub mod diag;
 pub mod execrunner_host;

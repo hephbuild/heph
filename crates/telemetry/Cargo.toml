@@ -22,6 +22,7 @@ tracing = "0.1"
 clap = { version = "4.6.1", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -914,7 +914,7 @@ impl ProviderInner {
             if matches!(&*kind, GoPackageKind::FirstParty { .. })
                 && self
                     .skip
-                    .prunes_package(&self.workspace_root, Path::new(req.package.as_str()))
+                    .try_prunes_package(&self.workspace_root, Path::new(req.package.as_str()))?
             {
                 return empty();
             }
@@ -1133,6 +1133,9 @@ impl ProviderInner {
                     >);
             }
 
+            // The walk prunes through the infallible `prune_dir`; a skip set
+            // that cannot compile must fail here, not prune nothing.
+            self.skip.ensure_compiled()?;
             let packages = hcore::blocking::run(
                 enclose!((self.workspace_root => workspace_root, self.skip => skip, self.walker => walker) move || {
                     let mut packages = Vec::new();
@@ -1949,7 +1952,8 @@ impl ProviderInner {
         if matches!(&*kind, GoPackageKind::FirstParty { .. })
             && self
                 .skip
-                .prunes_package(&self.workspace_root, Path::new(addr.package.as_str()))
+                .try_prunes_package(&self.workspace_root, Path::new(addr.package.as_str()))
+                .map_err(GetError::Other)?
         {
             return Err(GetError::NotFound);
         }

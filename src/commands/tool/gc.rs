@@ -71,6 +71,15 @@ impl App for GcApp {
             Ok((n, freed)) => println!("Swept {n} scratch cache(s), freed {freed} bytes."),
             Err(err) => tracing::warn!(error = %err, "sweeping scratch caches"),
         }
+        // Plugin checksum stamps are keyed by the plugin's path, so a plugin
+        // that was removed or moved leaves its stamp behind. Tiny, but nothing
+        // else ever removes one. Never fatal, for the same reason as above.
+        match crate::engine::sweep_checksum_stamps() {
+            Ok(removed) => tracing::debug!(removed, "swept stale plugin checksum stamps"),
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "sweeping plugin checksum stamps")
+            }
+        }
         // The progress view renders the sweep summary (TUI final line / CI finish);
         // no extra print here, which would duplicate it.
         crate::commands::errors::finalize!(ctx, rs, res, _stats => { Ok(()) })

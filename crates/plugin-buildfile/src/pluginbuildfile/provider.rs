@@ -439,6 +439,9 @@ impl PackageList {
     pub(crate) fn get(&self) -> anyhow::Result<Arc<Vec<String>>> {
         self.cell
             .get_or_try_init(|| {
+                // The walk prunes through the infallible `prune_dir`; a skip
+                // set that cannot compile must fail here, not prune nothing.
+                self.skip.ensure_compiled()?;
                 let mut set = std::collections::HashSet::new();
                 find_packages_sync(
                     &self.walker,
@@ -551,7 +554,7 @@ impl EProvider for Provider {
             // package walk would have surfaced.
             if self
                 .skip
-                .prunes_package(&self.root, std::path::Path::new(req.package.as_str()))
+                .try_prunes_package(&self.root, std::path::Path::new(req.package.as_str()))?
             {
                 return Ok(Box::new(std::iter::empty())
                     as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
@@ -643,7 +646,8 @@ impl EProvider for Provider {
             // what lets the next provider answer the address.
             if self
                 .skip
-                .prunes_package(&self.root, std::path::Path::new(req.addr.package.as_str()))
+                .try_prunes_package(&self.root, std::path::Path::new(req.addr.package.as_str()))
+                .map_err(GetError::Other)?
             {
                 return Err(NotFound);
             }

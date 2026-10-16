@@ -371,7 +371,14 @@ impl EngineFuse {
             .with_context(|| format!("locking sandboxfuse dir {:?}", root))?
             .with_context(|| format!("sandboxfuse dir {:?} already owned", root))?;
         let fs = Arc::new(sandboxfuse::LayeredFs::new_empty(upper.clone()));
-        match sandboxfuse::Mount::mount(&lower, fs.clone()) {
+        // The supervisor is what force-unmounts this on a hard kill of heph, and
+        // it starts lazily — so start it before the mount exists, never after.
+        // If it cannot start, the mount is not made: the same fallback (or, when
+        // forced on, the same error) as a failed mount.
+        let mounted = hproc::process_supervisor::ensure_started()
+            .context("starting the process supervisor, which unmounts the sandbox FUSE mount if heph dies")
+            .and_then(|()| sandboxfuse::Mount::mount(&lower, fs.clone()));
+        match mounted {
             Ok(m) => {
                 // Tell the supervisor about this mount so a crashed
                 // parent doesn't leak the FUSE mount into the next run.
@@ -739,19 +746,19 @@ impl Engine {
         // `fs.skip` dirs/globs) the engine hands every plugin, so every fs glob
         // walk prunes the same paths. A bad `fs.skip` glob surfaces as an error
         // here.
+        //
+        // One `Ignore`, shared: the driver and the functions were each handed a
+        // separately built copy of the same set. Its matchers compile on first
+        // use, so a run that never walks through `fs` never compiles them.
         engine.register_plugin("fs", |init| {
-            let functions_ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
-            let driver_ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
+            let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             Ok(PluginParts::default()
                 .with_provider(Box::new(hbuiltins::pluginfs::Provider))
                 .with_driver(Box::new(hbuiltins::pluginfs::Driver::new(
-                    driver_ignore,
+                    Arc::clone(&ignore),
                     init.walker.clone(),
                 )))
-                .with_functions(hbuiltins::pluginfs::functions(
-                    &functions_ignore,
-                    &init.walker,
-                )))
+                .with_functions(hbuiltins::pluginfs::functions(&ignore, &init.walker)))
         })?;
 
         Ok(engine)
