@@ -70,7 +70,7 @@ async fn forced_selector_repairs_a_stale_target_that_discovery_depends_on() -> a
     )?;
     let ws = htestkit::WorkspaceBuilder::new()?
         .with_provider(move |_| Box::new(provider))
-        .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
         .build()?;
 
     // Cache T1 as stale, then move the state on under it.
