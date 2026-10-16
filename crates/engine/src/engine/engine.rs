@@ -375,7 +375,14 @@ impl EngineFuse {
             .with_context(|| format!("locking sandboxfuse dir {:?}", root))?
             .with_context(|| format!("sandboxfuse dir {:?} already owned", root))?;
         let fs = Arc::new(sandboxfuse::LayeredFs::new_empty(upper.clone()));
-        match sandboxfuse::Mount::mount(&lower, fs.clone()) {
+        // The supervisor is what force-unmounts this on a hard kill of heph, and
+        // it starts lazily — so start it before the mount exists, never after.
+        // If it cannot start, the mount is not made: the same fallback (or, when
+        // forced on, the same error) as a failed mount.
+        let mounted = hproc::process_supervisor::ensure_started()
+            .context("starting the process supervisor, which unmounts the sandbox FUSE mount if heph dies")
+            .and_then(|()| sandboxfuse::Mount::mount(&lower, fs.clone()));
+        match mounted {
             Ok(m) => {
                 // Tell the supervisor about this mount so a crashed
                 // parent doesn't leak the FUSE mount into the next run.

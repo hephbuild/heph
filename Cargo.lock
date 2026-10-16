@@ -5323,6 +5323,7 @@ dependencies = [
  "semver",
  "serde_json",
  "stabby",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-core",
