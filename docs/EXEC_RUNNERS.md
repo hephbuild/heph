@@ -107,10 +107,11 @@ by-name dispatch, same duplicate-name guard.
 `wrap` config:
 
 - `prefix` — argv prepended to the command. Its head becomes the program.
-- `env` — environment applied over the target's. **Hashed**, because it lives in
-  the runner target's output.
-- `runtime_pass_env` — host variables pulled through at spawn, by name.
-  **Unhashed**, and named to say so.
+- `env` — the base environment; a variable the target also sets keeps the
+  target's value, as under every runner (`PATH` is composed instead — see
+  below). **Hashed**, because it lives in the runner target's output.
+- `runtime_pass_env` — host variables pulled through at spawn, by name, under
+  the same rule. **Unhashed**, and named to say so.
 
 There is deliberately no `pass_env` here and no `cwd`. In the exec driver
 `pass_env` means *snapshotted at parse and hashed*; a runner config resolves at

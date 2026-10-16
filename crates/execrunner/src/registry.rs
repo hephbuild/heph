@@ -231,21 +231,38 @@ impl ExecRunner for WrapRunner {
             rewrite.program = std::path::PathBuf::from(head);
         }
 
-        // Hashed environment from the config wins over the target's own: the
-        // point of a runner is that it decides the environment, and its value
-        // is in the cache key while the target's ambient one may not be.
+        // The config's environment is the *base*, and the target's own values
+        // go on top — the rule every runner follows: `session` puts the
+        // request over the agent's environ, `oci` puts `docker exec -e` over
+        // the image's env. A target that declares a variable gets what it
+        // declared even when the environment has an opinion, and a runner
+        // cannot silently replace a credential or scratch variable that
+        // would otherwise be a refused collision.
+        //
+        // `PATH` is the exception, as everywhere: it is a list both sides
+        // contribute to, so the runner's is handed back and `hexecrunner`
+        // composes it behind the target's entries.
+        let base = |key: &OsString, env: &[(OsString, OsString)]| {
+            key == "PATH" || !env.iter().any(|(k, _)| k == key)
+        };
         for (k, v) in &cfg.env {
-            set_env(&mut rewrite.env, OsString::from(k), OsString::from(v));
+            let k = OsString::from(k);
+            if base(&k, &rewrite.env) {
+                set_env(&mut rewrite.env, k, OsString::from(v));
+            }
         }
 
-        // Unhashed pull-through, applied last and only when the host actually
-        // has the variable. Never overwrites something the config set.
+        // Unhashed pull-through, only when the host actually has the variable.
+        // Never overwrites something the config set, nor the target's own.
         for name in &cfg.runtime_pass_env {
             if cfg.env.contains_key(name) {
                 continue;
             }
-            if let Some(v) = std::env::var_os(name) {
-                set_env(&mut rewrite.env, OsString::from(name), v);
+            let k = OsString::from(name);
+            if base(&k, &rewrite.env)
+                && let Some(v) = std::env::var_os(name)
+            {
+                set_env(&mut rewrite.env, k, v);
             }
         }
 
@@ -345,8 +362,14 @@ mod tests {
         );
     }
 
+    /// The rule every runner follows: the environment is the base and the
+    /// target's own values go on top. `session` gets it from the agent, `oci`
+    /// from `docker exec -e` over the image's env; `wrap` used to be the one
+    /// runner where the config won — which let it silently replace a
+    /// credential or scratch variable that would otherwise be a refused
+    /// collision.
     #[tokio::test]
-    async fn wrap_env_overrides_the_targets_own() {
+    async fn the_targets_own_env_wins_over_wraps() {
         let out = run(
             &cfg("wrap", serde_json::json!({"env": {"A": "2", "B": "3"}})),
             rewrite(),
@@ -356,10 +379,56 @@ mod tests {
         assert_eq!(
             out.env,
             vec![
-                (OsString::from("A"), OsString::from("2")),
+                (OsString::from("A"), OsString::from("1")),
                 (OsString::from("B"), OsString::from("3")),
             ]
         );
+    }
+
+    /// `PATH` is a list both sides contribute to, so it is not "who wins": the
+    /// runner's must still come back, for `hexecrunner` to compose it behind
+    /// the target's entries.
+    #[tokio::test]
+    async fn wraps_path_is_handed_back_for_composition() {
+        let mut r = rewrite();
+        r.env
+            .push((OsString::from("PATH"), OsString::from("/sandbox/bin")));
+        let out = run(
+            &cfg("wrap", serde_json::json!({"env": {"PATH": "/runner/bin"}})),
+            r,
+        )
+        .await
+        .expect("wrap");
+        let path = out.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v);
+        assert_eq!(path, Some(&OsString::from("/runner/bin")));
+    }
+
+    /// The pull-through is part of the environment's half too: a target that
+    /// sets the variable keeps its value.
+    #[tokio::test]
+    async fn runtime_pass_env_does_not_outrank_the_targets_own() {
+        set_test_env("XR_TEST_TARGET_WINS", Some("from-host"));
+        let mut r = rewrite();
+        r.env.push((
+            OsString::from("XR_TEST_TARGET_WINS"),
+            OsString::from("from-target"),
+        ));
+        let out = run(
+            &cfg(
+                "wrap",
+                serde_json::json!({"runtime_pass_env": ["XR_TEST_TARGET_WINS"]}),
+            ),
+            r,
+        )
+        .await
+        .expect("wrap");
+        let got = out
+            .env
+            .iter()
+            .find(|(k, _)| k == "XR_TEST_TARGET_WINS")
+            .map(|(_, v)| v.clone());
+        assert_eq!(got, Some(OsString::from("from-target")));
+        set_test_env("XR_TEST_TARGET_WINS", None);
     }
 
     /// The unhashed pull-through must never overwrite the hashed value, or the
