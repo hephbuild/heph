@@ -1,5 +1,6 @@
 //! Anonymous usage telemetry: collects per-run counters from the engine's build
-//! events and ships a single snapshot to PostHog on exit. Depends only on
+//! events and spools a single snapshot at exit, for a detached flusher to send
+//! to PostHog (see `docs/TELEMETRY.md`). Depends only on
 //! heph-core (events) + heph-plugin (error); the engine calls its record_* API.
 #![cfg_attr(
     test,

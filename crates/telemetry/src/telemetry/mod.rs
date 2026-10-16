@@ -10,19 +10,25 @@
 //! machines would otherwise mint a fake install per job); it identifies an
 //! installation, not a person.
 //!
-//! At exit the event is appended to a local SQLite spool (one insert), then the
-//! command tries to flush the spool (this run's event plus any backlog) on a
-//! worker thread, bounded to 500ms past the end of its real work. Whatever
-//! doesn't make that deadline stays spooled and rides along with the next run's
-//! flush — so the common case sends this call, exit is never blocked for long,
-//! and nothing is lost. On CI (ephemeral runner, no next run) the flush blocks
-//! to completion instead. See [`spool`].
+//! At exit the event is appended to a local SQLite spool (one insert) and the
+//! command returns — it never waits on the network. When a flush is due (the
+//! oldest spooled event is older than [`FLUSH_MAX_AGE`], or the spool holds
+//! [`FLUSH_AT_EVENTS`]; see `flush_due`), the command spawns a detached
+//! `heph __telemetry-flush` and does not wait for it. On CI the flush runs
+//! synchronously instead: a CI runner tears down its process tree with the job
+//! (a detached flusher would be killed mid-send) and its spool with the machine
+//! (there is no next run to pick up the backlog), so CI pays the POST to get the
+//! data out at all. See [`spool`] for the flush protocol. Every flush is
+//! bounded in time: [`FLUSH_DEADLINE`] for the detached flusher (with a
+//! watchdog behind it), [`CI_FLUSH_BUDGET`] for CI's synchronous one.
 //!
 //! Disabled by `telemetry.enabled: false` in `.hephconfig2`, or by setting the
 //! `HEPH_DISABLE_TELEMETRY` environment variable (the latter also keeps the
-//! project's own test/CI binary invocations from reporting). Everything is
-//! strictly best-effort: any failure — offline, timeout, disabled — is swallowed
-//! and never affects the command's exit.
+//! project's own test/CI binary invocations from reporting). An opted-out
+//! command deletes the spool ([`forget`]), so events recorded before the
+//! opt-out are never sent. Everything is strictly best-effort: any failure —
+//! offline, timeout, disabled — is swallowed and never affects the command's
+//! exit. `docs/TELEMETRY.md` is the user-facing account of all of this.
 
 mod collector;
 mod repo;
@@ -30,13 +36,76 @@ mod spool;
 
 pub use collector::{QueryExprCounts, TelemetryCollector, TelemetrySnapshot};
 
+use anyhow::Context as _;
 use clap::ArgMatches;
 use clap::parser::ValueSource;
 use hcore::events::BuildEventKind;
 use posthog_rs::{ClientOptionsBuilder, Event};
-use spool::{FLUSH_BATCH, Spool, SpooledEvent};
-use std::path::PathBuf;
-use std::time::Duration;
+use spool::{FLUSH_BATCH, MAX_ROWS, Spool, SpoolState, SpooledEvent};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// The hidden `argv[1]` that runs a process as the detached flusher
+/// ([`flush_main`]). Dispatched in `main` before logging, clap or the
+/// supervisor, like the other `__` helpers. `argv[2]`, when present, is the
+/// workspace root of the command that spawned it, whose config the flusher
+/// re-checks for an opt-out.
+pub const FLUSH_SUBCOMMAND: &str = "__telemetry-flush";
+
+/// How long the detached flusher may spend sending before it gives up, rows
+/// unsent staying spooled for the next one. A send in flight at the deadline
+/// is abandoned, not waited for.
+pub const FLUSH_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The detached flusher's hard backstop: past this, a watchdog thread exits
+/// the process whatever it is doing (a SQLite busy wait, a send that ignored
+/// its deadline). Comfortably past [`FLUSH_DEADLINE`], so it only fires when
+/// the deadline itself failed to.
+const FLUSH_WATCHDOG: Duration = Duration::from_secs(35);
+
+/// Everything CI's synchronous flush may take — waiting for the flusher lock
+/// and every send together. The flush it replaced was a single request with a
+/// 10 s timeout; this keeps CI's worst case there.
+pub const CI_FLUSH_BUDGET: Duration = Duration::from_secs(10);
+
+/// How often a flush waiting for the flusher lock ([`LockMode::Wait`]) retries.
+const LOCK_POLL: Duration = Duration::from_millis(25);
+
+/// The longest last-flush error kept in the spool, in characters.
+const MAX_FLUSH_ERROR_CHARS: usize = 500;
+
+/// Env var that points the flush at another ingestion endpoint instead of
+/// PostHog EU. **Loopback only** (`http(s)://127.0.0.1`, `[::1]` or
+/// `localhost`, any port and path): it exists so a test or a benchmark can
+/// stand up a local sink and exercise the real send path without touching
+/// production. It is not a way to ship the events anywhere else, so it cannot
+/// be used to redirect them off the machine. A value that is not a loopback
+/// URL disables sending altogether (the flush fails and records why) rather
+/// than falling back to PostHog. `heph tool telemetry status` shows when it
+/// is set.
+pub const ENDPOINT_ENV: &str = "HEPH_TELEMETRY_ENDPOINT";
+
+/// A flush is due once the oldest spooled event is this old. Short enough that
+/// an occasional user's events arrive the same session; long enough that a run
+/// of commands shares one flusher instead of spawning one each.
+pub const FLUSH_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+
+/// A flush is due once the spool holds this many events, whatever their age:
+/// one full [`FLUSH_BATCH`], so a flusher spawned for size sends one request.
+/// It sits at a quarter of the spool cap ([`MAX_ROWS`]), so a burst of
+/// commands — a script calling heph in a loop — has the flusher spawned with
+/// three batches of headroom before the cap drops anything.
+pub const FLUSH_AT_EVENTS: u64 = FLUSH_BATCH as u64;
+
+/// Minimum gap between two flusher spawns. A flusher that cannot reach
+/// PostHog leaves the spool due, and without this every command run offline
+/// would spawn another one.
+pub const FLUSH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The spool file, in [`config_dir`].
+const SPOOL_FILE: &str = "telemetry-spool.db";
+/// The flusher's exclusive lock, in [`config_dir`].
+const FLUSH_LOCK_FILE: &str = "telemetry-flush.lock";
 
 /// Process-global counters. The engine bumps these from its hot paths without
 /// threading a handle through every request; the CLI snapshots them once at
@@ -215,14 +284,34 @@ pub fn is_enabled(config_enabled: bool) -> bool {
 /// *not* the per-repo `.heph` home — the install id must survive cache nukes
 /// and be shared across repos.
 fn config_dir() -> anyhow::Result<PathBuf> {
+    let dir = config_dir_path()?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("creating config dir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Where [`config_dir`] is, without creating it — for the paths that must not
+/// leave anything on disk (an opt-out, the status command, the flusher).
+fn config_dir_path() -> anyhow::Result<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .ok_or_else(|| anyhow::anyhow!("no XDG_CONFIG_HOME or HOME"))?;
-    let dir = base.join("heph");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("creating config dir {}: {e}", dir.display()))?;
-    Ok(dir)
+    Ok(base.join("heph"))
+}
+
+/// Opted out: delete the spool, so nothing recorded before the opt-out is
+/// ever sent. Called by every command that runs with telemetry disabled
+/// (either switch) — three `unlink`s that find nothing once the spool is gone.
+/// The spool is machine-wide, so an opt-out in one workspace also drops events
+/// another, still opted-in workspace had spooled. Creates nothing.
+pub fn forget() {
+    let outcome = config_dir_path().and_then(|dir| spool::remove(&dir.join(SPOOL_FILE)));
+    match outcome {
+        Ok(true) => tracing::debug!("telemetry disabled: spool deleted"),
+        Ok(false) => {}
+        Err(e) => tracing::debug!(error = %format!("{e:#}"), "telemetry spool not deleted"),
+    }
 }
 
 /// The anonymous install id: a random UUID minted on first use and persisted at
@@ -253,12 +342,6 @@ fn distinct_id(dir: &std::path::Path) -> anyhow::Result<String> {
     install_id(dir)
 }
 
-/// Record this invocation and try to send it: build the event from the clap
-/// matches + command result, spool it (one SQLite insert), then flush. Non-CI
-/// flushes within a 500ms post-work budget and defers the rest to the next run;
-/// CI (ephemeral, no next run) blocks to completion. The single entry point the
-/// CLI calls at exit; everything below is best-effort and never affects the
-/// command's outcome.
 /// Kick off background computation of the repo fingerprint so the exit path
 /// never runs git. Fire-and-forget: spawns a detached thread and returns at once.
 /// Call once at startup when telemetry is enabled; the result is cached and read
@@ -278,11 +361,21 @@ pub fn prewarm() {
     }
 }
 
+/// Record this invocation: build the event from the clap matches + command
+/// result and spool it (one SQLite insert). Then, off CI, spawn the detached
+/// flusher if a flush is due (`flush_due`) and return without waiting; on CI,
+/// send synchronously (see the module docs). The single entry point the CLI
+/// calls at exit; everything below is best-effort and never affects the
+/// command's outcome.
+///
+/// `root` is the command's workspace root, handed to the flusher so it can
+/// re-check that workspace's config opt-out before sending.
 pub fn record_invocation(
     matches: &ArgMatches,
     cmd: &clap::Command,
     error: Option<&anyhow::Error>,
     took: Duration,
+    root: Option<&Path>,
 ) {
     // Full subcommand path ("inspect deps", "tool gc") plus the args set at every
     // nesting level, walked in lockstep with the clap command model so positional
@@ -343,7 +436,7 @@ pub fn record_invocation(
 
     let failure = error.map(classify_failure);
 
-    if let Err(e) = try_enqueue(ReportContext {
+    let spool = match try_enqueue(ReportContext {
         command: &command,
         request_shape,
         flags: &flags,
@@ -351,14 +444,515 @@ pub fn record_invocation(
         failure,
         duration_ms: took.as_millis() as u64,
     }) {
-        tracing::debug!(error = %format!("{e:#}"), "telemetry enqueue skipped");
+        Ok(spool) => Some(spool),
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "telemetry enqueue skipped");
+            None
+        }
+    };
+
+    // CI: send now, blocking (see the module docs). Elsewhere: hand off to a
+    // detached flusher when one is due, and never wait.
+    if is_ci() {
+        drop(spool);
+        flush_blocking();
+    } else if let Some(spool) = spool {
+        match claim_flush(&spool, hcore::events::now_unix_ms() as i64) {
+            Ok(true) => {
+                if let Err(e) = spawn_flusher(root) {
+                    tracing::debug!(error = %format!("{e:#}"), "telemetry flusher not spawned");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::debug!(error = %format!("{e:#}"), "telemetry flush check failed"),
+        }
+    }
+}
+
+/// Whether a flush is due for a spool in state `s` at `now_ms`: there is
+/// something to send, no flusher was spawned in the last
+/// [`FLUSH_RETRY_INTERVAL`], and either the oldest event is at least
+/// [`FLUSH_MAX_AGE`] old or [`FLUSH_AT_EVENTS`] are waiting.
+///
+/// A last spawn recorded in the *future* (the clock stepped back) does not hold
+/// flushes off: it would otherwise suppress them until the clock caught up.
+fn flush_due(s: SpoolState, now_ms: i64) -> bool {
+    if s.count == 0 {
+        return false;
+    }
+    let spawned_recently = s.last_spawn_ms.is_some_and(|last| {
+        (0..millis(FLUSH_RETRY_INTERVAL)).contains(&now_ms.saturating_sub(last))
+    });
+    if spawned_recently {
+        return false;
+    }
+    s.count >= FLUSH_AT_EVENTS
+        || s.oldest_ms
+            .is_some_and(|oldest| now_ms.saturating_sub(oldest) >= millis(FLUSH_MAX_AGE))
+}
+
+/// The earliest time (ms since epoch) at which [`flush_due`] holds for a
+/// spool in state `s` if nothing more is spooled; `None` when it is empty. A
+/// time at or before `now_ms` means the next command spawns a flusher.
+fn next_flush_due(s: SpoolState, now_ms: i64) -> Option<i64> {
+    if s.count == 0 {
+        return None;
+    }
+    let oldest = s.oldest_ms?;
+    let ready = if s.count >= FLUSH_AT_EVENTS {
+        oldest
+    } else {
+        oldest.saturating_add(millis(FLUSH_MAX_AGE))
+    };
+    // A spawn stamp from the future does not hold flushes off (see
+    // `flush_due`), so it does not delay the answer either.
+    let retry = s
+        .last_spawn_ms
+        .filter(|&last| last <= now_ms)
+        .map(|last| last.saturating_add(millis(FLUSH_RETRY_INTERVAL)));
+    Some(retry.map_or(ready, |r| ready.max(r)))
+}
+
+/// `d` in whole milliseconds, saturating.
+fn millis(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Decide whether this command should spawn the flusher, and if so claim the
+/// spawn so a concurrent command that reached the same decision does not spawn
+/// a second one.
+fn claim_flush(spool: &Spool, now_ms: i64) -> anyhow::Result<bool> {
+    let state = spool.state()?;
+    if !flush_due(state, now_ms) {
+        return Ok(false);
+    }
+    spool.claim_spawn(state.last_spawn_ms, now_ms)
+}
+
+/// Start `heph __telemetry-flush` detached, and do not wait for it.
+///
+/// Detached in every sense: its own session (`setsid` — no controlling
+/// terminal, so closing the terminal does not SIGHUP it, and not in heph's
+/// process group, so a Ctrl-C to heph does not reach it), stdio on `/dev/null`,
+/// cwd `/` (it must not pin the workspace), and never waited on. It is
+/// deliberately *not* spawned through `proc_exec`: that registers every child
+/// with the process supervisor, which kills them when heph exits — and this one
+/// exists to outlive heph. Nor through `hexecrunner`: that seam is for a
+/// target's command and the runner its cache key names; this is heph re-running
+/// itself, like the supervisor sidecar.
+fn spawn_flusher(root: Option<&Path>) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locating heph")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(FLUSH_SUBCOMMAND);
+    if let Some(root) = root {
+        cmd.arg(root);
+    }
+    // The `Child` is dropped un-waited: the flusher outlives this process and
+    // is reparented once heph exits, and reaped by whatever it is reparented
+    // to (init, or a subreaper). A container whose PID 1 never reaps keeps it
+    // as a zombie until the container exits; see docs/TELEMETRY.md.
+    drop(spawn_detached(cmd)?);
+    Ok(())
+}
+
+/// Spawn `cmd` detached as [`spawn_flusher`] describes — its own session,
+/// stdio on `/dev/null`, cwd `/` — and return without waiting. The program is
+/// the caller's, so a test can stand in for heph.
+fn spawn_detached(mut cmd: std::process::Command) -> anyhow::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
+
+    cmd.current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "pre_exec installer + the setsid call it installs"
+    )]
+    // SAFETY: the closure runs between fork and exec and calls only setsid(2),
+    // which is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().context("spawning telemetry flusher")
+}
+
+/// Entry point of `heph __telemetry-flush`: send the spool and exit 0, whatever
+/// happens. Honors both opt-outs even here, for a user who opts out after a
+/// flusher was spawned: the `HEPH_DISABLE_TELEMETRY` kill switch (then it
+/// touches nothing on disk), and the config opt-out of the workspace whose
+/// command spawned it (`argv[2]`, checked with `config_enabled`; then it
+/// deletes the spool, as an opted-out command does).
+///
+/// Bounded twice: sending stops at [`FLUSH_DEADLINE`], and a watchdog thread
+/// exits the process at [`FLUSH_WATCHDOG`] whatever it is doing.
+pub fn flush_main(config_enabled: impl FnOnce(&Path) -> bool) -> ! {
+    let env_disabled = std::env::var_os(DISABLE_ENV).is_some();
+    if !env_disabled {
+        spawn_watchdog(FLUSH_WATCHDOG, || {
+            // Best-effort: say why this flush never recorded an outcome. The
+            // spool's own busy timeout bounds this write.
+            if let Ok(dir) = config_dir_path() {
+                record_outcome(
+                    &dir,
+                    &Err(anyhow::anyhow!(
+                        "the flusher was stopped by its {}s watchdog",
+                        FLUSH_WATCHDOG.as_secs()
+                    )),
+                );
+            }
+            std::process::exit(0)
+        });
+    }
+    let root = std::env::args_os().nth(2).map(PathBuf::from);
+    let outcome = run_flusher(
+        FlusherOptOut {
+            env_disabled,
+            config_disabled: || root.as_deref().is_some_and(|r| !config_enabled(r)),
+        },
+        config_dir_path,
+        production_sender,
+        Instant::now() + FLUSH_DEADLINE,
+    );
+    if let Err(e) = outcome {
+        tracing::debug!(error = %format!("{e:#}"), "telemetry flush failed");
+    }
+    std::process::exit(0)
+}
+
+/// Run `on_expire` on a detached thread once `after` has passed. The flusher's
+/// backstop: `on_expire` exits the process.
+fn spawn_watchdog(after: Duration, on_expire: impl FnOnce() + Send + 'static) {
+    let spawned = std::thread::Builder::new()
+        .name("heph-telemetry-watchdog".to_string())
+        .spawn(move || {
+            std::thread::sleep(after);
+            on_expire();
+        });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %format!("{e:#}"), "telemetry flush watchdog not spawned");
+    }
+}
+
+/// The two opt-outs the flusher re-checks before sending.
+struct FlusherOptOut<C: FnOnce() -> bool> {
+    /// `HEPH_DISABLE_TELEMETRY` is set.
+    env_disabled: bool,
+    /// The spawning workspace's config opts out. Only asked when the env var
+    /// does not already disable.
+    config_disabled: C,
+}
+
+/// [`flush_main`] minus the process. `None` when an opt-out applies: the env
+/// one resolves nothing on disk at all; the config one deletes the spool.
+/// Otherwise flushes `dir` until `deadline` and records the outcome there.
+fn run_flusher(
+    opt_out: FlusherOptOut<impl FnOnce() -> bool>,
+    dir: impl FnOnce() -> anyhow::Result<PathBuf>,
+    sender: impl FnOnce() -> anyhow::Result<Sender>,
+    deadline: Instant,
+) -> anyhow::Result<Option<FlushOutcome>> {
+    if opt_out.env_disabled {
+        return Ok(None);
+    }
+    let dir = dir()?;
+    if (opt_out.config_disabled)() {
+        spool::remove(&dir.join(SPOOL_FILE))?;
+        return Ok(None);
+    }
+    let outcome = sender().and_then(|send| run_flush(&dir, LockMode::Try, deadline, send));
+    record_outcome(&dir, &outcome);
+    outcome.map(Some)
+}
+
+/// Store a finished flush's outcome in the spool, for the status command. A
+/// flush that found another one running ([`FlushOutcome::Busy`]) did nothing
+/// and records nothing. Best-effort.
+fn record_outcome(dir: &Path, outcome: &anyhow::Result<FlushOutcome>) {
+    let error = match outcome {
+        Ok(FlushOutcome::Busy) => return,
+        Ok(FlushOutcome::Sent(_)) => None,
+        Err(e) => Some(
+            format!("{e:#}")
+                .chars()
+                .take(MAX_FLUSH_ERROR_CHARS)
+                .collect::<String>(),
+        ),
+    };
+    let recorded = Spool::open(&dir.join(SPOOL_FILE)).and_then(|spool| {
+        spool.record_flush(hcore::events::now_unix_ms() as i64, error.as_deref())
+    });
+    if let Err(e) = recorded {
+        tracing::debug!(error = %format!("{e:#}"), "telemetry flush outcome not recorded");
+    }
+}
+
+/// How a flush takes the flusher lock.
+#[derive(Debug, Clone, Copy)]
+enum LockMode {
+    /// Give up if another flusher holds it: that one is sending these rows.
+    /// The detached flusher.
+    Try,
+    /// Wait for it, up to the flush's deadline. CI, which must not exit with
+    /// its own event unsent just because another process was mid-flush when it
+    /// looked — but must not wait on that process forever either.
+    Wait,
+}
+
+/// What a flush did.
+#[derive(Debug, PartialEq, Eq)]
+enum FlushOutcome {
+    /// Another flusher holds the lock (past the deadline, for
+    /// [`LockMode::Wait`]); nothing was sent.
+    Busy,
+    /// This many rows were sent and removed.
+    Sent(usize),
+}
+
+/// Sends one batch, returning once the endpoint confirmed it. `Send +
+/// 'static` because it runs on its own thread (see [`SendWorker`]).
+type Sender = Box<dyn FnMut(Vec<SpooledEvent>) -> anyhow::Result<()> + Send>;
+
+/// Take the flusher lock as `mode` says, giving up at `deadline`. `false`:
+/// another flusher holds it.
+fn take_lock(
+    lock: &std::fs::File,
+    path: &Path,
+    mode: LockMode,
+    deadline: Instant,
+) -> anyhow::Result<bool> {
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if matches!(mode, LockMode::Try) || left.is_zero() {
+                    return Ok(false);
+                }
+                std::thread::sleep(LOCK_POLL.min(left));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
+        }
+    }
+}
+
+/// Runs the sender on a thread of its own, so a send still in flight at the
+/// deadline is abandoned rather than waited for: the flush returns, and the
+/// thread finishes (or dies with the process) on its own. Its late result is
+/// discarded, so an abandoned batch is never deleted — it stays spooled and
+/// is sent again, under the same UUIDs, by a later flush.
+struct SendWorker {
+    batches: std::sync::mpsc::Sender<Vec<SpooledEvent>>,
+    results: std::sync::mpsc::Receiver<anyhow::Result<()>>,
+}
+
+impl SendWorker {
+    fn spawn(mut send: Sender) -> anyhow::Result<Self> {
+        let (batches, batch_rx) = std::sync::mpsc::channel::<Vec<SpooledEvent>>();
+        let (result_tx, results) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("heph-telemetry-send".to_string())
+            .spawn(move || {
+                for batch in batch_rx {
+                    if result_tx.send(send(batch)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("spawning telemetry sender thread")?;
+        Ok(Self { batches, results })
     }
 
-    // CI has no next run to defer to, so block; otherwise cap the wait.
-    if is_ci() {
-        flush_blocking();
-    } else {
-        flush_bounded(Duration::from_millis(500));
+    /// Send one batch; an error if it failed, or if `deadline` came first.
+    fn send(&self, batch: Vec<SpooledEvent>, deadline: Instant) -> anyhow::Result<()> {
+        use std::sync::mpsc::RecvTimeoutError;
+        self.batches
+            .send(batch)
+            .map_err(|e| anyhow::anyhow!("telemetry sender thread is gone: {e}"))?;
+        match self
+            .results
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                anyhow::bail!("telemetry flush deadline exceeded mid-send")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("telemetry sender thread died mid-send")
+            }
+        }
+    }
+}
+
+/// Send everything spooled in `dir`, batch by batch, under the flusher lock —
+/// the protocol in [`spool`]'s docs. Stops at the first failed send (those rows
+/// stay spooled), and at `deadline`: no batch starts after it, and one in
+/// flight when it passes is abandoned (see [`SendWorker`]). Bounded in rounds
+/// too: the spool never holds more than [`MAX_ROWS`], so this drains it with a
+/// batch to spare even while commands keep appending.
+///
+/// An abandoned batch's lock is released with the flush, so the next flusher
+/// may send those rows while the abandoned send is still in flight; the
+/// duplicate carries the same UUIDs, which PostHog dedupes on.
+fn run_flush(
+    dir: &Path,
+    mode: LockMode,
+    deadline: Instant,
+    send: Sender,
+) -> anyhow::Result<FlushOutcome> {
+    let lock_path = dir.join(FLUSH_LOCK_FILE);
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    if !take_lock(&lock, &lock_path, mode, deadline)? {
+        return Ok(FlushOutcome::Busy);
+    }
+
+    let spool = Spool::open(&dir.join(SPOOL_FILE))?;
+    let rounds = usize::try_from(MAX_ROWS)
+        .unwrap_or(usize::MAX)
+        .div_ceil(FLUSH_BATCH)
+        + 1;
+    let mut sent = 0;
+    let mut send = Some(send);
+    let mut worker: Option<SendWorker> = None;
+    for _ in 0..rounds {
+        let batch = spool.take_batch(FLUSH_BATCH)?;
+        if batch.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("telemetry flush deadline exceeded after {sent} events");
+        }
+        // The thread starts with the first batch, so an empty spool costs none.
+        if let Some(send) = send.take() {
+            worker = Some(SendWorker::spawn(send)?);
+        }
+        let Some(worker) = worker.as_ref() else {
+            anyhow::bail!("telemetry sender thread missing");
+        };
+        let (ids, events): (Vec<i64>, Vec<SpooledEvent>) = batch.into_iter().unzip();
+        worker.send(events, deadline)?;
+        // Confirmed: drop exactly these rows. A crash before this commits
+        // re-sends them next time under the same UUIDs (deduped server-side).
+        spool.delete(&ids)?;
+        sent += ids.len();
+    }
+    // `lock` drops here, after the last delete committed.
+    drop(lock);
+    Ok(FlushOutcome::Sent(sent))
+}
+
+/// The sender for the configured endpoint ([`endpoint`]). Fails — and nothing
+/// is sent — when [`ENDPOINT_ENV`] is set to something that is not a loopback
+/// URL.
+fn production_sender() -> anyhow::Result<Sender> {
+    let endpoint = endpoint()?;
+    Ok(Box::new(posthog_sender(endpoint.url)))
+}
+
+/// Where events go: PostHog EU, or the loopback URL in [`ENDPOINT_ENV`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Endpoint {
+    url: String,
+    /// Whether [`ENDPOINT_ENV`] chose it.
+    overridden: bool,
+}
+
+/// The endpoint for this process's environment.
+fn endpoint() -> anyhow::Result<Endpoint> {
+    endpoint_from(std::env::var_os(ENDPOINT_ENV).as_deref())
+}
+
+/// [`endpoint`] over an injected [`ENDPOINT_ENV`] value. Set but invalid —
+/// empty, not UTF-8, not a URL, not http(s), not loopback — is an error, never
+/// a fallback to PostHog: whoever set it meant events not to go there.
+fn endpoint_from(raw: Option<&std::ffi::OsStr>) -> anyhow::Result<Endpoint> {
+    let Some(raw) = raw else {
+        return Ok(Endpoint {
+            url: POSTHOG_HOST.to_string(),
+            overridden: false,
+        });
+    };
+    let raw = raw
+        .to_str()
+        .with_context(|| format!("{ENDPOINT_ENV} is not valid UTF-8"))?;
+    let url =
+        reqwest::Url::parse(raw).with_context(|| format!("{ENDPOINT_ENV}={raw:?} is not a URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("{ENDPOINT_ENV}={raw:?} is not an http(s) URL");
+    }
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        anyhow::bail!(
+            "{ENDPOINT_ENV}={raw:?} is not a loopback address; the override only \
+             points telemetry at a local sink (127.0.0.1, [::1] or localhost)"
+        );
+    }
+    Ok(Endpoint {
+        url: url.to_string(),
+        overridden: true,
+    })
+}
+
+/// The production sender: one PostHog client (and the runtime it needs) for the
+/// whole flush, built on the first batch.
+fn posthog_sender(host: String) -> impl FnMut(Vec<SpooledEvent>) -> anyhow::Result<()> + Send {
+    let mut client: Option<(tokio::runtime::Runtime, posthog_rs::Client)> = None;
+    move |rows| {
+        let events = rows
+            .into_iter()
+            .map(rebuild_event)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if client.is_none() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow::anyhow!("building telemetry runtime: {e}"))?;
+            let options = ClientOptionsBuilder::default()
+                .api_key(POSTHOG_API_KEY.to_string())
+                .host(host.as_str())
+                .request_timeout_seconds(10)
+                // We never want PostHog inferring location from the request IP.
+                .disable_geoip(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("building telemetry client options: {e}"))?;
+            let c = rt.block_on(posthog_rs::client(options));
+            client = Some((rt, c));
+        }
+        let Some((rt, c)) = client.as_ref() else {
+            anyhow::bail!("telemetry client unavailable");
+        };
+        // `capture_batch_immediate`, not `capture_batch`: as of posthog-rs 0.21
+        // the latter is fire-and-forget (returns `()`, enqueues onto a
+        // background transport). We must not delete the spooled rows until the
+        // send is *confirmed*, or a failed flush silently loses the batch. The
+        // returned `CaptureSummary` is discarded on purpose: its
+        // `not_persisted()` is only ever non-zero under the non-default
+        // `capture-v1` feature, so on the v0 pipeline an `Ok` already means the
+        // whole batch persisted.
+        rt.block_on(c.capture_batch_immediate(events, false))
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("telemetry batch capture failed: {e}"))
     }
 }
 
@@ -426,7 +1020,8 @@ struct ReportContext<'a> {
     duration_ms: u64,
 }
 
-fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
+/// Spool this invocation's event; returns the open spool for the flush check.
+fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<Spool> {
     let stats = COLLECTOR.snapshot();
     let plugins = PLUGINS.get().cloned().unwrap_or_default();
 
@@ -443,7 +1038,9 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
         props,
         created_ms: hcore::events::now_unix_ms() as i64,
     };
-    Spool::open(&dir.join("telemetry-spool.db"))?.enqueue(&event)
+    let spool = Spool::open(&dir.join(SPOOL_FILE))?;
+    spool.enqueue(&event)?;
+    Ok(spool)
 }
 
 /// Assemble the event property bag. `$os` / `$os_version` are intentionally
@@ -579,84 +1176,182 @@ fn build_props(
 }
 
 /// Flush the spool synchronously, blocking until sent (or failed). Used on CI,
-/// where the runner — and its spool — is ephemeral: a deferred flush would
-/// never happen, so the exit pays the full POST to get the data out at all.
+/// where the runner — and its spool — is ephemeral: a detached flusher would be
+/// killed with the job and a deferred one would never happen, so the exit pays
+/// the full POST to get the data out at all. Waits for the flusher lock rather
+/// than skipping, so a concurrent heph on the same runner cannot leave this
+/// run's event behind — but lock wait and sends together stop at
+/// [`CI_FLUSH_BUDGET`].
 fn flush_blocking() {
-    if let Err(e) = flush_once() {
+    let deadline = Instant::now() + CI_FLUSH_BUDGET;
+    let outcome = config_dir().and_then(|dir| {
+        let outcome =
+            production_sender().and_then(|send| run_flush(&dir, LockMode::Wait, deadline, send));
+        record_outcome(&dir, &outcome);
+        outcome
+    });
+    if let Err(e) = outcome {
         tracing::debug!(error = %format!("{e:#}"), "telemetry flush skipped");
     }
 }
 
-/// Try to flush the spool (this run's event plus any backlog) on a worker
-/// thread, but wait at most `deadline` for it. Called at exit, so the budget is
-/// measured from after the command's real work is done. If the send doesn't
-/// finish in time we return and let the process exit — the thread is abandoned
-/// mid-flight, rows are deleted only after a successful send, so the unsent rows
-/// simply retry on the next run (per-event UUIDs dedupe any row that did reach
-/// PostHog before we gave up).
-fn flush_bounded(deadline: Duration) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("telemetry-flush".to_string())
-        .spawn(move || drop(tx.send(flush_once())));
-    if let Err(e) = spawned {
-        tracing::debug!(error = %e, "telemetry flush thread not started");
-        return;
-    }
-    match rx.recv_timeout(deadline) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::debug!(error = %format!("{e:#}"), "telemetry flush skipped"),
-        Err(_) => tracing::debug!("telemetry flush exceeded deadline; deferring to next run"),
-    }
+/// Why telemetry is off; empty when it is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisabledBy {
+    /// `HEPH_DISABLE_TELEMETRY` is set.
+    Env,
+    /// `telemetry.enabled: false` in the workspace config.
+    Config,
 }
 
-fn flush_once() -> anyhow::Result<()> {
-    let dir = config_dir()?;
-    let spool = Spool::open(&dir.join("telemetry-spool.db"))?;
-    let batch = spool.take_batch(FLUSH_BATCH)?;
-    if batch.is_empty() {
-        return Ok(());
+/// How this process would deliver its events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlushMode {
+    /// Spooled, and sent by a detached `heph __telemetry-flush` once due.
+    Detached,
+    /// CI: every command sends synchronously at exit.
+    Synchronous,
+    /// Telemetry is disabled; nothing is recorded or sent.
+    Off,
+}
+
+/// What `heph tool telemetry status` reports. The `--json` form is this
+/// struct; its keys are a stable interface (documented in
+/// `docs/TELEMETRY.md`): add fields, never rename or remove them. Times are
+/// milliseconds since the Unix epoch, ages are milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Status {
+    /// Whether this process would record and send events.
+    pub enabled: bool,
+    /// Every opt-out in force (both can be).
+    pub disabled_by: Vec<DisabledBy>,
+    /// Whether this looks like a CI runner.
+    pub ci: bool,
+    pub flush_mode: FlushMode,
+    /// Where events are sent: PostHog EU, or the [`ENDPOINT_ENV`] value.
+    pub endpoint: String,
+    /// Whether [`ENDPOINT_ENV`] is set.
+    pub endpoint_overridden: bool,
+    /// Why the [`ENDPOINT_ENV`] value was rejected (nothing is sent then).
+    pub endpoint_error: Option<String>,
+    /// The spool file; `None` when neither `XDG_CONFIG_HOME` nor `HOME` is set.
+    pub spool_path: Option<String>,
+    /// Events waiting to be sent.
+    pub pending_events: u64,
+    pub oldest_event_ms: Option<i64>,
+    pub oldest_event_age_ms: Option<i64>,
+    /// When the last flush that ran to completion finished.
+    pub last_flush_ms: Option<i64>,
+    /// Whether that flush sent everything; `None` before the first one.
+    pub last_flush_ok: Option<bool>,
+    /// Why it failed.
+    pub last_flush_error: Option<String>,
+    /// When a command last spawned a flusher.
+    pub last_flusher_spawn_ms: Option<i64>,
+    /// When the next command will spawn a flusher, if nothing more is spooled;
+    /// at or before `now_ms` means the next command does. `None` with nothing
+    /// pending, on CI (every command flushes), and when disabled.
+    pub next_flush_due_ms: Option<i64>,
+    /// The clock these were computed against.
+    pub now_ms: i64,
+}
+
+/// The telemetry status of this process, given the workspace config's
+/// opt-in. Reads the spool; creates nothing.
+pub fn status(config_enabled: bool) -> anyhow::Result<Status> {
+    status_from(
+        StatusInputs {
+            env_disabled: std::env::var_os(DISABLE_ENV).is_some(),
+            config_enabled,
+            ci: is_ci(),
+            now_ms: hcore::events::now_unix_ms() as i64,
+        },
+        std::env::var_os(ENDPOINT_ENV).as_deref(),
+        config_dir_path().ok(),
+    )
+}
+
+/// The process facts [`status`] reads, injectable for tests.
+#[derive(Debug, Clone, Copy)]
+struct StatusInputs {
+    env_disabled: bool,
+    config_enabled: bool,
+    ci: bool,
+    now_ms: i64,
+}
+
+fn status_from(
+    inputs: StatusInputs,
+    endpoint_raw: Option<&std::ffi::OsStr>,
+    dir: Option<PathBuf>,
+) -> anyhow::Result<Status> {
+    let mut disabled_by = Vec::new();
+    if inputs.env_disabled {
+        disabled_by.push(DisabledBy::Env);
     }
-
-    let mut ids = Vec::with_capacity(batch.len());
-    let mut events = Vec::with_capacity(batch.len());
-    for (id, row) in batch {
-        ids.push(id);
-        events.push(rebuild_event(row)?);
+    if !inputs.config_enabled {
+        disabled_by.push(DisabledBy::Config);
     }
+    let enabled = disabled_by.is_empty();
+    let flush_mode = match (enabled, inputs.ci) {
+        (false, _) => FlushMode::Off,
+        (true, true) => FlushMode::Synchronous,
+        (true, false) => FlushMode::Detached,
+    };
+    let (endpoint, endpoint_overridden, endpoint_error) = match endpoint_from(endpoint_raw) {
+        Ok(e) => (e.url, e.overridden, None),
+        Err(e) => (
+            endpoint_raw
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            true,
+            Some(format!("{e:#}")),
+        ),
+    };
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("building telemetry runtime: {e}"))?;
-    rt.block_on(async {
-        let options = ClientOptionsBuilder::default()
-            .api_key(POSTHOG_API_KEY.to_string())
-            .host(POSTHOG_HOST)
-            .request_timeout_seconds(10)
-            // We never want PostHog inferring location from the request IP.
-            .disable_geoip(true)
-            .build()
-            .map_err(|e| anyhow::anyhow!("building telemetry client options: {e}"))?;
-        let client = posthog_rs::client(options).await;
-        // `capture_batch_immediate`, not `capture_batch`: as of posthog-rs 0.21
-        // the latter is fire-and-forget (returns `()`, enqueues onto a
-        // background transport). We must not delete the spooled rows below
-        // until the send is *confirmed*, or a failed flush silently loses the
-        // batch. The returned `CaptureSummary` is discarded on purpose: its
-        // `not_persisted()` is only ever non-zero under the non-default
-        // `capture-v1` feature, so on the v0 pipeline an `Ok` already means the
-        // whole batch persisted — the same guarantee 0.12's `capture_batch` gave.
-        client
-            .capture_batch_immediate(events, false)
-            .await
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("telemetry batch capture failed: {e}"))
-    })?;
-
-    // Send succeeded: drop the rows. A crash between send and delete re-sends
-    // next run; the per-event UUID dedupes server-side.
-    spool.delete(&ids)
+    let spool_path = dir.map(|d| d.join(SPOOL_FILE));
+    // An absent spool is an empty one; opening it would create it.
+    let (state, last_flush) = match spool_path.as_deref().filter(|p| p.exists()) {
+        Some(path) => {
+            let spool = Spool::open(path)?;
+            (spool.state()?, spool.last_flush()?)
+        }
+        None => (
+            SpoolState {
+                count: 0,
+                oldest_ms: None,
+                last_spawn_ms: None,
+            },
+            None,
+        ),
+    };
+    let next_flush_due_ms = match flush_mode {
+        FlushMode::Detached => next_flush_due(state, inputs.now_ms),
+        FlushMode::Synchronous | FlushMode::Off => None,
+    };
+    Ok(Status {
+        enabled,
+        disabled_by,
+        ci: inputs.ci,
+        flush_mode,
+        endpoint,
+        endpoint_overridden,
+        endpoint_error,
+        spool_path: spool_path.map(|p| p.display().to_string()),
+        pending_events: state.count,
+        oldest_event_ms: state.oldest_ms,
+        oldest_event_age_ms: state
+            .oldest_ms
+            .map(|t| inputs.now_ms.saturating_sub(t).max(0)),
+        last_flush_ms: last_flush.as_ref().map(|f| f.at_ms),
+        last_flush_ok: last_flush.as_ref().map(|f| f.error.is_none()),
+        last_flush_error: last_flush.and_then(|f| f.error),
+        last_flusher_spawn_ms: state.last_spawn_ms,
+        next_flush_due_ms,
+        now_ms: inputs.now_ms,
+    })
 }
 
 /// Turn a spooled row back into a PostHog event, stamped with its original
@@ -924,7 +1619,14 @@ mod tests {
             .expect("enqueue");
         drop(spool);
 
-        flush_once().expect("flush");
+        let outcome = run_flush(
+            &cfg,
+            LockMode::Wait,
+            Instant::now() + CI_FLUSH_BUDGET,
+            Box::new(posthog_sender(POSTHOG_HOST.to_string())),
+        )
+        .expect("flush");
+        assert_eq!(outcome, FlushOutcome::Sent(1));
 
         let spool = Spool::open(&cfg.join("telemetry-spool.db")).expect("reopen");
         assert!(
@@ -952,5 +1654,767 @@ mod tests {
             ..row
         };
         assert!(rebuild_event(bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    const MIN: i64 = 60_000;
+    const NOW: i64 = 1_800_000_000_000;
+
+    fn state(count: u64, oldest_age_ms: i64, last_spawn_ago_ms: Option<i64>) -> SpoolState {
+        SpoolState {
+            count,
+            oldest_ms: (count > 0).then_some(NOW - oldest_age_ms),
+            last_spawn_ms: last_spawn_ago_ms.map(|ago| NOW - ago),
+        }
+    }
+
+    fn ev(n: usize) -> SpooledEvent {
+        SpooledEvent {
+            uuid: uuid::Uuid::new_v4().to_string(),
+            distinct_id: "install".into(),
+            event: format!("e{n}"),
+            props: serde_json::Map::new(),
+            created_ms: NOW,
+        }
+    }
+
+    fn spool_in(dir: &Path) -> Spool {
+        Spool::open(&dir.join(SPOOL_FILE)).expect("open spool")
+    }
+
+    fn remaining(dir: &Path) -> Vec<String> {
+        spool_in(dir)
+            .take_batch(usize::MAX)
+            .expect("take")
+            .into_iter()
+            .map(|(_, e)| e.uuid)
+            .collect()
+    }
+
+    /// A deadline no test reaches.
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(600)
+    }
+
+    /// A sender that confirms every batch.
+    fn ok_sender() -> Sender {
+        Box::new(|_| Ok(()))
+    }
+
+    /// The thresholds: five minutes of age, or a full batch of events.
+    #[test]
+    fn flush_is_due_at_five_minutes_or_a_full_batch() {
+        assert_eq!(FLUSH_MAX_AGE, Duration::from_secs(5 * 60));
+        // Nothing spooled: never.
+        assert!(!flush_due(state(0, 0, None), NOW));
+        // Fresh and few: not yet.
+        assert!(!flush_due(state(1, 0, None), NOW));
+        assert!(!flush_due(
+            state(FLUSH_AT_EVENTS - 1, 5 * MIN - 1, None),
+            NOW
+        ));
+        // Oldest event exactly five minutes old: due.
+        assert!(flush_due(state(1, 5 * MIN, None), NOW));
+        // A full batch, however fresh: due.
+        assert!(flush_due(state(FLUSH_AT_EVENTS, 0, None), NOW));
+    }
+
+    /// A flusher spawned less than the retry interval ago holds the next one
+    /// off — an offline machine spawns one per minute, not one per command —
+    /// and a spawn stamp from the future (clock stepped back) does not.
+    #[test]
+    fn a_recent_spawn_holds_off_the_next() {
+        let retry = i64::try_from(FLUSH_RETRY_INTERVAL.as_millis()).expect("ms");
+        assert!(!flush_due(state(FLUSH_AT_EVENTS, 10 * MIN, Some(0)), NOW));
+        assert!(!flush_due(
+            state(FLUSH_AT_EVENTS, 10 * MIN, Some(retry - 1)),
+            NOW
+        ));
+        assert!(flush_due(
+            state(FLUSH_AT_EVENTS, 10 * MIN, Some(retry)),
+            NOW
+        ));
+        assert!(flush_due(
+            state(FLUSH_AT_EVENTS, 10 * MIN, Some(-10 * MIN)),
+            NOW
+        ));
+    }
+
+    /// Of several commands that find a flush due at once, exactly one claims
+    /// the spawn; once the retry interval has passed, the next one can.
+    #[test]
+    fn only_one_command_claims_a_due_flush() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = spool_in(dir.path());
+        let mut old = ev(0);
+        old.created_ms = NOW - 6 * MIN;
+        spool.enqueue(&old).expect("enqueue");
+        let other = spool_in(dir.path());
+
+        assert!(claim_flush(&spool, NOW).expect("claim"));
+        assert!(!claim_flush(&other, NOW).expect("second claim"));
+        assert!(!claim_flush(&spool, NOW + 1).expect("still recent"));
+        let later = NOW + i64::try_from(FLUSH_RETRY_INTERVAL.as_millis()).expect("ms");
+        assert!(claim_flush(&other, later).expect("after the interval"));
+    }
+
+    /// A due check on a fresh spool claims nothing and writes no spawn stamp.
+    #[test]
+    fn a_flush_that_is_not_due_claims_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = spool_in(dir.path());
+        spool.enqueue(&ev(0)).expect("enqueue");
+        assert!(!claim_flush(&spool, NOW).expect("claim"));
+        assert_eq!(spool.state().expect("state").last_spawn_ms, None);
+    }
+
+    /// One flusher at a time: while another holds the lock, a detached flusher
+    /// sends nothing and leaves every row in place.
+    #[test]
+    fn a_held_flusher_lock_makes_the_next_flusher_back_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        spool_in(dir.path()).enqueue(&ev(0)).expect("enqueue");
+        let held = std::fs::File::create(dir.path().join(FLUSH_LOCK_FILE)).expect("lock file");
+        held.lock().expect("hold the lock");
+
+        let calls = Arc::new(Mutex::new(0));
+        let counted = Arc::clone(&calls);
+        let outcome = run_flush(
+            dir.path(),
+            LockMode::Try,
+            far(),
+            Box::new(move |_| {
+                *counted.lock().expect("lock") += 1;
+                Ok(())
+            }),
+        )
+        .expect("flush");
+        assert_eq!(outcome, FlushOutcome::Busy);
+        assert_eq!(*calls.lock().expect("lock"), 0);
+        assert_eq!(remaining(dir.path()).len(), 1);
+
+        // Released: the next flusher runs. Retried briefly, because a `flock`
+        // belongs to the open file, and a sibling test forking `git` while
+        // `held` was open shares it until that child execs.
+        drop(held);
+        assert_eq!(flush_when_free(dir.path()), FlushOutcome::Sent(1));
+    }
+
+    /// CI's wait for the flusher lock is bounded: with the lock held past the
+    /// deadline it gives up as `Busy`, about when the deadline passes, rather
+    /// than waiting for the holder to finish.
+    #[test]
+    fn a_waiting_flush_gives_up_on_the_lock_at_its_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        spool_in(dir.path()).enqueue(&ev(0)).expect("enqueue");
+        let held = std::fs::File::create(dir.path().join(FLUSH_LOCK_FILE)).expect("lock file");
+        held.lock().expect("hold the lock");
+
+        let started = Instant::now();
+        let outcome = run_flush(
+            dir.path(),
+            LockMode::Wait,
+            started + Duration::from_millis(300),
+            ok_sender(),
+        )
+        .expect("flush");
+        let took = started.elapsed();
+        assert_eq!(outcome, FlushOutcome::Busy);
+        assert!(
+            took >= Duration::from_millis(300),
+            "gave up early: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "waited past the deadline: {took:?}"
+        );
+        assert_eq!(remaining(dir.path()).len(), 1);
+    }
+
+    /// A send still in flight at the deadline is abandoned, not waited for:
+    /// the flush returns about when the deadline passes, with an error, and
+    /// the batch stays spooled for the next flush.
+    #[test]
+    fn a_send_that_hangs_past_the_deadline_is_abandoned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for n in 0..3 {
+            spool_in(dir.path()).enqueue(&ev(n)).expect("enqueue");
+        }
+        let started = Instant::now();
+        let err = run_flush(
+            dir.path(),
+            LockMode::Wait,
+            started + Duration::from_millis(200),
+            Box::new(|_| {
+                std::thread::sleep(Duration::from_secs(30));
+                Ok(())
+            }),
+        )
+        .expect_err("the deadline passed mid-send");
+        let took = started.elapsed();
+        assert!(
+            format!("{err:#}").contains("deadline exceeded"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "waited for the send: {took:?}"
+        );
+        assert_eq!(remaining(dir.path()).len(), 3, "nothing deleted");
+    }
+
+    /// A deadline already past sends nothing at all.
+    #[test]
+    fn a_flush_past_its_deadline_starts_no_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        spool_in(dir.path()).enqueue(&ev(0)).expect("enqueue");
+        let err = run_flush(
+            dir.path(),
+            LockMode::Wait,
+            Instant::now(),
+            Box::new(|_| panic!("no batch may start after the deadline")),
+        )
+        .expect_err("past the deadline");
+        assert!(format!("{err:#}").contains("deadline exceeded"));
+        assert_eq!(remaining(dir.path()).len(), 1);
+    }
+
+    /// `run_flush` in [`LockMode::Try`], retried while the lock is transiently
+    /// held by a forked-but-not-yet-exec'd child of a sibling test.
+    fn flush_when_free(dir: &Path) -> FlushOutcome {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let outcome = run_flush(dir, LockMode::Try, far(), ok_sender()).expect("flush");
+            if outcome != FlushOutcome::Busy || Instant::now() > deadline {
+                return outcome;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The whole spool goes out in batches, each row exactly once, and rows a
+    /// command appends while a batch is in flight are not deleted with it —
+    /// they go out in a later batch.
+    #[test]
+    fn a_flush_sends_every_row_exactly_once_including_ones_appended_mid_send() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = spool_in(dir.path());
+        let mut expected = Vec::new();
+        for n in 0..(FLUSH_BATCH + 7) {
+            let e = ev(n);
+            expected.push(e.uuid.clone());
+            spool.enqueue(&e).expect("enqueue");
+        }
+        let late = ev(999);
+        expected.push(late.uuid.clone());
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&sent);
+        let mut late = Some(late);
+        let appender = spool_in(dir.path());
+        let outcome = run_flush(
+            dir.path(),
+            LockMode::Wait,
+            far(),
+            Box::new(move |batch| {
+                if let Some(e) = late.take() {
+                    appender.enqueue(&e).expect("append mid-send");
+                }
+                recorded
+                    .lock()
+                    .expect("lock")
+                    .extend(batch.into_iter().map(|e| e.uuid));
+                Ok(())
+            }),
+        )
+        .expect("flush");
+
+        let mut sent = sent.lock().expect("lock").clone();
+        assert_eq!(outcome, FlushOutcome::Sent(sent.len()));
+        sent.sort();
+        expected.sort();
+        assert_eq!(sent, expected, "every row sent, none twice");
+        assert!(remaining(dir.path()).is_empty());
+    }
+
+    /// A send that fails deletes nothing: the batch is still there for the
+    /// next flush, which sends it.
+    #[test]
+    fn a_failed_send_loses_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for n in 0..3 {
+            spool_in(dir.path()).enqueue(&ev(n)).expect("enqueue");
+        }
+        let before = remaining(dir.path());
+        let err = run_flush(
+            dir.path(),
+            LockMode::Wait,
+            far(),
+            Box::new(|_| anyhow::bail!("offline")),
+        )
+        .expect_err("send failed");
+        assert!(format!("{err:#}").contains("offline"));
+        assert_eq!(remaining(dir.path()), before);
+        assert_eq!(
+            run_flush(dir.path(), LockMode::Wait, far(), ok_sender()).expect("retry"),
+            FlushOutcome::Sent(3)
+        );
+    }
+
+    /// The flusher dies right after PostHog accepted a batch, before deleting
+    /// it — the one window no protocol closes. Nothing is lost, and the resend
+    /// carries the very same UUIDs, which is what PostHog dedupes on.
+    #[test]
+    fn a_crash_between_send_and_delete_resends_the_same_uuids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for n in 0..3 {
+            spool_in(dir.path()).enqueue(&ev(n)).expect("enqueue");
+        }
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&first);
+        // The send thread dies after the server accepted the batch.
+        let err = run_flush(
+            dir.path(),
+            LockMode::Wait,
+            far(),
+            Box::new(move |batch| {
+                recorded
+                    .lock()
+                    .expect("lock")
+                    .extend(batch.into_iter().map(|e| e.uuid));
+                panic!("the flusher dies after the server accepted the batch");
+            }),
+        )
+        .expect_err("the sender died");
+        assert!(format!("{err:#}").contains("died"), "{err:#}");
+
+        let resent = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&resent);
+        run_flush(
+            dir.path(),
+            LockMode::Wait,
+            far(),
+            Box::new(move |batch| {
+                recorded
+                    .lock()
+                    .expect("lock")
+                    .extend(batch.into_iter().map(|e| e.uuid));
+                Ok(())
+            }),
+        )
+        .expect("next flush");
+        let mut first = first.lock().expect("lock").clone();
+        let mut resent = resent.lock().expect("lock").clone();
+        first.sort();
+        resent.sort();
+        assert_eq!(first.len(), 3);
+        assert_eq!(resent, first, "the resend is the same events, by UUID");
+        assert!(remaining(dir.path()).is_empty());
+    }
+
+    /// `run_flusher` with no opt-out, retried past a transient `Busy` (see
+    /// `flush_when_free`).
+    fn flusher_when_free(
+        cfg: &Path,
+        sender: impl Fn() -> anyhow::Result<Sender>,
+    ) -> anyhow::Result<Option<FlushOutcome>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let outcome = run_flusher(
+                FlusherOptOut {
+                    env_disabled: false,
+                    config_disabled: || false,
+                },
+                || Ok(cfg.to_path_buf()),
+                &sender,
+                far(),
+            );
+            if !matches!(outcome, Ok(Some(FlushOutcome::Busy))) || Instant::now() > deadline {
+                return outcome;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Opted out by the kill switch by the time the flusher runs: it does not
+    /// even resolve the config dir, let alone create or send anything — nor
+    /// ask the config.
+    #[test]
+    fn an_env_opted_out_flusher_touches_nothing() {
+        let outcome = run_flusher(
+            FlusherOptOut {
+                env_disabled: true,
+                config_disabled: || panic!("the config must not be read when the env disables"),
+            },
+            || panic!("the config dir must not be resolved when disabled"),
+            || panic!("no sender may be built when disabled"),
+            far(),
+        )
+        .expect("flusher");
+        assert_eq!(outcome, None);
+    }
+
+    /// Opted out in the spawning workspace's config by the time the flusher
+    /// runs: it sends nothing and deletes the spool, as an opted-out command
+    /// does.
+    #[test]
+    fn a_config_opted_out_flusher_deletes_the_spool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        spool_in(dir.path()).enqueue(&ev(0)).expect("enqueue");
+        let outcome = run_flusher(
+            FlusherOptOut {
+                env_disabled: false,
+                config_disabled: || true,
+            },
+            || Ok(dir.path().to_path_buf()),
+            || panic!("no sender may be built when the config opts out"),
+            far(),
+        )
+        .expect("flusher");
+        assert_eq!(outcome, None);
+        assert!(!dir.path().join(SPOOL_FILE).exists(), "spool deleted");
+    }
+
+    /// Enabled, the flusher sends, and records each outcome for the status
+    /// command: a failure with its reason (rows kept), then a success that
+    /// clears it.
+    #[test]
+    fn an_enabled_flusher_sends_and_records_the_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        spool_in(dir.path()).enqueue(&ev(0)).expect("enqueue");
+
+        let err = flusher_when_free(dir.path(), || {
+            Ok(Box::new(|_| anyhow::bail!("connection refused")))
+        })
+        .expect_err("send failed");
+        assert!(format!("{err:#}").contains("connection refused"));
+        let last = spool_in(dir.path()).last_flush().expect("read");
+        assert!(
+            last.as_ref()
+                .and_then(|l| l.error.as_deref())
+                .is_some_and(|e| e.contains("connection refused")),
+            "failure recorded: {last:?}"
+        );
+        assert_eq!(remaining(dir.path()).len(), 1);
+
+        let outcome = flusher_when_free(dir.path(), || Ok(ok_sender())).expect("flusher");
+        assert_eq!(outcome, Some(FlushOutcome::Sent(1)));
+        let last = spool_in(dir.path()).last_flush().expect("read");
+        assert!(last.is_some_and(|l| l.error.is_none()), "success recorded");
+    }
+
+    /// A sender that cannot be built (an endpoint override that is not
+    /// loopback) sends nothing, keeps every row, and records why.
+    #[test]
+    fn a_rejected_endpoint_sends_nothing_and_says_why() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        spool_in(dir.path()).enqueue(&ev(0)).expect("enqueue");
+        let err = flusher_when_free(dir.path(), || {
+            endpoint_from(Some(std::ffi::OsStr::new("https://example.com"))).map(|_| ok_sender())
+        })
+        .expect_err("rejected endpoint");
+        assert!(format!("{err:#}").contains("loopback"), "{err:#}");
+        assert_eq!(remaining(dir.path()).len(), 1);
+        let last = spool_in(dir.path()).last_flush().expect("read");
+        assert!(
+            last.and_then(|l| l.error)
+                .is_some_and(|e| e.contains(ENDPOINT_ENV))
+        );
+    }
+
+    /// The endpoint override accepts a loopback http(s) URL and nothing else;
+    /// unset means PostHog EU.
+    #[test]
+    fn the_endpoint_override_is_loopback_only() {
+        let parse = |v: &str| endpoint_from(Some(std::ffi::OsStr::new(v)));
+        assert_eq!(
+            endpoint_from(None).expect("default"),
+            Endpoint {
+                url: POSTHOG_HOST.to_string(),
+                overridden: false
+            }
+        );
+        for ok in [
+            "http://127.0.0.1:8123",
+            "http://127.0.0.1:8123/ingest",
+            "https://localhost",
+            "http://LOCALHOST:1",
+            "http://[::1]:9",
+            "http://127.1.2.3",
+        ] {
+            let e = parse(ok).unwrap_or_else(|e| panic!("{ok} rejected: {e:#}"));
+            assert!(e.overridden, "{ok}");
+        }
+        for bad in [
+            "",
+            "127.0.0.1:8123",
+            "ftp://127.0.0.1",
+            "file:///tmp/x",
+            "https://eu.posthog.com",
+            "http://10.0.0.1",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.nip.io",
+            "http://[::2]",
+            "http://0.0.0.0",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            assert!(endpoint_from(Some(std::ffi::OsStr::from_bytes(b"http://\xff"))).is_err());
+        }
+    }
+
+    /// `next_flush_due` names exactly the moment `flush_due` turns true, for
+    /// each reason a flush can be held off.
+    #[test]
+    fn next_flush_due_is_when_flush_due_turns_true() {
+        let retry = millis(FLUSH_RETRY_INTERVAL);
+        let cases = [
+            // Young and few: due when the oldest turns five minutes old.
+            state(1, MIN, None),
+            // A full batch: due already.
+            state(FLUSH_AT_EVENTS, 0, None),
+            // Due by age but a flusher was just spawned: the retry floor.
+            state(1, 10 * MIN, Some(10_000)),
+            // Both held: the later of the two.
+            state(1, 4 * MIN, Some(30_000)),
+        ];
+        for s in cases {
+            let due = next_flush_due(s, NOW).expect("something pending");
+            let at = due.max(NOW);
+            assert!(flush_due(s, at), "{s:?}: not due at {at}");
+            if due > NOW {
+                assert!(!flush_due(s, due - 1), "{s:?}: due before {due}");
+            }
+        }
+        assert_eq!(next_flush_due(state(0, 0, None), NOW), None);
+        assert_eq!(
+            next_flush_due(state(1, 4 * MIN, Some(30_000)), NOW),
+            Some(NOW + MIN)
+        );
+        assert_eq!(
+            next_flush_due(state(1, 10 * MIN, Some(10_000)), NOW),
+            Some(NOW - 10_000 + retry)
+        );
+        // A spawn stamp from the future is ignored, as `flush_due` ignores it.
+        assert_eq!(
+            next_flush_due(state(FLUSH_AT_EVENTS, 0, Some(-10 * MIN)), NOW),
+            Some(NOW)
+        );
+    }
+
+    fn inputs() -> StatusInputs {
+        StatusInputs {
+            env_disabled: false,
+            config_enabled: true,
+            ci: false,
+            now_ms: NOW,
+        }
+    }
+
+    /// The `--json` shape of `heph tool telemetry status` is a stable
+    /// interface: exactly these keys, and these values for a spool with one
+    /// pending event, a failed flush and a recent spawn.
+    #[test]
+    fn status_json_shape_is_stable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = spool_in(dir.path());
+        let mut old = ev(0);
+        old.created_ms = NOW - 2 * MIN;
+        spool.enqueue(&old).expect("enqueue");
+        spool
+            .record_flush(NOW - MIN, Some("offline"))
+            .expect("record");
+        assert!(spool.claim_spawn(None, NOW - MIN).expect("claim"));
+
+        let status = status_from(inputs(), None, Some(dir.path().to_path_buf())).expect("status");
+        let json = serde_json::to_value(&status).expect("json");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "ci",
+                "disabled_by",
+                "enabled",
+                "endpoint",
+                "endpoint_error",
+                "endpoint_overridden",
+                "flush_mode",
+                "last_flush_error",
+                "last_flush_ms",
+                "last_flush_ok",
+                "last_flusher_spawn_ms",
+                "next_flush_due_ms",
+                "now_ms",
+                "oldest_event_age_ms",
+                "oldest_event_ms",
+                "pending_events",
+                "spool_path",
+            ]
+        );
+        let spool_path = dir.path().join(SPOOL_FILE).display().to_string();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "ci": false,
+                "disabled_by": [],
+                "enabled": true,
+                "endpoint": POSTHOG_HOST,
+                "endpoint_error": null,
+                "endpoint_overridden": false,
+                "flush_mode": "detached",
+                "last_flush_error": "offline",
+                "last_flush_ms": NOW - MIN,
+                "last_flush_ok": false,
+                "last_flusher_spawn_ms": NOW - MIN,
+                "next_flush_due_ms": NOW + 3 * MIN,
+                "now_ms": NOW,
+                "oldest_event_age_ms": 2 * MIN,
+                "oldest_event_ms": NOW - 2 * MIN,
+                "pending_events": 1,
+                "spool_path": spool_path,
+            })
+        );
+    }
+
+    /// Disabled, status says by what (both switches can be), reports the
+    /// flush mode as off, and — with no spool on disk — creates none.
+    #[test]
+    fn status_reports_every_opt_out_and_creates_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("heph");
+        let status = status_from(
+            StatusInputs {
+                env_disabled: true,
+                config_enabled: false,
+                ..inputs()
+            },
+            None,
+            Some(cfg.clone()),
+        )
+        .expect("status");
+        assert!(!status.enabled);
+        assert_eq!(status.disabled_by, [DisabledBy::Env, DisabledBy::Config]);
+        assert_eq!(status.flush_mode, FlushMode::Off);
+        assert_eq!(status.pending_events, 0);
+        assert_eq!(status.next_flush_due_ms, None);
+        assert!(!cfg.exists(), "status must not create the config dir");
+
+        let ci = status_from(
+            StatusInputs {
+                ci: true,
+                ..inputs()
+            },
+            None,
+            Some(cfg),
+        )
+        .expect("status");
+        assert_eq!(ci.flush_mode, FlushMode::Synchronous);
+        assert!(ci.disabled_by.is_empty());
+    }
+
+    /// A rejected endpoint override shows up in status with the reason, the
+    /// raw value, and as an override.
+    #[test]
+    fn status_shows_a_rejected_endpoint_override() {
+        let status = status_from(
+            inputs(),
+            Some(std::ffi::OsStr::new("https://example.com")),
+            None,
+        )
+        .expect("status");
+        assert_eq!(status.endpoint, "https://example.com");
+        assert!(status.endpoint_overridden);
+        assert!(
+            status
+                .endpoint_error
+                .is_some_and(|e| e.contains("loopback"))
+        );
+        assert_eq!(status.spool_path, None);
+    }
+
+    /// Env var carrying the marker path to [`detached_child_helper`].
+    const CHILD_MARKER_ENV: &str = "HEPH_TELEMETRY_TEST_CHILD_MARKER";
+
+    /// Not a test on its own: the stand-in for heph that
+    /// [`spawn_detached_does_not_wait_and_detaches_the_child`] spawns (this
+    /// test binary re-run with only this test selected). A no-op unless
+    /// [`CHILD_MARKER_ENV`] is set. Waits a second, so the spawner has long
+    /// returned, then records its session id and cwd and publishes the marker
+    /// atomically.
+    #[test]
+    fn detached_child_helper() {
+        let Some(marker) = std::env::var_os(CHILD_MARKER_ENV).map(PathBuf::from) else {
+            return;
+        };
+        std::thread::sleep(Duration::from_secs(1));
+        // SAFETY: getsid(0) reads the calling process's session id; it has no
+        // preconditions.
+        let sid = unsafe { libc::getsid(0) };
+        let cwd = std::env::current_dir().expect("cwd");
+        let tmp = marker.with_extension("tmp");
+        std::fs::write(&tmp, format!("{sid}\n{}\n", cwd.display())).expect("write marker");
+        std::fs::rename(&tmp, &marker).expect("publish marker");
+    }
+
+    /// The flusher hand-off: `spawn_detached` returns while the child is
+    /// still running, and the child runs in a session of its own (so the
+    /// terminal's SIGHUP and a Ctrl-C to heph's process group miss it) with
+    /// cwd `/` (so it pins no workspace).
+    #[test]
+    fn spawn_detached_does_not_wait_and_detaches_the_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("marker");
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        cmd.args([
+            "--exact",
+            "telemetry::flush_tests::detached_child_helper",
+            "--test-threads=1",
+        ])
+        .env(CHILD_MARKER_ENV, &marker);
+
+        let mut child = spawn_detached(cmd).expect("spawn");
+        assert!(
+            !marker.exists(),
+            "spawn_detached waited for the child to finish"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the child never wrote its marker"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let report = std::fs::read_to_string(&marker).expect("marker");
+        let mut lines = report.lines();
+        let sid: i32 = lines.next().expect("sid").parse().expect("sid number");
+        let cwd = lines.next().expect("cwd");
+
+        // SAFETY: as in the helper.
+        let our_sid = unsafe { libc::getsid(0) };
+        assert_ne!(sid, our_sid, "the child shares the spawner's session");
+        assert_eq!(
+            i64::from(sid),
+            i64::from(child.id()),
+            "the child leads its own session"
+        );
+        assert_eq!(cwd, "/");
+        // Reap it; it has exited or is about to.
+        drop(child.wait());
     }
 }
