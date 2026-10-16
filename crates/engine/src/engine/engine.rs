@@ -782,19 +782,19 @@ impl Engine {
         // `fs.skip` dirs/globs) the engine hands every plugin, so every fs glob
         // walk prunes the same paths. A bad `fs.skip` glob surfaces as an error
         // here.
+        //
+        // One `Ignore`, shared: the driver and the functions were each handed a
+        // separately built copy of the same set. Its matchers compile on first
+        // use, so a run that never walks through `fs` never compiles them.
         engine.register_plugin("fs", |init| {
-            let functions_ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
-            let driver_ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
+            let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             Ok(PluginParts::default()
                 .with_provider(Box::new(hbuiltins::pluginfs::Provider))
                 .with_driver(Box::new(hbuiltins::pluginfs::Driver::new(
-                    driver_ignore,
+                    Arc::clone(&ignore),
                     init.walker.clone(),
                 )))
-                .with_functions(hbuiltins::pluginfs::functions(
-                    &functions_ignore,
-                    &init.walker,
-                )))
+                .with_functions(hbuiltins::pluginfs::functions(&ignore, &init.walker)))
         })?;
 
         Ok(engine)
