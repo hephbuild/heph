@@ -64,7 +64,8 @@ impl Workspace {
             })
             .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
             .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
-            .with_managed_driver(Box::new(pluginhttp::Driver));
+            .with_managed_driver(Box::new(pluginhttp::Driver))
+            .with_driver(Box::new(heph::plugintemplate::Driver));
         let builder = if let Some(p) = p {
             builder.with_parallelism(p)
         } else {
@@ -132,6 +133,9 @@ impl Workspace {
         engine
             .register_managed_driver(|_| Box::new(pluginhttp::Driver))
             .context("reopen: register http driver")?;
+        engine
+            .register_driver(|_| Box::new(heph::plugintemplate::Driver))
+            .context("reopen: register template driver")?;
         let engine = Arc::new(engine);
         engine.install_exec_runner_host();
         Ok(engine)

@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hplugin::driver::{
-    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, RunRequest, RunResponse, TargetAddr, outputartifact,
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
+    ParseRequest, ParseResponse, RunRequest, RunResponse, TargetAddr, outputartifact,
     targetdef::{
         CacheConfig, Input, InputMode, Output, TargetDef,
         path::{CodegenMode, Content, Path},
@@ -25,7 +25,7 @@ use hplugin::driver::{
 };
 use hplugin::htspec::Spec;
 use htemplate::{TEMPLATE_FORMAT_VERSION, render};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -41,8 +41,14 @@ struct TemplateSpec {
     /// Output filename; defaults to the target name.
     #[spec(ty = ParamType::String)]
     out: Option<String>,
-    /// Variables the template can reference by name.
-    vars: HashMap<String, String>,
+    /// Variables the template can reference by name. A value may be, or
+    /// contain, a `${read://pkg:name}` deferred value.
+    ///
+    /// `Option` so that `None` means "no vars": a macro forwarding its own
+    /// `vars=None` default is the common shape, and it parsed before `vars`
+    /// became deferrable.
+    #[spec(ty = ParamType::map(ParamType::String))]
+    vars: Option<BTreeMap<String, Deferred<String>>>,
     /// Mark the rendered file executable.
     executable: bool,
 }
@@ -50,10 +56,14 @@ struct TemplateSpec {
 #[derive(serde::Serialize)]
 struct TemplateDef {
     out: String,
-    /// Ordered, because a `HashMap`'s iteration order is randomized per process
-    /// and this is hashed: an unordered fold would give the same target a
-    /// different def hash on every run and never hit cache.
-    vars: BTreeMap<String, String>,
+    /// Ordered, because this is hashed: the config arrives as a `HashMap`,
+    /// whose iteration order is randomized per process, and an unordered fold
+    /// would give the same target a different def hash on every run.
+    ///
+    /// Held unresolved. A `${read:…}` is substituted at run, by the host; the
+    /// def — and so `heph inspect def` and the def hash — carries the reference
+    /// as written.
+    vars: BTreeMap<String, Deferred<String>>,
     executable: bool,
 }
 
@@ -81,7 +91,21 @@ impl hplugin::driver::Driver for Driver {
             .out
             .unwrap_or_else(|| req.target_spec.addr.name.clone());
         let executable = spec.executable;
-        let vars: BTreeMap<String, String> = spec.vars.into_iter().collect();
+        let vars = spec.vars.unwrap_or_default();
+        // `${src:}` is the sandbox path of an artifact, and this driver renders
+        // in-process with no sandbox to stage one into — the host completes a
+        // `${src:}` only in the managed-driver layer, so one here would fail at
+        // run with a message blaming heph. Refused where the author wrote it.
+        for (k, v) in &vars {
+            if let Some(r) = hcore::template::first_ref_of(v.raw(), &[hcore::template::SRC_KIND]) {
+                anyhow::bail!(
+                    "`{}` in `vars.{k}`: the template driver renders without a sandbox, so \
+                     there is no path for `${{src://…}}` to name. Use `${{read://…}}` for a \
+                     producer's contents",
+                    r.raw
+                );
+            }
+        }
 
         let pkg = req.target_spec.addr.package.clone();
         let src = TargetAddr::parse(&spec.src, &pkg)
@@ -101,10 +125,14 @@ impl hplugin::driver::Driver for Driver {
         // The template's own bytes reach the key through the dep's hashout, so
         // only the address goes in here.
         h.update(src.r#ref.format().as_bytes());
+        // The *unresolved* text: a `${read:}` producer's bytes reach `hashin`
+        // through the edge the host appends, so the def stays computable
+        // without building anything — and a plain value hashes exactly as it
+        // did before `vars` became deferrable.
         for (k, v) in &vars {
             h.update(k.as_bytes());
             h.update(b"=");
-            h.update(v.as_bytes());
+            h.update(v.raw().as_bytes());
             h.update(b"\0");
         }
         let hash = format!("{:016x}", h.digest()).into_bytes();
@@ -160,7 +188,13 @@ impl hplugin::driver::Driver for Driver {
     ) -> anyhow::Result<RunResponse> {
         let def = req.target.def::<TemplateDef>();
         let template = read_single_file(&req)?;
-        let rendered = render(&template, &def.vars)
+        let vars = def
+            .vars
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), req.resolve(v)?.to_string())))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()
+            .with_context(|| format!("template {}: resolving `vars`", req.target.addr.format()))?;
+        let rendered = render(&template, &vars)
             .with_context(|| format!("template {}", req.target.addr.format()))?;
         let data = rendered.into_bytes();
 
@@ -261,6 +295,7 @@ mod tests {
     use hmodel::htaddr::parse_addr;
     use hplugin::driver::Driver as EDriver;
     use hplugin::provider::TargetSpec;
+    use std::collections::HashMap;
 
     fn ctoken() -> StdCancellationToken {
         StdCancellationToken::new()
@@ -375,6 +410,67 @@ mod tests {
         .await
         .expect("parse");
         assert_eq!(one.hash, two.hash);
+    }
+
+    #[test]
+    fn the_schema_accepts_deferred_values() {
+        // The host refuses a `${read:}` for any driver whose schema says no,
+        // so this flag is what lets `vars` take one at all.
+        assert!(Driver.schema().accepts_deferred);
+    }
+
+    #[tokio::test]
+    async fn a_src_reference_in_vars_is_refused_at_parse() {
+        // Nothing would ever complete it: `${src:}` is filled in by the
+        // managed-driver layer, and this driver has no sandbox.
+        let err = match parse(
+            "//pkg:conf",
+            config(&[
+                ("src", s(":conf.j2")),
+                ("vars", vars(&[("bin", "${src://tools:cli}")])),
+            ]),
+        )
+        .await
+        {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("a `${{src:}}` in vars must not parse"),
+        };
+        assert!(err.contains("vars.bin"), "names the variable: {err}");
+        assert!(
+            err.contains("${read://"),
+            "points at the alternative: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vars_none_means_no_vars() {
+        // `def conf(name, vars = None): target(..., vars = vars)` — a macro
+        // forwarding its default. It parsed before `vars` became deferrable.
+        let none = parse(
+            "//pkg:conf",
+            config(&[("src", s(":conf.j2")), ("vars", Value::Null())]),
+        )
+        .await
+        .expect("`vars = None` parses");
+        let absent = parse("//pkg:conf", config(&[("src", s(":conf.j2"))]))
+            .await
+            .expect("parse");
+        assert_eq!(none.hash, absent.hash);
+    }
+
+    #[tokio::test]
+    async fn a_shell_form_in_vars_is_a_plain_value() {
+        // Only an absolute-address `${src:…}` is heph's; `${src:0:3}` is just
+        // text a config file might legitimately contain.
+        parse(
+            "//pkg:conf",
+            config(&[
+                ("src", s(":conf.j2")),
+                ("vars", vars(&[("cut", "${src:0:3}")])),
+            ]),
+        )
+        .await
+        .expect("a bash-style expansion is not a reference");
     }
 
     #[tokio::test]
