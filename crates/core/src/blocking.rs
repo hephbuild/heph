@@ -263,25 +263,38 @@ mod tests {
     }
 
     /// The whole point: a job that blocks its thread outright must not stop
-    /// the runtime from making progress. If the work ran inline on the worker
-    /// a single-worker runtime would never poll the timer, and this test
-    /// would hang.
+    /// the runtime from making progress. The job is awaited from a task, so
+    /// it would run on the runtime's only worker if `run` ran it inline; it
+    /// then blocks until the ticker has ticked. Inline, the ticker could
+    /// never be polled and the job would give up at its deadline.
+    ///
+    /// The job waits for the tick rather than sleeping a fixed time and
+    /// checking afterwards: on a loaded CI runner a worker can go unscheduled
+    /// for longer than any short sleep, which failed this test with nothing
+    /// wrong (linux/amd64, run 39156333907).
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_work_does_not_stall_the_runtime() {
         let ticks = Arc::new(AtomicUsize::new(0));
         let ticker = tokio::spawn({
             let ticks = Arc::clone(&ticks);
             async move {
-                for _ in 0..10 {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    ticks.fetch_add(1, Ordering::SeqCst);
-                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                ticks.fetch_add(1, Ordering::SeqCst);
             }
         });
 
-        run(|| thread::sleep(Duration::from_millis(120))).await;
+        let job = tokio::spawn(run({
+            let ticks = Arc::clone(&ticks);
+            move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while ticks.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                ticks.load(Ordering::SeqCst) > 0
+            }
+        }));
         assert!(
-            ticks.load(Ordering::SeqCst) > 0,
+            job.await.expect("job"),
             "the runtime must keep polling while a blocking job runs",
         );
         ticker.await.expect("ticker");
