@@ -20,3 +20,30 @@
 # this only changes the Linux builds. It costs one register and a
 # push/pop per call — the profilers stop lying in exchange.
 rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes"]
+
+# Link with ld-prime or lld on macOS, never Apple's old ld64.
+#
+# Each function's entry in a Mach-O `__unwind_info` either encodes its unwind
+# compactly or points at its FDE in `__eh_frame` — through a 24-bit offset, so
+# only the first 16 MiB are reachable. rustc emits epilogue CFI on
+# aarch64-apple-darwin, which compact unwind cannot express, so nearly every
+# function takes the `__eh_frame` route, and a debug test binary's `__eh_frame`
+# is past 16 MiB. ld64 954.16 — nix's, the last open-source release — writes
+# the offset truncated to 24 bits without a word. libunwind trusts it, parses whatever
+# lies at the wrapped offset as an FDE, and depending on the bytes there either
+# falls back to a full scan or dies with
+# `libunwind: malformed DW_CFA_def_cfa_register DWARF unwind, reg too big` and
+# a SIGSEGV — on a panic, or on every anyhow error under `RUST_BACKTRACE=1`.
+# Which binary it hits moves with layout, so it read as a flake.
+#
+# Xcode's ld-prime (ld-1000 and later) and lld both mark an entry they cannot
+# address as "no hint", and libunwind scans the section for it.
+# `-fuse-ld=heph` runs `ld64.heph` from the devenv shell, which picks ld-prime
+# when Xcode or the Command Line Tools provide it — it links in about half
+# lld's time — and nix's lld otherwise. `tests/darwin_linker.rs` fails if a
+# darwin test binary is linked by ld64.
+#
+# `target.<triple>.rustflags` replaces `build.rustflags` rather than adding to
+# it, so the flags above are repeated.
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes", "-Clink-arg=-fuse-ld=heph"]
