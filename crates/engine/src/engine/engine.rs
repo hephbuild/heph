@@ -198,6 +198,10 @@ pub struct Engine {
     /// memory and never touch the SQLite WAL; entries over the per-entry cap
     /// spill to `local_cache`. See [`LocalCacheTmp`].
     pub(crate) local_cache_tmp: Arc<dyn LocalCache>,
+    /// The brake on the durable sqlite tier's writer thread, for
+    /// [`hold_local_cache_writes`](Self::hold_local_cache_writes).
+    #[cfg(any(test, feature = "test-support"))]
+    sqlite_writer_gate: Arc<crate::engine::local_cache_sqlite::WriterGate>,
     /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
     /// tree-walking plugins via [`PluginInit`].
     pub(crate) walker: Arc<hwalk::CachedWalker>,
@@ -421,6 +425,40 @@ impl Drop for Engine {
     }
 }
 
+/// Test-only: holds this engine's durable cache writes in its write-behind
+/// queue until dropped. See [`Engine::hold_local_cache_writes`].
+#[cfg(any(test, feature = "test-support"))]
+#[must_use = "the writes are released as soon as the hold is dropped"]
+#[derive(Debug)]
+pub struct LocalCacheWriteHold(Arc<crate::engine::local_cache_sqlite::WriterGate>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for LocalCacheWriteHold {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Engine {
+    /// Stop this engine's sqlite writer thread from committing until the
+    /// returned hold drops: every sqlite write is queued, none lands. Two
+    /// exceptions: a blob over the spill threshold lands at once through the
+    /// filesystem tier, and a `delete` parks its calling thread until release —
+    /// so a test must not await GC or spill work under a hold. One hold at a
+    /// time: dropping any hold releases the writer.
+    ///
+    /// The window a slow writer thread opens by chance, held open on purpose,
+    /// so a test can show what another engine over the same home sees while
+    /// this one's writes are still in flight. Released on drop — including on
+    /// an unwinding panic, so a failed assertion does not leave the writer
+    /// parked and the test hung.
+    pub fn hold_local_cache_writes(&self) -> LocalCacheWriteHold {
+        self.sqlite_writer_gate.close();
+        LocalCacheWriteHold(Arc::clone(&self.sqlite_writer_gate))
+    }
+}
+
 impl Drop for EngineFuse {
     fn drop(&mut self) {
         // Drop the mount on a worker thread with a bounded wait. The
@@ -582,11 +620,14 @@ impl Engine {
                 .unwrap_or(1)
         });
 
-        let sqlite: Arc<dyn LocalCache> = Arc::new(LocalCacheSQLite::with_pipe_limit(
+        let sqlite = LocalCacheSQLite::with_pipe_limit(
             home.join("cache").join("cache.db"),
             cfg.mem_cache.per_entry_bytes,
             2 * parallelism,
-        )?);
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        let sqlite_writer_gate = sqlite.writer_gate();
+        let sqlite: Arc<dyn LocalCache> = Arc::new(sqlite);
         // Durable tier: manifests + small/medium blobs in sqlite, large blobs
         // spilled to plain files. The mem tier (below) fronts both.
         let blobs = Arc::new(crate::engine::local_cache_fs::LocalCacheFS::new(
@@ -669,6 +710,8 @@ impl Engine {
             runtime: runtime.clone(),
             local_cache,
             local_cache_tmp,
+            #[cfg(any(test, feature = "test-support"))]
+            sqlite_writer_gate,
             walker,
             providers: vec![],
             providers_by_name: HashMap::new(),
