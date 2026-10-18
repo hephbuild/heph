@@ -68,10 +68,12 @@ async fn push_blob(
 ) -> anyhow::Result<()> {
     let body = blob_body(blob)?;
     if body.is_empty() {
-        // A monolithic PUT refuses an empty body (`PushNoDataError`). An empty
-        // stream is the same POST and the closing PUT, with no PATCH between.
+        // `push_blob` refuses an empty body (`PushNoDataError`). An empty stream
+        // with a declared size of 0 is the same POST and the closing PUT, with
+        // `Content-Length: 0` and nothing in between. The size is mandatory
+        // since oci-client 0.18: with `use_monolithic_push` it is the header.
         client
-            .push_blob_stream(reference, futures::stream::empty(), digest)
+            .push_blob_stream(reference, futures::stream::empty(), digest, Some(0))
             .await?;
     } else {
         client.push_blob(reference, body, digest).await?;
@@ -615,7 +617,7 @@ mod tests {
         // Past two of the old 512 KiB chunks, and not a multiple of one.
         let len: usize = 1024 * 1024 + 7;
         let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-        let digest = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("blob");
         std::fs::write(&path, &data).expect("write");
@@ -672,7 +674,7 @@ mod tests {
         let (port, seen) = artifact_registry_mock();
         let client = client(true);
         let reference: Reference = format!("127.0.0.1:{port}/p/r/img:t").parse().expect("ref");
-        let digest = format!("sha256:{:x}", sha2::Sha256::digest(b""));
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"")));
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("empty");
         std::fs::write(&path, b"").expect("write");
