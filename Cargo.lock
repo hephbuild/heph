@@ -1623,6 +1623,7 @@ dependencies = [
  "sha2 0.11.0",
  "similar",
  "smart-default",
+ "sqlite",
  "stacker",
  "tar",
  "telemetry",
@@ -5765,6 +5766,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlite"
+version = "0.1.0"
+dependencies = [
+ "r2d2",
+ "scheduled-thread-pool",
+]
+
+[[package]]
 name = "sqlite-wasm-rs"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6822,6 +6831,7 @@ dependencies = [
  "r2d2_sqlite",
  "rusqlite",
  "rustc-hash",
+ "sqlite",
  "tempfile",
  "tracing",
  "wax",

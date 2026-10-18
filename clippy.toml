@@ -3,3 +3,7 @@ allow-panic-in-tests = true
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-dbg-in-tests = true
+
+disallowed-methods = [
+    { path = "r2d2::Pool::builder", reason = "use `hsqlite::pool_builder()`: the default helper threads outlive a dropped pool by up to 30s" },
+]
