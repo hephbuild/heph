@@ -5068,6 +5068,7 @@ dependencies = [
  "serde_yaml",
  "tar",
  "tempfile",
+ "template",
  "tokio",
  "tracing",
  "tracing-subscriber",
