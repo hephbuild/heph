@@ -93,7 +93,13 @@ impl TtyReader {
             },
         };
         let restore = restore_flags_of(&source);
-        AsyncFd::with_interest(source, Interest::READABLE)
+        // SAFETY: `Owned` holds the descriptor, so it is open until the
+        // `AsyncFd` drops it. `Borrowed` is the caller's descriptor — stdin in
+        // production, which the process never closes, and a pty slave or pipe
+        // end the test holds for the reader's lifetime in the tests. Either way
+        // `as_raw_fd` returns that same descriptor every time.
+        unsafe { AsyncFd::register_with_interest(source, Interest::READABLE) }
+            .map_err(io::Error::from)
             .inspect_err(|_| restore())
             .map(|inner| Self { inner })
     }

@@ -104,9 +104,11 @@ impl AsyncPty {
     /// fd's access mode.
     pub fn with_interest(fd: OwnedFd, interest: Interest) -> io::Result<Self> {
         set_nonblocking(fd.as_raw_fd())?;
-        Ok(Self {
-            inner: AsyncFd::with_interest(fd, interest)?,
-        })
+        // SAFETY: `fd` is an `OwnedFd`, so it is open, it stays open for as
+        // long as the `AsyncFd` owns it (the `AsyncFd` is what closes it), and
+        // `as_raw_fd` returns the same descriptor every time.
+        let inner = unsafe { AsyncFd::register_with_interest(fd, interest) }?;
+        Ok(Self { inner })
     }
 }
 
