@@ -354,16 +354,18 @@ enum WriterCmd {
 /// `Existence::Queued`, a superseded write and a queued delete all live in the
 /// window between enqueue and commit, which the writer thread closes in
 /// microseconds — racing it produces flaky tests that mostly assert nothing. The
-/// whole type and its call site are `#[cfg(test)]`, so production keeps the
-/// unbraked loop.
-#[cfg(test)]
-#[derive(Default)]
-struct WriterGate {
+/// whole type and its call site are test-only (`cfg(test)` or the
+/// `test-support` feature, which `crates/e2e` reaches it through
+/// [`Engine::hold_local_cache_writes`](crate::engine::Engine::hold_local_cache_writes)),
+/// so production keeps the unbraked loop.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub(crate) struct WriterGate {
     closed: Mutex<bool>,
     cond: Condvar,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl WriterGate {
     /// Called by the writer thread before it drains each batch.
     fn wait_while_closed(&self) {
@@ -373,11 +375,11 @@ impl WriterGate {
         }
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         *self.closed.lock().expect("writer gate poisoned") = true;
     }
 
-    fn open(&self) {
+    pub(crate) fn open(&self) {
         *self.closed.lock().expect("writer gate poisoned") = false;
         self.cond.notify_all();
     }
@@ -390,7 +392,7 @@ pub struct LocalCacheSQLite {
     pending: Arc<PendingTracker>,
     pipe_sem: Arc<PipeSemaphore>,
     inline_threshold: usize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     gate: Arc<WriterGate>,
 }
 
@@ -486,9 +488,9 @@ impl LocalCacheSQLite {
         let pending = Arc::new(PendingTracker::default());
         let (writer_tx, writer_rx) = mpsc::channel::<WriterCmd>();
         let pending_bg = pending.clone();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let gate = Arc::new(WriterGate::default());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let gate_bg = gate.clone();
         let writer_handle = std::thread::Builder::new()
             .name("heph-sqlite-writer".to_string())
@@ -497,7 +499,7 @@ impl LocalCacheSQLite {
                     &mut write_conn,
                     &writer_rx,
                     &pending_bg,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     &gate_bg,
                 )
             })
@@ -510,9 +512,15 @@ impl LocalCacheSQLite {
             pending,
             pipe_sem: PipeSemaphore::new(pipe_limit),
             inline_threshold,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             gate,
         })
+    }
+
+    /// The brake on this cache's writer thread. See [`WriterGate`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn writer_gate(&self) -> Arc<WriterGate> {
+        Arc::clone(&self.gate)
     }
 
     fn key(addr: &Addr) -> String {
@@ -632,7 +640,7 @@ fn writer_loop(
     conn: &mut Connection,
     rx: &mpsc::Receiver<WriterCmd>,
     pending: &PendingTracker,
-    #[cfg(test)] gate: &WriterGate,
+    #[cfg(any(test, feature = "test-support"))] gate: &WriterGate,
 ) {
     let _drain = DrainOnExit(pending);
     loop {
@@ -641,7 +649,7 @@ fn writer_loop(
             Err(_) => return,
         };
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         gate.wait_while_closed();
 
         let mut batch = collect_batch(first, rx);

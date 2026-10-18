@@ -5,6 +5,8 @@
 pub mod engine;
 pub use engine::Engine;
 pub use engine::EngineFuse;
+#[cfg(any(test, feature = "test-support"))]
+pub use engine::LocalCacheWriteHold;
 pub use engine::{PluginDriver, PluginFactory, PluginInfo, PluginInit, PluginParts};
 pub mod config;
 pub use config::Config;

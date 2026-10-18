@@ -765,6 +765,44 @@ impl Engine {
             .commit()
             .with_context(|| format!("commit manifest for {addr}"))?;
 
+        // Durable before returning. `commit` only *queues* onto the sqlite
+        // writer thread, and the caller holds this revision's write lock — which
+        // it releases (or downgrades to a riding read) right after. The
+        // in-process reader covers a queued write through the backend's pending
+        // map, but another `heph` cannot see that map: once the lock is gone it
+        // reads the committed state, i.e. the revision as it was *before* this
+        // write. For a `--force` rebuild of a non-reproducible target that is a
+        // silent wrong build — its `GuardSlot` revalidation passes against the
+        // old manifest, then the new blobs land under the read lock it believes
+        // protects the old ones. A miss is no better: a second process probes,
+        // finds nothing, and rebuilds over a revision this one already handed
+        // out. So the lock must not outlive the write's invisibility, the same
+        // rule `LocalCache::delete` keeps by parking until its batch commits.
+        //
+        // The manifest is the last write this call queued, and the writer thread
+        // drains its queue in order, so once it is *processed* every blob write
+        // ahead of it has been too. Processed, not committed: the writer
+        // completes a failed batch's slots as well (see `writer_loop`), and a
+        // manifest from an older revision under the same key also answers
+        // "present" here. A write error can therefore still leave a mixed
+        // revision; that is a known gap, not something this wait closes. A `tmp`
+        // revision is never read back across processes, so it does not wait.
+        //
+        // Exemption: if this future is dropped mid-wait (cancellation), the
+        // caller's write lock goes with it while the manifest is still queued,
+        // and it lands later when the cache flushes on drop. The window is the
+        // shutdown of a cancelled build.
+        if !tmp
+            && !self
+                .exists_local(addr, &key, MANIFEST_V1)
+                .await
+                .with_context(|| format!("waiting for the cache write of {addr} to commit"))?
+        {
+            // The writer thread dropped the batch (it logs why). Nothing reads
+            // a revision with no manifest, so a later probe misses and rebuilds.
+            tracing::warn!(%addr, hashin, "cache write did not land; the revision is not cached");
+        }
+
         // Remote push happens on a background task driven from the execute path
         // (see `Engine::spawn_remote_upload`), not here — it must not block the
         // build's critical path on the network.
@@ -1772,6 +1810,52 @@ mod tests {
             .await
             .expect("releasing the slots must let the write through")
             .expect("cache_locally");
+    }
+
+    /// A durable write returns only once its revision is committed. The caller
+    /// releases the revision's write lock right after, and another `heph`
+    /// cannot see this process's write-behind queue — so returning while the
+    /// manifest is still queued hands that process the revision as it was
+    /// before this write. `crates/e2e`'s
+    /// `a_revision_rebuilt_differently_while_unused_is_not_served` is the wrong
+    /// build that follows.
+    #[tokio::test]
+    async fn a_durable_write_returns_only_once_committed() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let hold = engine.hold_local_cache_writes();
+        let write = engine.cache_locally(
+            &ctoken,
+            &addr,
+            "HASHIN_DURABLE",
+            vec![raw_artifact("out", b"payload")],
+            false,
+        );
+        tokio::pin!(write);
+        if let Ok(returned) =
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut write).await
+        {
+            panic!(
+                "cache_locally returned with its manifest still in the write-behind queue: \
+                 {:?}",
+                returned.map(|written| written.len())
+            );
+        }
+
+        drop(hold);
+        tokio::time::timeout(std::time::Duration::from_secs(30), write)
+            .await
+            .expect("releasing the writer must let the write finish")
+            .expect("cache_locally");
+        assert!(
+            engine
+                .local_cache
+                .exists_committed(&addr, "HASHIN_DURABLE", MANIFEST_V1)
+                .expect("exists_committed"),
+            "the manifest is committed by the time cache_locally returns",
+        );
     }
 
     /// Two artifacts that map to the same cache entry name must be rejected up

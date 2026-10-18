@@ -429,17 +429,38 @@ async fn a_revision_rebuilt_differently_while_unused_is_not_served() -> anyhow::
         force: true,
         ..ResultOptions::default()
     };
-    let rebuilt = resolve_all(&other, &other.new_state(), &addr, &forced).await?;
+    // The sqlite cache commits through a write-behind queue. Hold `other`'s
+    // writes there: the window a slow writer thread used to open by chance
+    // (once in CI, on linux/amd64), held open on purpose. A forced build that
+    // returned now would have released its lock on a revision no other engine
+    // can see yet, and `resident` would revalidate against the old manifest.
+    let hold = other.hold_local_cache_writes();
+    let mut build = tokio::spawn({
+        let (other, addr) = (std::sync::Arc::clone(&other), addr.clone());
+        async move { resolve_all(&other, &other.new_state(), &addr, &forced).await }
+    });
+    if let Ok(joined) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut build).await
+    {
+        panic!(
+            "the forced build returned, and released its lock, before its revision was \
+             committed: {:?}",
+            joined.map(|r| r.map(|e| common::artifact_paths(&e)))
+        );
+    }
+    drop(hold);
+    let rebuilt = build.await??;
+    let rebuilt_bytes = common::artifact_string(&rebuilt);
     assert_ne!(
-        common::artifact_string(&rebuilt),
-        first_bytes,
+        rebuilt_bytes, first_bytes,
         "the target must not be reproducible for this test to mean anything"
     );
     drop(rebuilt);
 
     let err = match resolve_all(&resident, &rs, &addr, &opts).await {
         Ok(r) => panic!(
-            "served the other build's bytes under this request's hashout: {:?}",
+            "served {:?} under this request's hashout (first build {first_bytes:?}, \
+             rebuild {rebuilt_bytes:?})",
             common::artifact_string(&r)
         ),
         Err(e) => e,
