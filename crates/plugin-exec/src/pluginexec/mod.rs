@@ -229,7 +229,7 @@ fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
         .context("compile init.sh template")?;
     env.get_template("init.sh")
         .context("load init.sh template")?
-        .render(minijinja::context! { cmds, lines })
+        .render(minijinja::context! { cmds, lines => minijinja::value::Serde(lines) })
         .context("render init.sh template")
 }
 
