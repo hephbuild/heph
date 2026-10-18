@@ -29,6 +29,9 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 # `serde`: minijinja 3 converts only `Into<Value>` by default; `InitLine`
 # reaches the template through the `Serde` wrapper.
 minijinja = { version = "3", features = ["serde"] }
+# `TEMPLATE_FORMAT_VERSION`: the `tmpl` applet on every exec target's PATH
+# renders through it, so it is part of the toolbox's identity in the def hash.
+htemplate = { package = "template", path = "../template" }
 tracing = "0.1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "net"] }

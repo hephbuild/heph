@@ -158,7 +158,10 @@ depending on) or a hardlink (which breaks across filesystems and goes stale).
 ## The cache key
 
 `COREUTILS_VERSION` in `crates/coreutils` is the toolbox's identity, and every
-`exec`/`bash` target folds it into its def hash when the toolbox is on.
+`exec`/`bash` target folds it into its def hash when the toolbox is on. `tmpl`
+renders through `crates/template`, so its output moves with
+`TEMPLATE_FORMAT_VERSION` as well; the exec driver folds that in beside it, and
+the template crate's pin test goes red when the renderer changes.
 
 The utilities are on a target's `PATH` without being declared, and nothing can
 tell which of them a shell command will invoke without parsing it — so the whole

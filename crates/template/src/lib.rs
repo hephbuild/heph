@@ -22,7 +22,13 @@ use std::collections::BTreeMap;
 ///
 /// Consumers fold this into their cache key: the rendered bytes are a function
 /// of the renderer as well as of the template, so a renderer that moved without
-/// moving the key would keep serving the old rendering forever.
+/// moving the key would keep serving the old rendering forever. Two of them:
+/// the `template` driver's def hash, and, because the `tmpl` applet renders
+/// through here and sits on every exec target's `PATH`, every exec target's def
+/// hash while the builtin toolbox is on (`crates/plugin-exec`).
+///
+/// `derived_values_render_as_pinned` below goes red when the renderer moves,
+/// so the bump cannot be forgotten.
 pub const TEMPLATE_FORMAT_VERSION: u32 = 3;
 
 /// Render `template` with `vars`.
@@ -106,6 +112,28 @@ mod tests {
         // These render files. A config file that lost its final newline is
         // wrong, and every diff against it is noisy.
         assert_eq!(render("a\n", &vars(&[])).expect("render"), "a\n");
+    }
+
+    /// What the renderer prints for values a template derives itself, pinned.
+    /// Every var is a string, but an expression can produce a bool, `none`, a
+    /// sequence or a number, and minijinja has changed the spelling of each of
+    /// those across releases. If one of these moves, the renderer moved: bump
+    /// `TEMPLATE_FORMAT_VERSION` in the same change.
+    #[test]
+    fn derived_values_render_as_pinned() {
+        let v = vars(&[("x", "a"), ("csv", "a,b")]);
+        let r = |t: &str| render(t, &v).expect("render");
+        assert_eq!(
+            r("{{ x == 'a' }} {{ x == 'b' }} {{ none }}"),
+            "True False None"
+        );
+        assert_eq!(r("{{ csv | split(',') }}"), "['a', 'b']");
+        assert_eq!(
+            r("{{ 7 // 2 }} {{ 7 % 2 }} {{ 2.5 | round }} {{ -2 ** 2 }}"),
+            "3 1 2.0 4"
+        );
+        // Case-insensitive since 3.0.1; a byte comparison would say `B`.
+        assert_eq!(r("{{ ['B', 'a'] | min }}"), "a");
     }
 
     #[test]
