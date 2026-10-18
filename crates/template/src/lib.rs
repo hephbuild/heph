@@ -36,7 +36,11 @@ pub fn render(template: &str, vars: &BTreeMap<String, String>) -> anyhow::Result
     // minijinja drops a template's final newline by default. These render
     // *files*, and a config file that has lost its trailing newline is wrong —
     // POSIX text files end with one, and diffs against them get noisy.
-    env.set_keep_trailing_newline(true);
+    let syntax = minijinja::syntax::SyntaxConfig::builder()
+        .keep_trailing_newline(true)
+        .build()
+        .context("configure template syntax")?;
+    env.set_syntax(syntax);
     env.add_template("template", template)
         .context("compile template")?;
     let tmpl = env.get_template("template").context("load template")?;
@@ -60,8 +64,9 @@ pub fn render(template: &str, vars: &BTreeMap<String, String>) -> anyhow::Result
         );
     }
 
-    tmpl.render(minijinja::Value::from_serialize(vars))
-        .context("render template")
+    // Every var is a string, so the context is a plain map of them; no serde.
+    let ctx = minijinja::Value::from_pairs(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    tmpl.render(ctx).context("render template")
 }
 
 /// The variables `tmpl` references that `vars` does not supply.
