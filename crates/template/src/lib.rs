@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 /// Consumers fold this into their cache key: the rendered bytes are a function
 /// of the renderer as well as of the template, so a renderer that moved without
 /// moving the key would keep serving the old rendering forever.
-pub const TEMPLATE_FORMAT_VERSION: u32 = 2;
+pub const TEMPLATE_FORMAT_VERSION: u32 = 3;
 
 /// Render `template` with `vars`.
 ///
