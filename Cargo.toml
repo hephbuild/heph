@@ -184,7 +184,7 @@ erased-serde = "0.4"
 crossbeam-channel = "0.5"
 quick_cache = "0.7"
 indexmap = "2"
-posthog-rs = "0.21.0"
+posthog-rs = "0.27.0"
 mimalloc = { version = "0.1", default-features = false }
 uuid = { version = "1.23.3", features = ["v4"] }
 object_store = { version = "0.14.1", features = ["aws", "gcp", "azure", "http", "tokio"] }
