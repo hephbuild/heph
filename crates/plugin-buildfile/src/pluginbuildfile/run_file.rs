@@ -2628,7 +2628,7 @@ target(
         }
 
         if let Some(htvalue::Value::Float(f)) = target.config.get("config_float") {
-            assert_eq!(*f, 1.5);
+            assert_eq!(f.to_bits(), 1.5_f64.to_bits());
         } else {
             panic!(
                 "Expected float for config_float, got {:?}",

@@ -455,10 +455,7 @@ pub fn downcast_chain_ref<T: std::error::Error + Send + Sync + 'static>(
         if let Some(t) = cur.downcast_ref::<T>() {
             return Some(t);
         }
-        match cur.downcast_ref::<SharedAnyhow>() {
-            Some(shared) => cur = &shared.0,
-            None => return None,
-        }
+        cur = &cur.downcast_ref::<SharedAnyhow>()?.0;
     }
 }
 
