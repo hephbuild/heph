@@ -150,6 +150,14 @@ in
   ] ++ lib.optionals pkgs.stdenv.isDarwin [
     pkgs.samply
     pkgs.macfuse-stubs
+    # The darwin linker, `-fuse-ld=heph` (`.cargo/config.toml` explains why
+    # ld64 is not used). Xcode's ld-prime when the machine has one, since it
+    # links in half lld's time; nix's lld otherwise. ld-prime is not open
+    # source, so nix cannot pin it. `enterShell` picks which one.
+    pkgs.lld
+    (pkgs.writeShellScriptBin "ld64.heph" ''
+      exec "''${HEPH_DARWIN_LD:-ld64.lld}" "$@"
+    '')
   ] ++ lib.optionals pkgs.stdenv.isLinux [
     pkgs.fuse3
   ];
@@ -734,7 +742,17 @@ in
   # passing. It also left `target-verify/` behind as a workaround for the same
   # poisoning. Scripts locate the target dir with `target-dir` instead, which
   # asks cargo rather than assuming.
-  enterShell = "";
+  # `ld64.heph` (above) execs `$HEPH_DARWIN_LD`. Resolving ld-prime costs
+  # an `xcrun` and an `ld -v`, about 40ms — a tenth of a debug link — so it is
+  # done once per shell, not once per link.
+  enterShell = lib.optionalString pkgs.stdenv.isDarwin ''
+    export HEPH_DARWIN_LD=ld64.lld
+    _heph_ld=$(env -u DEVELOPER_DIR /usr/bin/xcrun --find ld 2>/dev/null) || _heph_ld=
+    # `PROJECT:ld-1230.1` is ld-prime; ld64 prints `PROJECT:ld64-954.16`.
+    _heph_v=$([ -n "$_heph_ld" ] && "$_heph_ld" -v 2>&1 | sed -n 's/.*PROJECT:ld-\([0-9]*\).*/\1/p')
+    if [ "$_heph_v" -ge 1000 ] 2>/dev/null; then export HEPH_DARWIN_LD=$_heph_ld; fi
+    unset _heph_ld _heph_v
+  '';
 
   # https://devenv.sh/tests/
   enterTest = ''

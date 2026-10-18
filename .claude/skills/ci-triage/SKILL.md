@@ -60,6 +60,7 @@ which reads as a pass.
    - `unrecognized subcommand` from `documented_examples_are_accepted`, red on all three `Test` jobs: a clap doc comment has a line starting with `heph `. See `src/commands/gendocs.rs`.
    - `Diff in <file>` in Lint: rustfmt. The branch was pushed without a passing `lint`.
    - Lint red in CI but green locally after a `devenv.nix` edit: the local shell's `lint` is stale. Start a new `devenv shell`.
+   - `libunwind: malformed DW_CFA_def_cfa_register DWARF unwind, reg too big` and a test binary dying with SIGSEGV on `Test darwin/arm64`, the same binary on every rerun: a binary linked by the old ld64, which truncates unwind offsets past 16 MiB of `__eh_frame`. `tests/darwin_linker.rs` should be red too. See the linker note in `.cargo/config.toml`. A rerun never fixes it.
    - An unrelated test breaking after a dependency was added: check `git diff master -- Cargo.lock | grep -c '^-version'`. A re-resolved lockfile moves existing pins.
 4. **Anything else is REAL.** Report the test, the first error line and its `file:line`, then stop.
 
