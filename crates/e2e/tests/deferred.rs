@@ -293,6 +293,64 @@ async fn a_src_reference_in_a_credential_is_refused() -> anyhow::Result<()> {
 // The edge, and the two hashes
 // ---------------------------------------------------------------------------
 
+/// A `template` var takes a reference, and the template sees the producer's
+/// bytes — beside a literal var, in one rendered file.
+#[tokio::test]
+async fn a_reference_in_template_vars_renders_the_producers_bytes() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("infra/registry", "registry.example.com\n");
+    ws.write_build_file("infra", &producer("registry", "registry"));
+    ws.write_file("app/deploy.yaml.j2", "image: {{ registry }}/{{ name }}\n");
+    ws.write_build_file(
+        "app",
+        r#"target(name = "deploy", driver = "template", src = file("deploy.yaml.j2"),
+       out = "deploy.yaml",
+       vars = {"registry": "${read://infra:registry-value}", "name": "web"})"#,
+    );
+    assert_eq!(
+        common::artifact_string(&*ws.run("//app:deploy").await?),
+        "image: registry.example.com/web\n"
+    );
+    Ok(())
+}
+
+/// The rendered file follows the value, and the def does not: the def holds the
+/// reference, the input hash holds what the producer made of its inputs.
+#[tokio::test]
+async fn a_template_re_renders_when_the_value_moves() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("infra/registry", "reg-a\n");
+    ws.write_build_file("infra", &producer("registry", "registry"));
+    ws.write_file("app/conf.j2", "{{ registry }}\n");
+    ws.write_build_file(
+        "app",
+        r#"target(name = "conf", driver = "template", src = file("conf.j2"),
+       vars = {"registry": "${read://infra:registry-value}"})"#,
+    );
+    let before_def = def_hash(&ws.engine, "//app:conf").await?;
+    let before = hashin(&ws.engine, "//app:conf").await?;
+    assert_eq!(
+        common::artifact_string(&*ws.run("//app:conf").await?),
+        "reg-a\n"
+    );
+
+    ws.write_file("infra/registry", "reg-b\n");
+    let engine = ws.reopen()?;
+    assert_eq!(def_hash(&engine, "//app:conf").await?, before_def);
+    assert_ne!(hashin(&engine, "//app:conf").await?, before);
+    let addr = heph::htaddr::parse_addr("//app:conf")?;
+    let res = Arc::clone(&engine)
+        .result_addr(
+            engine.new_state(),
+            &addr,
+            heph::engine::OutputMatcher::All,
+            &Default::default(),
+        )
+        .await?;
+    assert_eq!(common::artifact_string(&res), "reg-b\n");
+    Ok(())
+}
+
 /// The edge is `(hashed, not staged)`.
 ///
 /// `runtime: true` would do two unwanted things: merge the *producer's*
