@@ -21,4 +21,4 @@ hex = "0.4"
 # a terminal, and its output is escape sequences — asserting on cells of a
 # parsed screen is the only way to test it that isn't asserting on raw bytes.
 portable-pty = "0.9"
-vt100 = "0.16"
+vt100 = "0.17"
