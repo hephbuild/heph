@@ -35,11 +35,11 @@ use std::path::{Path, PathBuf};
 ///
 /// Bump it on any observable behaviour change — an applet added or removed, an
 /// upstream upgrade that changes output, a fix to one of the hand-written parts.
-pub const COREUTILS_VERSION: u32 = 5;
+pub const COREUTILS_VERSION: u32 = 6;
 
 /// Where the applets come from, for `heph tool coreutils list`.
 pub const UPSTREAM: &str =
-    "uutils/coreutils 0.10, uutils/findutils 0.10, ripgrep's grep-* crates, tar/flate2/zstd";
+    "uutils/coreutils 0.12, uutils/findutils 0.10, ripgrep's grep-* crates, tar/flate2/zstd";
 
 /// One utility, and the entry point that runs it.
 #[derive(Debug)]
