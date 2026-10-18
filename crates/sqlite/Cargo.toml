@@ -1,0 +1,11 @@
+[package]
+name = "sqlite"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+r2d2 = "0.8"
+scheduled-thread-pool = "0.2.7"

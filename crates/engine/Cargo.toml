@@ -17,6 +17,7 @@ hfetch = { package = "fetch", path = "../fetch" }
 hconfig = { package = "config", path = "../config" }
 hmodel = { package = "model", path = "../model" }
 hwalk = { package = "walk", path = "../walk" }
+hsqlite = { package = "sqlite", path = "../sqlite" }
 hproc = { package = "proc", path = "../proc" }
 hexecrunner = { package = "execrunner", path = "../execrunner" }
 hlock = { package = "lock", path = "../lock" }

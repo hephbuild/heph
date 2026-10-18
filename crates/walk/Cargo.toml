@@ -15,6 +15,7 @@ borsh = { version = "1.6.1", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.35"
+hsqlite = { package = "sqlite", path = "../sqlite" }
 parking_lot = "0.12"
 rustc-hash = "2"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }

@@ -557,7 +557,7 @@ impl FsWalkStore {
                      PRAGMA mmap_size = 268435456;",
                 )
             });
-        let read_pool = r2d2::Pool::builder()
+        let read_pool = hsqlite::pool_builder()
             .max_size(16)
             .min_idle(Some(1))
             .build(manager)

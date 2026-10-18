@@ -467,7 +467,8 @@ impl LocalCacheSQLite {
                 )
             });
 
-        let read_pool = r2d2::Pool::builder()
+        // Its helper thread exits with the pool; see `hsqlite`.
+        let read_pool = hsqlite::pool_builder()
             .max_size(read_pool_size)
             .min_idle(Some(1))
             // Explicit rather than inherited: this bound is load-bearing for the
