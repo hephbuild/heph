@@ -9,7 +9,6 @@
         clippy::get_unwrap,
         clippy::assertions_on_result_states,
         clippy::unwrap_in_result,
-        clippy::float_cmp,
         clippy::assertions_on_constants,
         clippy::cloned_ref_to_slice_refs,
         unused_imports,
