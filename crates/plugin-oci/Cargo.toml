@@ -23,7 +23,7 @@ tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sy
 tracing = "0.1"
 # Registry transport: the OCI distribution protocol as a library, so `oci_push`
 # and `oci_pull` no longer shell out to skopeo. Maintained by the ORAS project.
-oci-client = "0.17"
+oci-client = "0.18"
 # `oci-client` takes credentials as a value; resolving them from
 # `~/.docker/config.json` and the `docker-credential-*` helpers is the caller's
 # job — which is what skopeo used to do for us, and what ECR/GCR/ACR need.
@@ -33,7 +33,10 @@ bytes = "1.12"
 # heap (see `registry::blob_body`).
 memmap2 = "0.9"
 tar = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
+# sha2 0.11 (digest 0.11) returns an `Array` that no longer implements
+# `LowerHex`; `hex::encode` emits the same lowercase digest.
+hex = "0.4"
 # The Docker daemon API, for `oci_load`'s `/images/load`.
 bollard = "0.21"
 
