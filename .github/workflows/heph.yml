@@ -162,7 +162,7 @@ jobs:
       repo_artifact_id: ${{ steps.upload_repo.outputs.artifact-id }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -183,7 +183,7 @@ jobs:
 
       - name: Upload repo
         id: upload_repo
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: repo
           path: |
@@ -218,9 +218,9 @@ jobs:
       sha256_darwin_arm64: ${{ steps.build.outputs.sha256_darwin_arm64 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: tools/heph-govet/go.mod
           cache-dependency-path: tools/heph-govet/go.sum
@@ -309,7 +309,7 @@ jobs:
       # picks them up and publishes them as release assets alongside the rest. The
       # `.sha256` sidecars are internal to this job and are not published.
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: heph-govet
           # Only the binaries become release assets; the `.sha256` sidecars are
@@ -356,7 +356,7 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: repo
           path: .
@@ -580,43 +580,43 @@ jobs:
       # queues behind another.
       - parallel:
           - name: Upload artifact
-            uses: actions/upload-artifact@v6
+            uses: actions/upload-artifact@v7
             with:
               name: ${{steps.build.outputs.bin_name}}
               path: ${{steps.build.outputs.bin_name}}
 
           - name: Upload debug flavour artifact
-            uses: actions/upload-artifact@v6
+            uses: actions/upload-artifact@v7
             with:
               name: ${{steps.build.outputs.debug_bin_name}}
               path: ${{steps.build.outputs.debug_bin_name}}
 
           - name: Upload heph-bench artifact
-            uses: actions/upload-artifact@v6
+            uses: actions/upload-artifact@v7
             with:
               name: ${{steps.build.outputs.bench_bin_name}}
               path: ${{steps.build.outputs.bench_bin_name}}
 
           - name: Upload go plugin artifact
-            uses: actions/upload-artifact@v6
+            uses: actions/upload-artifact@v7
             with:
               name: ${{steps.build.outputs.plugin_go_name}}
               path: ${{steps.build.outputs.plugin_go_name}}
 
           - name: Upload gha plugin artifact
-            uses: actions/upload-artifact@v6
+            uses: actions/upload-artifact@v7
             with:
               name: ${{steps.build.outputs.plugin_gha_name}}
               path: ${{steps.build.outputs.plugin_gha_name}}
 
           - name: Upload oci plugin artifact
-            uses: actions/upload-artifact@v6
+            uses: actions/upload-artifact@v7
             with:
               name: ${{steps.build.outputs.plugin_oci_name}}
               path: ${{steps.build.outputs.plugin_oci_name}}
 
           - name: Upload devenv plugin artifact
-            uses: actions/upload-artifact@v6
+            uses: actions/upload-artifact@v7
             with:
               name: ${{steps.build.outputs.plugin_devenv_name}}
               path: ${{steps.build.outputs.plugin_devenv_name}}
@@ -666,8 +666,8 @@ jobs:
       # Checkout brings tools/pluginmanifest (the manifest generator); the built
       # artifacts download into dist/ alongside it.
       - name: Checkout
-        uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+        uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25"
           # pluginmanifest has no external deps (no go.sum) — nothing to cache,
@@ -675,7 +675,7 @@ jobs:
           cache: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           # Matches every published artifact — both CLI flavours
           # (`heph_<os>_<arch>` std, `heph_debug_<os>_<arch>` debug),
@@ -754,7 +754,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # Full history so merge-base with the PR base resolves.
           fetch-depth: 0
@@ -847,7 +847,7 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: repo
           path: .
@@ -958,7 +958,7 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: repo
           path: .
@@ -1072,7 +1072,7 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: repo
           path: .
@@ -1165,7 +1165,7 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: repo
           path: .
@@ -1177,7 +1177,7 @@ jobs:
       # `heph-*-plugin_<os>_<arch>.{so,dylib}` cdylibs. `heph-govet` carries no os/arch
       # suffix, so the pattern leaves it out.
       - name: Download artifacts under test
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: heph*_${{ matrix.os }}_${{ matrix.arch }}*
           path: dist
@@ -1296,7 +1296,7 @@ jobs:
           make_latest: true
 
       - name: Trigger Deploy on hephbuild.github.io
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
           script: |
@@ -1369,7 +1369,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Delete Repo Artifact
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             github.rest.actions.deleteArtifact({
