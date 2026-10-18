@@ -137,25 +137,111 @@ cache key by construction.
 
 ## The environment a target actually gets
 
+Every spawn starts from `env_clear`: nothing of heph's own environment reaches a
+target unless something below names it. The `exec`/`bash` driver then builds
+the target's environment in this order — **a later row replaces an earlier one**
+(`crates/plugin-exec`, `run_inner`):
+
 ```text
-env_clear  +  the runner's environment  +  the target's own
+  ┌───┬──────────────────────────┬──────────────────────────────┬─────────┐
+  │ # │ source                   │ sets                         │ hashed? │
+  ├───┼──────────────────────────┼──────────────────────────────┼─────────┤
+  │ 1 │ shell mode only          │ TERM, from heph's own env    │   no    │
+  │ 2 │ driver `path:` option    │ PATH   (local spawn only)    │   no    │
+  │ 3 │ heph                     │ WORKSPACE_ROOT               │   —     │
+  │ 4 │ target `env`             │ anything                     │   yes   │
+  │ 5 │ heph                     │ OUT  OUT_*  SRC_*  LIST_*    │   —     │
+  │   │                          │ TOOL  TOOL_*   (appended to) │         │
+  │ 6 │ `pass_env`               │ host value, read at parse    │   yes   │
+  │   │   + producers' hashed `transitive` env                  │         │
+  │ 7 │ `runtime_pass_env`       │ host value, read at spawn    │   no    │
+  │   │   + producers' unhashed `transitive` pass-through        │         │
+  │   │   `"*"` = every host variable, over all of the above     │         │
+  │ 8 │ `runtime_env`            │ literal                      │   no    │
+  │   │   + producers' unhashed `transitive` values              │         │
+  │ 9 │ scratch declarations     │ its `env` → the slot dir     │   no    │
+  │10 │ credentials              │ the presented variables      │   no    │
+  └───┴──────────────────────────┴──────────────────────────────┴─────────┘
+     rows 9 and 10 never replace: a key set above with a different
+     value is an ERROR naming both, not a silent winner
 ```
 
-For `wrap` the runner's half is the `env` map in its config; for `session` it is
-the agent's `environ`. The target's half — its `env`, its `pass_env`, its deps
-and tools — goes on top, so a target that declares something gets what it
-declared even when the environment it runs in has an opinion.
+So a producer's `transitive` env (rows 6–8) outranks the consumer's own `env`
+(row 4), and `runtime_pass_env = ["*"]` outranks every row before it — including
+`PATH`, `OUT` and `SRC_*`.
 
-`PATH` is the exception, because it is a *list* and both sides legitimately
-contribute:
+That map is the **target's half**. A runner then lays it over the environment
+it runs in, and every runner follows the same rule — **the environment is the
+base, the target's half goes on top**:
 
 ```text
-PATH = the target's tools  ++  what the target declared  ++  the runner's PATH
-                                                          ++  what heph supplies
+  ┌──────────────────────────────────────────────┐
+  │ the target's half  (rows 1–10 above)         │  ◀── wins a key both set
+  ├──────────────────────────────────────────────┤
+  │ the environment's half                       │
+  │   local     nothing                          │
+  │   wrap      config `env`            (hashed) │
+  │             config `runtime_pass_env`  (not) │
+  │   session   the agent's own environ — what-  │
+  │   (devenv,    ever the launch argv put it in │
+  │    nix)                                      │
+  │   oci       the image's Config.Env           │
+  │             (target's half via docker -e)    │
+  ├──────────────────────────────────────────────┤
+  │ env_clear                                    │
+  └──────────────────────────────────────────────┘
+          PATH is not "who wins" — see below
+```
+
+A target that declares a variable gets what it declared even when the
+environment has an opinion, and so a runner can never replace a credential or
+scratch variable behind the collision check rows 9 and 10 perform.
+
+### `PATH`
+
+`PATH` is the exception everywhere, because it is a *list* and several parties
+legitimately contribute. It is never "who wins" but an order —
+**the first entry that has the binary wins**:
+
+```text
+  first ─────────────────────────────────────────────────────────────▶ last
+
+  ┌──────────────┬──────────────┬─────────────────┬───────────────┬──────────────┐
+  │ credential   │ the target's │ what the target │ the           │ heph's       │
+  │ helper shims │ tools        │ declared        │ environment's │ builtins     │
+  │              │ `tools = …`  │ `env`/`pass_env`│ PATH          │ (coreutils   │
+  │ docker-      │ sandbox/bin  │ `PATH`, or the  │               │  shim dir)   │
+  │ credential-  │              │ driver `path:`  │               │              │
+  │ heph         │              │                 │               │              │
+  └──────────────┴──────────────┴─────────────────┴───────────────┴──────────────┘
+  └──────────── prefix ─────────┘                                 └── suffix ───┘
+   leads wherever the target runs                                  fills gaps only
+```
+
+Which tiers exist depends on where the target runs:
+
+```text
+                 prefix        declared       environment              suffix
+                 (creds,tools)                                         (builtins)
+  ─────────────  ────────────  ─────────────  ───────────────────────  ──────────
+  local          ✓             ✓ + `path:`    — (no host directories)   ✓
+  wrap           ✓             ✓              config `env` PATH         ✓
+  session        ✓             ✓              the agent's PATH          ✓ (agent
+  (devenv, nix)                                                         appends it)
+  oci            ✓             ✓              the image's PATH          ✗
 ```
 
 Tools lead, so a target that declares a tool gets that one even when the
-environment ships another by the same name.
+environment ships another by the same name. The builtins trail, so they fill a
+gap the environment leaves and never shadow a binary it ships on purpose — a
+devenv that pins `sed` keeps its `sed`.
+
+Under `session` the environment's `PATH` lives in the agent, which heph never
+sees, so the builtins cannot be placed from the host. They ride to the agent
+under `HEPH_RUNNER_PATH_SUFFIX` — a control value the agent strips, like
+`HEPH_RUNNER_SOCK` — and the agent appends them after its own `PATH`. Under
+`oci` they are absent by design: they are host paths into a host-platform
+binary, and a container's filesystem is not this one.
 
 The prefix is composed onto the target's environment **before** the runner is
 asked to prepare, not after. A runner may carry that environment out of band —
@@ -176,12 +262,12 @@ composed into the environment this process spawns, and therefore deliberately
 does not reach a runner carrying the environment out of band: those are host
 paths, and a container's filesystem is not this one.
 
-What is **not** in there is the exec driver's own sandbox `PATH`
-(`/usr/local/bin:/usr/bin:/bin`, or its `path:` option). Under a runner the
-driver does not inject it at all: it is a fallback for a local spawn, and
-putting it in front of the environment would let a host-installed tool silently
-shadow the one the target asked to run beside — inside a cache key that claims
-the runner's environment.
+What is **not** in there is the host's directories. They are not injected under
+a runner — putting them in front of the environment would let a host-installed
+tool silently shadow the one the target asked to run beside, inside a cache key
+that claims the runner's environment — and, since heph ships its own utilities,
+they are not injected for a local spawn either. See `COREUTILS.md`. The driver's
+`path:` option names directories back for a workspace that needs them.
 
 ## The fingerprint, and why it exists
 

@@ -85,7 +85,9 @@ fn workspace() -> htestkit::Workspace {
                 std::sync::Arc::clone(&init.functions),
             ))
         })
-        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         .with_plugin("devenv", |_| {
             Ok(heph::engine::PluginParts::default()
                 .with_managed_driver(Box::new(plugindevenv::Driver::new())))

@@ -105,7 +105,9 @@ fn workspace_with_fake(fake: &Fake) -> htestkit::Workspace {
                 std::sync::Arc::clone(&init.functions),
             ))
         })
-        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         // `docker_build` without explicit `platforms` depends on
         // `//@heph/oci:platform`, so the probe's provider and driver have to be
         // registered for the graph to resolve at all.
@@ -492,7 +494,9 @@ async fn test_docker_build_build_failure_surfaces_the_builder_error() -> anyhow:
                 std::sync::Arc::clone(&init.functions),
             ))
         })
-        .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         .with_plugin("oci", {
             let bin = bin.to_string_lossy().into_owned();
             move |init| {
