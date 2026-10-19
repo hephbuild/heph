@@ -372,6 +372,8 @@ jobs:
         shell: devenv shell bash -- -e {0}
         env:
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
+          # diag: bypass the rustc wrapper to bisect the Linux cdylib link failure.
+          KACHE_DISABLED: "1"
           # Checksums of the heph-govet assets this same run publishes. Baked into
           # the go plugin so it verifies the binary it downloads at build time
           # (see crates/plugin-go/src/plugingo/govet.rs). All platforms are baked
