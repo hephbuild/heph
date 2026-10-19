@@ -4997,6 +4997,7 @@ dependencies = [
  "model",
  "once_cell",
  "plugin",
+ "plugin-buildfile",
  "plugin-query",
  "proc",
  "serde",

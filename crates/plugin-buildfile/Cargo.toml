@@ -6,6 +6,11 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# Exposes the transport-free LSP loop (`pluginbuildfile::lsp_run`) to the
+# editor-shaped harness in `tests/lsp.rs`. Never enabled by a binary.
+test-support = []
+
 [dependencies]
 hconfig = { package = "config", path = "../config" }
 hcore = { package = "core", path = "../core" }
@@ -46,5 +51,6 @@ tracing = "0.1"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util", "io-std", "process", "fs"] }
 
 [dev-dependencies]
+plugin-buildfile = { path = ".", features = ["test-support"] }
 serde_yaml = "0.9"
 tempfile = "3"

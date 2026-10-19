@@ -2,6 +2,9 @@ mod lsp;
 mod provider;
 mod run_file;
 
+/// The transport-free LSP loop, for the editor-shaped harness in `tests/lsp.rs`.
+#[cfg(feature = "test-support")]
+pub use lsp::run as lsp_run;
 pub use lsp::serve_stdio;
 pub use provider::{
     DEFAULT_INDENT, FormatSettings, Provider, build_file_indent_from_options,
