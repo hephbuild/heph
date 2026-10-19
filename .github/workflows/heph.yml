@@ -374,6 +374,9 @@ jobs:
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
           # diag: bypass the rustc wrapper to bisect the Linux cdylib link failure.
           KACHE_DISABLED: "1"
+          # diag: compile the C deps with clang instead of the shell's default cc.
+          CC: clang
+          CXX: clang++
           # Checksums of the heph-govet assets this same run publishes. Baked into
           # the go plugin so it verifies the binary it downloads at build time
           # (see crates/plugin-go/src/plugingo/govet.rs). All platforms are baked
@@ -533,7 +536,7 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: |
           set +e; set -x
-          which ar readelf objdump; ar --version | head -1; readelf --version | head -1; rustc -V
+          echo "CC=${CC:-unset} CXX=${CXX:-unset}"; which cc gcc clang ar readelf objdump; cc --version | head -1; ar --version | head -1; readelf --version | head -1; rustc -V
           T=target/${{ matrix.target }}/release
           rlib=$(ls $T/deps/libaws_lc_sys-*.rlib | head -1); echo "rlib=$rlib"
           a=$(ls $T/build/aws-lc-sys-*/out/libaws_lc_*_crypto.a | head -1); echo "a=$a"
@@ -544,6 +547,7 @@ jobs:
           for o in /tmp/a/*-obj.o /tmp/rlib/*-obj.o; do
             echo "===== $o"
             readelf -h "$o" | grep -E 'Class|Machine|Number of section|Section header string'
+            readelf -p .comment "$o" | grep -vE '^$|String dump' | head -3
             echo "section syms: $(readelf -s "$o" | awk '$4=="SECTION"' | wc -l)  und section syms: $(readelf -s "$o" | awk '$4=="SECTION" && $7=="UND"' | wc -l)  total syms: $(readelf -s "$o" | grep -cE '^ +[0-9]+:')"
             readelf -s "$o" | awk '$4=="SECTION"' | head -4
             readelf -S "$o" | grep -E '\.bss|\.rodata' | head -4
