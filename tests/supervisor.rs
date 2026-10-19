@@ -452,7 +452,7 @@ fn lazy_supervisor_child_process() {
     heph::process_supervisor::init_with_exe(heph_bin()).expect("init");
     println!(
         "SIDECAR_AT_INIT {}",
-        heph::process_supervisor::sidecar_pid().map_or(-1, |p| p)
+        heph::process_supervisor::sidecar_pid().unwrap_or(-1)
     );
     let rt = child_runtime();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(LAZY_CHILDREN));
@@ -488,7 +488,7 @@ fn lazy_supervisor_child_process() {
     }
     println!(
         "SIDECAR {}",
-        heph::process_supervisor::sidecar_pid().map_or(-1, |p| p)
+        heph::process_supervisor::sidecar_pid().unwrap_or(-1)
     );
     std::io::stdout().flush().expect("flush");
     let me = i32::try_from(std::process::id()).expect("pid fits");
@@ -564,7 +564,7 @@ fn supervisor_retry_child_process() {
     println!("MARKER_PRESENT {}", u8::from(marker.exists()));
     println!(
         "SIDECAR_AFTER_FAILURE {}",
-        heph::process_supervisor::sidecar_pid().map_or(-1, |p| p)
+        heph::process_supervisor::sidecar_pid().unwrap_or(-1)
     );
 
     std::os::unix::fs::symlink(heph_bin(), &exe).expect("install the binary");
@@ -587,7 +587,7 @@ fn supervisor_retry_child_process() {
     println!("CHILD {}", handle.pid());
     println!(
         "SIDECAR {}",
-        heph::process_supervisor::sidecar_pid().map_or(-1, |p| p)
+        heph::process_supervisor::sidecar_pid().unwrap_or(-1)
     );
     std::io::stdout().flush().expect("flush");
     let me = i32::try_from(std::process::id()).expect("pid fits");
