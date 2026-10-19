@@ -528,6 +528,31 @@ jobs:
       # specifically this also proves the weak-linked libfuse binary still
       # launches without macFUSE installed (dyld would abort here if it were
       # hard-linked).
+      - name: Inspect aws-lc objects (diag)
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: |
+          set +e; set -x
+          which ar readelf objdump; ar --version | head -1; readelf --version | head -1; rustc -V
+          T=target/${{ matrix.target }}/release
+          rlib=$(ls $T/deps/libaws_lc_sys-*.rlib | head -1); echo "rlib=$rlib"
+          a=$(ls $T/build/aws-lc-sys-*/out/libaws_lc_*_crypto.a | head -1); echo "a=$a"
+          rm -rf /tmp/rlib /tmp/a; mkdir -p /tmp/rlib /tmp/a
+          (cd /tmp/rlib && ar x "$rlib"); (cd /tmp/a && ar x "$a")
+          echo "rlib members: $(ls /tmp/rlib | wc -l)  .a members: $(ls /tmp/a | wc -l)"
+          ar t "$a" | head -3; ar t "$rlib" | head -3
+          for o in /tmp/a/*-obj.o /tmp/rlib/*-obj.o; do
+            echo "===== $o"
+            readelf -h "$o" | grep -E 'Class|Machine|Number of section|Section header string'
+            echo "section syms: $(readelf -s "$o" | awk '$4=="SECTION"' | wc -l)  und section syms: $(readelf -s "$o" | awk '$4=="SECTION" && $7=="UND"' | wc -l)  total syms: $(readelf -s "$o" | grep -cE '^ +[0-9]+:')"
+            readelf -s "$o" | awk '$4=="SECTION"' | head -4
+            readelf -S "$o" | grep -E '\.bss|\.rodata' | head -4
+            readelf -r "$o" | grep -A6 'rela.text.aws_lc_[0-9_]*OBJ_sn2nid' | head -8
+          done
+          cmp /tmp/a/*-obj.o /tmp/rlib/*-obj.o && echo "rlib member identical to .a member"
+          echo "--- a .S object for comparison"
+          s=$(ls /tmp/a/*aesni*.o /tmp/a/*aesv8*.o 2>/dev/null | head -1); [ -n "$s" ] && readelf -s "$s" | awk '$4=="SECTION"' | head -3
+          true
       - name: Smoke test launch
         if: matrix.os == 'darwin' || matrix.arch == 'amd64'
         run: |
