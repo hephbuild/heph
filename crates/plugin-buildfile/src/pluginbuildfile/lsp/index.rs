@@ -12,11 +12,11 @@
 use crate::pluginbuildfile::run_file::RunResult;
 use hplugin::lsp::LspEngine;
 use hplugin::provider::ProvenanceFrame;
-use starlark_lsp::server::LspUri;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use vendored_starlark_lsp::server::LspUri;
 
 /// A 1-based source span within a single file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -309,6 +309,17 @@ impl SharedState {
 
     pub(crate) fn index(&self, uri: &LspUri) -> Option<DocIndex> {
         self.docs.lock().expect("docs lock").get(uri).cloned()
+    }
+
+    /// Drop `uri`'s index: the document was closed.
+    pub(crate) fn remove(&self, uri: &LspUri) {
+        self.docs.lock().expect("docs lock").remove(uri);
+    }
+
+    /// How many documents have an index (test support: closing frees them).
+    #[cfg(feature = "test-support")]
+    pub(crate) fn len(&self) -> usize {
+        self.docs.lock().expect("docs lock").len()
     }
 }
 

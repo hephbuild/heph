@@ -161,18 +161,30 @@ impl Doc {
 
 /// Strip the `│` marker and return the text plus its 0-based (line, UTF-16
 /// column). Without a marker the cursor is at the end of the text.
-fn split_cursor(fixture: &str) -> (String, u32, u32) {
+/// The column is counted in the named position encoding; lines end at `\n`,
+/// `\r\n` or a lone `\r`, as the LSP defines them.
+fn split_cursor_in(fixture: &str, encoding: &str) -> (String, u32, u32) {
     let (before, after) = match fixture.split_once(CURSOR) {
         Some((b, a)) => (b, a),
         None => (fixture, ""),
     };
-    let line = before.matches('\n').count() as u32;
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    let character = before
-        .get(line_start..)
-        .unwrap_or("")
-        .encode_utf16()
-        .count() as u32;
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    let bytes = before.as_bytes();
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
+            line += 1;
+            line_start = i + 1;
+        }
+        i += 1;
+    }
+    let tail = before.get(line_start..).unwrap_or("");
+    let character = match encoding {
+        "utf-8" => tail.len(),
+        "utf-32" => tail.chars().count(),
+        _ => tail.encode_utf16().count(),
+    } as u32;
     (format!("{before}{after}"), line, character)
 }
 
@@ -198,6 +210,8 @@ struct Lsp {
     next_id: i32,
     /// Every `publishDiagnostics` params object received, in order.
     diagnostics: Vec<Value>,
+    /// The position encoding the server chose at `initialize`.
+    encoding: String,
 }
 
 impl Lsp {
@@ -228,6 +242,7 @@ impl Lsp {
             dir,
             next_id: 0,
             diagnostics: Vec::new(),
+            encoding: "utf-16".to_string(),
         }
     }
 
@@ -321,7 +336,45 @@ impl Lsp {
             }),
         );
         self.notify("initialized", json!({}));
+        if let Some(enc) = result
+            .pointer("/capabilities/positionEncoding")
+            .and_then(Value::as_str)
+        {
+            self.encoding = enc.to_string();
+        }
         result
+    }
+
+    /// Send `shutdown` then `exit`, and return what the server loop returned.
+    fn shutdown_and_exit(&mut self) -> anyhow::Result<()> {
+        let resp = self.request_raw("shutdown", Value::Null);
+        if let Some(e) = resp.error {
+            anyhow::bail!("shutdown answered with an error: {e:?}");
+        }
+        self.notify("exit", Value::Null);
+        self.join()
+    }
+
+    /// Wait (bounded) for the server loop to return.
+    fn join(&mut self) -> anyhow::Result<()> {
+        let Some(server) = self.server.take() else {
+            anyhow::bail!("the server was already joined");
+        };
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while !server.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("the server loop did not return within {TIMEOUT:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        server
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the server thread panicked")))
+    }
+
+    /// The error code of a request's response, if it failed.
+    fn error_code(&mut self, method: &str, params: Value) -> Option<i32> {
+        self.request_raw(method, params).error.map(|e| e.code)
     }
 
     fn initialize(&mut self) -> Value {
@@ -331,7 +384,7 @@ impl Lsp {
     /// Open `rel` with the fixture's text (cursor marker stripped). The file
     /// is also written to disk so load resolution sees it.
     fn open(&mut self, rel: &str, fixture: &str) -> Doc {
-        let (text, line, character) = split_cursor(fixture);
+        let (text, line, character) = split_cursor_in(fixture, &self.encoding);
         self.write(rel, &text);
         let uri = self.uri(rel);
         self.notify(
@@ -351,7 +404,7 @@ impl Lsp {
     /// Replace the whole text of an open document (full sync), returning the
     /// new cursor.
     fn change(&mut self, doc: &Doc, fixture: &str) -> Doc {
-        let (text, line, character) = split_cursor(fixture);
+        let (text, line, character) = split_cursor_in(fixture, &self.encoding);
         let version = doc.version + 1;
         self.notify(
             "textDocument/didChange",
@@ -739,13 +792,17 @@ fn initialize_keeps_stock_capabilities_and_adds_formatting() {
     let result = lsp.initialize();
     let caps = &result["capabilities"];
     assert_eq!(caps["documentFormattingProvider"], json!(true), "{caps}");
+    // The stock capabilities survive.
     assert_eq!(caps["hoverProvider"], json!(true), "{caps}");
-    // KNOWN WRONG: trigger characters are overwritten with `.` alone.
+    assert!(caps["definitionProvider"].is_object(), "{caps}");
+    assert_eq!(caps["textDocumentSync"], json!(1), "full sync: {caps}");
+    // Trigger characters are declared once, extended rather than overwritten.
     assert_eq!(
         caps["completionProvider"]["triggerCharacters"],
-        json!(["."]),
+        json!([".", "\"", "'", "/", ":"]),
         "{caps}"
     );
+    assert_eq!(caps["positionEncoding"], json!("utf-16"), "{caps}");
 }
 
 #[test]
@@ -816,4 +873,160 @@ fn parity_string_completion() {
     let doc = lsp.open("BUILD", "load(\"//│\", \"make_name\")\n");
     let result = lsp.completion(&doc);
     assert!(has(&result, "//lib"), "package paths complete: {result}");
+}
+
+// ---------------------------------------------------------------------------
+// The owned loop: lifecycle, document lifetime, URIs, position encoding.
+// ---------------------------------------------------------------------------
+
+/// JSON-RPC / LSP error codes the loop answers with.
+const SERVER_NOT_INITIALIZED: i32 = -32002;
+const INVALID_REQUEST: i32 = -32600;
+const METHOD_NOT_FOUND: i32 = -32601;
+
+#[test]
+fn lifecycle_initialize_shutdown_exit_returns() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "target(│)\n");
+    assert!(has(&lsp.completion(&doc), "name"));
+    lsp.shutdown_and_exit()
+        .expect("the loop returns cleanly after shutdown and exit");
+}
+
+#[test]
+fn request_before_initialize_is_rejected() {
+    let mut lsp = Lsp::new();
+    let uri = lsp.uri("BUILD");
+    let code = lsp.error_code(
+        "textDocument/hover",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}}),
+    );
+    assert_eq!(code, Some(SERVER_NOT_INITIALIZED));
+    // The handshake still works afterwards.
+    lsp.initialize();
+    let doc = lsp.open("BUILD", "target(│)\n");
+    assert!(has(&lsp.completion(&doc), "name"));
+}
+
+#[test]
+fn request_after_shutdown_is_rejected() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "target(│)\n");
+    let resp = lsp.request_raw("shutdown", Value::Null);
+    assert!(resp.error.is_none(), "{resp:?}");
+    let params = lsp.at(&doc);
+    assert_eq!(
+        lsp.error_code("textDocument/completion", params),
+        Some(INVALID_REQUEST)
+    );
+    lsp.notify("exit", Value::Null);
+    lsp.join().expect("exit after shutdown returns cleanly");
+}
+
+#[test]
+fn cancel_request_is_acknowledged() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "target(│)\n");
+    // Every request is answered before the next message is read, so a
+    // cancellation names a request that is already done: it changes nothing
+    // and the loop carries on.
+    lsp.notify("$/cancelRequest", json!({"id": lsp.next_id}));
+    lsp.notify("$/cancelRequest", json!({"id": 9999}));
+    assert!(has(&lsp.completion(&doc), "name"));
+}
+
+#[test]
+fn unknown_method_is_an_error() {
+    let mut lsp = Lsp::start();
+    assert_eq!(
+        lsp.error_code("workspace/symbol", json!({"query": "x"})),
+        Some(METHOD_NOT_FOUND)
+    );
+    // An unknown notification is ignored, and the loop keeps serving.
+    lsp.notify("heph/unknownNotification", json!({}));
+    let doc = lsp.open("BUILD", "target(│)\n");
+    assert!(has(&lsp.completion(&doc), "name"));
+}
+
+#[test]
+fn did_close_frees_the_document_model() {
+    let mut lsp = Lsp::start();
+    let a = lsp.open("a/BUILD", "target(name = \"a\")\n");
+    let b = lsp.open("b/BUILD", "target(name = \"b\")\n");
+    let counts = |lsp: &mut Lsp| lsp.request("heph/documents", Value::Null);
+    assert_eq!(
+        counts(&mut lsp),
+        json!({"documents": 2, "parses": 2, "indexes": 2})
+    );
+    lsp.close(&a);
+    assert_eq!(
+        counts(&mut lsp),
+        json!({"documents": 1, "parses": 1, "indexes": 1})
+    );
+    lsp.close(&b);
+    assert_eq!(
+        counts(&mut lsp),
+        json!({"documents": 0, "parses": 0, "indexes": 0})
+    );
+}
+
+#[test]
+fn request_after_did_close_is_stock() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "target(│)\n");
+    assert!(has(&lsp.completion(&doc), "name"));
+    lsp.close(&doc);
+    let result = lsp.completion(&doc);
+    assert!(
+        !has(&result, "name"),
+        "a closed document gets no heph answer: {result}"
+    );
+    assert!(lsp.hover(&doc).is_null() || hover_text(&lsp.hover(&doc)).is_empty());
+}
+
+#[test]
+fn uri_with_spaces_and_non_ascii_round_trips() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("a dir/café/BUILD", "NAME = \"x\"\n\ntarget(name = NA│ME)\n");
+    assert!(doc.uri.contains("a%20dir/caf%C3%A9/BUILD"), "{}", doc.uri);
+    // The definition comes back on the same URI the client sent.
+    let found = targets(&lsp.definition(&doc));
+    assert_eq!(found, vec![(doc.uri.clone(), 0)]);
+    // So do the diagnostics.
+    let broken = lsp.open("a dir/café/x.BUILD", "broken(\n");
+    lsp.barrier();
+    assert!(
+        lsp.last_diagnostics(&broken).is_some_and(|d| !d.is_empty()),
+        "the parse error is published on the client's URI: {:?}",
+        lsp.diagnostics
+    );
+}
+
+#[test]
+fn position_encoding_negotiates_utf8_utf16_utf32() {
+    // The column of `dri│` follows a non-ASCII name, so each encoding counts
+    // it differently; the answer must be the same in all three.
+    let fixture = "target(name = \"café😀\", dri│)\n";
+    for (offered, chosen) in [
+        (json!(["utf-8", "utf-16"]), "utf-8"),
+        (json!(["utf-16"]), "utf-16"),
+        (json!(["utf-32"]), "utf-32"),
+        (json!(["latin-1"]), "utf-16"),
+        (json!([]), "utf-16"),
+    ] {
+        let mut lsp = Lsp::new();
+        let result = lsp.initialize_with(json!({"general": {"positionEncodings": offered}}));
+        assert_eq!(
+            result["capabilities"]["positionEncoding"],
+            json!(chosen),
+            "offered {offered}"
+        );
+        let doc = lsp.open("BUILD", fixture);
+        let result = lsp.completion(&doc);
+        assert!(has(&result, "driver"), "{chosen}: {result}");
+    }
+    // No `general` capabilities at all: fails closed to UTF-16.
+    let mut lsp = Lsp::new();
+    let result = lsp.initialize();
+    assert_eq!(result["capabilities"]["positionEncoding"], json!("utf-16"));
 }

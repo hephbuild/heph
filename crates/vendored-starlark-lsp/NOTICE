@@ -27,7 +27,8 @@ src/server.rs
     no JSON round-trip and no second parse per edit.
   - `Backend` is public, owns no connection, and gains `new`, `validate`
     (upstream's did_open/did_change without the notification: it returns the
-    diagnostics to publish) and `close` (upstream's did_close likewise).
+    diagnostics to publish), `close` (upstream's did_close likewise) and
+    `parsed_documents` (so heph's tests can check closing frees the parse).
     `find_definition`, `completion_options`, `hover_info` and
     `server_capabilities` are public so heph's loop can route requests to them.
   - `LspOpError` is public, its `format` is public, and its `Protocol` variant

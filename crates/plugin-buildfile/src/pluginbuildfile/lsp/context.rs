@@ -20,14 +20,14 @@ use starlark::docs::DocModule;
 use starlark::environment::Globals;
 use starlark::errors::EvalMessage;
 use starlark::syntax::{AstModule, Dialect};
-use starlark_lsp::completion::{StringCompletionResult, StringCompletionType};
-use starlark_lsp::error::eval_message_to_lsp_diagnostic;
-use starlark_lsp::server::{LspContext, LspEvalResult, LspUri, StringLiteralResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tower_lsp_server::UriExt as _;
+use vendored_starlark_lsp::completion::{StringCompletionResult, StringCompletionType};
+use vendored_starlark_lsp::error::eval_message_to_lsp_diagnostic;
+use vendored_starlark_lsp::server::{LspContext, LspEvalResult, LspUri, StringLiteralResult};
+use vendored_starlark_lsp::uri::file_path_to_uri;
 
 /// How long a listing provider (and its internal package/target memoization) is
 /// reused before being rebuilt. Bursts of completion requests (keystrokes) within
@@ -209,7 +209,7 @@ impl HephLspContext {
     /// The on-disk BUILD file URL for a package.
     fn build_file_url(&self, package: &str) -> Option<LspUri> {
         let path = first_build_file(&self.root.join(package), &self.patterns)?;
-        lsp_types::Uri::from_file_path(path).and_then(|u| LspUri::try_from(u).ok())
+        file_path_to_uri(&path).and_then(|u| LspUri::try_from(u).ok())
     }
 }
 
@@ -325,8 +325,7 @@ impl LspContext for HephLspContext {
         } else {
             resolved
         };
-        let uri = lsp_types::Uri::from_file_path(&file)
-            .ok_or_else(|| "non-file load path".to_string())?;
+        let uri = file_path_to_uri(&file).ok_or_else(|| "non-file load path".to_string())?;
         LspUri::try_from(uri).map_err(|e| e.to_string())
     }
 

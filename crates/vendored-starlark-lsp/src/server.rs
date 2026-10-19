@@ -431,6 +431,11 @@ impl<T: LspContext> Backend<T> {
         last_valid_parse.remove(uri);
     }
 
+    /// How many documents hold a parse (heph's tests check closing frees it).
+    pub fn parsed_documents(&self) -> usize {
+        self.last_valid_parse.read().unwrap().len()
+    }
+
     pub(crate) fn resolve_load_path(
         &self,
         path: &str,

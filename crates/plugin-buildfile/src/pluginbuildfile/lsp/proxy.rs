@@ -1,8 +1,7 @@
-//! A transparent middleware that sits between the editor (stdio) and the
-//! `starlark_lsp` server (an in-memory connection). It forwards every message
-//! untouched except `textDocument/hover` and `textDocument/completion`: those are
-//! forwarded too, but their responses are enriched on the way back with heph
-//! specifics the stock server can't know about —
+//! heph's enrichment of the stock answers. The loop (`server.rs`) computes the
+//! stock answer in-process from the vendored analysis modules, then hands the
+//! hover, completion and definition responses here to add what the stock
+//! analysis can't know about —
 //! - hover gains a "Targets" block (the addresses produced by the symbol
 //!   under the cursor), plus, once a `target(...)` call's driver is resolved,
 //!   a section documenting that driver's config fields;
@@ -17,166 +16,22 @@
 use super::index::SharedState;
 use crate::pluginbuildfile::run_file::resolve_load_target;
 use crate::pluginbuildfile::{DEFAULT_INDENT, build_file_indent_from_options};
-use lsp_server::{Connection, Message, Notification, RequestId};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, Hover, HoverContents, LocationLink,
     MarkedString, MarkupContent, MarkupKind, Position, Range, TextEdit,
 };
-use starlark_lsp::server::LspUri;
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use tower_lsp_server::UriExt as _;
-
-/// What an intercepted request was, so its response can be enriched.
-#[derive(Clone)]
-enum Pending {
-    Hover {
-        uri: LspUri,
-        line: u32,
-        col: u32,
-    },
-    Completion {
-        uri: LspUri,
-        line: u32,
-        col: u32,
-    },
-    Definition {
-        uri: LspUri,
-        line: u32,
-        col: u32,
-    },
-    /// The `initialize` handshake: its response's capabilities are patched so
-    /// the editor fires completion after `.` (member completion).
-    Initialize,
-}
-
-/// Pump messages between `client` (editor stdio) and `server` (starlark_lsp),
-/// enriching hover/completion responses. Returns when either side closes.
-pub(crate) fn run(client: &Connection, server: &Connection, shared: Arc<SharedState>) {
-    let pending: Arc<Mutex<HashMap<RequestId, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    std::thread::scope(|scope| {
-        // client → server: forward, recording hover/completion requests.
-        scope.spawn(|| {
-            for msg in &client.receiver {
-                // `textDocument/formatting` is answered here — the stock server
-                // has no formatter, so we never forward it.
-                if let Message::Request(req) = &msg
-                    && req.method == "textDocument/formatting"
-                {
-                    let result = format_request(&req.params, &shared);
-                    let resp = lsp_server::Response {
-                        id: req.id.clone(),
-                        result: Some(result),
-                        error: None,
-                    };
-                    if client.sender.send(Message::Response(resp)).is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                if let Message::Request(req) = &msg
-                    && let Some(p) = classify(&req.method, &req.params)
-                {
-                    pending.lock().expect("pending").insert(req.id.clone(), p);
-                }
-                let stop = matches!(&msg, Message::Notification(n) if n.method == "exit");
-                if server.sender.send(msg).is_err() || stop {
-                    break;
-                }
-            }
-            // The client side ended — either an `exit` notification, or stdin
-            // closed (the editor disconnected without the shutdown/exit handshake).
-            // Tell the inner server to exit so its main loop returns and the
-            // server→client thread unblocks; otherwise the process would hang.
-            // Ignore the result: the inner server may already be gone.
-            let _sent = server.sender.send(Message::Notification(Notification {
-                method: "exit".to_string(),
-                params: serde_json::Value::Null,
-            }));
-        });
-
-        // server → client: forward, enriching recorded responses.
-        scope.spawn(|| {
-            for msg in &server.receiver {
-                let out = match msg {
-                    Message::Response(mut resp) => {
-                        if let Some(p) = pending.lock().expect("pending").remove(&resp.id) {
-                            enrich(&mut resp, &p, &shared);
-                        }
-                        Message::Response(resp)
-                    }
-                    other => other,
-                };
-                if client.sender.send(out).is_err() {
-                    break;
-                }
-            }
-        });
-    });
-}
-
-/// Extract `(uri, line, col)` for the requests we enrich. Positions are 0-based,
-/// as sent by the client.
-fn classify(method: &str, params: &serde_json::Value) -> Option<Pending> {
-    // `initialize` carries no position; handle it before the position extraction.
-    if method == "initialize" {
-        return Some(Pending::Initialize);
-    }
-    let pos = params.get("position")?;
-    let line = pos.get("line")?.as_u64()? as u32;
-    let col = pos.get("character")?.as_u64()? as u32;
-    let uri_str = params.get("textDocument")?.get("uri")?.as_str()?;
-    let uri = LspUri::try_from(uri_str.parse::<lsp_types::Uri>().ok()?).ok()?;
-    match method {
-        "textDocument/hover" => Some(Pending::Hover { uri, line, col }),
-        "textDocument/completion" => Some(Pending::Completion { uri, line, col }),
-        "textDocument/definition" => Some(Pending::Definition { uri, line, col }),
-        _ => None,
-    }
-}
-
-fn enrich(resp: &mut lsp_server::Response, pending: &Pending, shared: &SharedState) {
-    match pending {
-        Pending::Hover { uri, line, col } => enrich_hover(resp, uri, *line, *col, shared),
-        Pending::Completion { uri, line, col } => enrich_completion(resp, uri, *line, *col, shared),
-        Pending::Definition { uri, line, col } => enrich_definition(resp, uri, *line, *col, shared),
-        Pending::Initialize => enrich_initialize(resp),
-    }
-}
-
-/// Patch the `initialize` response capabilities the stock server can't provide:
-/// advertise `.` as a completion trigger (so editors fire member completion after
-/// `heph.`/`heph.fs.`), and `documentFormattingProvider` (the stock server has no
-/// formatter — the proxy answers `textDocument/formatting` itself).
-fn enrich_initialize(resp: &mut lsp_server::Response) {
-    let Some(serde_json::Value::Object(result)) = resp.result.as_mut() else {
-        return;
-    };
-    let caps = result
-        .entry("capabilities")
-        .or_insert_with(|| serde_json::json!({}));
-    let serde_json::Value::Object(caps) = caps else {
-        return;
-    };
-    let cp = caps
-        .entry("completionProvider")
-        .or_insert_with(|| serde_json::json!({}));
-    if let serde_json::Value::Object(cp) = cp {
-        cp.insert("triggerCharacters".to_string(), serde_json::json!(["."]));
-    }
-    caps.insert(
-        "documentFormattingProvider".to_string(),
-        serde_json::json!(true),
-    );
-}
+use vendored_starlark_lsp::server::LspUri;
+use vendored_starlark_lsp::uri::file_path_to_uri;
 
 /// Build the JSON result for a `textDocument/formatting` request: a list of
 /// `TextEdit`s (a single whole-document replacement), an empty list when the
 /// buffer is already formatted, or `null` when it can't be formatted (unknown
 /// document, parse error, or the `heph:fmt skip-file` directive).
-fn format_request(params: &serde_json::Value, shared: &SharedState) -> serde_json::Value {
+pub(super) fn format_request(
+    params: &serde_json::Value,
+    shared: &SharedState,
+) -> serde_json::Value {
     let null = serde_json::Value::Null;
     let Some(uri) = params
         .get("textDocument")
@@ -238,7 +93,7 @@ fn whole_document_range(source: &str) -> Range {
 /// in its package. The stock server only parses one file per package, so a symbol
 /// defined in a sibling file resolves to the `load(...)` line (or nothing); we
 /// scan the whole package and point at the real definition.
-fn enrich_definition(
+pub(super) fn enrich_definition(
     resp: &mut lsp_server::Response,
     uri: &LspUri,
     line: u32,
@@ -273,7 +128,7 @@ fn enrich_definition(
 
     for file in files {
         if let Some((dl, c0, c1)) = find_symbol_def(&file, exported) {
-            let Some(uri) = lsp_types::Uri::from_file_path(&file) else {
+            let Some(uri) = file_path_to_uri(&file) else {
                 continue;
             };
             let target_range = Range {
@@ -297,7 +152,7 @@ fn enrich_definition(
 /// the stock server resolved it cross-file and we should not override).
 fn result_points_to_other_file(result: Option<&serde_json::Value>, doc_path: &Path) -> bool {
     let Some(value) = result else { return false };
-    let doc = lsp_types::Uri::from_file_path(doc_path);
+    let doc = file_path_to_uri(doc_path);
     let targets = match value {
         serde_json::Value::Array(a) => a.clone(),
         serde_json::Value::Object(_) => vec![value.clone()],
@@ -369,7 +224,7 @@ fn pkg_of(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn enrich_hover(
+pub(super) fn enrich_hover(
     resp: &mut lsp_server::Response,
     uri: &LspUri,
     line: u32,
@@ -1144,7 +999,7 @@ fn field_item(name: &str, ty: &str, doc: String, ctx: &str, required: bool) -> C
     }
 }
 
-fn enrich_completion(
+pub(super) fn enrich_completion(
     resp: &mut lsp_server::Response,
     uri: &LspUri,
     line: u32,
@@ -1304,7 +1159,7 @@ mod tests {
         content: &str,
     ) -> (
         std::sync::Arc<super::SharedState>,
-        starlark_lsp::server::LspUri,
+        vendored_starlark_lsp::server::LspUri,
     ) {
         use crate::pluginbuildfile::run_file::{BuildFileLoader, eval_source};
         use std::collections::HashMap;
@@ -1349,14 +1204,14 @@ mod tests {
             vec![],
             builtin_hovers,
         );
-        let uri = starlark_lsp::server::LspUri::File(tmp.path().join("BUILD"));
+        let uri = vendored_starlark_lsp::server::LspUri::File(tmp.path().join("BUILD"));
         shared.set_index(uri.clone(), index);
         (shared, uri)
     }
 
     fn completion_labels(
         shared: &super::SharedState,
-        uri: &starlark_lsp::server::LspUri,
+        uri: &vendored_starlark_lsp::server::LspUri,
         line: u32,
         col: u32,
     ) -> Vec<String> {
@@ -1381,7 +1236,7 @@ mod tests {
 
     fn hover_value(
         shared: &super::SharedState,
-        uri: &starlark_lsp::server::LspUri,
+        uri: &vendored_starlark_lsp::server::LspUri,
         line: u32,
         col: u32,
     ) -> Option<String> {
@@ -1817,23 +1672,6 @@ mod tests {
         assert_eq!(completion_member_base("x = heph"), None);
         assert_eq!(completion_member_base("x = "), None);
         assert_eq!(completion_member_base(""), None);
-    }
-
-    #[test]
-    fn initialize_advertises_formatting_capability() {
-        let mut resp = lsp_server::Response {
-            id: 1.into(),
-            result: Some(serde_json::json!({ "capabilities": {} })),
-            error: None,
-        };
-        super::enrich_initialize(&mut resp);
-        let caps = &resp.result.unwrap()["capabilities"];
-        assert_eq!(caps["documentFormattingProvider"], serde_json::json!(true));
-        // The completion trigger is still advertised.
-        assert_eq!(
-            caps["completionProvider"]["triggerCharacters"],
-            serde_json::json!(["."])
-        );
     }
 
     #[test]

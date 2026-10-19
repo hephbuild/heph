@@ -1,17 +1,20 @@
 //! BUILD-file language server.
 //!
-//! `heph tool build-lsp` runs this. It reuses the official `starlark_lsp` server
-//! for the standard surface (diagnostics, symbol completion/hover, goto-def, load
-//! resolution) via [`HephLspContext`], and layers heph specifics on top through a
-//! small [`proxy`] that enriches hover and completion responses (provenance,
-//! driver config schemas). See the submodule docs for detail.
+//! `heph tool build-lsp` runs this. heph owns the loop ([`server`]): it answers
+//! `initialize`, keeps the open documents, and serves each request in-process.
+//! The standard Starlark surface (diagnostics, symbol completion/hover,
+//! goto-def, load resolution) comes from the vendored `starlark_lsp` analysis
+//! modules through [`HephLspContext`]; heph specifics (provenance, driver
+//! config schemas, plugin functions) are layered on by [`proxy`]. See the
+//! submodule docs for detail.
 
 mod context;
 pub(crate) mod diagnostics;
 mod index;
+mod position;
 mod proxy;
+mod server;
 
-use context::HephLspContext;
 use hplugin::lsp::LspEngine;
 use lsp_server::Connection;
 use std::sync::Arc;
@@ -48,29 +51,5 @@ pub fn serve_stdio(engine: Arc<dyn LspEngine>) -> anyhow::Result<()> {
 /// `tests/lsp.rs` drives it over an in-memory connection. Same runtime
 /// contract as [`serve_stdio`].
 pub fn run(connection: Connection, engine: Arc<dyn LspEngine>) -> anyhow::Result<()> {
-    let ctx = HephLspContext::new(engine);
-    let shared = Arc::clone(&ctx.shared);
-
-    // `proxy_end` is the client-facing side of the in-memory pair; `server_end`
-    // is what the starlark_lsp server reads/writes.
-    let (proxy_end, server_end) = Connection::memory();
-
-    std::thread::scope(|scope| {
-        let server = scope.spawn(move || {
-            // The stock server owns the initialize handshake and main loop on its
-            // connection; the proxy just pipes bytes through.
-            starlark_lsp::server::server_with_connection(server_end, ctx)
-        });
-
-        // Returns once the client sends `exit` (or the connection closes) and
-        // the inner server finishes.
-        proxy::run(&connection, &proxy_end, shared);
-        drop(proxy_end);
-
-        match server.join() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(anyhow::anyhow!("BUILD-file language server: {e}")),
-            Err(_) => Err(anyhow::anyhow!("BUILD-file language server panicked")),
-        }
-    })
+    server::run(connection, engine)
 }
