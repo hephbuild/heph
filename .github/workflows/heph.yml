@@ -547,6 +547,9 @@ jobs:
             readelf -p .comment "$o" | grep -vE '^$|String dump' | head -3
             echo "section syms: $(readelf -s "$o" | awk '$4=="SECTION"' | wc -l)  und section syms: $(readelf -s "$o" | awk '$4=="SECTION" && $7=="UND"' | wc -l)  total syms: $(readelf -s "$o" | grep -cE '^ +[0-9]+:')"
             readelf -s "$o" | awk '$4=="SECTION"' | head -4
+            readelf -W -s "$o" | awk '$4=="SECTION" && $7=="UND"'
+            readelf -W -S "$o" | sed -n '/^  \[ *[0-9]*\] \.bss/p' | head -6
+            mkdir -p "$PWD/diag-objs" && cp "$o" "$PWD/diag-objs/$(basename "$(dirname "$o")")-$(basename "$o")"
             readelf -S "$o" | grep -E '\.bss|\.rodata' | head -4
             readelf -r "$o" | grep -A6 'rela.text.aws_lc_[0-9_]*OBJ_sn2nid' | head -8
           done
@@ -554,6 +557,13 @@ jobs:
           echo "--- a .S object for comparison"
           s=$(ls /tmp/a/*aesni*.o /tmp/a/*aesv8*.o 2>/dev/null | head -1); [ -n "$s" ] && readelf -s "$s" | awk '$4=="SECTION"' | head -3
           true
+      - name: Upload diag objects
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: diag-objs-${{ matrix.arch }}
+          path: diag-objs/
+          if-no-files-found: warn
       - name: Smoke test launch
         if: matrix.os == 'darwin' || matrix.arch == 'amd64'
         run: |
