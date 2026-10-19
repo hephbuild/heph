@@ -405,9 +405,24 @@ fn append_blob<W: std::io::Write>(
 pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<(String, u64)> {
     use sha2::{Digest as _, Sha256};
     let mut f = std::fs::File::open(path).with_context(|| format!("open {path:?}"))?;
-    let mut h = Sha256::new();
+    let mut h = HashWriter(Sha256::new());
     let n = std::io::copy(&mut f, &mut h).with_context(|| format!("hash {path:?}"))?;
-    Ok((format!("sha256:{:x}", h.finalize()), n))
+    Ok((format!("sha256:{}", hex::encode(h.0.finalize())), n))
+}
+
+/// `io::Write` over a hasher, so `io::copy` can stream a file into it: digest
+/// 0.11 dropped the `Write` impl the hashers used to carry.
+struct HashWriter(sha2::Sha256);
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        sha2::Digest::update(&mut self.0, buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn blob_path(digest: &str) -> anyhow::Result<String> {
@@ -420,7 +435,7 @@ fn blob_path(digest: &str) -> anyhow::Result<String> {
 /// The digest of `bytes`, in the `sha256:<hex>` form the OCI spec uses.
 pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
 /// Write one image out of an OCI layout as a docker-format archive — the shape

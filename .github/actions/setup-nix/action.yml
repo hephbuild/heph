@@ -183,7 +183,7 @@ runs:
     # handled by kache (above), so target/ is intentionally not cached here.
     - name: Cargo registry cache
       if: inputs.cargo-target != ''
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry/index/

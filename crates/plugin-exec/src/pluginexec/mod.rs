@@ -229,7 +229,7 @@ fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
         .context("compile init.sh template")?;
     env.get_template("init.sh")
         .context("load init.sh template")?
-        .render(minijinja::context! { cmds, lines })
+        .render(minijinja::context! { cmds, lines => minijinja::value::Serde(lines) })
         .context("render init.sh template")
 }
 
@@ -1334,6 +1334,11 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             if let Some(version) = self.coreutils_version() {
                 "coreutils".hash(&mut h);
                 version.hash(&mut h);
+                // `tmpl` is one of those utilities, and what it renders is a
+                // function of the template renderer too — the same dependency
+                // the `template` driver's own def hash carries.
+                "tmpl".hash(&mut h);
+                htemplate::TEMPLATE_FORMAT_VERSION.hash(&mut h);
             }
 
             format!("{:x}", h.finish()).into_bytes()

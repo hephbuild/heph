@@ -8,4 +8,4 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
-minijinja = "2"
+minijinja = "3"

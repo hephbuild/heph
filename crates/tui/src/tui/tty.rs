@@ -76,7 +76,10 @@ pub struct TtyReader {
 
 impl TtyReader {
     pub fn from_stdin() -> io::Result<Self> {
-        Self::from_fd(io::stdin().as_raw_fd())
+        // SAFETY: fd 0 outlives the reader. Rust's runtime opens /dev/null onto
+        // any closed standard fd at startup, and nothing in heph closes or
+        // `dup2`s over its own stdin.
+        unsafe { Self::from_fd(io::stdin().as_raw_fd()) }
     }
 
     /// Read the terminal (or pipe) behind `fd`.
@@ -84,7 +87,14 @@ impl TtyReader {
     /// Takes the descriptor rather than reaching for `stdin()` so the
     /// non-blocking policy above is testable against a pty pair, which is the
     /// only shape in which the bug it exists for can be observed.
-    fn from_fd(fd: RawFd) -> io::Result<Self> {
+    ///
+    /// # Safety
+    ///
+    /// When `fd` is not a terminal it is registered with the reactor as is, so
+    /// it must stay open — and must not be closed and reused, or `dup2`'d over —
+    /// for the reader's whole lifetime. The reactor deregisters *that number*
+    /// on drop, and would otherwise deregister whatever fd took its place.
+    unsafe fn from_fd(fd: RawFd) -> io::Result<Self> {
         let source = match reopen_terminal(fd) {
             Some(owned) => Source::Owned(owned),
             None => Source::Borrowed {
@@ -93,7 +103,13 @@ impl TtyReader {
             },
         };
         let restore = restore_flags_of(&source);
-        AsyncFd::with_interest(source, Interest::READABLE)
+        // SAFETY: `Owned` holds the descriptor, so it is open until the
+        // `AsyncFd` drops it. `Borrowed` is the caller's descriptor, which
+        // `from_fd`'s caller promised stays open, and the same open file
+        // description, for the reader's lifetime. Either way `as_raw_fd`
+        // returns that same descriptor every time.
+        unsafe { AsyncFd::register_with_interest(source, Interest::READABLE) }
+            .map_err(io::Error::from)
             .inspect_err(|_| restore())
             .map(|inner| Self { inner })
     }
@@ -277,7 +293,8 @@ mod tests {
             "precondition: a fresh pty slave is blocking"
         );
 
-        let reader = TtyReader::from_fd(fd).expect("reader over a pty slave");
+        // SAFETY: `slave` is held to the end of the test, after `reader`.
+        let reader = unsafe { TtyReader::from_fd(fd) }.expect("reader over a pty slave");
         assert!(
             !is_nonblocking(fd),
             "the caller's fd (shared with stdout) was switched to non-blocking"
@@ -291,7 +308,9 @@ mod tests {
     #[tokio::test]
     async fn a_terminal_reader_still_receives_input() {
         let (master, slave) = open_pty();
-        let mut reader = TtyReader::from_fd(slave.as_raw_fd()).expect("reader over a pty slave");
+        // SAFETY: `slave` is held to the end of the test, after `reader`.
+        let mut reader =
+            unsafe { TtyReader::from_fd(slave.as_raw_fd()) }.expect("reader over a pty slave");
 
         let mut master_file = std::fs::File::from(master);
         master_file.write_all(b"hi\n").expect("write to pty master");
@@ -316,7 +335,8 @@ mod tests {
         let fd = read_end.as_raw_fd();
         let before = flags(fd);
 
-        let mut reader = TtyReader::from_fd(fd).expect("reader over a pipe");
+        // SAFETY: `read_end` is held to the end of the test, after `reader`.
+        let mut reader = unsafe { TtyReader::from_fd(fd) }.expect("reader over a pipe");
         assert!(
             is_nonblocking(fd),
             "a pipe has to be switched in place — there is no second open of it"

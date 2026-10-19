@@ -62,6 +62,7 @@ which reads as a pass.
    - Lint red in CI but green locally after a `devenv.nix` edit: the local shell's `lint` is stale. Start a new `devenv shell`.
    - `libunwind: malformed DW_CFA_def_cfa_register DWARF unwind, reg too big` and a test binary dying with SIGSEGV on `Test darwin/arm64`, the same binary on every rerun: a binary linked by the old ld64, which truncates unwind offsets past 16 MiB of `__eh_frame`. `tests/darwin_linker.rs` should be red too. See the linker note in `.cargo/config.toml`. A rerun never fixes it.
    - An unrelated test breaking after a dependency was added: check `git diff master -- Cargo.lock | grep -c '^-version'`. A re-resolved lockfile moves existing pins.
+   - `ld.lld: error: undefined symbol: ` with an **empty** name, `>>> referenced by … in archive …/libaws_lc_sys-*.rlib`, on the Linux `Build` jobs only while the debug `Test` jobs stay green: the nixpkgs LLVM that compiles the C deps (the shell exports `CC=clang`; on arm64 it is the libclang zig links) emits objects whose section symbols for some `.bss.*` sections are undefined — nixpkgs rolling 2026-10-12, LLVM 21.1.8 built by GCC 16.2. Not kache, not rustc, not the aws-lc version: #503–#507 swapped each one and only the nixpkgs revision mattered. `devenv.lock` holds the nixpkgs input at the last good revision; a PR that bumps it has to check whether nixpkgs fixed it first. A rerun never fixes it.
 4. **Anything else is REAL.** Report the test, the first error line and its `file:line`, then stop.
 
 ## 4. Report

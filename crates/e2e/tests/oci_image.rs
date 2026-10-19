@@ -551,7 +551,10 @@ async fn test_the_image_digest_is_the_same_on_every_supported_target() -> anyhow
     let r = ws.run("//app:img").await?;
     let manifest = manifest_of(&htestkit::artifact_bytes(&r));
     let raw = serde_json::to_vec(&manifest).expect("re-encode");
-    let digest = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(&raw));
+    let digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&raw))
+    );
     assert_eq!(
         digest, "sha256:729f38276dc0b50b996908f034e3c25516cf33d0d12e83946b0a750dca744e2b",
         "the image manifest's bytes changed. If that was deliberate, bump \

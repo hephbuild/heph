@@ -52,6 +52,53 @@ let
     installPhase = "install -Dm755 kache $out/bin/kache";
   };
 
+  # cargo-zigbuild — the cross-linking driver behind both Linux release builds
+  # (see the zigbuild comment in `.github/workflows/heph.yml`). rustc 1.99
+  # passes `-Wl,--fix-cortex-a53-843419` to the linker for
+  # aarch64-unknown-linux-gnu; cargo-zigbuild < 0.23 forwards it to zig as is,
+  # zig rejects it ("unsupported linker arg"), and the linux/arm64 cross build
+  # dies at link. 0.23 strips it. The nixpkgs input is held at a revision whose
+  # cargo-zigbuild is 0.22.3 (its newer LLVM miscompiles aws-lc-sys — see the
+  # `devenv.lock` commit that holds it), so take the published release binary
+  # the same way as kache: static musl on Linux, Mach-O on darwin. Unlike
+  # kache's, the tarball has a `cargo-zigbuild-<target>/` directory at the
+  # root, which the default unpack enters, so no `sourceRoot` here.
+  #
+  # Only the systems that run it get the prebuilt: x86_64-linux (CI
+  # cross-compiles both Linux targets on the amd64 runner) and aarch64-darwin
+  # (the local shell). Upstream ships no aarch64-linux asset, and that system
+  # never cross-compiles, so it — and anything else — keeps nixpkgs' package.
+  # Bumping: as for kache above (`<asset>.sha256` next to each release asset,
+  # `nix hash convert` to SRI).
+  cargoZigbuildVersion = "0.23.4";
+  cargoZigbuildAssets = {
+    aarch64-darwin = {
+      target = "aarch64-apple-darwin";
+      hash = "sha256-yiNprhqZlVQiBqbBjdNyrP+U3d6518B+Cb+3WUGXzqM=";
+    };
+    x86_64-linux = {
+      target = "x86_64-unknown-linux-musl";
+      hash = "sha256-njz3NIXtvUWQXIqtvA/fhpx93DhI8MiYIp8mgNtS5Es=";
+    };
+  };
+  cargoZigbuildPrebuilt = asset: pkgs.stdenvNoCC.mkDerivation {
+    pname = "cargo-zigbuild";
+    version = cargoZigbuildVersion;
+    src = pkgs.fetchurl {
+      url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v${cargoZigbuildVersion}/cargo-zigbuild-${asset.target}.tar.xz";
+      inherit (asset) hash;
+    };
+    dontBuild = true;
+    # Same reasoning as kache: static musl has no interpreter to rewrite, and
+    # stripping the Mach-O would invalidate its signature.
+    dontPatchELF = true;
+    dontStrip = true;
+    installPhase = "install -Dm755 cargo-zigbuild $out/bin/cargo-zigbuild";
+  };
+  cargoZigbuild =
+    let asset = cargoZigbuildAssets.${pkgs.stdenv.hostPlatform.system} or null;
+    in if asset == null then pkgs.cargo-zigbuild else cargoZigbuildPrebuilt asset;
+
   # buffa — the protobuf codegen behind `gen` (see `buf.gen.yaml`). It replaced
   # prost, which cannot read an editions file (`unknown syntax: editions`). Not
   # in nixpkgs; the release binaries are self-contained (static-pie on Linux,
@@ -121,7 +168,8 @@ in
     (buffaPlugin "protoc-gen-buffa" buffaAsset.gen)
     (buffaPlugin "protoc-gen-buffa-packaging" buffaAsset.packaging)
     pkgs.zig
-    pkgs.cargo-zigbuild
+    # 0.23.4 prebuilt where the cross build runs; see `cargoZigbuild` above.
+    cargoZigbuild
     pkgs.tokio-console
     kache
     # `rust-objcopy`/`rust-strip` (wraps the `llvm-tools` component's

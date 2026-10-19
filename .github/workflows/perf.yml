@@ -139,14 +139,14 @@ jobs:
       # `.git` is equally usable. No devenv/Rust toolchain needed at all —
       # every binary this job runs is downloaded, not compiled.
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       # Corpus generation's go/ subtree (`tools/gorepogen` + `go mod tidy`)
       # needs a host Go toolchain — separate from the hermetic one the `go`
       # plugin downloads at target-build time.
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25"
           cache: false
@@ -242,7 +242,7 @@ jobs:
           fi
 
       - name: Download candidate (N) artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: heph*_${{ matrix.os }}_${{ matrix.arch }}*
           path: candidate-dist-raw
