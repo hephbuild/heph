@@ -163,6 +163,21 @@ pub fn check_plugin_abi(path: &std::path::Path, reported: Option<&str>) -> anyho
     ))
 }
 
+/// Hand a plugin the host's supervisor client through its `set_supervisor`
+/// entry point, starting the supervisor first.
+///
+/// The host starts its supervisor lazily, before its own first child. A
+/// plugin's children report through this sink only *after* they are spawned,
+/// from code the host does not see, so the host cannot defer the start to them:
+/// it must be running before the plugin holds a sink it could spawn against.
+fn hand_supervisor(set_supervisor: SetSupervisorFn) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    hproc::process_supervisor::ensure_started()
+        .context("starting the process supervisor for a plugin")?;
+    set_supervisor(crate::host::HostSupervisor::wrap());
+    Ok(())
+}
+
 /// An optional entry point. `None`, silently, when the plugin does not export
 /// `symbol` (an SDK that predates it); `None` with a `warn!` when it exports one
 /// whose stabby type report does not match ours — a skewed plugin, whose
@@ -336,7 +351,7 @@ pub fn load(
         if let Some(set_supervisor) =
             optional_entry::<SetSupervisorFn>(&lib, SET_SUPERVISOR_SYMBOL, path)
         {
-            set_supervisor(crate::host::HostSupervisor::wrap());
+            hand_supervisor(*set_supervisor)?;
         }
         // Hand the plugin a handle to the host's exec-runner registry. Same
         // reason as the supervisor: this cdylib links its own `execrunner`,
@@ -1639,6 +1654,82 @@ mod tests {
         assert!(
             format!("{err:#}").contains("missing field ListResponse.addr"),
             "{err:#}"
+        );
+    }
+
+    /// Env var naming the fake supervisor binary for
+    /// [`hand_supervisor_child_process`]; unset under a normal run.
+    const HAND_SUPERVISOR_CHILD_ENV: &str = "HEPH_TEST_HAND_SUPERVISOR_CHILD";
+
+    /// The supervisor pid the fake `set_supervisor` saw when it was called; 0
+    /// until it is.
+    static SIDECAR_AT_HAND_OFF: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// A plugin's `heph_plugin_set_supervisor`, recording whether the host's
+    /// supervisor was already running when the plugin got its sink.
+    extern "C" fn recording_set_supervisor(sup: crate::abi::DynSupervisor) {
+        let pid = hproc::process_supervisor::sidecar_pid().unwrap_or(-1);
+        SIDECAR_AT_HAND_OFF.store(pid, std::sync::atomic::Ordering::SeqCst);
+        drop(sup);
+    }
+
+    /// The child half of the test below: a host process whose supervisor is set
+    /// up but not started (it starts lazily, at the first child), handing a
+    /// plugin its sink. Its own process, because the supervisor is a
+    /// process-global.
+    #[test]
+    fn hand_supervisor_child_process() {
+        let Some(exe) = std::env::var_os(HAND_SUPERVISOR_CHILD_ENV) else {
+            return;
+        };
+        hproc::process_supervisor::init_with_exe(exe.into()).expect("init");
+        assert_eq!(
+            hproc::process_supervisor::sidecar_pid(),
+            None,
+            "init must not start the supervisor"
+        );
+        hand_supervisor(recording_set_supervisor).expect("hand the plugin its sink");
+        let seen = SIDECAR_AT_HAND_OFF.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            seen > 0,
+            "the plugin got its supervisor sink before the supervisor was started (saw {seen})"
+        );
+        println!("HAND_SUPERVISOR_DONE");
+    }
+
+    /// A plugin's children report to the supervisor only after they exist, from
+    /// code the host never sees, so the host must start its lazy supervisor
+    /// before the plugin holds a sink — not at its own first child, which may
+    /// come after the plugin's.
+    #[test]
+    fn a_plugin_gets_its_supervisor_sink_only_once_the_supervisor_runs() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("fake-supervisor");
+        // Stands in for `heph __supervisor --ipc-fd N`: holds its socket end
+        // until the host's end closes.
+        std::fs::write(&exe, "#!/bin/sh\neval \"exec cat <&$3 >/dev/null\"\n")
+            .expect("write fake supervisor");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake supervisor");
+        let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args([
+                "--exact",
+                "load_stable::tests::hand_supervisor_child_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(HAND_SUPERVISOR_CHILD_ENV, &exe)
+            .env_remove("heph_DISABLE_REAPER")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the hand-off child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("HAND_SUPERVISOR_DONE"),
+            "hand-off child failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status
         );
     }
 }

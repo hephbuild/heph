@@ -301,11 +301,11 @@ target(
 async fn run_in_a_fresh_engine(ws: &Workspace, addr_str: &str) -> anyhow::Result<()> {
     use heph::engine::{Engine, OutputMatcher, ResultOptions};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     let addr = heph::htaddr::parse_addr(addr_str)?;
     let engine = ws.reopen()?;
-    let bg: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let bg = hcore::pending::Pending::new_counter();
     let rs = engine.new_state_full(
         true,
         None,

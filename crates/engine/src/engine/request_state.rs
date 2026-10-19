@@ -1145,7 +1145,7 @@ impl Engine {
         self.new_state_full(
             fail_fast,
             events,
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hcore::pending::Pending::new_counter(),
             Self::DEFAULT_LOG_TAIL_LINES,
             None,
         )
@@ -1186,7 +1186,7 @@ impl Engine {
         self.new_state_inner(
             true,
             None,
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hcore::pending::Pending::new_counter(),
             Self::DEFAULT_LOG_TAIL_LINES,
             None,
             RequestMode {
@@ -1218,7 +1218,7 @@ impl Engine {
         self.new_state_inner(
             true,
             None,
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hcore::pending::Pending::new_counter(),
             Self::DEFAULT_LOG_TAIL_LINES,
             None,
             RequestMode {
@@ -1342,11 +1342,10 @@ mod tests {
     fn bg_state(
         engine: &Arc<Engine>,
     ) -> (
-        Arc<std::sync::atomic::AtomicUsize>,
+        hcore::pending::PendingCounter,
         Arc<crate::engine::request_state::RequestState>,
     ) {
-        let bg: Arc<std::sync::atomic::AtomicUsize> =
-            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bg = hcore::pending::Pending::new_counter();
         let rs = engine.new_state_full(
             true,
             None,
@@ -1357,16 +1356,10 @@ mod tests {
         (bg, rs)
     }
 
-    async fn wait_drained(bg: &std::sync::atomic::AtomicUsize) {
-        use std::sync::atomic::Ordering;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while bg.load(Ordering::Acquire) > 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "background work never drained"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
+    async fn wait_drained(bg: &hcore::pending::Pending) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), bg.wait_drained())
+            .await
+            .expect("background work never drained");
     }
 
     /// Recording a trim must *not* take a background slot: the slot is taken

@@ -99,6 +99,11 @@ impl Workspace {
         self.dir.path()
     }
 
+    /// The temp `HOME` every [`Self::cmd`] runs with.
+    pub fn home(&self) -> &Path {
+        self.home.path()
+    }
+
     /// Overwrite `.hephconfig`. Callers that need a plugin append to
     /// [`BASE_CONFIG`] rather than restating the builtins.
     pub fn config(&self, yaml: &str) -> Result<()> {

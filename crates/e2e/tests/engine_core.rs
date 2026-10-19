@@ -579,7 +579,7 @@ async fn cache_history_is_enforced_by_the_end_of_the_run() -> anyhow::Result<()>
     use heph::engine::{Engine, OutputMatcher, ResultOptions};
     use heph::htaddr::parse_addr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     let ws = Workspace::new();
     let addr = parse_addr("//hist:t")?;
@@ -595,7 +595,7 @@ async fn cache_history_is_enforced_by_the_end_of_the_run() -> anyhow::Result<()>
         );
 
         let engine = ws.reopen()?;
-        let bg: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let bg = hcore::pending::Pending::new_counter();
         let rs = engine.new_state_full(
             true,
             None,

@@ -213,6 +213,24 @@ pub fn spawn(spec: Spec) -> io::Result<Handle> {
     imp::spawn(spec)
 }
 
+/// Start the process supervisor before `program` is spawned, so the child never
+/// exists without one (it starts lazily; see `process_supervisor::init`).
+///
+/// On failure the child is not spawned, and the error names the program and
+/// says what to check: the start is a `posix_spawn` of heph itself, so what
+/// usually fails it is a descriptor or process limit. Kind `Other`, so a caller
+/// that renders `NotFound` as "not on PATH" does not misread a missing
+/// supervisor binary as a missing `program`.
+fn ensure_supervisor_for(program: &std::path::Path) -> io::Result<()> {
+    crate::process_supervisor::ensure_started().map_err(|e| {
+        io::Error::other(format!(
+            "not spawning {program:?}: {e}\n\
+             hint: heph cannot track child processes without its supervisor; \
+             check `ulimit -n` and the process limit (`ulimit -u`)"
+        ))
+    })
+}
+
 pub use imp::{Handle, OutputReader, StdinPump};
 
 impl Handle {

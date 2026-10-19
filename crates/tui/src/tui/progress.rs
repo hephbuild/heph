@@ -352,17 +352,10 @@ fn worker_spans(max_workers: usize, busy: usize) -> Vec<Span<'static>> {
 /// band is natural width (compact start); everything past a minute is padded to
 /// [`ELAPSED_MIN_WIDTH`] so the field grows monotonically and never flickers.
 fn human_elapsed(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs < 60 {
-        return format!("{secs}s");
+    let s = hcore::units::human_duration(std::time::Duration::from_millis(ms));
+    if ms / 1000 < 60 {
+        return s;
     }
-    let s = if secs < 3_600 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    } else if secs < 86_400 {
-        format!("{}h{:02}m", secs / 3_600, (secs % 3_600) / 60)
-    } else {
-        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3_600)
-    };
     format!("{s:>ELAPSED_MIN_WIDTH$}")
 }
 

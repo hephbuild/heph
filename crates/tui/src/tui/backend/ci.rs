@@ -22,7 +22,7 @@ pub async fn run<A: App + 'static>(
     // Shared with the app's request state so we can wait for fire-and-forget
     // sandbox cleanups to drain before returning (and tearing down the runtime /
     // exiting the process out from under the cleaner thread).
-    let bg_pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bg_pending = hcore::pending::Pending::new_counter();
     let ctx = AppContext::direct(sink, Some(event_tx), std::sync::Arc::clone(&bg_pending));
     // App runs on its own task, as on the interactive backend. Sharing one task
     // with the loop below means every synchronous stretch inside the app — a
@@ -100,24 +100,37 @@ pub async fn run<A: App + 'static>(
     // we never abandon a push that is still making progress — each one carries its
     // own deadline).
     //
-    // Report while waiting. There is no TUI here, so a silent poll makes a long
-    // drain indistinguishable from a hang: the run prints its summary and then the
-    // process just sits there. Saying what is outstanding, and that the count is
-    // going down, is the difference between "uploading 400 revisions" and "heph is
-    // wedged".
-    let started = std::time::Instant::now();
+    drain_background(&bg_pending).await;
+
+    result
+}
+
+/// Wait for `pending` to reach zero, waking on the last decrement rather than
+/// polling — the poll put up to one interval on the exit of every run that had
+/// any background work.
+///
+/// Report while waiting. There is no TUI here, so a silent wait makes a long
+/// drain indistinguishable from a hang: the run prints its summary and then the
+/// process just sits there. Saying what is outstanding, and that the count is
+/// going down, is the difference between "uploading 400 revisions" and "heph is
+/// wedged".
+async fn drain_background(pending: &hcore::pending::Pending) {
+    use std::sync::atomic::Ordering;
+    let started = tokio::time::Instant::now();
     let mut next_report = started + DRAIN_REPORT_EVERY;
     let mut announced = false;
-    while bg_pending.load(std::sync::atomic::Ordering::Acquire) > 0 {
-        tokio::time::sleep(DRAIN_POLL).await;
-        if std::time::Instant::now() >= next_report {
-            next_report += DRAIN_REPORT_EVERY;
-            tracing::info!(
-                pending = bg_pending.load(std::sync::atomic::Ordering::Acquire),
-                elapsed_secs = started.elapsed().as_secs(),
-                "waiting for background cache uploads, history trims and sandbox cleanup to finish",
-            );
-            announced = true;
+    loop {
+        tokio::select! {
+            () = pending.wait_drained() => break,
+            () = tokio::time::sleep_until(next_report) => {
+                next_report += DRAIN_REPORT_EVERY;
+                tracing::info!(
+                    pending = pending.load(Ordering::Acquire),
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "waiting for background cache uploads, history trims and sandbox cleanup to finish",
+                );
+                announced = true;
+            }
         }
     }
     if announced {
@@ -126,13 +139,7 @@ pub async fn run<A: App + 'static>(
             "background work drained",
         );
     }
-
-    result
 }
-
-/// Poll interval for the background-work drain. Short because most runs drain
-/// almost immediately — cleanups are brief rmdirs.
-const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// How often the drain reports what it is still waiting on. Long enough that a
 /// normal run says nothing at all, short enough that a slow drain never looks like
@@ -156,9 +163,51 @@ mod tests {
     const FOLD_DEADLINE: Duration = Duration::from_secs(5);
 
     /// How long `Behavior::LeavesBackgroundWork` keeps its ticket outstanding.
-    /// Comfortably above the backend's 10 ms `DRAIN_POLL` so "did `run` wait?" is
-    /// not a scheduler coin flip.
+    /// Long enough that "did `run` wait?" is not a scheduler coin flip.
     const BG_WORK_DELAY: Duration = Duration::from_millis(150);
+
+    /// The exit drain wakes on the decrement, not on a poll timer: under paused
+    /// time, a `run` whose background work finishes without any timer firing
+    /// returns with the virtual clock unmoved. The 10 ms poll this replaced
+    /// always advanced it by at least one interval.
+    #[tokio::test(start_paused = true)]
+    async fn drain_wakes_on_the_last_decrement_not_a_poll() {
+        let pending = hcore::pending::Pending::new_counter();
+        pending.fetch_add(1, Ordering::AcqRel);
+        let bg = Arc::clone(&pending);
+        let job = tokio::spawn(async move {
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            bg.fetch_sub(1, Ordering::AcqRel);
+        });
+        let started = tokio::time::Instant::now();
+        drain_background(&pending).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        job.await.expect("job");
+    }
+
+    /// The progress report still fires on its period while the drain waits, and
+    /// the drain still holds until the count reaches zero.
+    #[tokio::test(start_paused = true)]
+    async fn drain_keeps_waiting_and_reporting_while_work_is_outstanding() {
+        let pending = hcore::pending::Pending::new_counter();
+        pending.fetch_add(1, Ordering::AcqRel);
+        let bg = Arc::clone(&pending);
+        let finish_at = DRAIN_REPORT_EVERY * 2 + Duration::from_millis(1);
+        let job = tokio::spawn(async move {
+            tokio::time::sleep(finish_at).await;
+            bg.fetch_sub(1, Ordering::AcqRel);
+        });
+        let started = tokio::time::Instant::now();
+        drain_background(&pending).await;
+        assert_eq!(
+            started.elapsed(),
+            finish_at,
+            "returned exactly at the decrement"
+        );
+        job.await.expect("job");
+    }
 
     fn result_start(addr: &str) -> BuildEvent {
         BuildEvent {

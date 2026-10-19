@@ -47,4 +47,5 @@ host = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:hdriver-support", "dep:hp
 
 [dev-dependencies]
 futures = "0.3.32"
+tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
