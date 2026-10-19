@@ -368,6 +368,32 @@ impl Lsp {
         }
     }
 
+    fn close(&mut self, doc: &Doc) {
+        self.notify(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": doc.uri}}),
+        );
+    }
+
+    /// Round-trip one request, so every notification the server sent before
+    /// handling it has been collected.
+    fn barrier(&mut self) {
+        let uri = self.uri("__barrier__/BUILD");
+        self.request(
+            "textDocument/hover",
+            json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}}),
+        );
+    }
+
+    /// The diagnostics most recently published for `doc`.
+    fn last_diagnostics(&self, doc: &Doc) -> Option<Vec<Value>> {
+        self.diagnostics
+            .iter()
+            .rev()
+            .find(|d| d["uri"] == json!(doc.uri))
+            .map(|d| d["diagnostics"].as_array().cloned().unwrap_or_default())
+    }
+
     fn at(&self, doc: &Doc) -> Value {
         json!({"textDocument": {"uri": doc.uri}, "position": doc.position()})
     }
@@ -732,4 +758,62 @@ fn colon_trigger_completes_only_in_address_shaped_strings() {
     let doc = lsp.open("BUILD", "x = [\"//lib:│\"]\n");
     let result = lsp.completion(&doc);
     assert!(has(&result, "//lib:util"), "{result}");
+}
+
+// ---------------------------------------------------------------------------
+// Vendored parity: what the stock server did, the vendored modules keep doing,
+// except where the vendored crate's NOTICE lists a fix.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parity_local_symbol_goto() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "NAME = \"x\"\n\ntarget(name = NA│ME)\n");
+    let found = targets(&lsp.definition(&doc));
+    assert_eq!(found, vec![(doc.uri.clone(), 0)], "the assignment line");
+}
+
+#[test]
+fn parity_loaded_file_goto() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/BUILD", "def make_name(s):\n    return s\n");
+    let doc = lsp.open("BUILD", "load(\"//l│ib\", \"make_name\")\n");
+    let found = targets(&lsp.definition(&doc));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].0.ends_with("/lib/BUILD"),
+        "the loaded file: {found:?}"
+    );
+}
+
+#[test]
+fn parity_diagnostics_published_and_cleared_on_close() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "target(name = \n");
+    lsp.barrier();
+    let published = lsp.last_diagnostics(&doc).expect("diagnostics published");
+    assert!(!published.is_empty(), "the parse error is published");
+    lsp.close(&doc);
+    lsp.barrier();
+    let cleared = lsp
+        .last_diagnostics(&doc)
+        .expect("diagnostics re-published");
+    assert!(cleared.is_empty(), "closing clears them: {cleared:?}");
+}
+
+#[test]
+fn parity_builtin_hover() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "x = l│en([1])\n");
+    let text = hover_text(&lsp.hover(&doc));
+    assert!(text.contains("len"), "the builtin's doc: {text}");
+}
+
+#[test]
+fn parity_string_completion() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/BUILD", "def make_name(s):\n    return s\n");
+    let doc = lsp.open("BUILD", "load(\"//│\", \"make_name\")\n");
+    let result = lsp.completion(&doc);
+    assert!(has(&result, "//lib"), "package paths complete: {result}");
 }
