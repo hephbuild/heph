@@ -1297,6 +1297,17 @@ impl hplugin::lsp::LspEngine for Engine {
         Engine::driver_names(self)
     }
 
+    fn provider_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .providers_by_name
+            .iter()
+            .filter(|(_, p)| p.provider.state_schema().is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     fn provider_state_schema(&self, name: &str) -> Option<provider::StateSchema> {
         Engine::provider_state_schema(self, name)
     }

@@ -12,11 +12,11 @@
 use crate::pluginbuildfile::run_file::RunResult;
 use hplugin::lsp::LspEngine;
 use hplugin::provider::ProvenanceFrame;
-use starlark_lsp::server::LspUri;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use vendored_starlark_lsp::server::LspUri;
 
 /// A 1-based source span within a single file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,7 +51,9 @@ pub(crate) struct CallTargets {
     pub addrs: Vec<String>,
 }
 
-/// Everything the proxy needs to answer position-based requests for one document.
+/// What the evaluation contributes for one document. It enriches answers (the
+/// "Targets" hover, an undocumented `def`'s signature) and never gates them:
+/// the site, the shadowing and the loaded names come from the resolver.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DocIndex {
     pub call_targets: Vec<CallTargets>,
@@ -59,29 +61,15 @@ pub(crate) struct DocIndex {
     /// or imported via `load`), keyed by name. Used to synthesize a signature
     /// tooltip for undocumented functions, which the stock server skips.
     pub defs: std::collections::HashMap<String, String>,
-    /// Symbols imported via `load`, keyed by their local name → (load path,
-    /// exported name in the loaded package). Drives cross-file goto-definition:
-    /// heph merges every BUILD file in a package, but the stock server only parses
-    /// one, so we resolve loaded symbols across all of them ourselves.
-    pub loaded: HashMap<String, (String, String)>,
     /// The buffer's source text, for extracting the identifier under the cursor.
     pub source: String,
 }
 
 impl DocIndex {
-    /// An index for a buffer that didn't parse or evaluate — the user is
-    /// mid-edit, or the file has an error the engine rejects. Carries the
-    /// buffer text (so prefix-based completion/hover still see the current
-    /// source) and the `load(...)` imports, which are read textually and so
-    /// cost nothing an evaluation would have paid for.
-    ///
-    /// Keeping `loaded` here is what makes cross-file goto-definition survive a
-    /// broken buffer: an unknown key on a macro call fails the whole
-    /// evaluation, and a jump-to-definition that stops working exactly when the
-    /// user is trying to fix the file is the worst moment to lose it.
+    /// An index for a buffer that didn't evaluate — the user is mid-edit, or
+    /// the file has an error the engine rejects. No provenance, no docs.
     pub(crate) fn unevaluated(source: String) -> DocIndex {
         DocIndex {
-            loaded: parse_load_symbols(&source),
             source,
             ..DocIndex::default()
         }
@@ -91,7 +79,6 @@ impl DocIndex {
     /// (used to format `//pkg:name` addresses); `source` is the buffer text.
     pub(crate) fn build(result: &RunResult, pkg: &str, source: String) -> DocIndex {
         let defs = function_docs(result);
-        let loaded = parse_load_symbols(&source);
         // Aggregate addresses per unique call-site span. BTreeMap keeps a stable
         // order and dedups identical spans (e.g. a loop body line that produced
         // several targets).
@@ -119,18 +106,8 @@ impl DocIndex {
         DocIndex {
             call_targets,
             defs,
-            loaded,
             source,
         }
-    }
-
-    /// The load path and exported name for the loaded symbol at the 1-based
-    /// position, if the identifier under the cursor was imported via `load`.
-    pub(crate) fn loaded_symbol_at(&self, line: u32, col: u32) -> Option<(&str, &str)> {
-        let word = word_at(&self.source, line, col)?;
-        self.loaded
-            .get(word)
-            .map(|(path, exported)| (path.as_str(), exported.as_str()))
     }
 
     /// Rendered hover for the function named by the identifier at the 1-based
@@ -179,70 +156,6 @@ fn function_docs(result: &RunResult) -> HashMap<String, String> {
     out
 }
 
-/// Parse `load(...)` statements out of the source, mapping each imported local
-/// name to `(load path, exported name)`. Handles positional imports
-/// (`load("//p", "sym")` → local == exported == `sym`) and aliased ones
-/// (`load("//p", alias = "sym")` → local `alias`, exported `sym`). A best-effort
-/// textual scan — load statements are simple, single-line in practice.
-fn parse_load_symbols(source: &str) -> HashMap<String, (String, String)> {
-    let mut out = HashMap::new();
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("load(") else {
-            continue;
-        };
-        let Some(close) = rest.find(')') else {
-            continue;
-        };
-        let Some(args) = rest.get(..close) else {
-            continue;
-        };
-        // Split on commas (symbol/path strings never contain commas).
-        let mut parts = args.split(',');
-        let Some(path) = parts.next().and_then(unquote) else {
-            continue;
-        };
-        for part in parts {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            match part.split_once('=') {
-                // `alias = "exported"`
-                Some((local, exported)) => {
-                    let local = local.trim();
-                    if let Some(exported) = unquote(exported)
-                        && !local.is_empty()
-                    {
-                        out.insert(local.to_string(), (path.clone(), exported));
-                    }
-                }
-                // positional `"sym"` — local name equals exported name
-                None => {
-                    if let Some(sym) = unquote(part) {
-                        out.insert(sym.clone(), (path.clone(), sym));
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Strip surrounding single or double quotes from a trimmed token.
-fn unquote(s: &str) -> Option<String> {
-    let s = s.trim();
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2
-        && (bytes.first() == Some(&b'"') || bytes.first() == Some(&b'\''))
-        && bytes.last() == bytes.first()
-    {
-        s.get(1..s.len() - 1).map(str::to_string)
-    } else {
-        None
-    }
-}
-
 /// The identifier (ASCII alphanumeric + `_`) under the 1-based `(line, col)` in
 /// `source`. Returns `None` when the cursor isn't on an identifier character —
 /// Starlark identifiers are ASCII, so byte indexing is safe here.
@@ -283,6 +196,12 @@ pub(crate) struct SharedState {
     /// site names.
     pub builtin_hovers: crate::pluginbuildfile::run_file::BuiltinHovers,
     docs: Mutex<HashMap<LspUri, DocIndex>>,
+    /// The name sets of each document's last good parse (D3).
+    overlays: Mutex<HashMap<LspUri, Arc<super::site::Overlay>>>,
+    /// The token array the loop just built for a document, handed to the
+    /// parse it is about to run so the text is lexed once per edit. Present
+    /// only while an open document is being parsed.
+    staged: Mutex<HashMap<LspUri, Arc<super::lex::Tokens>>>,
 }
 
 impl SharedState {
@@ -300,6 +219,8 @@ impl SharedState {
             core_members,
             builtin_hovers,
             docs: Mutex::new(HashMap::new()),
+            overlays: Mutex::new(HashMap::new()),
+            staged: Mutex::new(HashMap::new()),
         })
     }
 
@@ -309,6 +230,43 @@ impl SharedState {
 
     pub(crate) fn index(&self, uri: &LspUri) -> Option<DocIndex> {
         self.docs.lock().expect("docs lock").get(uri).cloned()
+    }
+
+    /// Drop `uri`'s index: the document was closed.
+    pub(crate) fn set_overlay(&self, uri: LspUri, overlay: super::site::Overlay) {
+        self.overlays
+            .lock()
+            .expect("overlays lock")
+            .insert(uri, Arc::new(overlay));
+    }
+
+    pub(crate) fn stage_tokens(&self, uri: LspUri, tokens: Arc<super::lex::Tokens>) {
+        self.staged.lock().expect("staged lock").insert(uri, tokens);
+    }
+
+    /// The tokens staged for `uri`, if an open document's parse is running;
+    /// `None` for a file read from disk for the stock analysis.
+    pub(crate) fn take_tokens(&self, uri: &LspUri) -> Option<Arc<super::lex::Tokens>> {
+        self.staged.lock().expect("staged lock").remove(uri)
+    }
+
+    pub(crate) fn overlay(&self, uri: &LspUri) -> Option<Arc<super::site::Overlay>> {
+        self.overlays
+            .lock()
+            .expect("overlays lock")
+            .get(uri)
+            .cloned()
+    }
+
+    pub(crate) fn remove(&self, uri: &LspUri) {
+        self.docs.lock().expect("docs lock").remove(uri);
+        self.overlays.lock().expect("overlays lock").remove(uri);
+    }
+
+    /// How many documents have an index (test support: closing frees them).
+    #[cfg(feature = "test-support")]
+    pub(crate) fn len(&self) -> usize {
+        self.docs.lock().expect("docs lock").len()
     }
 }
 
@@ -387,11 +345,17 @@ target(name = \"direct\", driver = \"exec\")
     }
 
     #[test]
-    fn parse_load_symbols_handles_positional_and_aliased() {
-        let src = r#"load("//lib", "make_name", greeting = "GREETING")
-load("//other", "x")
-"#;
-        let m = super::parse_load_symbols(src);
+    fn overlay_reads_positional_and_aliased_loads_from_the_ast() {
+        let src = "load(\"//lib\", \"make_name\", greeting = \"GREETING\")\n\
+                   load(\"//other\", \"x\")\n\
+                   load(\"//multi\",\n    \"a\",\n    \"b\",\n)\n";
+        let ast = starlark::syntax::AstModule::parse(
+            "BUILD",
+            src.to_string(),
+            &starlark::syntax::Dialect::Extended,
+        )
+        .unwrap();
+        let m = super::super::site::overlay_of(&ast).loaded;
         // positional: local == exported
         assert_eq!(
             m.get("make_name"),
@@ -403,19 +367,8 @@ load("//other", "x")
             Some(&("//lib".to_string(), "GREETING".to_string()))
         );
         assert_eq!(m.get("x"), Some(&("//other".to_string(), "x".to_string())));
-    }
-
-    #[test]
-    fn unevaluated_index_still_resolves_loaded_symbols() {
-        // No evaluation happened, so there is no provenance — but the load
-        // imports are textual, and goto-definition depends on them.
-        let index = DocIndex::unevaluated(
-            "load(\"//lib\", \"make_name\")\ntarget(name = make_name(\"t\"))\n".to_string(),
-        );
-        assert!(index.call_targets.is_empty());
-        assert_eq!(index.loaded_symbol_at(1, 18), Some(("//lib", "make_name")));
-        // The usage on line 2 resolves to the same import.
-        assert_eq!(index.loaded_symbol_at(2, 16), Some(("//lib", "make_name")));
+        // A load split over lines, which the old line-by-line scan missed.
+        assert_eq!(m.get("b"), Some(&("//multi".to_string(), "b".to_string())));
     }
 
     #[test]

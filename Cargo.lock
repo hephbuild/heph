@@ -4997,18 +4997,19 @@ dependencies = [
  "model",
  "once_cell",
  "plugin",
+ "plugin-buildfile",
  "plugin-query",
  "proc",
  "serde",
  "serde_json",
  "serde_yaml",
  "starlark",
- "starlark_lsp",
+ "starlark_syntax",
  "strsim 0.11.1",
  "tempfile",
  "tokio",
- "tower-lsp-server",
  "tracing",
+ "vendored-starlark-lsp",
  "walk",
  "xstarlark-fmt",
 ]
@@ -6867,27 +6868,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "starlark_lsp"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61e9b7fc7aa19aa7a21b04450a0ee246eb67cd3712d3b8c2ab95572d438d7a89"
-dependencies = [
- "anyhow",
- "derivative",
- "derive_more 1.0.0",
- "dupe",
- "itertools 0.14.0",
- "lsp-server",
- "lsp-types",
- "serde",
- "serde_json",
- "starlark",
- "starlark_syntax",
- "thiserror 2.0.21",
- "tower-lsp-server",
-]
-
-[[package]]
 name = "starlark_map"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7525,27 +7505,6 @@ name = "tower-layer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
-
-[[package]]
-name = "tower-lsp-server"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88f3f8ec0dcfdda4d908bad2882fe0f89cf2b606e78d16491323e918dfa95765"
-dependencies = [
- "bytes",
- "dashmap",
- "futures",
- "httparse",
- "lsp-types",
- "memchr",
- "percent-encoding",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
-]
 
 [[package]]
 name = "tower-service"
@@ -8484,6 +8443,25 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vendored-starlark-lsp"
+version = "0.14.2"
+dependencies = [
+ "anyhow",
+ "derivative",
+ "derive_more 1.0.0",
+ "dupe",
+ "itertools 0.14.0",
+ "lsp-types",
+ "regex",
+ "serde",
+ "serde_json",
+ "starlark",
+ "starlark_syntax",
+ "textwrap",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "version_check"

@@ -1922,7 +1922,8 @@ pub(crate) fn check_function_refs(
     ast: &AstModule,
     registry: &FunctionRegistry,
 ) -> anyhow::Result<()> {
-    use crate::pluginbuildfile::lsp::diagnostics::{bound_names, walk_expr};
+    use crate::pluginbuildfile::lsp::diagnostics::walk_expr;
+    use crate::pluginbuildfile::lsp::site::bound_names;
     use starlark::syntax::ast::Expr;
 
     if bound_names(ast).contains("heph") {

@@ -144,6 +144,19 @@ Read `docs/TEMPLATE.md` before touching it. The one thing to know going in:
 `vars` is hashed from a `BTreeMap` because it arrives as a `HashMap`, and
 hashing it in iteration order would move the def hash on every run.
 
+### The BUILD-file LSP
+
+`heph tool build-lsp` (`crates/plugin-buildfile/src/pluginbuildfile/lsp`) owns its
+loop and vendors `starlark_lsp`'s analysis modules (`crates/vendored-starlark-lsp`,
+divergences in its `NOTICE`).
+
+Read `docs/LSP.md` before touching it. The one thing to know going in: every
+heph answer derives from `site.rs`'s one classification of the cursor, computed
+from tokens so it holds on a broken document. A feature that scans the text
+itself, or depends on the file evaluating, brings back the bugs this design
+removed. A site kind ships with its editor-shaped test in `tests/lsp.rs`.
+`heph tool build-lsp --explain FILE:LINE:COL` prints the classification.
+
 ### `heph-bench` — perf-regression harness
 
 `crates/bench-corpus` (deterministic synthetic corpus generator) + `crates/bench` (`heph-bench` binary: `corpus`/`run inprocess`/`run dist`/`compare`). Times `heph` scenarios in-process (Tier A, no process spawn, no plugin cdylib) or against the real prebuilt binary + plugin cdylib (Tier B, the seam only a real `dlopen` can exercise), then decides regression from a baseline-vs-candidate comparison.

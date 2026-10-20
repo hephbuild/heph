@@ -20,14 +20,14 @@ use starlark::docs::DocModule;
 use starlark::environment::Globals;
 use starlark::errors::EvalMessage;
 use starlark::syntax::{AstModule, Dialect};
-use starlark_lsp::completion::{StringCompletionResult, StringCompletionType};
-use starlark_lsp::error::eval_message_to_lsp_diagnostic;
-use starlark_lsp::server::{LspContext, LspEvalResult, LspUri, StringLiteralResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tower_lsp_server::UriExt as _;
+use vendored_starlark_lsp::completion::{StringCompletionResult, StringCompletionType};
+use vendored_starlark_lsp::error::eval_message_to_lsp_diagnostic;
+use vendored_starlark_lsp::server::{LspContext, LspEvalResult, LspUri, StringLiteralResult};
+use vendored_starlark_lsp::uri::file_path_to_uri;
 
 /// How long a listing provider (and its internal package/target memoization) is
 /// reused before being rebuilt. Bursts of completion requests (keystrokes) within
@@ -82,6 +82,11 @@ impl HephLspContext {
             runtime,
             shared,
         }
+    }
+
+    /// The documentation of the global `name` (a builtin), if it has any.
+    pub(crate) fn doc_global(&self, name: &str) -> Option<&starlark::docs::DocItem> {
+        self.doc_globals.members.get(name)
     }
 
     /// The listing provider, rebuilt if older than [`LISTING_TTL`]. Reuse within
@@ -149,7 +154,7 @@ impl HephLspContext {
     }
 
     /// List package names beginning with `prefix` (no leading `//`).
-    fn list_packages(&self, prefix: &str) -> Vec<String> {
+    pub(crate) fn list_packages(&self, prefix: &str) -> Vec<String> {
         let provider = self.provider();
         let ctoken = StdCancellationToken::new();
         let fut = provider.list_packages(
@@ -182,7 +187,7 @@ impl HephLspContext {
     }
 
     /// List target names in `package`.
-    fn list_targets(&self, package: &str) -> Vec<String> {
+    pub(crate) fn list_targets(&self, package: &str) -> Vec<String> {
         let provider = self.provider();
         let ctoken = StdCancellationToken::new();
         let fut = provider.list(
@@ -209,7 +214,7 @@ impl HephLspContext {
     /// The on-disk BUILD file URL for a package.
     fn build_file_url(&self, package: &str) -> Option<LspUri> {
         let path = first_build_file(&self.root.join(package), &self.patterns)?;
-        lsp_types::Uri::from_file_path(path).and_then(|u| LspUri::try_from(u).ok())
+        file_path_to_uri(&path).and_then(|u| LspUri::try_from(u).ok())
     }
 }
 
@@ -256,17 +261,21 @@ impl LspContext for HephLspContext {
             _ => return LspEvalResult::default(),
         };
         let filename = path.to_string_lossy().to_string();
+        // An open document's parse comes with the tokens the loop just built;
+        // a file read from disk for the stock analysis (a loaded file, say)
+        // comes without, and gets an AST and nothing else: no index, no
+        // overlay, no evaluation, so memory stays bounded by open documents.
+        let staged = self.shared.take_tokens(uri);
 
-        // Parse the AST for starlark_lsp (symbols, hover, goto); parse errors
-        // become diagnostics.
+        // Parse the AST for the stock analysis (symbols, hover, goto); parse
+        // errors become diagnostics.
         let ast = match AstModule::parse(&filename, content.clone(), &Dialect::Extended) {
             Ok(ast) => ast,
             Err(e) => {
-                // Keep the (unparseable) buffer source so prefix-based completion
-                // and hover still work while the user is typing (`heph.` etc.),
-                // and its `load(...)` imports so goto-definition still resolves.
-                self.shared
-                    .set_index(uri.clone(), DocIndex::unevaluated(content));
+                if staged.is_some() {
+                    self.shared
+                        .set_index(uri.clone(), DocIndex::unevaluated(content));
+                }
                 return LspEvalResult {
                     diagnostics: vec![eval_message_to_lsp_diagnostic(EvalMessage::from_error(
                         &path, &e,
@@ -275,11 +284,29 @@ impl LspContext for HephLspContext {
                 };
             }
         };
+        let Some(tokens) = staged else {
+            return LspEvalResult {
+                diagnostics: Vec::new(),
+                ast: Some(ast),
+            };
+        };
+
+        // The name sets the resolver overlays on the tokens (D3): kept until
+        // the next good parse replaces them.
+        let overlay = super::site::overlay_of(&ast);
 
         // Static validation of `target` / `provider_state` keyword arguments
         // against the engine's schemas (unknown key / wrong type → red squiggle).
-        // Runs off the parsed AST, so it works mid-edit without a full eval.
-        let diagnostics = super::diagnostics::validate(&ast, &*self.shared.engine);
+        // Runs off the parsed AST, so it works mid-edit without a full eval;
+        // shadowing and driver selection come from the resolver's helpers.
+        let doc = super::site::Doc {
+            text: &content,
+            tokens: &tokens,
+            overlay: Some(&overlay),
+            ast: super::site::AstState::Current,
+        };
+        let diagnostics = super::diagnostics::validate(&ast, &doc, &*self.shared.engine);
+        self.shared.set_overlay(uri.clone(), overlay);
 
         // Best-effort evaluation to populate the provenance / driver index. A
         // half-typed buffer (or one the engine rejects — an unknown key on a
@@ -325,8 +352,7 @@ impl LspContext for HephLspContext {
         } else {
             resolved
         };
-        let uri = lsp_types::Uri::from_file_path(&file)
-            .ok_or_else(|| "non-file load path".to_string())?;
+        let uri = file_path_to_uri(&file).ok_or_else(|| "non-file load path".to_string())?;
         LspUri::try_from(uri).map_err(|e| e.to_string())
     }
 
@@ -483,6 +509,9 @@ mod tests {
         fn driver_names(&self) -> Vec<String> {
             Vec::new()
         }
+        fn provider_names(&self) -> Vec<String> {
+            Vec::new()
+        }
         fn provider_state_schema(&self, _name: &str) -> Option<StateSchema> {
             None
         }
@@ -537,8 +566,8 @@ mod tests {
     ///
     /// An unknown key on a macro call is an eval error, and the index built from
     /// a failed eval carries no provenance — but the `load(...)` imports that
-    /// drive cross-file goto-definition are read from the source text, so they
-    /// must still be there. Losing the jump exactly while the user is fixing the
+    /// drive cross-file goto-definition are read from the parse, so they must
+    /// still be there. Losing the jump exactly while the user is fixing the
     /// error is the worst moment to lose it.
     #[test]
     fn loaded_symbols_survive_a_buffer_that_fails_to_evaluate() {
@@ -558,6 +587,9 @@ mod tests {
         // with it — the same shape as any other error in the file.
         let content = "load(\"//lib\", \"make_name\")\n\ntarget(name = make_name(\"t\"))\n";
         let uri = super::LspUri::File(dir.path().join("BUILD"));
+        // An open document: the loop stages its tokens before the parse.
+        ctx.shared
+            .stage_tokens(uri.clone(), Arc::new(super::super::lex::lex(content)));
         let result = ctx.parse_file_with_contents(&uri, content.to_string());
         assert!(
             result.ast.is_some(),
@@ -569,10 +601,11 @@ mod tests {
             index.call_targets.is_empty(),
             "a failed eval yields no provenance"
         );
-        // Line 1, over the `make_name` inside the load statement.
+        // The loaded names come from the parse, not the evaluation.
+        let overlay = ctx.shared.overlay(&uri).expect("overlay");
         assert_eq!(
-            index.loaded_symbol_at(1, 18),
-            Some(("//lib", "make_name")),
+            overlay.loaded.get("make_name"),
+            Some(&("//lib".to_string(), "make_name".to_string())),
             "the loaded symbol must still resolve for goto-definition"
         );
     }
