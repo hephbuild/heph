@@ -30,6 +30,7 @@
 //! a call against the builtin's schema would underline valid code, so a
 //! shadowed name is skipped entirely.
 
+use super::site::{self, Doc};
 use crate::pluginbuildfile::run_file::target_base_fields;
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::ParamType;
@@ -37,9 +38,7 @@ use hplugin::lsp::LspEngine;
 use lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use starlark::codemap::Span;
 use starlark::syntax::AstModule;
-use starlark::syntax::ast::{
-    Argument, AssignTarget, AstArgument, AstAssignTarget, AstExpr, AstLiteral, AstStmt, Expr, Stmt,
-};
+use starlark::syntax::ast::{Argument, AstArgument, AstExpr, AstLiteral, Expr};
 use std::collections::{HashMap, HashSet};
 
 /// Which recognized builtin a call site is.
@@ -50,9 +49,12 @@ enum Callee {
 
 /// Validate every `target(...)` / `provider_state(...)` call in `ast`, returning a
 /// diagnostic per invalid keyword argument (unknown key or type mismatch).
-pub(crate) fn validate(ast: &AstModule, engine: &dyn LspEngine) -> Vec<Diagnostic> {
+///
+/// Shadowing and the selected driver/provider come from the site resolver's
+/// helpers over the same document (`doc`), so diagnostics, hover and
+/// completion never disagree about either.
+pub(crate) fn validate(ast: &AstModule, doc: &Doc<'_>, engine: &dyn LspEngine) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    let shadowed = bound_names(ast);
     // `Stmt::visit_expr` yields each top-level expression across all nested
     // statements; `walk_expr` then descends into sub-expressions, so nested calls
     // (e.g. inside a list or another call) are covered too.
@@ -64,7 +66,7 @@ pub(crate) fn validate(ast: &AstModule, engine: &dyn LspEngine) -> Vec<Diagnosti
                 let name = id.node.ident.as_str();
                 // The buffer's own `target`/`provider_state`, not heph's — its
                 // signature is unknown here, so there is nothing to check against.
-                if shadowed.contains(name) {
+                if site::is_rebound(doc.overlay, name) {
                     return;
                 }
                 let callee = match name {
@@ -72,7 +74,16 @@ pub(crate) fn validate(ast: &AstModule, engine: &dyn LspEngine) -> Vec<Diagnosti
                     "provider_state" => Callee::ProviderState,
                     _ => return,
                 };
-                check_call(ast, engine, callee_expr.span, &args.args, callee, &mut out);
+                let selected = site::selected_after(doc, callee_expr.span.end().get() as usize);
+                check_call(
+                    ast,
+                    engine,
+                    callee_expr.span,
+                    &args.args,
+                    callee,
+                    selected,
+                    &mut out,
+                );
             }
         });
     });
@@ -86,67 +97,15 @@ pub(crate) fn walk_expr<'a>(e: &'a AstExpr, f: &mut impl FnMut(&'a AstExpr)) {
     e.visit_expr(|child| walk_expr(child, f));
 }
 
-/// Visit `s` and every statement nested within it.
-fn walk_stmt<'a>(s: &'a AstStmt, f: &mut impl FnMut(&'a AstStmt)) {
-    f(s);
-    // `Stmt::visit_stmt` is one level deep; recurse to reach the whole subtree.
-    s.visit_stmt(|child| walk_stmt(child, f));
-}
-
-/// Every name the module binds: `def`s and their parameters, assignment and loop
-/// targets, and `load(...)` imports.
-///
-/// Deliberately flat — a name bound anywhere counts as bound everywhere, with no
-/// scope tracking. Over-approximating errs toward silence, which is this
-/// module's rule for anything it cannot resolve exactly, and the alternative
-/// (a real scope analysis) would buy nothing: a buffer that defines its own
-/// `target` almost certainly means it at every call site.
-pub(crate) fn bound_names(ast: &AstModule) -> HashSet<&str> {
-    let mut names = HashSet::new();
-    walk_stmt(ast.statement(), &mut |s| match &s.node {
-        Stmt::Def(def) => {
-            names.insert(def.name.node.ident.as_str());
-            names.extend(
-                def.params
-                    .iter()
-                    .filter_map(|p| p.ident())
-                    .map(|i| i.node.ident.as_str()),
-            );
-        }
-        Stmt::Load(load) => {
-            names.extend(load.args.iter().map(|a| a.local.node.ident.as_str()));
-        }
-        Stmt::Assign(assign) => collect_assign_target(&assign.lhs, &mut names),
-        Stmt::AssignModify(target, _, _) => collect_assign_target(target, &mut names),
-        Stmt::For(for_stmt) => collect_assign_target(&for_stmt.var, &mut names),
-        _ => {}
-    });
-    names
-}
-
-/// Add the identifiers an assignment or loop target binds (`a`, `a, b`, `[a, b]`).
-/// Index and attribute targets (`a[0] = …`, `a.b = …`) mutate an existing
-/// binding rather than introducing one, so they bind nothing.
-fn collect_assign_target<'a>(target: &'a AstAssignTarget, names: &mut HashSet<&'a str>) {
-    match &target.node {
-        AssignTarget::Identifier(id) => {
-            names.insert(id.node.ident.as_str());
-        }
-        AssignTarget::Tuple(items) => {
-            for item in items {
-                collect_assign_target(item, names);
-            }
-        }
-        AssignTarget::Index(_) | AssignTarget::Dot(_, _) => {}
-    }
-}
-
+/// `selected` is the call's string-literal `driver = "…"` (or `provider =
+/// "…"`), as the site resolver reads it.
 fn check_call(
     ast: &AstModule,
     engine: &dyn LspEngine,
     callee_span: Span,
     args: &[AstArgument],
     callee: Callee,
+    selected: Option<String>,
     out: &mut Vec<Diagnostic>,
 ) {
     // The known fields (name, type, required). Base fields (`target`'s
@@ -174,7 +133,8 @@ fn check_call(
             // resolved from a string-literal `driver=`. Without it (or with an
             // unknown driver) any extra key might be a valid driver field, and
             // we can't tell whether the driver's required fields are missing.
-            match named_str_literal(args, "driver")
+            match selected
+                .clone()
                 .and_then(|d| engine.driver_schema(&d).map(|s| (d, s)))
             {
                 Some((driver, schema)) => {
@@ -199,7 +159,8 @@ fn check_call(
             // `provider` is always a valid (string) key, and required.
             known.push(("provider".to_string(), ParamType::String, true));
             base_count = known.len();
-            match named_str_literal(args, "provider")
+            match selected
+                .clone()
                 .and_then(|p| engine.provider_state_schema(&p).map(|s| (p, s)))
             {
                 Some((provider, schema)) => {
@@ -286,19 +247,6 @@ fn check_call(
             }
         }
     }
-}
-
-/// The string value of the `key = "…"` keyword argument, when present with a
-/// string-literal value; `None` otherwise (missing, or a non-literal value whose
-/// driver/provider we can't statically resolve).
-fn named_str_literal(args: &[AstArgument], key: &str) -> Option<String> {
-    args.iter().find_map(|a| match &a.node {
-        Argument::Named(name, value) if name.node == key => match &value.node {
-            Expr::Literal(AstLiteral::String(s)) => Some(s.node.clone()),
-            _ => None,
-        },
-        _ => None,
-    })
 }
 
 /// The [`Value`] of a literal expression, or `None` when the expression isn't a
@@ -456,6 +404,9 @@ mod tests {
         fn driver_names(&self) -> Vec<String> {
             vec!["exec".to_string(), "shadow".to_string()]
         }
+        fn provider_names(&self) -> Vec<String> {
+            vec!["go".to_string()]
+        }
         fn provider_state_schema(&self, name: &str) -> Option<StateSchema> {
             (name == "go").then(|| StateSchema {
                 fields: vec![StateField {
@@ -471,9 +422,23 @@ mod tests {
         }
     }
 
-    fn messages(content: &str) -> Vec<String> {
+    /// Validate `content` the way the server does: its tokens and overlay
+    /// beside its AST.
+    fn validate_src(content: &str) -> Vec<lsp_types::Diagnostic> {
         let ast = AstModule::parse("BUILD", content.to_string(), &Dialect::Extended).unwrap();
-        validate(&ast, &FakeEngine)
+        let tokens = super::super::lex::lex(content);
+        let overlay = site::overlay_of(&ast);
+        let doc = Doc {
+            text: content,
+            tokens: &tokens,
+            overlay: Some(&overlay),
+            ast: site::AstState::Current,
+        };
+        validate(&ast, &doc, &FakeEngine)
+    }
+
+    fn messages(content: &str) -> Vec<String> {
+        validate_src(content)
             .into_iter()
             .map(|d| d.message)
             .collect()
@@ -659,8 +624,7 @@ mod tests {
         // The diagnostic must land on the `target` token (line 0), regardless
         // of which line the call's arguments span.
         let content = "target(\n    name = \"t\",\n    driver = \"exec\",\n)\n";
-        let ast = AstModule::parse("BUILD", content.to_string(), &Dialect::Extended).unwrap();
-        let diags = validate(&ast, &FakeEngine);
+        let diags = validate_src(content);
         let d = diags
             .iter()
             .find(|d| d.message.contains("missing required field `cmd`"))
@@ -698,8 +662,7 @@ mod tests {
     fn diagnostic_range_targets_the_offending_token() {
         // The unknown-key squiggle must land on the key, not the whole call.
         let content = "target(name = \"t\", driver = \"exec\", bogus = 1)\n";
-        let ast = AstModule::parse("BUILD", content.to_string(), &Dialect::Extended).unwrap();
-        let diags = validate(&ast, &FakeEngine);
+        let diags = validate_src(content);
         let d = diags
             .iter()
             .find(|d| d.message.contains("bogus"))
@@ -823,7 +786,7 @@ def fn_name(param, *args_param, **kwargs_param):
     pass
 ";
         let ast = AstModule::parse("BUILD", content.to_string(), &Dialect::Extended).unwrap();
-        let names = super::bound_names(&ast);
+        let names = site::bound_names(&ast);
         for expected in [
             "imported",
             "alias",

@@ -414,21 +414,28 @@ impl<T: LspContext> Backend<T> {
 
     /// Parse `text` as the new contents of `uri`: a successful parse replaces
     /// the last valid one, a failed one keeps it. Returns the diagnostics to
-    /// publish. Upstream's `did_open` / `did_change`, minus the notification.
-    pub fn validate(&self, uri: &LspUri, text: String) -> Vec<Diagnostic> {
+    /// publish and whether this text parsed. Upstream's `did_open` /
+    /// `did_change`, minus the notification.
+    pub fn validate(&self, uri: &LspUri, text: String) -> (Vec<Diagnostic>, bool) {
         let eval_result = self.context.parse_file_with_contents(uri, text);
+        let parsed = eval_result.ast.is_some();
         if let Some(ast) = eval_result.ast {
             let module = Arc::new(LspModule::new(ast));
             let mut last_valid_parse = self.last_valid_parse.write().unwrap();
             last_valid_parse.insert(uri.clone(), module);
         }
-        eval_result.diagnostics
+        (eval_result.diagnostics, parsed)
     }
 
     /// Forget `uri`'s parse. Upstream's `did_close`, minus the notification.
     pub fn close(&self, uri: &LspUri) {
         let mut last_valid_parse = self.last_valid_parse.write().unwrap();
         last_valid_parse.remove(uri);
+    }
+
+    /// How many documents hold a parse (heph's tests check closing frees it).
+    pub fn parsed_documents(&self) -> usize {
+        self.last_valid_parse.read().unwrap().len()
     }
 
     pub(crate) fn resolve_load_path(
