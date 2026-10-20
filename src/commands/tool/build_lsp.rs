@@ -9,9 +9,25 @@ use crate::tui::LogSink;
 /// Editors launch this directly (`heph tool build-lsp`). It
 /// speaks LSP JSON-RPC on stdin/stdout and runs until the client disconnects.
 #[derive(ClapArgs, Clone)]
-pub struct Args {}
+pub struct Args {
+    /// Instead of serving, print how the server classifies one position of a
+    /// BUILD file: the site, why heph's answer there would be empty, and what
+    /// a present answer could not do in full. Line and column are 1-based,
+    /// the column counted in characters.
+    #[arg(long, value_name = "FILE:LINE:COL")]
+    explain: Option<String>,
 
-pub fn execute(_args: &Args, _sink: LogSink, _global: &GlobalOptions) -> anyhow::Result<()> {
+    /// With `--explain`: print the classification as one JSON object.
+    #[arg(long, requires = "explain")]
+    json: bool,
+}
+
+pub fn execute(args: &Args, _sink: LogSink, _global: &GlobalOptions) -> anyhow::Result<()> {
+    if let Some(target) = &args.explain {
+        let out = crate::pluginbuildfile::lsp_explain(target, args.json)?;
+        println!("{out}");
+        return Ok(());
+    }
     // Engine construction spawns background tasks (signal/shutdown handlers), so
     // it must run inside a runtime context. The LSP itself is a blocking stdio
     // loop that owns its own lifecycle via the LSP shutdown/exit handshake, so we
