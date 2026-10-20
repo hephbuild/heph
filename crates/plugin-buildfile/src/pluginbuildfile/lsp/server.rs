@@ -327,6 +327,17 @@ fn hover_text(hover: &Hover) -> String {
     }
 }
 
+/// Whether a stock hover is nothing but headings. The stock renderer gives an
+/// undocumented global (`heph`) a level-one heading of its name and nothing
+/// else, and answers anywhere on a dotted chain with its root's hover, so the
+/// whole of `heph.fs.base(f).removesuffix(…)` showed a big `heph`.
+fn is_heading_only(md: &str) -> bool {
+    md.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .all(|l| l.starts_with('#'))
+}
+
 /// A located request: the document, the cursor's byte offset, and its
 /// resolution.
 struct Located {
@@ -731,7 +742,11 @@ impl Server<'_> {
             self.text_of(&located.key)
                 .map(|text| self.stock_range(r, &text))
         });
-        let mut md = stock.as_ref().map(hover_text).unwrap_or_default();
+        let mut md = stock
+            .as_ref()
+            .map(hover_text)
+            .filter(|md| !is_heading_only(md))
+            .unwrap_or_default();
         self.with_ctx(&located.key, reg, |ctx| {
             if md.is_empty()
                 && let Some(doc) = handlers::def_fallback(ctx, located.offset)

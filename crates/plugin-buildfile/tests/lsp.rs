@@ -790,6 +790,36 @@ fn hover_on_target_callee_shows_schema_for_selected_driver() {
     assert!(!text.contains("cmd"), "rebound: no schema: {text}");
 }
 
+/// The stock hover renders an undocumented global as its name in a level-one
+/// heading, and answers anywhere on a dotted chain with its root's hover. A
+/// hover that is only a heading says nothing, so none is sent.
+#[test]
+fn hover_that_is_only_a_heading_is_dropped() {
+    let mut lsp = Lsp::start();
+    for (path, src) in [
+        (
+            "root/BUILD",
+            "x = he│ph.fs.join(\"a\", \"b\").removesuffix(\".proto\")\n",
+        ),
+        (
+            "method/BUILD",
+            "x = heph.fs.join(\"a\", \"b\").removesu│ffix(\".proto\")\n",
+        ),
+    ] {
+        let doc = lsp.open(path, src);
+        let result = lsp.hover(&doc);
+        assert!(result.is_null(), "{path}: {}", hover_text(&result));
+    }
+
+    // A documented local `def` still gets the stock hover, heading and all.
+    let doc = lsp.open(
+        "def/BUILD",
+        "def f():\n    \"\"\"Makes things.\"\"\"\n    pass\n\nf│()\n",
+    );
+    let text = hover_text(&lsp.hover(&doc));
+    assert!(text.contains("Makes things."), "{text}");
+}
+
 #[test]
 fn completion_in_driver_value_lists_drivers_in_both_quote_styles() {
     let mut lsp = Lsp::start();
