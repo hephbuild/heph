@@ -568,7 +568,7 @@ impl Doc<'_> {
 
     /// The guessed extent of the unclosed opener at `open`: the start of the
     /// first later line that ends it, and that line's number (or EOF).
-    fn guessed_extent(&self, open: usize) -> (usize, u32) {
+    fn guessed_extent(&self, open: usize) -> usize {
         let indent = self.indent_of(open);
         let mut ls = line_end(self.text, open) + 1;
         while ls < self.text.len() {
@@ -578,14 +578,14 @@ impl Doc<'_> {
                 let first = line.as_bytes().get(i).copied().unwrap_or(b' ');
                 let skipped = first == b'#' || self.inside_string(ls) || self.inside_string(ls + i);
                 if !skipped && i <= indent && !matches!(first, b')' | b']' | b'}') {
-                    return (ls, self.line_of(ls));
+                    return ls;
                 }
             }
             ls = le + 1;
         }
         // Runs to EOF, the end of the text included (a cursor there is still
         // inside the call).
-        (self.text.len() + 1, self.line_of(self.text.len()))
+        self.text.len() + 1
     }
 
     /// The end of opener `i`'s extent, and the guessed line when it was not
@@ -595,8 +595,8 @@ impl Doc<'_> {
             return (self.text.len(), None);
         };
         if t.link == NO_LINK {
-            let (end, line) = self.guessed_extent(t.start as usize);
-            return (end, Some(line));
+            let end = self.guessed_extent(t.start as usize);
+            return (end, Some(self.line_of(end)));
         }
         let closer = self
             .tok(t.link as usize)
@@ -634,7 +634,7 @@ impl Doc<'_> {
         // no longer open.
         stack.retain(|&i| {
             self.tok(i)
-                .is_none_or(|t| t.link != NO_LINK || self.guessed_extent(t.start as usize).0 > o)
+                .is_none_or(|t| t.link != NO_LINK || self.guessed_extent(t.start as usize) > o)
         });
         stack
     }
@@ -1425,9 +1425,16 @@ mod cost {
 
     /// 10,000 lines: a clean corpus, and an adversarial one where every line
     /// is tab-indented, an unterminated string or a stray `$`.
-    fn corpora() -> [(&'static str, String); 2] {
+    fn corpora() -> [(&'static str, String); 3] {
         let mut clean = String::new();
         let mut adversarial = String::new();
+        // Every line an unclosed call: the bracket stack prunes each by its
+        // guessed extent, which must stay linear.
+        let mut unclosed = String::new();
+        for _ in 0..10_000 {
+            unclosed.push_str("x = foo(1,\n");
+        }
+        unclosed.push_str("target(name = \"last\", dri");
         for i in 0..10_000 {
             clean.push_str(&format!(
                 "target(name = \"t{i}\", driver = \"exec\", cmd = \"echo {i}\")\n"
@@ -1440,7 +1447,11 @@ mod cost {
         }
         clean.push_str("target(name = \"last\", dri");
         adversarial.push_str("target(name = \"last\", dri");
-        [("clean", clean), ("adversarial", adversarial)]
+        [
+            ("clean", clean),
+            ("adversarial", adversarial),
+            ("unclosed", unclosed),
+        ]
     }
 
     /// The slowest resolution over a few runs, the cursor at the end (the

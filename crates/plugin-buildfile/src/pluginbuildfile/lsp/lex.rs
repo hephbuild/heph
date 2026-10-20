@@ -217,6 +217,8 @@ struct Builder<'a> {
     out: Tokens,
     /// End of the furthest item kept.
     hw: usize,
+    /// The line start of the last error kept.
+    last_error_line: Option<usize>,
 }
 
 impl Builder<'_> {
@@ -234,12 +236,10 @@ impl Builder<'_> {
     fn error(&mut self, s: usize, e: usize, kind: ErrorKind, message: String) {
         let token = self.out.toks.len() as u32;
         let line = line_start(self.src, s);
-        let publish = !self.out.errors.iter().any(|prev| {
-            self.out
-                .toks
-                .get(prev.token as usize)
-                .is_some_and(|t| line_start(self.src, t.start as usize) == line)
-        });
+        // Errors arrive in source order, so an earlier error on this line is
+        // the last one kept.
+        let publish = self.last_error_line != Some(line);
+        self.last_error_line = Some(line);
         self.push(Kind::Error(kind), s, e);
         self.out.errors.push(LexError {
             token,
@@ -305,6 +305,7 @@ pub(crate) fn lex(src: &str) -> Tokens {
         src,
         out: Tokens::default(),
         hw: 0,
+        last_error_line: None,
     };
     let mut base = 0usize;
     let mut restarts = 0usize;
