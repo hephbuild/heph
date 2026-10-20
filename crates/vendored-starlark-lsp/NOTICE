@@ -1,0 +1,49 @@
+vendored-starlark-lsp
+=====================
+
+This crate contains code from starlark_lsp 0.14.2
+(https://github.com/facebook/starlark-rust, crate `starlark_lsp`),
+Copyright 2019 The Starlark in Rust Authors and Copyright (c) Facebook, Inc.
+and its affiliates, licensed under the Apache License, Version 2.0 (see
+LICENSE in this directory).
+
+heph owns this copy. Bugs are fixed in place; there is no verbatim refresh at
+starlark releases, and an upstream fix is ported by hand when it matters to
+BUILD files. Every divergence from 0.14.2 is listed below with its reason.
+
+Copied unchanged
+----------------
+src/bind.rs, src/completion.rs, src/docs.rs, src/error.rs, src/exported.rs,
+src/inspect.rs, src/loaded.rs, src/symbols.rs.
+
+Divergences
+-----------
+src/server.rs
+  - The server loop is gone: `stdio_server`, `server_with_connection`,
+    `main_loop`, the `send_*`/`log_message`/`publish_diagnostics` helpers, the
+    `starlark/fileContents` request and the `as_request`/`as_notification`/
+    `new_response`/`new_notification` glue. heph runs its own loop (its
+    BUILD-file LSP's `server.rs`) and calls the analysis directly, so there is
+    no JSON round-trip and no second parse per edit.
+  - `Backend` is public, owns no connection, and gains `new`, `validate`
+    (upstream's did_open/did_change without the notification: it returns the
+    diagnostics to publish) and `close` (upstream's did_close likewise).
+    `find_definition`, `completion_options`, `hover_info` and
+    `server_capabilities` are public so heph's loop can route requests to them.
+  - `LspOpError` is public, its `format` is public, and its `Protocol` variant
+    is gone with the loop that produced it.
+  - The `tests` module (driven through upstream's `TestServer` loop harness,
+    `src/test.rs`) is not vendored; heph's editor-shaped harness
+    (crates/plugin-buildfile/tests/lsp.rs, the `parity_*` tests) covers the
+    behaviour instead.
+  - `file://` URI <-> path conversion goes through `src/uri.rs` instead of
+    `tower_lsp_server::UriExt`, so the crate does not depend on
+    `tower-lsp-server`.
+
+src/definition.rs
+  - The test-only `FixtureWithRanges::program` helper is removed: only the
+    unvendored server tests called it.
+
+src/lib.rs
+  - `definition` is a public module; `uri` is new (see above); `test` is not
+    vendored.
