@@ -456,6 +456,9 @@ mod tests {
         fn driver_names(&self) -> Vec<String> {
             vec!["exec".to_string(), "shadow".to_string()]
         }
+        fn provider_names(&self) -> Vec<String> {
+            vec!["go".to_string()]
+        }
         fn provider_state_schema(&self, name: &str) -> Option<StateSchema> {
             (name == "go").then(|| StateSchema {
                 fields: vec![StateField {

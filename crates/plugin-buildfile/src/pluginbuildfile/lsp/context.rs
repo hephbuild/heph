@@ -149,7 +149,7 @@ impl HephLspContext {
     }
 
     /// List package names beginning with `prefix` (no leading `//`).
-    fn list_packages(&self, prefix: &str) -> Vec<String> {
+    pub(crate) fn list_packages(&self, prefix: &str) -> Vec<String> {
         let provider = self.provider();
         let ctoken = StdCancellationToken::new();
         let fut = provider.list_packages(
@@ -182,7 +182,7 @@ impl HephLspContext {
     }
 
     /// List target names in `package`.
-    fn list_targets(&self, package: &str) -> Vec<String> {
+    pub(crate) fn list_targets(&self, package: &str) -> Vec<String> {
         let provider = self.provider();
         let ctoken = StdCancellationToken::new();
         let fut = provider.list(
@@ -275,6 +275,11 @@ impl LspContext for HephLspContext {
                 };
             }
         };
+
+        // The name sets the resolver overlays on the tokens (D3): kept until
+        // the next good parse replaces them.
+        self.shared
+            .set_overlay(uri.clone(), super::site::overlay_of(&ast));
 
         // Static validation of `target` / `provider_state` keyword arguments
         // against the engine's schemas (unknown key / wrong type → red squiggle).
@@ -482,6 +487,9 @@ mod tests {
         fn driver_names(&self) -> Vec<String> {
             Vec::new()
         }
+        fn provider_names(&self) -> Vec<String> {
+            Vec::new()
+        }
         fn provider_state_schema(&self, _name: &str) -> Option<StateSchema> {
             None
         }
@@ -536,8 +544,8 @@ mod tests {
     ///
     /// An unknown key on a macro call is an eval error, and the index built from
     /// a failed eval carries no provenance — but the `load(...)` imports that
-    /// drive cross-file goto-definition are read from the source text, so they
-    /// must still be there. Losing the jump exactly while the user is fixing the
+    /// drive cross-file goto-definition are read from the parse, so they must
+    /// still be there. Losing the jump exactly while the user is fixing the
     /// error is the worst moment to lose it.
     #[test]
     fn loaded_symbols_survive_a_buffer_that_fails_to_evaluate() {
@@ -568,10 +576,11 @@ mod tests {
             index.call_targets.is_empty(),
             "a failed eval yields no provenance"
         );
-        // Line 1, over the `make_name` inside the load statement.
+        // The loaded names come from the parse, not the evaluation.
+        let overlay = ctx.shared.overlay(&uri).expect("overlay");
         assert_eq!(
-            index.loaded_symbol_at(1, 18),
-            Some(("//lib", "make_name")),
+            overlay.loaded.get("make_name"),
+            Some(&("//lib".to_string(), "make_name".to_string())),
             "the loaded symbol must still resolve for goto-definition"
         );
     }

@@ -1,0 +1,285 @@
+=== A unterminated string, paren on next line: "target(name = \"x\", driver = \"ex\n)\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..11 Identifier("name")
+  12..13 Equal
+  14..17 String("x")
+  17..18 Comma
+  19..25 Identifier("driver")
+  26..27 Equal
+  ERR 28..31 Parse error: unfinished string literal
+  29..31 Identifier("ex")
+  32..33 ClosingRound
+  33..34 Newline
+  34..34 Newline
+=== B lex error before cursor: "x = \"oops\ntarget(dri\n"
+  0..1 Identifier("x")
+  2..3 Equal
+  ERR 4..9 Parse error: unfinished string literal
+  5..9 Identifier("oops")
+  9..10 Newline
+  10..16 Identifier("target")
+  16..17 OpeningRound
+  17..20 Identifier("dri")
+  21..21 Newline
+=== C missing comma: "target(\n  name = \"x\"\n  dri\n)\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  10..14 Identifier("name")
+  15..16 Equal
+  17..20 String("x")
+  23..26 Identifier("dri")
+  27..28 ClosingRound
+  28..29 Newline
+  29..29 Newline
+=== D unclosed at EOF: "target(dri"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..10 Identifier("dri")
+  10..10 Newline
+=== E bad indentation before cursor: "if x:\n        a = 1\n    b = 2\ntarget(dri\n"
+  0..2 If
+  3..4 Identifier("x")
+  4..5 Colon
+  5..6 Newline
+  6..14 Indent
+  14..15 Identifier("a")
+  16..17 Equal
+  18..19 Int(I32(1))
+  ERR 19..24 Parse error: incorrect indentation
+  24..25 Identifier("b")
+  26..27 Equal
+  28..29 Int(I32(2))
+  29..30 Newline
+  30..36 Identifier("target")
+  36..37 OpeningRound
+  37..40 Identifier("dri")
+  41..41 Newline
+=== F stray char: "target(name = $, dri\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..11 Identifier("name")
+  12..13 Equal
+  ERR 14..15 Parse error: invalid input `$`
+  15..16 Comma
+  17..20 Identifier("dri")
+  21..21 Newline
+=== G unterminated triple before cursor: "\"\"\"abc\ntarget(dri\n"
+  ERR 0..18 Parse error: unfinished string literal
+  1..3 String("")
+  3..6 Identifier("abc")
+  6..7 Newline
+  7..13 Identifier("target")
+  13..14 OpeningRound
+  14..17 Identifier("dri")
+  18..18 Newline
+=== H unterminated string swallowing paren at EOF: "target(name = \"x\", driver = \"ex)"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..11 Identifier("name")
+  12..13 Equal
+  14..17 String("x")
+  17..18 Comma
+  19..25 Identifier("driver")
+  26..27 Equal
+  ERR 28..32 Parse error: unfinished string literal
+  29..31 Identifier("ex")
+  31..32 ClosingRound
+  32..32 Newline
+=== I mismatched bracket before cursor: "foo(]\ntarget(dri\n"
+  0..3 Identifier("foo")
+  3..4 OpeningRound
+  4..5 ClosingSquare
+  5..6 Newline
+  6..12 Identifier("target")
+  12..13 OpeningRound
+  13..16 Identifier("dri")
+  17..17 Newline
+=== J single quote unterminated with auto-pair text after: "target(driver = 'ex\nbar = 1\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..13 Identifier("driver")
+  14..15 Equal
+  ERR 16..19 Parse error: unfinished string literal
+  17..19 Identifier("ex")
+  20..23 Identifier("bar")
+  24..25 Equal
+  26..27 Int(I32(1))
+  28..28 Newline
+=== K bad escape: "target(driver = \"\\q\", na\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..13 Identifier("driver")
+  14..15 Equal
+  16..20 String("\\q")
+  20..21 Comma
+  22..24 Identifier("na")
+  25..25 Newline
+=== L tab indent: "if x:\n\ta = 1\ntarget(dri\n"
+  0..2 If
+  3..4 Identifier("x")
+  4..5 Colon
+  ERR 5..5 Parse error: tabs are not allowed
+  7..8 Identifier("a")
+  9..10 Equal
+  11..12 Int(I32(1))
+  12..13 Newline
+  13..19 Identifier("target")
+  19..20 OpeningRound
+  20..23 Identifier("dri")
+  24..24 Newline
+=== M invalid escape in a closed string: "target(driver = \"ex\\xZZ\", na\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..13 Identifier("driver")
+  14..15 Equal
+  ERR 19..22 Parse error: invalid string escape sequence `xZ`
+  17..19 Identifier("ex")
+  ERR 19..20 Parse error: invalid input `\`
+  20..23 Identifier("xZZ")
+  ERR 23..28 Parse error: unfinished string literal
+  24..25 Comma
+  26..28 Identifier("na")
+  29..29 Newline
+=== O raw prefix unterminated: "target(driver = r\"ex\n)\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..13 Identifier("driver")
+  14..15 Equal
+  ERR 16..20 Parse error: unfinished string literal
+  18..20 Identifier("ex")
+  21..22 ClosingRound
+  22..23 Newline
+  23..23 Newline
+=== P bytes prefix unterminated: "target(driver = b\"ex\n)\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..13 Identifier("driver")
+  14..15 Equal
+  ERR 16..20 Parse error: unfinished string literal
+  18..20 Identifier("ex")
+  21..22 ClosingRound
+  22..23 Newline
+  23..23 Newline
+=== Q lone quote as last byte: "target(driver = \""
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..13 Identifier("driver")
+  14..15 Equal
+  ERR 16..17 Parse error: unfinished string literal
+  17..17 Newline
+=== R CRLF after unterminated: "target(driver = \"ex\r\n)\r\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..13 Identifier("driver")
+  14..15 Equal
+  ERR 16..20 Parse error: unfinished string literal
+  17..19 Identifier("ex")
+  21..22 ClosingRound
+  22..24 Newline
+  24..24 Newline
+=== S quote inside a comment: "x = 1  # say \"hi\ntarget(dri\n"
+  0..1 Identifier("x")
+  2..3 Equal
+  4..5 Int(I32(1))
+  7..16 Comment(" say \"hi")
+  16..17 Newline
+  17..23 Identifier("target")
+  23..24 OpeningRound
+  24..27 Identifier("dri")
+  28..28 Newline
+=== T non-ascii before cursor: "target(name = \"café\", driver = \"ex\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..11 Identifier("name")
+  12..13 Equal
+  14..21 String("café")
+  21..22 Comma
+  23..29 Identifier("driver")
+  30..31 Equal
+  ERR 32..35 Parse error: unfinished string literal
+  33..35 Identifier("ex")
+  36..36 Newline
+=== U f-string unterminated: "target(driver = f\"ex\n)\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..13 Identifier("driver")
+  14..15 Equal
+  16..18 FStringStart(Double)
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ERR 18..21 Parse error: unfinished string literal
+  ... (capped)
+=== W two errors on one line: "target(name = $, driver = \"ex\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..11 Identifier("name")
+  12..13 Equal
+  ERR 14..15 Parse error: invalid input `$`
+  15..16 Comma
+  17..23 Identifier("driver")
+  24..25 Equal
+  ERR 26..29 Parse error: unfinished string literal
+  27..29 Identifier("ex")
+  30..30 Newline
+=== X unterminated string inside a nested list: "target(srcs = [\"//a:b, dri\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..11 Identifier("srcs")
+  12..13 Equal
+  14..15 OpeningSquare
+  ERR 15..26 Parse error: unfinished string literal
+  16..18 SlashSlash
+  18..19 Identifier("a")
+  19..20 Colon
+  20..21 Identifier("b")
+  21..22 Comma
+  23..26 Identifier("dri")
+  27..27 Newline
+=== Y triple quote closed then cursor: "\"\"\"doc\"\"\"\ntarget(dri\n"
+  0..9 String("doc")
+  9..10 Newline
+  10..16 Identifier("target")
+  16..17 OpeningRound
+  17..20 Identifier("dri")
+  21..21 Newline
+=== Z unterminated triple with cursor above it: "target(dri\n\"\"\"abc\n"
+  0..6 Identifier("target")
+  6..7 OpeningRound
+  7..10 Identifier("dri")
+  ERR 11..18 Parse error: unfinished string literal
+  12..14 String("")
+  14..17 Identifier("abc")
+  18..18 Newline

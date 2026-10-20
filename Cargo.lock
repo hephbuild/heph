@@ -5005,6 +5005,7 @@ dependencies = [
  "serde_yaml",
  "starlark",
  "starlark_lsp",
+ "starlark_syntax",
  "strsim 0.11.1",
  "tempfile",
  "tokio",

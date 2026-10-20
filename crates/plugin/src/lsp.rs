@@ -20,6 +20,9 @@ pub trait LspEngine: Send + Sync {
     fn driver_schema(&self, name: &str) -> Option<DriverSchema>;
     /// All registered driver names, sorted (for target-kind completion).
     fn driver_names(&self) -> Vec<String>;
+    /// The registered providers that declare a state schema, sorted (for
+    /// `provider_state(provider = "…")` completion).
+    fn provider_names(&self) -> Vec<String>;
     /// A provider's state schema by registry name (for state-field completion).
     fn provider_state_schema(&self, name: &str) -> Option<StateSchema>;
     /// The raw `options:` map a provider was configured with (for the LSP to
