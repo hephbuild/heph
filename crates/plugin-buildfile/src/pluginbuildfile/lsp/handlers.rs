@@ -862,7 +862,12 @@ pub(crate) fn loaded_definition(
 /// The `textDocument/formatting` result: one whole-document edit, an empty list
 /// when already formatted, or `null` when the formatter declines (parse error,
 /// `heph:fmt skip-file`).
-pub(crate) fn format(name: &str, source: &str, engine: &dyn LspEngine) -> serde_json::Value {
+pub(crate) fn format(
+    name: &str,
+    source: &str,
+    engine: &dyn LspEngine,
+    encoding: Encoding,
+) -> serde_json::Value {
     let indent = build_file_indent_from_options(&engine.provider_options("buildfile"))
         .unwrap_or(DEFAULT_INDENT);
     let Ok(formatted) = hxstarlark_fmt::format(
@@ -877,22 +882,16 @@ pub(crate) fn format(name: &str, source: &str, engine: &dyn LspEngine) -> serde_
     if formatted == source {
         return serde_json::json!([]);
     }
+    // The whole document, its end in the negotiated encoding.
+    let range = Range {
+        start: Position::new(0, 0),
+        end: position::to_position(source, source.len(), encoding),
+    };
     serde_json::to_value(vec![TextEdit {
-        range: whole_document_range(source),
+        range,
         new_text: formatted,
     }])
     .unwrap_or(serde_json::Value::Null)
-}
-
-/// The range covering the whole document, in UTF-16 code units.
-fn whole_document_range(source: &str) -> Range {
-    let last_line = source.matches('\n').count() as u32;
-    let last_line_text = source.rsplit('\n').next().unwrap_or("");
-    let last_col = last_line_text.encode_utf16().count() as u32;
-    Range {
-        start: Position::new(0, 0),
-        end: Position::new(last_line, last_col),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -959,7 +958,12 @@ mod tests {
 
     #[test]
     fn formatting_replaces_whole_document() {
-        let edits = format("BUILD", "target(name=\"a\",deps=[\"x\",\"y\"])\n", &Fmt);
+        let edits = format(
+            "BUILD",
+            "target(name=\"a\",deps=[\"x\",\"y\"])\n",
+            &Fmt,
+            Encoding::Utf16,
+        );
         let edits = edits.as_array().expect("edits");
         assert_eq!(edits.len(), 1, "one whole-document edit");
         assert_eq!(
@@ -974,7 +978,10 @@ mod tests {
 
     #[test]
     fn formatting_already_formatted_yields_no_edits() {
-        assert_eq!(format("BUILD", "x = 1\n", &Fmt), serde_json::json!([]));
+        assert_eq!(
+            format("BUILD", "x = 1\n", &Fmt, Encoding::Utf16),
+            serde_json::json!([])
+        );
     }
 
     #[test]
@@ -983,6 +990,7 @@ mod tests {
             "BUILD",
             "# heph:fmt skip-file\ntarget(  name=\"a\"  )\n",
             &Fmt,
+            Encoding::Utf16,
         );
         assert!(
             out.is_null(),

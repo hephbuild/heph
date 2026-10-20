@@ -396,6 +396,8 @@ pub(crate) enum Reason {
     NotASite,
     /// The registry snapshot is still loading.
     ProvidersLoading,
+    /// The document lies outside the repo the server is bound to.
+    OutsideRoot,
 }
 
 impl Reason {
@@ -416,6 +418,7 @@ impl Reason {
             }),
             Reason::NotASite => json!({"reason": "not_a_site"}),
             Reason::ProvidersLoading => json!({"reason": "providers_loading"}),
+            Reason::OutsideRoot => json!({"reason": "outside_root"}),
         }
     }
 }

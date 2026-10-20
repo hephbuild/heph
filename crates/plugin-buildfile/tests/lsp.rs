@@ -297,6 +297,8 @@ struct Lsp {
     next_id: i32,
     /// Every `publishDiagnostics` params object received, in order.
     diagnostics: Vec<Value>,
+    /// Every `window/showMessage` params object received, in order.
+    messages: Vec<Value>,
     /// The position encoding the server chose at `initialize`.
     encoding: String,
 }
@@ -354,6 +356,7 @@ impl Lsp {
             gate,
             next_id: 0,
             diagnostics: Vec::new(),
+            messages: Vec::new(),
             encoding: "utf-16".to_string(),
         }
     }
@@ -428,11 +431,11 @@ impl Lsp {
             match msg {
                 Message::Response(resp) if &resp.id == id => return resp,
                 Message::Response(_) | Message::Request(_) => {}
-                Message::Notification(n) => {
-                    if n.method == "textDocument/publishDiagnostics" {
-                        self.diagnostics.push(n.params);
-                    }
-                }
+                Message::Notification(n) => match n.method.as_str() {
+                    "textDocument/publishDiagnostics" => self.diagnostics.push(n.params),
+                    "window/showMessage" => self.messages.push(n.params),
+                    _ => {}
+                },
             }
         }
     }
@@ -2347,4 +2350,77 @@ fn parity_string_completion() {
     let doc = lsp.open("BUILD", "load(\"//│\", \"make_name\")\n");
     let result = lsp.completion(&doc);
     assert!(has(&result, "//lib"), "package paths complete: {result}");
+}
+
+// ---------------------------------------------------------------------------
+// One workspace: the folder the editor sends, inside the bound repo.
+// ---------------------------------------------------------------------------
+
+const INVALID_PARAMS: i32 = -32602;
+
+#[test]
+fn initialize_warns_on_more_than_one_workspace_folder() {
+    let mut lsp = Lsp::new();
+    let other = tempfile::tempdir().expect("tempdir");
+    let root = lsp.root();
+    lsp.request(
+        "initialize",
+        json!({
+            "processId": null,
+            "workspaceFolders": [
+                {"uri": file_uri(&root), "name": "first"},
+                {"uri": file_uri(other.path()), "name": "second"},
+            ],
+            "capabilities": {},
+        }),
+    );
+    lsp.barrier();
+    assert_eq!(lsp.messages.len(), 1, "{:?}", lsp.messages);
+    assert_eq!(lsp.messages[0]["type"], json!(2), "a warning");
+    // Only the first is used, and it serves.
+    let doc = lsp.open("BUILD", "target(│)\n");
+    assert!(has(&lsp.completion(&doc), "name"));
+}
+
+#[test]
+fn initialize_refuses_a_folder_outside_the_repo() {
+    let mut lsp = Lsp::new();
+    let other = tempfile::tempdir().expect("tempdir");
+    let code = lsp.error_code(
+        "initialize",
+        json!({
+            "processId": null,
+            "workspaceFolders": [{"uri": file_uri(other.path()), "name": "elsewhere"}],
+            "capabilities": {},
+        }),
+    );
+    assert_eq!(code, Some(INVALID_PARAMS));
+}
+
+#[test]
+fn document_outside_the_root_gets_stock_with_a_reason() {
+    let mut lsp = Lsp::start();
+    let other = tempfile::tempdir().expect("tempdir");
+    let path = other
+        .path()
+        .canonicalize()
+        .expect("canonical")
+        .join("BUILD");
+    std::fs::write(&path, "target()\n").expect("write");
+    let uri = file_uri(&path);
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri, "languageId": "starlark", "version": 1, "text": "target()\n",
+        }}),
+    );
+    let doc = Doc {
+        uri,
+        text: "target()\n".to_string(),
+        line: 0,
+        character: 7,
+        version: 1,
+    };
+    assert_eq!(reason(&lsp.explain(&doc)).as_deref(), Some("outside_root"));
+    assert!(heph_items(&lsp.completion(&doc)).is_empty());
 }

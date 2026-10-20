@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use vendored_starlark_lsp::server::{Backend, LspServerSettings, LspUri};
+use vendored_starlark_lsp::uri::uri_to_file_path;
 
 /// The completion trigger characters heph declares (D7): `.` for namespace
 /// members, quotes for string values, `/` and `:` for addresses.
@@ -64,6 +65,8 @@ struct Document {
     tokens: Arc<Tokens>,
     /// The version of the last text that parsed, if any did.
     ast_version: Option<i32>,
+    /// Outside the bound repo: stock answers only, `reason: outside_root`.
+    outside_root: bool,
 }
 
 impl Document {
@@ -92,9 +95,35 @@ struct Server<'a> {
     shared: Arc<SharedState>,
     encoding: Encoding,
     init: InitializeParams,
+    /// The repo the engine was bound to; a document outside it gets the stock
+    /// answers only.
+    root: Root,
     documents: HashMap<LspUri, Document>,
     registry: RegistryState,
     shutting_down: bool,
+}
+
+/// The engine's root, as given and canonical (an editor may spell a path
+/// either way, `/var` against `/private/var` on macOS).
+struct Root {
+    path: std::path::PathBuf,
+    canonical: Option<std::path::PathBuf>,
+}
+
+impl Root {
+    fn new(path: &std::path::Path) -> Root {
+        Root {
+            path: path.to_path_buf(),
+            canonical: path.canonicalize().ok(),
+        }
+    }
+
+    fn contains(&self, p: &std::path::Path) -> bool {
+        p.starts_with(&self.path)
+            || self.canonical.as_ref().is_some_and(|c| p.starts_with(c))
+            || p.canonicalize()
+                .is_ok_and(|pc| self.canonical.as_ref().is_some_and(|c| pc.starts_with(c)))
+    }
 }
 
 /// Serve on `connection` until `exit`, or until the client hangs up.
@@ -119,6 +148,37 @@ pub fn run_with(
     let Some((id, params)) = await_initialize(&connection) else {
         return Ok(());
     };
+    // One workspace for now: the first folder the editor sends (or its
+    // `rootUri`), which must lie in the repo the engine was bound to.
+    let folders: Vec<std::path::PathBuf> = match params.get("workspaceFolders") {
+        Some(Value::Array(folders)) => folders
+            .iter()
+            .filter_map(|f| f.get("uri")?.as_str()?.parse::<Uri>().ok())
+            .filter_map(|u| uri_to_file_path(&u))
+            .collect(),
+        _ => params
+            .get("rootUri")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<Uri>().ok())
+            .and_then(|u| uri_to_file_path(&u))
+            .into_iter()
+            .collect(),
+    };
+    let root = Root::new(engine.root());
+    if let Some(first) = folders.first()
+        && !root.contains(first)
+    {
+        let message = format!(
+            "workspace folder {} is outside the heph repo at {}",
+            first.display(),
+            root.path.display()
+        );
+        send(
+            &connection,
+            Response::new_err(id, ErrorCode::InvalidParams as i32, message.clone()),
+        );
+        return Err(anyhow::anyhow!(message));
+    }
     let init: InitializeParams = match serde_json::from_value(params) {
         Ok(init) => init,
         Err(e) => {
@@ -151,6 +211,24 @@ pub fn run_with(
         "serverInfo": ServerInfo { name: "heph".to_string(), version: None },
     });
     send(&connection, Response::new_ok(id, result));
+    if folders.len() > 1 {
+        let message = format!(
+            "heph's BUILD-file server supports one workspace folder; using {} and ignoring the other {}",
+            folders
+                .first()
+                .map_or_else(String::new, |f| f.display().to_string()),
+            folders.len() - 1
+        );
+        let _sent = connection
+            .sender
+            .send(Message::Notification(Notification::new(
+                "window/showMessage".to_string(),
+                lsp_types::ShowMessageParams {
+                    typ: lsp_types::MessageType::WARNING,
+                    message,
+                },
+            )));
+    }
 
     let mut server = Server {
         connection: &connection,
@@ -158,6 +236,7 @@ pub fn run_with(
         shared,
         encoding,
         init,
+        root,
         documents: HashMap::new(),
         registry,
         shutting_down: false,
@@ -387,6 +466,10 @@ impl Server<'_> {
             });
         }
         self.publish(client_uri, diagnostics, Some(version));
+        let outside_root = match self.documents.get(&key) {
+            Some(prev) => prev.outside_root,
+            None => matches!(&key, LspUri::File(p) if !self.root.contains(p)),
+        };
         self.documents.insert(
             key,
             Document {
@@ -394,6 +477,7 @@ impl Server<'_> {
                 version,
                 tokens,
                 ast_version,
+                outside_root,
             },
         );
     }
@@ -473,7 +557,9 @@ impl Server<'_> {
             },
             offset,
         );
-        let resolution = if !ready && resolution.site != Site::None {
+        let resolution = if doc.outside_root {
+            Resolution::none(site::Reason::OutsideRoot)
+        } else if !ready && resolution.site != Site::None {
             Resolution::none(site::Reason::ProvidersLoading)
         } else {
             resolution
@@ -775,6 +861,6 @@ impl Server<'_> {
             return Value::Null;
         };
         let name = key.path().to_string_lossy().into_owned();
-        handlers::format(&name, &doc.text, &*self.shared.engine)
+        handlers::format(&name, &doc.text, &*self.shared.engine, self.encoding)
     }
 }

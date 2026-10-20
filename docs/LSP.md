@@ -34,6 +34,17 @@ request ──> position.rs (UTF-16/8/32 → byte, once)
 | `index.rs` | The evaluation side channel (provenance "Targets" hover, undocumented `def` signatures) and the per-document shared state |
 | `crates/vendored-starlark-lsp` | `starlark_lsp` 0.14.2's analysis modules, owned by heph; its `NOTICE` lists every divergence |
 
+## One workspace
+
+The server supports a single workspace for now: the first workspace folder the
+editor sends in `initialize` (or its `rootUri`), which must lie inside the heph
+repo the server was started in. A folder outside it is an `initialize` error;
+more than one folder gets a `window/showMessage` warning and only the first is
+used. A BUILD file opened outside the repo gets the stock answers only, with
+`reason: outside_root`. The driver/provider registry is read once per server
+start; until that snapshot lands, heph answers with the stock results and
+`reason: providers_loading`.
+
 ## Site kinds
 
 | Site kind | Detected from | Completion | Hover | Definition |
@@ -118,7 +129,8 @@ reason, degradations, item count and time:
 - `reason` says why a heph answer is empty: `callee_rebound` (the file rebinds
   `target`), `in_lex_error` (with the root cause's kind, span, line and
   message), `not_a_site`, `providers_loading` (the registry snapshot has not
-  landed; the stock answer stands in).
+  landed; the stock answer stands in), `outside_root` (the document lies
+  outside the repo the server is bound to).
 - `degraded` says what a present answer could not do in full:
   `call_extent_guessed` (with the line the extent stopped at),
   `edit_to_word_end`, `ast_stale` (with the versions behind), `ast_absent`,
