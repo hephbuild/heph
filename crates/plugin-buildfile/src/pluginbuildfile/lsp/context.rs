@@ -256,17 +256,21 @@ impl LspContext for HephLspContext {
             _ => return LspEvalResult::default(),
         };
         let filename = path.to_string_lossy().to_string();
+        // An open document's parse comes with the tokens the loop just built;
+        // a file read from disk for the stock analysis (a loaded file, say)
+        // comes without, and gets an AST and nothing else: no index, no
+        // overlay, no evaluation, so memory stays bounded by open documents.
+        let staged = self.shared.take_tokens(uri);
 
-        // Parse the AST for starlark_lsp (symbols, hover, goto); parse errors
-        // become diagnostics.
+        // Parse the AST for the stock analysis (symbols, hover, goto); parse
+        // errors become diagnostics.
         let ast = match AstModule::parse(&filename, content.clone(), &Dialect::Extended) {
             Ok(ast) => ast,
             Err(e) => {
-                // Keep the (unparseable) buffer source so prefix-based completion
-                // and hover still work while the user is typing (`heph.` etc.),
-                // and its `load(...)` imports so goto-definition still resolves.
-                self.shared
-                    .set_index(uri.clone(), DocIndex::unevaluated(content));
+                if staged.is_some() {
+                    self.shared
+                        .set_index(uri.clone(), DocIndex::unevaluated(content));
+                }
                 return LspEvalResult {
                     diagnostics: vec![eval_message_to_lsp_diagnostic(EvalMessage::from_error(
                         &path, &e,
@@ -275,16 +279,29 @@ impl LspContext for HephLspContext {
                 };
             }
         };
+        let Some(tokens) = staged else {
+            return LspEvalResult {
+                diagnostics: Vec::new(),
+                ast: Some(ast),
+            };
+        };
 
         // The name sets the resolver overlays on the tokens (D3): kept until
         // the next good parse replaces them.
-        self.shared
-            .set_overlay(uri.clone(), super::site::overlay_of(&ast));
+        let overlay = super::site::overlay_of(&ast);
 
         // Static validation of `target` / `provider_state` keyword arguments
         // against the engine's schemas (unknown key / wrong type → red squiggle).
-        // Runs off the parsed AST, so it works mid-edit without a full eval.
-        let diagnostics = super::diagnostics::validate(&ast, &*self.shared.engine);
+        // Runs off the parsed AST, so it works mid-edit without a full eval;
+        // shadowing and driver selection come from the resolver's helpers.
+        let doc = super::site::Doc {
+            text: &content,
+            tokens: &tokens,
+            overlay: Some(&overlay),
+            ast: super::site::AstState::Current,
+        };
+        let diagnostics = super::diagnostics::validate(&ast, &doc, &*self.shared.engine);
+        self.shared.set_overlay(uri.clone(), overlay);
 
         // Best-effort evaluation to populate the provenance / driver index. A
         // half-typed buffer (or one the engine rejects — an unknown key on a
@@ -565,6 +582,9 @@ mod tests {
         // with it — the same shape as any other error in the file.
         let content = "load(\"//lib\", \"make_name\")\n\ntarget(name = make_name(\"t\"))\n";
         let uri = super::LspUri::File(dir.path().join("BUILD"));
+        // An open document: the loop stages its tokens before the parse.
+        ctx.shared
+            .stage_tokens(uri.clone(), Arc::new(super::super::lex::lex(content)));
         let result = ctx.parse_file_with_contents(&uri, content.to_string());
         assert!(
             result.ast.is_some(),

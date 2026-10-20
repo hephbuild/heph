@@ -61,7 +61,7 @@ impl Default for RunOptions {
 struct Document {
     text: String,
     version: i32,
-    tokens: Tokens,
+    tokens: Arc<Tokens>,
     /// The version of the last text that parsed, if any did.
     ast_version: Option<i32>,
 }
@@ -348,7 +348,10 @@ impl Server<'_> {
         let Some(key) = uri_key(&client_uri) else {
             return;
         };
-        let tokens = lex::lex(&text);
+        // Lexed once per edit: the parse below (and its diagnostics) reads the
+        // same token array the requests will.
+        let tokens = Arc::new(lex::lex(&text));
+        self.shared.stage_tokens(key.clone(), Arc::clone(&tokens));
         let (stock, parsed) = self.backend.validate(&key, text.clone());
         let ast_version = if parsed {
             Some(version)

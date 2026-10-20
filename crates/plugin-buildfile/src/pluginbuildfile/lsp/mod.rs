@@ -20,7 +20,7 @@ mod index;
 mod lex;
 mod position;
 mod server;
-mod site;
+pub(crate) mod site;
 
 #[cfg(feature = "test-support")]
 pub use server::{RunOptions, run_with};

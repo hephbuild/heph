@@ -38,13 +38,72 @@ pub(crate) struct Overlay {
     pub loaded: HashMap<String, (String, String)>,
 }
 
+/// Visit `s` and every statement nested within it.
+fn walk_stmt<'a>(
+    s: &'a starlark::syntax::ast::AstStmt,
+    f: &mut impl FnMut(&'a starlark::syntax::ast::AstStmt),
+) {
+    f(s);
+    // `Stmt::visit_stmt` is one level deep; recurse to reach the whole subtree.
+    s.visit_stmt(|child| walk_stmt(child, f));
+}
+
+/// Every name the module binds: `def`s and their parameters, assignment and loop
+/// targets, and `load(...)` imports.
+///
+/// Deliberately flat — a name bound anywhere counts as bound everywhere, with no
+/// scope tracking. Over-approximating errs toward silence, and the alternative
+/// (a real scope analysis) would buy nothing: a buffer that defines its own
+/// `target` almost certainly means it at every call site.
+pub(crate) fn bound_names(ast: &starlark::syntax::AstModule) -> HashSet<&str> {
+    use starlark::syntax::ast::Stmt;
+    let mut names = HashSet::new();
+    walk_stmt(ast.statement(), &mut |s| match &s.node {
+        Stmt::Def(def) => {
+            names.insert(def.name.node.ident.as_str());
+            names.extend(
+                def.params
+                    .iter()
+                    .filter_map(|p| p.ident())
+                    .map(|i| i.node.ident.as_str()),
+            );
+        }
+        Stmt::Load(load) => {
+            names.extend(load.args.iter().map(|a| a.local.node.ident.as_str()));
+        }
+        Stmt::Assign(assign) => collect_assign_target(&assign.lhs, &mut names),
+        Stmt::AssignModify(target, _, _) => collect_assign_target(target, &mut names),
+        Stmt::For(for_stmt) => collect_assign_target(&for_stmt.var, &mut names),
+        _ => {}
+    });
+    names
+}
+
+/// Add the identifiers an assignment or loop target binds (`a`, `a, b`, `[a, b]`).
+/// Index and attribute targets (`a[0] = …`, `a.b = …`) mutate an existing
+/// binding rather than introducing one, so they bind nothing.
+fn collect_assign_target<'a>(
+    target: &'a starlark::syntax::ast::AstAssignTarget,
+    names: &mut HashSet<&'a str>,
+) {
+    use starlark::syntax::ast::AssignTarget;
+    match &target.node {
+        AssignTarget::Identifier(id) => {
+            names.insert(id.node.ident.as_str());
+        }
+        AssignTarget::Tuple(items) => {
+            for item in items {
+                collect_assign_target(item, names);
+            }
+        }
+        AssignTarget::Index(_) | AssignTarget::Dot(_, _) => {}
+    }
+}
+
 /// The overlay of a parsed module: its bound names and its `load` imports.
 pub(crate) fn overlay_of(ast: &starlark::syntax::AstModule) -> Overlay {
     use starlark::syntax::ast::Stmt;
-    let rebound = super::diagnostics::bound_names(ast)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let rebound = bound_names(ast).into_iter().map(str::to_string).collect();
     let mut loaded = HashMap::new();
     let mut add = |s: &starlark::syntax::ast::AstStmt| {
         if let Stmt::Load(load) = &s.node {
@@ -1031,6 +1090,19 @@ fn string_site(
     let value = doc.str_at(i, o, is_address_byte)?;
     (value.prefix.starts_with("//") || value.prefix.starts_with(':'))
         .then_some(Site::Address { value })
+}
+
+/// The selected driver (`target`) or provider (`provider_state`) of the call
+/// whose `(` is the first bracket at or after byte `from` — the callee's end.
+/// The one reading of `driver = "…"` that completion, hover and diagnostics
+/// share.
+pub(crate) fn selected_after(doc: &Doc<'_>, from: usize) -> Option<String> {
+    let i = doc.first_at_or_after(from);
+    let t = doc.tok(i)?;
+    if t.kind != Kind::Open(Bracket::Round) {
+        return None;
+    }
+    doc.call_at(i, None)?.selected
 }
 
 /// The `:` trigger's light address check (D7): the cursor is inside a string

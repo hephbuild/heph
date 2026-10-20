@@ -198,6 +198,10 @@ pub(crate) struct SharedState {
     docs: Mutex<HashMap<LspUri, DocIndex>>,
     /// The name sets of each document's last good parse (D3).
     overlays: Mutex<HashMap<LspUri, Arc<super::site::Overlay>>>,
+    /// The token array the loop just built for a document, handed to the
+    /// parse it is about to run so the text is lexed once per edit. Present
+    /// only while an open document is being parsed.
+    staged: Mutex<HashMap<LspUri, Arc<super::lex::Tokens>>>,
 }
 
 impl SharedState {
@@ -216,6 +220,7 @@ impl SharedState {
             builtin_hovers,
             docs: Mutex::new(HashMap::new()),
             overlays: Mutex::new(HashMap::new()),
+            staged: Mutex::new(HashMap::new()),
         })
     }
 
@@ -233,6 +238,16 @@ impl SharedState {
             .lock()
             .expect("overlays lock")
             .insert(uri, Arc::new(overlay));
+    }
+
+    pub(crate) fn stage_tokens(&self, uri: LspUri, tokens: Arc<super::lex::Tokens>) {
+        self.staged.lock().expect("staged lock").insert(uri, tokens);
+    }
+
+    /// The tokens staged for `uri`, if an open document's parse is running;
+    /// `None` for a file read from disk for the stock analysis.
+    pub(crate) fn take_tokens(&self, uri: &LspUri) -> Option<Arc<super::lex::Tokens>> {
+        self.staged.lock().expect("staged lock").remove(uri)
     }
 
     pub(crate) fn overlay(&self, uri: &LspUri) -> Option<Arc<super::site::Overlay>> {
