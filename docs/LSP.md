@@ -54,6 +54,7 @@ start; until that snapshot lands, heph answers with the stock results and
 | `provider_value` | `provider =` inside `provider_state(` | provider names | the provider's state fields | — |
 | `target_key` | a keyword-name position inside `target(` | base fields + the selected driver's, minus keys present | the field's type and doc | — |
 | `state_key` | a keyword-name position inside `provider_state(` | `provider` + the selected provider's schema, minus keys present | the field's type and doc | — |
+| `arg_key` | a keyword-name position inside a call to any other plain-named function (`my_rule(`, `glob(`; not `x.f(`, not a `def`'s parameters) | the callee's unwritten parameters, each inserting `name = `, ranked first; then stock (see below) | stock | stock |
 | `plugin_namespace` | after `heph.` | plugins and `core` | — | — |
 | `plugin_member` | after `heph.<plugin>.`, or on the function name | the plugin's functions | the function's signature and doc | — |
 | `address` | a string starting `//` or `:`, inside a call or not | packages, then targets, both forms | — | the target's line, or the package's BUILD file |
@@ -71,7 +72,18 @@ Wherever heph controls or knows the answer for sure, heph is authoritative and
 covers keyword names, driver and provider names, plugin namespaces and members,
 addresses, and load paths and symbols. The stock answer **passes through**
 only where heph cannot know: free expressions, locals, other value positions.
-There is no append policy. No site mixes heph and stock items.
+
+One site **prepends**: `arg_key`. A keyword-name position is also where a
+positional argument starts, so the stock items (locals, globals) stay, after
+the callee's parameters. heph reads the parameters without the document
+having to parse: a local `def` from the tokens; a loaded name through its
+`load(…)` (from the tokens) to the `def` in the loaded file, read from disk;
+otherwise a documented global's keyword-usable parameters (not positional-only
+ones). Where heph finds the function, its list replaces the stock parameter
+items and every stock item gets `sortText` `1_<label>`; where it does not
+(an unknown name, a `def` whose parameter list is unclosed), the stock answer
+passes through untouched. heph's own sites keep precedence: `target(` and
+`provider_state(` are never `arg_key`.
 
 Every heph completion item carries:
 

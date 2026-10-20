@@ -570,7 +570,7 @@ impl Server<'_> {
         );
         let resolution = if doc.outside_root {
             Resolution::none(site::Reason::OutsideRoot)
-        } else if !ready && resolution.site != Site::None {
+        } else if !ready && !matches!(resolution.site, Site::None | Site::ArgKey { .. }) {
             Resolution::none(site::Reason::ProvidersLoading)
         } else {
             resolution
@@ -651,6 +651,16 @@ impl Server<'_> {
         }
         let items: Vec<CompletionItem> = match handlers::merge_for(&located.resolution.site) {
             Merge::PassThrough => self.stock_completion(params, &located),
+            Merge::Prepend => {
+                let stock = self.stock_completion(params, &located);
+                // Parameters need no registry: they come from the document,
+                // the loaded files and the builtins' docs.
+                let empty = Registry::default();
+                self.with_ctx(&located.key, &empty, |ctx| {
+                    handlers::prepend(&located.resolution.site, ctx, stock)
+                })
+                .unwrap_or_default()
+            }
             Merge::Replace => match self.registry() {
                 Some(registry) => self
                     .with_ctx(&located.key, &registry, |ctx| {
@@ -705,7 +715,7 @@ impl Server<'_> {
         let registry = self.registry().unwrap_or_default();
         let reg = &*registry;
         let hover = match site {
-            Site::None => self.stock_hover(params, &located, reg),
+            Site::None | Site::ArgKey { .. } => self.stock_hover(params, &located, reg),
             _ => self
                 .with_ctx(&located.key, reg, |ctx| {
                     let mut hover = handlers::hover(site, ctx)?;

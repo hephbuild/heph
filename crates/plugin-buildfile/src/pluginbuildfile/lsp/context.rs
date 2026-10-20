@@ -84,6 +84,11 @@ impl HephLspContext {
         }
     }
 
+    /// The documentation of the global `name` (a builtin), if it has any.
+    pub(crate) fn doc_global(&self, name: &str) -> Option<&starlark::docs::DocItem> {
+        self.doc_globals.members.get(name)
+    }
+
     /// The listing provider, rebuilt if older than [`LISTING_TTL`]. Reuse within
     /// the window keeps repeated completion requests fast (served from the
     /// provider's own memoization); a rebuild drops that cache so the next walk

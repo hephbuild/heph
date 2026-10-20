@@ -22,6 +22,9 @@ const FIXTURES: &[(&str, &str, bool)] = &[
     ("load_path", "load(\"//│\", \"make_name\")\n", false),
     ("load_symbol", "load(\"//x:y.star\", \"f│\")\n", false),
     ("none_value", "MY_CMD = \"x\"\ntarget(name = \"x\", cmd = M│)\n", false),
+    ("arg_key", "def helper(alpha, beta = 1):\n    pass\n\nhelper(alpha = 1, │)\n", false),
+    ("arg_key_prefix", "def helper(alpha, beta = 1):\n    pass\n\nhelper(be│)\n", false),
+    ("arg_key_unclosed", "def helper(alpha, beta = 1):\n    pass\n\nhelper(be│", false),
     // While typing.
     ("unclosed_at_eof", "target(│", false),
     ("unclosed_filters", "target(name = \"x\", dri│", false),

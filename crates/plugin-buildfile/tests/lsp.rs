@@ -889,6 +889,180 @@ fn completion_in_unclosed_target_call_still_resolves() {
     assert!(has(&result, "cmd") && !has(&result, "name"), "{result}");
 }
 
+// ---------------------------------------------------------------------------
+// Keyword arguments of a call to a loaded, local or global function.
+// ---------------------------------------------------------------------------
+
+/// A loaded rule with positional, defaulted, variadic and keyword-only
+/// parameters.
+const RULE_DEFS: &str =
+    "def my_rule(name, srcs_glob, out_dir = None, *args, visibility_x = [], **kwargs):\n    pass\n";
+const RULE_LOAD: &str = "load(\"//x:defs.star\", \"my_rule\")\n\nZZ_LOCAL = 1\n";
+
+/// The labels of the items ranked before everything else, in response order,
+/// and whether every other item ranks after them.
+fn ranked_first(result: &Value) -> Vec<String> {
+    let all = items(result);
+    let first: Vec<String> = all
+        .iter()
+        .take_while(|i| is_heph(i))
+        .filter_map(|i| i["label"].as_str().map(str::to_string))
+        .collect();
+    let rest = all.get(first.len()..).unwrap_or_default();
+    for other in rest {
+        let sort = other["sortText"]
+            .as_str()
+            .or(other["label"].as_str())
+            .unwrap_or_default();
+        for f in &first {
+            assert!(
+                format!("0_{f}").as_str() < sort,
+                "`{sort}` must rank after the parameters: {result}"
+            );
+        }
+    }
+    first
+}
+
+#[test]
+fn completion_in_loaded_function_call_ranks_its_parameters_first() {
+    let mut lsp = Lsp::start();
+    lsp.write("x/defs.star", RULE_DEFS);
+    let doc = lsp.open("BUILD", &format!("{RULE_LOAD}my_rule(│)\n"));
+    assert_eq!(kind(&lsp.explain(&doc)), "arg_key");
+    let result = lsp.completion(&doc);
+    assert_eq!(
+        ranked_first(&result),
+        vec!["name", "out_dir", "srcs_glob", "visibility_x"],
+        "the keyword-usable parameters, first: {result}"
+    );
+    assert!(!has(&result, "args") && !has(&result, "kwargs"), "{result}");
+    assert!(has(&result, "ZZ_LOCAL"), "the stock items follow: {result}");
+    // Shaped like heph's target keys: a field inserting `name = `.
+    let srcs = item(&result, "srcs_glob");
+    assert_eq!(srcs["kind"], json!(5), "FIELD: {srcs}");
+    assert_eq!(srcs["filterText"], json!("srcs_glob"));
+    assert_eq!(
+        apply(&doc.text, &srcs),
+        format!("{RULE_LOAD}my_rule(srcs_glob = )\n")
+    );
+}
+
+#[test]
+fn completion_in_loaded_function_call_drops_written_keywords() {
+    let mut lsp = Lsp::start();
+    lsp.write("x/defs.star", RULE_DEFS);
+    let doc = lsp.open(
+        "BUILD",
+        &format!("{RULE_LOAD}my_rule(name = \"a\", out_dir = \"o\", │)\n"),
+    );
+    let result = lsp.completion(&doc);
+    assert_eq!(ranked_first(&result), vec!["srcs_glob", "visibility_x"]);
+    assert!(
+        !has(&result, "name") && !has(&result, "out_dir"),
+        "a written keyword is never offered again: {result}"
+    );
+}
+
+#[test]
+fn completion_in_unclosed_loaded_function_call_mid_word() {
+    let mut lsp = Lsp::start();
+    lsp.write("x/defs.star", RULE_DEFS);
+    let doc = lsp.open("BUILD", &format!("{RULE_LOAD}my_rule(name = \"a\", sr│"));
+    let result = lsp.completion(&doc);
+    assert_eq!(ranked_first(&result), vec!["srcs_glob"], "{result}");
+    let srcs = item(&result, "srcs_glob");
+    assert_eq!(
+        apply(&doc.text, &srcs),
+        format!("{RULE_LOAD}my_rule(name = \"a\", srcs_glob = "),
+        "the typed word is replaced"
+    );
+
+    // Reached by an edit from a parsing document, so a stale AST exists.
+    let base = lsp.open(
+        "edited/BUILD",
+        &format!("{RULE_LOAD}my_rule(name = \"a\")\n"),
+    );
+    let doc = lsp.change(&base, &format!("{RULE_LOAD}my_rule(name = \"a\", sr│"));
+    assert_eq!(ranked_first(&lsp.completion(&doc)), vec!["srcs_glob"]);
+}
+
+#[test]
+fn completion_in_loaded_function_call_with_an_error_after_the_cursor() {
+    let mut lsp = Lsp::start();
+    lsp.write("x/defs.star", RULE_DEFS);
+    let doc = lsp.open(
+        "BUILD",
+        &format!("{RULE_LOAD}my_rule(out│)\n\nbroken = (\n"),
+    );
+    assert_eq!(ranked_first(&lsp.completion(&doc)), vec!["out_dir"]);
+}
+
+#[test]
+fn completion_in_local_def_call_ranks_its_parameters_first() {
+    let mut lsp = Lsp::start();
+    let src =
+        "def helper(alpha, beta = 1, *, gamma):\n    pass\n\nZZ_LOCAL = 1\nhelper(alpha = 1, │)\n";
+    let doc = lsp.open("BUILD", src);
+    let result = lsp.completion(&doc);
+    assert_eq!(ranked_first(&result), vec!["beta", "gamma"], "{result}");
+    assert!(!has(&result, "alpha"), "{result}");
+    assert!(has(&result, "ZZ_LOCAL"), "{result}");
+
+    // Unclosed and mid-word: the `def` is read from the tokens.
+    let doc = lsp.open(
+        "broken/BUILD",
+        "def helper(alpha, beta = 1):\n    pass\n\nhelper(be│",
+    );
+    assert_eq!(ranked_first(&lsp.completion(&doc)), vec!["beta"]);
+}
+
+#[test]
+fn completion_in_global_builtin_call_ranks_its_keywords_first() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "x = glob(\"*.go\", │)\n");
+    let first = ranked_first(&lsp.completion(&doc));
+    assert!(first.contains(&"abs".to_string()), "{first:?}");
+    assert!(first.contains(&"exclude".to_string()), "{first:?}");
+}
+
+#[test]
+fn completion_in_call_to_a_near_miss_name_offers_no_parameters() {
+    let mut lsp = Lsp::start();
+    lsp.write("x/defs.star", RULE_DEFS);
+    for (i, call) in ["my_rul(│)\n", "my_rule_x(│)\n", "x.my_rule(│)\n"]
+        .iter()
+        .enumerate()
+    {
+        let doc = lsp.open(&format!("n{i}/BUILD"), &format!("{RULE_LOAD}{call}"));
+        let result = lsp.completion(&doc);
+        assert!(heph_items(&result).is_empty(), "{call:?}: {result}");
+        assert!(!has(&result, "srcs_glob"), "{call:?}: {result}");
+    }
+}
+
+#[test]
+fn completion_in_target_call_is_unaffected_by_loaded_functions() {
+    let mut lsp = Lsp::start();
+    lsp.write("x/defs.star", RULE_DEFS);
+    let doc = lsp.open(
+        "BUILD",
+        &format!("{RULE_LOAD}target(name = \"x\", driver = \"exec\", │)\n"),
+    );
+    let result = lsp.completion(&doc);
+    assert_eq!(
+        labels(&result),
+        vec!["approval", "cmd", "env", "labels", "transitive"],
+        "only the missing heph keys"
+    );
+    assert_eq!(kind(&lsp.explain(&doc)), "target_key");
+    // A value position of a loaded call is still the stock answer.
+    let doc = lsp.open("value/BUILD", &format!("{RULE_LOAD}my_rule(name = ZZ│)\n"));
+    let result = lsp.completion(&doc);
+    assert!(has(&result, "ZZ_LOCAL"), "{result}");
+    assert!(heph_items(&result).is_empty(), "{result}");
+}
+
 #[test]
 fn completion_in_provider_state_offers_provider_then_schema() {
     let mut lsp = Lsp::start();
@@ -1140,6 +1314,9 @@ fn matrix(site: &str, feature: Feature) {
         "load_path" => "load(\"//l│ib\", \"make_name\")\n",
         "load_symbol" => "load(\"//x:y.star\", \"fo│o\")\n",
         "none" => "MY_CMD = \"x\"\ntarget(name = \"x\", cmd = MY_C│MD)\n",
+        "arg_key" => {
+            "def helper(alpha, beta = 1):\n    pass\n\nBEX = 1\nhelper(alpha = 1, be│ta = 2)\n"
+        }
         other => panic!("unknown site {other}"),
     };
     let doc = lsp.open("m/BUILD", fixture);
@@ -1155,6 +1332,15 @@ fn matrix(site: &str, feature: Feature) {
                     if site == "none" {
                         assert!(has(&result, "MY_CMD"), "{result}");
                     }
+                    return;
+                }
+                "arg_key" => {
+                    // Prepend: the parameter first, the stock items after.
+                    let heph: Vec<Value> = heph_items(&result);
+                    assert_eq!(heph.len(), 1, "{result}");
+                    assert_eq!(heph[0]["label"], json!("beta"));
+                    assert_eq!(items(&result)[0], heph[0], "ranked first");
+                    assert!(has(&result, "BEX"), "{result}");
                     return;
                 }
                 "driver_value" => &["exec"],
@@ -1179,6 +1365,8 @@ fn matrix(site: &str, feature: Feature) {
                 "target_key" => Some("Command line to run."),
                 "state_key" => Some("Mark this package as a Go codegen root."),
                 "plugin_member" => Some("Join two path segments."),
+                // Stock passes through; it has nothing on a keyword name.
+                "arg_key" => None,
                 "plugin_namespace" | "address" | "load_path" | "load_symbol" => None,
                 "none" => {
                     // Stock: an undocumented assignment has no hover, and no
@@ -1328,6 +1516,18 @@ fn matrix_load_symbol_definition() {
     matrix("load_symbol", Feature::Definition);
 }
 #[test]
+fn matrix_arg_key_items() {
+    matrix("arg_key", Feature::Items);
+}
+#[test]
+fn matrix_arg_key_hover() {
+    matrix("arg_key", Feature::Hover);
+}
+#[test]
+fn matrix_arg_key_definition() {
+    matrix("arg_key", Feature::Definition);
+}
+#[test]
 fn matrix_none_items() {
     matrix("none", Feature::Items);
 }
@@ -1344,8 +1544,9 @@ fn matrix_none_definition() {
 // The merge policy.
 // ---------------------------------------------------------------------------
 
-/// The handler table has no append site: wherever heph knows the answer it
-/// replaces the stock one, and elsewhere the stock one passes untouched.
+/// Wherever heph knows the answer it replaces the stock one, and elsewhere the
+/// stock one passes untouched. (The one prepend site, a call's keyword names,
+/// has its own tests above.)
 #[test]
 fn merge_replace_sites_drop_stock_and_append_sites_keep_it() {
     let mut lsp = Lsp::workspace();
@@ -2101,7 +2302,10 @@ fn site_is_a_function_of_the_prefix() {
         let original = lsp.explain(&doc);
         let original_labels = heph_labels(&lsp.completion(&doc));
         let in_call = !original["site"]["call"].is_null();
-        let key_site = matches!(kind(&original).as_str(), "target_key" | "state_key");
+        let key_site = matches!(
+            kind(&original).as_str(),
+            "target_key" | "state_key" | "arg_key"
+        );
         for (v, text) in variants(fixture, *skip_c) {
             // Opened fresh, and reached by didChange from the original (only
             // the second has a stale AST to exercise).

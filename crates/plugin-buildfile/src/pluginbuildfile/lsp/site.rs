@@ -185,6 +185,20 @@ pub(crate) struct Call {
     pub selected: Option<String>,
 }
 
+/// The enclosing call to any other function named by a plain identifier
+/// (`my_rule(`, `glob(`; not `x.f(` and not a `def`'s own parameter list).
+/// Whose parameters it takes is the handler's question: the resolver reads
+/// tokens only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArgCall {
+    pub callee: String,
+    /// `Some(line)` when the extent was guessed, as for [`Call::guessed`].
+    pub guessed: Option<u32>,
+    /// The keyword arguments present in the extent (the one under the cursor
+    /// excluded).
+    pub keys: Vec<String>,
+}
+
 /// How the value being completed is quoted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Quote {
@@ -252,6 +266,13 @@ pub(crate) enum Site {
         edit: Range<usize>,
         prefix: String,
     },
+    /// A keyword-name position inside a call to any other plain-named
+    /// function.
+    ArgKey {
+        call: ArgCall,
+        edit: Range<usize>,
+        prefix: String,
+    },
     /// After `heph.`.
     PluginNamespace {
         edit: Range<usize>,
@@ -287,6 +308,7 @@ impl Site {
             Site::ProviderValue { .. } => "provider_value",
             Site::TargetKey { .. } => "target_key",
             Site::StateKey { .. } => "state_key",
+            Site::ArgKey { .. } => "arg_key",
             Site::PluginNamespace { .. } => "plugin_namespace",
             Site::PluginMember { .. } => "plugin_member",
             Site::Address { .. } => "address",
@@ -326,8 +348,17 @@ impl Site {
             | Site::LoadSymbol { value, .. } => Some(&value.prefix),
             Site::TargetKey { prefix, .. }
             | Site::StateKey { prefix, .. }
+            | Site::ArgKey { prefix, .. }
             | Site::PluginNamespace { prefix, .. }
             | Site::PluginMember { prefix, .. } => Some(prefix),
+        }
+    }
+
+    /// Where the enclosing call's extent was guessed, for any call site.
+    fn guessed(&self) -> Option<u32> {
+        match self {
+            Site::ArgKey { call, .. } => call.guessed,
+            _ => self.call().and_then(|c| c.guessed),
         }
     }
 
@@ -354,6 +385,10 @@ impl Site {
             map.insert("present_keys".to_string(), json!(call.keys));
             map.insert("selected".to_string(), json!(call.selected));
         }
+        if let (Site::ArgKey { call, .. }, Some(map)) = (self, out.as_object_mut()) {
+            map.insert("call".to_string(), json!(call.callee));
+            map.insert("present_keys".to_string(), json!(call.keys));
+        }
         if let (Some(value), Some(map)) = (self.value(), out.as_object_mut()) {
             map.insert("quote".to_string(), json!(value.quote.name()));
             map.insert("edit".to_string(), span(&value.edit));
@@ -362,6 +397,7 @@ impl Site {
         let word = match self {
             Site::TargetKey { edit, .. }
             | Site::StateKey { edit, .. }
+            | Site::ArgKey { edit, .. }
             | Site::PluginNamespace { edit, .. }
             | Site::PluginMember { edit, .. } => Some(edit),
             _ => None,
@@ -676,13 +712,61 @@ impl Doc<'_> {
         let (callee, callee_span) = self.callee_of(i)?;
         let open = self.tok(i)?.start as usize;
         let (end, guessed) = self.extent(i);
-        let mut keys = Vec::new();
-        let mut selected = None;
         let selector = match callee {
             Builtin::Target => "driver",
             Builtin::ProviderState => "provider",
             Builtin::Load => "",
         };
+        let (keys, selected) = self.keys_in(i, end, cursor, selector);
+        Some(Call {
+            callee,
+            callee_span,
+            open,
+            end,
+            guessed,
+            keys,
+            selected,
+        })
+    }
+
+    /// The call to a plain-named non-builtin function whose `(` is token `i`.
+    fn arg_call_at(&self, i: usize, cursor: Option<usize>) -> Option<ArgCall> {
+        let t = self.tok(i)?;
+        if t.kind != Kind::Open(Bracket::Round) {
+            return None;
+        }
+        let c = self.tok(i.checked_sub(1)?)?;
+        if c.kind != Kind::Ident || Builtin::of(self.text_of(c)).is_some() {
+            return None;
+        }
+        // Not a member call (`x.f(`), and not a `def`'s parameter list.
+        if let Some(before) = i.checked_sub(2).and_then(|j| self.tok(j))
+            && (before.kind == Kind::Dot
+                || (before.kind == Kind::Keyword && self.text_of(before) == "def"))
+        {
+            return None;
+        }
+        let (end, guessed) = self.extent(i);
+        let (keys, _) = self.keys_in(i, end, cursor, "");
+        Some(ArgCall {
+            callee: self.text_of(c).to_string(),
+            guessed,
+            keys,
+        })
+    }
+
+    /// The keyword names written directly inside the call whose `(` is token
+    /// `i` (up to `end`), the one under `cursor` excluded; and the string
+    /// value of the `selector` keyword, if any.
+    fn keys_in(
+        &self,
+        i: usize,
+        end: usize,
+        cursor: Option<usize>,
+        selector: &str,
+    ) -> (Vec<String>, Option<String>) {
+        let mut keys = Vec::new();
+        let mut selected = None;
         let mut depth = 0usize;
         let mut j = i + 1;
         while let Some(t) = self.tok(j) {
@@ -716,15 +800,7 @@ impl Doc<'_> {
             }
             j += 1;
         }
-        Some(Call {
-            callee,
-            callee_span,
-            open,
-            end,
-            guessed,
-            keys,
-            selected,
-        })
+        (keys, selected)
     }
 
     /// The identifier-like token under the cursor (the cursor anywhere in it,
@@ -865,9 +941,7 @@ pub(crate) fn resolve(doc: &Doc<'_>, o: usize) -> Resolution {
             degraded: ast_degraded.into_iter().collect(),
         };
     }
-    if let Some(call) = resolution.site.call()
-        && let Some(line) = call.guessed
-    {
+    if let Some(line) = resolution.site.guessed() {
         resolution
             .degraded
             .push(Degraded::CallExtentGuessed { line });
@@ -949,7 +1023,9 @@ fn classify(doc: &Doc<'_>, o: usize) -> Result<Site, Reason> {
     }
 
     let Some((open_idx, call)) = enclosing_call else {
-        return Err(Reason::NotASite);
+        return innermost
+            .and_then(|i| arg_key_site(doc, i, o, word_tok, word_start, edit, prefix))
+            .ok_or(Reason::NotASite);
     };
     if call.callee == Builtin::Load {
         return Err(Reason::NotASite);
@@ -990,6 +1066,32 @@ fn classify(doc: &Doc<'_>, o: usize) -> Result<Site, Reason> {
         }
         _ => Err(Reason::NotASite),
     }
+}
+
+/// A keyword-name position (right after the `(` or a `,`, on an identifier or
+/// nothing) directly inside a call to a plain-named non-builtin function whose
+/// `(` is token `open_idx`.
+fn arg_key_site(
+    doc: &Doc<'_>,
+    open_idx: usize,
+    o: usize,
+    word_tok: Option<Tok>,
+    word_start: usize,
+    edit: Range<usize>,
+    prefix: String,
+) -> Option<Site> {
+    if word_tok.is_some_and(|t| t.kind != Kind::Ident) {
+        return None;
+    }
+    let prev = doc.prev_significant(word_start, Some(open_idx));
+    if !matches!(
+        prev.and_then(|i| doc.tok(i)).map(|t| t.kind),
+        None | Some(Kind::Comma)
+    ) {
+        return None;
+    }
+    let call = doc.arg_call_at(open_idx, Some(o))?;
+    Some(Site::ArgKey { call, edit, prefix })
 }
 
 fn key_site(call: Call, edit: Range<usize>, prefix: String) -> Site {
@@ -1239,7 +1341,61 @@ mod tests {
     #[test]
     fn site_nested_calls() {
         let r = at("target(name = f(x, dri│\n");
-        assert_eq!(kind(&r), "none", "the inner call is the site, not target");
+        assert_eq!(
+            kind(&r),
+            "arg_key",
+            "the inner call is the site, not target"
+        );
+        match r.site {
+            Site::ArgKey { call, prefix, .. } => {
+                assert_eq!(call.callee, "f");
+                assert_eq!(prefix, "dri");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn site_arg_key_in_any_plain_call() {
+        let r = at("my_rule(name = \"a\", out = 1, sr│\n\nbroken = (\n");
+        let Site::ArgKey { call, edit, prefix } = r.site else {
+            panic!("{:?}", r.site);
+        };
+        assert_eq!(call.callee, "my_rule");
+        assert_eq!(call.keys, vec!["name".to_string(), "out".to_string()]);
+        assert_eq!((edit.end - edit.start, prefix.as_str()), (2, "sr"));
+        assert!(
+            r.degraded
+                .iter()
+                .any(|d| matches!(d, Degraded::CallExtentGuessed { .. })),
+            "{:?}",
+            r.degraded
+        );
+        assert_eq!(kind(&at("f(│)\n")), "arg_key", "right after the `(`");
+        assert_eq!(kind(&at("f(x, │)\n")), "arg_key", "after a comma");
+        assert_eq!(kind(&at("f(\n    a = 1,\n    │\n)\n")), "arg_key");
+    }
+
+    #[test]
+    fn site_arg_key_is_not_every_bracket() {
+        for fixture in [
+            "def f(a, │):\n    pass\n", // the def's own parameters
+            "x.f(│)\n",                 // a member call
+            "f(a = │)\n",               // a value position
+            "f(a = M│)\n",              // a value position, mid-word
+            "f(**│)\n",                 // after `**`
+            "f(x + │)\n",               // inside an expression
+            "f([a, │])\n",              // inside a list argument
+            "x = (a, │)\n",             // a tuple
+        ] {
+            assert_eq!(kind(&at(fixture)), "none", "{fixture:?}");
+        }
+        // A lex error after the cursor does not matter.
+        assert_eq!(kind(&at("f(\"a\", │\n\"\"\"\n")), "arg_key");
+        // heph's builtins keep their own sites.
+        assert_eq!(kind(&at("target(│)\n")), "target_key");
+        assert_eq!(kind(&at("provider_state(│)\n")), "state_key");
+        assert_eq!(kind(&at("load(\"//x\", │)\n")), "none");
     }
 
     #[test]

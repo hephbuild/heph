@@ -6,7 +6,10 @@
 //! (keyword names, driver and provider names, plugin namespaces and members,
 //! addresses, load paths and symbols) heph is authoritative and replaces the
 //! stock answer, for completion, hover and definition alike; the stock answer
-//! passes through only where heph cannot know (free expressions, locals). Every
+//! passes through only where heph cannot know (free expressions, locals). One
+//! site prepends instead: the keyword names of a call to a loaded, local or
+//! global function whose parameters heph can read come first, the stock items
+//! (values a positional argument could take) after them. Every
 //! heph completion item carries a text edit over the site's token, a
 //! `filterText` matching what the editor compares against, one kind per site
 //! kind, Markdown documentation and a `sortText` of `0_<name>`; heph filters by
@@ -18,9 +21,9 @@
 
 use super::context::HephLspContext;
 use super::index::SharedState;
-use super::lex::{Kind, Tokens};
+use super::lex::{self, Bracket, Kind, NO_LINK, Tok, Tokens};
 use super::position::{self, Encoding};
-use super::site::{Builtin, Call, Quote, Site, Str};
+use super::site::{ArgCall, Builtin, Call, Quote, Site, Str};
 use crate::pluginbuildfile::run_file::{resolve_load_target, target_base_fields};
 use crate::pluginbuildfile::{DEFAULT_INDENT, build_file_indent_from_options};
 use hplugin::driver::DriverSchema;
@@ -74,12 +77,15 @@ pub(crate) enum Merge {
     Replace,
     /// The stock answer, untouched.
     PassThrough,
+    /// heph's items ranked first, the stock ones after them ([`prepend`]).
+    Prepend,
 }
 
 /// The stock column of the site table.
 pub(crate) fn merge_for(site: &Site) -> Merge {
     match site {
         Site::None | Site::Callee { .. } => Merge::PassThrough,
+        Site::ArgKey { .. } => Merge::Prepend,
         _ => Merge::Replace,
     }
 }
@@ -157,7 +163,9 @@ fn markdown(value: String) -> Documentation {
 /// The kind every item of a site carries.
 fn item_kind(site: &Site) -> CompletionItemKind {
     match site {
-        Site::TargetKey { .. } | Site::StateKey { .. } => CompletionItemKind::FIELD,
+        Site::TargetKey { .. } | Site::StateKey { .. } | Site::ArgKey { .. } => {
+            CompletionItemKind::FIELD
+        }
         Site::DriverValue { .. } | Site::ProviderValue { .. } => CompletionItemKind::ENUM_MEMBER,
         Site::PluginNamespace { .. } => CompletionItemKind::MODULE,
         Site::PluginMember { .. } | Site::LoadSymbol { .. } => CompletionItemKind::FUNCTION,
@@ -173,6 +181,13 @@ pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Vec<CompletionItem> {
         Site::None | Site::Callee { .. } => return Vec::new(),
         Site::TargetKey { call, edit, .. } => (target_keys(call, ctx), edit.clone(), None),
         Site::StateKey { call, edit, .. } => (state_keys(call, ctx), edit.clone(), None),
+        Site::ArgKey { call, edit, .. } => (
+            callee_params(&call.callee, ctx)
+                .map(|params| arg_keys(call, params))
+                .unwrap_or_default(),
+            edit.clone(),
+            None,
+        ),
         Site::DriverValue { value, .. } => (
             ctx.registry
                 .drivers
@@ -227,6 +242,50 @@ pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Vec<CompletionItem> {
             (load_symbols(path, ctx), value.edit.clone(), Some(value))
         }
     };
+    render(site, candidates, edit, value, ctx)
+}
+
+/// The keyword-argument completion of a call to a function whose parameters
+/// heph can read (an `ArgKey` site): its unwritten parameters first, each
+/// inserting `name = `, then the stock items. Where the callee's parameters
+/// are unknown the stock answer passes through untouched; where they are
+/// known, heph's list replaces the stock parameter items (which neither rank
+/// nor, for a loaded or global callee, drop the keywords already written).
+pub(crate) fn prepend(
+    site: &Site,
+    ctx: &Ctx<'_>,
+    stock: Vec<CompletionItem>,
+) -> Vec<CompletionItem> {
+    let Site::ArgKey { call, edit, .. } = site else {
+        return stock;
+    };
+    let Some(params) = callee_params(&call.callee, ctx) else {
+        return stock;
+    };
+    let mut out = render(site, arg_keys(call, params), edit.clone(), None, ctx);
+    out.extend(
+        stock
+            .into_iter()
+            .filter(|i| i.kind != Some(CompletionItemKind::PROPERTY))
+            .map(|mut i| {
+                if i.sort_text.is_none() {
+                    i.sort_text = Some(format!("1_{}", i.label));
+                }
+                i
+            }),
+    );
+    out
+}
+
+/// `candidates` as completion items under the conventions: prefix-filtered,
+/// deduped by label, sorted, each with its text edit over `edit`.
+fn render(
+    site: &Site,
+    candidates: Vec<Candidate>,
+    edit: Bytes<usize>,
+    value: Option<&Str>,
+    ctx: &Ctx<'_>,
+) -> Vec<CompletionItem> {
     let prefix = site.prefix().unwrap_or("");
     // What the editor compares `filterText` against: the edit range's text up
     // to the cursor, which for an unterminated string starts at its quote.
@@ -348,6 +407,194 @@ fn state_keys(call: &Call, ctx: &Ctx<'_>) -> Vec<Candidate> {
     }
     out.retain(|c| !call.keys.contains(&c.label));
     out
+}
+
+/// A parameter a call can pass by keyword.
+struct Param {
+    name: String,
+    /// How it is declared: `out_dir = None`, `abs: bool = False`.
+    sig: String,
+    required: bool,
+    doc: String,
+}
+
+/// An `ArgKey` call's candidates: the callee's parameters not yet written.
+fn arg_keys(call: &ArgCall, params: Vec<Param>) -> Vec<Candidate> {
+    params
+        .into_iter()
+        .filter(|p| !call.keys.contains(&p.name))
+        .map(|p| {
+            let mut doc = format!("```python\n{}\n```", p.sig);
+            if p.required {
+                doc.push_str("\n\nRequired.");
+            }
+            if !p.doc.is_empty() {
+                doc.push_str("\n\n");
+                doc.push_str(&p.doc);
+            }
+            Candidate {
+                detail: Some(if p.required {
+                    format!("{}: parameter (required)", call.callee)
+                } else {
+                    format!("{}: parameter", call.callee)
+                }),
+                doc,
+                insert: format!("{} = ", p.name),
+                label: p.name,
+            }
+        })
+        .collect()
+}
+
+/// The keyword-usable parameters of the function `name` names in the current
+/// document, read without the document having to parse: a local `def` from
+/// the tokens; a loaded name through its `load` (from the tokens) to the
+/// loaded file's `def`, read from disk; otherwise a documented global. `None`
+/// when heph cannot tell which function it is.
+fn callee_params(name: &str, ctx: &Ctx<'_>) -> Option<Vec<Param>> {
+    if let Some(params) = def_params(ctx.text, ctx.tokens, name) {
+        return Some(params);
+    }
+    if let Some((path, exported)) = load_binding(ctx.text, ctx.tokens, name) {
+        return load_files(&path, ctx).iter().find_map(|f| {
+            let text = std::fs::read_to_string(f).ok()?;
+            def_params(&text, &lex::lex(&text), &exported)
+        });
+    }
+    use starlark::docs::{DocItem, DocMember};
+    let DocItem::Member(DocMember::Function(f)) = ctx.listing.doc_global(name)? else {
+        return None;
+    };
+    let any = starlark::typing::Ty::any();
+    Some(
+        f.params
+            .pos_or_named
+            .iter()
+            .chain(&f.params.named_only)
+            .map(|p| {
+                let mut sig = p.name.clone();
+                if p.typ != any {
+                    sig.push_str(&format!(": {}", p.typ));
+                }
+                if let Some(d) = &p.default_value {
+                    sig.push_str(&format!(" = {d}"));
+                }
+                Param {
+                    name: p.name.clone(),
+                    sig,
+                    required: p.default_value.is_none(),
+                    doc: p
+                        .docs
+                        .as_ref()
+                        .map(|d| d.summary.clone())
+                        .unwrap_or_default(),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The parameters of the first `def name(…)` in `tokens`, `*args`,
+/// `**kwargs` and the bare `*` / `/` markers left out. `None` when there is no
+/// such `def`, or its parameter list is unclosed (no reliable end).
+fn def_params(text: &str, tokens: &Tokens, name: &str) -> Option<Vec<Param>> {
+    let toks = &tokens.toks;
+    let at = toks.windows(3).position(|w| {
+        matches!(w, [d, n, p] if d.kind == Kind::Keyword
+            && text.get(d.range()) == Some("def")
+            && n.kind == Kind::Ident
+            && text.get(n.range()) == Some(name)
+            && p.kind == Kind::Open(Bracket::Round))
+    })?;
+    let open = at + 2;
+    let close = toks.get(open)?.link;
+    if close == NO_LINK {
+        return None;
+    }
+    let close = close as usize;
+    let mut params = Vec::new();
+    let mut push = |from: usize, to: usize, defaulted: bool| {
+        let (Some(first), Some(last)) =
+            (toks.get(from), to.checked_sub(1).and_then(|l| toks.get(l)))
+        else {
+            return;
+        };
+        if from >= to || first.kind != Kind::Ident {
+            return;
+        }
+        let (Some(name), Some(sig)) = (
+            text.get(first.range()),
+            text.get(first.start as usize..last.end as usize),
+        ) else {
+            return;
+        };
+        params.push(Param {
+            name: name.to_string(),
+            sig: sig.to_string(),
+            required: !defaulted,
+            doc: String::new(),
+        });
+    };
+    let (mut depth, mut from, mut defaulted) = (0usize, open + 1, false);
+    for j in open + 1..close {
+        let Some(t) = toks.get(j) else { break };
+        match t.kind {
+            Kind::Open(_) => depth += 1,
+            Kind::Close(_) => depth = depth.saturating_sub(1),
+            Kind::Equal if depth == 0 => defaulted = true,
+            Kind::Comma if depth == 0 => {
+                push(from, j, defaulted);
+                (from, defaulted) = (j + 1, false);
+            }
+            _ => {}
+        }
+    }
+    push(from, close, defaulted);
+    Some(params)
+}
+
+/// The `(load path, exported name)` a `load(…)` in `tokens` binds `name` to:
+/// `load("p", "name")` or `load("p", name = "exported")`. Read from the
+/// tokens, so an unclosed call or an error elsewhere in the file does not hide
+/// it.
+fn load_binding(text: &str, tokens: &Tokens, name: &str) -> Option<(String, String)> {
+    let toks = &tokens.toks;
+    let unquote = |t: &Tok| {
+        text.get(t.range())
+            .map(|s| s.trim_matches(['"', '\'']).to_string())
+    };
+    toks.windows(2)
+        .enumerate()
+        .filter(|(_, w)| {
+            matches!(w, [l, p] if l.kind == Kind::Load && p.kind == Kind::Open(Bracket::Round))
+        })
+        .find_map(|(i, _)| {
+            let args = toks.get(i + 2..)?;
+            let path = args.first().filter(|t| t.kind == Kind::Str).and_then(unquote)?;
+            // The load's arguments run to its closer, or, unclosed, to the
+            // first token no argument list contains.
+            let args = args.get(1..)?.iter().take_while(|t| {
+                matches!(t.kind, Kind::Str | Kind::Ident | Kind::Equal | Kind::Comma | Kind::Comment)
+            });
+            let args: Vec<&Tok> = args.filter(|t| t.kind != Kind::Comment).collect();
+            let exported = args.iter().enumerate().find_map(|(k, t)| match t.kind {
+                // `"name"`, not the value of an `alias = "name"`.
+                Kind::Str
+                    if k.checked_sub(1)
+                        .and_then(|p| args.get(p))
+                        .is_none_or(|p| p.kind == Kind::Comma) =>
+                {
+                    unquote(t).filter(|s| s == name)
+                }
+                Kind::Ident if text.get(t.range()) == Some(name) => {
+                    let equal = args.get(k + 1).is_some_and(|e| e.kind == Kind::Equal);
+                    let value = args.get(k + 2).filter(|v| equal && v.kind == Kind::Str)?;
+                    unquote(value)
+                }
+                _ => None,
+            })?;
+            Some((path, exported))
+        })
 }
 
 fn driver_doc(name: &str, schema: &DriverSchema) -> String {
@@ -585,7 +832,7 @@ fn hover_markdown(value: String, range: Option<Range>) -> Hover {
 pub(crate) fn hover(site: &Site, ctx: &Ctx<'_>) -> Option<Hover> {
     let (md, range) = match site {
         Site::None | Site::PluginNamespace { .. } | Site::Address { .. } => return None,
-        Site::LoadPath { .. } | Site::LoadSymbol { .. } => return None,
+        Site::LoadPath { .. } | Site::LoadSymbol { .. } | Site::ArgKey { .. } => return None,
         Site::Callee { call } => {
             let md = match call.callee {
                 Builtin::ProviderState => {
@@ -757,7 +1004,7 @@ fn link(origin: Range, path: &Path, line: u32) -> Option<LocationLink> {
 /// `Some(empty)` is heph saying there is nothing to jump to.
 pub(crate) fn definition(site: &Site, ctx: &Ctx<'_>) -> Option<Vec<LocationLink>> {
     match site {
-        Site::None => None,
+        Site::None | Site::ArgKey { .. } => None,
         Site::Address { value } => Some(address_definition(value, ctx).into_iter().collect()),
         Site::LoadPath { value } => {
             let origin = ctx.range(&value.token);
@@ -1015,5 +1262,60 @@ mod tests {
     #[test]
     fn every_site_has_a_merge_policy() {
         assert_eq!(merge_for(&Site::None), Merge::PassThrough);
+    }
+
+    fn binding(src: &str, name: &str) -> Option<(String, String)> {
+        load_binding(src, &lex::lex(src), name)
+    }
+
+    #[test]
+    fn load_binding_reads_plain_and_aliased_symbols() {
+        let src = "load(\"//p\", \"a\", b = \"c\")\nload(\"//q:f.star\", \"d\")\n";
+        let bound = |p: &str, e: &str| Some((p.to_string(), e.to_string()));
+        assert_eq!(binding(src, "a"), bound("//p", "a"));
+        assert_eq!(binding(src, "b"), bound("//p", "c"), "the alias");
+        assert_eq!(binding(src, "d"), bound("//q:f.star", "d"), "a later load");
+        assert_eq!(binding(src, "c"), None, "an alias's value binds nothing");
+        assert_eq!(binding(src, "ab"), None, "a near miss");
+        assert_eq!(binding(src, "p"), None, "the path binds nothing");
+        // Unclosed, and followed by more code.
+        let open = "load(\"//p\", \"a\"\nx = a(\n";
+        assert_eq!(binding(open, "a"), bound("//p", "a"));
+        assert_eq!(binding("a(\"//p\", \"a\")\n", "a"), None, "not a load");
+    }
+
+    fn params(src: &str, name: &str) -> Option<Vec<(String, String, bool)>> {
+        def_params(src, &lex::lex(src), name).map(|ps| {
+            ps.into_iter()
+                .map(|p| (p.name, p.sig, p.required))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn def_params_skips_variadics_and_reads_defaults() {
+        let src = "def f(a, b: dict[str, int] = {}, *args, c = [1, 2], **kw):\n    pass\n";
+        let p = |n: &str, s: &str, r: bool| (n.to_string(), s.to_string(), r);
+        assert_eq!(
+            params(src, "f"),
+            Some(vec![
+                p("a", "a", true),
+                p("b", "b: dict[str, int] = {}", false),
+                p("c", "c = [1, 2]", false),
+            ])
+        );
+        assert_eq!(
+            params("def g(*, k, /):\n    pass\n", "g"),
+            Some(vec![p("k", "k", true)]),
+            "bare markers are not parameters"
+        );
+        assert_eq!(params("def h():\n    pass\n", "h"), Some(Vec::new()));
+        assert_eq!(params(src, "fx"), None, "a near miss");
+        assert_eq!(params("f(a, b)\n", "f"), None, "a call is not a def");
+        assert_eq!(
+            params("def f(a, b\n", "f"),
+            None,
+            "unclosed: no reliable end"
+        );
     }
 }
