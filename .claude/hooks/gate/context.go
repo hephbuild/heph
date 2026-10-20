@@ -16,6 +16,9 @@ import (
 const (
 	contextWarnAt   = 300_000
 	contextWarnStep = 100_000
+	// A subagent cannot /compact; its only way out is to hand back, which
+	// is worth doing earlier. One implementation agent ran 228 calls to 671k.
+	subagentWarnAt = 200_000
 	// The transcript is read from the end; the last assistant turn is near it.
 	transcriptTail = 1 << 20
 )
@@ -26,29 +29,42 @@ const contextNoticeText = "Context is ~%dk tokens, and every call re-sends all o
 	"(isolation: \"worktree\", continued with SendMessage) instead of doing it here. " +
 	"A request unrelated to the open PR is a new session. See CLAUDE.md \"Phases and hand-offs\"."
 
+const subagentNoticeText = "Context is ~%dk tokens, and every call re-sends all of it. " +
+	"You are a subagent and cannot /compact. Finish the unit in hand, commit it, and return: " +
+	"what is done (branch and SHA), what is left, and the decisions that still hold — " +
+	"the parent continues the rest in a fresh agent. Do not start the next unit here."
+
 // contextNotice returns a reminder for the model when the session's context
 // has crossed the next threshold since the last reminder, or "". stateDir
-// holds one small file per session recording the last threshold reported;
-// a /compact drops the context under it and re-arms the notice.
+// holds one small file per session (and per subagent) recording the last
+// threshold reported; a /compact drops the context under it and re-arms the
+// notice.
 //
-// A subagent's call is skipped: its transcript_path is not documented to be
-// its own, and a subagent is the fresh context the notice points to.
+// A subagent's hook input carries the parent's transcript_path; its own
+// transcript sits beside it as <session>/subagents/agent-<id>.jsonl. When
+// that file is not there, the subagent gets no notice.
 func contextNotice(transcriptPath, sessionID, agentID, stateDir string) string {
-	if transcriptPath == "" || sessionID == "" || agentID != "" {
+	if transcriptPath == "" || sessionID == "" {
 		return ""
+	}
+	warnAt, text, key := contextWarnAt, contextNoticeText, filepath.Base(sessionID)
+	if agentID != "" {
+		agentID = filepath.Base(agentID)
+		transcriptPath = filepath.Join(strings.TrimSuffix(transcriptPath, ".jsonl"), "subagents", "agent-"+agentID+".jsonl")
+		warnAt, text, key = subagentWarnAt, subagentNoticeText, key+"-"+agentID
 	}
 	tokens := lastContext(transcriptPath)
 	if tokens == 0 {
 		return ""
 	}
-	state := filepath.Join(stateDir, "heph-gate-context-"+filepath.Base(sessionID))
+	state := filepath.Join(stateDir, "heph-gate-context-"+key)
 	reported := 0
 	if b, err := os.ReadFile(state); err == nil {
 		reported, _ = strconv.Atoi(strings.TrimSpace(string(b)))
 	}
 	level := 0
-	if tokens >= contextWarnAt {
-		level = contextWarnAt + (tokens-contextWarnAt)/contextWarnStep*contextWarnStep
+	if tokens >= warnAt {
+		level = warnAt + (tokens-warnAt)/contextWarnStep*contextWarnStep
 	}
 	if level != reported {
 		_ = os.WriteFile(state, []byte(strconv.Itoa(level)), 0o600)
@@ -56,7 +72,7 @@ func contextNotice(transcriptPath, sessionID, agentID, stateDir string) string {
 	if level == 0 || level <= reported {
 		return ""
 	}
-	return fmt.Sprintf(contextNoticeText, tokens/1000)
+	return fmt.Sprintf(text, tokens/1000)
 }
 
 // lastContext is the context size of the transcript's last assistant turn:
