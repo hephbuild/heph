@@ -205,7 +205,7 @@ A `PreToolUse` hook (`.claude/hooks/gate`, a Go program run with `go run`; tests
   - Nothing is added to `lint` itself, which CI runs.
   - Any edit or commit after the run means running `lint` again. `HEPH_PUSH_UNLINTED=1` pushes anyway.
 - A scripted edit is refused: `sed -i`, `perl -i`, or a python script that reads, replaces and writes. `HEPH_SCRIPTED_EDIT=1` is the opt-in, only for the compiler-verified exception under "Session economy".
-- Nothing else is refused, but the model is told its context size once it passes 300k, and again at each further 100k (not inside a subagent).
+- Nothing else is refused, but the model is told its context size once it passes 300k, and again at each further 100k. A subagent, which cannot `/compact`, is told from 200k to hand back.
 
 The hook needs `go` on `PATH` (devenv provides it) and lets everything through without it.
 
@@ -264,6 +264,8 @@ The next session starts from the hand-off's link, never from the conversation th
 
 **One implementation context per stack layer.** A stack built and review-fixed in one context grows it past 400k, and every call re-sends all of it: one two-layer session ran 299 calls to a 736k context and 136M input tokens, 67% of it above 150k. Build each layer in its own context — a `general-purpose` agent with `isolation: "worktree"` per layer, continued with `SendMessage` for that layer's review fixes, or end the turn at the layer boundary and `/compact`. The cost is each layer re-reading its own code, which at a small context is a fraction of carrying the other layer.
 
+**A subagent is not a free context.** It cannot `/compact`, so a brief that hands it a whole spec makes it the long session. On 2026-10-19 one implementation agent built an entire redesign in one context, 228 calls to 671k and 91M input, more than every main session of those two days but one. Brief one unit per agent (a stack layer, a PR, a stage of the spec), with a stop condition: commit, report branch, SHA, what is left. Then brief the next unit to a fresh agent.
+
 **Rework goes to a fresh context too.** Two cases count as rework:
 - a review-fix round after the first board;
 - a redesign the user asks for once code exists.
@@ -276,7 +278,7 @@ Brief a fresh agent with the diff range, the finding or the user's words, and th
 
 **Match the model to the job.** Lookups and triage don't need the strongest model: `Explore`, `/ci-triage` (which runs forked on Sonnet), and the `product-vision` and `feature-quality` consults at both stages use `model: "sonnet"`. `code-quality`, `hermeticity` and `compatibility` and the implementation itself inherit the session model.
 
-**Match the effort to the phase, too.** `/effort xhigh` saved during design carries into implementation, and thinking is re-sent on every later call: one implementation session carried ~210k thinking tokens, ~35M input. Use `xhigh` for design and for review agents, `high` (or lower) for implementation, and raise it for the stretch that needs it — concurrency, locking, cache keys.
+**Match the effort to the phase, too.** `/effort xhigh` saved during design carries into implementation, and thinking is re-sent on every later call: one implementation session carried ~210k thinking tokens, ~35M input. Use `xhigh` for design and for review agents, `high` (or lower) for implementation, and raise it for the stretch that needs it — concurrency, locking, cache keys. The same goes for the model: a dependency upgrade, its CI fixes and an upstream bug report ran on Fable at `xhigh` for 302 calls (2026-10-18), ~74s of generation per call and six hours of model time against one hour of tools.
 
 **Knowledge goes in the repo, not in memory.** Memory reaches one user's sessions, and only when it happens to be recalled. A trap about this repo belongs in the repo:
 - a CI failure signature goes in `/ci-triage`;
@@ -295,6 +297,7 @@ Every turn re-sends the whole context, so a long session pays for its history on
 - **Send long output to a file.** Redirect build and test output into the scratchpad and grep what you need from the file, instead of letting a whole run into context. Judge the run by its exit code, not by the grep: rustfmt prints `Diff in`, not `error`, and `| tail` hides the status.
 - **Don't poll.** CI: `/ci-triage` waits on the run and classifies each failure: a known flake (it reruns it), a failure inherited from a stacked base, or a real break. It reads the failed logs from a file, not into context. The primitive underneath is `gh run watch <run-id> --exit-status` with `run_in_background`. `gh pr checks` right after a push prints "no checks reported", which is not a pass. A local process: `run_in_background`, or Monitor with an until-loop.
 - **Artifacts: one publish per round of feedback.** Collect the changes, edit the local file with `Edit`, publish once. Don't read back the published page — the local file is the source.
+- **Claude Docs: one `batch` per round, and read narrowly.** Each `update` call takes 1–2 minutes, so one design session spent 17 of its 26 tool minutes on 36 of them. Group a round's edits into one `batch`. Load a `guide` topic once per session; `topic.index` plus `topic.editing` is 46k. Don't `read` a whole node, since one read returned 119k. Export the doc to the scratchpad and `rg` it, then read the section you need.
 - **The shell is zsh with GNU coreutils from nix**, not bash or BSD: `stat -c` (not `-f`), no `mapfile`, `sed -i` takes no suffix argument. A directory under `~/.claude/projects/` starts with `-`, so it needs `--` or `./` before it reaches `ls`/`du`/`find`.
 
 ## Review Board

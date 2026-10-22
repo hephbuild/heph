@@ -77,12 +77,45 @@ func TestContextNoticeFiresOncePerStep(t *testing.T) {
 	}
 }
 
-func TestContextNoticeSkipsSubagentsAndUnknowns(t *testing.T) {
+func TestContextNoticeReadsTheSubagentsOwnTranscript(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sess.jsonl")
+	// The parent is far past its threshold; the subagent's notice must
+	// follow the subagent's transcript, not the parent's.
+	writeTranscript(t, p, assistantLine(900_000))
+	sub := filepath.Join(dir, "sess", "subagents", "agent-a1.jsonl")
+	if err := os.MkdirAll(filepath.Dir(sub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	notice := func(tokens int) string {
+		writeTranscript(t, sub, assistantLine(tokens))
+		return contextNotice(p, "sess", "a1", dir)
+	}
+	if got := notice(150_000); got != "" {
+		t.Errorf("subagent at 150k got %q", got)
+	}
+	got := notice(210_000)
+	if !strings.Contains(got, "subagent") {
+		t.Errorf("subagent crossing 200k got %q, want the subagent notice", got)
+	}
+	if got := notice(250_000); got != "" {
+		t.Errorf("same step repeated: %q", got)
+	}
+	if got := notice(310_000); got == "" {
+		t.Error("crossing 300k did not fire again")
+	}
+	// The subagent's state is its own: the parent still gets its first notice.
+	if got := contextNotice(p, "sess", "", dir); strings.Contains(got, "subagent") || got == "" {
+		t.Errorf("parent got %q, want the session notice", got)
+	}
+}
+
+func TestContextNoticeSkipsUnknowns(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "t.jsonl")
 	writeTranscript(t, p, assistantLine(500_000))
-	if contextNotice(p, "sess", "agent-1", dir) != "" {
-		t.Error("a subagent's call got the notice")
+	if contextNotice(p, "sess", "missing", dir) != "" {
+		t.Error("a subagent with no transcript got the notice")
 	}
 	if contextNotice("", "sess", "", dir) != "" || contextNotice(p, "", "", dir) != "" {
 		t.Error("notice without a transcript or session")
