@@ -208,6 +208,17 @@ in
     '')
   ] ++ lib.optionals pkgs.stdenv.isLinux [
     pkgs.fuse3
+    # The aarch64-linux dev linker (`.cargo/config.toml` names it for
+    # `aarch64-unknown-linux-gnu`). rustc links x86_64 Linux with its bundled
+    # lld already; aarch64 still goes through the C compiler's GNU ld, which
+    # made the linux/arm64 test job's links about twice as slow. `-B` points
+    # the compiler driver at nix's `ld.lld` rather than whatever is on PATH.
+    # Release builds never see it: zigbuild sets the target's linker in the
+    # environment, which wins over the config file.
+    pkgs.lld
+    (pkgs.writeShellScriptBin "heph-aarch64-linux-cc" ''
+      exec cc -fuse-ld=lld -B${pkgs.lld}/bin "$@"
+    '')
   ];
 
   # Route every rustc invocation through kache (local + CI, since CI runs inside
