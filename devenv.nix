@@ -481,9 +481,8 @@ in
   #
   # `TST_SCOPE` replaces the first pass's package selection — `--workspace
   # --exclude bin-e2e` by default — and nothing else. CI uses it to run the
-  # workspace minus `plugingo-e2e` on linux/amd64 and the crates
-  # `scripts/platform-crates` selects elsewhere, e.g.
-  # `TST_SCOPE='-p engine -p proc -p e2e' tst`.
+  # workspace minus `plugingo-e2e`, which runs sharded on its own; locally,
+  # e.g. `TST_SCOPE='-p engine -p proc -p e2e' tst`.
   #
   # Extra args pass through to every call, so only a test-name filter and
   # `-- --exact|--skip|--ignored|--include-ignored|--nocapture` make sense
