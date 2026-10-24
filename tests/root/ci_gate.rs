@@ -1004,32 +1004,6 @@ fn a_run_uses_at_most_four_macos_jobs() {
     );
 }
 
-/// `kache daemon stop` returns once the daemon acknowledges, and the daemon
-/// drains its upload queue afterwards. A step that ends there lets the runner's
-/// orphan-process cleanup kill the daemon mid-drain: Lint linux/amd64 lost all
-/// but 15 of its uploads that way, and the next run missed the same crates.
-#[test]
-fn every_kache_drain_waits_for_the_daemon_to_exit() {
-    let wf = parsed();
-    let mut drains = 0;
-    for id in job_ids(&wf) {
-        let Some(j) = job(&wf, &id) else { continue };
-        for step in steps(j) {
-            let run = without_comments(field(step, "run"));
-            let Some((_, after_stop)) = run.split_once("kache daemon stop") else {
-                continue;
-            };
-            drains += 1;
-            assert!(
-                after_stop.contains("pgrep -f 'kache daemon run'"),
-                "job `{id}` stops the kache daemon without waiting for it to exit, \
-                 so uploads still queued die with the runner"
-            );
-        }
-    }
-    assert!(drains > 0, "no step stops the kache daemon");
-}
-
 /// heph-bench is skipped on PRs without `ci/perf-test`, but every push builds
 /// it: perf baselines (N-1) are downloaded from master's releases, so a master
 /// build without it would leave the next PR's perf run with nothing to compare.

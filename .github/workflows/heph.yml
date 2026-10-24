@@ -753,19 +753,14 @@ jobs:
           log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
           log=${log/#\~/$HOME}
 
-          kache daemon stop || true
-
-          # `stop` returns as soon as the daemon acknowledges; the daemon then
-          # drains its upload queue on its own, for up to 30s. Ending the step
-          # there let the runner's orphan-process cleanup kill it mid-drain —
-          # every queued upload lost, and the next run missing the same crates.
-          for _ in $(seq 40); do
-            pgrep -f 'kache daemon run' >/dev/null || break
-            sleep 1
-          done
-          if pgrep -f 'kache daemon run' >/dev/null; then
-            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
-          fi
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
@@ -1013,8 +1008,9 @@ jobs:
       # this job compiled is actually published. Without it the cache still
       # reads correctly, it just never fills.
       #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
+      # Every daemon call tolerates failure: fork PRs run with no remote and
+      # therefore no daemon (see setup-nix), and this must not turn a green
+      # build red on the way out.
       - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
@@ -1040,19 +1036,14 @@ jobs:
           log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
           log=${log/#\~/$HOME}
 
-          kache daemon stop || true
-
-          # `stop` returns as soon as the daemon acknowledges; the daemon then
-          # drains its upload queue on its own, for up to 30s. Ending the step
-          # there let the runner's orphan-process cleanup kill it mid-drain —
-          # every queued upload lost, and the next run missing the same crates.
-          for _ in $(seq 40); do
-            pgrep -f 'kache daemon run' >/dev/null || break
-            sleep 1
-          done
-          if pgrep -f 'kache daemon run' >/dev/null; then
-            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
-          fi
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
@@ -1141,8 +1132,9 @@ jobs:
       # this job compiled is actually published. Without it the cache still
       # reads correctly, it just never fills.
       #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
+      # Every daemon call tolerates failure: fork PRs run with no remote and
+      # therefore no daemon (see setup-nix), and this must not turn a green
+      # build red on the way out.
       - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
@@ -1168,19 +1160,14 @@ jobs:
           log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
           log=${log/#\~/$HOME}
 
-          kache daemon stop || true
-
-          # `stop` returns as soon as the daemon acknowledges; the daemon then
-          # drains its upload queue on its own, for up to 30s. Ending the step
-          # there let the runner's orphan-process cleanup kill it mid-drain —
-          # every queued upload lost, and the next run missing the same crates.
-          for _ in $(seq 40); do
-            pgrep -f 'kache daemon run' >/dev/null || break
-            sleep 1
-          done
-          if pgrep -f 'kache daemon run' >/dev/null; then
-            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
-          fi
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
@@ -1353,8 +1340,9 @@ jobs:
       # this job compiled is actually published. Without it the cache still
       # reads correctly, it just never fills.
       #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
+      # Every daemon call tolerates failure: fork PRs run with no remote and
+      # therefore no daemon (see setup-nix), and this must not turn a green
+      # build red on the way out.
       - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
@@ -1377,19 +1365,14 @@ jobs:
           log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
           log=${log/#\~/$HOME}
 
-          kache daemon stop || true
-
-          # `stop` returns as soon as the daemon acknowledges; the daemon then
-          # drains its upload queue on its own, for up to 30s. Ending the step
-          # there let the runner's orphan-process cleanup kill it mid-drain —
-          # every queued upload lost, and the next run missing the same crates.
-          for _ in $(seq 40); do
-            pgrep -f 'kache daemon run' >/dev/null || break
-            sleep 1
-          done
-          if pgrep -f 'kache daemon run' >/dev/null; then
-            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
-          fi
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           if [ -n "${log:-}" ] && [ -f "$log" ]; then
             echo "::group::kache daemon log (tail)"
@@ -1499,19 +1482,14 @@ jobs:
           echo "::endgroup::"
           log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
           log=${log/#\~/$HOME}
-          kache daemon stop || true
-
-          # `stop` returns as soon as the daemon acknowledges; the daemon then
-          # drains its upload queue on its own, for up to 30s. Ending the step
-          # there let the runner's orphan-process cleanup kill it mid-drain —
-          # every queued upload lost, and the next run missing the same crates.
-          for _ in $(seq 40); do
-            pgrep -f 'kache daemon run' >/dev/null || break
-            sleep 1
-          done
-          if pgrep -f 'kache daemon run' >/dev/null; then
-            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
-          fi
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
           if [ -n "${log:-}" ] && [ -f "$log" ]; then
             echo "::group::kache daemon log (tail)"
             tail -n 200 "$log"
@@ -1703,8 +1681,9 @@ jobs:
       # this job compiled is actually published. Without it the cache still
       # reads correctly, it just never fills.
       #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
+      # Every daemon call tolerates failure: fork PRs run with no remote and
+      # therefore no daemon (see setup-nix), and this must not turn a green
+      # build red on the way out.
       - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
@@ -1730,19 +1709,14 @@ jobs:
           log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
           log=${log/#\~/$HOME}
 
-          kache daemon stop || true
-
-          # `stop` returns as soon as the daemon acknowledges; the daemon then
-          # drains its upload queue on its own, for up to 30s. Ending the step
-          # there let the runner's orphan-process cleanup kill it mid-drain —
-          # every queued upload lost, and the next run missing the same crates.
-          for _ in $(seq 40); do
-            pgrep -f 'kache daemon run' >/dev/null || break
-            sleep 1
-          done
-          if pgrep -f 'kache daemon run' >/dev/null; then
-            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
-          fi
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
@@ -1849,8 +1823,9 @@ jobs:
       # this job compiled is actually published. Without it the cache still
       # reads correctly, it just never fills.
       #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
+      # Every daemon call tolerates failure: fork PRs run with no remote and
+      # therefore no daemon (see setup-nix), and this must not turn a green
+      # build red on the way out.
       - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
@@ -1876,19 +1851,14 @@ jobs:
           log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
           log=${log/#\~/$HOME}
 
-          kache daemon stop || true
-
-          # `stop` returns as soon as the daemon acknowledges; the daemon then
-          # drains its upload queue on its own, for up to 30s. Ending the step
-          # there let the runner's orphan-process cleanup kill it mid-drain —
-          # every queued upload lost, and the next run missing the same crates.
-          for _ in $(seq 40); do
-            pgrep -f 'kache daemon run' >/dev/null || break
-            sleep 1
-          done
-          if pgrep -f 'kache daemon run' >/dev/null; then
-            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
-          fi
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
