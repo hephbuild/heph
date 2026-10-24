@@ -465,13 +465,37 @@ impl LocalCacheSQLite {
         headroom: usize,
         read_pool_timeout: Duration,
     ) -> Result<Self> {
+        Self::with_pool_config_and_connect_delay(
+            db_path,
+            inline_threshold,
+            pipe_limit,
+            headroom,
+            read_pool_timeout,
+            Duration::ZERO,
+        )
+    }
+
+    /// [`Self::with_pool_config`] whose read connections each take at least
+    /// `connect_delay` to open, standing in for a loaded machine where the
+    /// pool's helper thread is slow to get scheduled.
+    fn with_pool_config_and_connect_delay(
+        db_path: PathBuf,
+        inline_threshold: usize,
+        pipe_limit: usize,
+        headroom: usize,
+        read_pool_timeout: Duration,
+        connect_delay: Duration,
+    ) -> Result<Self> {
         let read_pool_size = u32::try_from(pipe_limit.saturating_add(headroom))
             .unwrap_or(u32::MAX)
             .max(1);
 
         let manager = SqliteConnectionManager::file(&db_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_init(|conn| {
+            .with_init(move |conn| {
+                if !connect_delay.is_zero() {
+                    std::thread::sleep(connect_delay);
+                }
                 conn.execute_batch(
                     "PRAGMA busy_timeout = 10000;
                      PRAGMA synchronous = NORMAL;
@@ -573,9 +597,15 @@ impl LocalCacheSQLite {
             // open one, and r2d2 retries that failing open for the pool's full
             // 30 s timeout. A held connection keeps reading the unlinked file,
             // as the eager pool before lazy opening did.
+            //
+            // This wait is the pool's, not `SCHEMA_CHECK_TIMEOUT`: the
+            // migration just opened this file, so an open that is still
+            // pending here is a slow one, not one that will fail. On a loaded
+            // CI runner the helper thread took longer than 500 ms to run it,
+            // and the whole cache was reported unavailable.
             drop(
                 self.read_pool
-                    .get_timeout(SCHEMA_CHECK_TIMEOUT)
+                    .get()
                     .with_context(|| format!("opening a read connection to {:?}", self.db_path))?,
             );
         }
@@ -1301,6 +1331,26 @@ mod tests {
             cache.writer.get().is_none(),
             "a read-only use must not spawn the writer"
         );
+        Ok(())
+    }
+
+    /// The read connection left idle after a migration may be slow to open —
+    /// the pool's one helper thread is not scheduled at once on a loaded
+    /// machine — and that is not a failure. Waiting for it with the schema
+    /// check's 500 ms reported the cache unavailable (`timed out waiting for
+    /// connection`, plugingo-e2e on a busy CI runner).
+    #[test]
+    fn a_slow_read_open_after_migration_does_not_fail_the_cache() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pool_config_and_connect_delay(
+            dir.path().join("cache.db"),
+            1024,
+            4,
+            read_pool_headroom(4),
+            READ_POOL_TIMEOUT,
+            SCHEMA_CHECK_TIMEOUT * 3,
+        )?;
+        assert!(!cache.exists(&make_addr("pkg", "t"), "h", "a")?);
         Ok(())
     }
 

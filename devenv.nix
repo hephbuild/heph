@@ -13,23 +13,27 @@ let
   # turns that hex into the SRI form below. All four are verified by Nix at
   # fetch time, so a wrong hash fails loudly rather than silently installing
   # something else.
-  kacheVersion = "0.13.0";
+  #
+  # A bump that changes kache's cache key format also wants a new R2 prefix
+  # (`.github/actions/setup-nix`), so the old entries age out instead of
+  # sitting next to ones nothing can hit.
+  kacheVersion = "1.2.2";
   kacheAssets = {
     aarch64-darwin = {
       target = "aarch64-apple-darwin";
-      hash = "sha256-8/TXz+ziDSUfh0Da4iR3fQlqXtKxYIscrplumPYBijE=";
+      hash = "sha256-ENCeFGhSqN+Hls9kLKWIchB6fzkbdkfsjMJTzyia8Kk=";
     };
     x86_64-darwin = {
       target = "x86_64-apple-darwin";
-      hash = "sha256-waUdA52DT2qtusGhZrlUTVMgs8qMsEhSD0XH1nqsG7U=";
+      hash = "sha256-mhw+zInPNrI1Eqk4aCJhQNRvH3DPbLZIv+CO6vslo2g=";
     };
     x86_64-linux = {
       target = "x86_64-unknown-linux-musl";
-      hash = "sha256-MK7e1NxuYgxACqOq96sWPclccDoPPdtNC6VsUfI/C9A=";
+      hash = "sha256-8vZVXe5QlFwqkKf7eTwghKAMxkWdCKwjBtONkFBkMhs=";
     };
     aarch64-linux = {
       target = "aarch64-unknown-linux-musl";
-      hash = "sha256-th3j3mqauyGjdfqcZRPUe7jPc5H07rJMW+KXJzi4POM=";
+      hash = "sha256-OIVs7mE/buDsV5CZ/JIFuECgtFu3Y/S4+ngtJdk8GO8=";
     };
   };
   kacheAsset =
@@ -49,7 +53,11 @@ let
     # (there is no interpreter to rewrite) and invalidate the latter's signature.
     dontPatchELF = true;
     dontStrip = true;
-    installPhase = "install -Dm755 kache $out/bin/kache";
+    # `kache-rustc` is the name `RUSTC_WRAPPER` uses — see there for why.
+    installPhase = ''
+      install -Dm755 kache $out/bin/kache
+      ln -s kache $out/bin/kache-rustc
+    '';
   };
 
   # cargo-zigbuild — the cross-linking driver behind both Linux release builds
@@ -172,6 +180,11 @@ in
     cargoZigbuild
     pkgs.tokio-console
     kache
+    # The test runner behind `tst` and CI. It schedules every test binary at
+    # once instead of one after another, runs each test in its own process,
+    # turns a hang into a named TIMEOUT (`.config/nextest.toml`), and provides
+    # the `archive` / `--partition slice:` that shard `plugingo-e2e` in CI.
+    pkgs.cargo-nextest
     # `rust-objcopy`/`rust-strip` (wraps the `llvm-tools` component's
     # llvm-objcopy, below) — used by `scripts/patch-slot.sh`'s CI caller to
     # derive the "std" release flavour's stripped binary. LLVM-based and
@@ -208,6 +221,17 @@ in
     '')
   ] ++ lib.optionals pkgs.stdenv.isLinux [
     pkgs.fuse3
+    # The aarch64-linux dev linker (`.cargo/config.toml` names it for
+    # `aarch64-unknown-linux-gnu`). rustc links x86_64 Linux with its bundled
+    # lld already; aarch64 still goes through the C compiler's GNU ld, which
+    # made the linux/arm64 test job's links about twice as slow. `-B` points
+    # the compiler driver at nix's `ld.lld` rather than whatever is on PATH.
+    # Release builds never see it: zigbuild sets the target's linker in the
+    # environment, which wins over the config file.
+    pkgs.lld
+    (pkgs.writeShellScriptBin "heph-aarch64-linux-cc" ''
+      exec cc -fuse-ld=lld -B${pkgs.lld}/bin "$@"
+    '')
   ];
 
   # Route every rustc invocation through kache (local + CI, since CI runs inside
@@ -216,15 +240,28 @@ in
   # exactly this workspace's expensive tail: the `heph` binary, the three plugin
   # cdylibs, every proc-macro, and every test harness. kache caches all of them.
   #
+  # Named `kache-rustc`, a symlink to `kache`, so that only rustc goes through
+  # it. The `cc` crate takes `RUSTC_WRAPPER` as its C compiler wrapper as well
+  # when its file stem is a wrapper it knows (`kache` is one), and build
+  # scripts' C (aws-lc-sys, zstd-sys, onig_sys: ~490 objects) would then be
+  # cached too. Measured on CI, that is a loss: each object is ~1s to fetch from
+  # R2 against ~0.1s to compile, the fetches barely overlap, and they queue
+  # ahead of the Rust hits for the daemon's download slots. A warm run went from
+  # 30 to 37 minutes. kache only cares that argv[0] is not a compiler name.
+  #
   # No remote is configured here, so a local shell is a local-disk cache and
-  # needs no daemon. CI points the same wrapper at R2 via `KACHE_S3_*` (see
-  # `.github/actions/setup-nix`). To share CI's cache locally, export those same
-  # vars and run `kache daemon start` — the remote is inert without the daemon.
-  env.RUSTC_WRAPPER = "kache";
+  # needs no daemon. CI points the same wrapper at R2 through a kache config
+  # file (see `.github/actions/setup-nix`). To share CI's cache locally, write
+  # the same `[cache.remote]` table, export `KACHE_S3_ACCESS_KEY` /
+  # `KACHE_S3_SECRET_KEY`, and run `kache daemon start` — the remote is inert
+  # without the daemon.
+  env.RUSTC_WRAPPER = "kache-rustc";
 
   # Cache linked `bin` and `--test` executables on macOS too, not just Linux.
   #
-  # kache defaults this on for Linux and off for macOS: a Mach-O binary carries
+  # kache 1.x defaults this on everywhere; it is set explicitly because kache
+  # 0.x defaulted it off for macOS, and the reason to want it on there is not
+  # obvious. A Mach-O binary carries
   # only a *debug map* (`N_OSO` entries naming each `.o` by path + mtime) rather
   # than embedded DWARF, so a restored mac binary points at object files that no
   # longer match and LLDB drops to function names without file:line. Linux
@@ -334,7 +371,7 @@ in
   # want a faster local loop, narrow with `-p <crate>` — never by dropping
   # `--workspace`.
   #
-  # `tests/lint_gate.rs` asserts these flags are still here, and that every
+  # `tests/root/lint_gate.rs` asserts these flags are still here, and that every
   # workspace member inherits `[workspace.lints]` — a member that does not is
   # linted with stock clippy only, which is the same silent hole one level down.
   #
@@ -361,18 +398,13 @@ in
   #     compiled and linted, never executed. `crates/sandboxfuse`'s
   #     `fuse_sandbox_is_a_default_feature` asserts the feature *is* on, so a
   #     test leg would need that test `#[cfg]`-split first.
-  #   - CI lints `linux/amd64` and `darwin/arm64`, so the OS axis is covered but
-  #     the arch axis is confounded: `aarch64` is only ever linted together with
-  #     macOS, and there is no `Lint linux/arm64`. An `#[expect(clippy::…)]`
-  #     that is unfulfilled only on `aarch64-unknown-linux-gnu` would be
-  #     invisible — plain rustc reports `unfulfilled_lint_expectations` for its
-  #     own lints, but silently ignores an unfulfilled expectation on a *tool*
-  #     lint it does not know, so `Test linux/arm64` cannot stand in for a lint
-  #     job. Either keep lint exemptions free of `target_arch` conditions, or
-  #     add the third leg.
+  #   - CI lints all three supported platforms: `linux/amd64` in its own Lint
+  #     job, `darwin/arm64` and `linux/arm64` as the first step of their Test
+  #     legs. Both axes are covered, so an `#[expect(clippy::…)]` that is
+  #     unfulfilled only on `aarch64-unknown-linux-gnu` is caught there.
   #
   # The flags are written out literally in both scripts rather than factored
-  # into a shared Nix variable on purpose: `tests/lint_gate.rs` guards them by
+  # into a shared Nix variable on purpose: `tests/root/lint_gate.rs` guards them by
   # reading this file, and a guard that reads back an interpolation hole rather
   # than the flags guards nothing.
   scripts.lint.exec = ''
@@ -419,7 +451,7 @@ in
   # clippy's machine-applicable suggestions as well as rustc's, and clippy's are
   # what `lint` fails on. The `--no-default-features` line carries the same
   # exclusions for the same reason as in `lint`; without it CI reports a lint in
-  # `stub.rs` that `fix` cannot reach. `tests/lint_gate.rs` asserts the two
+  # `stub.rs` that `fix` cannot reach. `tests/root/lint_gate.rs` asserts the two
   # scripts select the same code.
   scripts.fix.exec = ''
     set -euo pipefail
@@ -439,15 +471,41 @@ in
   # failed. One red test binary used to stop the rest of the workspace from
   # running at all, so a single unrelated failure (a Docker test on a machine
   # with the daemon down) hid everything after it and cost a second full run.
-  # Extra args pass through to every pass, so only a test-name filter and `--
-  # <libtest args>` make sense (`--test x` or `-p x` would fail the passes that
-  # have no such target). `tests/tst_script.rs` runs this text against a stub
-  # cargo. `rc`, not `status`: that name is read-only in zsh.
+  #
+  # Each pass is `cargo nextest run` followed by `cargo test --doc`: nextest
+  # schedules every test binary at once and runs each test in its own process,
+  # but it does not run doctests, so without the second call the doc examples
+  # would silently stop being tested. CI selects the nextest profile with
+  # `NEXTEST_PROFILE=ci` (`.config/nextest.toml`: a per-test timeout, no
+  # retries).
+  #
+  # `TST_SCOPE` replaces the first pass's package selection — `--workspace
+  # --exclude bin-e2e` by default — and nothing else. CI uses it to run the
+  # workspace minus `plugingo-e2e`, which runs sharded on its own; locally,
+  # e.g. `TST_SCOPE='-p engine -p proc -p e2e' tst`.
+  #
+  # Extra args pass through to every call, so only a test-name filter and
+  # `-- --exact|--skip|--ignored|--include-ignored|--nocapture` make sense
+  # (`--test x` or `-p x` would fail the passes that have no such target, and
+  # nextest rejects `-- --test-threads=N`; use `-j N` before the filter). With
+  # args, a pass that matches no test only warns (`--no-tests=warn`), because a
+  # filter aimed at one crate matches nothing in the two feature passes; a bare
+  # `tst` that runs no test at all fails (`--no-tests=fail`).
+  # `tests/root/tst_script.rs` runs this text against a stub cargo. `rc`, not
+  # `status`: that name is read-only in zsh.
   scripts.tst.exec = ''
     rc=0
-    cargo test --locked --no-fail-fast --workspace --exclude bin-e2e "$@" || rc=$?
-    cargo test --locked --no-fail-fast -p plugin-stabby --features host "$@" || rc=$?
-    cargo test --locked --no-fail-fast -p plugin-sdk --features stabby "$@" || rc=$?
+    no_tests=fail
+    if [ "$#" -gt 0 ]; then no_tests=warn; fi
+    scope="--workspace --exclude bin-e2e"
+    if [ -n "$TST_SCOPE" ]; then scope="$TST_SCOPE"; fi
+    # $scope is unquoted on purpose: it is a list of cargo flags.
+    cargo nextest run --locked --no-fail-fast --no-tests="$no_tests" $scope "$@" || rc=$?
+    cargo test --locked --no-fail-fast --doc $scope "$@" || rc=$?
+    cargo nextest run --locked --no-fail-fast --no-tests="$no_tests" -p plugin-stabby --features host "$@" || rc=$?
+    cargo test --locked --no-fail-fast --doc -p plugin-stabby --features host "$@" || rc=$?
+    cargo nextest run --locked --no-fail-fast --no-tests="$no_tests" -p plugin-sdk --features stabby "$@" || rc=$?
+    cargo test --locked --no-fail-fast --doc -p plugin-sdk --features stabby "$@" || rc=$?
     exit "$rc"
   '';
 
@@ -588,7 +646,7 @@ in
   # shell's `$DEVENV_ROOT` is wherever it was started, which in another
   # worktree is the wrong checkout — `e2e` there built the worktree, then
   # staged and tested the main checkout's stale binaries, green.
-  # `tests/target_dir_script.rs` holds every building script to this.
+  # `tests/root/target_dir_script.rs` holds every building script to this.
   scripts.target-dir.exec = ''
     set -euo pipefail
     root="$(cd "''${1:-$DEVENV_ROOT}" && cargo locate-project --workspace --message-format plain)"

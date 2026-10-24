@@ -15,7 +15,7 @@
 //! No daemon is needed: the drivers are registered pointed at a shell script
 //! that records its argv and writes the files buildx would have written.
 
-mod common;
+use crate::common;
 
 use hplugin_oci::pluginoci;
 use htestkit::WorkspaceBuilder;

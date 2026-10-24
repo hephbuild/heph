@@ -61,9 +61,14 @@ concurrency:
 # cost their bytes twice, once in the store and once in target/. macOS (APFS)
 # reflinks them for free. Overshooting here is a disk-full test failure, which
 # this repo has hit before, not a slow build.
+#
+# NEXTEST_PROFILE selects the `ci` profile of `.config/nextest.toml` for every
+# nextest run here (`tst` and the go_e2e shards): a per-test slow-timeout that
+# turns a hang into a named TIMEOUT, and no retries.
 env:
   KACHE_MAX_SIZE: "10GiB"
   CARGO_INCREMENTAL: "0"
+  NEXTEST_PROFILE: ci
 
 jobs:
   # Which pull requests get a build.
@@ -305,8 +310,9 @@ jobs:
             echo "sha256_${name#heph-govet_}=$sha" >> $GITHUB_OUTPUT
           done
 
-      # Named `heph-govet_*`, so the `heph*` download pattern in `upload_artifacts`
-      # picks them up and publishes them as release assets alongside the rest. The
+      # The `manifests` job downloads this artifact and publishes the binaries
+      # as `heph-govet_<os>_<arch>` release assets — the URL the go plugin
+      # fetches them from (`crates/plugin-go/src/plugingo/govet.rs`). The
       # `.sha256` sidecars are internal to this job and are not published.
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -318,11 +324,71 @@ jobs:
             dist/heph-govet_*
             !dist/*.sha256
 
+  # Artifacts publish as they land. This job creates the run's pre-release in
+  # `hephbuild/heph-artifacts-v1` up front; each `build` leg uploads its own
+  # files the moment its build and smoke test pass; `manifests` adds the
+  # plugin manifests and `heph-govet` once every build is done, and marks the
+  # release complete. No test, lint or bin-e2e result delays any of it — only
+  # `release` waits for those, and only `release` promotes to mainline.
+  # `tests/root/ci_gate.rs` checks both halves.
+  #
+  # Until `manifests` runs, the pre-release is partial, and a failed build
+  # leaves it partial for good (accepted exemption E5). It is still marked
+  # pre-release and its body says so. Nothing reads pre-releases: self-upgrade,
+  # `scripts/install-release-plugins.py` and the go plugin's heph-govet fetch
+  # all address one exact version, and fail closed on a missing asset; the
+  # website reads `releases/latest`, which never returns a pre-release.
+  #
+  # Without the upload secret — a fork PR gets none — `publish` is false and
+  # every upload step skips. Builds, smoke tests and bin-e2e still run and
+  # still gate.
+  #
+  # Create only if absent: on "Re-run all jobs" of a master run whose release
+  # was already promoted, recreating or editing its flags would flip it back to
+  # a pre-release.
+  prerelease_create:
+    name: Create pre-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: gen
+    outputs:
+      publish: ${{ steps.create.outputs.publish }}
+      url: ${{ steps.create.outputs.url }}
+    steps:
+      - name: Create the pre-release
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          VERSION: ${{ needs.gen.outputs.version }}
+          REPO: hephbuild/heph-artifacts-v1
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Not publishing::This run has no HEPH_ARTIFACTS_PAT (a fork PR gets no secrets), so nothing is uploaded. Builds, smoke tests and bin-e2e still run."
+            exit 0
+          fi
+          if gh release view "$VERSION" -R "$REPO" >/dev/null 2>&1; then
+            echo "$VERSION already exists in $REPO; leaving it as it is."
+          else
+            gh release create "$VERSION" -R "$REPO" --prerelease --latest=false \
+              --title "Build $VERSION" \
+              --notes "$(printf 'Artifacts automatically published from source-repo (rust).\n\nStatus: partial: in progress or a build failed.')"
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/$REPO/releases/tag/$VERSION" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
-    needs: [gen, govet]
+    needs: [gen, govet, prerelease_create]
+    # heph-bench's only consumer on a PR is `perfbench`, which runs only with
+    # the `ci/perf-test` label, so an unlabelled PR skips one of the build's
+    # six release-LTO leaves. Every push to master builds and publishes it:
+    # N-1 baselines are downloaded from master's releases.
+    env:
+      BUILD_BENCH: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci/perf-test') }}
     strategy:
       fail-fast: false
       matrix:
@@ -437,8 +503,13 @@ jobs:
           # cdylibs (heph's own lib is already built as the bin's dependency, so it
           # costs nothing extra). `heph-bench` links the same `heph` lib crate, so
           # adding it here is marginal — the expensive part (engine + deps) is
-          # already being compiled for `heph` itself.
-          TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib -p bench"
+          # already being compiled for `heph` itself — but its thin-LTO link is
+          # not, so it is built only when something will use it (BUILD_BENCH,
+          # set on the job).
+          TARGETS="--bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib"
+          if [ "$BUILD_BENCH" = "true" ]; then
+            TARGETS="$TARGETS --bin heph-bench -p bench"
+          fi
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cargo build --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.dylib"
@@ -449,7 +520,7 @@ jobs:
             # which is absent on user machines (dyld aborts at launch). Rewrite
             # those load commands to the OS /usr/lib copies — for every artifact.
             bash scripts/macos-portable.sh "$OUT/heph"
-            bash scripts/macos-portable.sh "$OUT/heph-bench"
+            if [ "$BUILD_BENCH" = "true" ]; then bash scripts/macos-portable.sh "$OUT/heph-bench"; fi
             bash scripts/macos-portable.sh "$lib"
             bash scripts/macos-portable.sh "$gha_lib"
             bash scripts/macos-portable.sh "$oci_lib"
@@ -461,7 +532,11 @@ jobs:
             oci_lib="$OUT/libplugin_oci_cdylib.so"
             devenv_lib="$OUT/libplugin_devenv_cdylib.so"
           fi
-          cp "$OUT/heph-bench" $BENCH_BIN_NAME
+          stamped="$PLUGIN_GO_NAME $PLUGIN_GHA_NAME $PLUGIN_OCI_NAME $PLUGIN_DEVENV_NAME"
+          if [ "$BUILD_BENCH" = "true" ]; then
+            cp "$OUT/heph-bench" $BENCH_BIN_NAME
+            stamped="$BENCH_BIN_NAME $stamped"
+          fi
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
           cp "$oci_lib" $PLUGIN_OCI_NAME
@@ -483,9 +558,7 @@ jobs:
           # build, never upgrade". The go plugin additionally derives its
           # default govet target address from the version, so a dev-stamped
           # cdylib would resolve the wrong address at runtime.
-          for artifact in \
-            $BENCH_BIN_NAME $PLUGIN_GO_NAME $PLUGIN_GHA_NAME $PLUGIN_OCI_NAME \
-            $PLUGIN_DEVENV_NAME
+          for artifact in $stamped
           do
             bash scripts/patch-slot.sh "$artifact" "version=$VERSION"
           done
@@ -530,7 +603,7 @@ jobs:
         if: matrix.os == 'darwin' || matrix.arch == 'amd64'
         run: |
           ./$BIN_NAME version
-          ./$BENCH_BIN_NAME --help
+          if [ "$BUILD_BENCH" = "true" ]; then ./$BENCH_BIN_NAME --help; fi
           # Both flavours launch, and each reports the flavour patch-slot.sh
           # actually stamped — not just that the binary runs at all. The
           # baked-in version already carries its own build metadata (a commit
@@ -592,6 +665,7 @@ jobs:
               path: ${{steps.build.outputs.debug_bin_name}}
 
           - name: Upload heph-bench artifact
+            if: env.BUILD_BENCH == 'true'
             uses: actions/upload-artifact@v7
             with:
               name: ${{steps.build.outputs.bench_bin_name}}
@@ -621,6 +695,35 @@ jobs:
               name: ${{steps.build.outputs.plugin_devenv_name}}
               path: ${{steps.build.outputs.plugin_devenv_name}}
 
+      # This platform's release assets, the moment they are built and (where
+      # this runner can execute them) smoke-tested — see `prerelease_create`.
+      # The token is in this step's env only. It shares a job with the build,
+      # whose build scripts could in principle tamper with later steps; that
+      # risk is accepted at the level of the R2 write secret this job already
+      # holds (accepted exemption E4). `--clobber`, so a re-run replaces rather
+      # than fails.
+      - name: Publish to the pre-release
+        if: needs.prerelease_create.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          VERSION: ${{ needs.gen.outputs.version }}
+          REPO: hephbuild/heph-artifacts-v1
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+          EXT: ${{ matrix.os == 'darwin' && 'dylib' || 'so' }}
+        run: |
+          set -euo pipefail
+          files=(
+            "heph_${OS}_${ARCH}"
+            "heph_debug_${OS}_${ARCH}"
+            "heph-go-plugin_${OS}_${ARCH}.${EXT}"
+            "heph-gha-plugin_${OS}_${ARCH}.${EXT}"
+            "heph-oci-plugin_${OS}_${ARCH}.${EXT}"
+            "heph-devenv-plugin_${OS}_${ARCH}.${EXT}"
+          )
+          if [ "$BUILD_BENCH" = "true" ]; then files+=("heph-bench_${OS}_${ARCH}"); fi
+          gh release upload "$VERSION" -R "$REPO" --clobber "${files[@]}"
+
       # Last, deliberately. This is the only job with steps after its compile,
       # and the drain must not sit in front of them: it would still be correct
       # today (nothing after `Build` compiles) but only by accident, and a
@@ -631,15 +734,33 @@ jobs:
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
-          kache daemon stop || true
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
@@ -654,14 +775,25 @@ jobs:
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
 
-  upload_artifacts:
-    name: Pre-release
-    needs: [gen, govet, build]
-    if: always() && needs.gen.result == 'success'
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The rest of the pre-release: the plugin manifests (which need every
+  # platform's cdylib to checksum) and `heph-govet`, then the release body
+  # flips from "partial" to "complete". Runs only when every build succeeded —
+  # deliberately not `always()`, which would publish manifests with a platform
+  # missing from them.
+  manifests:
+    name: Plugin manifests
+    needs: [gen, govet, prerelease_create, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      release_url: ${{ steps.create_release.outputs.url }}
     steps:
       # Checkout brings tools/pluginmanifest (the manifest generator); the built
       # artifacts download into dist/ alongside it.
@@ -674,20 +806,21 @@ jobs:
           # and the default cache lookup warns about a missing root go.mod.
           cache: false
 
-      - name: Download all artifacts
+      # Every plugin cdylib (`heph-<name>-plugin_<os>_<arch>.{so,dylib}`), by
+      # pattern rather than a list, so a new platform cannot be silently
+      # absent from its manifest.
+      - name: Download plugin artifacts
         uses: actions/download-artifact@v8
         with:
-          # Matches every published artifact — both CLI flavours
-          # (`heph_<os>_<arch>` std, `heph_debug_<os>_<arch>` debug),
-          # `heph-bench`, and every plugin cdylib
-          # (`heph-<name>-plugin_<os>_<arch>.{so,dylib}`) — and excludes the
-          # `repo` source artifact. Deliberately a pattern rather than a list:
-          # the enumeration this replaces still said "the go plugin cdylib"
-          # after gha, oci and bench had been added, so a new artifact was
-          # silently absent here until something downstream failed on it.
-          pattern: "heph*"
+          pattern: "heph-*-plugin_*"
           path: dist
           merge-multiple: true
+
+      - name: Download heph-govet
+        uses: actions/download-artifact@v8
+        with:
+          name: heph-govet
+          path: dist
 
       - name: List artifacts
         run: ls -lahR dist
@@ -729,18 +862,25 @@ jobs:
           cat dist/heph-devenv-plugin.json
           echo "manifest checksum: $(cat dist/heph-devenv-plugin.json.sha256)"
 
-      - name: Create Release in artifacts repo
-        id: create_release
-        uses: softprops/action-gh-release@v3
-        with:
-          repository: hephbuild/heph-artifacts-v1
-          token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
-          tag_name: ${{needs.gen.outputs.version}}
-          name: Build ${{needs.gen.outputs.version}}
-          body: "Artifacts automatically published from source-repo (rust)."
-          draft: false
-          prerelease: true
-          files: dist/*
+      # The manifests, their `.sha256` sidecars and `heph-govet`, then mark the
+      # pre-release complete. Every file is named, so a missing one fails the
+      # upload rather than leaving a gap.
+      - name: Publish manifests and heph-govet
+        if: needs.prerelease_create.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          VERSION: ${{ needs.gen.outputs.version }}
+          REPO: hephbuild/heph-artifacts-v1
+        run: |
+          set -euo pipefail
+          gh release upload "$VERSION" -R "$REPO" --clobber \
+            dist/heph-go-plugin.json dist/heph-go-plugin.json.sha256 \
+            dist/heph-gha-plugin.json dist/heph-gha-plugin.json.sha256 \
+            dist/heph-oci-plugin.json dist/heph-oci-plugin.json.sha256 \
+            dist/heph-devenv-plugin.json dist/heph-devenv-plugin.json.sha256 \
+            dist/heph-govet_*
+          gh release edit "$VERSION" -R "$REPO" \
+            --notes "$(printf 'Artifacts automatically published from source-repo (rust).\n\nStatus: complete.')"
 
   abi:
     name: ABI guard
@@ -777,13 +917,21 @@ jobs:
   # A timeout renders as a red lint leg indistinguishable from a real lint
   # failure, so the 30min headroom is deliberate.
   #
-  # Both platforms, because macOS-only code was clippy-linted nowhere.
-  # `Test darwin/arm64` compiles it, but nothing there passes `-D warnings`, so
-  # the Mach `sweep_threads` block in `src/diag.rs` — the largest unsafe region
-  # in the tree — plus `crates/proc/src/proc_exec/imp_macos.rs` and
-  # `process_watcher/kqueue_macos.rs` had never been through
-  # `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`,
-  # `indexing_slicing` or `unwrap_used`.
+  # Every supported platform is linted on every run, because platform-gated
+  # code is clippy-linted nowhere else: `Test darwin/arm64` used to compile the
+  # Mach `sweep_threads` block in `src/diag.rs` — the largest unsafe region in
+  # the tree — plus `crates/proc/src/proc_exec/imp_macos.rs` and
+  # `process_watcher/kqueue_macos.rs` without `-D warnings`, so they had never
+  # been through `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`,
+  # `indexing_slicing` or `unwrap_used`. And `clippy --all-targets` is what
+  # type-checks every crate, tests included, on each platform.
+  #
+  # One leg per platform, each its own job, so lint runs alongside the tests
+  # rather than ahead of them. Folding it into the darwin Test leg (to save a
+  # macOS slot) put a warm ~7 min lint on the critical path: `Test
+  # darwin/arm64` took 28 min, the run 30 min, with every other check done at
+  # 19 min. A run now uses four macOS jobs (Build, Lint, Test, Binary E2E),
+  # within the free tier's five.
   #
   # Every leg runs the *same* `lint` script — no per-OS variant. The failure
   # being closed is a Mac developer's local `lint` disagreeing with CI in either
@@ -791,42 +939,26 @@ jobs:
   # and not the other is a hard error on the other), and that only stays closed
   # if every leg runs the same command as the developer does.
   #
-  # This is a matrix, so the published status contexts are the *rendered* names,
-  # one per leg — `Lint linux/amd64` and `Lint darwin/arm64`. There is no longer
-  # any context named plain `Lint`. Branch protection must require the two new
-  # names; until it does, a red lint does not block a merge. (Verified from a
-  # real run of this matrix, not inferred: GitHub publishes the rendered name,
-  # with no parenthesised matrix suffix.)
+  # A matrix, so each check renders as `Lint <os>/<arch>`, and
+  # `tests/root/lint_gate.rs` reads every lint leg's platform from the same
+  # `matrix.include` coordinates.
   #
   # `needs: lint` elsewhere in this file waits for *every* leg and is skipped if
-  # any of them fails — the same fan-in the `build` matrix already relies on via
-  # `bin_e2e`'s `needs: [gen, build, …]`. Downstream gating therefore needs no
-  # aggregator job.
+  # any of them fails. Downstream gating therefore needs no aggregator job.
   #
   # No `continue-on-error:` and no `if:` on the Lint step, ever. Either one lets
   # a leg conclude `success` with clippy never having run, which makes the leg's
   # own check green — and, because `needs` treats a successful job as satisfied,
   # lets `release` proceed over a platform that was not linted. It is the one
   # remaining way to reach a silent pass here, and it is invisible in the check
-  # list. `tests/lint_gate.rs` asserts their absence.
-  #
-  # Cost, measured rather than assumed — see the PR body. The darwin leg is a
-  # fourth concurrent `macos-latest` job in the `needs: gen` wave, which is the
-  # real price rather than the minutes: the darwin build chain has been observed
-  # on the critical path, and macOS jobs in this repo have queued up to ~2m30s
-  # waiting for a slot. macOS also starts colder — the Nix setup alone measures
-  # 3m15s-4m42s there, and the cargo registry cache is restore-only on PRs
-  # (only master saves), so the darwin leg stays near its cold ~10min until this
-  # key is populated from master.
+  # list. `tests/root/lint_gate.rs` asserts their absence, here and in
+  # `test`.
   lint:
     name: Lint ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
     needs: gen
     strategy:
-      # Both legs always report. With fail-fast the second is cancelled the
-      # moment the first goes red, and `cancelled` is exactly the state that
-      # tells you nothing about the platform you did not see.
       fail-fast: false
       matrix:
         include:
@@ -835,15 +967,16 @@ jobs:
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
 
-          # macos-latest is Apple Silicon. There is no `Lint linux/arm64` leg:
-          # aarch64 is covered here on the OS axis, and an `#[expect]` that is
-          # unfulfilled only on aarch64-linux would be invisible anyway — plain
-          # rustc silently ignores an unfulfilled expectation on a *tool* lint
-          # it does not know, so `Test linux/arm64` cannot stand in for one.
-          # See the note in devenv.nix.
+          # Linux runners cost no macOS slot, so linux/arm64 gets its own leg
+          # too rather than linting ahead of its tests.
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+
           - os: darwin
             arch: arm64
-            runs-on: macos-latest
+            runs-on: ${{ vars.MACOS_RUNNER }}
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
@@ -875,23 +1008,42 @@ jobs:
       # this job compiled is actually published. Without it the cache still
       # reads correctly, it just never fills.
       #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
+      # Every daemon call tolerates failure: fork PRs run with no remote and
+      # therefore no daemon (see setup-nix), and this must not turn a green
+      # build red on the way out.
       - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
-          kache daemon stop || true
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
@@ -906,43 +1058,56 @@ jobs:
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
 
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The workspace on every platform, on every run — minus `bin-e2e` (its own
+  # job, against the shipped artifacts) and `plugingo-e2e` (sharded across the
+  # `go_e2e` jobs below, on linux/amd64). This is where "every test runs on
+  # every master-targeting run" is kept; `tests/root/ci_gate.rs` checks that
+  # this scope plus `go_e2e` is the workspace minus `bin-e2e`.
+  #
+  # Every platform, not a subset. Selecting only the crates with
+  # platform-conditional code for darwin and linux/arm64 was tried and bought
+  # little: those crates hold most of the tests (23 of 47 packages, 3,363 of
+  # 4,061 tests), so darwin ran nearly the whole suite anyway, and every other
+  # crate went untested there.
+  #
+  # darwin/arm64 and linux/arm64 then run two Go smoke tests, since the rest of
+  # `plugingo-e2e` does not run there. They carry `if: !cancelled()`, so a red
+  # test run still lets them run and report. The Summary step says which of
+  # the two failed. Lint is the `lint` job's, one leg per platform.
+  #
+  # No macFUSE on the darwin runner: the macOS binaries weak-link libfuse, so
+  # they launch with the dylib absent. `support_check` finds no macfuse.fs and
+  # reports Unavailable, so FUSE mount tests skip. Linux exercises the real
+  # pure-Rust FUSE path.
   test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    # 30 was sized when the macOS leg silently skipped every Go test (`go` was
-    # absent from the runner and `require_go!` returned Ok — the whole go-plugin
-    # suite "passed" in under a second). Now that devenv supplies a Go, darwin
-    # does the work it was always meant to: 480 `plugin-go` unit tests in 150s,
-    # ~11min of `plugingo-e2e` on top. It landed at 30m19s and got cancelled
-    # while running out the last few crates.
-    #
-    # 45 covers that with room for a cold kache. The linux legs sit near 24min,
-    # so this is headroom for them too rather than a licence to grow — if a leg
-    # starts approaching it, find out what got slower.
-    #
-    # darwin did approach it, and nothing got slower: master's darwin leg runs
-    # 39–45min and timed out in one of four runs (2026-10-04/05), while the
-    # linux legs finish in ~30min. The macOS runner is just slower at the same
-    # work — the engine unit tests take 265s there against 21s on linux/amd64,
-    # and `plugingo-e2e`'s build.rs ~630s. So darwin gets 60 and linux keeps
-    # the 45 that still bounds it.
+    # darwin is the slow one: a runner that runs the engine unit tests ~10x
+    # slower than linux/amd64.
     timeout-minutes: ${{ matrix.os == 'darwin' && 60 || 45 }}
     needs: gen
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux AMD64 (Native)
           - os: linux
             arch: amd64
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
 
           # Linux ARM64 (Native). ubuntu-24.04-arm is free for public repos and
-          # is the only place aarch64-linux is exercised at all — the build job
-          # cross-compiles it, so without this job the target shipped with no
-          # test ever run against it. Pairs with darwin/arm64 to give the arch
-          # axis coverage on both OSes rather than only on macOS.
+          # is the only place aarch64-linux code runs before release — the
+          # build job cross-compiles it. Pairs with darwin/arm64 to give the
+          # arch axis coverage on both OSes rather than only on macOS.
           - os: linux
             arch: arm64
             runs-on: ubuntu-24.04-arm
@@ -982,15 +1147,46 @@ jobs:
           cache-suffix: "-test"
           r2-secret: ${{ secrets.CF_SSCACHE }}
 
-      # No macFUSE on the runner: the macOS binaries weak-link libfuse, so they
-      # launch with the dylib absent. `support_check` finds no macfuse.fs and
-      # reports Unavailable, so FUSE mount tests skip. Linux exercises the real
-      # pure-Rust FUSE path.
       - name: Test
+        id: test
         shell: devenv shell bash -- -e {0}
         env:
           RUST_BACKTRACE: "1"
+          TST_SCOPE: "--workspace --exclude bin-e2e --exclude plugingo-e2e"
         run: tst
+
+      # The rest of `plugingo-e2e` checks heph's own Go logic (go list parsing,
+      # codegen, labels, lint rules), which is the same on every platform and
+      # runs in `go_e2e`. These two prove the Go toolchain resolves and runs on
+      # this host. Their own invocation, not part of TST_SCOPE: `--test` there
+      # would apply to every crate in the scope and drop all their other tests.
+      # `devenv_host_toolchain` skips itself unless HEPH_E2E_DEVENV is set.
+      # Not on linux/amd64, which runs all of `plugingo-e2e` in `go_e2e`.
+      - name: Go smoke tests
+        id: smoke
+        if: ${{ !cancelled() && !(matrix.os == 'linux' && matrix.arch == 'amd64') }}
+        shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
+          HEPH_E2E_DEVENV: "1"
+        run: cargo nextest run --locked --no-fail-fast --no-tests=fail -p plugingo-e2e --test testmain --test devenv_host_toolchain
+
+      - name: Summary
+        if: always()
+        env:
+          PLATFORM: ${{ matrix.os }}/${{ matrix.arch }}
+          TESTS: ${{ steps.test.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+        run: |
+          mark() { case "$1" in success) echo "✓ passed" ;; failure) echo "✗ failed" ;; *) echo "– ${1:-not run}" ;; esac; }
+          {
+            echo "### Test $PLATFORM"
+            echo ""
+            echo "| Step | Result |"
+            echo "|---|---|"
+            echo "| tests | $(mark "$TESTS") |"
+            echo "| Go smoke tests | $(mark "$SMOKE") |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Also the upload barrier, which is why it is `always()` and why every
       # compiling job needs one. The daemon uploads to R2 in the background so
@@ -1000,28 +1196,47 @@ jobs:
       # this job compiled is actually published. Without it the cache still
       # reads correctly, it just never fills.
       #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
+      # Every daemon call tolerates failure: fork PRs run with no remote and
+      # therefore no daemon (see setup-nix), and this must not turn a green
+      # build red on the way out.
       - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
-          kache daemon stop || true
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
-          # between "uploaded" and "still queued when the 30s drain cap fired"
-          # is invisible — which is precisely the question a low hit rate on a
+          # between "uploaded" and "still queued when the drain cap fired" is
+          # invisible — which is precisely the question a low hit rate on a
           # re-run raises, and which cost a round trip to answer once already.
           if [ -n "${log:-}" ] && [ -f "$log" ]; then
             echo "::group::kache daemon log (tail)"
@@ -1029,6 +1244,238 @@ jobs:
             echo "::endgroup::"
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # `plugingo-e2e`, compiled once and run in shards, on linux/amd64 only.
+  #
+  # It was 15–19 min of every Test leg: its tests build real Go programs, one
+  # after another inside a few binaries. `go_e2e_build` compiles the test
+  # binaries into a nextest archive; the `go_e2e` matrix runs that archive in
+  # shards on separate runners (a public repo gets 20 concurrent Linux jobs, so
+  # the shards cost no wall-clock time against each other); `go_e2e_count`
+  # checks the shards between them ran every test the archive lists.
+  #
+  # On darwin and linux/arm64, `test` runs the two Go smoke tests
+  # instead (accepted exemption E2).
+  go_e2e_build:
+    name: Go E2E build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: gen
+    outputs:
+      total: ${{ steps.list.outputs.total }}
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v8
+        with:
+          name: repo
+          path: .
+
+      - name: Free disk space (linux)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+        with:
+          cargo-target: x86_64-unknown-linux-gnu
+          cache-suffix: "-go-e2e"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
+
+      # Budget: 2 GB. The archive is every plugingo-e2e test binary plus the
+      # std dylib; with line-tables-only debuginfo it was ~240 MB on darwin.
+      - name: Archive plugingo-e2e
+        shell: devenv shell bash -- -e {0}
+        run: |
+          set -euo pipefail
+          cargo nextest archive --locked -p plugingo-e2e --archive-file go-e2e.tar.zst
+          size=$(stat -c %s go-e2e.tar.zst)
+          human=$(numfmt --to=iec "$size")
+          echo "go-e2e archive: $human ($size bytes)"
+          echo "go-e2e archive: **$human** (budget 2G)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -gt 2147483648 ]; then
+            echo "::warning title=go-e2e archive::the plugingo-e2e nextest archive is $human, over its 2 GB budget"
+          fi
+
+      # The number of tests a full run of the archive would run, for
+      # `go_e2e_count` to compare the shards' total against.
+      - name: List archive
+        id: list
+        shell: devenv shell bash -- -e {0}
+        run: |
+          set -euo pipefail
+          cargo nextest list --archive-file go-e2e.tar.zst --workspace-remap . --message-format json > go-e2e-list.json
+          total=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for s in d["rust-suites"].values() for t in s["testcases"].values() if t["filter-match"]["status"] == "matches"))' go-e2e-list.json)
+          echo "plugingo-e2e: $total tests"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-e2e-archive
+          path: go-e2e.tar.zst
+          retention-days: 1
+          # Already zstd-compressed.
+          compression-level: 0
+
+      # Also the upload barrier, which is why it is `always()` and why every
+      # compiling job needs one; see the same step in `test`.
+      - name: kache stats + drain uploads
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: |
+          kache stats
+
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
+          if [ -n "${log:-}" ] && [ -f "$log" ]; then
+            echo "::group::kache daemon log (tail)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          else
+            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # `--partition slice:k/N`, not `count:`: `count:` splits per binary, so every
+  # one-test binary lands on shard 1; `slice:` deals tests out round-robin
+  # across all binaries. N is tuned from the shards' timings; the matrix list
+  # and the `/N` below must agree, which `tests/root/ci_gate.rs` checks.
+  #
+  # Each shard enters the same devenv as the build job: the archived test
+  # binaries' ELF interpreter is a nix store path, and the tests need its Go.
+  go_e2e:
+    name: Go E2E ${{ matrix.shard }}/3
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [gen, go_e2e_build]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v8
+        with:
+          name: repo
+          path: .
+
+      - name: Download archive
+        uses: actions/download-artifact@v8
+        with:
+          name: go-e2e-archive
+          path: .
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+
+      - name: Test shard
+        shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          echo "plugingo-e2e, partition slice:$SHARD/3"
+          cargo nextest run --archive-file go-e2e.tar.zst --workspace-remap . \
+            --partition "slice:$SHARD/3" --no-fail-fast --no-tests=fail --color never 2>&1 | tee nextest.log
+          # nextest's summary line: `N tests run: N passed, M skipped`.
+          ran=$(grep -oE '[0-9]+ tests? run:' nextest.log | tail -n 1 | grep -oE '^[0-9]+' || true)
+          if [ -z "$ran" ]; then
+            echo "::error title=go_e2e shard $SHARD::no nextest summary line in the output, so this shard's test count is unknown"
+            exit 1
+          fi
+          echo "shard $SHARD ran $ran tests"
+          mkdir -p go-e2e-count
+          echo "$ran" > "go-e2e-count/shard-$SHARD"
+
+      - name: How to rerun
+        if: failure()
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          echo "::error title=go_e2e shard $SHARD::Rerun this shard locally with: cargo nextest run -p plugingo-e2e --partition slice:$SHARD/3 (or pass the failing test's name as a filter: cargo nextest run -p plugingo-e2e <name>)"
+
+      - name: Upload count
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-e2e-count-${{ matrix.shard }}
+          path: go-e2e-count/
+          retention-days: 1
+
+  # The shards' run counts must add up to what the archive lists. A shard that
+  # silently ran nothing (a partition bug, a changed summary format) would
+  # otherwise look exactly like a shard whose tests passed.
+  go_e2e_count:
+    name: Go E2E count
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [go_e2e_build, go_e2e]
+    steps:
+      - name: Download counts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: go-e2e-count-*
+          path: go-e2e-count
+          merge-multiple: true
+
+      - name: Check the shards ran every test
+        env:
+          EXPECTED: ${{ needs.go_e2e_build.outputs.total }}
+          SHARDS: "3"
+        run: |
+          set -euo pipefail
+          found=0
+          sum=0
+          for f in go-e2e-count/shard-*; do
+            n=$(cat "$f")
+            echo "$(basename "$f"): $n"
+            sum=$((sum + n))
+            found=$((found + 1))
+          done
+          echo "shards: $found, tests run: $sum, archive lists: $EXPECTED"
+          echo "plugingo-e2e: $found shards ran $sum tests; the archive lists $EXPECTED." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$found" -ne "$SHARDS" ]; then
+            echo "::error title=go_e2e count::expected counts from $SHARDS shards, found $found"
+            exit 1
+          fi
+          if [ -z "$EXPECTED" ] || [ "$sum" -ne "$EXPECTED" ]; then
+            echo "::error title=go_e2e count::the shards ran $sum tests between them, but the archive lists ${EXPECTED:-?}"
+            exit 1
           fi
 
   # Compile `bin_e2e`'s test binaries ahead of the job that runs them. `tst`
@@ -1049,6 +1496,12 @@ jobs:
   #
   # --no-run because the tests hard-fail without a dist. A compile error here is
   # a real failure — `bin_e2e` would hit the same one 20 minutes later.
+  #
+  # Linux only. A run gets four macOS jobs — Build, Lint, Test and Binary E2E
+  # darwin/arm64 — against GitHub's five concurrent macOS slots on the free
+  # tier. A darwin warm job would be a fifth; `Binary E2E darwin/arm64`
+  # compiles its own test binaries instead,
+  # which with the kache restore is a minute or two.
   bin_e2e_warm:
     name: Warm Binary E2E ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
@@ -1066,10 +1519,6 @@ jobs:
             arch: arm64
             runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: darwin
-            arch: arm64
-            runs-on: macos-latest
-            target: aarch64-apple-darwin
     steps:
       - name: Download repo
         uses: actions/download-artifact@v8
@@ -1096,23 +1545,42 @@ jobs:
       # this job compiled is actually published. Without it the cache still
       # reads correctly, it just never fills.
       #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
+      # Every daemon call tolerates failure: fork PRs run with no remote and
+      # therefore no daemon (see setup-nix), and this must not turn a green
+      # build red on the way out.
       - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
-          kache daemon stop || true
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
@@ -1127,6 +1595,15 @@ jobs:
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
 
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Black-box tests against the artifacts the `build` job just produced — the
   # exact bytes that get published. Covers only what `test` structurally cannot:
   # dlopen of the shipped plugin cdylibs, the TUI under a real PTY, and process
@@ -1135,6 +1612,11 @@ jobs:
   #
   # linux/arm64 matters most here: the build job cross-compiles it, so this is
   # the only place the shipped aarch64-linux binary is ever executed.
+  #
+  # It gates only `release` (promotion to mainline), never publishing: the
+  # pre-release gets each platform's artifacts as soon as they are built.
+  # The darwin leg has no warm job and compiles its test binaries itself (see
+  # `bin_e2e_warm`).
   bin_e2e:
     name: Binary E2E ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
@@ -1205,23 +1687,42 @@ jobs:
       # this job compiled is actually published. Without it the cache still
       # reads correctly, it just never fills.
       #
-      # `|| true`: fork PRs run with no remote and therefore no daemon (see
-      # setup-nix), and this must not turn a green build red on the way out.
+      # Every daemon call tolerates failure: fork PRs run with no remote and
+      # therefore no daemon (see setup-nix), and this must not turn a green
+      # build red on the way out.
       - name: kache stats + drain uploads
         if: always()
         shell: devenv shell bash -- -e {0}
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
-          kache daemon stop || true
+          # Waits (up to 35s) for the daemon to drain its upload queue and
+          # exit. Failing means it was still uploading, and what is left dies
+          # with the runner. It also fails on fork PRs, which have no remote
+          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          kache daemon stop || {
+            [ -z "${KACHE_CONFIG:-}" ] ||
+              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
+          }
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
@@ -1235,6 +1736,15 @@ jobs:
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Perf-regression check (own workflow: .github/workflows/perf.yml) —
   # generates one synthetic corpus, times a fixed scenario set against N and
@@ -1271,9 +1781,15 @@ jobs:
     uses: ./.github/workflows/perf.yml
     secrets: inherit
 
+  # The one job that promotes a pre-release to mainline (`prerelease: false`,
+  # `make_latest`) and deploys the site, and the one job that waits for every
+  # check: the complete pre-release (`manifests`, hence every build), lint on
+  # all three platforms, both test tiers, every go_e2e shard and their count,
+  # and bin-e2e on all three platforms. `tests/root/ci_gate.rs` holds it to
+  # that, and holds every other job to never promoting.
   release:
     name: Release
-    needs: [gen, upload_artifacts, lint, test, bin_e2e]
+    needs: [gen, manifests, lint, test, go_e2e, go_e2e_count, bin_e2e]
     if: github.ref == 'refs/heads/master'
     # Build/test run concurrently for every master commit (see top-level
     # concurrency), but only the latest landed commit should ever mark a
@@ -1316,7 +1832,7 @@ jobs:
   # reason instead.
   summary:
     name: Summary
-    needs: [gate, gen, upload_artifacts]
+    needs: [gate, gen, prerelease_create, manifests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1331,6 +1847,9 @@ jobs:
           GATE_RUN: ${{ needs.gate.outputs.run }}
           GATE_REASON: ${{ needs.gate.outputs.reason }}
           GATE_RESULT: ${{ needs.gate.result }}
+          PUBLISH: ${{ needs.prerelease_create.outputs.publish }}
+          RELEASE_URL: ${{ needs.prerelease_create.outputs.url }}
+          MANIFESTS: ${{ needs.manifests.result }}
         run: |
           # `needs.gate.result` first, and only then its outputs. `always()`
           # means this job also runs when `gate` was cancelled or failed, and
@@ -1354,17 +1873,18 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** \`${{needs.gen.outputs.version}}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ needs.upload_artifacts.result }}" == "success" ]; then
-            echo "**Release:** [${{needs.gen.outputs.version}}](${{needs.upload_artifacts.outputs.release_url}})" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.upload_artifacts.result }}" == "skipped" ]; then
-            echo "**Release:** Skipped" >> $GITHUB_STEP_SUMMARY
+          VERSION='${{needs.gen.outputs.version}}'
+          if [ "$PUBLISH" != "true" ]; then
+            echo "**Release:** not published (no upload secret in this run, as on a fork PR)" >> $GITHUB_STEP_SUMMARY
+          elif [ "$MANIFESTS" == "success" ]; then
+            echo "**Release:** [$VERSION]($RELEASE_URL) — complete (pre-release until \`Release\` promotes it)" >> $GITHUB_STEP_SUMMARY
           else
-            echo "**Release:** Failed or cancelled" >> $GITHUB_STEP_SUMMARY
+            echo "**Release:** [$VERSION]($RELEASE_URL) — partial: the plugin manifests job concluded \`${MANIFESTS:-not run}\`, so some platform's build did not finish" >> $GITHUB_STEP_SUMMARY
           fi
 
   cleanup:
     name: Cleanup
-    needs: [gen, build, lint, test, bin_e2e, upload_artifacts]
+    needs: [gen, build, lint, test, go_e2e_build, go_e2e, go_e2e_count, bin_e2e, manifests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

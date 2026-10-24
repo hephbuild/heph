@@ -79,8 +79,17 @@ pub fn has_interp(data: &[u8]) -> anyhow::Result<bool> {
         .any(|ph| ph.p_type(endian) == object::elf::PT_INTERP))
 }
 
+/// `testdata/<name>` of this crate.
+///
+/// Read from the environment at run time, not with `env!`: CI compiles these
+/// tests once into a nextest archive and runs it in other jobs, and nextest
+/// sets `CARGO_MANIFEST_DIR` to the crate's directory where the archive is
+/// unpacked (`--workspace-remap`). A path baked in at compile time would point
+/// at the build job's checkout. `cargo test` sets it too; the compile-time
+/// value is only the fallback for a binary run by hand.
 pub fn testdata(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
         .join("testdata")
         .join(name)
 }

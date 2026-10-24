@@ -1,0 +1,18 @@
+# cargo-nextest configuration. `tst` and CI run every test through nextest; see
+# the comment on `scripts.tst` in devenv.nix.
+
+# The profile CI selects with `NEXTEST_PROFILE=ci`.
+#
+# A test still running after 120s is reported as slow, and killed after five
+# periods (10 min) with nextest's TIMEOUT status — a hung test becomes a named
+# failure instead of a job that runs into its `timeout-minutes` with no clue
+# which test it was waiting on.
+#
+# No retries, on purpose: a flake must show up as a failure, not be absorbed.
+[profile.ci]
+slow-timeout = { period = "120s", terminate-after = 5 }
+retries = 0
+fail-fast = false
+# Print a failing test's output where it fails and again in the final summary,
+# so the cause is at the bottom of a long CI log.
+failure-output = "immediate-final"

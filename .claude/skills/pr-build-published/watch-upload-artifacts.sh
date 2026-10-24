@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Watch the current PR's "CI" run for the `upload_artifacts` job (display name
-# "Pre-release") and report its terminal outcome.
+# Watch the current PR's "CI" run for the `manifests` job (display name
+# "Plugin manifests"), the last publishing step, and report its terminal outcome.
 #
 # On success, prints:   ok\n<run_url>\n<pr_url>
 # On skip/failure, prints (to stderr) the reason and exits non-zero:
@@ -11,7 +11,7 @@
 # Polls until the job reaches a terminal state (default cap 45 min).
 set -euo pipefail
 
-JOB_NAME="${JOB_NAME:-Pre-release}"   # display name of the `upload_artifacts` job
+JOB_NAME="${JOB_NAME:-Plugin manifests}"   # display name of the `manifests` job
 WORKFLOW="CI"
 DEADLINE=$(( $(date +%s) + ${TIMEOUT_SECONDS:-2700} ))   # default 45 minutes
 POLL_INTERVAL="${POLL_INTERVAL:-15}"
@@ -53,15 +53,15 @@ while :; do
             exit 0
             ;;
           skipped)
-            echo "error: '$JOB_NAME' (upload_artifacts) was skipped" >&2
-            echo "reason: an upstream dependency did not succeed (the job runs only when the 'gen' codegen job succeeds)" >&2
+            echo "error: '$JOB_NAME' (manifests) was skipped" >&2
+            echo "reason: an upstream job did not succeed (it runs only when every 'Build <os>/<arch>' leg, 'gen' and 'govet' succeeded); the pre-release is partial" >&2
             echo "run: $run_url" >&2
             exit 4
             ;;
           *)
             failed_steps=$(echo "$job" | jq -r \
               '[.steps[]? | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .name] | join(", ")')
-            echo "error: '$JOB_NAME' (upload_artifacts) concluded '$conclusion'" >&2
+            echo "error: '$JOB_NAME' (manifests) concluded '$conclusion'" >&2
             if [ -n "$failed_steps" ]; then
               echo "reason: failing step(s): $failed_steps" >&2
             fi
@@ -78,7 +78,7 @@ while :; do
       echo "error: no CI run found for commit $sha within the deadline" >&2
       exit 3
     fi
-    echo "error: timeout - '$JOB_NAME' (upload_artifacts) did not complete within the deadline" >&2
+    echo "error: timeout - '$JOB_NAME' (manifests) did not complete within the deadline" >&2
     echo "run: $found_run_url" >&2
     exit 6
   fi

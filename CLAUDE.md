@@ -23,12 +23,28 @@ binary, the three plugin cdylibs, every proc-macro and every test harness.
   the wrapper reads and writes the store directly. On a copy-on-write filesystem
   (APFS, btrfs, XFS-with-reflink) restores are reflinks, so a restored `target/`
   costs almost no additional disk and blobs are shared across worktrees.
-- **CI** points the same wrapper at the shared R2 bucket via `KACHE_S3_*` and runs
-  the daemon (`.github/actions/setup-nix`). The remote is inert without the daemon:
-  it owns remote lookups and background uploads. Each compiling job ends with
-  `kache daemon stop`, which drains the upload queue before the runner is torn down.
-- To share CI's cache locally, export the same `KACHE_S3_*` vars and run
-  `kache daemon start`.
+- **CI** points the same wrapper at the shared R2 bucket through a kache config
+  file (`KACHE_CONFIG`, written by `.github/actions/setup-nix`) and runs the
+  daemon. The remote is inert without the daemon: it owns remote lookups and
+  background uploads. Each compiling job ends with `kache daemon stop`, which
+  waits for the upload queue to drain before the runner is torn down.
+- **Who writes**: kache only publishes from a push to a protected branch, so
+  `master` writes `kache/v2`. A PR run reads `kache/v2`, then `kache-pr/v2`, and
+  writes only `kache-pr/v2`: a PR's later pushes reuse its earlier ones, and
+  nothing a PR compiled reaches `master`'s prefix.
+- **C is not cached, on purpose.** `RUSTC_WRAPPER` is `kache-rustc`, a symlink
+  to `kache`, because the `cc` crate would take a wrapper named `kache` as its C
+  wrapper too. Fetching build scripts' ~490 C objects from R2 measured slower
+  than compiling them (a warm run went from 30 to 37 minutes; `devenv.nix` has
+  the numbers). Don't point `RUSTC_WRAPPER` back at `kache`.
+- `kache report` counts every build-script *run* as a miss (`build_script_run`,
+  ~100 per job, milliseconds each). Leave them out when reading a hit rate.
+- A cache hit can still show up as a miss: the wrapper gives the daemon 3s per
+  remote lookup, and an R2 round trip over that compiles the crate instead.
+  Misses at ~3,050 ms of overhead in `kache report` are these.
+- To share CI's cache locally, write the same `[cache.remote]` table into a
+  kache config file, export `KACHE_S3_ACCESS_KEY` / `KACHE_S3_SECRET_KEY`, and
+  run `kache daemon start`.
 
 `kache stats` for a summary, `kache monitor` for a live TUI, `kache why-miss <crate>`
 to explain a miss, `KACHE_PROGRESS=verbose` for per-crate stderr lines, and
@@ -49,7 +65,14 @@ gen                                  # regenerate protobuf bindings (runs buf ge
 
 The `gen` script is a devenv-provided alias, assume its present. It must be run at the beginning of all sessions, or after any `.proto` file changes before building.
 
-`tst` runs every pass with `--no-fail-fast` and exits non-zero if any failed, so one red test binary no longer hides the rest; extra args pass through to every pass. Its body spelled out as `cargo test --workspace` is the same suite, and the gate holds it to the same `HEPH_FULL_SUITE=1` opt-in.
+`tst` runs every pass with `--no-fail-fast` and exits non-zero if any failed, so one red test binary no longer hides the rest; extra args pass through to every pass. Each pass is `cargo nextest run` followed by `cargo test --doc`, because nextest does not run doctests. Locally `tst` is still the whole workspace (minus `bin-e2e`). Its body spelled out as `cargo test --workspace` or `cargo nextest run --workspace` is the same suite, and the gate holds it to the same `HEPH_FULL_SUITE=1` opt-in.
+
+- `TST_SCOPE` replaces the first pass's crate selection and nothing else, e.g. `TST_SCOPE='-p engine -p e2e' tst`. CI uses it to split the suite by platform (see "What CI runs where" below).
+- Only a test-name filter and `-- --exact|--skip|--ignored|--include-ignored|--nocapture` make sense as args. nextest rejects `-- --test-threads=N`; pass `-j N` before the filter instead.
+
+`crates/e2e` and the root package link their integration tests into **one binary each**, so a file is a module, not a `--test` target: `cargo test -p e2e --test e2e clean::`, `cargo test --test root ci_gate::`. A few files stay separate binaries because they touch process-global state (`set_var`, re-exec, the child watcher); `tests/root/test_layout.rs` lists them and fails on a file that is neither declared in its `main.rs` nor on that list.
+
+Debug builds carry line tables only, and dependencies no debuginfo (`[profile.dev]` in `Cargo.toml`): backtraces keep file:line, a debugger loses variables. `CARGO_PROFILE_DEV_DEBUG=full cargo build` restores full debuginfo for the workspace crates only; dependencies need `--config 'profile.dev.package."*".debug=true'` as well.
 
 `lint`, `fix`, `tst` and `e2e` are devenv scripts, and their text is **baked into the shell when it starts**. After editing `devenv.nix`, the running shell still has the old scripts. For example, a new crate added to `qualityCrates` is not format-checked, so `lint` is green locally and red in CI. Start a new `devenv shell` before trusting them.
 
@@ -74,11 +97,19 @@ One script, one code path — CI runs the same `e2e`, differing only in where th
 
 Concurrency-safe: the suite stages into a `mktemp -d` unique to each run rather than a fixed path two runs would fight over, and fingerprints `release/` around the copy — if another build lands in that window, the run aborts rather than quietly testing the wrong binary. Keep it that way when editing the script; a fixed staging path reintroduces both.
 
-There is no `CARGO_TARGET_DIR` override anywhere — every workspace uses cargo's own `target/`. Worktrees used to share one target dir so dependencies compiled once; kache does that properly now (keyed on content, shared across worktrees and machines, reflinked so a restored `target/` costs almost no disk), and the shared directory only bought concurrent builds writing to the same path. Scripts that need the path call `target-dir`, which asks cargo — don't reintroduce the env var, and don't assume `$DEVENV_ROOT/target`, which is wrong the moment a shell started in one checkout is used in another. Bare `target-dir` answers for `$DEVENV_ROOT` (for `run-release` against another project); a script that has just run `cargo build` calls `target-dir .`, the workspace it built. A bare one in `e2e` once built a worktree and then tested the main checkout's stale binaries, green; `tests/target_dir_script.rs` now fails on that.
+There is no `CARGO_TARGET_DIR` override anywhere — every workspace uses cargo's own `target/`. Worktrees used to share one target dir so dependencies compiled once; kache does that properly now (keyed on content, shared across worktrees and machines, reflinked so a restored `target/` costs almost no disk), and the shared directory only bought concurrent builds writing to the same path. Scripts that need the path call `target-dir`, which asks cargo — don't reintroduce the env var, and don't assume `$DEVENV_ROOT/target`, which is wrong the moment a shell started in one checkout is used in another. Bare `target-dir` answers for `$DEVENV_ROOT` (for `run-release` against another project); a script that has just run `cargo build` calls `target-dir .`, the workspace it built. A bare one in `e2e` once built a worktree and then tested the main checkout's stale binaries, green; `tests/root/target_dir_script.rs` now fails on that.
 
 It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run it reflexively: the `bin_e2e` CI job runs it on all three platforms on every push, and it gates `release`. Run it locally only when changing something it covers (the loader, the TUI, CLI exit codes, the `e2e` script itself) — and expect a full release build the first time.
 
 `tst` excludes `bin-e2e` deliberately: those tests need staged artifacts and hard-fail without `HEPH_E2E_DIST`, so a suite that never ran can't read as a suite that passed. See `.claude/testing.md` for what belongs there versus `crates/e2e`.
+
+### What CI runs where
+
+- **Every platform** has a `Lint <os>/<arch>` and a `Test <os>/<arch>` check. `Test` runs the workspace minus `bin-e2e` and `plugingo-e2e`.
+- **`plugingo-e2e`** runs on linux/amd64: compiled once (`Go E2E build`) and run in three shards (`Go E2E k/3`), whose run counts `Go E2E count` checks against the archive. On darwin/arm64 and linux/arm64, `Test` runs two of its tests (`testmain`, `devenv_host_toolchain`) as Go smoke tests after the rest.
+- **bin-e2e** runs on all three, and gates only promotion to mainline. Artifacts reach the pre-release as each build finishes.
+
+A red `Test darwin/arm64` or `Test linux/arm64` can be the tests or the Go smoke tests; the job's step summary says which.
 
 ### Credentials
 
@@ -111,7 +142,7 @@ A reference is refused in anything that shapes the graph or identity, and a
 ### Exec runners
 
 Every subprocess heph spawns goes through `crates/execrunner`, never
-`hproc::proc_exec` directly — `tests/execrunner_gate.rs` fails the build if a
+`hproc::proc_exec` directly — `tests/root/execrunner_gate.rs` fails the build if a
 driver starts to. A target can name a runner (`runner = "//tools/devenv:runner"`
 on `exec`/`bash`, or the driver's `runner:` option workspace-wide) and its
 command runs inside the environment that runner describes.
@@ -165,7 +196,7 @@ removed. A site kind ships with its editor-shaped test in `tests/lsp.rs`.
 
 ## Workflow
 
-**Never run the whole test suite locally — not `tst`, not `cargo test --workspace`, whatever the change.** CI runs it on every push, on all three platforms; a local run only delays the push. That holds for engine-core, trait and caching changes too: a wide break shows up in CI.
+**Never run the whole test suite locally — not `tst`, not `cargo test --workspace`, whatever the change.** CI runs it on every push (on all three platforms); a local run only delays the push. That holds for engine-core, trait and caching changes too: a wide break shows up in CI.
 
 Spot-run the tests of the crates the change touched, and of the crates it could have broken:
 
@@ -184,7 +215,7 @@ When that set is most of the workspace — a change in `core` or `model` reaches
 
 ```bash
 cargo test -p <crate> -p <dependent>      # touched and possibly-broken crates
-cargo test -p e2e --test <file>           # the e2e file covering the change
+cargo test -p e2e --test e2e clean::      # the e2e file covering the change (`<file>::`)
 cargo test -p <crate> <test_name>         # one test while iterating
 ```
 
@@ -235,7 +266,7 @@ Plain `gh stack submit` opens an editor for PR titles — pass `--auto` from a s
 - **A stacked PR does not build until it reaches the bottom.** The `gate` job in `.github/workflows/heph.yml` runs CI for a push, or for a PR whose base is `master`; a PR based on another branch is skipped — every check reports "skipped" and the `Summary` job says why. Add the **`ci/force-ci`** label to build one anyway (labelling starts the run on its own; no push needed). This does not weaken the merge gate: required status checks live in the `master` ruleset, whose condition is `~DEFAULT_BRANCH`, so they apply to exactly the PRs the gate builds. A stacked PR merges with skipped checks because nothing is required of it, and its code still cannot reach `master` without first becoming a `master`-targeting PR, which builds.
 - **What the skip costs you: an upper layer's break surfaces late.** A change that only fails on `darwin/arm64`, or only under `--no-default-features`, sits undetected at layer 3 until the two below it land. On a deep stack that serializes debugging into one cycle per layer. `ci/force-ci` is the answer when a layer is worth testing on its own — a large refactor low in the stack, anything platform-specific, a flake hunt. Use it rather than assuming green-when-it-gets-there.
 - **Sync after the base merges.** GitHub retargets the child at `master` itself, and that retarget *is* an `edited` event, so it now starts a full run — but the tree it builds still carries the base's commits. `gh stack sync` force-pushes the rebased branch (`synchronize` → another run), and that is the run whose result means anything. You need the rebase regardless, since `master` is squash-only.
-- **Don't add a `branches:` filter to `pull_request:`.** It matches the PR's *base*, so stacked PRs got zero runs and an empty check list that reads like a pass (fixed in #240) — invisible, and not overridable by a label. That is why the skip lives in `gate` instead. `tests/ci_gate.rs` guards this, plus the rule that every job hangs off `gate`.
+- **Don't add a `branches:` filter to `pull_request:`.** It matches the PR's *base*, so stacked PRs got zero runs and an empty check list that reads like a pass (fixed in #240) — invisible, and not overridable by a label. That is why the skip lives in `gate` instead. `tests/root/ci_gate.rs` guards this, plus the rule that every job hangs off `gate`.
 
 ## Phases and hand-offs
 
@@ -332,7 +363,7 @@ Mechanical triggers — if the change touches it, consult. Not a judgment call.
 - A **BLOCKER** from `feature-quality`, `code-quality`, `hermeticity`, or `compatibility` is fixed, or explicitly overruled with a stated reason, before the commit.
 - **NOT HERMETIC** and **BREAKING** are never silently accepted — either fix, or record the decision in the commit body.
 - A **RETHINK** / **DON'T BUILD** from `product-vision` goes back to the user, not around them.
-- **Per-platform behavior is the user's decision.** The supported set is `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` — no BSD, no Windows, no 32-bit — and features work uniformly across all three by default, on the OS axis (Linux vs macOS) and the arch axis (x86_64 vs aarch64) alike. A divergence may be the right answer — but it is never settled by an agent or by the implementation. Flag it (what differs, on which target, what each option costs) and put the call to the user before writing the code. CI runs the suite natively on all three supported targets, so a green CI does cover an arch-conditional change — but the `linux/arm64` *release* binary is cross-compiled while its test job builds natively, so a toolchain-specific break there is still uncovered.
+- **Per-platform behavior is the user's decision.** The supported set is `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` — no BSD, no Windows, no 32-bit — and features work uniformly across all three by default, on the OS axis (Linux vs macOS) and the arch axis (x86_64 vs aarch64) alike. A divergence may be the right answer — but it is never settled by an agent or by the implementation. Flag it (what differs, on which target, what each option costs) and put the call to the user before writing the code. CI lints all three supported targets natively and runs the tests of every crate with platform-conditional code on each of them, so a green CI covers an arch-conditional change in the crate that owns it — but the full suite runs on linux/amd64 only, behavior reached only through a third-party dependency is tested only there, and the `linux/arm64` *release* binary is cross-compiled while its test job builds natively, so a toolchain-specific break there is still uncovered.
 - **Adding a dependency is allowed** when it gets the job done reliably. A maintained crate beats a fragile hand-rolled version. What still gets flagged: duplicating a crate already in the tree, a second copy of an ecosystem (async runtime, TLS, HTTP client, allocator), hot-path or startup cost, and support limited to one OS or one arch. Adding a dependency also re-resolves the **whole** lockfile.
   - Once, adding 40 crates bumped tokio and 200 other packages, and it broke an unrelated engine test on macOS only. It looked like a flake.
   - Check `git diff master -- Cargo.lock | grep -c '^-version'`. If existing pins moved, run `git checkout master -- Cargo.lock && cargo check --workspace` so that only what the new crates need changes.

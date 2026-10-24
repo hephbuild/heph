@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! HEPH_LT_TARGETS=100 HEPH_LT_SIZE_KB=1024 HEPH_LT_WORKERS=10 \
-//!   cargo test --release -p e2e --test cache_load -- --ignored --nocapture --test-threads=1
+//!   cargo test --release -p e2e --test e2e cache_load:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Always `--release`; a debug build measures rustc, not heph.
