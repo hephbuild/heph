@@ -105,9 +105,8 @@ It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run i
 
 ### What CI runs where
 
-- **linux/amd64** runs everything: `Lint linux/amd64`, `Test linux/amd64` (the workspace minus `bin-e2e` and `plugingo-e2e`), and `plugingo-e2e` compiled once (`Go E2E build`) and run in three shards (`Go E2E k/3`), whose run counts `Go E2E count` checks against the archive.
-- **Every platform** has its own lint job: `Lint linux/amd64`, `Lint linux/arm64`, `Lint darwin/arm64`.
-- **darwin/arm64 and linux/arm64** run the same scope as `Test linux/amd64`, then two Go smoke tests from `plugingo-e2e` (`testmain`, `devenv_host_toolchain`). The rest of `plugingo-e2e` runs on linux/amd64 only.
+- **Every platform** has a `Lint <os>/<arch>` and a `Test <os>/<arch>` check. `Test` runs the workspace minus `bin-e2e` and `plugingo-e2e`.
+- **`plugingo-e2e`** runs on linux/amd64: compiled once (`Go E2E build`) and run in three shards (`Go E2E k/3`), whose run counts `Go E2E count` checks against the archive. On darwin/arm64 and linux/arm64, `Test` runs two of its tests (`testmain`, `devenv_host_toolchain`) as Go smoke tests after the rest.
 - **bin-e2e** runs on all three, and gates only promotion to mainline. Artifacts reach the pre-release as each build finishes.
 
 A red `Test darwin/arm64` or `Test linux/arm64` can be the tests or the Go smoke tests; the job's step summary says which.

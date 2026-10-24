@@ -59,10 +59,9 @@ which reads as a pass.
 3. **Known real-but-confusing.** These are REAL:
    - `unrecognized subcommand` from `documented_examples_are_accepted`, red on all three `Test` jobs: a clap doc comment has a line starting with `heph `. See `src/commands/gendocs.rs`.
    - `Diff in <file>` in Lint: rustfmt. The branch was pushed without a passing `lint`.
-   - `Test darwin/arm64` or `Test linux/arm64` red: open the job's step summary first. Those legs run the tier-2 tests and then the Go smoke tests, and the summary table says which failed. Lint is its own check per platform (`Lint <os>/<arch>`).
+   - `Test darwin/arm64` or `Test linux/arm64` red: open the job's step summary first. Those legs run the tests and then the Go smoke tests, and the summary table says which failed. Lint is its own check per platform (`Lint <os>/<arch>`).
    - `TIMEOUT` in a nextest summary: a test hit the ci profile's kill (5 × 120s, `.config/nextest.toml`). That is a hang, not a slow runner; a rerun hides it.
    - `Go E2E count` red with every `Go E2E k/3` shard green: the shards between them ran fewer (or more) tests than the archive lists. A partition or a summary-format problem, not a flake.
-   - `platform-crates: warning: … unknown target key` in a Test leg's log: a `cfg` key `scripts/platform-crates` does not know. The crate was selected anyway; add the key to `KNOWN_TARGET_KEYS` if it is real.
    - Lint red in CI but green locally after a `devenv.nix` edit: the local shell's `lint` is stale. Start a new `devenv shell`.
    - `libunwind: malformed DW_CFA_def_cfa_register DWARF unwind, reg too big` and a test binary dying with SIGSEGV on `Test darwin/arm64`, the same binary on every rerun: a binary linked by the old ld64, which truncates unwind offsets past 16 MiB of `__eh_frame`. `tests/root/darwin_linker.rs` should be red too. See the linker note in `.cargo/config.toml`. A rerun never fixes it.
    - An unrelated test breaking after a dependency was added: check `git diff master -- Cargo.lock | grep -c '^-version'`. A re-resolved lockfile moves existing pins.
