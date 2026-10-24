@@ -107,10 +107,10 @@ It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run i
 
 - **linux/amd64** runs everything: `Lint linux/amd64`, `Test linux/amd64` (the workspace minus `bin-e2e` and `plugingo-e2e`), and `plugingo-e2e` compiled once (`Go E2E build`) and run in three shards (`Go E2E k/3`), whose run counts `Go E2E count` checks against the archive.
 - **Every platform** has its own lint job: `Lint linux/amd64`, `Lint linux/arm64`, `Lint darwin/arm64`.
-- **darwin/arm64 and linux/arm64** run the tests of the crates `scripts/platform-crates` selects — every crate with platform-conditional code (a `cfg` on a target key, a target-specific dependency, a build script reading `CARGO_CFG_TARGET_*`, `std::env::consts`), plus `crates/e2e` — then two Go smoke tests. `scripts/platform-crates --explain` says why each crate is in. A crate with no platform code of its own is compiled there (the Lint leg's `clippy --all-targets`) but tested on linux/amd64 only.
+- **darwin/arm64 and linux/arm64** run the same scope as `Test linux/amd64`, then two Go smoke tests from `plugingo-e2e` (`testmain`, `devenv_host_toolchain`). The rest of `plugingo-e2e` runs on linux/amd64 only.
 - **bin-e2e** runs on all three, and gates only promotion to mainline. Artifacts reach the pre-release as each build finishes.
 
-A red `Test darwin/arm64` or `Test linux/arm64` can be the tier-2 tests or the Go smoke tests; the job's step summary says which.
+A red `Test darwin/arm64` or `Test linux/arm64` can be the tests or the Go smoke tests; the job's step summary says which.
 
 ### Credentials
 
@@ -197,7 +197,7 @@ removed. A site kind ships with its editor-shaped test in `tests/lsp.rs`.
 
 ## Workflow
 
-**Never run the whole test suite locally — not `tst`, not `cargo test --workspace`, whatever the change.** CI runs it on every push (the full suite on linux/amd64, lint and the platform crates' tests on the other two); a local run only delays the push. That holds for engine-core, trait and caching changes too: a wide break shows up in CI.
+**Never run the whole test suite locally — not `tst`, not `cargo test --workspace`, whatever the change.** CI runs it on every push (on all three platforms); a local run only delays the push. That holds for engine-core, trait and caching changes too: a wide break shows up in CI.
 
 Spot-run the tests of the crates the change touched, and of the crates it could have broken:
 

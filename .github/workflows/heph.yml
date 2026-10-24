@@ -1073,7 +1073,7 @@ jobs:
   # every master-targeting run" is kept; `tests/root/ci_gate.rs` checks that
   # this scope plus `go_e2e` is the workspace minus `bin-e2e`.
   #
-  # darwin/arm64 and linux/arm64 run tier 2 in `test_platform`.
+  # darwin/arm64 and linux/arm64 run the same scope in `test_platform`.
   #
   # A one-leg matrix so the check keeps its rendered name, `Test linux/amd64`.
   test:
@@ -1191,21 +1191,16 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Tier 2: darwin/arm64 and linux/arm64. The tests of the crates that own
-  # platform-conditional code, then two Go smoke tests. Lint is the `lint`
-  # job's, one leg per platform.
+  # darwin/arm64 and linux/arm64: the same scope as `Test linux/amd64`, then
+  # two Go smoke tests. Lint is the `lint` job's, one leg per platform.
   #
-  # The full suite on these runners cost 15–20 min per leg for tests whose
-  # behaviour is the same on every platform. What must run here is every
-  # platform-gated path, and `scripts/platform-crates` computes which crates
-  # own one from this tree, on every run — there is no committed list to go
-  # stale. It always adds `crates/e2e`. A crate with no platform code of its
-  # own is still compiled on this platform, tests included, by the `lint` leg's
-  # `clippy --all-targets`; its tests run on linux/amd64 only (accepted
-  # exemption E1 in the spec). `tests/root/ci_gate.rs` checks the scope comes
-  # from the script's step output and nowhere else.
+  # Not a subset. Selecting only the crates with platform-conditional code
+  # was tried and bought little: those crates hold most of the tests (23 of
+  # 47 packages, 3,363 of 4,061 tests), so darwin ran nearly the whole suite
+  # anyway, and every other crate went untested here. `tests/root/ci_gate.rs`
+  # checks the two scopes stay equal.
   #
-  # The smoke tests carry `if: !cancelled()`, so a red tier-2 run still lets
+  # The smoke tests carry `if: !cancelled()`, so a red test run still lets
   # them run and report. The Summary step says which of the two failed.
   #
   # No macFUSE on the darwin runner: the macOS binaries weak-link libfuse, so
@@ -1215,8 +1210,8 @@ jobs:
   test_platform:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    # darwin is the slow one: tier 2 on a runner that runs the engine unit
-    # tests ~10x slower than linux/amd64.
+    # darwin is the slow one: a runner that runs the engine unit tests ~10x
+    # slower than linux/amd64.
     timeout-minutes: ${{ matrix.os == 'darwin' && 60 || 45 }}
     needs: gen
     strategy:
@@ -1261,39 +1256,12 @@ jobs:
           cache-suffix: "-test"
           r2-secret: ${{ secrets.CF_SSCACHE }}
 
-      # Its own step, under `set -euo pipefail`, so a script failure stops here
-      # with its own error instead of reaching `tst` as an empty or partial
-      # scope. The Test step reads the result from this step's output, never
-      # from a `$(…)` in its own command.
-      - name: Select platform crates
-        id: platform
-        if: ${{ !cancelled() }}
-        shell: devenv shell bash -- -e {0}
-        run: |
-          set -euo pipefail
-          # `python3` rather than the shebang: download-artifact drops the
-          # executable bit from the `repo` artifact.
-          python3 scripts/platform-crates > platform-crates.txt
-          scope=$(tr '\n' ' ' < platform-crates.txt | sed 's/ *$//')
-          count=$(grep -c . platform-crates.txt || true)
-          if [ -z "$scope" ] || [ "$count" -eq 0 ]; then
-            echo "::error title=platform-crates::scripts/platform-crates selected nothing, so tier 2 would test nothing"
-            exit 1
-          fi
-          echo "::group::Tier-2 crates and why (scripts/platform-crates --explain)"
-          python3 scripts/platform-crates --explain
-          echo "::endgroup::"
-          echo "Tier 2: $count crates: $scope"
-          echo "scope=$scope" >> "$GITHUB_OUTPUT"
-          echo "count=$count" >> "$GITHUB_OUTPUT"
-
       - name: Test
         id: test
-        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
         shell: devenv shell bash -- -e {0}
         env:
           RUST_BACKTRACE: "1"
-          TST_SCOPE: ${{ steps.platform.outputs.scope }}
+          TST_SCOPE: "--workspace --exclude bin-e2e --exclude plugingo-e2e"
         run: tst
 
       # The rest of `plugingo-e2e` checks heph's own Go logic (go list parsing,
@@ -1317,8 +1285,6 @@ jobs:
           PLATFORM: ${{ matrix.os }}/${{ matrix.arch }}
           TESTS: ${{ steps.test.outcome }}
           SMOKE: ${{ steps.smoke.outcome }}
-          COUNT: ${{ steps.platform.outputs.count }}
-          SCOPE: ${{ steps.platform.outputs.scope }}
         run: |
           mark() { case "$1" in success) echo "✓ passed" ;; failure) echo "✗ failed" ;; *) echo "– ${1:-not run}" ;; esac; }
           {
@@ -1326,10 +1292,8 @@ jobs:
             echo ""
             echo "| Step | Result |"
             echo "|---|---|"
-            echo "| tier-2 tests | $(mark "$TESTS") |"
+            echo "| tests | $(mark "$TESTS") |"
             echo "| Go smoke tests | $(mark "$SMOKE") |"
-            echo ""
-            echo "Tier-2 scope (${COUNT:-0} crates, from \`scripts/platform-crates\`): \`${SCOPE:-none}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Also the upload barrier, which is why it is `always()` and why every

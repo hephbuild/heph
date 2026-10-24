@@ -603,37 +603,24 @@ fn tier_one_plus_go_e2e_covers_the_workspace() {
     }
 }
 
-/// The darwin and linux/arm64 test scope is the `scripts/platform-crates`
-/// step's output — never a literal list, never a `$(…)` in the test command.
+/// darwin/arm64 and linux/arm64 test what linux/amd64 tests. A subset — the
+/// crates with platform-conditional code — was tried, and darwin still ran
+/// nearly the whole suite while every other crate went untested there.
 #[test]
-fn tier_two_uses_the_generated_crate_list() {
+fn test_platform_runs_the_linux_amd64_scope() {
     let wf = parsed();
-    let tier_two = job(&wf, "test_platform").expect("a `test_platform` job");
-    let step = step_running_exactly(tier_two, "tst").expect("test_platform runs `tst`");
-    let scope = env_of(step, "TST_SCOPE").expect("tier 2 sets TST_SCOPE");
-    let id = scope
-        .trim()
-        .strip_prefix("${{ steps.")
-        .and_then(|rest| rest.strip_suffix(".outputs.scope }}"))
-        .expect("TST_SCOPE is `${{ steps.<id>.outputs.scope }}`");
-    let producer = steps(tier_two)
-        .into_iter()
-        .find(|s| field(s, "id") == id)
-        .expect("the step TST_SCOPE names exists");
-    let run = field(producer, "run");
-    assert!(
-        run.contains("scripts/platform-crates"),
-        "the scope comes from scripts/platform-crates: {run}"
-    );
-    assert!(
-        run.contains("set -euo pipefail"),
-        "the platform-crates step runs under `set -euo pipefail`, so a script \
-         failure stops the leg instead of reaching `tst` as a partial scope"
-    );
-    assert!(
-        field(step, "if").contains(&format!("steps.{id}.outcome == 'success'")),
-        "the Test step runs only when the scope step succeeded; an empty \
-         TST_SCOPE would fall back to the whole workspace"
+    let scope_of = |id: &str| {
+        let tester = job(&wf, id).unwrap_or_else(|| panic!("a `{id}` job"));
+        let step =
+            step_running_exactly(tester, "tst").unwrap_or_else(|| panic!("`{id}` runs `tst`"));
+        env_of(step, "TST_SCOPE")
+            .unwrap_or_else(|| panic!("`{id}` sets TST_SCOPE"))
+            .to_owned()
+    };
+    assert_eq!(
+        scope_of("test_platform"),
+        scope_of("test"),
+        "test_platform tests the same scope as `Test linux/amd64`"
     );
 }
 
