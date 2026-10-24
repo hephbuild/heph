@@ -32,10 +32,13 @@ binary, the three plugin cdylibs, every proc-macro and every test harness.
   `master` writes `kache/v2`. A PR run reads `kache/v2`, then `kache-pr/v2`, and
   writes only `kache-pr/v2`: a PR's later pushes reuse its earlier ones, and
   nothing a PR compiled reaches `master`'s prefix.
-- **C is cached too.** The `cc` crate uses `RUSTC_WRAPPER=kache` as its C
-  wrapper, so build scripts' C (aws-lc-sys, zstd-sys, onig_sys) goes through
-  the same cache and remote. A compile with a flag kache does not support is
-  passed through, and `kache report` counts it under passthroughs, not misses.
+- **C is not cached, on purpose.** `RUSTC_WRAPPER` is `kache-rustc`, a symlink
+  to `kache`, because the `cc` crate would take a wrapper named `kache` as its C
+  wrapper too. Fetching build scripts' ~490 C objects from R2 measured slower
+  than compiling them (a warm run went from 30 to 37 minutes; `devenv.nix` has
+  the numbers). Don't point `RUSTC_WRAPPER` back at `kache`.
+- `kache report` counts every build-script *run* as a miss (`build_script_run`,
+  ~100 per job, milliseconds each). Leave them out when reading a hit rate.
 - A cache hit can still show up as a miss: the wrapper gives the daemon 3s per
   remote lookup, and an R2 round trip over that compiles the crate instead.
   Misses at ~3,050 ms of overhead in `kache report` are these.
