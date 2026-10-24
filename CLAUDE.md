@@ -49,7 +49,14 @@ gen                                  # regenerate protobuf bindings (runs buf ge
 
 The `gen` script is a devenv-provided alias, assume its present. It must be run at the beginning of all sessions, or after any `.proto` file changes before building.
 
-`tst` runs every pass with `--no-fail-fast` and exits non-zero if any failed, so one red test binary no longer hides the rest; extra args pass through to every pass. Its body spelled out as `cargo test --workspace` is the same suite, and the gate holds it to the same `HEPH_FULL_SUITE=1` opt-in.
+`tst` runs every pass with `--no-fail-fast` and exits non-zero if any failed, so one red test binary no longer hides the rest; extra args pass through to every pass. Each pass is `cargo nextest run` followed by `cargo test --doc`, because nextest does not run doctests. Locally `tst` is still the whole workspace (minus `bin-e2e`). Its body spelled out as `cargo test --workspace` or `cargo nextest run --workspace` is the same suite, and the gate holds it to the same `HEPH_FULL_SUITE=1` opt-in.
+
+- `TST_SCOPE` replaces the first pass's crate selection and nothing else, e.g. `TST_SCOPE='-p engine -p e2e' tst`. CI uses it to split the suite by platform (see "What CI runs where" below).
+- Only a test-name filter and `-- --exact|--skip|--ignored|--include-ignored|--nocapture` make sense as args. nextest rejects `-- --test-threads=N`; pass `-j N` before the filter instead.
+
+`crates/e2e` and the root package link their integration tests into **one binary each**, so a file is a module, not a `--test` target: `cargo test -p e2e --test e2e clean::`, `cargo test --test root ci_gate::`. A few files stay separate binaries because they touch process-global state (`set_var`, re-exec, the child watcher); `tests/root/test_layout.rs` lists them and fails on a file that is neither declared in its `main.rs` nor on that list.
+
+Debug builds carry line tables only, and dependencies no debuginfo (`[profile.dev]` in `Cargo.toml`): backtraces keep file:line, a debugger loses variables. `CARGO_PROFILE_DEV_DEBUG=full cargo build` restores full debuginfo for the workspace crates only; dependencies need `--config 'profile.dev.package."*".debug=true'` as well.
 
 `lint`, `fix`, `tst` and `e2e` are devenv scripts, and their text is **baked into the shell when it starts**. After editing `devenv.nix`, the running shell still has the old scripts. For example, a new crate added to `qualityCrates` is not format-checked, so `lint` is green locally and red in CI. Start a new `devenv shell` before trusting them.
 
@@ -79,6 +86,14 @@ There is no `CARGO_TARGET_DIR` override anywhere — every workspace uses cargo'
 It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run it reflexively: the `bin_e2e` CI job runs it on all three platforms on every push, and it gates `release`. Run it locally only when changing something it covers (the loader, the TUI, CLI exit codes, the `e2e` script itself) — and expect a full release build the first time.
 
 `tst` excludes `bin-e2e` deliberately: those tests need staged artifacts and hard-fail without `HEPH_E2E_DIST`, so a suite that never ran can't read as a suite that passed. See `.claude/testing.md` for what belongs there versus `crates/e2e`.
+
+### What CI runs where
+
+- **linux/amd64** runs everything: `Lint linux/amd64`, `Test linux/amd64` (the workspace minus `bin-e2e` and `plugingo-e2e`), and `plugingo-e2e` compiled once (`Go E2E build`) and run in three shards (`Go E2E k/3`), whose run counts `Go E2E count` checks against the archive.
+- **darwin/arm64 and linux/arm64** run `lint` first, then the tests of the crates `scripts/platform-crates` selects — every crate with platform-conditional code (a `cfg` on a target key, a target-specific dependency, a build script reading `CARGO_CFG_TARGET_*`, `std::env::consts`), plus `crates/e2e` — then two Go smoke tests. `scripts/platform-crates --explain` says why each crate is in. A crate with no platform code of its own is compiled there (lint's `clippy --all-targets`) but tested on linux/amd64 only.
+- **bin-e2e** runs on all three, and gates only promotion to mainline. Artifacts reach the pre-release as each build finishes.
+
+A red `Test darwin/arm64` or `Test linux/arm64` can be lint or tests; the job's step summary says which.
 
 ### Credentials
 
@@ -165,7 +180,7 @@ removed. A site kind ships with its editor-shaped test in `tests/lsp.rs`.
 
 ## Workflow
 
-**Never run the whole test suite locally — not `tst`, not `cargo test --workspace`, whatever the change.** CI runs it on every push, on all three platforms; a local run only delays the push. That holds for engine-core, trait and caching changes too: a wide break shows up in CI.
+**Never run the whole test suite locally — not `tst`, not `cargo test --workspace`, whatever the change.** CI runs it on every push (the full suite on linux/amd64, lint and the platform crates' tests on the other two); a local run only delays the push. That holds for engine-core, trait and caching changes too: a wide break shows up in CI.
 
 Spot-run the tests of the crates the change touched, and of the crates it could have broken:
 
@@ -332,7 +347,7 @@ Mechanical triggers — if the change touches it, consult. Not a judgment call.
 - A **BLOCKER** from `feature-quality`, `code-quality`, `hermeticity`, or `compatibility` is fixed, or explicitly overruled with a stated reason, before the commit.
 - **NOT HERMETIC** and **BREAKING** are never silently accepted — either fix, or record the decision in the commit body.
 - A **RETHINK** / **DON'T BUILD** from `product-vision` goes back to the user, not around them.
-- **Per-platform behavior is the user's decision.** The supported set is `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` — no BSD, no Windows, no 32-bit — and features work uniformly across all three by default, on the OS axis (Linux vs macOS) and the arch axis (x86_64 vs aarch64) alike. A divergence may be the right answer — but it is never settled by an agent or by the implementation. Flag it (what differs, on which target, what each option costs) and put the call to the user before writing the code. CI runs the suite natively on all three supported targets, so a green CI does cover an arch-conditional change — but the `linux/arm64` *release* binary is cross-compiled while its test job builds natively, so a toolchain-specific break there is still uncovered.
+- **Per-platform behavior is the user's decision.** The supported set is `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` — no BSD, no Windows, no 32-bit — and features work uniformly across all three by default, on the OS axis (Linux vs macOS) and the arch axis (x86_64 vs aarch64) alike. A divergence may be the right answer — but it is never settled by an agent or by the implementation. Flag it (what differs, on which target, what each option costs) and put the call to the user before writing the code. CI lints all three supported targets natively and runs the tests of every crate with platform-conditional code on each of them, so a green CI covers an arch-conditional change in the crate that owns it — but the full suite runs on linux/amd64 only, behavior reached only through a third-party dependency is tested only there, and the `linux/arm64` *release* binary is cross-compiled while its test job builds natively, so a toolchain-specific break there is still uncovered.
 - **Adding a dependency is allowed** when it gets the job done reliably. A maintained crate beats a fragile hand-rolled version. What still gets flagged: duplicating a crate already in the tree, a second copy of an ecosystem (async runtime, TLS, HTTP client, allocator), hot-path or startup cost, and support limited to one OS or one arch. Adding a dependency also re-resolves the **whole** lockfile.
   - Once, adding 40 crates bumped tokio and 200 other packages, and it broke an unrelated engine test on macOS only. It looked like a flake.
   - Check `git diff master -- Cargo.lock | grep -c '^-version'`. If existing pins moved, run `git checkout master -- Cargo.lock && cargo check --workspace` so that only what the new crates need changes.

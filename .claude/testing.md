@@ -14,8 +14,18 @@ Default to the closest-in unit that can prove the behavior. Reach outward only w
 | Where | What | Run with |
 |---|---|---|
 | `#[cfg(test)]` in the crate | pure logic, parsing, a single type's contract | `cargo test <name>` |
-| `crates/e2e`, `crates/plugingo-e2e` | engine semantics end to end — providers, drivers, caching, hashing, the graph. Links `heph` in-process and drives the real `Engine`. | `cargo test <name>` |
+| `crates/e2e`, `crates/plugingo-e2e` | engine semantics end to end — providers, drivers, caching, hashing, the graph. Links `heph` in-process and drives the real `Engine`. | `cargo test -p e2e --test e2e <file>::<name>` |
 | `crates/bin-e2e` | **only** what has no in-process form. Spawns the release binary; links no workspace crate. | `e2e` |
+
+### One test binary per package, for `crates/e2e` and the root
+
+A new integration test file in `crates/e2e/tests/` goes in `tests/e2e/` and gets a `mod` line in its `main.rs`; one in the root `tests/` goes in `tests/root/`. Each extra `tests/*.rs` is another link of all of `heph`. The exception is a file that touches process-global state — `std::env::set_var`, re-executing its own binary, the process-wide child watcher — since libtest runs a binary's tests as threads of one process: it stays a top-level `tests/*.rs` and goes on the separate-binary list in `tests/root/test_layout.rs`, which fails on a file that is in neither place.
+
+### Where it runs in CI
+
+The full suite runs on linux/amd64. darwin/arm64 and linux/arm64 run the tests of the crates `scripts/platform-crates` selects (the ones with platform-conditional code) plus `crates/e2e`; `scripts/platform-crates --explain` prints why each is in. A test of platform-specific behavior therefore belongs in the crate that has the `#[cfg]` — or in `crates/e2e` — to run on the platform it is about. `plugingo-e2e` runs on linux/amd64 only, sharded, apart from two smoke tests on the other two.
+
+Tests run under cargo-nextest, one process per test, with a 10-minute kill in CI (`.config/nextest.toml`); a `static` lock that serialised tests within one binary serialises nothing there.
 
 ### The `crates/bin-e2e` bar
 
