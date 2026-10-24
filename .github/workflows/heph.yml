@@ -752,6 +752,18 @@ jobs:
 
           kache daemon stop || true
 
+          # `stop` returns as soon as the daemon acknowledges; the daemon then
+          # drains its upload queue on its own, for up to 30s. Ending the step
+          # there let the runner's orphan-process cleanup kill it mid-drain —
+          # every queued upload lost, and the next run missing the same crates.
+          for _ in $(seq 40); do
+            pgrep -f 'kache daemon run' >/dev/null || break
+            sleep 1
+          done
+          if pgrep -f 'kache daemon run' >/dev/null; then
+            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
+          fi
+
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
           # between "uploaded" and "still queued when the 30s drain cap fired"
@@ -1024,6 +1036,18 @@ jobs:
 
           kache daemon stop || true
 
+          # `stop` returns as soon as the daemon acknowledges; the daemon then
+          # drains its upload queue on its own, for up to 30s. Ending the step
+          # there let the runner's orphan-process cleanup kill it mid-drain —
+          # every queued upload lost, and the next run missing the same crates.
+          for _ in $(seq 40); do
+            pgrep -f 'kache daemon run' >/dev/null || break
+            sleep 1
+          done
+          if pgrep -f 'kache daemon run' >/dev/null; then
+            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
+          fi
+
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
           # between "uploaded" and "still queued when the 30s drain cap fired"
@@ -1136,6 +1160,18 @@ jobs:
           log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
 
           kache daemon stop || true
+
+          # `stop` returns as soon as the daemon acknowledges; the daemon then
+          # drains its upload queue on its own, for up to 30s. Ending the step
+          # there let the runner's orphan-process cleanup kill it mid-drain —
+          # every queued upload lost, and the next run missing the same crates.
+          for _ in $(seq 40); do
+            pgrep -f 'kache daemon run' >/dev/null || break
+            sleep 1
+          done
+          if pgrep -f 'kache daemon run' >/dev/null; then
+            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
+          fi
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
@@ -1332,6 +1368,18 @@ jobs:
 
           kache daemon stop || true
 
+          # `stop` returns as soon as the daemon acknowledges; the daemon then
+          # drains its upload queue on its own, for up to 30s. Ending the step
+          # there let the runner's orphan-process cleanup kill it mid-drain —
+          # every queued upload lost, and the next run missing the same crates.
+          for _ in $(seq 40); do
+            pgrep -f 'kache daemon run' >/dev/null || break
+            sleep 1
+          done
+          if pgrep -f 'kache daemon run' >/dev/null; then
+            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
+          fi
+
           if [ -n "${log:-}" ] && [ -f "$log" ]; then
             echo "::group::kache daemon log (tail)"
             tail -n 200 "$log"
@@ -1440,6 +1488,18 @@ jobs:
           echo "::endgroup::"
           log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
           kache daemon stop || true
+
+          # `stop` returns as soon as the daemon acknowledges; the daemon then
+          # drains its upload queue on its own, for up to 30s. Ending the step
+          # there let the runner's orphan-process cleanup kill it mid-drain —
+          # every queued upload lost, and the next run missing the same crates.
+          for _ in $(seq 40); do
+            pgrep -f 'kache daemon run' >/dev/null || break
+            sleep 1
+          done
+          if pgrep -f 'kache daemon run' >/dev/null; then
+            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
+          fi
           if [ -n "${log:-}" ] && [ -f "$log" ]; then
             echo "::group::kache daemon log (tail)"
             tail -n 200 "$log"
@@ -1657,6 +1717,18 @@ jobs:
 
           kache daemon stop || true
 
+          # `stop` returns as soon as the daemon acknowledges; the daemon then
+          # drains its upload queue on its own, for up to 30s. Ending the step
+          # there let the runner's orphan-process cleanup kill it mid-drain —
+          # every queued upload lost, and the next run missing the same crates.
+          for _ in $(seq 40); do
+            pgrep -f 'kache daemon run' >/dev/null || break
+            sleep 1
+          done
+          if pgrep -f 'kache daemon run' >/dev/null; then
+            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
+          fi
+
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
           # between "uploaded" and "still queued when the 30s drain cap fired"
@@ -1787,6 +1859,18 @@ jobs:
           log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
 
           kache daemon stop || true
+
+          # `stop` returns as soon as the daemon acknowledges; the daemon then
+          # drains its upload queue on its own, for up to 30s. Ending the step
+          # there let the runner's orphan-process cleanup kill it mid-drain —
+          # every queued upload lost, and the next run missing the same crates.
+          for _ in $(seq 40); do
+            pgrep -f 'kache daemon run' >/dev/null || break
+            sleep 1
+          done
+          if pgrep -f 'kache daemon run' >/dev/null; then
+            echo "::warning title=kache::daemon still draining after 40s — its queued uploads die with the runner"
+          fi
 
           # Upload outcomes exist *only* in this log. `kache stats` reports what
           # was read, never what was published, so without this the difference
