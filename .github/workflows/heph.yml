@@ -383,6 +383,12 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
     needs: [gen, govet, prerelease_create]
+    # heph-bench's only consumer on a PR is `perfbench`, which runs only with
+    # the `ci/perf-test` label, so an unlabelled PR skips one of the build's
+    # six release-LTO leaves. Every push to master builds and publishes it:
+    # N-1 baselines are downloaded from master's releases.
+    env:
+      BUILD_BENCH: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci/perf-test') }}
     strategy:
       fail-fast: false
       matrix:
@@ -497,8 +503,13 @@ jobs:
           # cdylibs (heph's own lib is already built as the bin's dependency, so it
           # costs nothing extra). `heph-bench` links the same `heph` lib crate, so
           # adding it here is marginal — the expensive part (engine + deps) is
-          # already being compiled for `heph` itself.
-          TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib -p bench"
+          # already being compiled for `heph` itself — but its thin-LTO link is
+          # not, so it is built only when something will use it (BUILD_BENCH,
+          # set on the job).
+          TARGETS="--bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib"
+          if [ "$BUILD_BENCH" = "true" ]; then
+            TARGETS="$TARGETS --bin heph-bench -p bench"
+          fi
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cargo build --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.dylib"
@@ -509,7 +520,7 @@ jobs:
             # which is absent on user machines (dyld aborts at launch). Rewrite
             # those load commands to the OS /usr/lib copies — for every artifact.
             bash scripts/macos-portable.sh "$OUT/heph"
-            bash scripts/macos-portable.sh "$OUT/heph-bench"
+            if [ "$BUILD_BENCH" = "true" ]; then bash scripts/macos-portable.sh "$OUT/heph-bench"; fi
             bash scripts/macos-portable.sh "$lib"
             bash scripts/macos-portable.sh "$gha_lib"
             bash scripts/macos-portable.sh "$oci_lib"
@@ -521,7 +532,11 @@ jobs:
             oci_lib="$OUT/libplugin_oci_cdylib.so"
             devenv_lib="$OUT/libplugin_devenv_cdylib.so"
           fi
-          cp "$OUT/heph-bench" $BENCH_BIN_NAME
+          stamped="$PLUGIN_GO_NAME $PLUGIN_GHA_NAME $PLUGIN_OCI_NAME $PLUGIN_DEVENV_NAME"
+          if [ "$BUILD_BENCH" = "true" ]; then
+            cp "$OUT/heph-bench" $BENCH_BIN_NAME
+            stamped="$BENCH_BIN_NAME $stamped"
+          fi
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
           cp "$oci_lib" $PLUGIN_OCI_NAME
@@ -543,9 +558,7 @@ jobs:
           # build, never upgrade". The go plugin additionally derives its
           # default govet target address from the version, so a dev-stamped
           # cdylib would resolve the wrong address at runtime.
-          for artifact in \
-            $BENCH_BIN_NAME $PLUGIN_GO_NAME $PLUGIN_GHA_NAME $PLUGIN_OCI_NAME \
-            $PLUGIN_DEVENV_NAME
+          for artifact in $stamped
           do
             bash scripts/patch-slot.sh "$artifact" "version=$VERSION"
           done
@@ -590,7 +603,7 @@ jobs:
         if: matrix.os == 'darwin' || matrix.arch == 'amd64'
         run: |
           ./$BIN_NAME version
-          ./$BENCH_BIN_NAME --help
+          if [ "$BUILD_BENCH" = "true" ]; then ./$BENCH_BIN_NAME --help; fi
           # Both flavours launch, and each reports the flavour patch-slot.sh
           # actually stamped — not just that the binary runs at all. The
           # baked-in version already carries its own build metadata (a commit
@@ -652,6 +665,7 @@ jobs:
               path: ${{steps.build.outputs.debug_bin_name}}
 
           - name: Upload heph-bench artifact
+            if: env.BUILD_BENCH == 'true'
             uses: actions/upload-artifact@v7
             with:
               name: ${{steps.build.outputs.bench_bin_name}}
@@ -702,12 +716,12 @@ jobs:
           files=(
             "heph_${OS}_${ARCH}"
             "heph_debug_${OS}_${ARCH}"
-            "heph-bench_${OS}_${ARCH}"
             "heph-go-plugin_${OS}_${ARCH}.${EXT}"
             "heph-gha-plugin_${OS}_${ARCH}.${EXT}"
             "heph-oci-plugin_${OS}_${ARCH}.${EXT}"
             "heph-devenv-plugin_${OS}_${ARCH}.${EXT}"
           )
+          if [ "$BUILD_BENCH" = "true" ]; then files+=("heph-bench_${OS}_${ARCH}"); fi
           gh release upload "$VERSION" -R "$REPO" --clobber "${files[@]}"
 
       # Last, deliberately. This is the only job with steps after its compile,

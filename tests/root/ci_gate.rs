@@ -1030,3 +1030,50 @@ fn a_run_uses_at_most_three_macos_jobs() {
         mac_jobs.len()
     );
 }
+
+/// heph-bench is skipped on PRs without `ci/perf-test`, but every push builds
+/// it: perf baselines (N-1) are downloaded from master's releases, so a master
+/// build without it would leave the next PR's perf run with nothing to compare.
+#[test]
+fn master_always_builds_heph_bench() {
+    let wf = parsed();
+    let build = job(&wf, "build").expect("a `build` job");
+    let expr = env_of(build, "BUILD_BENCH").expect("build sets BUILD_BENCH");
+    let inner = expr
+        .trim()
+        .strip_prefix("${{")
+        .and_then(|e| e.strip_suffix("}}"))
+        .expect("BUILD_BENCH is an expression")
+        .trim();
+    assert!(
+        !inner.contains("&&"),
+        "BUILD_BENCH must be a plain disjunction, so its push arm cannot be \
+         narrowed: {inner}"
+    );
+    let arms: Vec<&str> = inner.split("||").map(str::trim).collect();
+    assert!(
+        arms.contains(&"github.event_name != 'pull_request'"),
+        "BUILD_BENCH is not true for every push: {inner}"
+    );
+    assert!(
+        arms.iter().any(|a| a.contains("'ci/perf-test'")),
+        "BUILD_BENCH must be true for a PR labelled ci/perf-test, which runs \
+         perfbench against this build: {inner}"
+    );
+
+    let build_step = step_running(build, "TARGETS=").expect("build composes TARGETS");
+    let run = field(build_step, "run");
+    let adds_bench = run
+        .split_once("if [ \"$BUILD_BENCH\" = \"true\" ]; then")
+        .and_then(|(_, rest)| rest.split_once("fi"))
+        .is_some_and(|(then, _)| then.trim() == "TARGETS=\"$TARGETS --bin heph-bench -p bench\"");
+    assert!(
+        adds_bench,
+        "the Build step adds heph-bench to TARGETS when BUILD_BENCH is true"
+    );
+    let perf = job(&wf, "perfbench").expect("a `perfbench` job");
+    assert!(
+        field(perf, "if").contains("'ci/perf-test'"),
+        "perfbench and BUILD_BENCH key on the same label"
+    );
+}
