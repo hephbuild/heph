@@ -15,7 +15,7 @@
 //! The storage, mounting and locking a declaration eventually drives are not here;
 //! a declaration is inert on its own. See `docs/SCRATCH.md`.
 
-mod common;
+use crate::common;
 
 use common::Workspace;
 use heph::engine::{OutputMatcher, ResultOptions};

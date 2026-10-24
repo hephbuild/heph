@@ -179,4 +179,4 @@ under Apache-2.0 and owned. Bugs are fixed in place, and each divergence is
 listed in its `NOTICE` with the reason. There is no verbatim refresh at
 starlark releases. An upstream fix is ported by hand when it matters to BUILD
 files. The crate keeps upstream's style under its own `[lints]`, exempted in
-`tests/lint_gate.rs`.
+`tests/root/lint_gate.rs`.

@@ -23,7 +23,7 @@
 //! They no longer need any host tool beyond docker itself: push and pull speak
 //! the registry protocol in-process and load goes through the daemon API.
 
-mod common;
+use crate::common;
 
 use hplugin_oci::pluginoci;
 use htestkit::WorkspaceBuilder;

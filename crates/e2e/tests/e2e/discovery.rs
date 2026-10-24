@@ -5,7 +5,7 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-mod common;
+use crate::common;
 
 use heph::engine::discovery::Stage;
 use heph::engine::fault_provider::{FaultProvider, Faults};

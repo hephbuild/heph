@@ -43,7 +43,7 @@ Fixtures there use the harness in `crates/bin-e2e/tests/common/mod.rs` (`Dist`, 
 
 ## Load harnesses
 
-`crates/e2e/tests/cache_load.rs` is an instrument, not a test: it measures whether the tokio
+`crates/e2e/tests/e2e/cache_load.rs` is an instrument, not a test: it measures whether the tokio
 runtime keeps making progress under cache load, by heartbeating a 1ms sleep and recording the
 gaps. It exists because the failure it looks for — a worker blocked on a sync cache call — burns
 no CPU, so a profiler shows nothing while the whole build appears to hang.
@@ -53,7 +53,7 @@ reports numbers a human reads.
 
 ```bash
 HEPH_LT_TARGETS=100 HEPH_LT_SIZE_KB=1024 HEPH_LT_WORKERS=10 \
-  cargo test --release -p e2e --test cache_load -- --ignored --nocapture --test-threads=1
+  cargo test --release -p e2e --test e2e cache_load:: -- --ignored --nocapture --test-threads=1
 ```
 
 Read the module docs before trusting a number from it. Two traps, both hit in practice: comparing

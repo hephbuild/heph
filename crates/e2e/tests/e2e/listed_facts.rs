@@ -8,8 +8,6 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-mod common;
-
 use futures::TryStreamExt;
 use heph::engine::discovery::Stage;
 use heph::engine::event::{BuildEvent, BuildEventKind};

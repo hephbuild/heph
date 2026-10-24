@@ -26,10 +26,10 @@
 //! when touching the devenv driver:
 //!
 //! ```sh
-//! HEPH_E2E_DEVENV=1 cargo test -p e2e --test devenv_runner
+//! HEPH_E2E_DEVENV=1 cargo test -p e2e --test e2e devenv_runner::
 //! ```
 
-mod common;
+use crate::common;
 
 use hplugin_devenv::plugindevenv;
 use htestkit::WorkspaceBuilder;
