@@ -734,6 +734,14 @@ jobs:
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
@@ -756,6 +764,15 @@ jobs:
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # The rest of the pre-release: the plugin manifests (which need every
   # platform's cdylib to checksum) and `heph-govet`, then the release body
@@ -989,6 +1006,14 @@ jobs:
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
@@ -1011,6 +1036,15 @@ jobs:
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Tier 1: the whole workspace, on linux/amd64, on every run — minus
   # `bin-e2e` (its own job, against the shipped artifacts) and `plugingo-e2e`
@@ -1085,6 +1119,14 @@ jobs:
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
@@ -1107,6 +1149,15 @@ jobs:
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Tier 2: darwin/arm64 and linux/arm64. The tests of the crates that own
   # platform-conditional code, then two Go smoke tests. Lint is the `lint`
@@ -1265,6 +1316,14 @@ jobs:
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
@@ -1280,6 +1339,15 @@ jobs:
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # `plugingo-e2e`, compiled once and run in shards, on linux/amd64 only.
   #
@@ -1362,6 +1430,14 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: |
           kache stats
+
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
           log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
           kache daemon stop || true
           if [ -n "${log:-}" ] && [ -f "$log" ]; then
@@ -1371,6 +1447,15 @@ jobs:
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # `--partition slice:k/N`, not `count:`: `count:` splits per binary, so every
   # one-test binary lands on shard 1; `slice:` deals tests out round-robin
@@ -1554,6 +1639,14 @@ jobs:
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
@@ -1576,6 +1669,15 @@ jobs:
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Black-box tests against the artifacts the `build` job just produced — the
   # exact bytes that get published. Covers only what `test` structurally cannot:
@@ -1668,6 +1770,14 @@ jobs:
         run: |
           kache stats
 
+          # Per-crate hits and misses, each with its cache key, so a low hit
+          # rate can be traced to the crates behind it — and two attempts of
+          # one commit compared key by key. Uploaded by the next step.
+          kache report --format json -o kache-report.json || true
+          echo "::group::kache report (top misses)"
+          kache report --top 30 || true
+          echo "::endgroup::"
+
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
@@ -1690,6 +1800,15 @@ jobs:
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
+
+      - name: Upload kache report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: kache-report.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Perf-regression check (own workflow: .github/workflows/perf.yml) —
   # generates one synthetic corpus, times a fixed scenario set against N and
