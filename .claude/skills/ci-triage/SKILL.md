@@ -59,7 +59,7 @@ which reads as a pass.
 3. **Known real-but-confusing.** These are REAL:
    - `unrecognized subcommand` from `documented_examples_are_accepted`, red on all three `Test` jobs: a clap doc comment has a line starting with `heph `. See `src/commands/gendocs.rs`.
    - `Diff in <file>` in Lint: rustfmt. The branch was pushed without a passing `lint`.
-   - `Test darwin/arm64` or `Test linux/arm64` red: open the job's step summary first. Those legs run `lint` and then the tests, and the job fails if either did; the `::error title=lint::` annotation and the summary table say which.
+   - `Test darwin/arm64` or `Test linux/arm64` red: open the job's step summary first. Those legs run the tier-2 tests and then the Go smoke tests, and the summary table says which failed. Lint is its own check per platform (`Lint <os>/<arch>`).
    - `TIMEOUT` in a nextest summary: a test hit the ci profile's kill (5 × 120s, `.config/nextest.toml`). That is a hang, not a slow runner; a rerun hides it.
    - `Go E2E count` red with every `Go E2E k/3` shard green: the shards between them ran fewer (or more) tests than the archive lists. A partition or a summary-format problem, not a flake.
    - `platform-crates: warning: … unknown target key` in a Test leg's log: a `cfg` key `scripts/platform-crates` does not know. The crate was selected anyway; add the key to `KNOWN_TARGET_KEYS` if it is real.

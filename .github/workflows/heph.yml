@@ -899,12 +899,12 @@ jobs:
   # `indexing_slicing` or `unwrap_used`. And `clippy --all-targets` is what
   # type-checks every crate, tests included, on each platform.
   #
-  # linux/amd64 lints here, in its own job. darwin/arm64 and linux/arm64 lint
-  # as the first step of their `test_platform` leg instead: a separate darwin
-  # Lint job was a fifth macOS job per run against GitHub's five-slot free
-  # tier, and the Test leg has the shell and the warm cache already. Those
-  # legs run the tests even when lint fails, then fail the job — see
-  # `test_platform`.
+  # One leg per platform, each its own job, so lint runs alongside the tests
+  # rather than ahead of them. Folding it into the darwin Test leg (to save a
+  # macOS slot) put a warm ~7 min lint on the critical path: `Test
+  # darwin/arm64` took 28 min, the run 30 min, with every other check done at
+  # 19 min. A run now uses four macOS jobs (Build, Lint, Test, Binary E2E),
+  # within the free tier's five.
   #
   # Every leg runs the *same* `lint` script — no per-OS variant. The failure
   # being closed is a Mac developer's local `lint` disagreeing with CI in either
@@ -912,9 +912,9 @@ jobs:
   # and not the other is a hard error on the other), and that only stays closed
   # if every leg runs the same command as the developer does.
   #
-  # A one-leg matrix rather than a plain job, so its check keeps the rendered
-  # name `Lint linux/amd64` the ruleset requires, and `tests/root/lint_gate.rs`
-  # reads every lint leg's platform from the same `matrix.include` coordinates.
+  # A matrix, so each check renders as `Lint <os>/<arch>`, and
+  # `tests/root/lint_gate.rs` reads every lint leg's platform from the same
+  # `matrix.include` coordinates.
   #
   # `needs: lint` elsewhere in this file waits for *every* leg and is skipped if
   # any of them fails. Downstream gating therefore needs no aggregator job.
@@ -939,6 +939,18 @@ jobs:
             arch: amd64
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+
+          # Linux runners cost no macOS slot, so linux/arm64 gets its own leg
+          # too rather than linting ahead of its tests.
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+
+          - os: darwin
+            arch: arm64
+            runs-on: ${{ vars.MACOS_RUNNER }}
+            target: aarch64-apple-darwin
     steps:
       - name: Download repo
         uses: actions/download-artifact@v8
@@ -1096,24 +1108,22 @@ jobs:
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
 
-  # Tier 2: darwin/arm64 and linux/arm64. Lint, then the tests of the crates
-  # that own platform-conditional code, then two Go smoke tests.
+  # Tier 2: darwin/arm64 and linux/arm64. The tests of the crates that own
+  # platform-conditional code, then two Go smoke tests. Lint is the `lint`
+  # job's, one leg per platform.
   #
   # The full suite on these runners cost 15–20 min per leg for tests whose
   # behaviour is the same on every platform. What must run here is every
   # platform-gated path, and `scripts/platform-crates` computes which crates
   # own one from this tree, on every run — there is no committed list to go
   # stale. It always adds `crates/e2e`. A crate with no platform code of its
-  # own is still compiled here, tests included, by `lint`'s
+  # own is still compiled on this platform, tests included, by the `lint` leg's
   # `clippy --all-targets`; its tests run on linux/amd64 only (accepted
   # exemption E1 in the spec). `tests/root/ci_gate.rs` checks the scope comes
   # from the script's step output and nowhere else.
   #
-  # Lint runs first and as-is: no `if:`, no `continue-on-error:` (see the
-  # comment on `lint`). The steps after it carry `if: !cancelled()`, so a red
-  # lint still lets the tests run and report, and the job fails at the end
-  # because the Lint step did. The Summary step and an `::error title=lint::`
-  # annotation say which of the two it was, so a red check names its cause.
+  # The smoke tests carry `if: !cancelled()`, so a red tier-2 run still lets
+  # them run and report. The Summary step says which of the two failed.
   #
   # No macFUSE on the darwin runner: the macOS binaries weak-link libfuse, so
   # they launch with the dylib absent. `support_check` finds no macfuse.fs and
@@ -1122,8 +1132,8 @@ jobs:
   test_platform:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    # darwin is the slow one: lint (~5–10 min warm) plus tier 2 on a runner
-    # that runs the engine unit tests ~10x slower than linux/amd64.
+    # darwin is the slow one: tier 2 on a runner that runs the engine unit
+    # tests ~10x slower than linux/amd64.
     timeout-minutes: ${{ matrix.os == 'darwin' && 60 || 45 }}
     needs: gen
     strategy:
@@ -1167,17 +1177,6 @@ jobs:
           cargo-target: ${{ matrix.target }}
           cache-suffix: "-test"
           r2-secret: ${{ secrets.CF_SSCACHE }}
-
-      - name: Lint
-        id: lint
-        shell: devenv shell bash -- -e {0}
-        run: lint
-
-      - name: Report lint failure
-        if: failure() && steps.lint.outcome == 'failure'
-        env:
-          PLATFORM: ${{ matrix.os }}/${{ matrix.arch }}
-        run: echo "::error title=lint::lint failed on $PLATFORM. The tests below still run; this job fails because of lint either way. See the Lint step's log."
 
       # Its own step, under `set -euo pipefail`, so a script failure stops here
       # with its own error instead of reaching `tst` as an empty or partial
@@ -1233,7 +1232,6 @@ jobs:
         if: always()
         env:
           PLATFORM: ${{ matrix.os }}/${{ matrix.arch }}
-          LINT: ${{ steps.lint.outcome }}
           TESTS: ${{ steps.test.outcome }}
           SMOKE: ${{ steps.smoke.outcome }}
           COUNT: ${{ steps.platform.outputs.count }}
@@ -1245,7 +1243,6 @@ jobs:
             echo ""
             echo "| Step | Result |"
             echo "|---|---|"
-            echo "| lint | $(mark "$LINT") |"
             echo "| tier-2 tests | $(mark "$TESTS") |"
             echo "| Go smoke tests | $(mark "$SMOKE") |"
             echo ""
@@ -1501,10 +1498,10 @@ jobs:
   # --no-run because the tests hard-fail without a dist. A compile error here is
   # a real failure — `bin_e2e` would hit the same one 20 minutes later.
   #
-  # Linux only. A run gets three macOS jobs — Test, Build and Binary E2E
+  # Linux only. A run gets four macOS jobs — Build, Lint, Test and Binary E2E
   # darwin/arm64 — against GitHub's five concurrent macOS slots on the free
-  # tier, so two overlapping runs still fit. A darwin warm job would be a
-  # fourth; `Binary E2E darwin/arm64` compiles its own test binaries instead,
+  # tier. A darwin warm job would be a fifth; `Binary E2E darwin/arm64`
+  # compiles its own test binaries instead,
   # which with the kache restore is a minute or two.
   bin_e2e_warm:
     name: Warm Binary E2E ${{ matrix.os }}/${{ matrix.arch }}

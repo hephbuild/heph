@@ -517,20 +517,23 @@ fn go_e2e_jobs_are_behind_the_gate() {
     }
 }
 
-/// Lint runs on every supported platform, and a red lint fails its leg.
+/// Lint runs on every supported platform, each leg in the `lint` job, and no
+/// test job lints.
 ///
-/// linux/amd64 keeps its own `lint` job. darwin/arm64 and linux/arm64 lint as
-/// the first step of their Test legs: the Lint step runs unconditionally (no
-/// `if:`, no `continue-on-error:`), so its failure fails the job, and the test
-/// step carries `!cancelled()` so the tests still run and report.
+/// Lint was once the first step of the darwin and linux/arm64 Test legs, to
+/// save a macOS slot. That serialized a ~7 min warm lint ahead of tier 2, and
+/// `Test darwin/arm64` became the run's critical path (28 min, against 19 min
+/// for every other check).
 #[test]
-fn every_platform_runs_lint() {
+fn every_platform_lints_in_its_own_job() {
     let wf = parsed();
     let lint = job(&wf, "lint").expect("a `lint` job");
+    let mut legs = coords(lint);
+    legs.sort();
     assert_eq!(
-        coords(lint),
-        ["linux/amd64"],
-        "the `lint` job lints linux/amd64"
+        legs,
+        ["darwin/arm64", "linux/amd64", "linux/arm64"],
+        "the `lint` job has one leg per supported platform"
     );
     assert!(
         step_running_exactly(lint, "lint").is_some(),
@@ -544,46 +547,14 @@ fn every_platform_runs_lint() {
         legs, TIER_TWO,
         "test_platform runs darwin/arm64 and linux/arm64"
     );
-
-    let lint_step = step_running_exactly(tier_two, "lint").expect("test_platform runs `lint`");
-    assert!(
-        lint_step.get("if").is_none() && lint_step.get("continue-on-error").is_none(),
-        "test_platform's Lint step must run unconditionally and fail the job"
-    );
-    assert!(
-        tier_two.get("continue-on-error").is_none(),
-        "test_platform must not be continue-on-error: a red lint would read green"
-    );
-    let test_step = step_running_exactly(tier_two, "tst").expect("test_platform runs `tst`");
-    assert!(
-        field(test_step, "if").contains("!cancelled()"),
-        "test_platform's Test step must run after a failed lint (`!cancelled()`), \
-         or a lint failure hides every test result on that platform"
-    );
-}
-
-/// `Test darwin/arm64` lints before it tests, in the same job.
-#[test]
-fn darwin_test_runs_lint() {
-    let wf = parsed();
-    let (id, darwin_tester) = job_ids(&wf)
-        .into_iter()
-        .filter_map(|id| job(&wf, &id).map(|j| (id, j)))
-        .find(|(_, j)| {
-            coords(j).iter().any(|c| c == "darwin/arm64")
-                && step_running_exactly(j, "tst").is_some()
-        })
-        .expect("a job runs `tst` on darwin/arm64");
-    let runs: Vec<&str> = steps(darwin_tester)
-        .into_iter()
-        .map(|s| field(s, "run").trim())
-        .collect();
-    let lint_at = runs.iter().position(|r| *r == "lint");
-    let tst_at = runs.iter().position(|r| *r == "tst");
-    assert!(
-        matches!((lint_at, tst_at), (Some(l), Some(t)) if l < t),
-        "`{id}` (Test darwin/arm64) must run `lint` before `tst`; steps: {runs:?}"
-    );
+    for id in ["test", "test_platform"] {
+        let tester = job(&wf, id).unwrap_or_else(|| panic!("a `{id}` job"));
+        assert!(
+            step_running_exactly(tester, "lint").is_none(),
+            "`{id}` runs `lint`, which puts it on that test job's critical path; \
+             lint belongs to the `lint` job"
+        );
+    }
 }
 
 /// Every test runs on linux/amd64: tier 1 is the workspace minus exactly
@@ -995,11 +966,13 @@ fn publishing_is_skipped_not_failed_without_the_secret() {
     }
 }
 
-/// A run uses at most three macOS jobs, so two overlapping runs fit GitHub's
-/// five concurrent macOS slots with one to spare. `perfbench` is excluded: it
-/// runs only on master pushes or with `ci/perf-test`.
+/// A run uses at most four macOS jobs — Build, Lint, Test and Binary E2E — so
+/// one run fits GitHub's five concurrent macOS slots. It used five or six,
+/// which queued its own jobs. Three, with Lint folded into Test, put lint on
+/// the darwin critical path. `perfbench` is excluded: it runs only on master
+/// pushes or with `ci/perf-test`.
 #[test]
-fn a_run_uses_at_most_three_macos_jobs() {
+fn a_run_uses_at_most_four_macos_jobs() {
     let wf = parsed();
     let is_mac = |v: &Value| {
         field(v, "os") == "darwin" || {
@@ -1024,9 +997,9 @@ fn a_run_uses_at_most_three_macos_jobs() {
         }
     }
     assert!(
-        mac_jobs.len() <= 3,
+        mac_jobs.len() <= 4,
         "a run starts {} macOS jobs ({mac_jobs:?}); the free tier runs five at \
-         once, so two overlapping runs would queue",
+         once, so a run would queue behind its own jobs",
         mac_jobs.len()
     );
 }
