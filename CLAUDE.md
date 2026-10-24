@@ -74,7 +74,7 @@ One script, one code path — CI runs the same `e2e`, differing only in where th
 
 Concurrency-safe: the suite stages into a `mktemp -d` unique to each run rather than a fixed path two runs would fight over, and fingerprints `release/` around the copy — if another build lands in that window, the run aborts rather than quietly testing the wrong binary. Keep it that way when editing the script; a fixed staging path reintroduces both.
 
-There is no `CARGO_TARGET_DIR` override anywhere — every workspace uses cargo's own `target/`. Worktrees used to share one target dir so dependencies compiled once; kache does that properly now (keyed on content, shared across worktrees and machines, reflinked so a restored `target/` costs almost no disk), and the shared directory only bought concurrent builds writing to the same path. Scripts that need the path call `target-dir`, which asks cargo — don't reintroduce the env var, and don't assume `$DEVENV_ROOT/target`, which is wrong the moment a shell started in one checkout is used in another. Bare `target-dir` answers for `$DEVENV_ROOT` (for `run-release` against another project); a script that has just run `cargo build` calls `target-dir .`, the workspace it built. A bare one in `e2e` once built a worktree and then tested the main checkout's stale binaries, green; `tests/target_dir_script.rs` now fails on that.
+There is no `CARGO_TARGET_DIR` override anywhere — every workspace uses cargo's own `target/`. Worktrees used to share one target dir so dependencies compiled once; kache does that properly now (keyed on content, shared across worktrees and machines, reflinked so a restored `target/` costs almost no disk), and the shared directory only bought concurrent builds writing to the same path. Scripts that need the path call `target-dir`, which asks cargo — don't reintroduce the env var, and don't assume `$DEVENV_ROOT/target`, which is wrong the moment a shell started in one checkout is used in another. Bare `target-dir` answers for `$DEVENV_ROOT` (for `run-release` against another project); a script that has just run `cargo build` calls `target-dir .`, the workspace it built. A bare one in `e2e` once built a worktree and then tested the main checkout's stale binaries, green; `tests/root/target_dir_script.rs` now fails on that.
 
 It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run it reflexively: the `bin_e2e` CI job runs it on all three platforms on every push, and it gates `release`. Run it locally only when changing something it covers (the loader, the TUI, CLI exit codes, the `e2e` script itself) — and expect a full release build the first time.
 
@@ -111,7 +111,7 @@ A reference is refused in anything that shapes the graph or identity, and a
 ### Exec runners
 
 Every subprocess heph spawns goes through `crates/execrunner`, never
-`hproc::proc_exec` directly — `tests/execrunner_gate.rs` fails the build if a
+`hproc::proc_exec` directly — `tests/root/execrunner_gate.rs` fails the build if a
 driver starts to. A target can name a runner (`runner = "//tools/devenv:runner"`
 on `exec`/`bash`, or the driver's `runner:` option workspace-wide) and its
 command runs inside the environment that runner describes.
@@ -184,7 +184,7 @@ When that set is most of the workspace — a change in `core` or `model` reaches
 
 ```bash
 cargo test -p <crate> -p <dependent>      # touched and possibly-broken crates
-cargo test -p e2e --test <file>           # the e2e file covering the change
+cargo test -p e2e --test e2e clean::      # the e2e file covering the change (`<file>::`)
 cargo test -p <crate> <test_name>         # one test while iterating
 ```
 
@@ -235,7 +235,7 @@ Plain `gh stack submit` opens an editor for PR titles — pass `--auto` from a s
 - **A stacked PR does not build until it reaches the bottom.** The `gate` job in `.github/workflows/heph.yml` runs CI for a push, or for a PR whose base is `master`; a PR based on another branch is skipped — every check reports "skipped" and the `Summary` job says why. Add the **`ci/force-ci`** label to build one anyway (labelling starts the run on its own; no push needed). This does not weaken the merge gate: required status checks live in the `master` ruleset, whose condition is `~DEFAULT_BRANCH`, so they apply to exactly the PRs the gate builds. A stacked PR merges with skipped checks because nothing is required of it, and its code still cannot reach `master` without first becoming a `master`-targeting PR, which builds.
 - **What the skip costs you: an upper layer's break surfaces late.** A change that only fails on `darwin/arm64`, or only under `--no-default-features`, sits undetected at layer 3 until the two below it land. On a deep stack that serializes debugging into one cycle per layer. `ci/force-ci` is the answer when a layer is worth testing on its own — a large refactor low in the stack, anything platform-specific, a flake hunt. Use it rather than assuming green-when-it-gets-there.
 - **Sync after the base merges.** GitHub retargets the child at `master` itself, and that retarget *is* an `edited` event, so it now starts a full run — but the tree it builds still carries the base's commits. `gh stack sync` force-pushes the rebased branch (`synchronize` → another run), and that is the run whose result means anything. You need the rebase regardless, since `master` is squash-only.
-- **Don't add a `branches:` filter to `pull_request:`.** It matches the PR's *base*, so stacked PRs got zero runs and an empty check list that reads like a pass (fixed in #240) — invisible, and not overridable by a label. That is why the skip lives in `gate` instead. `tests/ci_gate.rs` guards this, plus the rule that every job hangs off `gate`.
+- **Don't add a `branches:` filter to `pull_request:`.** It matches the PR's *base*, so stacked PRs got zero runs and an empty check list that reads like a pass (fixed in #240) — invisible, and not overridable by a label. That is why the skip lives in `gate` instead. `tests/root/ci_gate.rs` guards this, plus the rule that every job hangs off `gate`.
 
 ## Phases and hand-offs
 

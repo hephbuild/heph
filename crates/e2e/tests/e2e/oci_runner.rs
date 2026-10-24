@@ -28,7 +28,7 @@
 //! `docker exec`, which needs nothing of heph inside the image. So the test
 //! that could never pass is here, and it runs anywhere a daemon does.
 
-mod common;
+use crate::common;
 
 use hplugin_oci::pluginoci;
 use htestkit::WorkspaceBuilder;

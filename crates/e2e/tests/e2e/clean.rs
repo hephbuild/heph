@@ -13,7 +13,7 @@
 //! what makes them tight: each leaves the cache in the state the previous step
 //! should already have produced, so a failure is attributable to one step.
 
-mod common;
+use crate::common;
 
 use common::Workspace;
 use heph::engine::{Engine, OutputMatcher, ResultOptions};

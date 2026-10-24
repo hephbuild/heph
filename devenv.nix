@@ -345,7 +345,7 @@ in
   # want a faster local loop, narrow with `-p <crate>` — never by dropping
   # `--workspace`.
   #
-  # `tests/lint_gate.rs` asserts these flags are still here, and that every
+  # `tests/root/lint_gate.rs` asserts these flags are still here, and that every
   # workspace member inherits `[workspace.lints]` — a member that does not is
   # linted with stock clippy only, which is the same silent hole one level down.
   #
@@ -383,7 +383,7 @@ in
   #     add the third leg.
   #
   # The flags are written out literally in both scripts rather than factored
-  # into a shared Nix variable on purpose: `tests/lint_gate.rs` guards them by
+  # into a shared Nix variable on purpose: `tests/root/lint_gate.rs` guards them by
   # reading this file, and a guard that reads back an interpolation hole rather
   # than the flags guards nothing.
   scripts.lint.exec = ''
@@ -430,7 +430,7 @@ in
   # clippy's machine-applicable suggestions as well as rustc's, and clippy's are
   # what `lint` fails on. The `--no-default-features` line carries the same
   # exclusions for the same reason as in `lint`; without it CI reports a lint in
-  # `stub.rs` that `fix` cannot reach. `tests/lint_gate.rs` asserts the two
+  # `stub.rs` that `fix` cannot reach. `tests/root/lint_gate.rs` asserts the two
   # scripts select the same code.
   scripts.fix.exec = ''
     set -euo pipefail
@@ -452,7 +452,7 @@ in
   # with the daemon down) hid everything after it and cost a second full run.
   # Extra args pass through to every pass, so only a test-name filter and `--
   # <libtest args>` make sense (`--test x` or `-p x` would fail the passes that
-  # have no such target). `tests/tst_script.rs` runs this text against a stub
+  # have no such target). `tests/root/tst_script.rs` runs this text against a stub
   # cargo. `rc`, not `status`: that name is read-only in zsh.
   scripts.tst.exec = ''
     rc=0
@@ -599,7 +599,7 @@ in
   # shell's `$DEVENV_ROOT` is wherever it was started, which in another
   # worktree is the wrong checkout — `e2e` there built the worktree, then
   # staged and tested the main checkout's stale binaries, green.
-  # `tests/target_dir_script.rs` holds every building script to this.
+  # `tests/root/target_dir_script.rs` holds every building script to this.
   scripts.target-dir.exec = ''
     set -euo pipefail
     root="$(cd "''${1:-$DEVENV_ROOT}" && cargo locate-project --workspace --message-format plain)"

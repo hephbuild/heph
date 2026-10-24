@@ -11,7 +11,7 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-mod common;
+use crate::common;
 
 use common::Workspace;
 use heph::htaddr::parse_addr;

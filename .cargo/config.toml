@@ -40,7 +40,7 @@ rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes"]
 # address as "no hint", and libunwind scans the section for it.
 # `-fuse-ld=heph` runs `ld64.heph` from the devenv shell, which picks ld-prime
 # when Xcode or the Command Line Tools provide it — it links in about half
-# lld's time — and nix's lld otherwise. `tests/darwin_linker.rs` fails if a
+# lld's time — and nix's lld otherwise. `tests/root/darwin_linker.rs` fails if a
 # darwin test binary is linked by ld64.
 #
 # `target.<triple>.rustflags` replaces `build.rustflags` rather than adding to

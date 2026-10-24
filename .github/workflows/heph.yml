@@ -808,7 +808,7 @@ jobs:
   # own check green — and, because `needs` treats a successful job as satisfied,
   # lets `release` proceed over a platform that was not linted. It is the one
   # remaining way to reach a silent pass here, and it is invisible in the check
-  # list. `tests/lint_gate.rs` asserts their absence.
+  # list. `tests/root/lint_gate.rs` asserts their absence.
   #
   # Cost, measured rather than assumed — see the PR body. The darwin leg is a
   # fourth concurrent `macos-latest` job in the `needs: gen` wave, which is the

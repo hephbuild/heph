@@ -7,7 +7,7 @@ description = "The analysis modules of starlark_lsp 0.14.2, vendored and owned b
 publish = false
 
 # Vendored code keeps upstream's style: it is exempt from heph's workspace lint
-# policy (see `LINTS_EXEMPT` in tests/lint_gate.rs), as `gen/proto` is, so a
+# policy (see `LINTS_EXEMPT` in tests/root/lint_gate.rs), as `gen/proto` is, so a
 # toolchain bump cannot break an `expect` list in code nobody restyles.
 [lints.clippy]
 all = "allow"
