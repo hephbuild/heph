@@ -53,7 +53,11 @@ let
     # (there is no interpreter to rewrite) and invalidate the latter's signature.
     dontPatchELF = true;
     dontStrip = true;
-    installPhase = "install -Dm755 kache $out/bin/kache";
+    # `kache-rustc` is the name `RUSTC_WRAPPER` uses — see there for why.
+    installPhase = ''
+      install -Dm755 kache $out/bin/kache
+      ln -s kache $out/bin/kache-rustc
+    '';
   };
 
   # cargo-zigbuild — the cross-linking driver behind both Linux release builds
@@ -236,8 +240,14 @@ in
   # exactly this workspace's expensive tail: the `heph` binary, the three plugin
   # cdylibs, every proc-macro, and every test harness. kache caches all of them.
   #
-  # The `cc` crate picks `RUSTC_WRAPPER=kache` up as its C compiler wrapper too,
-  # so build scripts' C (aws-lc-sys, zstd-sys, onig_sys) is cached the same way.
+  # Named `kache-rustc`, a symlink to `kache`, so that only rustc goes through
+  # it. The `cc` crate takes `RUSTC_WRAPPER` as its C compiler wrapper as well
+  # when its file stem is a wrapper it knows (`kache` is one), and build
+  # scripts' C (aws-lc-sys, zstd-sys, onig_sys: ~490 objects) would then be
+  # cached too. Measured on CI, that is a loss: each object is ~1s to fetch from
+  # R2 against ~0.1s to compile, the fetches barely overlap, and they queue
+  # ahead of the Rust hits for the daemon's download slots. A warm run went from
+  # 30 to 37 minutes. kache only cares that argv[0] is not a compiler name.
   #
   # No remote is configured here, so a local shell is a local-disk cache and
   # needs no daemon. CI points the same wrapper at R2 through a kache config
@@ -245,7 +255,7 @@ in
   # the same `[cache.remote]` table, export `KACHE_S3_ACCESS_KEY` /
   # `KACHE_S3_SECRET_KEY`, and run `kache daemon start` — the remote is inert
   # without the daemon.
-  env.RUSTC_WRAPPER = "kache";
+  env.RUSTC_WRAPPER = "kache-rustc";
 
   # Cache linked `bin` and `--test` executables on macOS too, not just Linux.
   #
