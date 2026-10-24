@@ -498,6 +498,31 @@ impl Driver {
     fn coreutils_version(&self) -> Option<u32> {
         self.coreutils.as_ref().map(|(version, _)| *version)
     }
+
+    /// The def hash of `def` under this driver: the one computation both
+    /// `parse` and `apply_transitive` use, so what the driver folds in beyond
+    /// the `TargetDef` itself cannot reach one path and miss the other.
+    /// `label` names the hash in debug traces.
+    fn def_hash(&self, def: &TargetDef, label: impl Fn() -> String) -> Vec<u8> {
+        let mut h = DebugHasher::new(Xxh3Default::new(), label);
+        def.hash(&mut h);
+        // The builtin utilities sit on this target's PATH without being
+        // declared, and nothing can tell which of them a shell command will
+        // invoke without parsing it — so the whole toolbox's identity goes
+        // in, or a heph upgrade that changes `cp` would keep serving
+        // artifacts the old one built. Hashed only when the toolbox is on,
+        // so a workspace that leaves it off keeps every key it has today.
+        if let Some(version) = self.coreutils_version() {
+            "coreutils".hash(&mut h);
+            version.hash(&mut h);
+            // `tmpl` is one of those utilities, and what it renders is a
+            // function of the template renderer too — the same dependency
+            // the `template` driver's own def hash carries.
+            "tmpl".hash(&mut h);
+            htemplate::TEMPLATE_FORMAT_VERSION.hash(&mut h);
+        }
+        format!("{:x}", h.finish()).into_bytes()
+    }
 }
 
 fn spec_path_to_target_path(
@@ -1320,29 +1345,9 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             runner: runner.clone(),
         };
 
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("exec_def_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            // The builtin utilities sit on this target's PATH without being
-            // declared, and nothing can tell which of them a shell command will
-            // invoke without parsing it — so the whole toolbox's identity goes
-            // in, or a heph upgrade that changes `cp` would keep serving
-            // artifacts the old one built. Hashed only when the toolbox is on,
-            // so a workspace that leaves it off keeps every key it has today.
-            if let Some(version) = self.coreutils_version() {
-                "coreutils".hash(&mut h);
-                version.hash(&mut h);
-                // `tmpl` is one of those utilities, and what it renders is a
-                // function of the template renderer too — the same dependency
-                // the `template` driver's own def hash carries.
-                "tmpl".hash(&mut h);
-                htemplate::TEMPLATE_FORMAT_VERSION.hash(&mut h);
-            }
-
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash = self.def_hash(&def, || {
+            format!("exec_def_{}", req.target_spec.addr.format())
+        });
 
         let outputs = def
             .outputs
@@ -1463,13 +1468,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             }
         }
 
-        def.hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("exec_def_tr_{}", def.addr.format())
-            });
-            xdef.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        def.hash = self.def_hash(&xdef, || format!("exec_def_tr_{}", def.addr.format()));
 
         def.set_def(xdef);
 
@@ -5864,6 +5863,70 @@ mod tests {
         )
         .await?;
         assert_eq!(base.hash, off_again.hash);
+        Ok(())
+    }
+
+    /// Parse then `apply_transitive` with `sandbox`, the way the engine does for
+    /// a target that has transitive inputs.
+    async fn parse_and_apply_transitive(
+        driver: &Driver,
+        sandbox: hplugin::driver::sandbox::Sandbox,
+    ) -> anyhow::Result<hplugin::driver::targetdef::TargetDef> {
+        let parsed = parse_with_driver(driver, HashMap::new()).await?;
+        let ctoken = StdCancellationToken::new();
+        Ok(driver
+            .apply_transitive(
+                ApplyTransitiveRequest {
+                    request_id: "test".to_string(),
+                    target_def: parsed,
+                    sandbox,
+                },
+                &ctoken,
+            )
+            .await?
+            .target_def)
+    }
+
+    /// `apply_transitive` recomputes the def hash from scratch; it used to drop
+    /// the toolbox's version while doing so, so a target with transitive inputs
+    /// kept serving artifacts built by an older `cp` after a heph upgrade.
+    #[tokio::test]
+    async fn coreutils_version_survives_apply_transitive() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let mut sandbox = hplugin::driver::sandbox::Sandbox::default();
+        sandbox.env.insert(
+            "TR_VAR".to_string(),
+            hplugin::driver::sandbox::Env {
+                value: hplugin::driver::sandbox::EnvValue::Literal("v".to_string()),
+                hash: true,
+                append: false,
+                append_prefix: String::new(),
+            },
+        );
+
+        let v1 = Driver::from_options_exec(&coreutils_opts(true))?
+            .with_coreutils(1, fake_shims(home.path()));
+        let v2 = Driver::from_options_exec(&coreutils_opts(true))?
+            .with_coreutils(2, fake_shims(home.path()));
+        let tr_v1 = parse_and_apply_transitive(&v1, sandbox.clone()).await?;
+        let tr_v2 = parse_and_apply_transitive(&v2, sandbox.clone()).await?;
+        assert_ne!(
+            String::from_utf8_lossy(&tr_v1.hash),
+            String::from_utf8_lossy(&tr_v2.hash),
+            "bumping the toolbox version must move the def hash of a target \
+             with transitive inputs"
+        );
+
+        // With the toolbox off the transitive def hash is pinned to what it was
+        // before the toolbox's version reached this path (the digest is the one
+        // the unfixed code produced): a workspace that leaves the toolbox off
+        // keeps every key it has.
+        let off = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await?;
+        assert_eq!(
+            String::from_utf8_lossy(&off.hash),
+            "8505d329f96f4aa6",
+            "the toolbox-off transitive def hash must not move"
+        );
         Ok(())
     }
 
