@@ -310,8 +310,9 @@ jobs:
             echo "sha256_${name#heph-govet_}=$sha" >> $GITHUB_OUTPUT
           done
 
-      # Named `heph-govet_*`, so the `heph*` download pattern in `upload_artifacts`
-      # picks them up and publishes them as release assets alongside the rest. The
+      # The `manifests` job downloads this artifact and publishes the binaries
+      # as `heph-govet_<os>_<arch>` release assets — the URL the go plugin
+      # fetches them from (`crates/plugin-go/src/plugingo/govet.rs`). The
       # `.sha256` sidecars are internal to this job and are not published.
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -323,11 +324,65 @@ jobs:
             dist/heph-govet_*
             !dist/*.sha256
 
+  # Artifacts publish as they land. This job creates the run's pre-release in
+  # `hephbuild/heph-artifacts-v1` up front; each `build` leg uploads its own
+  # files the moment its build and smoke test pass; `manifests` adds the
+  # plugin manifests and `heph-govet` once every build is done, and marks the
+  # release complete. No test, lint or bin-e2e result delays any of it — only
+  # `release` waits for those, and only `release` promotes to mainline.
+  # `tests/root/ci_gate.rs` checks both halves.
+  #
+  # Until `manifests` runs, the pre-release is partial, and a failed build
+  # leaves it partial for good (accepted exemption E5). It is still marked
+  # pre-release and its body says so. Nothing reads pre-releases: self-upgrade,
+  # `scripts/install-release-plugins.py` and the go plugin's heph-govet fetch
+  # all address one exact version, and fail closed on a missing asset; the
+  # website reads `releases/latest`, which never returns a pre-release.
+  #
+  # Without the upload secret — a fork PR gets none — `publish` is false and
+  # every upload step skips. Builds, smoke tests and bin-e2e still run and
+  # still gate.
+  #
+  # Create only if absent: on "Re-run all jobs" of a master run whose release
+  # was already promoted, recreating or editing its flags would flip it back to
+  # a pre-release.
+  prerelease_create:
+    name: Create pre-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: gen
+    outputs:
+      publish: ${{ steps.create.outputs.publish }}
+      url: ${{ steps.create.outputs.url }}
+    steps:
+      - name: Create the pre-release
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          VERSION: ${{ needs.gen.outputs.version }}
+          REPO: hephbuild/heph-artifacts-v1
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Not publishing::This run has no HEPH_ARTIFACTS_PAT (a fork PR gets no secrets), so nothing is uploaded. Builds, smoke tests and bin-e2e still run."
+            exit 0
+          fi
+          if gh release view "$VERSION" -R "$REPO" >/dev/null 2>&1; then
+            echo "$VERSION already exists in $REPO; leaving it as it is."
+          else
+            gh release create "$VERSION" -R "$REPO" --prerelease --latest=false \
+              --title "Build $VERSION" \
+              --notes "$(printf 'Artifacts automatically published from source-repo (rust).\n\nStatus: partial: in progress or a build failed.')"
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/$REPO/releases/tag/$VERSION" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
-    needs: [gen, govet]
+    needs: [gen, govet, prerelease_create]
     strategy:
       fail-fast: false
       matrix:
@@ -626,6 +681,35 @@ jobs:
               name: ${{steps.build.outputs.plugin_devenv_name}}
               path: ${{steps.build.outputs.plugin_devenv_name}}
 
+      # This platform's release assets, the moment they are built and (where
+      # this runner can execute them) smoke-tested — see `prerelease_create`.
+      # The token is in this step's env only. It shares a job with the build,
+      # whose build scripts could in principle tamper with later steps; that
+      # risk is accepted at the level of the R2 write secret this job already
+      # holds (accepted exemption E4). `--clobber`, so a re-run replaces rather
+      # than fails.
+      - name: Publish to the pre-release
+        if: needs.prerelease_create.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          VERSION: ${{ needs.gen.outputs.version }}
+          REPO: hephbuild/heph-artifacts-v1
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+          EXT: ${{ matrix.os == 'darwin' && 'dylib' || 'so' }}
+        run: |
+          set -euo pipefail
+          files=(
+            "heph_${OS}_${ARCH}"
+            "heph_debug_${OS}_${ARCH}"
+            "heph-bench_${OS}_${ARCH}"
+            "heph-go-plugin_${OS}_${ARCH}.${EXT}"
+            "heph-gha-plugin_${OS}_${ARCH}.${EXT}"
+            "heph-oci-plugin_${OS}_${ARCH}.${EXT}"
+            "heph-devenv-plugin_${OS}_${ARCH}.${EXT}"
+          )
+          gh release upload "$VERSION" -R "$REPO" --clobber "${files[@]}"
+
       # Last, deliberately. This is the only job with steps after its compile,
       # and the drain must not sit in front of them: it would still be correct
       # today (nothing after `Build` compiles) but only by accident, and a
@@ -659,14 +743,16 @@ jobs:
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
 
-  upload_artifacts:
-    name: Pre-release
-    needs: [gen, govet, build]
-    if: always() && needs.gen.result == 'success'
+  # The rest of the pre-release: the plugin manifests (which need every
+  # platform's cdylib to checksum) and `heph-govet`, then the release body
+  # flips from "partial" to "complete". Runs only when every build succeeded —
+  # deliberately not `always()`, which would publish manifests with a platform
+  # missing from them.
+  manifests:
+    name: Plugin manifests
+    needs: [gen, govet, prerelease_create, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      release_url: ${{ steps.create_release.outputs.url }}
     steps:
       # Checkout brings tools/pluginmanifest (the manifest generator); the built
       # artifacts download into dist/ alongside it.
@@ -679,20 +765,21 @@ jobs:
           # and the default cache lookup warns about a missing root go.mod.
           cache: false
 
-      - name: Download all artifacts
+      # Every plugin cdylib (`heph-<name>-plugin_<os>_<arch>.{so,dylib}`), by
+      # pattern rather than a list, so a new platform cannot be silently
+      # absent from its manifest.
+      - name: Download plugin artifacts
         uses: actions/download-artifact@v8
         with:
-          # Matches every published artifact — both CLI flavours
-          # (`heph_<os>_<arch>` std, `heph_debug_<os>_<arch>` debug),
-          # `heph-bench`, and every plugin cdylib
-          # (`heph-<name>-plugin_<os>_<arch>.{so,dylib}`) — and excludes the
-          # `repo` source artifact. Deliberately a pattern rather than a list:
-          # the enumeration this replaces still said "the go plugin cdylib"
-          # after gha, oci and bench had been added, so a new artifact was
-          # silently absent here until something downstream failed on it.
-          pattern: "heph*"
+          pattern: "heph-*-plugin_*"
           path: dist
           merge-multiple: true
+
+      - name: Download heph-govet
+        uses: actions/download-artifact@v8
+        with:
+          name: heph-govet
+          path: dist
 
       - name: List artifacts
         run: ls -lahR dist
@@ -734,18 +821,25 @@ jobs:
           cat dist/heph-devenv-plugin.json
           echo "manifest checksum: $(cat dist/heph-devenv-plugin.json.sha256)"
 
-      - name: Create Release in artifacts repo
-        id: create_release
-        uses: softprops/action-gh-release@v3
-        with:
-          repository: hephbuild/heph-artifacts-v1
-          token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
-          tag_name: ${{needs.gen.outputs.version}}
-          name: Build ${{needs.gen.outputs.version}}
-          body: "Artifacts automatically published from source-repo (rust)."
-          draft: false
-          prerelease: true
-          files: dist/*
+      # The manifests, their `.sha256` sidecars and `heph-govet`, then mark the
+      # pre-release complete. Every file is named, so a missing one fails the
+      # upload rather than leaving a gap.
+      - name: Publish manifests and heph-govet
+        if: needs.prerelease_create.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          VERSION: ${{ needs.gen.outputs.version }}
+          REPO: hephbuild/heph-artifacts-v1
+        run: |
+          set -euo pipefail
+          gh release upload "$VERSION" -R "$REPO" --clobber \
+            dist/heph-go-plugin.json dist/heph-go-plugin.json.sha256 \
+            dist/heph-gha-plugin.json dist/heph-gha-plugin.json.sha256 \
+            dist/heph-oci-plugin.json dist/heph-oci-plugin.json.sha256 \
+            dist/heph-devenv-plugin.json dist/heph-devenv-plugin.json.sha256 \
+            dist/heph-govet_*
+          gh release edit "$VERSION" -R "$REPO" \
+            --notes "$(printf 'Artifacts automatically published from source-repo (rust).\n\nStatus: complete.')"
 
   abi:
     name: ABI guard
@@ -1390,6 +1484,12 @@ jobs:
   #
   # --no-run because the tests hard-fail without a dist. A compile error here is
   # a real failure — `bin_e2e` would hit the same one 20 minutes later.
+  #
+  # Linux only. A run gets three macOS jobs — Test, Build and Binary E2E
+  # darwin/arm64 — against GitHub's five concurrent macOS slots on the free
+  # tier, so two overlapping runs still fit. A darwin warm job would be a
+  # fourth; `Binary E2E darwin/arm64` compiles its own test binaries instead,
+  # which with the kache restore is a minute or two.
   bin_e2e_warm:
     name: Warm Binary E2E ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
@@ -1407,10 +1507,6 @@ jobs:
             arch: arm64
             runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: darwin
-            arch: arm64
-            runs-on: macos-latest
-            target: aarch64-apple-darwin
     steps:
       - name: Download repo
         uses: actions/download-artifact@v8
@@ -1476,6 +1572,11 @@ jobs:
   #
   # linux/arm64 matters most here: the build job cross-compiles it, so this is
   # the only place the shipped aarch64-linux binary is ever executed.
+  #
+  # It gates only `release` (promotion to mainline), never publishing: the
+  # pre-release gets each platform's artifacts as soon as they are built.
+  # The darwin leg has no warm job and compiles its test binaries itself (see
+  # `bin_e2e_warm`).
   bin_e2e:
     name: Binary E2E ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
@@ -1612,9 +1713,15 @@ jobs:
     uses: ./.github/workflows/perf.yml
     secrets: inherit
 
+  # The one job that promotes a pre-release to mainline (`prerelease: false`,
+  # `make_latest`) and deploys the site, and the one job that waits for every
+  # check: the complete pre-release (`manifests`, hence every build), lint on
+  # all three platforms, both test tiers, every go_e2e shard and their count,
+  # and bin-e2e on all three platforms. `tests/root/ci_gate.rs` holds it to
+  # that, and holds every other job to never promoting.
   release:
     name: Release
-    needs: [gen, upload_artifacts, lint, test, test_platform, go_e2e, go_e2e_count, bin_e2e]
+    needs: [gen, manifests, lint, test, test_platform, go_e2e, go_e2e_count, bin_e2e]
     if: github.ref == 'refs/heads/master'
     # Build/test run concurrently for every master commit (see top-level
     # concurrency), but only the latest landed commit should ever mark a
@@ -1657,7 +1764,7 @@ jobs:
   # reason instead.
   summary:
     name: Summary
-    needs: [gate, gen, upload_artifacts]
+    needs: [gate, gen, prerelease_create, manifests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1672,6 +1779,9 @@ jobs:
           GATE_RUN: ${{ needs.gate.outputs.run }}
           GATE_REASON: ${{ needs.gate.outputs.reason }}
           GATE_RESULT: ${{ needs.gate.result }}
+          PUBLISH: ${{ needs.prerelease_create.outputs.publish }}
+          RELEASE_URL: ${{ needs.prerelease_create.outputs.url }}
+          MANIFESTS: ${{ needs.manifests.result }}
         run: |
           # `needs.gate.result` first, and only then its outputs. `always()`
           # means this job also runs when `gate` was cancelled or failed, and
@@ -1695,17 +1805,18 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** \`${{needs.gen.outputs.version}}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ needs.upload_artifacts.result }}" == "success" ]; then
-            echo "**Release:** [${{needs.gen.outputs.version}}](${{needs.upload_artifacts.outputs.release_url}})" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.upload_artifacts.result }}" == "skipped" ]; then
-            echo "**Release:** Skipped" >> $GITHUB_STEP_SUMMARY
+          VERSION='${{needs.gen.outputs.version}}'
+          if [ "$PUBLISH" != "true" ]; then
+            echo "**Release:** not published (no upload secret in this run, as on a fork PR)" >> $GITHUB_STEP_SUMMARY
+          elif [ "$MANIFESTS" == "success" ]; then
+            echo "**Release:** [$VERSION]($RELEASE_URL) — complete (pre-release until \`Release\` promotes it)" >> $GITHUB_STEP_SUMMARY
           else
-            echo "**Release:** Failed or cancelled" >> $GITHUB_STEP_SUMMARY
+            echo "**Release:** [$VERSION]($RELEASE_URL) — partial: the plugin manifests job concluded \`${MANIFESTS:-not run}\`, so some platform's build did not finish" >> $GITHUB_STEP_SUMMARY
           fi
 
   cleanup:
     name: Cleanup
-    needs: [gen, build, lint, test, test_platform, go_e2e_build, go_e2e, go_e2e_count, bin_e2e, upload_artifacts]
+    needs: [gen, build, lint, test, test_platform, go_e2e_build, go_e2e, go_e2e_count, bin_e2e, manifests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

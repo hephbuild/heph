@@ -783,3 +783,250 @@ fn ci_runs_the_nextest_ci_profile() {
         "the ci profile has a slow-timeout: {settings:?}"
     );
 }
+
+/// Jobs whose result says something about the code rather than about the
+/// artifacts. Publishing must never wait on one of them.
+const CHECK_JOBS: [&str; 9] = [
+    "lint",
+    "test",
+    "test_platform",
+    "go_e2e_build",
+    "go_e2e",
+    "go_e2e_count",
+    "bin_e2e_warm",
+    "bin_e2e",
+    "abi",
+];
+
+/// The step publishes to, or authenticates against, the artifacts repo.
+fn touches_the_release(step: &Value) -> bool {
+    let run = field(step, "run");
+    let token = step
+        .get("env")
+        .and_then(Value::as_mapping)
+        .is_some_and(|env| {
+            env.values()
+                .filter_map(Value::as_str)
+                .any(|v| v.contains("HEPH_ARTIFACTS_PAT"))
+        });
+    run.contains("gh release") || field(step, "uses").contains("action-gh-release") || token
+}
+
+/// Every job but `release` that touches the artifacts repo.
+fn publishing_jobs(wf: &Value) -> Vec<String> {
+    job_ids(wf)
+        .into_iter()
+        .filter(|id| id != "release")
+        .filter(|id| job(wf, id).is_some_and(|j| steps(j).into_iter().any(touches_the_release)))
+        .collect()
+}
+
+/// Publishing waits only on building: no job that uploads to the pre-release
+/// reaches a test, lint or bin-e2e job through `needs:`. A tester's flake used
+/// to hold every platform's artifacts back.
+#[test]
+fn publishing_does_not_wait_on_tests() {
+    let wf = parsed();
+    let mut publishers = publishing_jobs(&wf);
+    publishers.sort();
+    assert_eq!(
+        publishers,
+        ["build", "manifests", "prerelease_create"],
+        "the jobs that publish to the pre-release changed; check the new one \
+         against this test's rule before adding it here"
+    );
+    for id in &publishers {
+        let waits_on: Vec<String> = needs_closure(&wf, id)
+            .into_iter()
+            .filter(|dep| CHECK_JOBS.contains(&dep.as_str()))
+            .collect();
+        assert!(
+            waits_on.is_empty(),
+            "`{id}` publishes to the pre-release but waits for {waits_on:?}, so \
+             a red or slow check holds the artifacts back"
+        );
+    }
+}
+
+/// Only `release` makes a release mainline, and it waits for everything.
+#[test]
+fn only_release_promotes_to_mainline() {
+    let wf = parsed();
+    for id in job_ids(&wf).into_iter().filter(|id| id != "release") {
+        let Some(j) = job(&wf, &id) else { continue };
+        for step in steps(j) {
+            let with = step.get("with");
+            let promotes_with_action = with.is_some_and(|w| {
+                w.get("prerelease").and_then(Value::as_bool) == Some(false)
+                    || w.get("make_latest").is_some()
+            });
+            let promotes_with_cli = field(step, "run")
+                .split_whitespace()
+                .any(|w| w == "--latest" || w == "--latest=true" || w == "--prerelease=false");
+            assert!(
+                !promotes_with_action && !promotes_with_cli,
+                "`{id}` promotes a release to mainline; only `release` may"
+            );
+        }
+    }
+
+    let release = job(&wf, "release").expect("a `release` job");
+    assert!(
+        field(release, "if").contains("refs/heads/master"),
+        "release runs on master only"
+    );
+    let promotes = steps(release).into_iter().any(|s| {
+        s.get("with").is_some_and(|w| {
+            w.get("prerelease").and_then(Value::as_bool) == Some(false)
+                && w.get("make_latest").and_then(Value::as_bool) == Some(true)
+        })
+    });
+    assert!(
+        promotes,
+        "release promotes (prerelease: false, make_latest: true)"
+    );
+    let needs = needs_of(release);
+    for required in [
+        "manifests",
+        "lint",
+        "test",
+        "test_platform",
+        "go_e2e",
+        "go_e2e_count",
+        "bin_e2e",
+    ] {
+        assert!(
+            needs.iter().any(|n| n == required),
+            "release does not wait for `{required}`, so mainline can move past \
+             a red check. needs: {needs:?}"
+        );
+    }
+}
+
+/// Every asset family the old single `Pre-release` job published still has an
+/// upload step: the CLI in both flavours, heph-bench, the four plugin cdylibs,
+/// their manifests and checksums, and heph-govet — which the go plugin
+/// downloads from `releases/download/<version>/heph-govet_<os>_<arch>`.
+#[test]
+fn every_release_asset_has_an_uploader() {
+    let wf = parsed();
+    let uploads: String = job_ids(&wf)
+        .into_iter()
+        .filter_map(|id| job(&wf, &id))
+        .flat_map(steps)
+        .map(|s| field(s, "run"))
+        .filter(|run| run.contains("gh release upload"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut families = vec![
+        "\"heph_${OS}_${ARCH}\"".to_string(),
+        "\"heph_debug_${OS}_${ARCH}\"".to_string(),
+        "\"heph-bench_${OS}_${ARCH}\"".to_string(),
+        "dist/heph-govet_*".to_string(),
+    ];
+    for plugin in ["go", "gha", "oci", "devenv"] {
+        families.push(format!(
+            "\"heph-{plugin}-plugin_${{OS}}_${{ARCH}}.${{EXT}}\""
+        ));
+        families.push(format!("dist/heph-{plugin}-plugin.json "));
+        families.push(format!("dist/heph-{plugin}-plugin.json.sha256"));
+    }
+    let missing: Vec<&String> = families
+        .iter()
+        .filter(|f| !uploads.contains(f.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "no `gh release upload` publishes {missing:?}"
+    );
+}
+
+/// Without the upload secret (a fork PR) publishing is skipped, not failed:
+/// `prerelease_create` reports `publish=false`, every upload step is
+/// conditional on it, and the token lives only in step-level env (accepted
+/// exemption E4).
+#[test]
+fn publishing_is_skipped_not_failed_without_the_secret() {
+    let wf = parsed();
+    let create = job(&wf, "prerelease_create").expect("a `prerelease_create` job");
+    let step = step_running(create, "publish=").expect("prerelease_create sets `publish`");
+    assert_eq!(
+        env_of(step, "GH_TOKEN"),
+        Some("${{ secrets.HEPH_ARTIFACTS_PAT }}")
+    );
+    let run = field(step, "run");
+    let (absent, present) = run
+        .split_once("publish=false")
+        .expect("prerelease_create can report publish=false");
+    assert!(
+        absent.contains("[ -z \"$GH_TOKEN\" ]") && present.contains("exit 0"),
+        "publish=false is decided by the token being empty, and exits cleanly"
+    );
+
+    assert!(
+        env_of(&wf, "GH_TOKEN").is_none(),
+        "no workflow-level release token"
+    );
+    for id in job_ids(&wf) {
+        let Some(j) = job(&wf, &id) else { continue };
+        let job_env = j
+            .get("env")
+            .map(|e| serde_yaml::to_string(e).unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            !job_env.contains("HEPH_ARTIFACTS_PAT"),
+            "`{id}` puts HEPH_ARTIFACTS_PAT in job-level env; it belongs in the \
+             upload step's env only"
+        );
+        if id == "prerelease_create" || id == "release" {
+            continue;
+        }
+        for s in steps(j).into_iter().filter(|s| touches_the_release(s)) {
+            assert!(
+                field(s, "if").contains("needs.prerelease_create.outputs.publish == 'true'"),
+                "`{id}` has an upload step that does not skip without the secret: {:?}",
+                field(s, "name")
+            );
+            assert!(
+                needs_of(j).iter().any(|n| n == "prerelease_create"),
+                "`{id}` reads needs.prerelease_create but does not need it"
+            );
+        }
+    }
+}
+
+/// A run uses at most three macOS jobs, so two overlapping runs fit GitHub's
+/// five concurrent macOS slots with one to spare. `perfbench` is excluded: it
+/// runs only on master pushes or with `ci/perf-test`.
+#[test]
+fn a_run_uses_at_most_three_macos_jobs() {
+    let wf = parsed();
+    let is_mac = |v: &Value| {
+        field(v, "os") == "darwin" || {
+            let runs_on = field(v, "runs-on");
+            runs_on.contains("macos") || runs_on.contains("MACOS_RUNNER")
+        }
+    };
+    let mut mac_jobs = Vec::new();
+    for id in job_ids(&wf).into_iter().filter(|id| id != "perfbench") {
+        let Some(j) = job(&wf, &id) else { continue };
+        let entries = j
+            .get("strategy")
+            .and_then(|s| s.get("matrix"))
+            .and_then(|m| m.get("include"))
+            .and_then(Value::as_sequence);
+        match entries {
+            Some(entries) => {
+                mac_jobs.extend(entries.iter().filter(|e| is_mac(e)).map(|_| id.clone()))
+            }
+            None if is_mac(j) => mac_jobs.push(id.clone()),
+            None => {}
+        }
+    }
+    assert!(
+        mac_jobs.len() <= 3,
+        "a run starts {} macOS jobs ({mac_jobs:?}); the free tier runs five at \
+         once, so two overlapping runs would queue",
+        mac_jobs.len()
+    );
+}
