@@ -499,7 +499,7 @@ fn coords(job: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-const TIER_TWO: [&str; 2] = ["darwin/arm64", "linux/arm64"];
+const PLATFORMS: [&str; 3] = ["darwin/arm64", "linux/amd64", "linux/arm64"];
 
 /// The jobs this layout added hang off `gate` like every other. Also covered
 /// by `every_job_is_behind_the_gate`; stated through the parsed `needs:` here
@@ -508,7 +508,7 @@ const TIER_TWO: [&str; 2] = ["darwin/arm64", "linux/arm64"];
 #[test]
 fn go_e2e_jobs_are_behind_the_gate() {
     let wf = parsed();
-    for id in ["test_platform", "go_e2e_build", "go_e2e", "go_e2e_count"] {
+    for id in ["go_e2e_build", "go_e2e", "go_e2e_count"] {
         assert!(job(&wf, id).is_some(), "no `{id}` job");
         assert!(
             needs_closure(&wf, id).contains("gate"),
@@ -521,7 +521,7 @@ fn go_e2e_jobs_are_behind_the_gate() {
 /// test job lints.
 ///
 /// Lint was once the first step of the darwin and linux/arm64 Test legs, to
-/// save a macOS slot. That serialized a ~7 min warm lint ahead of tier 2, and
+/// save a macOS slot. That serialized a ~7 min warm lint ahead of the tests, and
 /// `Test darwin/arm64` became the run's critical path (28 min, against 19 min
 /// for every other check).
 #[test]
@@ -531,8 +531,7 @@ fn every_platform_lints_in_its_own_job() {
     let mut legs = coords(lint);
     legs.sort();
     assert_eq!(
-        legs,
-        ["darwin/arm64", "linux/amd64", "linux/arm64"],
+        legs, PLATFORMS,
         "the `lint` job has one leg per supported platform"
     );
     assert!(
@@ -540,40 +539,36 @@ fn every_platform_lints_in_its_own_job() {
         "the `lint` job runs the `lint` script"
     );
 
-    let tier_two = job(&wf, "test_platform").expect("a `test_platform` job");
-    let mut legs = coords(tier_two);
-    legs.sort();
-    assert_eq!(
-        legs, TIER_TWO,
-        "test_platform runs darwin/arm64 and linux/arm64"
+    let test = job(&wf, "test").expect("a `test` job");
+    assert!(
+        step_running_exactly(test, "lint").is_none(),
+        "`test` runs `lint`, which puts it on that test job's critical path; \
+         lint belongs to the `lint` job"
     );
-    for id in ["test", "test_platform"] {
-        let tester = job(&wf, id).unwrap_or_else(|| panic!("a `{id}` job"));
-        assert!(
-            step_running_exactly(tester, "lint").is_none(),
-            "`{id}` runs `lint`, which puts it on that test job's critical path; \
-             lint belongs to the `lint` job"
-        );
-    }
 }
 
-/// Every test runs on linux/amd64: tier 1 is the workspace minus exactly
-/// `bin-e2e` and `plugingo-e2e`, and the `go_e2e` jobs run `plugingo-e2e`.
+/// Every platform tests the workspace minus exactly `bin-e2e` and
+/// `plugingo-e2e`, and the `go_e2e` jobs run `plugingo-e2e`. A subset for
+/// darwin and linux/arm64 — the crates with platform-conditional code — was
+/// tried, and darwin still ran nearly the whole suite while every other crate
+/// went untested there.
 #[test]
-fn tier_one_plus_go_e2e_covers_the_workspace() {
+fn test_plus_go_e2e_covers_the_workspace() {
     let wf = parsed();
     let test = job(&wf, "test").expect("a `test` job");
-    assert_eq!(coords(test), ["linux/amd64"], "tier 1 runs on linux/amd64");
+    let mut legs = coords(test);
+    legs.sort();
+    assert_eq!(legs, PLATFORMS, "`test` has one leg per supported platform");
     let step = step_running_exactly(test, "tst").expect("`test` runs `tst`");
-    let scope = env_of(step, "TST_SCOPE").expect("tier 1 sets TST_SCOPE");
+    let scope = env_of(step, "TST_SCOPE").expect("`test` sets TST_SCOPE");
     let words: Vec<&str> = scope.split_whitespace().collect();
     assert!(
         words.contains(&"--workspace"),
-        "tier 1 is the workspace: {scope}"
+        "`test` is the workspace: {scope}"
     );
     assert!(
         !words.contains(&"-p"),
-        "tier 1 selects no single crate: {scope}"
+        "`test` selects no single crate: {scope}"
     );
     let excluded: BTreeSet<&str> = words
         .windows(2)
@@ -583,7 +578,7 @@ fn tier_one_plus_go_e2e_covers_the_workspace() {
     assert_eq!(
         excluded,
         BTreeSet::from(["bin-e2e", "plugingo-e2e"]),
-        "tier 1 must exclude only bin-e2e (its own job) and plugingo-e2e (go_e2e)"
+        "`test` must exclude only bin-e2e (its own job) and plugingo-e2e (go_e2e)"
     );
 
     let build = job(&wf, "go_e2e_build").expect("a `go_e2e_build` job");
@@ -603,35 +598,21 @@ fn tier_one_plus_go_e2e_covers_the_workspace() {
     }
 }
 
-/// darwin/arm64 and linux/arm64 test what linux/amd64 tests. A subset — the
-/// crates with platform-conditional code — was tried, and darwin still ran
-/// nearly the whole suite while every other crate went untested there.
-#[test]
-fn test_platform_runs_the_linux_amd64_scope() {
-    let wf = parsed();
-    let scope_of = |id: &str| {
-        let tester = job(&wf, id).unwrap_or_else(|| panic!("a `{id}` job"));
-        let step =
-            step_running_exactly(tester, "tst").unwrap_or_else(|| panic!("`{id}` runs `tst`"));
-        env_of(step, "TST_SCOPE")
-            .unwrap_or_else(|| panic!("`{id}` sets TST_SCOPE"))
-            .to_owned()
-    };
-    assert_eq!(
-        scope_of("test_platform"),
-        scope_of("test"),
-        "test_platform tests the same scope as `Test linux/amd64`"
-    );
-}
-
 /// The two Go smoke tests run as their own invocation with HEPH_E2E_DEVENV,
-/// which `devenv_host_toolchain` needs or it returns early and passes vacuously.
+/// which `devenv_host_toolchain` needs or it returns early and passes
+/// vacuously. They are skipped on linux/amd64 only, which runs all of
+/// `plugingo-e2e` in `go_e2e`.
 #[test]
 fn smoke_step_sets_heph_e2e_devenv() {
     let wf = parsed();
-    let tier_two = job(&wf, "test_platform").expect("a `test_platform` job");
-    let smoke = step_running(tier_two, "--test devenv_host_toolchain")
-        .expect("test_platform runs the Go smoke tests");
+    let test = job(&wf, "test").expect("a `test` job");
+    let smoke =
+        step_running(test, "--test devenv_host_toolchain").expect("`test` runs the Go smoke tests");
+    assert!(
+        field(smoke, "if").contains("!(matrix.os == 'linux' && matrix.arch == 'amd64')"),
+        "the smoke tests skip linux/amd64 and nothing else: {}",
+        field(smoke, "if")
+    );
     let run = field(smoke, "run");
     assert!(
         run.contains("-p plugingo-e2e") && run.contains("--test testmain"),
@@ -693,7 +674,7 @@ fn go_e2e_shards_agree_on_their_count() {
     );
 }
 
-/// `plugingo-e2e` is excluded from tier 1's doctest pass as well as its
+/// `plugingo-e2e` is excluded from `test`'s doctest pass as well as its
 /// nextest pass, and the `go_e2e` jobs run no doctests. That loses nothing only
 /// while the crate has no library, and so no doctests.
 #[test]
@@ -704,7 +685,7 @@ fn go_e2e_drops_no_doctests() {
     assert!(
         !root.join("src/lib.rs").exists() && !manifest.contains("[lib]"),
         "plugingo-e2e has a library now, so it can have doctests, and nothing \
-         runs them: tier 1 excludes the crate from `cargo test --doc` too. Run \
+         runs them: `test` excludes the crate from `cargo test --doc` too. Run \
          its doctests somewhere (e.g. a `cargo test --doc -p plugingo-e2e` step \
          in go_e2e_build)."
     );
@@ -744,10 +725,9 @@ fn ci_runs_the_nextest_ci_profile() {
 
 /// Jobs whose result says something about the code rather than about the
 /// artifacts. Publishing must never wait on one of them.
-const CHECK_JOBS: [&str; 9] = [
+const CHECK_JOBS: [&str; 8] = [
     "lint",
     "test",
-    "test_platform",
     "go_e2e_build",
     "go_e2e",
     "go_e2e_count",
@@ -848,7 +828,6 @@ fn only_release_promotes_to_mainline() {
         "manifests",
         "lint",
         "test",
-        "test_platform",
         "go_e2e",
         "go_e2e_count",
         "bin_e2e",

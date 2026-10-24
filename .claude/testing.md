@@ -23,7 +23,7 @@ A new integration test file in `crates/e2e/tests/` goes in `tests/e2e/` and gets
 
 ### Where it runs in CI
 
-The full suite runs on linux/amd64. darwin/arm64 and linux/arm64 run the tests of the crates `scripts/platform-crates` selects (the ones with platform-conditional code) plus `crates/e2e`; `scripts/platform-crates --explain` prints why each is in. A test of platform-specific behavior therefore belongs in the crate that has the `#[cfg]` — or in `crates/e2e` — to run on the platform it is about. `plugingo-e2e` runs on linux/amd64 only, sharded, apart from two smoke tests on the other two.
+Every test runs on all three platforms, except `plugingo-e2e`: it runs on linux/amd64 only, sharded, apart from two smoke tests on the other two.
 
 Tests run under cargo-nextest, one process per test, with a 10-minute kill in CI (`.config/nextest.toml`); a `static` lock that serialised tests within one binary serialises nothing there.
 

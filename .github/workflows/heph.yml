@@ -952,7 +952,7 @@ jobs:
   # lets `release` proceed over a platform that was not linted. It is the one
   # remaining way to reach a silent pass here, and it is invisible in the check
   # list. `tests/root/lint_gate.rs` asserts their absence, here and in
-  # `test_platform`.
+  # `test`.
   lint:
     name: Lint ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
@@ -1067,147 +1067,28 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Tier 1: the whole workspace, on linux/amd64, on every run — minus
-  # `bin-e2e` (its own job, against the shipped artifacts) and `plugingo-e2e`
-  # (sharded across the `go_e2e` jobs below). This is where "every test runs on
+  # The workspace on every platform, on every run — minus `bin-e2e` (its own
+  # job, against the shipped artifacts) and `plugingo-e2e` (sharded across the
+  # `go_e2e` jobs below, on linux/amd64). This is where "every test runs on
   # every master-targeting run" is kept; `tests/root/ci_gate.rs` checks that
   # this scope plus `go_e2e` is the workspace minus `bin-e2e`.
   #
-  # darwin/arm64 and linux/arm64 run the same scope in `test_platform`.
+  # Every platform, not a subset. Selecting only the crates with
+  # platform-conditional code for darwin and linux/arm64 was tried and bought
+  # little: those crates hold most of the tests (23 of 47 packages, 3,363 of
+  # 4,061 tests), so darwin ran nearly the whole suite anyway, and every other
+  # crate went untested there.
   #
-  # A one-leg matrix so the check keeps its rendered name, `Test linux/amd64`.
-  test:
-    name: Test ${{ matrix.os }}/${{ matrix.arch }}
-    runs-on: ${{ matrix.runs-on }}
-    # The leg sat near 24min with `plugingo-e2e` in it; without it, and with
-    # nextest scheduling every binary at once, it is well inside this.
-    timeout-minutes: 45
-    needs: gen
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: linux
-            arch: amd64
-            runs-on: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-    steps:
-      - name: Download repo
-        uses: actions/download-artifact@v8
-        with:
-          name: repo
-          path: .
-
-      # `tst` links a test binary per workspace crate; with the nix store and the
-      # heavy dep graph this can exhaust the ~14 GB ubuntu-latest root disk mid-link
-      # ("No space left on device"). Drop preinstalled toolchains this job never
-      # uses to reclaim ~15 GB before the build. Linux only (paths are linux, and
-      # the macOS runner is not disk-constrained here).
-      - name: Free disk space (linux)
-        if: matrix.os == 'linux'
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
-          df -h /
-
-      - name: Setup Nix + devenv
-        uses: ./.github/actions/setup-nix
-        with:
-          cargo-target: ${{ matrix.target }}
-          cache-suffix: "-test"
-          r2-secret: ${{ secrets.CF_SSCACHE }}
-
-      - name: Test
-        shell: devenv shell bash -- -e {0}
-        env:
-          RUST_BACKTRACE: "1"
-          TST_SCOPE: "--workspace --exclude bin-e2e --exclude plugingo-e2e"
-        run: tst
-
-      # Also the upload barrier, which is why it is `always()` and why every
-      # compiling job needs one. The daemon uploads to R2 in the background so
-      # no rustc invocation waits on the network — but an ephemeral runner is
-      # torn down the moment the job ends, taking any queued upload with it.
-      # `daemon stop` drains the queue (up to 30s) before returning, so what
-      # this job compiled is actually published. Without it the cache still
-      # reads correctly, it just never fills.
-      #
-      # Every daemon call tolerates failure: fork PRs run with no remote and
-      # therefore no daemon (see setup-nix), and this must not turn a green
-      # build red on the way out.
-      - name: kache stats + drain uploads
-        if: always()
-        shell: devenv shell bash -- -e {0}
-        run: |
-          kache stats
-
-          # Per-crate hits and misses, each with its cache key, so a low hit
-          # rate can be traced to the crates behind it — and two attempts of
-          # one commit compared key by key. Uploaded by the next step.
-          kache report --format json -o kache-report.json || true
-          echo "::group::kache report (top misses)"
-          kache report --top 30 || true
-          echo "::endgroup::"
-
-          # Resolve the log path from the daemon itself rather than hardcoding
-          # it. Both OSes run this same step and they do not agree: Linux puts
-          # it at `~/.cache/kache/kache.log`, macOS at
-          # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
-          # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs. The status
-          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
-          # only streams, which would hang the step.
-          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
-          log=${log/#\~/$HOME}
-
-          # Waits (up to 35s) for the daemon to drain its upload queue and
-          # exit. Failing means it was still uploading, and what is left dies
-          # with the runner. It also fails on fork PRs, which have no remote
-          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
-          kache daemon stop || {
-            [ -z "${KACHE_CONFIG:-}" ] ||
-              echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
-          }
-
-          # Upload outcomes exist *only* in this log. `kache stats` reports what
-          # was read, never what was published, so without this the difference
-          # between "uploaded" and "still queued when the 30s drain cap fired"
-          # is invisible — which is precisely the question a low hit rate on a
-          # re-run raises, and which cost a round trip to answer once already.
-          if [ -n "${log:-}" ] && [ -f "$log" ]; then
-            echo "::group::kache daemon log (tail)"
-            tail -n 200 "$log"
-            echo "::endgroup::"
-          else
-            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
-          fi
-
-      - name: Upload kache report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: kache-report-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: kache-report.json
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # darwin/arm64 and linux/arm64: the same scope as `Test linux/amd64`, then
-  # two Go smoke tests. Lint is the `lint` job's, one leg per platform.
-  #
-  # Not a subset. Selecting only the crates with platform-conditional code
-  # was tried and bought little: those crates hold most of the tests (23 of
-  # 47 packages, 3,363 of 4,061 tests), so darwin ran nearly the whole suite
-  # anyway, and every other crate went untested here. `tests/root/ci_gate.rs`
-  # checks the two scopes stay equal.
-  #
-  # The smoke tests carry `if: !cancelled()`, so a red test run still lets
-  # them run and report. The Summary step says which of the two failed.
+  # darwin/arm64 and linux/arm64 then run two Go smoke tests, since the rest of
+  # `plugingo-e2e` does not run there. They carry `if: !cancelled()`, so a red
+  # test run still lets them run and report. The Summary step says which of
+  # the two failed. Lint is the `lint` job's, one leg per platform.
   #
   # No macFUSE on the darwin runner: the macOS binaries weak-link libfuse, so
   # they launch with the dylib absent. `support_check` finds no macfuse.fs and
   # reports Unavailable, so FUSE mount tests skip. Linux exercises the real
   # pure-Rust FUSE path.
-  test_platform:
+  test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     # darwin is the slow one: a runner that runs the engine unit tests ~10x
@@ -1218,6 +1099,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
           # Linux ARM64 (Native). ubuntu-24.04-arm is free for public repos and
           # is the only place aarch64-linux code runs before release — the
           # build job cross-compiles it. Pairs with darwin/arm64 to give the
@@ -1242,6 +1128,11 @@ jobs:
           name: repo
           path: .
 
+      # `tst` links a test binary per workspace crate; with the nix store and the
+      # heavy dep graph this can exhaust the ~14 GB ubuntu-latest root disk mid-link
+      # ("No space left on device"). Drop preinstalled toolchains this job never
+      # uses to reclaim ~15 GB before the build. Linux only (paths are linux, and
+      # the macOS runner is not disk-constrained here).
       - name: Free disk space (linux)
         if: matrix.os == 'linux'
         run: |
@@ -1270,9 +1161,10 @@ jobs:
       # this host. Their own invocation, not part of TST_SCOPE: `--test` there
       # would apply to every crate in the scope and drop all their other tests.
       # `devenv_host_toolchain` skips itself unless HEPH_E2E_DEVENV is set.
+      # Not on linux/amd64, which runs all of `plugingo-e2e` in `go_e2e`.
       - name: Go smoke tests
         id: smoke
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(matrix.os == 'linux' && matrix.arch == 'amd64') }}
         shell: devenv shell bash -- -e {0}
         env:
           RUST_BACKTRACE: "1"
@@ -1324,8 +1216,11 @@ jobs:
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
-          # `~/Library/Logs/kache/kache.log`. The status prints a `Logs` row with
-          # the path `~`-abbreviated.
+          # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
+          # directory the upstream docs name, which is where hardcoding it
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
           log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
           log=${log/#\~/$HOME}
 
@@ -1338,6 +1233,11 @@ jobs:
               echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
           }
 
+          # Upload outcomes exist *only* in this log. `kache stats` reports what
+          # was read, never what was published, so without this the difference
+          # between "uploaded" and "still queued when the drain cap fired" is
+          # invisible — which is precisely the question a low hit rate on a
+          # re-run raises, and which cost a round trip to answer once already.
           if [ -n "${log:-}" ] && [ -f "$log" ]; then
             echo "::group::kache daemon log (tail)"
             tail -n 200 "$log"
@@ -1364,7 +1264,7 @@ jobs:
   # the shards cost no wall-clock time against each other); `go_e2e_count`
   # checks the shards between them ran every test the archive lists.
   #
-  # On darwin and linux/arm64, `test_platform` runs the two Go smoke tests
+  # On darwin and linux/arm64, `test` runs the two Go smoke tests
   # instead (accepted exemption E2).
   go_e2e_build:
     name: Go E2E build
@@ -1889,7 +1789,7 @@ jobs:
   # that, and holds every other job to never promoting.
   release:
     name: Release
-    needs: [gen, manifests, lint, test, test_platform, go_e2e, go_e2e_count, bin_e2e]
+    needs: [gen, manifests, lint, test, go_e2e, go_e2e_count, bin_e2e]
     if: github.ref == 'refs/heads/master'
     # Build/test run concurrently for every master commit (see top-level
     # concurrency), but only the latest landed commit should ever mark a
@@ -1984,7 +1884,7 @@ jobs:
 
   cleanup:
     name: Cleanup
-    needs: [gen, build, lint, test, test_platform, go_e2e_build, go_e2e, go_e2e_count, bin_e2e, manifests]
+    needs: [gen, build, lint, test, go_e2e_build, go_e2e, go_e2e_count, bin_e2e, manifests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
