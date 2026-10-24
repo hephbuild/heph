@@ -22,9 +22,10 @@
 //!     conclude `success` without clippy ever running, and the `needs:` wiring
 //!     that makes a red lint stop a release can simply be deleted.
 //!
-//! What these tests **cannot** cover: the lint job is a matrix, so its status
-//! contexts are the rendered per-leg names (`Lint linux/amd64`,
-//! `Lint darwin/arm64`). Whether those are *required* lives in the repo's
+//! What these tests **cannot** cover: lint reports through the rendered
+//! per-leg check names (`Lint linux/amd64`, and `Test darwin/arm64` /
+//! `Test linux/arm64`, whose legs run lint first). Whether those are
+//! *required* lives in the repo's
 //! branch protection, outside this tree — so nothing here can assert that a red
 //! lint blocks a merge. `lint_gates_release_and_cleanup` guards the only part
 //! the workflow owns.
@@ -538,23 +539,6 @@ fn job_run_steps(body: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The concrete `runs-on:` labels in a job body.
-///
-/// Skips `${{ matrix.runs-on }}` and friends: on a matrix job the job-level
-/// `runs-on` is an expression and the real labels live in `matrix.include`.
-fn job_runners(body: &str) -> Vec<&str> {
-    body.lines()
-        .map(str::trim)
-        .filter_map(|line| {
-            line.strip_prefix("- ")
-                .unwrap_or(line)
-                .strip_prefix("runs-on:")
-        })
-        .map(str::trim)
-        .filter(|label| !label.contains("${{"))
-        .collect()
-}
-
 /// Job ids that actually run the `lint` script.
 ///
 /// Derived from the `run:` steps rather than from the job name: a job that
@@ -645,47 +629,60 @@ fn without_comments(text: &str) -> String {
         .join("\n")
 }
 
-/// The gate must run on macOS as well as Linux.
+/// The `os/arch` coordinates of every lint leg, across every job that runs the
+/// `lint` script.
+fn lint_coordinates(jobs: &[(&str, String)]) -> Vec<String> {
+    let legs = lint_legs(jobs);
+    jobs.iter()
+        .filter(|(id, _)| legs.contains(id))
+        .flat_map(|(_, body)| matrix_include(&without_comments(body)))
+        .filter_map(|entry| {
+            let get = |k: &str| {
+                entry
+                    .iter()
+                    .find(|(key, _)| key == k)
+                    .map(|(_, value)| value.clone())
+            };
+            Some(format!("{}/{}", get("os")?, get("arch")?))
+        })
+        .collect()
+}
+
+/// The gate must lint every supported platform.
 ///
-/// macOS-only code — the Mach `sweep_threads` block in `src/diag.rs`,
-/// `crates/proc/src/proc_exec/imp_macos.rs`, `kqueue_macos.rs` — is compiled by
-/// `Test darwin/arm64`, but nothing there passes `-D warnings`, so before the
-/// darwin lint leg it was clippy-linted nowhere.
+/// Platform-gated code is linted only where it compiles: the Mach
+/// `sweep_threads` block in `src/diag.rs`, `crates/proc/src/proc_exec/
+/// imp_macos.rs` and `kqueue_macos.rs` on darwin, the aarch64-linux arms on
+/// linux/arm64. Before the darwin lint leg, macOS-only code was clippy-linted
+/// nowhere.
 ///
 /// It is also the half that cannot fail loudly on its own: `#[expect]` is
 /// fulfilled-or-error, so the crate-root test exemptions are pinned to whatever
-/// lint set the gate actually runs. Drop the darwin leg and nothing goes red —
-/// the macOS half of every `#[expect]` simply stops being checked. Hence a test.
+/// lint set the gate actually runs. Drop a platform's leg and nothing goes red
+/// — that platform's half of every `#[expect]` simply stops being checked.
+///
+/// linux/amd64 lints in the `lint` job; darwin/arm64 and linux/arm64 lint as
+/// the first step of their Test legs. Both shapes count: a lint leg is any job
+/// whose steps run the `lint` script, located by its matrix coordinates.
 #[test]
-fn the_lint_gate_runs_on_macos_as_well_as_linux() {
+fn the_lint_gate_runs_on_every_supported_platform() {
     let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))
         .expect("read .github/workflows/heph.yml");
     let jobs = workflow_jobs(&workflow);
-    let legs = lint_legs(&jobs);
-
     assert!(
-        !legs.is_empty(),
+        !lint_legs(&jobs).is_empty(),
         "no job in the workflow runs the `lint` script at all"
     );
 
-    let runners: Vec<&str> = jobs
-        .iter()
-        .filter(|(id, _)| legs.contains(id))
-        .flat_map(|(_, body)| job_runners(body))
-        .collect();
-
-    assert!(
-        runners.iter().any(|label| label.contains("ubuntu")),
-        "no lint leg runs on a Linux runner; found {runners:?}"
-    );
-    assert!(
-        runners.iter().any(|label| label.contains("macos")),
-        "no lint leg runs on a macOS runner, so macOS-only code — including the \
-         Mach `sweep_threads` block in `src/diag.rs`, the largest unsafe region \
-         in the tree — is clippy-linted nowhere, and the crate-root `#[expect]` \
-         headers are only ever checked against the lints that fire on Linux. \
-         Found {runners:?}"
-    );
+    let coords = lint_coordinates(&jobs);
+    for platform in ["linux/amd64", "linux/arm64", "darwin/arm64"] {
+        assert!(
+            coords.iter().any(|c| c == platform),
+            "no lint leg runs on {platform}, so code gated to it is clippy-linted \
+             nowhere and the crate-root `#[expect]` headers are never checked \
+             against the lints that fire there. Lint legs cover {coords:?}"
+        );
+    }
 }
 
 /// A lint leg must not be able to conclude `success` without linting.
@@ -737,88 +734,57 @@ fn a_lint_leg_cannot_report_success_without_running_the_lint() {
     }
 }
 
-/// The lint job must be a matrix, and it must carry both supported OSes.
+/// Every lint leg must be a fail-slow matrix, and no platform linted twice.
 ///
-/// The legs *are* the status contexts now — there is no aggregator and no
-/// context named plain `Lint` — so the matrix's shape is the gate's shape.
-/// Three things are asserted because each fails silently:
+/// The legs *are* the status contexts — there is no aggregator and no context
+/// named plain `Lint` — so the matrices' shape is the gate's shape. Two
+/// things are asserted because each fails silently:
 ///
-///   - both platforms present, or a whole OS goes unlinted while the remaining
-///     leg reports green (the macOS half is the one that was missing);
-///   - `fail-fast: false`, or the first red leg *cancels* the other and the
-///     platform you did not see reports `cancelled` rather than a result. On
-///     the pass that matters — a lint that fires on one OS only — fail-fast
-///     hides exactly the half you need;
-///   - one leg per platform, so a duplicated coordinate cannot masquerade as
-///     coverage of a second OS.
+///   - `fail-fast: false` on every lint job, or the first red leg *cancels*
+///     the others and the platform you did not see reports `cancelled` rather
+///     than a result. On the pass that matters — a lint that fires on one
+///     platform only — fail-fast hides exactly the half you need;
+///   - one leg per platform across all lint jobs, so a duplicated coordinate
+///     cannot masquerade as coverage of another platform (and linux/amd64 is
+///     not linted twice, once in `lint` and again in a Test leg).
 #[test]
-fn the_lint_job_is_a_matrix_over_both_supported_oses() {
+fn every_lint_leg_is_a_fail_slow_matrix_with_unique_platforms() {
     let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))
         .expect("read .github/workflows/heph.yml");
     let jobs = workflow_jobs(&workflow);
     let legs = lint_legs(&jobs);
-    assert_eq!(
-        legs.len(),
-        1,
-        "expected exactly one job to run the `lint` script — the matrix. Found \
-         {legs:?}"
-    );
-
-    let (id, body) = jobs
-        .iter()
-        .find(|(id, _)| legs.contains(id))
-        .expect("the lint leg is a job");
-    let body = without_comments(body);
-
     assert!(
-        body.lines()
-            .any(|line| line.trim().starts_with("strategy:")),
-        "the `{id}` job has no `strategy:`, so it is not a matrix and cannot \
-         cover more than one platform"
-    );
-    assert!(
-        body.lines()
-            .any(|line| line.replace(' ', "") == "fail-fast:false"),
-        "the `{id}` matrix does not set `fail-fast: false`. With fail-fast on, \
-         the first red leg cancels the other, so the platform you did not see \
-         reports `cancelled` instead of a result — and a lint that fires on one \
-         OS only is exactly the case that hides."
+        !legs.is_empty(),
+        "no job in the workflow runs the `lint` script at all"
     );
 
-    let coords: Vec<String> = matrix_include(&body)
-        .iter()
-        .filter_map(|entry| {
-            let get = |k: &str| {
-                entry
-                    .iter()
-                    .find(|(key, _)| key == k)
-                    .map(|(_, value)| value.clone())
-            };
-            Some(format!("{}/{}", get("os")?, get("arch")?))
-        })
-        .collect();
+    for (id, body) in jobs.iter().filter(|(id, _)| legs.contains(id)) {
+        let body = without_comments(body);
+        assert!(
+            body.lines()
+                .any(|line| line.trim().starts_with("strategy:")),
+            "the `{id}` job runs `lint` but has no `strategy:`, so its platform \
+             cannot be read from `matrix.include`"
+        );
+        assert!(
+            body.lines()
+                .any(|line| line.replace(' ', "") == "fail-fast:false"),
+            "the `{id}` matrix does not set `fail-fast: false`. With fail-fast on, \
+             the first red leg cancels the others, so the platform you did not \
+             see reports `cancelled` instead of a result — and a lint that fires \
+             on one platform only is exactly the case that hides."
+        );
+    }
 
-    assert!(
-        coords.iter().any(|c| c.starts_with("linux/")),
-        "the `{id}` matrix has no linux leg; found {coords:?}"
-    );
-    assert!(
-        coords.iter().any(|c| c.starts_with("darwin/")),
-        "the `{id}` matrix has no darwin leg, so macOS-only code — including \
-         the Mach `sweep_threads` block in `src/diag.rs`, the largest unsafe \
-         region in the tree — is clippy-linted nowhere, and the crate-root \
-         `#[expect]` headers are only ever checked against the lints that fire \
-         on Linux. Found {coords:?}"
-    );
-
+    let coords = lint_coordinates(&jobs);
     let mut unique = coords.clone();
     unique.sort();
     unique.dedup();
     assert_eq!(
         unique.len(),
         coords.len(),
-        "the `{id}` matrix has a duplicated os/arch coordinate, so it looks \
-         like it covers more platforms than it does: {coords:?}"
+        "a platform is linted by more than one leg, so the lint legs look like \
+         they cover more platforms than they do: {coords:?}"
     );
 }
 

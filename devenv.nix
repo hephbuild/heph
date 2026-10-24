@@ -377,15 +377,10 @@ in
   #     compiled and linted, never executed. `crates/sandboxfuse`'s
   #     `fuse_sandbox_is_a_default_feature` asserts the feature *is* on, so a
   #     test leg would need that test `#[cfg]`-split first.
-  #   - CI lints `linux/amd64` and `darwin/arm64`, so the OS axis is covered but
-  #     the arch axis is confounded: `aarch64` is only ever linted together with
-  #     macOS, and there is no `Lint linux/arm64`. An `#[expect(clippy::…)]`
-  #     that is unfulfilled only on `aarch64-unknown-linux-gnu` would be
-  #     invisible — plain rustc reports `unfulfilled_lint_expectations` for its
-  #     own lints, but silently ignores an unfulfilled expectation on a *tool*
-  #     lint it does not know, so `Test linux/arm64` cannot stand in for a lint
-  #     job. Either keep lint exemptions free of `target_arch` conditions, or
-  #     add the third leg.
+  #   - CI lints all three supported platforms: `linux/amd64` in its own Lint
+  #     job, `darwin/arm64` and `linux/arm64` as the first step of their Test
+  #     legs. Both axes are covered, so an `#[expect(clippy::…)]` that is
+  #     unfulfilled only on `aarch64-unknown-linux-gnu` is caught there.
   #
   # The flags are written out literally in both scripts rather than factored
   # into a shared Nix variable on purpose: `tests/root/lint_gate.rs` guards them by
