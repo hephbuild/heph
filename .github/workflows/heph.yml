@@ -61,9 +61,14 @@ concurrency:
 # cost their bytes twice, once in the store and once in target/. macOS (APFS)
 # reflinks them for free. Overshooting here is a disk-full test failure, which
 # this repo has hit before, not a slow build.
+#
+# NEXTEST_PROFILE selects the `ci` profile of `.config/nextest.toml` for every
+# nextest run here (`tst` and the go_e2e shards): a per-test slow-timeout that
+# turns a hang into a named TIMEOUT, and no retries.
 env:
   KACHE_MAX_SIZE: "10GiB"
   CARGO_INCREMENTAL: "0"
+  NEXTEST_PROFILE: ci
 
 jobs:
   # Which pull requests get a build.
@@ -777,13 +782,21 @@ jobs:
   # A timeout renders as a red lint leg indistinguishable from a real lint
   # failure, so the 30min headroom is deliberate.
   #
-  # Both platforms, because macOS-only code was clippy-linted nowhere.
-  # `Test darwin/arm64` compiles it, but nothing there passes `-D warnings`, so
-  # the Mach `sweep_threads` block in `src/diag.rs` — the largest unsafe region
-  # in the tree — plus `crates/proc/src/proc_exec/imp_macos.rs` and
-  # `process_watcher/kqueue_macos.rs` had never been through
-  # `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`,
-  # `indexing_slicing` or `unwrap_used`.
+  # Every supported platform is linted on every run, because platform-gated
+  # code is clippy-linted nowhere else: `Test darwin/arm64` used to compile the
+  # Mach `sweep_threads` block in `src/diag.rs` — the largest unsafe region in
+  # the tree — plus `crates/proc/src/proc_exec/imp_macos.rs` and
+  # `process_watcher/kqueue_macos.rs` without `-D warnings`, so they had never
+  # been through `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`,
+  # `indexing_slicing` or `unwrap_used`. And `clippy --all-targets` is what
+  # type-checks every crate, tests included, on each platform.
+  #
+  # linux/amd64 lints here, in its own job. darwin/arm64 and linux/arm64 lint
+  # as the first step of their `test_platform` leg instead: a separate darwin
+  # Lint job was a fifth macOS job per run against GitHub's five-slot free
+  # tier, and the Test leg has the shell and the warm cache already. Those
+  # legs run the tests even when lint fails, then fail the job — see
+  # `test_platform`.
   #
   # Every leg runs the *same* `lint` script — no per-OS variant. The failure
   # being closed is a Mac developer's local `lint` disagreeing with CI in either
@@ -791,42 +804,26 @@ jobs:
   # and not the other is a hard error on the other), and that only stays closed
   # if every leg runs the same command as the developer does.
   #
-  # This is a matrix, so the published status contexts are the *rendered* names,
-  # one per leg — `Lint linux/amd64` and `Lint darwin/arm64`. There is no longer
-  # any context named plain `Lint`. Branch protection must require the two new
-  # names; until it does, a red lint does not block a merge. (Verified from a
-  # real run of this matrix, not inferred: GitHub publishes the rendered name,
-  # with no parenthesised matrix suffix.)
+  # A one-leg matrix rather than a plain job, so its check keeps the rendered
+  # name `Lint linux/amd64` the ruleset requires, and `tests/root/lint_gate.rs`
+  # reads every lint leg's platform from the same `matrix.include` coordinates.
   #
   # `needs: lint` elsewhere in this file waits for *every* leg and is skipped if
-  # any of them fails — the same fan-in the `build` matrix already relies on via
-  # `bin_e2e`'s `needs: [gen, build, …]`. Downstream gating therefore needs no
-  # aggregator job.
+  # any of them fails. Downstream gating therefore needs no aggregator job.
   #
   # No `continue-on-error:` and no `if:` on the Lint step, ever. Either one lets
   # a leg conclude `success` with clippy never having run, which makes the leg's
   # own check green — and, because `needs` treats a successful job as satisfied,
   # lets `release` proceed over a platform that was not linted. It is the one
   # remaining way to reach a silent pass here, and it is invisible in the check
-  # list. `tests/root/lint_gate.rs` asserts their absence.
-  #
-  # Cost, measured rather than assumed — see the PR body. The darwin leg is a
-  # fourth concurrent `macos-latest` job in the `needs: gen` wave, which is the
-  # real price rather than the minutes: the darwin build chain has been observed
-  # on the critical path, and macOS jobs in this repo have queued up to ~2m30s
-  # waiting for a slot. macOS also starts colder — the Nix setup alone measures
-  # 3m15s-4m42s there, and the cargo registry cache is restore-only on PRs
-  # (only master saves), so the darwin leg stays near its cold ~10min until this
-  # key is populated from master.
+  # list. `tests/root/lint_gate.rs` asserts their absence, here and in
+  # `test_platform`.
   lint:
     name: Lint ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
     needs: gen
     strategy:
-      # Both legs always report. With fail-fast the second is cancelled the
-      # moment the first goes red, and `cancelled` is exactly the state that
-      # tells you nothing about the platform you did not see.
       fail-fast: false
       matrix:
         include:
@@ -834,17 +831,6 @@ jobs:
             arch: amd64
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-
-          # macos-latest is Apple Silicon. There is no `Lint linux/arm64` leg:
-          # aarch64 is covered here on the OS axis, and an `#[expect]` that is
-          # unfulfilled only on aarch64-linux would be invisible anyway — plain
-          # rustc silently ignores an unfulfilled expectation on a *tool* lint
-          # it does not know, so `Test linux/arm64` cannot stand in for one.
-          # See the note in devenv.nix.
-          - os: darwin
-            arch: arm64
-            runs-on: macos-latest
-            target: aarch64-apple-darwin
     steps:
       - name: Download repo
         uses: actions/download-artifact@v8
@@ -906,56 +892,30 @@ jobs:
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
           fi
 
+  # Tier 1: the whole workspace, on linux/amd64, on every run — minus
+  # `bin-e2e` (its own job, against the shipped artifacts) and `plugingo-e2e`
+  # (sharded across the `go_e2e` jobs below). This is where "every test runs on
+  # every master-targeting run" is kept; `tests/root/ci_gate.rs` checks that
+  # this scope plus `go_e2e` is the workspace minus `bin-e2e`.
+  #
+  # darwin/arm64 and linux/arm64 run tier 2 in `test_platform`.
+  #
+  # A one-leg matrix so the check keeps its rendered name, `Test linux/amd64`.
   test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    # 30 was sized when the macOS leg silently skipped every Go test (`go` was
-    # absent from the runner and `require_go!` returned Ok — the whole go-plugin
-    # suite "passed" in under a second). Now that devenv supplies a Go, darwin
-    # does the work it was always meant to: 480 `plugin-go` unit tests in 150s,
-    # ~11min of `plugingo-e2e` on top. It landed at 30m19s and got cancelled
-    # while running out the last few crates.
-    #
-    # 45 covers that with room for a cold kache. The linux legs sit near 24min,
-    # so this is headroom for them too rather than a licence to grow — if a leg
-    # starts approaching it, find out what got slower.
-    #
-    # darwin did approach it, and nothing got slower: master's darwin leg runs
-    # 39–45min and timed out in one of four runs (2026-10-04/05), while the
-    # linux legs finish in ~30min. The macOS runner is just slower at the same
-    # work — the engine unit tests take 265s there against 21s on linux/amd64,
-    # and `plugingo-e2e`'s build.rs ~630s. So darwin gets 60 and linux keeps
-    # the 45 that still bounds it.
-    timeout-minutes: ${{ matrix.os == 'darwin' && 60 || 45 }}
+    # The leg sat near 24min with `plugingo-e2e` in it; without it, and with
+    # nextest scheduling every binary at once, it is well inside this.
+    timeout-minutes: 45
     needs: gen
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux AMD64 (Native)
           - os: linux
             arch: amd64
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-
-          # Linux ARM64 (Native). ubuntu-24.04-arm is free for public repos and
-          # is the only place aarch64-linux is exercised at all — the build job
-          # cross-compiles it, so without this job the target shipped with no
-          # test ever run against it. Pairs with darwin/arm64 to give the arch
-          # axis coverage on both OSes rather than only on macOS.
-          - os: linux
-            arch: arm64
-            runs-on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-
-          # macOS ARM64 (Apple Silicon). The runner label is the `MACOS_RUNNER`
-          # repository variable, so switching between the blacksmith runner and a
-          # GitHub-hosted one is a repo-settings change rather than a code change.
-          # There is no fallback: unset the variable and the job fails to start.
-          - os: darwin
-            arch: arm64
-            runs-on: ${{ vars.MACOS_RUNNER }}
-            target: aarch64-apple-darwin
     steps:
       - name: Download repo
         uses: actions/download-artifact@v8
@@ -982,14 +942,11 @@ jobs:
           cache-suffix: "-test"
           r2-secret: ${{ secrets.CF_SSCACHE }}
 
-      # No macFUSE on the runner: the macOS binaries weak-link libfuse, so they
-      # launch with the dylib absent. `support_check` finds no macfuse.fs and
-      # reports Unavailable, so FUSE mount tests skip. Linux exercises the real
-      # pure-Rust FUSE path.
       - name: Test
         shell: devenv shell bash -- -e {0}
         env:
           RUST_BACKTRACE: "1"
+          TST_SCOPE: "--workspace --exclude bin-e2e --exclude plugingo-e2e"
         run: tst
 
       # Also the upload barrier, which is why it is `always()` and why every
@@ -1029,6 +986,390 @@ jobs:
             echo "::endgroup::"
           else
             echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
+
+  # Tier 2: darwin/arm64 and linux/arm64. Lint, then the tests of the crates
+  # that own platform-conditional code, then two Go smoke tests.
+  #
+  # The full suite on these runners cost 15–20 min per leg for tests whose
+  # behaviour is the same on every platform. What must run here is every
+  # platform-gated path, and `scripts/platform-crates` computes which crates
+  # own one from this tree, on every run — there is no committed list to go
+  # stale. It always adds `crates/e2e`. A crate with no platform code of its
+  # own is still compiled here, tests included, by `lint`'s
+  # `clippy --all-targets`; its tests run on linux/amd64 only (accepted
+  # exemption E1 in the spec). `tests/root/ci_gate.rs` checks the scope comes
+  # from the script's step output and nowhere else.
+  #
+  # Lint runs first and as-is: no `if:`, no `continue-on-error:` (see the
+  # comment on `lint`). The steps after it carry `if: !cancelled()`, so a red
+  # lint still lets the tests run and report, and the job fails at the end
+  # because the Lint step did. The Summary step and an `::error title=lint::`
+  # annotation say which of the two it was, so a red check names its cause.
+  #
+  # No macFUSE on the darwin runner: the macOS binaries weak-link libfuse, so
+  # they launch with the dylib absent. `support_check` finds no macfuse.fs and
+  # reports Unavailable, so FUSE mount tests skip. Linux exercises the real
+  # pure-Rust FUSE path.
+  test_platform:
+    name: Test ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    # darwin is the slow one: lint (~5–10 min warm) plus tier 2 on a runner
+    # that runs the engine unit tests ~10x slower than linux/amd64.
+    timeout-minutes: ${{ matrix.os == 'darwin' && 60 || 45 }}
+    needs: gen
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux ARM64 (Native). ubuntu-24.04-arm is free for public repos and
+          # is the only place aarch64-linux code runs before release — the
+          # build job cross-compiles it. Pairs with darwin/arm64 to give the
+          # arch axis coverage on both OSes rather than only on macOS.
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+
+          # macOS ARM64 (Apple Silicon). The runner label is the `MACOS_RUNNER`
+          # repository variable, so switching between the blacksmith runner and a
+          # GitHub-hosted one is a repo-settings change rather than a code change.
+          # There is no fallback: unset the variable and the job fails to start.
+          - os: darwin
+            arch: arm64
+            runs-on: ${{ vars.MACOS_RUNNER }}
+            target: aarch64-apple-darwin
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v8
+        with:
+          name: repo
+          path: .
+
+      - name: Free disk space (linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+        with:
+          cargo-target: ${{ matrix.target }}
+          cache-suffix: "-test"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
+
+      - name: Lint
+        id: lint
+        shell: devenv shell bash -- -e {0}
+        run: lint
+
+      - name: Report lint failure
+        if: failure() && steps.lint.outcome == 'failure'
+        env:
+          PLATFORM: ${{ matrix.os }}/${{ matrix.arch }}
+        run: echo "::error title=lint::lint failed on $PLATFORM. The tests below still run; this job fails because of lint either way. See the Lint step's log."
+
+      # Its own step, under `set -euo pipefail`, so a script failure stops here
+      # with its own error instead of reaching `tst` as an empty or partial
+      # scope. The Test step reads the result from this step's output, never
+      # from a `$(…)` in its own command.
+      - name: Select platform crates
+        id: platform
+        if: ${{ !cancelled() }}
+        shell: devenv shell bash -- -e {0}
+        run: |
+          set -euo pipefail
+          scripts/platform-crates > platform-crates.txt
+          scope=$(tr '\n' ' ' < platform-crates.txt | sed 's/ *$//')
+          count=$(grep -c . platform-crates.txt || true)
+          if [ -z "$scope" ] || [ "$count" -eq 0 ]; then
+            echo "::error title=platform-crates::scripts/platform-crates selected nothing, so tier 2 would test nothing"
+            exit 1
+          fi
+          echo "::group::Tier-2 crates and why (scripts/platform-crates --explain)"
+          scripts/platform-crates --explain
+          echo "::endgroup::"
+          echo "Tier 2: $count crates: $scope"
+          echo "scope=$scope" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        id: test
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
+          TST_SCOPE: ${{ steps.platform.outputs.scope }}
+        run: tst
+
+      # The rest of `plugingo-e2e` checks heph's own Go logic (go list parsing,
+      # codegen, labels, lint rules), which is the same on every platform and
+      # runs in `go_e2e`. These two prove the Go toolchain resolves and runs on
+      # this host. Their own invocation, not part of TST_SCOPE: `--test` there
+      # would apply to every crate in the scope and drop all their other tests.
+      # `devenv_host_toolchain` skips itself unless HEPH_E2E_DEVENV is set.
+      - name: Go smoke tests
+        id: smoke
+        if: ${{ !cancelled() }}
+        shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
+          HEPH_E2E_DEVENV: "1"
+        run: cargo nextest run --locked --no-fail-fast --no-tests=fail -p plugingo-e2e --test testmain --test devenv_host_toolchain
+
+      - name: Summary
+        if: always()
+        env:
+          PLATFORM: ${{ matrix.os }}/${{ matrix.arch }}
+          LINT: ${{ steps.lint.outcome }}
+          TESTS: ${{ steps.test.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+          COUNT: ${{ steps.platform.outputs.count }}
+          SCOPE: ${{ steps.platform.outputs.scope }}
+        run: |
+          mark() { case "$1" in success) echo "✓ passed" ;; failure) echo "✗ failed" ;; *) echo "– ${1:-not run}" ;; esac; }
+          {
+            echo "### Test $PLATFORM"
+            echo ""
+            echo "| Step | Result |"
+            echo "|---|---|"
+            echo "| lint | $(mark "$LINT") |"
+            echo "| tier-2 tests | $(mark "$TESTS") |"
+            echo "| Go smoke tests | $(mark "$SMOKE") |"
+            echo ""
+            echo "Tier-2 scope (${COUNT:-0} crates, from \`scripts/platform-crates\`): \`${SCOPE:-none}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Also the upload barrier, which is why it is `always()` and why every
+      # compiling job needs one. The daemon uploads to R2 in the background so
+      # no rustc invocation waits on the network — but an ephemeral runner is
+      # torn down the moment the job ends, taking any queued upload with it.
+      # `daemon stop` drains the queue (up to 30s) before returning, so what
+      # this job compiled is actually published. Without it the cache still
+      # reads correctly, it just never fills.
+      #
+      # `|| true`: fork PRs run with no remote and therefore no daemon (see
+      # setup-nix), and this must not turn a green build red on the way out.
+      - name: kache stats + drain uploads
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: |
+          kache stats
+
+          # Resolve the log path from the daemon itself rather than hardcoding
+          # it. Both OSes run this same step and they do not agree: Linux puts
+          # it at `~/.cache/kache/kache.log`, macOS at
+          # `~/Library/Logs/kache/kache.log`.
+          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+
+          kache daemon stop || true
+
+          if [ -n "${log:-}" ] && [ -f "$log" ]; then
+            echo "::group::kache daemon log (tail)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          else
+            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
+
+  # `plugingo-e2e`, compiled once and run in shards, on linux/amd64 only.
+  #
+  # It was 15–19 min of every Test leg: its tests build real Go programs, one
+  # after another inside a few binaries. `go_e2e_build` compiles the test
+  # binaries into a nextest archive; the `go_e2e` matrix runs that archive in
+  # shards on separate runners (a public repo gets 20 concurrent Linux jobs, so
+  # the shards cost no wall-clock time against each other); `go_e2e_count`
+  # checks the shards between them ran every test the archive lists.
+  #
+  # On darwin and linux/arm64, `test_platform` runs the two Go smoke tests
+  # instead (accepted exemption E2).
+  go_e2e_build:
+    name: Go E2E build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: gen
+    outputs:
+      total: ${{ steps.list.outputs.total }}
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v8
+        with:
+          name: repo
+          path: .
+
+      - name: Free disk space (linux)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+        with:
+          cargo-target: x86_64-unknown-linux-gnu
+          cache-suffix: "-go-e2e"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
+
+      # Budget: 2 GB. The archive is every plugingo-e2e test binary plus the
+      # std dylib; with line-tables-only debuginfo it was ~240 MB on darwin.
+      - name: Archive plugingo-e2e
+        shell: devenv shell bash -- -e {0}
+        run: |
+          set -euo pipefail
+          cargo nextest archive --locked -p plugingo-e2e --archive-file go-e2e.tar.zst
+          size=$(stat -c %s go-e2e.tar.zst)
+          human=$(numfmt --to=iec "$size")
+          echo "go-e2e archive: $human ($size bytes)"
+          echo "go-e2e archive: **$human** (budget 2G)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -gt 2147483648 ]; then
+            echo "::warning title=go-e2e archive::the plugingo-e2e nextest archive is $human, over its 2 GB budget"
+          fi
+
+      # The number of tests a full run of the archive would run, for
+      # `go_e2e_count` to compare the shards' total against.
+      - name: List archive
+        id: list
+        shell: devenv shell bash -- -e {0}
+        run: |
+          set -euo pipefail
+          cargo nextest list --archive-file go-e2e.tar.zst --workspace-remap . --message-format json > go-e2e-list.json
+          total=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for s in d["rust-suites"].values() for t in s["testcases"].values() if t["filter-match"]["status"] == "matches"))' go-e2e-list.json)
+          echo "plugingo-e2e: $total tests"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-e2e-archive
+          path: go-e2e.tar.zst
+          retention-days: 1
+          # Already zstd-compressed.
+          compression-level: 0
+
+      # Also the upload barrier, which is why it is `always()` and why every
+      # compiling job needs one; see the same step in `test`.
+      - name: kache stats + drain uploads
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: |
+          kache stats
+          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          kache daemon stop || true
+          if [ -n "${log:-}" ] && [ -f "$log" ]; then
+            echo "::group::kache daemon log (tail)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          else
+            echo "::warning title=kache::daemon log not found at '${log:-<unresolved>}' — upload outcomes are not diagnosable for this job"
+          fi
+
+  # `--partition slice:k/N`, not `count:`: `count:` splits per binary, so every
+  # one-test binary lands on shard 1; `slice:` deals tests out round-robin
+  # across all binaries. N is tuned from the shards' timings; the matrix list
+  # and the `/N` below must agree, which `tests/root/ci_gate.rs` checks.
+  #
+  # Each shard enters the same devenv as the build job: the archived test
+  # binaries' ELF interpreter is a nix store path, and the tests need its Go.
+  go_e2e:
+    name: Go E2E ${{ matrix.shard }}/3
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [gen, go_e2e_build]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v8
+        with:
+          name: repo
+          path: .
+
+      - name: Download archive
+        uses: actions/download-artifact@v8
+        with:
+          name: go-e2e-archive
+          path: .
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+
+      - name: Test shard
+        shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          echo "plugingo-e2e, partition slice:$SHARD/3"
+          cargo nextest run --archive-file go-e2e.tar.zst --workspace-remap . \
+            --partition "slice:$SHARD/3" --no-fail-fast --no-tests=fail --color never 2>&1 | tee nextest.log
+          # nextest's summary line: `N tests run: N passed, M skipped`.
+          ran=$(grep -oE '[0-9]+ tests? run:' nextest.log | tail -n 1 | grep -oE '^[0-9]+' || true)
+          if [ -z "$ran" ]; then
+            echo "::error title=go_e2e shard $SHARD::no nextest summary line in the output, so this shard's test count is unknown"
+            exit 1
+          fi
+          echo "shard $SHARD ran $ran tests"
+          mkdir -p go-e2e-count
+          echo "$ran" > "go-e2e-count/shard-$SHARD"
+
+      - name: How to rerun
+        if: failure()
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          echo "::error title=go_e2e shard $SHARD::Rerun this shard locally with: cargo nextest run -p plugingo-e2e --partition slice:$SHARD/3 (or pass the failing test's name as a filter: cargo nextest run -p plugingo-e2e <name>)"
+
+      - name: Upload count
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-e2e-count-${{ matrix.shard }}
+          path: go-e2e-count/
+          retention-days: 1
+
+  # The shards' run counts must add up to what the archive lists. A shard that
+  # silently ran nothing (a partition bug, a changed summary format) would
+  # otherwise look exactly like a shard whose tests passed.
+  go_e2e_count:
+    name: Go E2E count
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [go_e2e_build, go_e2e]
+    steps:
+      - name: Download counts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: go-e2e-count-*
+          path: go-e2e-count
+          merge-multiple: true
+
+      - name: Check the shards ran every test
+        env:
+          EXPECTED: ${{ needs.go_e2e_build.outputs.total }}
+          SHARDS: "3"
+        run: |
+          set -euo pipefail
+          found=0
+          sum=0
+          for f in go-e2e-count/shard-*; do
+            n=$(cat "$f")
+            echo "$(basename "$f"): $n"
+            sum=$((sum + n))
+            found=$((found + 1))
+          done
+          echo "shards: $found, tests run: $sum, archive lists: $EXPECTED"
+          echo "plugingo-e2e: $found shards ran $sum tests; the archive lists $EXPECTED." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$found" -ne "$SHARDS" ]; then
+            echo "::error title=go_e2e count::expected counts from $SHARDS shards, found $found"
+            exit 1
+          fi
+          if [ -z "$EXPECTED" ] || [ "$sum" -ne "$EXPECTED" ]; then
+            echo "::error title=go_e2e count::the shards ran $sum tests between them, but the archive lists ${EXPECTED:-?}"
+            exit 1
           fi
 
   # Compile `bin_e2e`'s test binaries ahead of the job that runs them. `tst`
@@ -1273,7 +1614,7 @@ jobs:
 
   release:
     name: Release
-    needs: [gen, upload_artifacts, lint, test, bin_e2e]
+    needs: [gen, upload_artifacts, lint, test, test_platform, go_e2e, go_e2e_count, bin_e2e]
     if: github.ref == 'refs/heads/master'
     # Build/test run concurrently for every master commit (see top-level
     # concurrency), but only the latest landed commit should ever mark a
@@ -1364,7 +1705,7 @@ jobs:
 
   cleanup:
     name: Cleanup
-    needs: [gen, build, lint, test, bin_e2e, upload_artifacts]
+    needs: [gen, build, lint, test, test_platform, go_e2e_build, go_e2e, go_e2e_count, bin_e2e, upload_artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

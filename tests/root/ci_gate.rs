@@ -383,3 +383,403 @@ fn the_pull_request_trigger_is_unfiltered() {
          Skip stacked PRs in the `gate` job instead:\n{trigger}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Structural checks over the parsed workflow.
+//
+// The checks above predate these and read the text; everything below asks
+// about transitive `needs:`, step conditions and step `env:`, which a line
+// scanner gets wrong in the silent direction. So it parses the file with
+// `serde_yaml` instead, and every helper returns `Option` so a test that
+// cannot find what it looks for fails with its own message.
+
+use serde_yaml::{Mapping, Value};
+use std::collections::BTreeSet;
+
+fn parsed() -> Value {
+    serde_yaml::from_str(&workflow()).expect("heph.yml parses as YAML")
+}
+
+fn jobs_map(wf: &Value) -> Option<&Mapping> {
+    wf.get("jobs").and_then(Value::as_mapping)
+}
+
+fn job<'a>(wf: &'a Value, id: &str) -> Option<&'a Value> {
+    jobs_map(wf)?.get(id)
+}
+
+fn job_ids(wf: &Value) -> Vec<String> {
+    jobs_map(wf)
+        .map(|jobs| {
+            jobs.keys()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A job's direct `needs:`, in either YAML form.
+fn needs_of(job: &Value) -> Vec<String> {
+    match job.get("needs") {
+        Some(Value::String(one)) => vec![one.clone()],
+        Some(Value::Sequence(many)) => many
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every job `id` waits for, directly or through another job.
+fn needs_closure(wf: &Value, id: &str) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<String> = job(wf, id).map(needs_of).unwrap_or_default();
+    while let Some(dep) = stack.pop() {
+        if seen.insert(dep.clone()) {
+            stack.extend(job(wf, &dep).map(needs_of).unwrap_or_default());
+        }
+    }
+    seen
+}
+
+/// A job's steps, with `parallel:` groups flattened into their members.
+fn steps(job: &Value) -> Vec<&Value> {
+    fn walk<'a>(seq: &'a [Value], out: &mut Vec<&'a Value>) {
+        for step in seq {
+            match step.get("parallel").and_then(Value::as_sequence) {
+                Some(group) => walk(group, out),
+                None => out.push(step),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(seq) = job.get("steps").and_then(Value::as_sequence) {
+        walk(seq, &mut out);
+    }
+    out
+}
+
+/// A string field of a step or job, or `""`.
+fn field<'a>(v: &'a Value, key: &str) -> &'a str {
+    v.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn env_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get("env")?.get(key)?.as_str()
+}
+
+/// The first step whose `run:` contains `needle`.
+fn step_running<'a>(job: &'a Value, needle: &str) -> Option<&'a Value> {
+    steps(job)
+        .into_iter()
+        .find(|step| field(step, "run").contains(needle))
+}
+
+/// The step whose whole `run:` is exactly `command`.
+fn step_running_exactly<'a>(job: &'a Value, command: &str) -> Option<&'a Value> {
+    steps(job)
+        .into_iter()
+        .find(|step| field(step, "run").trim() == command)
+}
+
+/// The `os/arch` of each `strategy.matrix.include` entry.
+fn coords(job: &Value) -> Vec<String> {
+    job.get("strategy")
+        .and_then(|s| s.get("matrix"))
+        .and_then(|m| m.get("include"))
+        .and_then(Value::as_sequence)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|e| format!("{}/{}", field(e, "os"), field(e, "arch")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const TIER_TWO: [&str; 2] = ["darwin/arm64", "linux/arm64"];
+
+/// The jobs this layout added hang off `gate` like every other. Also covered
+/// by `every_job_is_behind_the_gate`; stated through the parsed `needs:` here
+/// so a block-list `needs:` (which the text parser reads as empty) cannot
+/// slip past both.
+#[test]
+fn go_e2e_jobs_are_behind_the_gate() {
+    let wf = parsed();
+    for id in ["test_platform", "go_e2e_build", "go_e2e", "go_e2e_count"] {
+        assert!(job(&wf, id).is_some(), "no `{id}` job");
+        assert!(
+            needs_closure(&wf, id).contains("gate"),
+            "`{id}` does not wait for `gate`, so it runs on stacked PRs"
+        );
+    }
+}
+
+/// Lint runs on every supported platform, and a red lint fails its leg.
+///
+/// linux/amd64 keeps its own `lint` job. darwin/arm64 and linux/arm64 lint as
+/// the first step of their Test legs: the Lint step runs unconditionally (no
+/// `if:`, no `continue-on-error:`), so its failure fails the job, and the test
+/// step carries `!cancelled()` so the tests still run and report.
+#[test]
+fn every_platform_runs_lint() {
+    let wf = parsed();
+    let lint = job(&wf, "lint").expect("a `lint` job");
+    assert_eq!(
+        coords(lint),
+        ["linux/amd64"],
+        "the `lint` job lints linux/amd64"
+    );
+    assert!(
+        step_running_exactly(lint, "lint").is_some(),
+        "the `lint` job runs the `lint` script"
+    );
+
+    let tier_two = job(&wf, "test_platform").expect("a `test_platform` job");
+    let mut legs = coords(tier_two);
+    legs.sort();
+    assert_eq!(
+        legs, TIER_TWO,
+        "test_platform runs darwin/arm64 and linux/arm64"
+    );
+
+    let lint_step = step_running_exactly(tier_two, "lint").expect("test_platform runs `lint`");
+    assert!(
+        lint_step.get("if").is_none() && lint_step.get("continue-on-error").is_none(),
+        "test_platform's Lint step must run unconditionally and fail the job"
+    );
+    assert!(
+        tier_two.get("continue-on-error").is_none(),
+        "test_platform must not be continue-on-error: a red lint would read green"
+    );
+    let test_step = step_running_exactly(tier_two, "tst").expect("test_platform runs `tst`");
+    assert!(
+        field(test_step, "if").contains("!cancelled()"),
+        "test_platform's Test step must run after a failed lint (`!cancelled()`), \
+         or a lint failure hides every test result on that platform"
+    );
+}
+
+/// `Test darwin/arm64` lints before it tests, in the same job.
+#[test]
+fn darwin_test_runs_lint() {
+    let wf = parsed();
+    let (id, darwin_tester) = job_ids(&wf)
+        .into_iter()
+        .filter_map(|id| job(&wf, &id).map(|j| (id, j)))
+        .find(|(_, j)| {
+            coords(j).iter().any(|c| c == "darwin/arm64")
+                && step_running_exactly(j, "tst").is_some()
+        })
+        .expect("a job runs `tst` on darwin/arm64");
+    let runs: Vec<&str> = steps(darwin_tester)
+        .into_iter()
+        .map(|s| field(s, "run").trim())
+        .collect();
+    let lint_at = runs.iter().position(|r| *r == "lint");
+    let tst_at = runs.iter().position(|r| *r == "tst");
+    assert!(
+        matches!((lint_at, tst_at), (Some(l), Some(t)) if l < t),
+        "`{id}` (Test darwin/arm64) must run `lint` before `tst`; steps: {runs:?}"
+    );
+}
+
+/// Every test runs on linux/amd64: tier 1 is the workspace minus exactly
+/// `bin-e2e` and `plugingo-e2e`, and the `go_e2e` jobs run `plugingo-e2e`.
+#[test]
+fn tier_one_plus_go_e2e_covers_the_workspace() {
+    let wf = parsed();
+    let test = job(&wf, "test").expect("a `test` job");
+    assert_eq!(coords(test), ["linux/amd64"], "tier 1 runs on linux/amd64");
+    let step = step_running_exactly(test, "tst").expect("`test` runs `tst`");
+    let scope = env_of(step, "TST_SCOPE").expect("tier 1 sets TST_SCOPE");
+    let words: Vec<&str> = scope.split_whitespace().collect();
+    assert!(
+        words.contains(&"--workspace"),
+        "tier 1 is the workspace: {scope}"
+    );
+    assert!(
+        !words.contains(&"-p"),
+        "tier 1 selects no single crate: {scope}"
+    );
+    let excluded: BTreeSet<&str> = words
+        .windows(2)
+        .filter(|w| w.first() == Some(&"--exclude"))
+        .filter_map(|w| w.get(1).copied())
+        .collect();
+    assert_eq!(
+        excluded,
+        BTreeSet::from(["bin-e2e", "plugingo-e2e"]),
+        "tier 1 must exclude only bin-e2e (its own job) and plugingo-e2e (go_e2e)"
+    );
+
+    let build = job(&wf, "go_e2e_build").expect("a `go_e2e_build` job");
+    let archive = step_running(build, "nextest archive").expect("go_e2e_build archives");
+    assert!(
+        field(archive, "run").contains("-p plugingo-e2e"),
+        "go_e2e_build archives plugingo-e2e"
+    );
+    let shards = job(&wf, "go_e2e").expect("a `go_e2e` job");
+    assert!(
+        step_running(shards, "--archive-file").is_some(),
+        "go_e2e runs the archive"
+    );
+    for id in ["go_e2e_build", "go_e2e"] {
+        let runs_on = job(&wf, id).map(|j| field(j, "runs-on")).unwrap_or("");
+        assert_eq!(runs_on, "ubuntu-latest", "`{id}` runs on linux/amd64");
+    }
+}
+
+/// The darwin and linux/arm64 test scope is the `scripts/platform-crates`
+/// step's output — never a literal list, never a `$(…)` in the test command.
+#[test]
+fn tier_two_uses_the_generated_crate_list() {
+    let wf = parsed();
+    let tier_two = job(&wf, "test_platform").expect("a `test_platform` job");
+    let step = step_running_exactly(tier_two, "tst").expect("test_platform runs `tst`");
+    let scope = env_of(step, "TST_SCOPE").expect("tier 2 sets TST_SCOPE");
+    let id = scope
+        .trim()
+        .strip_prefix("${{ steps.")
+        .and_then(|rest| rest.strip_suffix(".outputs.scope }}"))
+        .expect("TST_SCOPE is `${{ steps.<id>.outputs.scope }}`");
+    let producer = steps(tier_two)
+        .into_iter()
+        .find(|s| field(s, "id") == id)
+        .expect("the step TST_SCOPE names exists");
+    let run = field(producer, "run");
+    assert!(
+        run.contains("scripts/platform-crates"),
+        "the scope comes from scripts/platform-crates: {run}"
+    );
+    assert!(
+        run.contains("set -euo pipefail"),
+        "the platform-crates step runs under `set -euo pipefail`, so a script \
+         failure stops the leg instead of reaching `tst` as a partial scope"
+    );
+    assert!(
+        field(step, "if").contains(&format!("steps.{id}.outcome == 'success'")),
+        "the Test step runs only when the scope step succeeded; an empty \
+         TST_SCOPE would fall back to the whole workspace"
+    );
+}
+
+/// The two Go smoke tests run as their own invocation with HEPH_E2E_DEVENV,
+/// which `devenv_host_toolchain` needs or it returns early and passes vacuously.
+#[test]
+fn smoke_step_sets_heph_e2e_devenv() {
+    let wf = parsed();
+    let tier_two = job(&wf, "test_platform").expect("a `test_platform` job");
+    let smoke = step_running(tier_two, "--test devenv_host_toolchain")
+        .expect("test_platform runs the Go smoke tests");
+    let run = field(smoke, "run");
+    assert!(
+        run.contains("-p plugingo-e2e") && run.contains("--test testmain"),
+        "{run}"
+    );
+    assert_eq!(
+        env_of(smoke, "HEPH_E2E_DEVENV"),
+        Some("1"),
+        "devenv_host_toolchain skips itself without HEPH_E2E_DEVENV=1"
+    );
+    assert_ne!(
+        run.trim(),
+        "tst",
+        "the smoke tests are not part of the `tst` call"
+    );
+}
+
+/// The shard list, the partition's denominator and the count check agree.
+#[test]
+fn go_e2e_shards_agree_on_their_count() {
+    let wf = parsed();
+    let shards = job(&wf, "go_e2e").expect("a `go_e2e` job");
+    let list = shards
+        .get("strategy")
+        .and_then(|s| s.get("matrix"))
+        .and_then(|m| m.get("shard"))
+        .and_then(Value::as_sequence)
+        .expect("go_e2e has a `matrix.shard` list");
+    let n = list.len();
+    let expected: Vec<u64> = (1..=n as u64).collect();
+    let got: Vec<u64> = list.iter().filter_map(Value::as_u64).collect();
+    assert_eq!(got, expected, "shards are numbered 1..=N");
+
+    let run = field(
+        step_running(shards, "--partition").expect("go_e2e partitions the archive"),
+        "run",
+    );
+    assert!(
+        run.contains(&format!("\"slice:$SHARD/{n}\"")),
+        "go_e2e partitions with `slice:$SHARD/{n}` (not `count:`, which puts \
+         every one-test binary on shard 1): {run}"
+    );
+    assert!(
+        run.contains("--no-tests=fail"),
+        "an empty shard fails: {run}"
+    );
+    assert!(
+        field(shards, "name").ends_with(&format!("/{n}")),
+        "the check name shows the shard count"
+    );
+
+    let count = job(&wf, "go_e2e_count").expect("a `go_e2e_count` job");
+    let check = step_running(count, "EXPECTED").expect("go_e2e_count compares counts");
+    assert_eq!(env_of(check, "SHARDS"), Some(n.to_string().as_str()));
+    let needs = needs_of(count);
+    assert!(
+        needs.iter().any(|d| d == "go_e2e") && needs.iter().any(|d| d == "go_e2e_build"),
+        "go_e2e_count waits for the shards and the build: {needs:?}"
+    );
+}
+
+/// `plugingo-e2e` is excluded from tier 1's doctest pass as well as its
+/// nextest pass, and the `go_e2e` jobs run no doctests. That loses nothing only
+/// while the crate has no library, and so no doctests.
+#[test]
+fn go_e2e_drops_no_doctests() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/plugingo-e2e");
+    let manifest =
+        std::fs::read_to_string(root.join("Cargo.toml")).expect("read plugingo-e2e's Cargo.toml");
+    assert!(
+        !root.join("src/lib.rs").exists() && !manifest.contains("[lib]"),
+        "plugingo-e2e has a library now, so it can have doctests, and nothing \
+         runs them: tier 1 excludes the crate from `cargo test --doc` too. Run \
+         its doctests somewhere (e.g. a `cargo test --doc -p plugingo-e2e` step \
+         in go_e2e_build)."
+    );
+}
+
+/// Every nextest run in CI uses the `ci` profile: a per-test timeout, so a
+/// hang is a named TIMEOUT, and no retries, so a flake is a failure.
+#[test]
+fn ci_runs_the_nextest_ci_profile() {
+    let wf = parsed();
+    assert_eq!(
+        env_of(&wf, "NEXTEST_PROFILE"),
+        Some("ci"),
+        "the workflow sets NEXTEST_PROFILE=ci for every job"
+    );
+    let config =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".config/nextest.toml"))
+            .expect("read .config/nextest.toml");
+    let (_, ci) = config
+        .split_once("\n[profile.ci]\n")
+        .expect("nextest.toml has a [profile.ci]");
+    let ci = ci.split("\n[").next().unwrap_or(ci);
+    let settings: Vec<&str> = ci
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    assert!(
+        settings.contains(&"retries = 0"),
+        "the ci profile retries nothing: {settings:?}"
+    );
+    assert!(
+        settings.iter().any(|l| l.starts_with("slow-timeout")),
+        "the ci profile has a slow-timeout: {settings:?}"
+    );
+}
