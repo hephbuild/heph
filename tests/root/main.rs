@@ -26,6 +26,7 @@ mod darwin_linker;
 mod execrunner_gate;
 mod lint_gate;
 mod lsp_lifecycle;
+mod platform_crates;
 mod target_dir_script;
 mod test_layout;
 mod tst_script;
