@@ -16,6 +16,14 @@ fn script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/platform-crates")
 }
 
+/// Through `python3`, not the shebang: CI's test jobs get the tree from an
+/// `actions/download-artifact`, which drops the executable bit.
+fn script_command() -> Command {
+    let mut cmd = Command::new("python3");
+    cmd.arg(script());
+    cmd
+}
+
 /// A throwaway cargo workspace. Every fixture has an `e2e` member, because the
 /// script always selects it and refuses a workspace without it.
 struct Fixture {
@@ -93,7 +101,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(script())
+        script_command()
             .args(args)
             .arg("--manifest-path")
             .arg(self.path().join("Cargo.toml"))
@@ -410,7 +418,7 @@ fn platform_crates_fails_without_e2e() {
     .expect("write manifest");
     std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
     std::fs::write(dir.path().join("src/lib.rs"), "#[cfg(unix)]\nfn f() {}\n").expect("write lib");
-    let out = Command::new(script())
+    let out = script_command()
         .arg("--manifest-path")
         .arg(dir.path().join("Cargo.toml"))
         .output()
@@ -449,7 +457,7 @@ fn platform_crates_output_is_sorted_unique_and_explained() {
 /// in, `e2e` is always in, and the two crates with their own jobs are out.
 #[test]
 fn platform_crates_always_adds_e2e_and_never_go_or_bin() {
-    let out = Command::new(script())
+    let out = script_command()
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("GITHUB_ACTIONS")
         .output()
