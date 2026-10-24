@@ -172,6 +172,11 @@ in
     cargoZigbuild
     pkgs.tokio-console
     kache
+    # The test runner behind `tst` and CI. It schedules every test binary at
+    # once instead of one after another, runs each test in its own process,
+    # turns a hang into a named TIMEOUT (`.config/nextest.toml`), and provides
+    # the `archive` / `--partition slice:` that shard `plugingo-e2e` in CI.
+    pkgs.cargo-nextest
     # `rust-objcopy`/`rust-strip` (wraps the `llvm-tools` component's
     # llvm-objcopy, below) — used by `scripts/patch-slot.sh`'s CI caller to
     # derive the "std" release flavour's stripped binary. LLVM-based and
@@ -450,15 +455,42 @@ in
   # failed. One red test binary used to stop the rest of the workspace from
   # running at all, so a single unrelated failure (a Docker test on a machine
   # with the daemon down) hid everything after it and cost a second full run.
-  # Extra args pass through to every pass, so only a test-name filter and `--
-  # <libtest args>` make sense (`--test x` or `-p x` would fail the passes that
-  # have no such target). `tests/root/tst_script.rs` runs this text against a stub
-  # cargo. `rc`, not `status`: that name is read-only in zsh.
+  #
+  # Each pass is `cargo nextest run` followed by `cargo test --doc`: nextest
+  # schedules every test binary at once and runs each test in its own process,
+  # but it does not run doctests, so without the second call the doc examples
+  # would silently stop being tested. CI selects the nextest profile with
+  # `NEXTEST_PROFILE=ci` (`.config/nextest.toml`: a per-test timeout, no
+  # retries).
+  #
+  # `TST_SCOPE` replaces the first pass's package selection — `--workspace
+  # --exclude bin-e2e` by default — and nothing else. CI uses it to run the
+  # workspace minus `plugingo-e2e` on linux/amd64 and the crates
+  # `scripts/platform-crates` selects elsewhere, e.g.
+  # `TST_SCOPE='-p engine -p proc -p e2e' tst`.
+  #
+  # Extra args pass through to every call, so only a test-name filter and
+  # `-- --exact|--skip|--ignored|--include-ignored|--nocapture` make sense
+  # (`--test x` or `-p x` would fail the passes that have no such target, and
+  # nextest rejects `-- --test-threads=N`; use `-j N` before the filter). With
+  # args, a pass that matches no test only warns (`--no-tests=warn`), because a
+  # filter aimed at one crate matches nothing in the two feature passes; a bare
+  # `tst` that runs no test at all fails (`--no-tests=fail`).
+  # `tests/root/tst_script.rs` runs this text against a stub cargo. `rc`, not
+  # `status`: that name is read-only in zsh.
   scripts.tst.exec = ''
     rc=0
-    cargo test --locked --no-fail-fast --workspace --exclude bin-e2e "$@" || rc=$?
-    cargo test --locked --no-fail-fast -p plugin-stabby --features host "$@" || rc=$?
-    cargo test --locked --no-fail-fast -p plugin-sdk --features stabby "$@" || rc=$?
+    no_tests=fail
+    if [ "$#" -gt 0 ]; then no_tests=warn; fi
+    scope="--workspace --exclude bin-e2e"
+    if [ -n "$TST_SCOPE" ]; then scope="$TST_SCOPE"; fi
+    # $scope is unquoted on purpose: it is a list of cargo flags.
+    cargo nextest run --locked --no-fail-fast --no-tests="$no_tests" $scope "$@" || rc=$?
+    cargo test --locked --no-fail-fast --doc $scope "$@" || rc=$?
+    cargo nextest run --locked --no-fail-fast --no-tests="$no_tests" -p plugin-stabby --features host "$@" || rc=$?
+    cargo test --locked --no-fail-fast --doc -p plugin-stabby --features host "$@" || rc=$?
+    cargo nextest run --locked --no-fail-fast --no-tests="$no_tests" -p plugin-sdk --features stabby "$@" || rc=$?
+    cargo test --locked --no-fail-fast --doc -p plugin-sdk --features stabby "$@" || rc=$?
     exit "$rc"
   '';
 
