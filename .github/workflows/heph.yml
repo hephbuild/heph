@@ -1189,7 +1189,9 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: |
           set -euo pipefail
-          scripts/platform-crates > platform-crates.txt
+          # `python3` rather than the shebang: download-artifact drops the
+          # executable bit from the `repo` artifact.
+          python3 scripts/platform-crates > platform-crates.txt
           scope=$(tr '\n' ' ' < platform-crates.txt | sed 's/ *$//')
           count=$(grep -c . platform-crates.txt || true)
           if [ -z "$scope" ] || [ "$count" -eq 0 ]; then
@@ -1197,7 +1199,7 @@ jobs:
             exit 1
           fi
           echo "::group::Tier-2 crates and why (scripts/platform-crates --explain)"
-          scripts/platform-crates --explain
+          python3 scripts/platform-crates --explain
           echo "::endgroup::"
           echo "Tier 2: $count crates: $scope"
           echo "scope=$scope" >> "$GITHUB_OUTPUT"
