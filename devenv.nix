@@ -13,23 +13,27 @@ let
   # turns that hex into the SRI form below. All four are verified by Nix at
   # fetch time, so a wrong hash fails loudly rather than silently installing
   # something else.
-  kacheVersion = "0.13.0";
+  #
+  # A bump that changes kache's cache key format also wants a new R2 prefix
+  # (`.github/actions/setup-nix`), so the old entries age out instead of
+  # sitting next to ones nothing can hit.
+  kacheVersion = "1.2.2";
   kacheAssets = {
     aarch64-darwin = {
       target = "aarch64-apple-darwin";
-      hash = "sha256-8/TXz+ziDSUfh0Da4iR3fQlqXtKxYIscrplumPYBijE=";
+      hash = "sha256-ENCeFGhSqN+Hls9kLKWIchB6fzkbdkfsjMJTzyia8Kk=";
     };
     x86_64-darwin = {
       target = "x86_64-apple-darwin";
-      hash = "sha256-waUdA52DT2qtusGhZrlUTVMgs8qMsEhSD0XH1nqsG7U=";
+      hash = "sha256-mhw+zInPNrI1Eqk4aCJhQNRvH3DPbLZIv+CO6vslo2g=";
     };
     x86_64-linux = {
       target = "x86_64-unknown-linux-musl";
-      hash = "sha256-MK7e1NxuYgxACqOq96sWPclccDoPPdtNC6VsUfI/C9A=";
+      hash = "sha256-8vZVXe5QlFwqkKf7eTwghKAMxkWdCKwjBtONkFBkMhs=";
     };
     aarch64-linux = {
       target = "aarch64-unknown-linux-musl";
-      hash = "sha256-th3j3mqauyGjdfqcZRPUe7jPc5H07rJMW+KXJzi4POM=";
+      hash = "sha256-OIVs7mE/buDsV5CZ/JIFuECgtFu3Y/S4+ngtJdk8GO8=";
     };
   };
   kacheAsset =
@@ -232,15 +236,22 @@ in
   # exactly this workspace's expensive tail: the `heph` binary, the three plugin
   # cdylibs, every proc-macro, and every test harness. kache caches all of them.
   #
+  # The `cc` crate picks `RUSTC_WRAPPER=kache` up as its C compiler wrapper too,
+  # so build scripts' C (aws-lc-sys, zstd-sys, onig_sys) is cached the same way.
+  #
   # No remote is configured here, so a local shell is a local-disk cache and
-  # needs no daemon. CI points the same wrapper at R2 via `KACHE_S3_*` (see
-  # `.github/actions/setup-nix`). To share CI's cache locally, export those same
-  # vars and run `kache daemon start` — the remote is inert without the daemon.
+  # needs no daemon. CI points the same wrapper at R2 through a kache config
+  # file (see `.github/actions/setup-nix`). To share CI's cache locally, write
+  # the same `[cache.remote]` table, export `KACHE_S3_ACCESS_KEY` /
+  # `KACHE_S3_SECRET_KEY`, and run `kache daemon start` — the remote is inert
+  # without the daemon.
   env.RUSTC_WRAPPER = "kache";
 
   # Cache linked `bin` and `--test` executables on macOS too, not just Linux.
   #
-  # kache defaults this on for Linux and off for macOS: a Mach-O binary carries
+  # kache 1.x defaults this on everywhere; it is set explicitly because kache
+  # 0.x defaulted it off for macOS, and the reason to want it on there is not
+  # obvious. A Mach-O binary carries
   # only a *debug map* (`N_OSO` entries naming each `.o` by path + mtime) rather
   # than embedded DWARF, so a restored mac binary points at object files that no
   # longer match and LLDB drops to function names without file:line. Linux

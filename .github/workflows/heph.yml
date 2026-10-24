@@ -747,8 +747,11 @@ jobs:
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
           kache daemon stop || true
 
@@ -1031,8 +1034,11 @@ jobs:
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
           kache daemon stop || true
 
@@ -1156,8 +1162,11 @@ jobs:
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
           kache daemon stop || true
 
@@ -1363,8 +1372,10 @@ jobs:
           # Resolve the log path from the daemon itself rather than hardcoding
           # it. Both OSes run this same step and they do not agree: Linux puts
           # it at `~/.cache/kache/kache.log`, macOS at
-          # `~/Library/Logs/kache/kache.log`.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # `~/Library/Logs/kache/kache.log`. The status prints a `Logs` row with
+          # the path `~`-abbreviated.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
           kache daemon stop || true
 
@@ -1486,7 +1497,8 @@ jobs:
           echo "::group::kache report (top misses)"
           kache report --top 30 || true
           echo "::endgroup::"
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
           kache daemon stop || true
 
           # `stop` returns as soon as the daemon acknowledges; the daemon then
@@ -1712,8 +1724,11 @@ jobs:
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
           kache daemon stop || true
 
@@ -1855,8 +1870,11 @@ jobs:
           # it at `~/.cache/kache/kache.log`, macOS at
           # `~/Library/Logs/kache/kache.log` — note *Logs*, not the `Caches`
           # directory the upstream docs name, which is where hardcoding it
-          # would have silently produced nothing on the darwin legs.
-          log=$(kache daemon 2>/dev/null | awk '/^[[:space:]]*Logs:/ {print $2; exit}') || true
+          # would have silently produced nothing on the darwin legs. The status
+          # prints a `Logs` row with the path `~`-abbreviated; `kache daemon log`
+          # only streams, which would hang the step.
+          log=$(kache daemon 2>/dev/null | awk '$1 == "Logs" {print $2; exit}') || true
+          log=${log/#\~/$HOME}
 
           kache daemon stop || true
 

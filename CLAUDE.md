@@ -23,12 +23,25 @@ binary, the three plugin cdylibs, every proc-macro and every test harness.
   the wrapper reads and writes the store directly. On a copy-on-write filesystem
   (APFS, btrfs, XFS-with-reflink) restores are reflinks, so a restored `target/`
   costs almost no additional disk and blobs are shared across worktrees.
-- **CI** points the same wrapper at the shared R2 bucket via `KACHE_S3_*` and runs
-  the daemon (`.github/actions/setup-nix`). The remote is inert without the daemon:
-  it owns remote lookups and background uploads. Each compiling job ends with
-  `kache daemon stop`, which drains the upload queue before the runner is torn down.
-- To share CI's cache locally, export the same `KACHE_S3_*` vars and run
-  `kache daemon start`.
+- **CI** points the same wrapper at the shared R2 bucket through a kache config
+  file (`KACHE_CONFIG`, written by `.github/actions/setup-nix`) and runs the
+  daemon. The remote is inert without the daemon: it owns remote lookups and
+  background uploads. Each compiling job ends with `kache daemon stop`, which
+  waits for the upload queue to drain before the runner is torn down.
+- **Who writes**: kache only publishes from a push to a protected branch, so
+  `master` writes `kache/v2`. A PR run reads `kache/v2`, then `kache-pr/v2`, and
+  writes only `kache-pr/v2`: a PR's later pushes reuse its earlier ones, and
+  nothing a PR compiled reaches `master`'s prefix.
+- **C is cached too.** The `cc` crate uses `RUSTC_WRAPPER=kache` as its C
+  wrapper, so build scripts' C (aws-lc-sys, zstd-sys, onig_sys) goes through
+  the same cache and remote. A compile with a flag kache does not support is
+  passed through, and `kache report` counts it under passthroughs, not misses.
+- A cache hit can still show up as a miss: the wrapper gives the daemon 3s per
+  remote lookup, and an R2 round trip over that compiles the crate instead.
+  Misses at ~3,050 ms of overhead in `kache report` are these.
+- To share CI's cache locally, write the same `[cache.remote]` table into a
+  kache config file, export `KACHE_S3_ACCESS_KEY` / `KACHE_S3_SECRET_KEY`, and
+  run `kache daemon start`.
 
 `kache stats` for a summary, `kache monitor` for a live TUI, `kache why-miss <crate>`
 to explain a miss, `KACHE_PROGRESS=verbose` for per-crate stderr lines, and
