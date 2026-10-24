@@ -23,8 +23,8 @@
 //!     that makes a red lint stop a release can simply be deleted.
 //!
 //! What these tests **cannot** cover: lint reports through the rendered
-//! per-leg check names (`Lint linux/amd64`, and `Test darwin/arm64` /
-//! `Test linux/arm64`, whose legs run lint first). Whether those are
+//! per-leg check names (`Lint linux/amd64`, `Lint linux/arm64`,
+//! `Lint darwin/arm64`). Whether those are
 //! *required* lives in the repo's
 //! branch protection, outside this tree — so nothing here can assert that a red
 //! lint blocks a merge. `lint_gates_release_and_cleanup` guards the only part
@@ -661,9 +661,8 @@ fn lint_coordinates(jobs: &[(&str, String)]) -> Vec<String> {
 /// lint set the gate actually runs. Drop a platform's leg and nothing goes red
 /// — that platform's half of every `#[expect]` simply stops being checked.
 ///
-/// linux/amd64 lints in the `lint` job; darwin/arm64 and linux/arm64 lint as
-/// the first step of their Test legs. Both shapes count: a lint leg is any job
-/// whose steps run the `lint` script, located by its matrix coordinates.
+/// A lint leg is any job whose steps run the `lint` script, located by its
+/// matrix coordinates — today the three legs of the `lint` job.
 #[test]
 fn the_lint_gate_runs_on_every_supported_platform() {
     let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))

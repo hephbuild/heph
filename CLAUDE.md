@@ -90,10 +90,11 @@ It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run i
 ### What CI runs where
 
 - **linux/amd64** runs everything: `Lint linux/amd64`, `Test linux/amd64` (the workspace minus `bin-e2e` and `plugingo-e2e`), and `plugingo-e2e` compiled once (`Go E2E build`) and run in three shards (`Go E2E k/3`), whose run counts `Go E2E count` checks against the archive.
-- **darwin/arm64 and linux/arm64** run `lint` first, then the tests of the crates `scripts/platform-crates` selects — every crate with platform-conditional code (a `cfg` on a target key, a target-specific dependency, a build script reading `CARGO_CFG_TARGET_*`, `std::env::consts`), plus `crates/e2e` — then two Go smoke tests. `scripts/platform-crates --explain` says why each crate is in. A crate with no platform code of its own is compiled there (lint's `clippy --all-targets`) but tested on linux/amd64 only.
+- **Every platform** has its own lint job: `Lint linux/amd64`, `Lint linux/arm64`, `Lint darwin/arm64`.
+- **darwin/arm64 and linux/arm64** run the tests of the crates `scripts/platform-crates` selects — every crate with platform-conditional code (a `cfg` on a target key, a target-specific dependency, a build script reading `CARGO_CFG_TARGET_*`, `std::env::consts`), plus `crates/e2e` — then two Go smoke tests. `scripts/platform-crates --explain` says why each crate is in. A crate with no platform code of its own is compiled there (the Lint leg's `clippy --all-targets`) but tested on linux/amd64 only.
 - **bin-e2e** runs on all three, and gates only promotion to mainline. Artifacts reach the pre-release as each build finishes.
 
-A red `Test darwin/arm64` or `Test linux/arm64` can be lint or tests; the job's step summary says which.
+A red `Test darwin/arm64` or `Test linux/arm64` can be the tier-2 tests or the Go smoke tests; the job's step summary says which.
 
 ### Credentials
 
