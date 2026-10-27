@@ -298,6 +298,14 @@ impl CredentialCache {
     fn clear(&self) {
         self.cells.lock().clear();
     }
+
+    /// Drop the cells for `addr` under every parent identity.
+    fn forget(&self, addr: &str) {
+        self.cells.lock().retain(|key, _| {
+            key.strip_prefix(addr)
+                .is_none_or(|rest| !rest.is_empty() && !rest.starts_with('\u{1f}'))
+        });
+    }
 }
 
 impl Engine {
@@ -1484,6 +1492,16 @@ impl Engine {
         self.credential_cache.clear();
     }
 
+    /// Drop everything held for one credential, in this process and on disk.
+    /// `heph auth login --force`.
+    pub fn forget_credential(&self, addr: &Addr) -> anyhow::Result<()> {
+        let addr = addr.format();
+        self.credential_cache.forget(&addr);
+        self.credential_store()
+            .forget(&addr)
+            .with_context(|| format!("forget credential {addr}"))
+    }
+
     fn credential_store(&self) -> CredentialStore {
         CredentialStore::new(&self.home)
     }
@@ -2134,6 +2152,22 @@ fn check_env_collisions(consumer: &Addr, resolved: &[ResolvedCredential]) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forgetting_a_credential_drops_its_cells_under_every_parent_and_no_other() {
+        let cache = CredentialCache::default();
+        let parent = ["p".to_string()];
+        drop(cache.cell("//auth:a", &[]));
+        drop(cache.cell("//auth:a", &parent));
+        drop(cache.cell("//auth:ab", &[]));
+        drop(cache.cell("//auth:ab", &parent));
+
+        cache.forget("//auth:a");
+
+        let mut left: Vec<String> = cache.cells.lock().keys().cloned().collect();
+        left.sort();
+        assert_eq!(left, ["//auth:ab", "//auth:ab\u{1f}p"]);
+    }
 
     #[test]
     fn a_presented_file_lands_beside_the_workspace_and_never_inside_it() {
