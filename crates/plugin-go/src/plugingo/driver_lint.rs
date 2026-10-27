@@ -333,12 +333,9 @@ impl ManagedDriver for GoLintDriver {
                 raw_def: Arc::new(def),
                 inputs,
                 outputs,
-                support_files: vec![],
                 cache: CacheConfig::on(true),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }
@@ -791,13 +788,9 @@ impl ManagedDriver for GoLintGateDriver {
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(GoLintGateDef),
                 inputs,
-                outputs: vec![],
-                support_files: vec![],
                 cache: CacheConfig::on(true),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }
@@ -1169,12 +1162,9 @@ impl ManagedDriver for GoLintFixDriver {
                 raw_def: Arc::new(GoLintFixDef),
                 inputs,
                 outputs,
-                support_files: vec![],
                 cache: CacheConfig::on(true),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

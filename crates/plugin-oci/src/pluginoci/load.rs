@@ -67,7 +67,7 @@ use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::{Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
@@ -423,12 +423,8 @@ impl ManagedDriver for Driver {
                         collect: true,
                     }],
                 }],
-                support_files: vec![],
-                cache: CacheConfig::off(),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

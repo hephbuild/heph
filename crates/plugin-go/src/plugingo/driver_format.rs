@@ -285,12 +285,9 @@ impl ManagedDriver for GoFormatDriver {
                 }),
                 inputs,
                 outputs,
-                support_files: vec![],
                 cache: CacheConfig::on(true),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }
@@ -413,13 +410,9 @@ impl ManagedDriver for GoFormatCheckDriver {
                     runner: runner.clone(),
                 }),
                 inputs,
-                outputs: vec![],
-                support_files: vec![],
                 cache: CacheConfig::on(true),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

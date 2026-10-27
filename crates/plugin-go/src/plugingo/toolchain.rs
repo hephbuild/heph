@@ -601,14 +601,10 @@ impl ManagedDriver for GoToolchainDriver {
                 raw_def: Arc::new(def),
                 // No inputs: the SDK is fetched from the network, not from
                 // other targets or the host filesystem.
-                inputs: vec![],
                 outputs,
-                support_files: vec![],
                 cache: CacheConfig::on(true),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

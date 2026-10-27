@@ -465,16 +465,10 @@ impl hplugin::driver::Driver for CachingEntrypoint {
         Ok(hplugin::driver::ParseResponse {
             target_def: hplugin::driver::targetdef::TargetDef {
                 addr: req.target_spec.addr.clone(),
-                labels: vec![],
-                raw_def: Arc::new(()),
-                inputs: vec![],
-                outputs: vec![],
-                support_files: vec![],
                 cache: hplugin::driver::targetdef::CacheConfig::on(true),
                 entrypoint: true,
-                pty: false,
                 hash: b"caching".to_vec(),
-                transparent: false,
+                ..Default::default()
             },
         })
     }

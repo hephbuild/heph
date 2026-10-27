@@ -316,14 +316,11 @@ impl ManagedDriver for Driver {
                 raw_def: Arc::new(def),
                 inputs: vec![nix_tool],
                 outputs,
-                support_files: vec![],
                 // The wrapper points at host-local /nix/store paths; remote
                 // consumers would not have those paths realized.
                 cache: CacheConfig::on(false),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

@@ -196,15 +196,12 @@ impl ManagedDriver for Driver {
                         collect: true,
                     }],
                 }],
-                support_files: vec![],
                 // Local yes, remote never: the answer is a fact about *this*
                 // daemon's image store, and publishing it would let one
                 // machine's resolution key another's builds.
                 cache: CacheConfig::on(false),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

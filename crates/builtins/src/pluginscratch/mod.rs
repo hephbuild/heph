@@ -303,17 +303,12 @@ impl hplugin::driver::Driver for Driver {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                inputs: vec![],
-                outputs: vec![],
-                support_files: vec![],
                 // Never cached as a target: there is nothing to cache. The
                 // directory it names is managed by the engine's scratch store,
                 // which is a different thing with a different lifetime.
                 cache: CacheConfig::off(),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

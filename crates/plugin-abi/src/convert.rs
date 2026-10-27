@@ -1333,13 +1333,13 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
                 .collect::<anyhow::Result<_>>()?,
             support_files: paths_from_pb(td.support_files)?,
             cache: cache_config_from_pb(required_msg(td.cache, "TargetDef.cache")?)?,
-            // Entrypoints are builtin-only: the wire has no field for it, so a
-            // cdylib driver's def is never one, whatever it set in-process.
-            entrypoint: false,
             pty: td.pty.unwrap_or_default(),
             hash: required(td.hash, "TargetDef.hash")?,
             transparent: td.transparent.unwrap_or_default(),
             addr: addr.clone(),
+            // Entrypoints are builtin-only: the wire has no field for it, so a
+            // cdylib driver's def is never one, whatever it set in-process.
+            ..Default::default()
         })
     })();
     def.with_context(|| format!("decoding the def of {}", addr.format()))

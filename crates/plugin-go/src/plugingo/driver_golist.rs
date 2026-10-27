@@ -422,12 +422,9 @@ impl ManagedDriver for GoGolistDriver {
                 raw_def: Arc::new(def),
                 inputs: dep_inputs.into_iter().chain([gocache_input]).collect(),
                 outputs,
-                support_files: vec![],
                 cache: CacheConfig::on(true),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

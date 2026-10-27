@@ -6,7 +6,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse, outputartifact,
     targetdef::{
-        CacheConfig, Output, TargetDef,
+        Output, TargetDef,
         path::{CodegenMode, Content, Path},
     },
 };
@@ -86,7 +86,6 @@ impl hplugin::driver::Driver for Driver {
                     out: out.clone(),
                     executable,
                 }),
-                inputs: vec![],
                 outputs: vec![Output {
                     group: "".to_string(),
                     paths: vec![Path {
@@ -95,12 +94,8 @@ impl hplugin::driver::Driver for Driver {
                         collect: false,
                     }],
                 }],
-                support_files: vec![],
-                cache: CacheConfig::off(),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

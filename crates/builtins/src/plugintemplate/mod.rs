@@ -19,7 +19,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
     ParseRequest, ParseResponse, RunRequest, RunResponse, TargetAddr, outputartifact,
     targetdef::{
-        CacheConfig, Input, InputMode, Output, TargetDef,
+        Input, InputMode, Output, TargetDef,
         path::{CodegenMode, Content, Path},
     },
 };
@@ -162,12 +162,8 @@ impl hplugin::driver::Driver for Driver {
                         collect: false,
                     }],
                 }],
-                support_files: vec![],
-                cache: CacheConfig::off(),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

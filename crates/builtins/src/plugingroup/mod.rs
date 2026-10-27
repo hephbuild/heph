@@ -221,16 +221,14 @@ impl hplugin::driver::Driver for Driver {
                 raw_def: Arc::new(GroupDef { transform }),
                 inputs,
                 outputs,
-                support_files: vec![],
                 // Off in both modes, for different reasons: an aggregate group
                 // has nothing of its own to cache, and a relocating one owns no
                 // bytes — its artifacts borrow its deps'. See `is_passthrough`
                 // in the engine.
                 cache: CacheConfig::off(),
-                pty: false,
                 hash,
                 transparent: !relocating,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }

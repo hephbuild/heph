@@ -338,16 +338,13 @@ impl ManagedDriver for Driver {
                         collect: true,
                     }],
                 }],
-                support_files: vec![],
                 // Local yes, remote never. The captured environment names this
                 // machine's nix store paths; publishing it would let one host's
                 // answer key another's builds, which is the cross-machine
                 // mix-up the fingerprint exists to prevent.
                 cache: CacheConfig::on(false),
-                pty: false,
                 hash,
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             },
         })
     }
