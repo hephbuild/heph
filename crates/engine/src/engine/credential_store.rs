@@ -329,6 +329,50 @@ impl CredentialStore {
         Ok(true)
     }
 
+    /// Drop every cached entry for one credential, under any source or parent
+    /// identity. `heph auth login --force`, so the next build acquires from the
+    /// session it just signed in to rather than serving what the old one minted.
+    ///
+    /// By the `addr` each entry records, because the key is a digest that also
+    /// covers the source and the parents, and every one of those is stale.
+    pub fn forget(&self, addr: &str) -> anyhow::Result<()> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("list {}", self.root.display())),
+        };
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("list {}", self.root.display()))?
+                .path();
+            let Some(key) = path
+                .extension()
+                .is_some_and(|x| x == "json")
+                .then(|| path.file_stem().and_then(|s| s.to_str()))
+                .flatten()
+            else {
+                continue;
+            };
+            // Unreadable or foreign: `get` would not serve it either.
+            let Some(e) = std::fs::read(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<Entry>(&raw).ok())
+            else {
+                continue;
+            };
+            if e.addr != addr {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
+            }
+            drop(std::fs::remove_dir_all(self.files_dir(key)));
+        }
+        Ok(())
+    }
+
     /// Drop every cached entry. `heph auth logout`.
     pub fn clear(&self) -> anyhow::Result<()> {
         match std::fs::remove_dir_all(&self.root) {
@@ -477,6 +521,33 @@ mod tests {
         // Past its expiry, the entry is both a miss and gone.
         assert!(store.get("k", now + Duration::from_secs(3601)).is_none());
         assert!(store.get("k", now).is_none(), "an expired entry is removed");
+    }
+
+    /// `login --force` forgets one credential under every key it was stored
+    /// at, and only that credential — not one whose address merely starts the
+    /// same way.
+    #[test]
+    fn forget_drops_every_entry_for_one_address_and_no_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CredentialStore::new(dir.path());
+        // Nothing stored yet is not an error.
+        store.forget("//auth:a").expect("forget on an empty store");
+        let now = SystemTime::now();
+        let m = material(Some(3600), now);
+        for (key, addr) in [("k1", "//auth:a"), ("k2", "//auth:a"), ("k3", "//auth:ab")] {
+            assert!(store.put(key, addr, "exec(x)", &m, now).expect("put"));
+        }
+        std::fs::create_dir_all(store.files_dir("k1")).expect("files dir");
+
+        store.forget("//auth:a").expect("forget");
+
+        assert!(store.get("k1", now).is_none());
+        assert!(store.get("k2", now).is_none());
+        assert!(!store.files_dir("k1").exists(), "its files go with it");
+        assert!(
+            store.get("k3", now).is_some(),
+            "a near-miss address is kept"
+        );
     }
 
     #[cfg(unix)]

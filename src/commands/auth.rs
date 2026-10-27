@@ -24,7 +24,7 @@
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::progress_app::{request_state, run_with_progress};
-use crate::engine::credential::source_login;
+use crate::engine::credential::{Chain, source_login};
 use crate::engine::{Engine, get_cwp};
 use crate::tui::{self, AppContext, LogSink};
 use anyhow::Context as _;
@@ -65,7 +65,12 @@ pub enum AuthCommands {
     ///
     /// Example: `heph auth explain //auth:aws`
     Explain(ExplainArgs),
-    /// Run whichever sign-in commands the probe found stale
+    /// Run the sign-in commands of every source that is stale
+    ///
+    /// Stale is a source the probe skipped, or the chosen source when
+    /// acquiring from it fails — the probe only checks that its tool is there,
+    /// so an expired session behind an installed tool shows up here. `--force`
+    /// signs in to the chosen source regardless.
     ///
     /// Never requires a terminal: it runs the vendor's own command with this
     /// process's stdio attached, so a browser flow works interactively and an
@@ -76,6 +81,8 @@ pub enum AuthCommands {
     /// `heph auth login` — everything that has gone stale
     ///
     /// `heph auth login //auth:aws` — one credential
+    ///
+    /// `heph auth login //auth:aws --force` — sign in again anyway
     Login(LoginArgs),
     /// Forget every acquired credential, in this process and on disk
     ///
@@ -110,6 +117,11 @@ pub struct LoginArgs {
     /// Credential to sign in to. Defaults to every one that has gone stale.
     #[arg(value_name = "TARGET_ADDRESS")]
     pub addr: Option<String>,
+    /// Sign in again even where the current session still works, and forget
+    /// what heph has cached for the credential — to switch accounts, or when a
+    /// session is broken in a way heph cannot see.
+    #[arg(long, short)]
+    pub force: bool,
 }
 
 impl AuthArgs {
@@ -450,7 +462,7 @@ async fn login(args: LoginArgs, sink: LogSink, global: GlobalOptions) -> anyhow:
         None => Wanted::All(credential_matcher(None)?),
     };
     run_with_progress(label, sink, global.no_tui, shutdown, move |ctx| {
-        login_body(engine, wanted, global.fail_fast, ctx)
+        login_body(engine, wanted, args.force, global.fail_fast, ctx)
     })
     .await
 }
@@ -466,6 +478,7 @@ enum Wanted {
 async fn login_body(
     engine: Arc<Engine>,
     wanted: Wanted,
+    force: bool,
     fail_fast: bool,
     ctx: AppContext,
 ) -> anyhow::Result<()> {
@@ -489,14 +502,40 @@ async fn login_body(
     let mut ran = 0usize;
     for (addr, def) in &creds {
         let walk = engine.walk_chain(&rs, addr, def).await;
-        // Only sources the probe found *stale*. Running a login for a source
-        // that already works would re-open a browser for nothing — and gcloud's
-        // two independent logins are exactly why this is per-source rather than
-        // per-credential.
-        for step in walk.iter().filter(|s| s.skipped.is_some()) {
-            let Some(src) = def.sources.get(step.index) else {
-                continue;
-            };
+        let chosen = walk.iter().position(|s| s.skipped.is_none());
+        // Sources the probe found *stale*: the ones it skipped before reaching
+        // the chosen one. Running a login for a source that already works would
+        // re-open a browser for nothing — and gcloud's two independent logins
+        // are exactly why this is per-source rather than per-credential. A
+        // source after the chosen one was never probed, so it is not stale.
+        let mut due: Vec<usize> = walk
+            .iter()
+            .take(chosen.unwrap_or(walk.len()))
+            .map(|s| s.index)
+            .collect();
+        // The chosen source's probe only asks whether its tool is *there*, so
+        // an expired session behind a tool that is installed reads as fine. If
+        // it has a sign-in to offer, find out the way a build would — by
+        // acquiring — and sign in when that fails. `--force` signs in
+        // regardless, and forgets what the old session minted so the next
+        // build does not keep serving it.
+        if let Some(step) = chosen.and_then(|i| walk.get(i))
+            && def
+                .sources
+                .get(step.index)
+                .is_some_and(|src| !source_login(src).is_empty())
+        {
+            if force {
+                engine.forget_credential(addr)?;
+                due.push(step.index);
+            } else if let Err(e) = engine.acquire_credential(&rs, addr, &Chain::root()).await {
+                tui::paused!(ctx, {
+                    println!("{addr}: {} does not work here: {e:#}", step.label)
+                });
+                due.push(step.index);
+            }
+        }
+        for src in due.iter().filter_map(|&i| def.sources.get(i)) {
             for argv in source_login(src) {
                 if argv.is_empty() {
                     continue;
@@ -871,11 +910,91 @@ mod tests {
     }
 
     async fn run_login(engine: Arc<Engine>) -> anyhow::Result<()> {
+        run_login_with(engine, false).await
+    }
+
+    async fn run_login_with(engine: Arc<Engine>, force: bool) -> anyhow::Result<()> {
         let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
         run_with_progress("t", LogSink::new_direct(), true, shutdown, move |ctx| {
-            login_body(engine, Wanted::One(token()), false, ctx)
+            login_body(engine, Wanted::One(token()), force, false, ctx)
         })
         .await
+    }
+
+    /// An `exec` source whose tool *is* on PATH, so the probe chooses it, and
+    /// whose sign-in leaves `marker` behind as proof it ran.
+    fn installed_exec_source(run: &str, marker: &std::path::Path) -> Value {
+        Value::Map(
+            [
+                ("kind".to_string(), s("exec")),
+                (
+                    "run".to_string(),
+                    Value::List(vec![s("sh"), s("-c"), s(run)]),
+                ),
+                (
+                    "fields".to_string(),
+                    Value::Map([("token".to_string(), s("t"))].into()),
+                ),
+                (
+                    "login".to_string(),
+                    Value::List(vec![
+                        s("sh"),
+                        s("-c"),
+                        s(&format!("touch '{}'", marker.display())),
+                    ]),
+                ),
+            ]
+            .into(),
+        )
+    }
+
+    /// The reported bug: the probe only checks that the tool is installed, so
+    /// an expired session behind it read as "nothing to sign in to". `login`
+    /// now acquires from the chosen source and signs in when that fails.
+    #[tokio::test]
+    async fn login_signs_in_when_the_chosen_source_fails_to_acquire() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let marker = root.path().join("signed-in");
+        let expired = installed_exec_source("echo 'session expired' >&2; exit 1", &marker);
+        run_login(credential_engine(root.path(), vec![expired])?).await?;
+        assert!(marker.exists(), "the chosen source's sign-in ran");
+        Ok(())
+    }
+
+    /// A chosen source that acquires is left alone — unless `--force`, which
+    /// signs in regardless.
+    #[tokio::test]
+    async fn login_leaves_a_working_source_alone_unless_forced() -> anyhow::Result<()> {
+        let working = r#"echo '{"t":"tok"}'"#;
+
+        let root = tempfile::tempdir()?;
+        let marker = root.path().join("signed-in");
+        let src = installed_exec_source(working, &marker);
+        run_login(credential_engine(root.path(), vec![src])?).await?;
+        assert!(!marker.exists(), "a working session needs no sign-in");
+
+        let root = tempfile::tempdir()?;
+        let marker = root.path().join("signed-in");
+        let src = installed_exec_source(working, &marker);
+        run_login_with(credential_engine(root.path(), vec![src])?, true).await?;
+        assert!(marker.exists(), "--force signs in anyway");
+        Ok(())
+    }
+
+    /// A source after the chosen one was never probed, so it is not stale and
+    /// its sign-in does not run.
+    #[tokio::test]
+    async fn login_skips_sources_the_walk_never_reached() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let marker = root.path().join("signed-in");
+        let unreached = installed_exec_source("exit 1", &marker);
+        run_login(credential_engine(
+            root.path(),
+            vec![env_source("PATH"), unreached],
+        )?)
+        .await?;
+        assert!(!marker.exists(), "an unreached source is not signed in to");
+        Ok(())
     }
 
     /// `login` runs a stale source's sign-in command with the terminal handed

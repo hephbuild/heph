@@ -512,7 +512,7 @@ and `bases`, which is also the hermetic way to take one.
 |---|---|
 | `heph auth status` | one row per declared credential. Exits non-zero unless every row is `ok`. `--json` carries `addr`, `state`, `source`, `expires_at`, `login`. |
 | `heph auth explain <addr>` | the whole chain walk: every source, why each was skipped, which won. |
-| `heph auth login [addr]` | runs whichever login commands the probe found stale. Never requires a terminal. |
+| `heph auth login [addr] [--force]` | runs the login commands of the sources the probe found stale, and of the chosen source when acquiring from it fails — a probe only checks that the tool is there, so an expired session behind an installed tool is caught by the acquire. `--force` runs the chosen source's login regardless and forgets the credential's cached material. Never requires a terminal. |
 | `heph auth logout` | clears the disk tier. |
 | `heph __auth-helper` | hidden. Speaks one callback dialect; parsed before the argument parser, since its argv and stdin belong to the calling tool. |
 

@@ -112,7 +112,8 @@ pub enum SourceKind {
         fields: BTreeMap<String, String>,
         expires: Option<String>,
         /// A *list* of argvs: some tools keep more than one login store, and
-        /// `heph auth login` runs whichever the probe found stale.
+        /// `heph auth login` runs them when the source is stale: skipped by the
+        /// probe, or chosen and failing to acquire.
         login: Vec<Vec<String>>,
         /// Where the probe and the command run. Both, necessarily: probing the
         /// host for a program that lives in a devenv shell answers the wrong

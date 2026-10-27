@@ -286,7 +286,8 @@ pub fn definitions() -> Vec<PluginFnDef> {
              that `run[0]` resolves inside `runner`, then runs it there. Stdout is JSON \
              and `fields` maps material field → JSON key (keys may be dotted paths). \
              `login` is a *list* of argvs, because some tools keep more than one login \
-             store; `heph auth login` runs whichever the probe found stale. A command \
+             store; `heph auth login` runs them when the probe skips this source or \
+             acquiring from it fails, and `--force` runs them regardless. A command \
              that writes files is a target, not a source — there is deliberately no \
              way to name output files here.",
             |args| {
