@@ -195,8 +195,22 @@ fn main() -> ExitCode {
     };
 
     let exec_result = cli.command.execute(sink, &cli.global);
+    // An entrypoint's program ended without success: heph exits as it did.
+    // Nothing to render — the program said what it had to say.
+    let tool_exit = exec_result
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<commands::run::ToolExit>())
+        .map(|t| t.0);
     let result = match &exec_result {
         Ok(_) => ExitCode::SUCCESS,
+        Err(_) if tool_exit.is_some() => match tool_exit {
+            Some(hexecrunner::foreground::ForegroundExit::Code(code)) => {
+                ExitCode::from(u8::try_from(code).unwrap_or(1))
+            }
+            // Re-raised below, once everything else on the way out has run.
+            _ => ExitCode::FAILURE,
+        },
         Err(e) => {
             // Render a graphical diagnostic if the error chain carries one
             // (Starlark/Go diagnostics from single-error commands). The TUI is
@@ -229,6 +243,12 @@ fn main() -> ExitCode {
     // Flush the final (filtered) report and stop the watcher.
     if let Some(watcher) = pprof_watcher {
         watcher.shutdown();
+    }
+
+    // Die of the signal that killed the program, rather than exit 128+N: a
+    // shell treats "killed by SIGINT" and "exited 130" differently.
+    if let Some(hexecrunner::foreground::ForegroundExit::Signal(sig)) = tool_exit {
+        hexecrunner::foreground::reraise(sig);
     }
 
     result

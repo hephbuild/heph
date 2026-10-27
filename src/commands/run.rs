@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
 
@@ -10,8 +11,10 @@ use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
 use crate::commands::utils::resolve_matcher;
+use crate::engine::driver::entrypoint::{Caller, PreparedCommand};
 use crate::engine::{
-    Discovery, Engine, Gaps, InteractiveWrapper, OutputMatcher, ResultOptions, get_cwp,
+    Discovery, Engine, Gaps, InteractiveWrapper, InvokeRequest, OutputMatcher, PreparedInvocation,
+    ResultOptions, get_cwp,
 };
 use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, LogSink};
@@ -120,12 +123,39 @@ pub struct RunArgs {
     /// diagnostic box. The full log is always saved as the `log.txt` artifact.
     #[arg(long = "log-lines", value_name = "N", default_value_t = 10)]
     pub log_lines: usize,
+    /// Arguments for an `exec.entrypoint` target that declares `args = True`,
+    /// after `--`: appended to its command, verbatim. Everything after `--`
+    /// is the program's, flags included (`heph run //t:go -- --version`).
+    #[arg(last = true, value_name = "ARGS")]
+    pub args: Vec<OsString>,
 }
+
+/// The program an entrypoint ran ended without success: heph exits as it did,
+/// with its code, or by re-raising the signal that killed it. Carried out to
+/// `main` as an error so the exit goes through its usual tail.
+#[derive(Debug)]
+pub struct ToolExit(pub hexecrunner::foreground::ForegroundExit);
+
+impl std::fmt::Display for ToolExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            hexecrunner::foreground::ForegroundExit::Code(c) => write!(f, "exited with {c}"),
+            hexecrunner::foreground::ForegroundExit::Signal(s) => {
+                write!(f, "killed by signal {s}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ToolExit {}
 
 struct RunApp {
     args: RunArgs,
     engine: Arc<Engine>,
     matcher: Matcher,
+    /// The caller's raw cwd and environment, captured before anything else
+    /// ran: what an entrypoint target runs with.
+    caller: Caller,
     fail_fast: bool,
     auto_approve: bool,
     /// `--no-scratch`: run with every declared scratch cache absent. Implies a
@@ -146,9 +176,41 @@ impl RunApp {
     }
 }
 
+impl RunApp {
+    /// An entrypoint: prepare it, and hand the command out of the app so the
+    /// binary spawns it once the TUI is gone.
+    async fn invoke(
+        self,
+        ctx: AppContext,
+        rs: Arc<crate::engine::request_state::RequestState>,
+        addr: crate::htaddr::Addr,
+    ) -> anyhow::Result<Option<PreparedInvocation>> {
+        let mut caller = self.caller;
+        caller.args = self.args.args;
+        let res = self
+            .engine
+            .clone()
+            .invoke(
+                rs.clone(),
+                InvokeRequest {
+                    addr,
+                    caller,
+                    shell: self.args.shell.is_some(),
+                },
+            )
+            .await;
+        let (res, prepared) = match res {
+            Ok(p) => (Ok(()), Some(p)),
+            Err(e) => (Err(e), None),
+        };
+        crate::commands::errors::finalize!(ctx, rs, res)?;
+        Ok(prepared)
+    }
+}
+
 #[async_trait]
 impl App for RunApp {
-    type Output = ();
+    type Output = Option<PreparedInvocation>;
     type TuiView = tui::TuiProgressView;
     type CiView = tui::CiProgressView;
 
@@ -160,7 +222,7 @@ impl App for RunApp {
         tui::CiProgressView::new(self.progress_label())
     }
 
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
+    async fn run(self, ctx: AppContext) -> anyhow::Result<Option<PreparedInvocation>> {
         let interactive: Option<InteractiveWrapper> = if ctx.interactive() {
             let pauser = ctx.pauser();
             // Who owns Ctrl-C while the target holds the terminal. `--shell` puts
@@ -248,6 +310,23 @@ impl App for RunApp {
             Some(approval),
         );
 
+        // An entrypoint is invoked, not built: it takes its own path from here.
+        // An unresolvable address falls through, so the build path reports it
+        // the way it reports any other.
+        if let Matcher::Addr(addr) = &self.matcher
+            && matches!(self.engine.is_entrypoint(&rs, addr).await, Ok(true))
+        {
+            let addr = addr.clone();
+            return self.invoke(ctx, rs, addr).await;
+        }
+        if !self.args.args.is_empty() {
+            anyhow::bail!(
+                "arguments after `--` are taken only by a single exec.entrypoint target that \
+                 declares `args = True`; {} is not one",
+                self.progress_label().trim_start_matches("Running "),
+            );
+        }
+
         // Fold both matcher paths into a single `res: Result<Vec<_>>` so the
         // `finalize!` paved road handles rendering and exit uniformly. The engine
         // already returns `Err` for cancellation and genuine top-level failures;
@@ -289,7 +368,7 @@ impl App for RunApp {
 
         // On success print `--cat-out` / `--list-out`; failures/cancellation are
         // rendered and turned into the right exit by the macro.
-        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps, result => {
+        let finalized: anyhow::Result<()> = crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps, result => {
             // Outputs are handed over only for a complete selection, exactly
             // as for one where a target failed: `--copy-out` into a directory
             // holding an earlier complete run would otherwise leave the
@@ -338,7 +417,8 @@ impl App for RunApp {
                 }
             }
             Ok(())
-        })
+        });
+        finalized.map(|()| None)
     }
 }
 
@@ -347,6 +427,14 @@ pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow:
 }
 
 async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+    // Raw, before anything else reads either: what an entrypoint runs with.
+    // Not the engine's memoized cwd — the caller's cwd may be outside the
+    // workspace, and an entrypoint runs there.
+    let caller = Caller {
+        cwd: std::env::current_dir().context("read the current directory")?,
+        env: std::env::vars_os().collect(),
+        args: Vec::new(),
+    };
     let base_pkg = get_cwp()?;
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
@@ -354,6 +442,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         args,
         engine: std::sync::Arc::clone(&engine),
         matcher: m,
+        caller,
         fail_fast: global.fail_fast,
         auto_approve: global.auto_approve,
         scratch_off: global.no_scratch,
@@ -427,5 +516,63 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     // await any hook's final out-of-process flush before returning so a process
     // exit never races it.
     engine.await_hooks().await;
-    result
+    match result? {
+        None => Ok(()),
+        Some(prepared) => run_prepared(prepared).await,
+    }
+}
+
+/// Run an entrypoint's prepared command in the foreground, now that the TUI
+/// has torn down, and exit as it did. The holds on its closure are released
+/// only once it has exited.
+async fn run_prepared(prepared: PreparedInvocation) -> anyhow::Result<()> {
+    let PreparedCommand { argv, env, cwd } = prepared.command.clone();
+    let program = argv.first().cloned().unwrap_or_default();
+    let started_in = cwd.clone();
+    let exit = tokio::task::spawn_blocking(move || {
+        hexecrunner::foreground::run_foreground(&argv, &env, &cwd)
+    })
+    .await
+    .context("the foreground wait panicked")?;
+    drop(prepared);
+    match exit.with_context(|| format!("start {program:?} in {}", started_in.display()))? {
+        hexecrunner::foreground::ForegroundExit::Code(0) => Ok(()),
+        other => Err(ToolExit(other).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        run: RunArgs,
+    }
+
+    fn parse(argv: &[&str]) -> RunArgs {
+        Cli::try_parse_from(std::iter::once("run").chain(argv.iter().copied()))
+            .expect("parse")
+            .run
+    }
+
+    /// Everything after `--` is the program's, in order and verbatim — heph's
+    /// own flag names included, so `-- --quiet` reaches the tool (D18).
+    #[test]
+    fn args_after_double_dash_are_the_programs() {
+        let args = parse(&["//t:go", "--", "--quiet", "", "-e", "--force", "x y"]);
+        assert_eq!(args.arg1.as_deref(), Some("//t:go"));
+        assert!(!args.force, "a flag after `--` is not heph's");
+        assert_eq!(
+            args.args,
+            ["--quiet", "", "-e", "--force", "x y"].map(OsString::from)
+        );
+        assert!(
+            parse(&["//t:go", "--"]).args.is_empty(),
+            "a bare `--` is fine"
+        );
+        assert!(parse(&["//t:go"]).args.is_empty());
+    }
 }

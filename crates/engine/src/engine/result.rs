@@ -2140,7 +2140,12 @@ impl Engine {
                 enclose!((self => engine, rs, opts, addr, outputs) async move {
                     // Released when this task ends, however it ends.
                     let _permit = permit;
-                    let r = engine.result_addr(rs, &addr, outputs, &opts).await;
+                    // An entrypoint is invoked on its own, never as one of a
+                    // selection — refused before any of it builds (I8).
+                    let r = match engine.refuse_entrypoint_in_selection(&rs, &addr).await {
+                        Ok(()) => engine.result_addr(rs, &addr, outputs, &opts).await,
+                        Err(e) => Err(e),
+                    };
                     (addr, r)
                 }),
             );
@@ -4287,6 +4292,15 @@ impl Engine {
             })
         {
             def.cache.history = def.cache.history.saturating_mul(2);
+        }
+
+        // An entrypoint is never cached, whatever its driver's parse said and
+        // whatever default reached it. Forced here, from the capability, because
+        // every cache decision downstream reads `def.cache` before anything
+        // executes — a zero-output remote "hit" must never make `go test` a
+        // no-op (I6, D43).
+        if driver.is_entrypoint() {
+            def.cache = crate::engine::driver::targetdef::CacheConfig::off();
         }
 
         if def.hash.is_empty() {

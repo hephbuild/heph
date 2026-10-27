@@ -85,6 +85,8 @@ pub use hdriver_bridge::driver_managed_fuse;
 pub use hdriver_support::driver_managed;
 pub use hdriver_support::driver_managed_os;
 mod execute;
+pub mod invoke;
+pub use invoke::{InvokeRequest, PreparedInvocation};
 mod managed_register;
 mod result_lock;
 pub use result_lock::{LockBackend, ResultLock};

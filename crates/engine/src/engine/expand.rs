@@ -2,6 +2,7 @@ use crate::engine::Engine;
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::path::Content;
 use crate::engine::driver::targetdef::{Input, InputMode};
+use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
 use async_recursion::async_recursion;
 use enclose::enclose;
@@ -158,7 +159,8 @@ impl Engine {
                             None,
                             &mut visited,
                         )
-                        .await?;
+                        .await
+                        .map_err(|e| EntrypointAsInput::name_consumer(e, &addr))?;
                     Ok(Arc::new(expanded))
                 }),
             )
@@ -201,6 +203,20 @@ impl Engine {
             let def = Arc::clone(&self)
                 .get_def(rs.clone(), &input.r#ref.r#ref)
                 .await?;
+
+            // Every input path converges here — deps, runtime_deps, tools,
+            // hash_deps, a runner, a `${read://…}`, a dep's transitive closure,
+            // a credential edge, and the members of a group — so this is the one
+            // place an entrypoint is refused as one (I8). Otherwise a build step
+            // could run something in a developer's cwd.
+            if self.is_entrypoint_driver(&def.driver) {
+                return Err(EntrypointAsInput {
+                    entrypoint: input.r#ref.r#ref.clone(),
+                    origin_id: input.origin_id.clone(),
+                    consumer: None,
+                }
+                .into());
+            }
 
             if def.target_def.transparent {
                 let out = result.get_or_insert_with(|| {

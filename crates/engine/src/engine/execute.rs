@@ -42,6 +42,13 @@ impl Engine {
             .get(&spec.driver)
             .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
             .cloned()?;
+        // The backstop for a direct `result_addr` on an entrypoint: it runs
+        // only through `Engine::invoke`, never in a sandbox (D30, I8).
+        if driver.is_entrypoint() {
+            return Err(
+                crate::engine::invoke::EntrypointNotBuildable { addr: addr.clone() }.into(),
+            );
+        }
 
         hcore::hmemoizer::set_phase("execute:inputs_result_exec");
         let deps_result = self

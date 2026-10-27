@@ -438,6 +438,26 @@ pub struct LocalCacheSQLite {
 }
 
 impl LocalCacheSQLite {
+    /// Resolve once every write queued before the call has committed.
+    ///
+    /// For a caller about to leave the process without the teardown that
+    /// would otherwise drain the writer — an entrypoint invocation, whose
+    /// freshly built deps must be cached when the tool exits (D43). Writes
+    /// queued after the call are not waited for. Awaits; never parks a worker.
+    pub(crate) async fn drain_queued_writes(&self) {
+        let slots: Vec<Arc<PendingSlot>> = self
+            .pending
+            .map
+            .lock()
+            .expect("pending tracker poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for slot in slots {
+            slot.wait_async().await;
+        }
+    }
+
     pub fn with_pipe_limit(
         db_path: PathBuf,
         inline_threshold: usize,

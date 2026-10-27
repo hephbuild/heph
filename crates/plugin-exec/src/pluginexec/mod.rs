@@ -1,3 +1,4 @@
+pub mod entrypoint;
 mod filterenv;
 mod pty;
 pub mod redact;
@@ -206,6 +207,193 @@ fn sorted_by_group(m: HashMap<String, Vec<String>>) -> Vec<(String, Vec<String>)
     let mut v: Vec<(String, Vec<String>)> = m.into_iter().collect();
     v.sort_by(|a, b| a.0.cmp(&b.0));
     v
+}
+
+// ---- Parse helpers shared by `exec`/`bash` and `exec.entrypoint` (D19) ----
+//
+// Shared by name rather than by branching one `parse` on the driver: each
+// driver builds its own def, from the same input vocabulary (D8). Their output
+// for `exec` is pinned by `exec_def_hash_golden_populated`.
+
+/// The inputs a `{group: [addr]}` dep attribute declares, ordered by group.
+///
+/// Sorted, not `HashMap` order: this is the order of `def.inputs`, and the
+/// transitive collector numbers each merged sandbox by an input's *position*
+/// in that list — a number that ends up in the merged dep/tool ids, and so in
+/// the def hash. Left in map order, a target with two or more dep groups hashes
+/// differently in every process and never hits its cache.
+pub(crate) fn build_dep_inputs(
+    pkg: &hmodel::htpkg::PkgBuf,
+    deps: HashMap<String, Vec<String>>,
+    origin_prefix: &str,
+    hashed: bool,
+    runtime: bool,
+    read_only_groups: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<(String, Input)>> {
+    let mut out = Vec::new();
+    for (k, v) in sorted_by_group(deps) {
+        let read_only = read_only_groups.contains(&k);
+        for (i, v) in v.into_iter().enumerate() {
+            let annotations = if read_only {
+                BTreeMap::from([(
+                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                    "true".to_string(),
+                )])
+            } else {
+                BTreeMap::new()
+            };
+            out.push((
+                k.clone(),
+                Input {
+                    r#ref: TargetAddr::parse(&v, pkg)?,
+                    mode: InputMode::Standard,
+                    origin_id: format!("{}|{}|{}", origin_prefix, k, i),
+                    annotations,
+                    hashed,
+                    runtime,
+                },
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The inputs a `tools` attribute declares, ordered by group.
+pub(crate) fn build_tool_inputs(
+    pkg: &hmodel::htpkg::PkgBuf,
+    tools: HashMap<String, Vec<String>>,
+) -> anyhow::Result<Vec<(String, Input)>> {
+    let mut out = Vec::new();
+    for (k, v) in sorted_by_group(tools) {
+        for (i, v) in v.into_iter().enumerate() {
+            out.push((
+                k.clone(),
+                Input {
+                    r#ref: TargetAddr::parse(&v, pkg)?,
+                    mode: InputMode::Tool,
+                    origin_id: format!("tool|{}|{}", k, i),
+                    annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+                    hashed: true,
+                    runtime: true,
+                },
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// `(group, input)` pairs, grouped in order.
+pub(crate) fn grouped(inputs: &[(String, Input)]) -> BTreeMap<String, Vec<Input>> {
+    let mut out: BTreeMap<String, Vec<Input>> = BTreeMap::new();
+    for (group, input) in inputs {
+        out.entry(group.clone()).or_default().push(input.clone());
+    }
+    out
+}
+
+/// Fold a transitive closure's tools and deps into a def: every one joins
+/// `inputs`, and the runtime ones are wired into their groups. Env is the
+/// caller's to fold, because the two drivers place it differently.
+pub(crate) fn fold_transitive_inputs(
+    sandbox: &hplugin::driver::sandbox::Sandbox,
+    inputs: &mut Vec<Input>,
+    tool_groups: &mut BTreeMap<String, Vec<Input>>,
+    dep_groups: &mut BTreeMap<String, Vec<Input>>,
+    runtime_dep_groups: &mut BTreeMap<String, Vec<Input>>,
+) {
+    for tool in &sandbox.tools {
+        let input = Input {
+            r#ref: tool.r#ref.clone(),
+            mode: InputMode::Tool,
+            origin_id: tool.id.clone(),
+            // Tools are consumed read-only (executables on PATH, never
+            // mutated by the target), so let the OS sandbox runner stage
+            // them once into the shared stage dir and link them in rather
+            // than copying every tool into every sandbox. `stage_per_file`
+            // forces the per-file link path: the tool consumer reads each
+            // input's file list and flattens every tool file into a `bin/`
+            // dir by basename, so it needs individual files listed — not the
+            // single subtree-root symlink the default staging emits.
+            annotations: BTreeMap::from([
+                ("unpack_root".to_string(), "tools".to_string()),
+                (
+                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+            hashed: tool.hash,
+            runtime: true,
+        };
+        tool_groups
+            .entry(tool.group.clone())
+            .or_default()
+            .push(input.clone());
+        inputs.push(input);
+    }
+    for dep in &sandbox.deps {
+        let input = Input {
+            r#ref: dep.r#ref.clone(),
+            mode: InputMode::Standard,
+            origin_id: dep.id.clone(),
+            annotations: BTreeMap::new(),
+            hashed: dep.hash,
+            runtime: dep.runtime,
+        };
+        // Route into runtime wiring only when the dep is meant to be available
+        // at runtime. Hash-only transitive deps still need to appear in
+        // `inputs` so the engine resolves them (and folds their hashout into a
+        // hashin), but they must not be wired into SRC_*/LIST_*.
+        if dep.runtime {
+            let target_map = if dep.hash {
+                &mut *dep_groups
+            } else {
+                &mut *runtime_dep_groups
+            };
+            target_map
+                .entry(dep.group.clone())
+                .or_default()
+                .push(input.clone());
+        }
+        inputs.push(input);
+    }
+}
+
+/// `SRC`/`SRC_<GROUP>` for a dep group.
+pub(crate) fn src_key(group: &str) -> String {
+    if group.is_empty() {
+        "SRC".to_string()
+    } else {
+        format!("SRC_{}", env_key_segment(group))
+    }
+}
+
+/// `TOOL`/`TOOL_<GROUP>` for a tool group.
+pub(crate) fn tool_key(group: &str) -> String {
+    if group.is_empty() {
+        "TOOL".to_string()
+    } else {
+        format!("TOOL_{}", env_key_segment(group))
+    }
+}
+
+/// Hashed and runtime-only dep groups merged so each group ends up with a
+/// single `SRC_*` covering both: `deps` first, `runtime_deps` after.
+pub(crate) fn merged_dep_groups<'d>(
+    dep_groups: &'d BTreeMap<String, Vec<Input>>,
+    runtime_dep_groups: &'d BTreeMap<String, Vec<Input>>,
+) -> BTreeMap<&'d str, Vec<&'d Input>> {
+    let mut merged: BTreeMap<&str, Vec<&Input>> = BTreeMap::new();
+    for (group, inputs) in dep_groups.iter().chain(runtime_dep_groups) {
+        merged
+            .entry(group.as_str())
+            .or_default()
+            .extend(inputs.iter());
+    }
+    merged
 }
 
 fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
@@ -1090,6 +1278,18 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
+        // Only `exec.entrypoint` takes the caller's args. Refused by name rather
+        // than left to the generic unknown-field error, which would not say
+        // where the field belongs.
+        if req.target_spec.config.contains_key("args") {
+            anyhow::bail!(
+                "`args` is only accepted on an `exec.entrypoint` target; {} uses the `{}` driver, \
+                 which runs in a sandbox and takes no caller arguments",
+                req.target_spec.addr.format(),
+                self.name,
+            );
+        }
+
         let spec = spec::TargetSpec::from(&req.target_spec.config)?;
         // Belt and braces with the host's whole-driver gate: the host refuses a
         // reference for a driver whose schema says no, and this catches the same
@@ -1115,69 +1315,26 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         let read_only_groups: std::collections::HashSet<String> =
             spec.read_only_deps.iter().cloned().collect();
 
-        let build_dep_inputs = |deps: HashMap<String, Vec<String>>,
-                                origin_prefix: &'static str,
-                                hashed: bool,
-                                runtime: bool|
-         -> anyhow::Result<Vec<(String, Input)>> {
-            let read_only_groups = &read_only_groups;
-            // Sorted, not `HashMap` order: this is the order of `def.inputs`,
-            // and the transitive collector numbers each merged sandbox by an
-            // input's *position* in that list — a number that ends up in the
-            // merged dep/tool ids, and so in this target's def hash. Left in
-            // map order, a target with two or more dep groups hashes
-            // differently in every process and never hits its cache.
-            sorted_by_group(deps)
-                .into_iter()
-                .flat_map(|(k, v)| {
-                    let pkg = pkg.clone();
-                    let read_only = read_only_groups.contains(&k);
-                    v.into_iter().enumerate().map(
-                        move |(i, v)| -> anyhow::Result<(String, Input)> {
-                            let annotations = if read_only {
-                                BTreeMap::from([(
-                                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                                    "true".to_string(),
-                                )])
-                            } else {
-                                BTreeMap::new()
-                            };
-                            Ok((
-                                k.parse()?,
-                                Input {
-                                    r#ref: TargetAddr::parse(&v, &pkg)?,
-                                    mode: InputMode::Standard,
-                                    origin_id: format!("{}|{}|{}", origin_prefix, k, i),
-                                    annotations,
-                                    hashed,
-                                    runtime,
-                                },
-                            ))
-                        },
-                    )
-                })
-                .collect::<anyhow::Result<Vec<_>>>()
-        };
+        let dep_inputs = build_dep_inputs(&pkg, spec.deps, "dep", true, true, &read_only_groups)?;
+        let hash_dep_inputs = build_dep_inputs(
+            &pkg,
+            spec.hash_deps,
+            "hash_dep",
+            true,
+            false,
+            &read_only_groups,
+        )?;
+        let runtime_dep_inputs = build_dep_inputs(
+            &pkg,
+            spec.runtime_deps,
+            "runtime_dep",
+            false,
+            true,
+            &read_only_groups,
+        )?;
 
-        let dep_inputs = build_dep_inputs(spec.deps, "dep", true, true)?;
-        let hash_dep_inputs = build_dep_inputs(spec.hash_deps, "hash_dep", true, false)?;
-        let runtime_dep_inputs = build_dep_inputs(spec.runtime_deps, "runtime_dep", false, true)?;
-
-        let mut dep_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
-        for (group, input) in &dep_inputs {
-            dep_group_inputs
-                .entry(group.clone())
-                .or_default()
-                .push(input.clone());
-        }
-
-        let mut runtime_dep_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
-        for (group, input) in &runtime_dep_inputs {
-            runtime_dep_group_inputs
-                .entry(group.clone())
-                .or_default()
-                .push(input.clone());
-        }
+        let dep_group_inputs = grouped(&dep_inputs);
+        let runtime_dep_group_inputs = grouped(&runtime_dep_inputs);
 
         // Scratch references. `hashed: false, runtime: false` is the one
         // combination nothing else uses, and it is exactly right: a scratch
@@ -1221,38 +1378,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         // than scratch's; see `credential::inputs`.
         let credential_inputs = hdriver_support::credential::inputs(&spec.credentials, &pkg)?;
 
-        let tool_inputs = sorted_by_group(spec.tools)
-            .into_iter()
-            .flat_map(|(k, v)| {
-                let pkg = pkg.clone();
-                v.into_iter()
-                    .enumerate()
-                    .map(move |(i, v)| -> anyhow::Result<(String, Input)> {
-                        Ok((
-                            k.parse()?,
-                            Input {
-                                r#ref: TargetAddr::parse(&v, &pkg)?,
-                                mode: InputMode::Tool,
-                                origin_id: format!("tool|{}|{}", k, i),
-                                annotations: BTreeMap::from([(
-                                    "unpack_root".to_string(),
-                                    "tools".to_string(),
-                                )]),
-                                hashed: true,
-                                runtime: true,
-                            },
-                        ))
-                    })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        let mut tool_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
-        for (group, input) in &tool_inputs {
-            tool_group_inputs
-                .entry(group.clone())
-                .or_default()
-                .push(input.clone());
-        }
+        let tool_inputs = build_tool_inputs(&pkg, spec.tools)?;
+        let tool_group_inputs = grouped(&tool_inputs);
 
         // `"*"` is a wildcard: pass through every host env var. Snapshotted at
         // parse time and hashed like any other pass_env (so the input hash
@@ -1399,63 +1526,13 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
     ) -> anyhow::Result<ApplyTransitiveResponse> {
         let mut def = req.target_def.clone();
         let mut xdef = def.def::<TargetDef>().clone();
-        for tool in req.sandbox.tools {
-            let input = Input {
-                r#ref: tool.r#ref.clone(),
-                mode: InputMode::Tool,
-                origin_id: tool.id.clone(),
-                // Tools are consumed read-only (executables on PATH, never
-                // mutated by the target), so let the OS sandbox runner stage
-                // them once into the shared stage dir and link them in rather
-                // than copying every tool into every sandbox. `stage_per_file`
-                // forces the per-file link path: the tool consumer below reads
-                // each input's file list and flattens every tool file into a
-                // `bin/` dir by basename, so it needs individual files listed —
-                // not the single subtree-root symlink the default staging emits.
-                annotations: BTreeMap::from([
-                    ("unpack_root".to_string(), "tools".to_string()),
-                    (
-                        hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
-                    (
-                        hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
-                ]),
-                hashed: tool.hash,
-                runtime: true,
-            };
-            xdef.tool_group_inputs
-                .entry(tool.group)
-                .or_default()
-                .push(input.clone());
-            def.inputs.push(input);
-        }
-        for dep in req.sandbox.deps {
-            let input = Input {
-                r#ref: dep.r#ref.clone(),
-                mode: InputMode::Standard,
-                origin_id: dep.id.clone(),
-                annotations: BTreeMap::new(),
-                hashed: dep.hash,
-                runtime: dep.runtime,
-            };
-            // Route into runtime wiring only when the dep is meant to be
-            // available at runtime. Hash-only transitive deps still need to
-            // appear in `def.inputs` so the engine resolves them and folds
-            // their hashout into hashin, but they must not be wired into
-            // SRC_*/LIST_*.
-            if dep.runtime {
-                let target_map = if dep.hash {
-                    &mut xdef.dep_group_inputs
-                } else {
-                    &mut xdef.runtime_dep_group_inputs
-                };
-                target_map.entry(dep.group).or_default().push(input.clone());
-            }
-            def.inputs.push(input);
-        }
+        fold_transitive_inputs(
+            &req.sandbox,
+            &mut def.inputs,
+            &mut xdef.tool_group_inputs,
+            &mut xdef.dep_group_inputs,
+            &mut xdef.runtime_dep_group_inputs,
+        );
         for (name, env) in req.sandbox.env {
             match env.value {
                 EnvValue::Pass => {
@@ -1635,26 +1712,11 @@ impl Driver {
         // `deps` come first to preserve their established input ordering;
         // `runtime_deps` (also `runtime=true` transitives with `hash=false`)
         // append after.
-        let mut merged_dep_groups: BTreeMap<&str, Vec<&Input>> = BTreeMap::new();
-        for (group, inputs) in &def.dep_group_inputs {
-            merged_dep_groups
-                .entry(group.as_str())
-                .or_default()
-                .extend(inputs.iter());
-        }
-        for (group, inputs) in &def.runtime_dep_group_inputs {
-            merged_dep_groups
-                .entry(group.as_str())
-                .or_default()
-                .extend(inputs.iter());
-        }
+        let merged_dep_groups =
+            merged_dep_groups(&def.dep_group_inputs, &def.runtime_dep_group_inputs);
 
         for (group, inputs) in &merged_dep_groups {
-            let src_key = if group.is_empty() {
-                "SRC".to_string()
-            } else {
-                format!("SRC_{}", env_key_segment(group))
-            };
+            let src_key = src_key(group);
 
             let mut list_f = {
                 let path = req
@@ -1733,11 +1795,7 @@ impl Driver {
             let mut linked: std::collections::HashSet<std::ffi::OsString> =
                 std::collections::HashSet::new();
             for (group, inputs) in &def.tool_group_inputs {
-                let tool_key = if group.is_empty() {
-                    "TOOL".to_string()
-                } else {
-                    format!("TOOL_{}", env_key_segment(group))
-                };
+                let tool_key = tool_key(group);
                 // Per-group dedup for $TOOL_<G> values. `linked` is process-wide
                 // (avoids EEXIST on symlink); `group_seen` is per-group so each
                 // TOOL_<G> reflects that group's references without duplicates

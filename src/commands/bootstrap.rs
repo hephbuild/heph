@@ -179,10 +179,16 @@ pub fn register_builtin_factories(
     // PATH. Resolved lazily, so a `heph query` never touches the filesystem.
     let (coreutils_exec, coreutils_bash) = (coreutils_shims(home_dir), coreutils_shims(home_dir));
     e.register_plugin_factory("exec", move |_init, opts| {
-        Ok(PluginParts::default().with_managed_driver(Box::new(
-            pluginexec::Driver::from_options_exec(opts)?
-                .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_exec.clone()),
-        )))
+        Ok(PluginParts::default()
+            .with_managed_driver(Box::new(
+                pluginexec::Driver::from_options_exec(opts)?
+                    .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_exec.clone()),
+            ))
+            // `exec.entrypoint`. Takes none of the plugin's options: the
+            // workspace `runner:` default, `path:` and `coreutils:` are for
+            // sandboxed targets, and an entrypoint runs in the caller's world
+            // (D24).
+            .with_entrypoint_driver(Arc::new(pluginexec::entrypoint::Entrypoint::new())))
     })?;
     e.register_plugin_factory("bash", move |_init, opts| {
         Ok(PluginParts::default().with_managed_driver(Box::new(

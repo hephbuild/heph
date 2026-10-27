@@ -1179,35 +1179,44 @@ impl<'a, 'io> RunRequest<'a, 'io> {
     /// A field with no reference in it resolves to its own text, so a driver never
     /// branches on whether the author used one.
     pub fn resolve<'r, 'd: 'r>(&'r self, d: &'d Deferred<String>) -> anyhow::Result<&'r str> {
-        match self.deferred.get(d.raw()) {
-            Some(DeferredValue::Ready(v)) => return Ok(v),
-            // Only reachable if a request skipped the managed-driver layer that
-            // completes these. Distinguishable from "never deferred" precisely
-            // because the entry is here, which is why the two states share a map.
-            Some(DeferredValue::NeedsSandbox { .. }) => anyhow::bail!(
-                "{:?} names a `${{src://…}}` that was never completed — the sandbox path is \
-                 filled in after an artifact is staged and before any driver runs, so this is a \
-                 bug in heph rather than in the BUILD file",
-                d.raw()
-            ),
-            None => {}
-        }
-        // The host walks the whole config, so a reference it did not resolve is a
-        // host bug rather than an author's — say so, instead of handing the
-        // driver the reference text as if it were a value.
-        //
-        // Only a *deferred* kind counts. `${FOO:-default}` and every other shell
-        // construct passes straight through, because heph does not own them and a
-        // deferrable field must still accept a command that uses one.
-        if hcore::template::has_deferred_ref(d.raw()) {
-            anyhow::bail!(
-                "the host did not resolve {:?} — a deferred field's value is filled in before the \
-                 run, so this is a bug in heph rather than in the BUILD file",
-                d.raw()
-            );
-        }
-        Ok(d.raw())
+        resolve_deferred_in(&self.deferred, d)
     }
+}
+
+/// [`RunRequest::resolve`] over a bare map, for the one other place values are
+/// handed to a driver: an entrypoint's [`entrypoint::PrepareRequest`].
+pub(crate) fn resolve_deferred_in<'r, 'd: 'r>(
+    deferred: &'r std::collections::BTreeMap<String, DeferredValue>,
+    d: &'d Deferred<String>,
+) -> anyhow::Result<&'r str> {
+    match deferred.get(d.raw()) {
+        Some(DeferredValue::Ready(v)) => return Ok(v),
+        // Only reachable if a request skipped the managed-driver layer that
+        // completes these. Distinguishable from "never deferred" precisely
+        // because the entry is here, which is why the two states share a map.
+        Some(DeferredValue::NeedsSandbox { .. }) => anyhow::bail!(
+            "{:?} names a `${{src://…}}` that was never completed — the sandbox path is \
+             filled in after an artifact is staged and before any driver runs, so this is a \
+             bug in heph rather than in the BUILD file",
+            d.raw()
+        ),
+        None => {}
+    }
+    // The host walks the whole config, so a reference it did not resolve is a
+    // host bug rather than an author's — say so, instead of handing the
+    // driver the reference text as if it were a value.
+    //
+    // Only a *deferred* kind counts. `${FOO:-default}` and every other shell
+    // construct passes straight through, because heph does not own them and a
+    // deferrable field must still accept a command that uses one.
+    if hcore::template::has_deferred_ref(d.raw()) {
+        anyhow::bail!(
+            "the host did not resolve {:?} — a deferred field's value is filled in before the \
+             run, so this is a bug in heph rather than in the BUILD file",
+            d.raw()
+        );
+    }
+    Ok(d.raw())
 }
 #[cfg(test)]
 mod resolve_tests {
@@ -1508,4 +1517,119 @@ pub trait Driver: Send + Sync {
         req: RunRequest<'a, 'io>,
         ctoken: &(dyn hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse>;
+}
+
+/// The `Entrypoint` capability: a driver whose targets are *invoked* in the
+/// caller's world rather than built in a sandbox (the tool-shims spec, D1, D30).
+///
+/// Builtin-only. Nothing here crosses the plugin ABI: a cdylib cannot declare
+/// it, and an N-1 heph meeting an `exec.entrypoint` target fails "driver not
+/// found" like any unknown driver.
+///
+/// The engine owns resolution, dep builds, staging and the holds that keep a
+/// running tool's closure alive; the driver owns only the shape of the command
+/// — its argv, environment and working directory — computed from what the
+/// engine staged. Nothing spawns here, and nothing in the engine library does
+/// either: the binary spawns the [`entrypoint::PreparedCommand`].
+pub mod entrypoint {
+    use super::{Deferred, DeferredValue, Driver, targetdef::TargetDef};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    /// The token only `Engine::invoke` constructs. An entrypoint driver's
+    /// [`EntrypointDriver::prepare`] needs one, so the prepare path is reachable
+    /// from exactly one place in the engine, never from `execute` (D30).
+    #[derive(Debug)]
+    pub struct Invocation {
+        _private: (),
+    }
+
+    impl Invocation {
+        /// For `Engine::invoke` alone. Public only because the engine is a
+        /// different crate; nothing else has a reason to call it, and the one
+        /// call site is the whole of the contract.
+        #[doc(hidden)]
+        pub fn for_engine_invoke() -> Self {
+            Self { _private: () }
+        }
+    }
+
+    /// One input's files, at their absolute paths in the read-only stage.
+    #[derive(Clone, Debug, Default)]
+    pub struct StagedInput {
+        /// The [`Input::origin_id`](super::targetdef::Input::origin_id) the
+        /// driver gave it at parse.
+        pub origin_id: String,
+        /// Every file the input provides, filters applied, sorted.
+        pub files: Vec<PathBuf>,
+    }
+
+    /// What the caller brought: its raw cwd, its environment as it was, and the
+    /// trailing args. Never hashed.
+    #[derive(Clone, Debug, Default)]
+    pub struct Caller {
+        /// Captured raw at startup, apart from the engine's memoized cwd; may be
+        /// outside the workspace.
+        pub cwd: PathBuf,
+        /// The caller's whole environment, byte for byte (D29).
+        pub env: Vec<(OsString, OsString)>,
+        /// The trailing args after `--`, in order.
+        pub args: Vec<OsString>,
+    }
+
+    pub struct PrepareRequest<'a> {
+        pub target: &'a TargetDef,
+        pub inputs: &'a [StagedInput],
+        /// The held toolbin stage entry, when the closure has tools.
+        pub toolbin: Option<&'a Path>,
+        /// `${read://…}` values the host resolved, as for
+        /// [`RunRequest::deferred`](super::RunRequest::deferred).
+        pub deferred: &'a BTreeMap<String, DeferredValue>,
+        pub caller: &'a Caller,
+        /// The workspace root.
+        pub root: &'a Path,
+        /// `--shell`: where to write the shell's init file, which the caller
+        /// removes once the shell has exited.
+        pub shell_init: Option<&'a Path>,
+    }
+
+    impl PrepareRequest<'_> {
+        /// The value of a deferred field. See [`RunRequest::resolve`](super::RunRequest::resolve).
+        pub fn resolve<'r, 'd: 'r>(&'r self, d: &'d Deferred<String>) -> anyhow::Result<&'r str> {
+            super::resolve_deferred_in(self.deferred, d)
+        }
+    }
+
+    /// The process to start: what the binary spawns, with stdio inherited.
+    #[derive(Clone, Debug)]
+    pub struct PreparedCommand {
+        pub argv: Vec<OsString>,
+        /// The complete environment, not a delta: the child gets exactly this.
+        pub env: Vec<(OsString, OsString)>,
+        pub cwd: PathBuf,
+    }
+
+    pub trait EntrypointDriver: Driver {
+        /// Whether `target` declared `args = True`. The engine refuses trailing
+        /// args for one that did not, after the spec resolves and before any
+        /// dep builds (D18, D21).
+        fn accepts_args(&self, target: &TargetDef) -> bool;
+
+        /// The tools to flatten into the toolbin: basename → absolute staged
+        /// file, collisions resolved as the driver resolves them for a sandbox.
+        fn toolbin(
+            &self,
+            token: &Invocation,
+            target: &TargetDef,
+            inputs: &[StagedInput],
+        ) -> anyhow::Result<BTreeMap<OsString, PathBuf>>;
+
+        /// The command, from what the engine staged.
+        fn prepare(
+            &self,
+            token: &Invocation,
+            req: PrepareRequest<'_>,
+        ) -> anyhow::Result<PreparedCommand>;
+    }
 }
