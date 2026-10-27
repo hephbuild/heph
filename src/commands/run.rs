@@ -123,7 +123,7 @@ pub struct RunArgs {
     /// diagnostic box. The full log is always saved as the `log.txt` artifact.
     #[arg(long = "log-lines", value_name = "N", default_value_t = 10)]
     pub log_lines: usize,
-    /// Arguments for an `exec.entrypoint` target that declares `args = True`,
+    /// Arguments for an entrypoint (`entrypoint = True`) that declares `args = True`,
     /// after `--`: appended to its command, verbatim. Everything after `--`
     /// is the program's, flags included (`heph run //t:go -- --version`).
     #[arg(last = true, value_name = "ARGS")]
@@ -321,8 +321,8 @@ impl App for RunApp {
         }
         if !self.args.args.is_empty() {
             anyhow::bail!(
-                "arguments after `--` are taken only by a single exec.entrypoint target that \
-                 declares `args = True`; {} is not one",
+                "arguments after `--` are taken only by a single entrypoint target \
+                 (`entrypoint = True`) that declares `args = True`; {} is not one",
                 self.progress_label().trim_start_matches("Running "),
             );
         }

@@ -1999,6 +1999,7 @@ mod tests {
             pty: false,
             hash: Vec::new(),
             transparent: false,
+            entrypoint: false,
         });
         LinkedTargetDef {
             target,

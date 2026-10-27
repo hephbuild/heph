@@ -91,6 +91,22 @@ pub(crate) struct TargetSpec {
     /// before. The runner is a hashed dependency, so changing it changes this
     /// target's cache key.
     pub runner: String,
+    /// Make this target an entrypoint: `heph run` invokes it in the caller's
+    /// world — their cwd (or the workspace root), their environment, their
+    /// stdio — instead of building it in a sandbox. Never cached and never an
+    /// input. `deps`, `hash_deps`, `runtime_deps`, `tools`, `env` and `run`
+    /// keep their meaning, with `$SRC_<group>`/`$TOOL_<group>` absolute paths
+    /// in heph's read-only stage; the sandbox's fields (`out`, `cache`,
+    /// `codegen`, `support_files`, `scratch`, the `*_env` fields, `runner`,
+    /// `credentials`, `read_only_deps`) are refused.
+    pub entrypoint: bool,
+    /// With `entrypoint = True`: append the caller's arguments
+    /// (`heph run //x -- a b`) to the command (`"$@"` for `bash`). Without it,
+    /// trailing arguments are refused before anything builds.
+    pub args: bool,
+    /// With `entrypoint = True`: where the program runs, `"caller"` (the
+    /// caller's cwd, the default) or `"root"` (the workspace root).
+    pub workdir: super::entrypoint::Workdir,
 }
 
 #[cfg(test)]
@@ -132,6 +148,9 @@ mod tests {
             "runtime_env",
             "runner",
             "credentials",
+            "entrypoint",
+            "args",
+            "workdir",
         ] {
             assert!(by_name.contains_key(key), "schema missing field `{key}`");
         }

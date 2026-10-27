@@ -1333,6 +1333,9 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
                 .collect::<anyhow::Result<_>>()?,
             support_files: paths_from_pb(td.support_files)?,
             cache: cache_config_from_pb(required_msg(td.cache, "TargetDef.cache")?)?,
+            // Entrypoints are builtin-only: the wire has no field for it, so a
+            // cdylib driver's def is never one, whatever it set in-process.
+            entrypoint: false,
             pty: td.pty.unwrap_or_default(),
             hash: required(td.hash, "TargetDef.hash")?,
             transparent: td.transparent.unwrap_or_default(),
@@ -2319,10 +2322,27 @@ nested: { a: 1, b: [x, y] }
                 remote_enabled: false,
                 history: 3,
             },
+            entrypoint: false,
             pty: true,
             hash: vec![0xde, 0xad, 0, 1],
             transparent: true,
         }
+    }
+
+    /// Entrypoints are builtin-only: a def that crosses the seam is never
+    /// one, in either direction, even when the driver set the flag in-process.
+    #[test]
+    fn a_target_def_from_the_wire_is_never_an_entrypoint() {
+        let mut td = full_target_def();
+        td.entrypoint = true;
+        let wire = target_def_to_pb(&td).expect("encode");
+        assert_eq!(
+            wire,
+            full_target_def_pb(),
+            "the flag puts nothing on the wire"
+        );
+        let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+        assert!(!back.entrypoint, "a converted def is never an entrypoint");
     }
 
     fn full_target_def_pb() -> pb::TargetDef {

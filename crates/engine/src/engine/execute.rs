@@ -44,7 +44,7 @@ impl Engine {
             .cloned()?;
         // The backstop for a direct `result_addr` on an entrypoint: it runs
         // only through `Engine::invoke`, never in a sandbox (D30, I8).
-        if driver.is_entrypoint() {
+        if def.target.entrypoint {
             return Err(
                 crate::engine::invoke::EntrypointNotBuildable { addr: addr.clone() }.into(),
             );

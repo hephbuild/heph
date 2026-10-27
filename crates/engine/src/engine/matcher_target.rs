@@ -237,6 +237,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         }
     }
 
@@ -382,6 +383,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         }
     }
 

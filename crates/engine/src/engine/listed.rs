@@ -421,6 +421,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
         (spec, def)
     }

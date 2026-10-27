@@ -230,6 +230,7 @@ impl hplugin::driver::Driver for Driver {
                 pty: false,
                 hash,
                 transparent: !relocating,
+                entrypoint: false,
             },
         })
     }

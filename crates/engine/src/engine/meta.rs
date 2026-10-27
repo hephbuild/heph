@@ -151,6 +151,7 @@ mod tests {
             pty: false,
             hash,
             transparent: false,
+            entrypoint: false,
         });
         ExtendedTargetDef {
             target_def,

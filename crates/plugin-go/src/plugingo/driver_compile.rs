@@ -449,6 +449,7 @@ impl ManagedDriver for GoCompileDriver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }

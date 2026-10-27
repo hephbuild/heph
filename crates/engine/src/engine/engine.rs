@@ -75,10 +75,11 @@ pub(crate) fn normalize_skip(entry: &str) -> &str {
 pub enum PluginDriver {
     Plain(Box<dyn SDKDriver>),
     Managed(Box<dyn SDKManagedDriver>),
-    /// A driver with the `Entrypoint` capability (`exec.entrypoint`). Builtin
-    /// only: a cdylib's parts never carry one, because the capability does not
-    /// cross the plugin ABI.
-    Entrypoint(Arc<dyn EntrypointDriver>),
+    /// A managed driver whose targets may be entrypoints (`entrypoint = True`
+    /// on exec/bash), with the hook that prepares one for `Engine::invoke`.
+    /// Builtin only: a cdylib's parts never carry one, and a def converted
+    /// from the plugin ABI is never an entrypoint.
+    ManagedWithEntrypoint(Box<dyn SDKManagedDriver>, Arc<dyn EntrypointDriver>),
 }
 
 /// Everything one plugin contributes. It carries no name: the engine supplies
@@ -117,57 +118,15 @@ impl PluginParts {
         self
     }
 
-    pub fn with_entrypoint_driver(mut self, driver: Arc<dyn EntrypointDriver>) -> Self {
-        self.drivers.push(PluginDriver::Entrypoint(driver));
+    /// A managed driver plus the hook that prepares its entrypoint targets.
+    pub fn with_managed_entrypoint_driver(
+        mut self,
+        driver: Box<dyn SDKManagedDriver>,
+        entrypoint: Arc<dyn EntrypointDriver>,
+    ) -> Self {
+        self.drivers
+            .push(PluginDriver::ManagedWithEntrypoint(driver, entrypoint));
         self
-    }
-}
-
-/// An [`EntrypointDriver`] in the plain-driver registry, so `parse`,
-/// `apply_transitive` and every reader of `drivers_by_name` see it like any
-/// other driver.
-struct EntrypointAsDriver(Arc<dyn EntrypointDriver>);
-
-#[async_trait::async_trait]
-impl SDKDriver for EntrypointAsDriver {
-    fn config(&self, req: driver::ConfigRequest) -> anyhow::Result<driver::ConfigResponse> {
-        self.0.config(req)
-    }
-
-    fn schema(&self) -> driver::DriverSchema {
-        self.0.schema()
-    }
-
-    async fn parse(
-        &self,
-        req: driver::ParseRequest,
-        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<driver::ParseResponse> {
-        self.0.parse(req, ctoken).await
-    }
-
-    async fn apply_transitive(
-        &self,
-        req: driver::ApplyTransitiveRequest,
-        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<driver::ApplyTransitiveResponse> {
-        self.0.apply_transitive(req, ctoken).await
-    }
-
-    async fn run<'a, 'io>(
-        &self,
-        req: driver::RunRequest<'a, 'io>,
-        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<driver::RunResponse> {
-        self.0.run(req, ctoken).await
-    }
-
-    async fn run_shell<'a, 'io>(
-        &self,
-        req: driver::RunRequest<'a, 'io>,
-        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<driver::RunResponse> {
-        self.0.run_shell(req, ctoken).await
     }
 }
 
@@ -647,16 +606,11 @@ pub struct Provider {
 pub struct Driver {
     pub name: String,
     pub driver: Box<dyn SDKDriver>,
-    /// The `Entrypoint` capability, for a driver that has it. Its targets are
-    /// never cached, never an input, never executed; they run only through
-    /// [`Engine::invoke`].
+    /// The hook that prepares this driver's entrypoint targets for
+    /// [`Engine::invoke`], for a driver that has one. Whether a target *is* an
+    /// entrypoint is its def's [`entrypoint`](crate::engine::driver::targetdef::TargetDef::entrypoint),
+    /// never this.
     pub entrypoint: Option<Arc<dyn EntrypointDriver>>,
-}
-
-impl Driver {
-    pub fn is_entrypoint(&self) -> bool {
-        self.entrypoint.is_some()
-    }
 }
 
 /// Create the home if needed and make it ignore itself: a `<home>/.gitignore`
@@ -1082,8 +1036,8 @@ impl Engine {
             let (driver, entrypoint): (Box<dyn SDKDriver>, _) = match driver {
                 PluginDriver::Plain(d) => (d, None),
                 PluginDriver::Managed(m) => (Box::new(self.new_managed_driver(m)), None),
-                PluginDriver::Entrypoint(e) => {
-                    (Box::new(EntrypointAsDriver(Arc::clone(&e))), Some(e))
+                PluginDriver::ManagedWithEntrypoint(m, e) => {
+                    (Box::new(self.new_managed_driver(m)), Some(e))
                 }
             };
             let local = driver
@@ -1215,8 +1169,9 @@ impl Engine {
     fn insert_bare_driver(&mut self, driver: PluginDriver) -> anyhow::Result<()> {
         let name = match &driver {
             PluginDriver::Plain(d) => d.config(driver::ConfigRequest {})?.name,
-            PluginDriver::Managed(m) => m.config(driver::ConfigRequest {})?.name,
-            PluginDriver::Entrypoint(e) => e.config(driver::ConfigRequest {})?.name,
+            PluginDriver::Managed(m) | PluginDriver::ManagedWithEntrypoint(m, _) => {
+                m.config(driver::ConfigRequest {})?.name
+            }
         };
         let source = format!("register_driver of driver {name:?}");
         let parts = PluginParts {

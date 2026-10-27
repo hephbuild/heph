@@ -338,6 +338,7 @@ impl ManagedDriver for GoLintDriver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }
@@ -796,6 +797,7 @@ impl ManagedDriver for GoLintGateDriver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }
@@ -1172,6 +1174,7 @@ impl ManagedDriver for GoLintFixDriver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }

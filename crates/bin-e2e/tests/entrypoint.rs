@@ -3,7 +3,7 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-//! `exec.entrypoint` through the shipped binary: what only a real process can
+//! `entrypoint = True` through the shipped binary: what only a real process can
 //! show. The program's exit status becomes heph's, a signal death is re-raised
 //! rather than mapped to `128 + n`, and stdin reaches the program untouched.
 //!
@@ -18,10 +18,10 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::process::Stdio;
 
 const BUILD: &str = r#"
-target(name = "code", driver = "exec.entrypoint",
+target(name = "code", driver = "exec", entrypoint = True,
        run = ["/bin/sh", "-c", "exit \"$1\"", "sh"], args = True)
-target(name = "cat", driver = "exec.entrypoint", run = ["/bin/cat"])
-target(name = "die", driver = "exec.entrypoint",
+target(name = "cat", driver = "exec", entrypoint = True, run = ["/bin/cat"])
+target(name = "die", driver = "exec", entrypoint = True,
        run = ["/bin/sh", "-c", "ulimit -c 0; kill -s \"$1\" $$", "sh"], args = True)
 "#;
 

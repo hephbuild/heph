@@ -427,6 +427,7 @@ impl ManagedDriver for GoGolistDriver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }

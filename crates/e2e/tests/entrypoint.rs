@@ -4,9 +4,9 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-//! `exec.entrypoint` end to end, in-process: `Engine::invoke` over a real
-//! workspace, its closure built, staged and held, and the command it prepares
-//! run the way the binary would run it.
+//! `entrypoint = True` on exec/bash end to end, in-process: `Engine::invoke`
+//! over a real workspace, its closure built, staged and held, and the command
+//! it prepares run the way the binary would run it.
 //!
 //! What only a real process can show — exit codes, stdin, signal deaths — is
 //! in `crates/bin-e2e/tests/entrypoint.rs`.
@@ -26,9 +26,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn exec_plugin() -> anyhow::Result<PluginParts> {
-    Ok(PluginParts::default()
-        .with_managed_driver(Box::new(pluginexec::Driver::new_exec().with_host_path()))
-        .with_entrypoint_driver(Arc::new(pluginexec::entrypoint::Entrypoint::new())))
+    Ok(PluginParts::default().with_managed_entrypoint_driver(
+        Box::new(pluginexec::Driver::new_exec().with_host_path()),
+        Arc::new(pluginexec::entrypoint::Entrypoint::exec()),
+    ))
+}
+
+fn bash_plugin() -> anyhow::Result<PluginParts> {
+    Ok(PluginParts::default().with_managed_entrypoint_driver(
+        Box::new(pluginexec::Driver::new_bash().with_host_path()),
+        Arc::new(pluginexec::entrypoint::Entrypoint::bash()),
+    ))
 }
 
 fn workspace() -> htestkit::Workspace {
@@ -42,7 +50,7 @@ fn workspace() -> htestkit::Workspace {
             ))
         })
         .with_plugin("exec", |_| exec_plugin())
-        .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
+        .with_plugin("bash", |_| bash_plugin())
         .build()
         .expect("build workspace")
 }
@@ -70,7 +78,7 @@ fn engine_with_remote(root: &Path, remote: &Path) -> anyhow::Result<Arc<Engine>>
         ))
     })?;
     e.register_plugin("exec", |_| exec_plugin())?;
-    e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))?;
+    e.register_plugin("bash", |_| bash_plugin())?;
     let e = Arc::new(e);
     e.install_exec_runner_host();
     Ok(e)
@@ -148,7 +156,7 @@ async fn entrypoint_runs_in_caller_cwd_and_env() -> anyhow::Result<()> {
     ws.write_build_file(
         "app",
         r#"
-target(name = "ep", driver = "exec.entrypoint",
+target(name = "ep", driver = "exec", entrypoint = True,
        deps = {"d": "//tools:data"}, tools = {"t": "//tools:tool"},
        env = {"FROM_TARGET": "$SRC_D"},
        run = ["/bin/sh", "-c",
@@ -200,9 +208,9 @@ async fn entrypoint_args_must_be_declared() -> anyhow::Result<()> {
         "app",
         r#"
 target(name = "boom", driver = "bash", run = "exit 1", out = "x")
-target(name = "noargs", driver = "exec.entrypoint", deps = {"b": ":boom"},
+target(name = "noargs", driver = "exec", entrypoint = True, deps = {"b": ":boom"},
        run = ["/bin/echo", "hi"])
-target(name = "withargs", driver = "exec.entrypoint", run = ["/bin/echo"], args = True)
+target(name = "withargs", driver = "exec", entrypoint = True, run = ["/bin/echo"], args = True)
 "#,
     );
     let cwd = ws.dir.path().to_path_buf();
@@ -250,9 +258,9 @@ async fn workdir_modes() -> anyhow::Result<()> {
     ws.write_build_file(
         "app",
         r#"
-target(name = "caller", driver = "exec.entrypoint",
+target(name = "caller", driver = "exec", entrypoint = True,
        run = ["/bin/sh", "-c", "pwd; echo $HEPH_TEST_CALLER"])
-target(name = "root", driver = "exec.entrypoint", workdir = "root",
+target(name = "root", driver = "exec", entrypoint = True, workdir = "root",
        run = ["/bin/sh", "-c", "pwd; echo $HEPH_TEST_CALLER"])
 "#,
     );
@@ -293,7 +301,7 @@ async fn entrypoint_refused_as_input() -> anyhow::Result<()> {
     ws.write_build_file(
         "ep",
         r#"
-target(name = "tool", driver = "exec.entrypoint", run = ["/bin/true"], labels = ["shim"])
+target(name = "tool", driver = "exec", entrypoint = True, run = ["/bin/true"], labels = ["shim"])
 target(name = "carrier", driver = "bash", run = "printf c > $OUT", out = "c",
        transitive = {"deps": {"t": ["//ep:tool"]}})
 target(name = "tcarrier", driver = "bash", run = "printf c > $OUT", out = "c",
@@ -311,7 +319,7 @@ target(name = "runner", driver = "exec", run = ["true"], runner = "//ep:tool")
 target(name = "read", driver = "exec", run = ["echo", "${read://ep:tool}"])
 target(name = "transitive_dep", driver = "bash", run = "true", out = "o", deps = ["//ep:carrier"])
 target(name = "transitive_tool", driver = "bash", run = "true", out = "o", deps = ["//ep:tcarrier"])
-target(name = "ep_dep", driver = "exec.entrypoint", run = ["/bin/true"], deps = ["//ep:tool"])
+target(name = "ep_dep", driver = "exec", entrypoint = True, run = ["/bin/true"], deps = ["//ep:tool"])
 "#,
     );
     for consumer in [
@@ -344,7 +352,7 @@ target(name = "ep_dep", driver = "exec.entrypoint", run = ["/bin/true"], deps = 
     ] {
         let err = err_of(ws.run_matcher(&matcher).await, "selection");
         assert!(
-            format!("{err:#}").contains("//ep:tool is an exec.entrypoint target"),
+            format!("{err:#}").contains("//ep:tool is an entrypoint"),
             "{err:#}"
         );
     }
@@ -368,7 +376,7 @@ async fn entrypoint_never_cached() -> anyhow::Result<()> {
         format!(
             r#"
 target(name = "dep_unique_name", driver = "bash", run = "printf d > $OUT", out = "d.txt")
-target(name = "entrypoint_unique_name", driver = "exec.entrypoint",
+target(name = "entrypoint_unique_name", driver = "exec", entrypoint = True,
        deps = {{"d": ":dep_unique_name"}},
        run = ["/bin/sh", "-c", "echo x >> {}"])
 "#,
@@ -431,75 +439,73 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A driver that says "cache me" for its entrypoint — the shape a provider or
-/// option default reaching the def would have. The engine forces it off from
-/// the capability, in `get_def`, before anything reads it (D43).
-struct CachingEntrypoint(pluginexec::entrypoint::Entrypoint);
+/// A driver whose def is an entrypoint that says "cache me" — the shape a
+/// provider or option default reaching the def would have — and that
+/// registers no hook to prepare it.
+struct CachingEntrypoint;
 
 #[async_trait::async_trait]
 impl hplugin::driver::Driver for CachingEntrypoint {
     fn config(
         &self,
-        req: hplugin::driver::ConfigRequest,
+        _req: hplugin::driver::ConfigRequest,
     ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
-        self.0.config(req)
+        Ok(hplugin::driver::ConfigResponse {
+            name: "caching".to_string(),
+        })
     }
     fn schema(&self) -> hplugin::driver::DriverSchema {
-        self.0.schema()
+        hplugin::driver::DriverSchema::default()
     }
     async fn parse(
         &self,
         req: hplugin::driver::ParseRequest,
-        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<hplugin::driver::ParseResponse> {
-        let mut res = self.0.parse(req, ctoken).await?;
-        res.target_def.cache = hplugin::driver::targetdef::CacheConfig::on(true);
-        Ok(res)
+        Ok(hplugin::driver::ParseResponse {
+            target_def: hplugin::driver::targetdef::TargetDef {
+                addr: req.target_spec.addr.clone(),
+                labels: vec![],
+                raw_def: Arc::new(()),
+                inputs: vec![],
+                outputs: vec![],
+                support_files: vec![],
+                cache: hplugin::driver::targetdef::CacheConfig::on(true),
+                entrypoint: true,
+                pty: false,
+                hash: b"caching".to_vec(),
+                transparent: false,
+            },
+        })
     }
     async fn apply_transitive(
         &self,
         req: hplugin::driver::ApplyTransitiveRequest,
-        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
-        self.0.apply_transitive(req, ctoken).await
+        Ok(hplugin::driver::ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
     }
     async fn run<'a, 'io>(
         &self,
-        req: hplugin::driver::RunRequest<'a, 'io>,
-        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        _req: hplugin::driver::RunRequest<'a, 'io>,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<hplugin::driver::RunResponse> {
-        self.0.run(req, ctoken).await
+        anyhow::bail!("never run")
     }
     async fn run_shell<'a, 'io>(
         &self,
-        req: hplugin::driver::RunRequest<'a, 'io>,
-        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        _req: hplugin::driver::RunRequest<'a, 'io>,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<hplugin::driver::RunResponse> {
-        self.0.run_shell(req, ctoken).await
+        anyhow::bail!("never run")
     }
 }
 
-impl hplugin::driver::entrypoint::EntrypointDriver for CachingEntrypoint {
-    fn accepts_args(&self, target: &hplugin::driver::targetdef::TargetDef) -> bool {
-        self.0.accepts_args(target)
-    }
-    fn toolbin(
-        &self,
-        token: &hplugin::driver::entrypoint::Invocation,
-        target: &hplugin::driver::targetdef::TargetDef,
-        inputs: &[hplugin::driver::entrypoint::StagedInput],
-    ) -> anyhow::Result<std::collections::BTreeMap<OsString, PathBuf>> {
-        self.0.toolbin(token, target, inputs)
-    }
-    fn prepare(
-        &self,
-        token: &hplugin::driver::entrypoint::Invocation,
-        req: hplugin::driver::entrypoint::PrepareRequest<'_>,
-    ) -> anyhow::Result<PreparedCommand> {
-        self.0.prepare(token, req)
-    }
-}
-
+/// The engine forces cache off from the def's `entrypoint` attribute, in
+/// `get_def`, before anything reads it, whatever the driver said (D43). And
+/// `invoke` refuses an entrypoint def whose driver has no hook to prepare it.
 #[tokio::test]
 async fn entrypoint_cache_off_before_execute() -> anyhow::Result<()> {
     let ws = WorkspaceBuilder::new()?
@@ -510,26 +516,66 @@ async fn entrypoint_cache_off_before_execute() -> anyhow::Result<()> {
                 Arc::clone(&init.functions),
             ))
         })
-        .with_plugin("exec", |_| {
-            Ok(
-                PluginParts::default().with_entrypoint_driver(Arc::new(CachingEntrypoint(
-                    pluginexec::entrypoint::Entrypoint::new(),
-                ))),
-            )
+        .with_plugin("caching", |_| {
+            Ok(PluginParts::default().with_driver(Box::new(CachingEntrypoint)))
         })
         .build()?;
-    ws.write_build_file(
-        "app",
-        r#"target(name = "ep", driver = "exec.entrypoint", run = ["/bin/true"])"#,
-    );
+    ws.write_build_file("app", r#"target(name = "ep", driver = "caching")"#);
     let def = Arc::clone(&ws.engine)
         .get_def(ws.engine.new_state(), &parse_addr("//app:ep")?)
         .await?;
     assert_eq!(
         def.target_def.cache,
         hplugin::driver::targetdef::CacheConfig::off(),
-        "the capability forces cache off whatever the driver said"
+        "the def's attribute forces cache off whatever the driver said"
     );
+
+    let err = invoke(&ws.engine, "//app:ep", caller(ws.dir.path(), &[]))
+        .await
+        .expect_err("no hook to prepare it");
+    assert!(
+        err.downcast_ref::<heph::engine::invoke::EntrypointWithoutHook>()
+            .is_some(),
+        "{err:#}"
+    );
+    Ok(())
+}
+
+/// `bash` with `entrypoint = True` runs its script through bash in the
+/// caller's cwd, the closure on its environment and the caller's args as
+/// `"$@"`, byte for byte.
+#[tokio::test]
+async fn bash_entrypoint_receives_args() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file("tools", TOOLS_BUILD);
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "sh", driver = "bash", entrypoint = True, args = True,
+       deps = {"d": "//tools:data"}, tools = {"t": "//tools:tool"},
+       run = ["cat \"$SRC_D\"; echo", "mytool x", "echo \"cwd=$(pwd)\"", "printf '<%s>' \"$@\""])
+"#,
+    );
+    let nested = ws.dir.path().join("app/sub");
+    std::fs::create_dir_all(&nested)?;
+    let args = ["", "-x", "a b", "$HOME", "é"];
+    let prepared = invoke(&ws.engine, "//app:sh", caller(&nested, &args)).await?;
+    let out = run(&prepared.command)?;
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8(out.stdout)?,
+        format!(
+            "payload\ntool-ran x\ncwd={}\n<><-x><a b><$HOME><é>",
+            nested.canonicalize()?.display()
+        )
+    );
+
+    // Without args, `"$@"` is empty: `printf` formats once, with nothing.
+    let prepared = invoke(&ws.engine, "//app:sh", caller(&nested, &[])).await?;
+    let out = run(&prepared.command)?;
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout)?;
+    assert!(stdout.ends_with("\n<>"), "{stdout}");
     Ok(())
 }
 
@@ -544,7 +590,7 @@ async fn entrypoint_resolves_deferred_config() -> anyhow::Result<()> {
     );
     ws.write_build_file(
         "app",
-        r#"target(name = "ep", driver = "exec.entrypoint",
+        r#"target(name = "ep", driver = "exec", entrypoint = True,
        env = {"VERSION": "${read://infra:version}"},
        run = ["/bin/sh", "-c", "printf %s \"$VERSION\""])"#,
     );
@@ -565,7 +611,7 @@ async fn entrypoint_takes_no_execute_lock() -> anyhow::Result<()> {
     ws.write_build_file("tools", TOOLS_BUILD);
     ws.write_build_file(
         "app",
-        r#"target(name = "ep", driver = "exec.entrypoint", deps = {"d": "//tools:data"},
+        r#"target(name = "ep", driver = "exec", entrypoint = True, deps = {"d": "//tools:data"},
        run = ["/bin/true"])"#,
     );
     let first = invoke(&ws.engine, "//app:ep", caller(ws.dir.path(), &[])).await?;
@@ -590,7 +636,7 @@ async fn entrypoint_dep_still_cached() -> anyhow::Result<()> {
         &format!(
             r#"
 target(name = "dep", driver = "bash", run = "echo x >> {} && printf d > $OUT", out = "d")
-target(name = "ep", driver = "exec.entrypoint", deps = {{"d": ":dep"}}, run = ["/bin/true"])
+target(name = "ep", driver = "exec", entrypoint = True, deps = {{"d": ":dep"}}, run = ["/bin/true"])
 "#,
             counter.display()
         ),
@@ -610,7 +656,7 @@ async fn gc_keeps_closure_of_running_tool() -> anyhow::Result<()> {
     ws.write_build_file("tools", TOOLS_BUILD);
     ws.write_build_file(
         "app",
-        r#"target(name = "ep", driver = "exec.entrypoint",
+        r#"target(name = "ep", driver = "exec", entrypoint = True,
        deps = {"d": "//tools:data"}, tools = {"t": "//tools:tool"}, run = ["/bin/true"])"#,
     );
     let prepared = invoke(&ws.engine, "//app:ep", caller(ws.dir.path(), &[])).await?;
@@ -641,7 +687,7 @@ async fn force_rebuild_waits_for_running_tool() -> anyhow::Result<()> {
     ws.write_build_file("tools", TOOLS_BUILD);
     ws.write_build_file(
         "app",
-        r#"target(name = "ep", driver = "exec.entrypoint", deps = {"d": "//tools:data"},
+        r#"target(name = "ep", driver = "exec", entrypoint = True, deps = {"d": "//tools:data"},
        run = ["/bin/true"])"#,
     );
     let prepared = invoke(&ws.engine, "//app:ep", caller(ws.dir.path(), &[])).await?;
@@ -687,7 +733,7 @@ async fn fast_exit_flushes_pending_cache_writes() -> anyhow::Result<()> {
         &format!(
             r#"
 target(name = "dep", driver = "bash", run = "echo x >> {} && printf d > $OUT", out = "d")
-target(name = "ep", driver = "exec.entrypoint", hash_deps = [":dep"], run = ["/bin/true"])
+target(name = "ep", driver = "exec", entrypoint = True, hash_deps = [":dep"], run = ["/bin/true"])
 "#,
             counter.display()
         ),
@@ -721,7 +767,7 @@ target(name = "ep", driver = "exec.entrypoint", hash_deps = [":dep"], run = ["/b
         ))
     })?;
     e.register_plugin("exec", |_| exec_plugin())?;
-    e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))?;
+    e.register_plugin("bash", |_| bash_plugin())?;
     let e = Arc::new(e);
     drop(invoke(&e, "//app:ep", caller(ws.dir.path(), &[])).await?);
     assert_eq!(
@@ -760,8 +806,8 @@ async fn entrypoint_shell_refuses_undeclared_args() -> anyhow::Result<()> {
         "app",
         r#"
 target(name = "boom", driver = "bash", run = "exit 1", out = "x")
-target(name = "noargs", driver = "exec.entrypoint", deps = {"b": ":boom"}, run = ["/bin/echo"])
-target(name = "withargs", driver = "exec.entrypoint", run = ["/bin/echo", "hi"], args = True)
+target(name = "noargs", driver = "exec", entrypoint = True, deps = {"b": ":boom"}, run = ["/bin/echo"])
+target(name = "withargs", driver = "exec", entrypoint = True, run = ["/bin/echo", "hi"], args = True)
 "#,
     );
     let cwd = tempfile::tempdir()?;

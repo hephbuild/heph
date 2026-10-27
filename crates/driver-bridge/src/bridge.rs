@@ -263,6 +263,7 @@ mod shell_fallback_tests {
                     pty: false,
                     hash: vec![],
                     transparent: false,
+                    entrypoint: false,
                 },
             })
         }
@@ -335,6 +336,7 @@ mod shell_fallback_tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
         let request_id = "shell-fallback-test".to_string();
         let req = RunRequest {

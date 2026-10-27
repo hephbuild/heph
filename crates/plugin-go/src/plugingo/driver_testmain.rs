@@ -183,6 +183,7 @@ impl ManagedDriver for GoTestmainDriver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }

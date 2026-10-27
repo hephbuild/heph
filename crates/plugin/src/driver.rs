@@ -581,6 +581,18 @@ pub mod targetdef {
         pub outputs: Vec<Output>,
         pub support_files: Vec<path::Path>,
         pub cache: CacheConfig,
+        /// The target is an entrypoint (`entrypoint = True` on exec/bash): it is
+        /// *invoked* in the caller's world through `Engine::invoke`, never
+        /// built. The engine reads this, not the driver's name: it forces
+        /// `cache` off, refuses the target as anyone's input or as one of a
+        /// selection, and refuses to execute it.
+        ///
+        /// Builtin drivers only. It does not cross the plugin ABI: a def that
+        /// arrives from a cdylib is converted with this `false`, so a cdylib
+        /// driver cannot declare an entrypoint. Skipped when `false`, so a
+        /// serialized def of every other target is unchanged.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        pub entrypoint: bool,
         pub pty: bool,
         #[serde(serialize_with = "serialize_hash")]
         pub hash: Vec<u8>,
@@ -654,6 +666,7 @@ pub mod targetdef {
                 pty: false,
                 hash: vec![],
                 transparent: false,
+                entrypoint: false,
             }
         }
 
@@ -1256,6 +1269,7 @@ mod resolve_tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         }
     }
 
@@ -1519,12 +1533,17 @@ pub trait Driver: Send + Sync {
     ) -> anyhow::Result<RunResponse>;
 }
 
-/// The `Entrypoint` capability: a driver whose targets are *invoked* in the
-/// caller's world rather than built in a sandbox (the tool-shims spec, D1, D30).
+/// Entrypoints: targets that are *invoked* in the caller's world rather than
+/// built in a sandbox (the tool-shims spec, D1, D30).
 ///
-/// Builtin-only. Nothing here crosses the plugin ABI: a cdylib cannot declare
-/// it, and an N-1 heph meeting an `exec.entrypoint` target fails "driver not
-/// found" like any unknown driver.
+/// A target is one when its def says so
+/// ([`TargetDef::entrypoint`](targetdef::TargetDef::entrypoint), set by
+/// `entrypoint = True` on exec/bash). The driver that parsed it supplies the
+/// [`EntrypointDriver`] hook that shapes the command.
+///
+/// Builtin-only. Nothing here crosses the plugin ABI: a cdylib's def arrives
+/// with `entrypoint = false`, and an N-1 heph meeting `entrypoint = True`
+/// refuses it as an unknown exec/bash field.
 ///
 /// The engine owns resolution, dep builds, staging and the holds that keep a
 /// running tool's closure alive; the driver owns only the shape of the command
@@ -1532,7 +1551,7 @@ pub trait Driver: Send + Sync {
 /// engine staged. Nothing spawns here, and nothing in the engine library does
 /// either: the binary spawns the [`entrypoint::PreparedCommand`].
 pub mod entrypoint {
-    use super::{Deferred, DeferredValue, Driver, targetdef::TargetDef};
+    use super::{Deferred, DeferredValue, targetdef::TargetDef};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -1610,7 +1629,10 @@ pub mod entrypoint {
         pub cwd: PathBuf,
     }
 
-    pub trait EntrypointDriver: Driver {
+    /// A driver's hook for preparing its entrypoint targets. Registered next to
+    /// the driver itself; `Engine::invoke` refuses a target whose def is an
+    /// entrypoint when its driver has none.
+    pub trait EntrypointDriver: Send + Sync {
         /// Whether `target` declared `args = True`. The engine refuses trailing
         /// args for one that did not, after the spec resolves and before any
         /// dep builds (D18, D21).

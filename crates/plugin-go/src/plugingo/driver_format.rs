@@ -290,6 +290,7 @@ impl ManagedDriver for GoFormatDriver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }
@@ -418,6 +419,7 @@ impl ManagedDriver for GoFormatCheckDriver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }

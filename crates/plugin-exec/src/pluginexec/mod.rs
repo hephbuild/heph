@@ -125,6 +125,12 @@ struct TargetDef {
     /// address would prevent. Keeping it out also means every target that names
     /// no runner hashes byte-identically to before this field existed.
     pub runner: Option<TargetAddr>,
+    /// `entrypoint = True`: the target is invoked in the caller's world rather
+    /// than built (see [`entrypoint`]). `None` for every other target, and then
+    /// absent from both the hash and the serialized def, so no existing exec or
+    /// bash def moves (pinned by `exec_def_hash_golden_populated`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<entrypoint::EntrypointMode>,
 }
 
 impl Hash for TargetDef {
@@ -140,6 +146,12 @@ impl Hash for TargetDef {
         self.env.hash(state);
         self.pass_env.hash(state);
         // runtime_pass_env and runtime_env intentionally excluded
+        // Only when set: a target without the flag hashes exactly as before
+        // the flag existed. With it, `run` and `env` above plus these.
+        if let Some(mode) = &self.entrypoint {
+            "entrypoint".hash(state);
+            mode.hash(state);
+        }
     }
 }
 
@@ -209,11 +221,9 @@ fn sorted_by_group(m: HashMap<String, Vec<String>>) -> Vec<(String, Vec<String>)
     v
 }
 
-// ---- Parse helpers shared by `exec`/`bash` and `exec.entrypoint` (D19) ----
+// ---- Parse helpers ----
 //
-// Shared by name rather than by branching one `parse` on the driver: each
-// driver builds its own def, from the same input vocabulary (D8). Their output
-// for `exec` is pinned by `exec_def_hash_golden_populated`.
+// Their output is pinned by `exec_def_hash_golden_populated`.
 
 /// The inputs a `{group: [addr]}` dep attribute declares, ordered by group.
 ///
@@ -428,11 +438,11 @@ fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
         .context("render init.sh template")
 }
 
-/// `init.sh` for an entrypoint's `--shell` (D13): one command line, the
-/// entrypoint's resolved argv with each word quoted, followed by the args —
-/// the caller's (bash's positional parameters, kept in `__heph_args`), or a
-/// helper's own when it is given any. Same template as exec's, its own branch,
-/// so exec's render does not move.
+/// `init.sh` for an entrypoint's `--shell` (D13): one command line — exec's
+/// resolved argv, or bash's invocation of the script — each word quoted,
+/// followed by the args: the caller's (bash's positional parameters, kept in
+/// `__heph_args`), or a helper's own when it is given any. Same template as
+/// exec's, its own branch, so exec's render does not move.
 pub(crate) fn render_entrypoint_shell_init(argv: &[String]) -> anyhow::Result<String> {
     let cmds = argv
         .iter()
@@ -737,7 +747,11 @@ impl Driver {
         // in, or a heph upgrade that changes `cp` would keep serving
         // artifacts the old one built. Hashed only when the toolbox is on,
         // so a workspace that leaves it off keeps every key it has today.
-        if let Some(version) = self.coreutils_version() {
+        // Never for an entrypoint, which runs on the caller's PATH and never
+        // sees the toolbox (D24).
+        if def.entrypoint.is_none()
+            && let Some(version) = self.coreutils_version()
+        {
             "coreutils".hash(&mut h);
             version.hash(&mut h);
             // `tmpl` is one of those utilities, and what it renders is a
@@ -1312,19 +1326,39 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        // Only `exec.entrypoint` takes the caller's args. Refused by name rather
-        // than left to the generic unknown-field error, which would not say
-        // where the field belongs.
-        if req.target_spec.config.contains_key("args") {
-            anyhow::bail!(
-                "`args` is only accepted on an `exec.entrypoint` target; {} uses the `{}` driver, \
-                 which runs in a sandbox and takes no caller arguments",
-                req.target_spec.addr.format(),
-                self.name,
-            );
-        }
-
-        let spec = spec::TargetSpec::from(&req.target_spec.config)?;
+        // `entrypoint = True`, read off the raw config before the spec parse,
+        // because what is refused depends on it. (Any other value is `False`
+        // or fails that parse.)
+        let wants_entrypoint = matches!(
+            req.target_spec.config.get("entrypoint"),
+            Some(hcore::htvalue::Value::Bool(true))
+        );
+        let spec = if wants_entrypoint {
+            let addr = req.target_spec.addr.format();
+            entrypoint::refuse_fields(&req.target_spec.config, &addr, &self.name)?;
+            let context = || format!("the entrypoint `{}` target {addr}", self.name);
+            let (config, env) =
+                entrypoint::split_env(&req.target_spec.config).with_context(context)?;
+            spec::TargetSpec {
+                env,
+                ..spec::TargetSpec::from(&config).with_context(context)?
+            }
+        } else {
+            // `args` and `workdir` shape an invocation; without the flag there
+            // is none. Refused by name, saying where they belong.
+            for field in entrypoint::ENTRYPOINT_ONLY_FIELDS {
+                if req.target_spec.config.contains_key(*field) {
+                    anyhow::bail!(
+                        "`{field}` is only accepted with `entrypoint = True`; {} is a `{}` \
+                         target built in a sandbox, not invoked in the caller's world",
+                        req.target_spec.addr.format(),
+                        self.name,
+                    );
+                }
+            }
+            spec::TargetSpec::from(&req.target_spec.config)?
+        };
+        let is_entrypoint = spec.entrypoint;
         // Belt and braces with the host's whole-driver gate: the host refuses a
         // reference for a driver whose schema says no, and this catches the same
         // mistake if a driver is ever constructed outside that path. Named at the
@@ -1451,8 +1485,12 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         // Per-target field wins, then the driver's workspace-wide default.
         // `"local"` is the explicit opt-out — the one value that is not an
         // address, so a per-package override of a workspace default can be
-        // spelled without inventing a second knob.
-        let (runner_spec, from_default) = if spec.runner.is_empty() {
+        // spelled without inventing a second knob. An entrypoint takes neither:
+        // `runner` was refused above, and the default is for sandboxed
+        // targets (D24).
+        let (runner_spec, from_default) = if is_entrypoint {
+            (None, true)
+        } else if spec.runner.is_empty() {
             (self.default_runner.as_deref(), true)
         } else {
             (Some(spec.runner.as_str()), false)
@@ -1513,11 +1551,22 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             runtime_pass_env: spec.runtime_pass_env,
             runtime_env: spec.runtime_env,
             runner: runner.clone(),
+            entrypoint: is_entrypoint.then_some(entrypoint::EntrypointMode {
+                args: spec.args,
+                workdir: spec.workdir,
+            }),
         };
 
         let hash = self.def_hash(&def, || {
             format!("exec_def_{}", req.target_spec.addr.format())
         });
+        // Never cached. The engine forces this again from the def's
+        // `entrypoint` (D43); saying it here too keeps `inspect def` honest.
+        let cache = if is_entrypoint {
+            hplugin::driver::targetdef::CacheConfig::off()
+        } else {
+            spec.cache.into()
+        };
 
         let outputs = def
             .outputs
@@ -1545,7 +1594,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .collect(),
                 outputs,
                 support_files,
-                cache: spec.cache.into(),
+                cache,
+                entrypoint: is_entrypoint,
                 pty: true,
                 hash,
                 transparent: false,
@@ -1567,8 +1617,13 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             &mut xdef.dep_group_inputs,
             &mut xdef.runtime_dep_group_inputs,
         );
+        let is_entrypoint = xdef.entrypoint.is_some();
         for (name, env) in req.sandbox.env {
             match env.value {
+                // An entrypoint runs with the caller's whole environment as
+                // its base: a passed variable is there, or the caller did not
+                // set it.
+                EnvValue::Pass if is_entrypoint => {}
                 EnvValue::Pass => {
                     if env.hash {
                         if let Ok(value) = std::env::var(&name) {
@@ -2678,6 +2733,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![
                     D::new("sh".to_string()),
                     D::new("-c".to_string()),
@@ -2702,6 +2758,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let request_id = "test-request".to_string();
@@ -3031,6 +3088,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("echo".to_string()), D::new("hello".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -3049,6 +3107,7 @@ mod tests {
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let mut stdout = Vec::new();
@@ -3100,6 +3159,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("definitely-not-a-real-binary-xyz".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -3118,6 +3178,7 @@ mod tests {
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let request_id = "test-request".to_string();
@@ -3172,6 +3233,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("cat".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -3190,6 +3252,7 @@ mod tests {
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let mut stdin = std::io::Cursor::new(b"test data");
@@ -3235,6 +3298,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("cat".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -3253,6 +3317,7 @@ mod tests {
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let request_id = "test-request".to_string();
@@ -3308,6 +3373,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 // Ignore SIGINT and hang, forcing the grace → SIGKILL path.
                 run: vec![D::new("trap '' INT; sleep 30".to_string())],
                 dep_group_inputs: BTreeMap::new(),
@@ -3327,6 +3393,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let request_id = "test-request".to_string();
@@ -3378,6 +3445,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new(format!(
                     "head -c {payload_bytes} /dev/urandom | base64"
                 ))],
@@ -3398,6 +3466,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let mut stdout = Vec::new();
@@ -3553,6 +3622,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new(
                     "echo out-first; echo err-first >&2; sleep 1; echo out-last; echo err-last >&2"
                         .to_string(),
@@ -3574,6 +3644,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let out_sink = TimedSink::default();
@@ -3642,6 +3713,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new(
                     "echo a; sleep 0.3; echo b >&2; sleep 0.3; echo c; sleep 0.3; echo d >&2"
                         .to_string(),
@@ -3663,6 +3735,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let request_id = "test-request".to_string();
@@ -3712,6 +3785,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 // Interleaved rather than sequential so both drains are live
                 // at once and each can stall the other. No pipeline: the
                 // wrapper runs under `pipefail`, and a producer killed by
@@ -3737,6 +3811,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let mut stdout = Vec::new();
@@ -3869,6 +3944,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 // `wc -c`'s count goes to a *file*, not stdout: stdout is
                 // deliberately paced slower than the child can produce (see
                 // `PacedSink` below) so its trailing bytes are subject to a
@@ -3896,6 +3972,7 @@ mod tests {
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let mut stdin = std::io::Cursor::new(vec![b'x'; STDIN_BYTES]);
@@ -3982,6 +4059,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new(run_cmd.to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -4000,6 +4078,7 @@ mod tests {
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
@@ -4312,6 +4391,7 @@ mod tests {
             runtime_pass_env: vec![],
             runtime_env: HashMap::new(),
             runner: None,
+            entrypoint: None,
         };
         let mut h = Xxh3Default::new();
         def.hash(&mut h);
@@ -4549,6 +4629,91 @@ exec+coreutils apply_transitive: da2388103db4f305
 bash parse: 61dea7f3aa15aa34
 bash apply_transitive: 26a90abee4625d43
 "#;
+
+    /// `entrypoint = False` is no flag at all: the golden's exec and bash def
+    /// hashes, and a serialized def without any entrypoint key. With the flag,
+    /// the hash moves with the flag itself and with each of `run`, `env`,
+    /// `workdir` and `args`.
+    #[tokio::test]
+    async fn entrypoint_flag_off_matches_golden_flag_on_hash_moves() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let ctoken = StdCancellationToken::new();
+        let parse = |driver: Driver, config: HashMap<String, Value>| {
+            let ctoken = &ctoken;
+            async move {
+                driver
+                    .parse(
+                        hplugin::driver::ParseRequest {
+                            request_id: "golden".to_string(),
+                            target_spec: Arc::new(hplugin::provider::TargetSpec {
+                                addr: parse_addr("//app:golden")?,
+                                driver: driver.name.clone(),
+                                config,
+                                ..Default::default()
+                            }),
+                        },
+                        ctoken,
+                    )
+                    .await
+                    .map(|r| r.target_def)
+            }
+        };
+
+        for driver in [Driver::new_exec, Driver::new_bash] {
+            let mut config = golden_populated_config();
+            config.insert("entrypoint".to_string(), Value::Bool(false));
+            let def = parse(driver(), config).await?;
+            assert_eq!(String::from_utf8_lossy(&def.hash), "61dea7f3aa15aa34");
+            assert!(!def.entrypoint);
+            let json = serde_json::to_string(&def)?;
+            assert!(!json.contains("entrypoint"), "{json}");
+            assert!(!json.contains("workdir"), "{json}");
+            assert!(!json.contains("\"args\""), "{json}");
+        }
+
+        let s = |v: &str| Value::String(v.to_string());
+        let base = || {
+            HashMap::from([
+                ("run".to_string(), Value::List(vec![s("go")])),
+                ("entrypoint".to_string(), Value::Bool(true)),
+            ])
+        };
+        for driver in [Driver::new_exec, Driver::new_bash] {
+            let on = parse(driver(), base()).await?.hash;
+            let mut off_config = base();
+            off_config.remove("entrypoint");
+            assert_ne!(
+                on,
+                parse(driver(), off_config).await?.hash,
+                "the flag moves the def hash"
+            );
+            for (field, value) in [
+                ("run", Value::List(vec![s("gofmt")])),
+                (
+                    "env",
+                    Value::Map(HashMap::from([("A".to_string(), s("1"))])),
+                ),
+                ("workdir", s("root")),
+                ("args", Value::Bool(true)),
+            ] {
+                let mut config = base();
+                config.insert(field.to_string(), value);
+                assert_ne!(
+                    on,
+                    parse(driver(), config).await?.hash,
+                    "{field} must move the def hash"
+                );
+            }
+            let mut config = base();
+            config.insert("workdir".to_string(), s("caller"));
+            assert_eq!(
+                on,
+                parse(driver(), config).await?.hash,
+                "the default workdir is \"caller\""
+            );
+        }
+        Ok(())
+    }
 
     /// A repeated reference would mount one directory twice and set one variable
     /// twice. Collapsing it silently would hide a BUILD-file mistake.
@@ -5252,6 +5417,7 @@ bash apply_transitive: 26a90abee4625d43
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: run.into_iter().map(D::new).collect(),
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -5283,6 +5449,7 @@ bash apply_transitive: 26a90abee4625d43
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         }
     }
 
@@ -5395,6 +5562,7 @@ bash apply_transitive: 26a90abee4625d43
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("echo $PATH".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -5426,6 +5594,7 @@ bash apply_transitive: 26a90abee4625d43
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let mut stdout = Vec::new();
@@ -5547,6 +5716,7 @@ bash apply_transitive: 26a90abee4625d43
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -5578,6 +5748,7 @@ bash apply_transitive: 26a90abee4625d43
             pty: false,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let sandbox = tmp.path().join("sandbox");
@@ -5744,6 +5915,7 @@ bash apply_transitive: 26a90abee4625d43
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -5762,6 +5934,7 @@ bash apply_transitive: 26a90abee4625d43
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let request_id = "test".to_string();
@@ -5813,6 +5986,7 @@ bash apply_transitive: 26a90abee4625d43
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -5851,6 +6025,7 @@ bash apply_transitive: 26a90abee4625d43
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let request_id = "test".to_string();
@@ -5915,6 +6090,7 @@ bash apply_transitive: 26a90abee4625d43
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -5956,6 +6132,7 @@ bash apply_transitive: 26a90abee4625d43
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let request_id = "test".to_string();
@@ -6003,6 +6180,7 @@ bash apply_transitive: 26a90abee4625d43
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("true".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -6046,6 +6224,7 @@ bash apply_transitive: 26a90abee4625d43
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let request_id = "test".to_string();
@@ -6342,6 +6521,7 @@ bash apply_transitive: 26a90abee4625d43
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("echo $PATH".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -6360,6 +6540,7 @@ bash apply_transitive: 26a90abee4625d43
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
@@ -6437,6 +6618,7 @@ bash apply_transitive: 26a90abee4625d43
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
+                entrypoint: None,
                 run: vec![D::new("echo $PATH".to_string())],
                 dep_group_inputs: BTreeMap::new(),
                 runtime_dep_group_inputs: BTreeMap::new(),
@@ -6468,6 +6650,7 @@ bash apply_transitive: 26a90abee4625d43
             pty: true,
             hash: vec![],
             transparent: false,
+            entrypoint: false,
         };
 
         let mut stdout = Vec::new();

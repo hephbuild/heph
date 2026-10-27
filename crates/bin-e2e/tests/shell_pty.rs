@@ -706,7 +706,7 @@ fn entrypoint_shell_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
-/// `heph run --shell` on an `exec.entrypoint` (D13): an interactive bash in
+/// `heph run --shell` on an entrypoint (D13): an interactive bash in
 /// the program's world, whose `run` is the program's argv plus the caller's
 /// args — `a b` and the empty string intact — or a helper's own args when it
 /// is given any. Ctrl-C at the prompt is the shell's, not heph's; the shell's
@@ -718,7 +718,7 @@ fn entrypoint_shell_pty() {
     let ws = common::Workspace::new().expect("workspace");
     ws.write(
         "pkg/BUILD",
-        "target(name = \"tool\", driver = \"exec.entrypoint\", args = True,\n\
+        "target(name = \"tool\", driver = \"exec\", entrypoint = True, args = True,\n\
          run = [\"/bin/sh\", \"-c\", \"printf '<%s>' \\\"$@\\\"; echo\", \"tool\"])\n",
     )
     .expect("write BUILD");

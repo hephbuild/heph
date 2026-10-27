@@ -608,6 +608,7 @@ impl ManagedDriver for GoToolchainDriver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }

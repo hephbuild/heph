@@ -1,5 +1,6 @@
-//! `Engine::invoke`: the one entry point an `Entrypoint`-capable target runs
-//! through (the tool-shims spec, D1, D30).
+//! `Engine::invoke`: the one entry point an entrypoint target — one whose def
+//! has `entrypoint` set, from `entrypoint = True` on exec/bash — runs through
+//! (the tool-shims spec, D1, D30).
 //!
 //! An entrypoint is *invoked*, not built: it runs in the caller's cwd with the
 //! caller's environment and stdio, is never cached, never sandboxed, and never
@@ -69,7 +70,7 @@ impl PreparedInvocation {
 /// An entrypoint named as some target's input (I8).
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{entrypoint} is an exec.entrypoint target and cannot be an input{}: an entrypoint runs in \
+    "{entrypoint} is an entrypoint (`entrypoint = True`) and cannot be an input{}: an entrypoint runs in \
      the caller's working directory and environment, so a build step depending on it could run \
      something outside any sandbox. Depend on what it runs instead",
     consumer_clause(.consumer.as_ref(), .origin_id)
@@ -105,7 +106,7 @@ impl EntrypointAsInput {
 /// selection, or anything else that would execute it (I8).
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{addr} is an exec.entrypoint target: it is invoked on its own with `heph run {addr}`, never \
+    "{addr} is an entrypoint (`entrypoint = True`): it is invoked on its own with `heph run {addr}`, never \
      built, and never as part of a multi-target selection"
 )]
 pub struct EntrypointNotBuildable {
@@ -123,22 +124,27 @@ pub struct UndeclaredArgs {
     pub count: usize,
 }
 
-impl Engine {
-    /// Whether the driver registered as `name` has the `Entrypoint` capability.
-    pub fn is_entrypoint_driver(&self, name: &str) -> bool {
-        self.drivers_by_name
-            .get(name)
-            .is_some_and(|d| d.is_entrypoint())
-    }
+/// A target whose def is an entrypoint, parsed by a driver that registered no
+/// hook to prepare one. Only a builtin wiring mistake reaches this.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{addr} is an entrypoint, but its `{driver}` driver has no entrypoint hook to prepare it with"
+)]
+pub struct EntrypointWithoutHook {
+    pub addr: Addr,
+    pub driver: String,
+}
 
-    /// Whether `addr` is an entrypoint. Resolves its spec only.
+impl Engine {
+    /// Whether `addr` is an entrypoint: its def's attribute. Resolves (parses)
+    /// its def, which builds nothing.
     pub async fn is_entrypoint(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<bool> {
-        let spec = Arc::clone(self).get_spec(rs.clone(), addr).await?;
-        Ok(self.is_entrypoint_driver(&spec.driver))
+        let def = Arc::clone(self).get_def(rs.clone(), addr).await?;
+        Ok(def.target_def.entrypoint)
     }
 
     /// Refuse an entrypoint reached by a multi-target selection, before
@@ -154,18 +160,31 @@ impl Engine {
         Ok(())
     }
 
+    /// The hook that prepares `addr`, refusing a target that is not an
+    /// entrypoint and one whose driver has no hook.
     fn entrypoint_driver(
         &self,
         driver: &str,
         addr: &Addr,
+        target: &hplugin::driver::targetdef::TargetDef,
     ) -> anyhow::Result<Arc<dyn EntrypointDriver>> {
+        if !target.entrypoint {
+            anyhow::bail!(
+                "{addr} is not an entrypoint; declare `entrypoint = True` on an exec or bash \
+                 target to invoke it"
+            );
+        }
         self.drivers_by_name
             .get(driver)
             .with_context(|| format!("driver not found: {driver}"))?
             .entrypoint
             .clone()
-            .with_context(|| {
-                format!("{addr} uses the `{driver}` driver, which is not an entrypoint driver")
+            .ok_or_else(|| {
+                EntrypointWithoutHook {
+                    addr: addr.clone(),
+                    driver: driver.to_string(),
+                }
+                .into()
             })
     }
 
@@ -182,9 +201,9 @@ impl Engine {
         let spec = Arc::clone(&self)
             .get_spec_no_track(rs.clone(), addr)
             .await?;
-        let driver = self.entrypoint_driver(&spec.driver, addr)?;
         let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
         let target = Arc::clone(&def.target_def);
+        let driver = self.entrypoint_driver(&spec.driver, addr, &target)?;
 
         // After the spec resolves, before any dep builds: a flagless release
         // script must not swallow a mistyped `--dry-run` and run for real.
@@ -199,7 +218,7 @@ impl Engine {
         if let Some(r) = deferred_refs.iter().find(|r| r.needs_sandbox()) {
             anyhow::bail!(
                 "{addr}: {:?} names a `${{src://…}}`, which needs a sandbox path; an \
-                 exec.entrypoint has no sandbox. Use `$SRC_<group>` with a dep instead",
+                 entrypoint has no sandbox. Use `$SRC_<group>` with a dep instead",
                 r.raw
             );
         }

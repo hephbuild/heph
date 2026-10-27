@@ -1081,6 +1081,7 @@ impl ManagedDriver for Driver {
                 pty: false,
                 hash,
                 transparent: false,
+                entrypoint: false,
             },
         })
     }

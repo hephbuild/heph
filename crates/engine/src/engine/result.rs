@@ -4295,11 +4295,11 @@ impl Engine {
         }
 
         // An entrypoint is never cached, whatever its driver's parse said and
-        // whatever default reached it. Forced here, from the capability, because
-        // every cache decision downstream reads `def.cache` before anything
-        // executes — a zero-output remote "hit" must never make `go test` a
-        // no-op (I6, D43).
-        if driver.is_entrypoint() {
+        // whatever default reached it. Forced here, from the def's attribute,
+        // because every cache decision downstream reads `def.cache` before
+        // anything executes — a zero-output remote "hit" must never make
+        // `go test` a no-op (I6, D43).
+        if def.entrypoint {
             def.cache = crate::engine::driver::targetdef::CacheConfig::off();
         }
 
@@ -9549,6 +9549,7 @@ mod tests {
                     pty: false,
                     hash: vec![1, 2, 3, 4],
                     transparent: false,
+                    entrypoint: false,
                 },
             })
         }
@@ -11769,6 +11770,7 @@ mod tests {
                     pty: false,
                     hash: req.target_spec.addr.format().into_bytes(),
                     transparent,
+                    entrypoint: false,
                 },
             })
         }
@@ -12571,6 +12573,7 @@ mod tests {
                     pty: false,
                     hash: Vec::new(),
                     transparent: false,
+                    entrypoint: false,
                 }),
                 inputs: Vec::new(),
             };
