@@ -441,8 +441,9 @@ fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
 /// `init.sh` for an entrypoint's `--shell` (D13): one command line — exec's
 /// resolved argv, or bash's invocation of the script — each word quoted,
 /// followed by the args: the caller's (bash's positional parameters, kept in
-/// `__heph_args`), or a helper's own when it is given any. Same template as
-/// exec's, its own branch, so exec's render does not move.
+/// `__heph_args`), or a helper's own when it is given any. One line, so `run`,
+/// `xrun`, `show` and `showl` and no `runN`. Same template as exec's, its own
+/// branch, so exec's render does not move.
 pub(crate) fn render_entrypoint_shell_init(argv: &[String]) -> anyhow::Result<String> {
     let cmds = argv
         .iter()

@@ -817,7 +817,7 @@ mod tests {
 
     /// The rendered `init.sh` hands the program its argv plus the args exactly,
     /// whatever bytes they hold; a helper's own args replace the originals for
-    /// that call only; `show` quotes them (D13).
+    /// that call only; `show` quotes them; there is no `runN` (D13).
     #[test]
     fn entrypoint_shell_init_args_exact() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -850,7 +850,7 @@ mod tests {
                 &["", "x", ""],
             ];
             for args in rows {
-                for helper in ["run", "xrun", "run1", "xrun1"] {
+                for helper in ["run", "xrun"] {
                     let (out, err) = in_shell(bash, &init, args, helper);
                     assert_eq!(
                         out,
@@ -865,12 +865,16 @@ mod tests {
                 ("run a 'b c'", expect(&["a", "b c"])),
                 ("run ''", expect(&[""])),
                 ("xrun z", expect(&["z"])),
-                ("run1 q", expect(&["q"])),
                 (
                     "run x; run",
                     format!("{}{}", expect(&["x"]), expect(&originals)),
                 ),
                 ("run", expect(&originals)),
+                // One command line, so no `runN`/`xrunN`.
+                (
+                    "for f in run1 xrun1; do declare -F \"$f\" >/dev/null && echo \"$f defined\"; done; echo none",
+                    "none\n".to_string(),
+                ),
             ] {
                 let (out, err) = in_shell(bash, &init, &originals, snippet);
                 assert_eq!(out, want, "{bash}: `{snippet}`; stderr: {err}");

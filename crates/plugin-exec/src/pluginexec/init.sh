@@ -44,8 +44,6 @@ xrun() (
   set -x
   {{ cmds }} ${__heph_a[@]+"${__heph_a[@]}"}
 )
-run1() { run "$@"; }
-xrun1() { xrun "$@"; }
 show() {
   printf '%s' {{ display }}
   if [ "$#" -gt 0 ]; then printf ' %q' "$@"; elif [ -n "${__heph_args[*]+set}" ]; then printf ' %q' "${__heph_args[@]}"; fi
@@ -58,7 +56,6 @@ showl() {
 
 echo "run [args…]   : Runs the command; args, when given, replace the ones heph run got"
 echo "xrun [args…]  : Same with trace"
-echo "run1, xrun1   : Same as run and xrun"
 echo "show [args…]  : Prints the command, args shell-quoted"
 echo "showl [args…] : Same with line numbers"
 echo ''
