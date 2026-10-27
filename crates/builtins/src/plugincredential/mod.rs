@@ -36,8 +36,7 @@ use hcore::htvalue::Value;
 use hcore::htvalue::signature::ParamType;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, DriverSchema,
-    ParseRequest, ParseResponse, RunRequest, RunResponse,
-    targetdef::{CacheConfig, TargetDef},
+    ParseRequest, ParseResponse, RunRequest, RunResponse, targetdef::TargetDef,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -256,10 +255,10 @@ impl hplugin::driver::Driver for Driver {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                // Never cached as a target. Material has a lifetime of its own,
-                // managed by the credential store, which is a different thing.
-                cache: CacheConfig::off(),
                 hash,
+                // Never cached as a target (the default `CacheConfig::off()`).
+                // Material has a lifetime of its own, managed by the credential
+                // store, which is a different thing.
                 ..Default::default()
             },
         })

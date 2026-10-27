@@ -24,8 +24,7 @@ use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, RunRequest, RunResponse,
-    targetdef::{CacheConfig, TargetDef},
+    ParseResponse, RunRequest, RunResponse, targetdef::TargetDef,
 };
 use hplugin::htspec::Spec;
 use std::sync::Arc;
@@ -303,11 +302,11 @@ impl hplugin::driver::Driver for Driver {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                // Never cached as a target: there is nothing to cache. The
-                // directory it names is managed by the engine's scratch store,
-                // which is a different thing with a different lifetime.
-                cache: CacheConfig::off(),
                 hash,
+                // Never cached as a target (the default `CacheConfig::off()`):
+                // there is nothing to cache. The directory it names is managed
+                // by the engine's scratch store, which is a different thing
+                // with a different lifetime.
                 ..Default::default()
             },
         })

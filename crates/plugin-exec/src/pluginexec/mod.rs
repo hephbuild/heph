@@ -79,7 +79,7 @@ pub struct Driver {
     run_is_deferrable: bool,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Default, serde::Serialize)]
 struct TargetDef {
     /// The command, still holding any `${read://…}` an author wrote.
     ///
@@ -1599,7 +1599,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 entrypoint: is_entrypoint,
                 pty: true,
                 hash,
-                transparent: false,
+                ..Default::default()
             },
         })
     }
@@ -2731,25 +2731,13 @@ mod tests {
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![
                     D::new("sh".to_string()),
                     D::new("-c".to_string()),
                     D::new("sleep 5 & echo boom >&2; exit 3".to_string()),
                 ],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
             cache: CacheConfig::on(true),
             ..Default::default()
         };
@@ -3078,18 +3066,8 @@ mod tests {
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("echo".to_string()), D::new("hello".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -3142,18 +3120,8 @@ mod tests {
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("definitely-not-a-real-binary-xyz".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -3209,18 +3177,8 @@ mod tests {
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("cat".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -3267,18 +3225,8 @@ mod tests {
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("cat".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -3335,19 +3283,9 @@ mod tests {
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 // Ignore SIGINT and hang, forcing the grace → SIGKILL path.
                 run: vec![D::new("trap '' INT; sleep 30".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             ..Default::default()
@@ -3399,20 +3337,10 @@ mod tests {
         let payload_bytes: usize = 256 * 1024;
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new(format!(
                     "head -c {payload_bytes} /dev/urandom | base64"
                 ))],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             ..Default::default()
@@ -3568,21 +3496,11 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new(
                     "echo out-first; echo err-first >&2; sleep 1; echo out-last; echo err-last >&2"
                         .to_string(),
                 )],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             ..Default::default()
@@ -3651,21 +3569,11 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new(
                     "echo a; sleep 0.3; echo b >&2; sleep 0.3; echo c; sleep 0.3; echo d >&2"
                         .to_string(),
                 )],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             ..Default::default()
@@ -3715,8 +3623,6 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 // Interleaved rather than sequential so both drains are live
                 // at once and each can stall the other. No pipeline: the
                 // wrapper runs under `pipefail`, and a producer killed by
@@ -3725,15 +3631,7 @@ mod tests {
                 run: vec![D::new(format!(
                     "head -c {PER_STREAM} /dev/zero & head -c {PER_STREAM} /dev/zero >&2; wait"
                 ))],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             ..Default::default()
@@ -3866,8 +3764,6 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 // `wc -c`'s count goes to a *file*, not stdout: stdout is
                 // deliberately paced slower than the child can produce (see
                 // `PacedSink` below) so its trailing bytes are subject to a
@@ -3878,15 +3774,7 @@ mod tests {
                 run: vec![D::new(format!(
                     "head -c {OUT_BYTES} /dev/zero; wc -c > stdin_byte_count.txt"
                 ))],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             ..Default::default()
@@ -3973,18 +3861,11 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new(run_cmd.to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
                 pass_env,
                 runtime_pass_env,
                 runtime_env,
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -4291,17 +4172,7 @@ mod tests {
         use std::hash::{Hash as _, Hasher as _};
         let def = TargetDef {
             run: vec![D::new("sh".to_string()), D::new("-c".to_string())],
-            dep_group_inputs: BTreeMap::new(),
-            runtime_dep_group_inputs: BTreeMap::new(),
-            tool_group_inputs: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-            support_files: vec![],
-            env: BTreeMap::new(),
-            pass_env: BTreeMap::new(),
-            runtime_pass_env: vec![],
-            runtime_env: HashMap::new(),
-            runner: None,
-            entrypoint: None,
+            ..Default::default()
         };
         let mut h = Xxh3Default::new();
         def.hash(&mut h);
@@ -5324,12 +5195,7 @@ bash apply_transitive: 26a90abee4625d43
     fn make_tool_target_def(run: Vec<String>, origin_id: &str, group: &str) -> EngineTargetDef {
         EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: run.into_iter().map(D::new).collect(),
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     group.to_string(),
                     vec![Input {
@@ -5344,11 +5210,7 @@ bash apply_transitive: 26a90abee4625d43
                         runtime: true,
                     }],
                 )]),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -5462,12 +5324,7 @@ bash apply_transitive: 26a90abee4625d43
         let existing_path = "/usr/bin:/bin";
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("echo $PATH".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![Input {
@@ -5483,10 +5340,7 @@ bash apply_transitive: 26a90abee4625d43
                     }],
                 )]),
                 pass_env: BTreeMap::from([("PATH".to_string(), existing_path.to_string())]),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -5610,12 +5464,7 @@ bash apply_transitive: 26a90abee4625d43
                 BTreeMap::new(),
             ),
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![Input {
@@ -5630,11 +5479,7 @@ bash apply_transitive: 26a90abee4625d43
                         runtime: true,
                     }],
                 )]),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             ..Default::default()
@@ -5801,18 +5646,8 @@ bash apply_transitive: 26a90abee4625d43
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -5865,12 +5700,7 @@ bash apply_transitive: 26a90abee4625d43
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![
@@ -5892,11 +5722,7 @@ bash apply_transitive: 26a90abee4625d43
                         },
                     ],
                 )]),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -5962,12 +5788,7 @@ bash apply_transitive: 26a90abee4625d43
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([
                     (
                         "g1".to_string(),
@@ -5992,11 +5813,7 @@ bash apply_transitive: 26a90abee4625d43
                         }],
                     ),
                 ]),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -6045,20 +5862,9 @@ bash apply_transitive: 26a90abee4625d43
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
             outputs: vec![
                 Output {
                     group: "file".to_string(),
@@ -6381,18 +6187,8 @@ bash apply_transitive: 26a90abee4625d43
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("echo $PATH".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,
@@ -6471,12 +6267,7 @@ bash apply_transitive: 26a90abee4625d43
 
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
-                runner: None,
-                entrypoint: None,
                 run: vec![D::new("echo $PATH".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![Input {
@@ -6492,10 +6283,7 @@ bash apply_transitive: 26a90abee4625d43
                     }],
                 )]),
                 pass_env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
             cache: CacheConfig::on(true),
             pty: true,

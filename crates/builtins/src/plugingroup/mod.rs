@@ -39,7 +39,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse, outputartifact,
     targetdef::{
-        CacheConfig, Input, InputMode, Output, TargetDef,
+        Input, InputMode, Output, TargetDef,
         path::{CodegenMode, Content as PathContent, Path},
     },
 };
@@ -221,13 +221,12 @@ impl hplugin::driver::Driver for Driver {
                 raw_def: Arc::new(GroupDef { transform }),
                 inputs,
                 outputs,
-                // Off in both modes, for different reasons: an aggregate group
-                // has nothing of its own to cache, and a relocating one owns no
-                // bytes — its artifacts borrow its deps'. See `is_passthrough`
-                // in the engine.
-                cache: CacheConfig::off(),
                 hash,
                 transparent: !relocating,
+                // `cache` stays at the default, off, in both modes, for different
+                // reasons: an aggregate group has nothing of its own to cache,
+                // and a relocating one owns no bytes — its artifacts borrow its
+                // deps'. See `is_passthrough` in the engine.
                 ..Default::default()
             },
         })
