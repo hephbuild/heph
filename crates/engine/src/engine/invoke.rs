@@ -46,6 +46,8 @@ pub struct PreparedInvocation {
     /// Each dep's result carries a read lock on its cache revision, so a
     /// `--force` rebuild of the same revision waits for the tool.
     _results: Vec<Arc<EResult>>,
+    /// `--shell`'s init file, removed with the invocation.
+    _shell_dir: Option<tempfile::TempDir>,
 }
 
 impl std::fmt::Debug for PreparedInvocation {
@@ -193,10 +195,6 @@ impl Engine {
             }
             .into());
         }
-        if req.shell {
-            anyhow::bail!("`--shell` is not supported yet on the exec.entrypoint target {addr}");
-        }
-
         let deferred_refs = self.deferred_refs(&spec.spec, &spec.driver)?;
         if let Some(r) = deferred_refs.iter().find(|r| r.needs_sandbox()) {
             anyhow::bail!(
@@ -310,6 +308,22 @@ impl Engine {
             )
         };
 
+        // `--shell`: the init file is per invocation, under heph's home and
+        // never the caller's cwd, and goes with the invocation (D13).
+        let shell_dir = if req.shell {
+            let tmp = self.home.join("tmp");
+            std::fs::create_dir_all(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            Some(
+                tempfile::Builder::new()
+                    .prefix("entrypoint-shell-")
+                    .tempdir_in(&tmp)
+                    .with_context(|| format!("create a shell init dir under {}", tmp.display()))?,
+            )
+        } else {
+            None
+        };
+        let shell_init = shell_dir.as_ref().map(|d| d.path().join("init.sh"));
+
         let command = driver
             .prepare(
                 &token,
@@ -320,7 +334,7 @@ impl Engine {
                     deferred: &deferred,
                     caller: &req.caller,
                     root: &self.cfg.root,
-                    shell_init: None,
+                    shell_init: shell_init.as_deref(),
                 },
             )
             .with_context(|| format!("prepare {addr}"))?;
@@ -329,6 +343,7 @@ impl Engine {
             command,
             holds,
             _results: results,
+            _shell_dir: shell_dir,
         })
     }
 }

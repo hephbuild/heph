@@ -420,8 +420,44 @@ fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
         .context("compile init.sh template")?;
     env.get_template("init.sh")
         .context("load init.sh template")?
-        .render(minijinja::context! { cmds, lines => minijinja::value::Serde(lines) })
+        .render(minijinja::context! {
+            entrypoint => false,
+            cmds,
+            lines => minijinja::value::Serde(lines),
+        })
         .context("render init.sh template")
+}
+
+/// `init.sh` for an entrypoint's `--shell` (D13): one command line, the
+/// entrypoint's resolved argv with each word quoted, followed by the args —
+/// the caller's (bash's positional parameters, kept in `__heph_args`), or a
+/// helper's own when it is given any. Same template as exec's, its own branch,
+/// so exec's render does not move.
+pub(crate) fn render_entrypoint_shell_init(argv: &[String]) -> anyhow::Result<String> {
+    let cmds = argv
+        .iter()
+        .map(|w| bash_squote(w))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let display = bash_squote(&cmds);
+    let mut env = minijinja::Environment::new();
+    env.add_template("init.sh", SHELL_INIT_SH)
+        .context("compile init.sh template")?;
+    env.get_template("init.sh")
+        .context("load init.sh template")?
+        .render(minijinja::context! { entrypoint => true, cmds, display })
+        .context("render init.sh template")
+}
+
+/// `program` on the `PATH` heph itself was launched with, for a shell heph
+/// starts on the target's behalf. See [`Driver::resolve_shell`].
+pub(crate) fn resolve_on_host_path(program: &str, driver: &str) -> anyhow::Result<PathBuf> {
+    which::which(program).with_context(|| {
+        format!(
+            "the {driver} driver needs `{program}` and could not find it on the PATH heph was \
+             launched with"
+        )
+    })
 }
 
 fn bash_args_shell(sandbox_dir: &std::path::Path, run: &[String]) -> anyhow::Result<Vec<String>> {
@@ -671,12 +707,10 @@ impl Driver {
             out.extend_from_slice(rest);
             return Ok(out);
         }
-        let found = which::which(program).with_context(|| {
-            format!(
-                "the {} driver needs `{program}` and could not find it on the PATH heph was                  launched with. A target's own PATH deliberately has no host directories on it,                  so the shell is resolved here instead.",
-                self.name,
-            )
-        })?;
+        let found = resolve_on_host_path(program, &self.name).context(
+            "a target's own PATH deliberately has no host directories on it, so the shell is \
+             resolved on heph's instead",
+        )?;
         let found = self.shell_path.get_or_init(|| found);
         let mut out = vec![found.to_string_lossy().into_owned()];
         out.extend_from_slice(rest);
@@ -2964,6 +2998,27 @@ mod tests {
             "should not have show() block: {out}"
         );
         assert!(!out.contains("{{"), "template tokens left: {out}");
+    }
+
+    /// The exec/bash `init.sh`, byte for byte: the entrypoint's shell renders
+    /// from the same template, and must not move a byte of this one. Pinned as
+    /// a digest of the whole render, with and without commands.
+    #[test]
+    fn exec_shell_init_is_byte_identical() {
+        let digest = |run: &[String]| {
+            let mut h = Xxh3Default::new();
+            std::hash::Hasher::write(&mut h, render_shell_init(run).expect("render").as_bytes());
+            format!("{:016x}", std::hash::Hasher::finish(&h))
+        };
+        let with = digest(&[
+            "echo 'it''s' \"$HOME\"".to_string(),
+            "ls -la\nmore".to_string(),
+        ]);
+        let without = digest(&[]);
+        assert_eq!(
+            (with.as_str(), without.as_str()),
+            ("50a976451839979a", "212c40f66956e0eb")
+        );
     }
 
     #[tokio::test]

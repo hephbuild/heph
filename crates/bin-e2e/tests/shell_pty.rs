@@ -681,6 +681,113 @@ fn echo_marker_prints_the_marker_without_typing_it() {
 /// never exits (see `ready`). Nothing about that is deterministic in a pty
 /// run — it failed ~1% of the time, Linux only — but the precondition is, and
 /// this pins it.
+/// Every directory named like an entrypoint shell's init dir under `root`.
+fn entrypoint_shell_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() || p.is_symlink() {
+                continue;
+            }
+            if e.file_name()
+                .to_string_lossy()
+                .starts_with("entrypoint-shell-")
+            {
+                found.push(p.clone());
+            }
+            stack.push(p);
+        }
+    }
+    found
+}
+
+/// `heph run --shell` on an `exec.entrypoint` (D13): an interactive bash in
+/// the program's world, whose `run` is the program's argv plus the caller's
+/// args — `a b` and the empty string intact — or a helper's own args when it
+/// is given any. Ctrl-C at the prompt is the shell's, not heph's; the shell's
+/// exit status is heph's; the terminal is left as it was found and the init
+/// file is gone.
+#[test]
+fn entrypoint_shell_pty() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"tool\", driver = \"exec.entrypoint\", args = True,\n\
+         run = [\"/bin/sh\", \"-c\", \"printf '<%s>' \\\"$@\\\"; echo\", \"tool\"])\n",
+    )
+    .expect("write BUILD");
+
+    let mut session = ShellSession::spawn(
+        &dist,
+        ws.root(),
+        &["run", "--shell", "//pkg:tool", "--", "a b", ""],
+    );
+    session.ready();
+    assert_eq!(
+        entrypoint_shell_dirs(ws.root()).len(),
+        1,
+        "the init file lives under heph's home while the shell runs"
+    );
+
+    // `run` with no args: the program's argv plus the caller's.
+    session.send_str("run\n");
+    session.wait_for("<a b><>", Duration::from_secs(10));
+    session.wait_for(PROMPT, Duration::from_secs(10));
+
+    // `run x`: its own args, not the originals. The line ends right after it.
+    session.send_str("run override\n");
+    session.wait_for("<override>\r\n", Duration::from_secs(10));
+    session.wait_for(PROMPT, Duration::from_secs(10));
+
+    // Ctrl-C at the prompt reaches the shell, not heph.
+    session.send(b"\x03");
+    session.wait_for(PROMPT, Duration::from_secs(10));
+    let (alive_cmd, alive_marker) = echo_marker("still-", "here");
+    session.send_str(&format!("{alive_cmd}\n"));
+    session.wait_for(&alive_marker, Duration::from_secs(10));
+    session.wait_for(PROMPT, Duration::from_secs(10));
+
+    session.send_str("exit 3\n");
+    let started = Instant::now();
+    let code = loop {
+        match session.child.try_wait().expect("wait on pty child") {
+            Some(status) => break status.exit_code(),
+            None => {
+                assert!(
+                    started.elapsed() < DEADLINE,
+                    "heph did not exit after `exit 3`\n{}",
+                    session.output_lossy()
+                );
+                std::thread::sleep(POLL);
+            }
+        }
+    };
+    assert_eq!(
+        code,
+        3,
+        "the shell's status is heph's\n{}",
+        session.output_lossy()
+    );
+
+    let mut screen = vt100::Parser::new(40, 140, 0);
+    screen.process(&session.output_snapshot());
+    assert!(
+        !screen.screen().alternate_screen(),
+        "left the alternate screen on"
+    );
+    assert!(!screen.screen().hide_cursor(), "left the cursor hidden");
+    assert!(
+        entrypoint_shell_dirs(ws.root()).is_empty(),
+        "the init file outlived the shell"
+    );
+}
+
 #[test]
 fn set_prompt_installs_the_prompt_without_typing_it() {
     assert!(

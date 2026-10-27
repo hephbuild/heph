@@ -581,9 +581,7 @@ impl EntrypointDriver for Entrypoint {
         if argv.is_empty() {
             anyhow::bail!("`run` is empty on {}", req.target.addr.format());
         }
-        if def.args {
-            argv.extend(req.caller.args.iter().cloned());
-        } else if !req.caller.args.is_empty() {
+        if !def.args && !req.caller.args.is_empty() {
             // The engine refuses this before anything builds; this is the
             // backstop for a caller that did not ask.
             anyhow::bail!(
@@ -591,12 +589,41 @@ impl EntrypointDriver for Entrypoint {
                 req.target.addr.format()
             );
         }
-        if req.shell_init.is_some() {
-            anyhow::bail!(
-                "`--shell` is not supported yet on the exec.entrypoint target {}",
-                req.target.addr.format()
-            );
-        }
+        let argv = match req.shell_init {
+            None => {
+                argv.extend(req.caller.args.iter().cloned());
+                argv
+            }
+            // `--shell` (D13): an interactive bash in the program's world, whose
+            // `run` is the program's argv plus the args. The args are bash's
+            // positional parameters, so they arrive byte for byte; `init.sh`
+            // keeps them at top level.
+            Some(init) => {
+                let words = argv
+                    .iter()
+                    .map(|w| {
+                        w.to_str().map(str::to_string).with_context(|| {
+                            format!("`run` word {w:?} is not valid UTF-8, which `--shell` needs")
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<String>>>()?;
+                let rendered = super::render_entrypoint_shell_init(&words)?;
+                std::fs::write(init, rendered)
+                    .with_context(|| format!("write the shell init file {}", init.display()))?;
+                let bash = super::resolve_on_host_path("bash", "exec.entrypoint")?;
+                let mut shell: Vec<OsString> = vec![
+                    bash.into_os_string(),
+                    "--noprofile".into(),
+                    "--rcfile".into(),
+                    init.as_os_str().to_os_string(),
+                    "-i".into(),
+                    "-s".into(),
+                    "--".into(),
+                ];
+                shell.extend(req.caller.args.iter().cloned());
+                shell
+            }
+        };
 
         let env = Self::environment(&req, def, &vars)?;
         let cwd = match def.workdir {
@@ -812,6 +839,135 @@ mod tests {
             ("", ""),
         ] {
             assert_eq!(expand_closure_vars(input, &vars), want, "{input:?}");
+        }
+    }
+
+    /// Run `snippet` in a non-interactive bash after sourcing the rendered
+    /// `init.sh` with `args` as its positional parameters — what the
+    /// interactive shell does with `--rcfile … -s -- args`.
+    fn in_shell(bash: &str, init: &Path, args: &[&str], snippet: &str) -> (String, String) {
+        let out = std::process::Command::new(bash)
+            .args(["--noprofile", "--norc", "-c"])
+            .arg(format!(". \"$0\" \"$@\" >/dev/null 2>&1; {snippet}"))
+            .arg(init)
+            .args(args)
+            .env_clear()
+            .output()
+            .expect("run bash");
+        (
+            String::from_utf8(out.stdout).expect("utf8 stdout"),
+            String::from_utf8(out.stderr).expect("utf8 stderr"),
+        )
+    }
+
+    /// The rendered `init.sh` hands the program its argv plus the args exactly,
+    /// whatever bytes they hold; a helper's own args replace the originals for
+    /// that call only; `show` quotes them (D13).
+    #[test]
+    fn entrypoint_shell_init_args_exact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = dir.path().join("init.sh");
+        let argv = ["printf", "<%s>", "fixed"].map(str::to_string);
+        std::fs::write(
+            &init,
+            super::super::render_entrypoint_shell_init(&argv).expect("render"),
+        )
+        .expect("write init.sh");
+        let expect = |args: &[&str]| {
+            let mut s = "<fixed>".to_string();
+            for a in args {
+                s.push_str(&format!("<{a}>"));
+            }
+            s
+        };
+
+        // Every bash we can find: the one on PATH, and macOS's 3.2, which is
+        // where `set -u` trips on an empty array.
+        let bashes: Vec<String> = ["bash", "/bin/bash"]
+            .into_iter()
+            .filter(|b| which::which(b).is_ok())
+            .map(str::to_string)
+            .collect();
+        assert!(!bashes.is_empty(), "no bash to test with");
+        for bash in &bashes {
+            let rows: &[&[&str]] = &[
+                &[],
+                &[""],
+                &[" "],
+                &["a\nb"],
+                &["'", "\"", "it's \"q\""],
+                &["$HOME", "`id`", "$(id)"],
+                &["-n", "--quiet"],
+                &["é", "日本"],
+                &["\u{1}\u{7f}"],
+                &["", "x", ""],
+            ];
+            for args in rows {
+                for helper in ["run", "xrun", "run1", "xrun1"] {
+                    let (out, err) = in_shell(bash, &init, args, helper);
+                    assert_eq!(
+                        out,
+                        expect(args),
+                        "{bash} {helper} with {args:?}; stderr: {err}"
+                    );
+                }
+            }
+
+            let originals = ["orig1", "orig 2"];
+            for (snippet, want) in [
+                ("run a 'b c'", expect(&["a", "b c"])),
+                ("run ''", expect(&[""])),
+                ("xrun z", expect(&["z"])),
+                ("run1 q", expect(&["q"])),
+                (
+                    "run x; run",
+                    format!("{}{}", expect(&["x"]), expect(&originals)),
+                ),
+                ("run", expect(&originals)),
+            ] {
+                let (out, err) = in_shell(bash, &init, &originals, snippet);
+                assert_eq!(out, want, "{bash}: `{snippet}`; stderr: {err}");
+            }
+
+            let (out, _) = in_shell(bash, &init, &["a b", ""], "show");
+            assert_eq!(out, "'printf' '<%s>' 'fixed' a\\ b ''\n", "{bash}: show");
+            let (out, _) = in_shell(bash, &init, &["a b"], "show 'c d'");
+            assert_eq!(
+                out, "'printf' '<%s>' 'fixed' c\\ d\n",
+                "{bash}: show with args"
+            );
+            let (out, _) = in_shell(bash, &init, &[], "showl");
+            assert_eq!(out, "1 │ 'printf' '<%s>' 'fixed'\n", "{bash}: showl");
+
+            // The real shape: an interactive bash reading the file as its
+            // rcfile, the args as its positional parameters, the commands on
+            // stdin. The rcfile must already see them.
+            let mut child = std::process::Command::new(bash)
+                .args(["--noprofile", "--rcfile"])
+                .arg(&init)
+                .args(["-i", "-s", "--", "a b", ""])
+                .env_clear()
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn interactive bash");
+            {
+                use std::io::Write as _;
+                let mut stdin = child.stdin.take().expect("stdin");
+                stdin
+                    .write_all(b"echo; echo BEGIN; run; echo; exit 3\n")
+                    .expect("type");
+            }
+            let out = child.wait_with_output().expect("wait");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let after = stdout.split("BEGIN\n").nth(1).unwrap_or_default();
+            assert_eq!(
+                after,
+                format!("{}\n", expect(&["a b", ""])),
+                "{bash}: {stdout}"
+            );
+            assert_eq!(out.status.code(), Some(3), "{bash}: the shell's status");
         }
     }
 

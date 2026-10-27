@@ -731,3 +731,85 @@ target(name = "ep", driver = "exec.entrypoint", hash_deps = [":dep"], run = ["/b
     );
     Ok(())
 }
+
+async fn invoke_shell(
+    engine: &Arc<Engine>,
+    addr: &str,
+    caller: Caller,
+) -> anyhow::Result<PreparedInvocation> {
+    Arc::clone(engine)
+        .invoke(
+            engine.new_state(),
+            InvokeRequest {
+                addr: parse_addr(addr)?,
+                caller,
+                shell: true,
+            },
+        )
+        .await
+}
+
+/// `--shell` keeps the args rule: undeclared trailing args are refused before
+/// anything builds. Declared, they become the shell's positional parameters,
+/// and its init file lives under heph's home — never the caller's cwd — for
+/// exactly as long as the invocation (D13, D18).
+#[tokio::test]
+async fn entrypoint_shell_refuses_undeclared_args() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "boom", driver = "bash", run = "exit 1", out = "x")
+target(name = "noargs", driver = "exec.entrypoint", deps = {"b": ":boom"}, run = ["/bin/echo"])
+target(name = "withargs", driver = "exec.entrypoint", run = ["/bin/echo", "hi"], args = True)
+"#,
+    );
+    let cwd = tempfile::tempdir()?;
+    let err = invoke_shell(&ws.engine, "//app:noargs", caller(cwd.path(), &["x"]))
+        .await
+        .expect_err("undeclared args must be refused under --shell too");
+    assert!(
+        err.downcast_ref::<heph::engine::invoke::UndeclaredArgs>()
+            .is_some(),
+        "refused before the failing dep built: {err:#}"
+    );
+
+    let prepared = invoke_shell(
+        &ws.engine,
+        "//app:withargs",
+        caller(cwd.path(), &["a b", ""]),
+    )
+    .await?;
+    let argv = &prepared.command.argv;
+    let tail: Vec<&OsString> = argv.iter().skip(1).collect();
+    let init = PathBuf::from(argv.get(3).context("--rcfile <init>")?);
+    assert_eq!(
+        tail,
+        [
+            "--noprofile",
+            "--rcfile",
+            init.to_str().context("utf8")?,
+            "-i",
+            "-s",
+            "--",
+            "a b",
+            ""
+        ]
+        .map(OsString::from)
+        .iter()
+        .collect::<Vec<_>>()
+    );
+    assert!(
+        init.starts_with(&*ws.engine.home),
+        "{init:?} is under heph's home"
+    );
+    assert!(
+        std::fs::read_dir(cwd.path())?.next().is_none(),
+        "nothing written to the cwd"
+    );
+    let script = std::fs::read_to_string(&init)?;
+    assert!(script.contains("'/bin/echo' 'hi'"), "{script}");
+    drop(prepared);
+    assert!(!init.exists(), "the init file goes with the invocation");
+    Ok(())
+}
