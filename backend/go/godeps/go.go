@@ -268,7 +268,7 @@ func goListImportPaths(pkg string) []string {
 		panic(err)
 	}
 
-	return strings.Split(string(b), "\n")
+	return strings.Split(strings.TrimSpace(string(b)), "\n")
 }
 
 func goList(pkg string, variant PkgCfgVariant) []*Package {
