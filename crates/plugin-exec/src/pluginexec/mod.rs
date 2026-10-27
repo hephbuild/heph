@@ -4222,6 +4222,221 @@ mod tests {
         assert_eq!(a.finish(), b.finish());
     }
 
+    /// A fully populated exec spec — every hashed field set — at a fixed address.
+    fn golden_populated_config() -> HashMap<String, hcore::htvalue::Value> {
+        use hcore::htvalue::Value;
+        let s = |v: &str| Value::String(v.to_string());
+        let list = |vs: &[&str]| Value::List(vs.iter().map(|v| s(v)).collect());
+        HashMap::from([
+            (
+                "run".to_string(),
+                list(&["$SRC_sdk/bin/go", "build", "./..."]),
+            ),
+            (
+                "deps".to_string(),
+                Value::Map(HashMap::from([
+                    ("sdk".to_string(), s("//tools/go:sdk")),
+                    ("srcs".to_string(), list(&["//app:a", "//app:b"])),
+                ])),
+            ),
+            ("hash_deps".to_string(), list(&["//app:hashed"])),
+            ("runtime_deps".to_string(), list(&["//app:rt"])),
+            (
+                "tools".to_string(),
+                Value::Map(HashMap::from([
+                    ("cc".to_string(), s("//toolchain:gcc")),
+                    ("".to_string(), list(&["//tools:jq", "//tools:yq"])),
+                ])),
+            ),
+            (
+                "env".to_string(),
+                Value::Map(HashMap::from([
+                    ("GOROOT".to_string(), s("$SRC_sdk")),
+                    ("CGO_ENABLED".to_string(), s("0")),
+                ])),
+            ),
+            (
+                "out".to_string(),
+                Value::Map(HashMap::from([
+                    ("bin".to_string(), s("bin/app")),
+                    ("".to_string(), s("gen/")),
+                ])),
+            ),
+            ("support_files".to_string(), list(&["testdata/*.json"])),
+            ("runner".to_string(), s("//tools/devenv:runner")),
+            // Named but unset, so the golden does not depend on the host env;
+            // a set `pass_env` reaches the hash through the transitive literal
+            // below instead.
+            (
+                "pass_env".to_string(),
+                list(&["HEPH_GOLDEN_SURELY_UNSET_VARIABLE"]),
+            ),
+        ])
+    }
+
+    /// The transitive closure `apply_transitive` folds in: a tool, a hashed
+    /// runtime dep, a runtime-only dep, a hash-only dep, and hashed and unhashed
+    /// env in both forms.
+    fn golden_transitive_sandbox() -> hplugin::driver::sandbox::Sandbox {
+        use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
+        let pkg = hmodel::htpkg::PkgBuf::from("");
+        let addr = |a: &str| TargetAddr::parse(a, &pkg).expect("golden addr");
+        let mut sb = Sandbox::default();
+        sb.push_tool(Tool {
+            r#ref: addr("//tools/node:node"),
+            group: "node".to_string(),
+            hash: true,
+            id: "_transitive_x_0_tool_t0".to_string(),
+        });
+        for (i, (a, runtime, hash)) in [
+            ("//lib:mods", true, true),
+            ("//lib:rt_only", true, false),
+            ("//lib:hash_only", false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sb.push_dep(Dep {
+                r#ref: addr(a),
+                mode: Mode::None,
+                group: "lib".to_string(),
+                runtime,
+                hash,
+                id: format!("_transitive_x_0_dep_d{i}"),
+            });
+        }
+        let env = |value: EnvValue, hash: bool| Env {
+            value,
+            hash,
+            append: false,
+            append_prefix: String::new(),
+        };
+        sb.env.insert(
+            "NODE_OPTIONS".to_string(),
+            env(EnvValue::Literal("--no-deprecation".to_string()), true),
+        );
+        sb.env.insert(
+            "NODE_RT".to_string(),
+            env(EnvValue::Literal("rt".to_string()), false),
+        );
+        sb.env.insert(
+            "HEPH_GOLDEN_SURELY_UNSET_PASS".to_string(),
+            env(EnvValue::Pass, true),
+        );
+        sb
+    }
+
+    /// D47: the exec def hash of a *populated* spec, before and after
+    /// `apply_transitive`, pinned byte for byte, together with the shape of the
+    /// def and its inputs.
+    ///
+    /// `the_def_hash_of_a_reference_free_run_is_pinned` covers an empty def
+    /// only; this one covers every hashed field, so refactoring `parse` and
+    /// `apply_transitive` into helpers shared with `exec.entrypoint` cannot move
+    /// an exec def hash unseen. Update only alongside a deliberate
+    /// `EXEC_DEF_FORMAT_VERSION` bump.
+    #[tokio::test]
+    async fn exec_def_hash_golden_populated() -> anyhow::Result<()> {
+        let ctoken = StdCancellationToken::new();
+        let addr = parse_addr("//app:golden")?;
+        let mut report = String::new();
+        for (label, driver) in [
+            ("exec", Driver::new_exec()),
+            (
+                "exec+coreutils",
+                Driver::new_exec()
+                    .with_coreutils_enabled_for_test()
+                    .with_coreutils(7, Arc::new(|| Ok(PathBuf::from("/unused")))),
+            ),
+            ("bash", Driver::new_bash()),
+        ] {
+            let parsed = driver
+                .parse(
+                    hplugin::driver::ParseRequest {
+                        request_id: "golden".to_string(),
+                        target_spec: Arc::new(hplugin::provider::TargetSpec {
+                            addr: addr.clone(),
+                            driver: driver.name.clone(),
+                            config: golden_populated_config(),
+                            ..Default::default()
+                        }),
+                    },
+                    &ctoken,
+                )
+                .await?
+                .target_def;
+            // The input list is the same for every driver here; listing it once
+            // keeps the golden readable.
+            let describe = |stage: &str, d: &hplugin::driver::targetdef::TargetDef| {
+                let inputs = if label == "exec" {
+                    d.inputs
+                        .iter()
+                        .map(|i| {
+                            format!(
+                                "  {} {} hashed={} runtime={} {:?}\n",
+                                i.origin_id, i.r#ref, i.hashed, i.runtime, i.annotations
+                            )
+                        })
+                        .collect::<String>()
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{label} {stage}: {}\n{inputs}",
+                    String::from_utf8_lossy(&d.hash)
+                )
+            };
+            report.push_str(&describe("parse", &parsed));
+            let applied = driver
+                .apply_transitive(
+                    hplugin::driver::ApplyTransitiveRequest {
+                        request_id: "golden".to_string(),
+                        target_def: parsed,
+                        sandbox: golden_transitive_sandbox(),
+                    },
+                    &ctoken,
+                )
+                .await?
+                .target_def;
+            report.push_str(&describe("apply_transitive", &applied));
+        }
+        assert_eq!(
+            report, EXEC_DEF_GOLDEN_POPULATED,
+            "an exec/bash def hash or input list moved:\n{report}"
+        );
+        Ok(())
+    }
+
+    const EXEC_DEF_GOLDEN_POPULATED: &str = r#"exec parse: 61dea7f3aa15aa34
+  dep|sdk|0 //tools/go:sdk hashed=true runtime=true {}
+  dep|srcs|0 //app:a hashed=true runtime=true {}
+  dep|srcs|1 //app:b hashed=true runtime=true {}
+  hash_dep||0 //app:hashed hashed=true runtime=false {}
+  runtime_dep||0 //app:rt hashed=false runtime=true {}
+  tool||0 //tools:jq hashed=true runtime=true {"unpack_root": "tools"}
+  tool||1 //tools:yq hashed=true runtime=true {"unpack_root": "tools"}
+  tool|cc|0 //toolchain:gcc hashed=true runtime=true {"unpack_root": "tools"}
+  runner //tools/devenv:runner hashed=true runtime=false {}
+exec apply_transitive: 26a90abee4625d43
+  dep|sdk|0 //tools/go:sdk hashed=true runtime=true {}
+  dep|srcs|0 //app:a hashed=true runtime=true {}
+  dep|srcs|1 //app:b hashed=true runtime=true {}
+  hash_dep||0 //app:hashed hashed=true runtime=false {}
+  runtime_dep||0 //app:rt hashed=false runtime=true {}
+  tool||0 //tools:jq hashed=true runtime=true {"unpack_root": "tools"}
+  tool||1 //tools:yq hashed=true runtime=true {"unpack_root": "tools"}
+  tool|cc|0 //toolchain:gcc hashed=true runtime=true {"unpack_root": "tools"}
+  runner //tools/devenv:runner hashed=true runtime=false {}
+  _transitive_x_0_tool_t0 //tools/node:node hashed=true runtime=true {"read_only": "true", "stage_per_file": "true", "unpack_root": "tools"}
+  _transitive_x_0_dep_d0 //lib:mods hashed=true runtime=true {}
+  _transitive_x_0_dep_d1 //lib:rt_only hashed=false runtime=true {}
+  _transitive_x_0_dep_d2 //lib:hash_only hashed=true runtime=false {}
+exec+coreutils parse: cfde72931f33cb07
+exec+coreutils apply_transitive: da2388103db4f305
+bash parse: 61dea7f3aa15aa34
+bash apply_transitive: 26a90abee4625d43
+"#;
+
     /// A repeated reference would mount one directory twice and set one variable
     /// twice. Collapsing it silently would hide a BUILD-file mistake.
     #[tokio::test]
