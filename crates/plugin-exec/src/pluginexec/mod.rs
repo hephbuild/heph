@@ -2730,8 +2730,6 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -2752,14 +2750,8 @@ mod tests {
             }),
             inputs: vec![],
             outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            // Pipes, not a PTY: the PTY path shares one fd for both streams
-            // and is not where the std build's targets run.
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
@@ -3085,8 +3077,6 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3101,14 +3091,9 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();
@@ -3156,8 +3141,6 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3172,14 +3155,9 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
@@ -3230,8 +3208,6 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3246,14 +3222,9 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let mut stdin = std::io::Cursor::new(b"test data");
@@ -3295,8 +3266,6 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3311,14 +3280,9 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
@@ -3370,8 +3334,6 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3387,14 +3349,8 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
@@ -3442,8 +3398,6 @@ mod tests {
         // a draining stdout pump the child would block on write forever.
         let payload_bytes: usize = 256 * 1024;
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3460,14 +3414,8 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();
@@ -3619,8 +3567,6 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3638,14 +3584,8 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let out_sink = TimedSink::default();
@@ -3710,8 +3650,6 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3729,14 +3667,8 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
@@ -3782,8 +3714,6 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3805,14 +3735,8 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();
@@ -3941,8 +3865,6 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -3966,14 +3888,8 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let mut stdin = std::io::Cursor::new(vec![b'x'; STDIN_BYTES]);
@@ -4056,8 +3972,6 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -4072,14 +3986,9 @@ mod tests {
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
@@ -5414,8 +5323,6 @@ bash apply_transitive: 26a90abee4625d43
 
     fn make_tool_target_def(run: Vec<String>, origin_id: &str, group: &str) -> EngineTargetDef {
         EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -5443,14 +5350,9 @@ bash apply_transitive: 26a90abee4625d43
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         }
     }
 
@@ -5559,8 +5461,6 @@ bash apply_transitive: 26a90abee4625d43
 
         let existing_path = "/usr/bin:/bin";
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -5588,14 +5488,9 @@ bash apply_transitive: 26a90abee4625d43
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();
@@ -5714,7 +5609,6 @@ bash apply_transitive: 26a90abee4625d43
                 "consumer".to_string(),
                 BTreeMap::new(),
             ),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -5742,14 +5636,8 @@ bash apply_transitive: 26a90abee4625d43
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let sandbox = tmp.path().join("sandbox");
@@ -5912,8 +5800,6 @@ bash apply_transitive: 26a90abee4625d43
         let tmp = tempfile::tempdir()?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -5928,14 +5814,9 @@ bash apply_transitive: 26a90abee4625d43
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let request_id = "test".to_string();
@@ -5983,8 +5864,6 @@ bash apply_transitive: 26a90abee4625d43
         let mi_b = make_tool_managed_input("tool|b|0", &tool_b, tmp.path())?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -6019,14 +5898,9 @@ bash apply_transitive: 26a90abee4625d43
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let request_id = "test".to_string();
@@ -6087,8 +5961,6 @@ bash apply_transitive: 26a90abee4625d43
         let mi_b = make_tool_managed_input_with_source("tool|g2|0", &tool_path, tmp.path(), src)?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -6126,14 +5998,9 @@ bash apply_transitive: 26a90abee4625d43
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let request_id = "test".to_string();
@@ -6177,8 +6044,6 @@ bash apply_transitive: 26a90abee4625d43
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -6220,12 +6085,9 @@ bash apply_transitive: 26a90abee4625d43
                     }],
                 },
             ],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let request_id = "test".to_string();
@@ -6518,8 +6380,6 @@ bash apply_transitive: 26a90abee4625d43
         let tmp = tempfile::tempdir()?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -6534,14 +6394,9 @@ bash apply_transitive: 26a90abee4625d43
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
@@ -6615,8 +6470,6 @@ bash apply_transitive: 26a90abee4625d43
         let managed_input = make_tool_managed_input(origin_id, &tool_path, tmp.path())?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 runner: None,
                 entrypoint: None,
@@ -6644,14 +6497,9 @@ bash apply_transitive: 26a90abee4625d43
                 outputs: BTreeMap::new(),
                 support_files: vec![],
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();

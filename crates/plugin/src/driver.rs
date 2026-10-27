@@ -599,6 +599,26 @@ pub mod targetdef {
         pub transparent: bool,
     }
 
+    /// For tests and struct-update syntax (`..Default::default()`); `raw_def` is
+    /// a unit placeholder, caching is off.
+    impl Default for TargetDef {
+        fn default() -> Self {
+            Self {
+                addr: Addr::default(),
+                labels: Vec::new(),
+                raw_def: Arc::new(()),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                support_files: Vec::new(),
+                cache: CacheConfig::off(),
+                entrypoint: false,
+                pty: false,
+                hash: Vec::new(),
+                transparent: false,
+            }
+        }
+    }
+
     impl TargetDef {
         pub fn def<T: 'static>(&self) -> &T {
             // Deref to `&dyn RawDef` before `as_any`: on a bare `self.raw_def`
@@ -657,16 +677,8 @@ pub mod targetdef {
         fn td(raw: Arc<dyn RawDef>) -> TargetDef {
             TargetDef {
                 addr: Addr::new(PkgBuf::from("//x"), "y".to_string(), Default::default()),
-                labels: vec![],
                 raw_def: raw,
-                inputs: vec![],
-                outputs: vec![],
-                support_files: vec![],
-                cache: CacheConfig::off(),
-                pty: false,
-                hash: vec![],
-                transparent: false,
-                entrypoint: false,
+                ..Default::default()
             }
         }
 
@@ -1259,17 +1271,8 @@ mod resolve_tests {
 
     fn target() -> targetdef::TargetDef {
         targetdef::TargetDef {
-            addr: Default::default(),
-            labels: vec![],
-            raw_def: std::sync::Arc::new(()),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: targetdef::CacheConfig::on(false),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         }
     }
 

@@ -2322,10 +2322,10 @@ nested: { a: 1, b: [x, y] }
                 remote_enabled: false,
                 history: 3,
             },
-            entrypoint: false,
             pty: true,
             hash: vec![0xde, 0xad, 0, 1],
             transparent: true,
+            ..Default::default()
         }
     }
 

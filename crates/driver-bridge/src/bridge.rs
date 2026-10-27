@@ -253,17 +253,8 @@ mod shell_fallback_tests {
             self.parse_called.store(true, Ordering::SeqCst);
             Ok(ParseResponse {
                 target_def: TargetDef {
-                    addr: Default::default(),
-                    labels: vec![],
                     raw_def: Arc::new("recorded-shell-def".to_string()),
-                    inputs: vec![],
-                    outputs: vec![],
-                    support_files: vec![],
-                    cache: hplugin::driver::targetdef::CacheConfig::off(),
-                    pty: false,
-                    hash: vec![],
-                    transparent: false,
-                    entrypoint: false,
+                    ..Default::default()
                 },
             })
         }
@@ -325,19 +316,7 @@ mod shell_fallback_tests {
         let sandbox = tmp.path().join("sandbox");
         fs::create_dir_all(&sandbox)?;
 
-        let target_def = TargetDef {
-            addr: Default::default(),
-            labels: vec![],
-            raw_def: Arc::new(()),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
-            cache: hplugin::driver::targetdef::CacheConfig::off(),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
-        };
+        let target_def = TargetDef::default();
         let request_id = "shell-fallback-test".to_string();
         let req = RunRequest {
             request_id: &request_id,

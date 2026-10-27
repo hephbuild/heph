@@ -482,15 +482,7 @@ mod tests {
         TargetDef {
             inputs: hdriver_support::credential::inputs(&refs, &addr.package).expect("inputs"),
             addr,
-            labels: vec![],
-            raw_def: std::sync::Arc::new(()),
-            outputs: vec![],
-            support_files: vec![],
-            cache: hplugin::driver::targetdef::CacheConfig::off(),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-            entrypoint: false,
+            ..Default::default()
         }
     }
 

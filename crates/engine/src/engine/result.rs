@@ -9533,9 +9533,6 @@ mod tests {
             Ok(ParseResponse {
                 target_def: TargetDef {
                     addr: req.target_spec.addr.clone(),
-                    labels: vec![],
-                    raw_def: SArc::new(()),
-                    inputs: vec![],
                     outputs: self
                         .outputs
                         .iter()
@@ -9544,12 +9541,9 @@ mod tests {
                             paths: vec![],
                         })
                         .collect(),
-                    support_files: vec![],
                     cache: CacheConfig::on(false),
-                    pty: false,
                     hash: vec![1, 2, 3, 4],
-                    transparent: false,
-                    entrypoint: false,
+                    ..Default::default()
                 },
             })
         }
@@ -11751,7 +11745,6 @@ mod tests {
                     } else {
                         vec![]
                     },
-                    raw_def: SArc::new(()),
                     inputs,
                     outputs: if transparent {
                         vec![]
@@ -11761,16 +11754,14 @@ mod tests {
                             paths: vec![],
                         }]
                     },
-                    support_files: vec![],
                     cache: if transparent {
                         CacheConfig::off()
                     } else {
                         CacheConfig::on(false)
                     },
-                    pty: false,
                     hash: req.target_spec.addr.format().into_bytes(),
                     transparent,
-                    entrypoint: false,
+                    ..Default::default()
                 },
             })
         }
@@ -12557,9 +12548,6 @@ mod tests {
             let def = LinkedTargetDef {
                 target: Arc::new(TargetDef {
                     addr: hmodel::htaddr::parse_addr("//pkg:gen")?,
-                    labels: Vec::new(),
-                    raw_def: Arc::new(()),
-                    inputs: Vec::new(),
                     outputs: vec![crate::engine::driver::targetdef::Output {
                         group: "out".to_string(),
                         paths: vec![path::Path {
@@ -12568,12 +12556,8 @@ mod tests {
                             collect: false,
                         }],
                     }],
-                    support_files: Vec::new(),
                     cache: crate::engine::driver::targetdef::CacheConfig::on(false),
-                    pty: false,
-                    hash: Vec::new(),
-                    transparent: false,
-                    entrypoint: false,
+                    ..Default::default()
                 }),
                 inputs: Vec::new(),
             };

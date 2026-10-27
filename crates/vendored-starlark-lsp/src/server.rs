@@ -158,8 +158,8 @@ impl TryFrom<Uri> for LspUri {
     fn try_from(uri: Uri) -> Result<Self, Self::Error> {
         match uri.scheme().map(|scheme| scheme.as_str()) {
             Some("file") => {
-                let file_path =
-                    uri_to_file_path(&uri).ok_or_else(|| LspUriError::InvalidFileUri(uri.clone()))?;
+                let file_path = uri_to_file_path(&uri)
+                    .ok_or_else(|| LspUriError::InvalidFileUri(uri.clone()))?;
                 if file_path.is_absolute() {
                     Ok(Self::File(file_path))
                 } else {
