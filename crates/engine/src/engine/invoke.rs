@@ -1,73 +1,150 @@
-//! `Engine::invoke`: the one entry point an entrypoint target — one whose def
-//! has `entrypoint` set, from `entrypoint = True` on exec/bash — runs through
-//! (the tool-shims spec, D1, D30).
+//! `Engine::invoke`: how an entrypoint target — one whose def has
+//! [`TargetDef::entrypoint`](crate::engine::driver::targetdef::TargetDef::entrypoint)
+//! set, from `entrypoint = True` on exec/bash or any driver's equivalent —
+//! runs.
 //!
-//! An entrypoint is *invoked*, not built: it runs in the caller's cwd with the
-//! caller's environment and stdio, is never cached, never sandboxed, and never
-//! anyone's input. `invoke` resolves it, refuses undeclared args before any dep
-//! builds, builds its closure, drains the cache writes those builds queued,
-//! stages and holds every entry the closure points at, and hands the driver
-//! the private [`Invocation`] token to shape the command. It spawns nothing:
-//! the binary owns spawn, wait, terminal and exit, so nothing here touches a
-//! terminal or a signal disposition in a library tests link in-process.
+//! An entrypoint is *invoked*, not built: it runs through its driver's
+//! ordinary `run` (or `run_shell`) in its own sandbox, with
+//! [`RunOptions`](crate::engine::driver::RunOptions) that hand it the
+//! caller's cwd (per [`Workdir`]), environment, args and terminal. It is never
+//! cached and never anyone's input.
 //!
-//! What is deliberately absent: the per-address execute lock (I2 — no sandbox
-//! to protect, so any number of invocations run at once), and every cache
-//! write of the entrypoint's own (I6).
+//! `invoke` resolves the def, refuses undeclared args before any dep builds
+//! (N5), builds the closure through the ordinary `result_addr`, drains the
+//! cache writes those builds queued (E15), then runs the shared sandbox block
+//! ([`Engine::run_in_sandbox`]) with an invocation lease (R11, R12).
+//!
+//! What it deliberately leaves out, against `execute`: the request memoizer
+//! (two calls in one process are two runs), the per-address execute lock, the
+//! worker permit, and every cache write of the entrypoint's own (N1, N10).
+//! The engine installs no signal handler: the caller hands in the relay's
+//! receiver and the dispositions (R9).
 
 use crate::engine::Engine;
-use crate::engine::driver::entrypoint::{
-    Caller, EntrypointDriver, Invocation, PrepareRequest, PreparedCommand, StagedInput,
+use crate::engine::InteractiveWrapper;
+use crate::engine::driver::targetdef::Workdir;
+use crate::engine::driver::{
+    Disposition, Foreground, RunOptions, RunStdio, Signal, SignalReceiver,
 };
+use crate::engine::execute::{SandboxLease, SandboxRun};
+use crate::engine::invoke_sandbox::{InvokeSandbox, invoke_parent};
 use crate::engine::request_state::RequestState;
 use crate::engine::result::{OutputMatcher, ResultOptions};
 use anyhow::Context;
-use hdriver_support::stage::{StageHolds, staged_files};
+use hcore::process::Exit;
 use hmodel::htaddr::Addr;
-use hplugin::eresult::EResult;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// What the CLI asks for: an address, and everything about the caller.
-#[derive(Debug, Clone)]
+///
+/// `#[non_exhaustive]`: built with [`InvokeRequest::new`] and the `with_*`
+/// setters. Not `Clone` (the signal receiver moves into the run); `Debug`
+/// prints the environment's keys only.
+#[non_exhaustive]
 pub struct InvokeRequest {
     pub addr: Addr,
-    pub caller: Caller,
-    /// `heph run --shell`: an interactive shell in the tool's world.
+    /// The trailing args after `--`, in order. Refused unless the target
+    /// declared it takes them.
+    pub args: Vec<OsString>,
+    /// The caller's raw cwd, captured at startup; may be outside the
+    /// workspace. Where a `workdir = "caller"` tool runs.
+    pub cwd: PathBuf,
+    /// The caller's whole environment, byte for byte: the bottom layer of the
+    /// tool's, under the target's own env. `HEPH_ROOT` is appended to it.
+    pub env: Vec<(OsString, OsString)>,
+    /// `heph run --shell`: the driver's `run_shell` instead of `run`.
     pub shell: bool,
+    /// Signals the caller relays to the tool while it runs (R9). A closed
+    /// channel is "no more signals", never a cancel.
+    pub signals: SignalReceiver,
+    /// Dispositions the tool gets before it execs: what the caller recorded
+    /// at startup.
+    pub dispositions: Vec<(Signal, Disposition)>,
+    /// Wraps the driver's run, as for a build: the CLI pauses its TUI here.
+    /// The streams it hands in are ignored — the tool inherits heph's fds.
+    pub wrapper: Option<InteractiveWrapper>,
 }
 
-/// A command ready to spawn, and everything that must stay alive while it
-/// runs: the holds on its staged closure and the read locks riding on its
-/// deps' results. Dropping it releases them all; the binary drops it once the
-/// process has exited.
-#[must_use = "dropping the invocation releases the holds its process relies on"]
-pub struct PreparedInvocation {
-    pub command: PreparedCommand,
-    holds: StageHolds,
-    /// Each dep's result carries a read lock on its cache revision, so a
-    /// `--force` rebuild of the same revision waits for the tool.
-    _results: Vec<Arc<EResult>>,
-    /// `--shell`'s init file, removed with the invocation.
-    _shell_dir: Option<tempfile::TempDir>,
+impl InvokeRequest {
+    /// A request with no args, no shell, a closed signal channel, no
+    /// dispositions and no wrapper.
+    pub fn new(addr: Addr, cwd: impl Into<PathBuf>, env: Vec<(OsString, OsString)>) -> Self {
+        let (_closed, signals) = crate::engine::driver::signal_channel();
+        Self {
+            addr,
+            args: Vec::new(),
+            cwd: cwd.into(),
+            env,
+            shell: false,
+            signals,
+            dispositions: Vec::new(),
+            wrapper: None,
+        }
+    }
+
+    pub fn with_args(mut self, args: Vec<OsString>) -> Self {
+        self.args = args;
+        self
+    }
+
+    pub fn with_shell(mut self, shell: bool) -> Self {
+        self.shell = shell;
+        self
+    }
+
+    pub fn with_signals(mut self, signals: SignalReceiver) -> Self {
+        self.signals = signals;
+        self
+    }
+
+    pub fn with_dispositions(mut self, dispositions: Vec<(Signal, Disposition)>) -> Self {
+        self.dispositions = dispositions;
+        self
+    }
+
+    pub fn with_wrapper(mut self, wrapper: InteractiveWrapper) -> Self {
+        self.wrapper = Some(wrapper);
+        self
+    }
 }
 
-impl std::fmt::Debug for PreparedInvocation {
+impl std::fmt::Debug for InvokeRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedInvocation")
-            .field("command", &self.command)
-            .field("holds", &self.holds.len())
+        // Keys only: a value is the caller's, and may be a token.
+        let env_keys: Vec<_> = self.env.iter().map(|(k, _)| k).collect();
+        f.debug_struct("InvokeRequest")
+            .field("addr", &self.addr)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("env_keys", &env_keys)
+            .field("shell", &self.shell)
+            .field("dispositions", &self.dispositions)
+            .field("wrapper", &self.wrapper.is_some())
             .finish_non_exhaustive()
     }
 }
 
-impl PreparedInvocation {
-    /// How many distinct stage entries are held.
-    pub fn held_entries(&self) -> usize {
-        self.holds.len()
-    }
+/// How an invocation that got past resolution ended (R4). A failure *before*
+/// the target resolved to an entrypoint is `invoke`'s `Err` instead.
+///
+/// For the binary: `Exited(Exit::Code(n))` exits `n` with no box (0
+/// included); `Exited(Exit::Signal(s))` re-raises `s`; `Failed` prints its box
+/// and exits 125; `invoke`'s `Err` keeps today's exit 1.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum InvokeOutcome {
+    /// The tool ran, and this is how it ended.
+    Exited(Exit),
+    /// heph failed after the target resolved to an entrypoint: a dep build,
+    /// a refused arg, materializing the closure, credentials, the spawn
+    /// itself (ENOENT/EACCES), or a cancellation before the tool exited. The
+    /// error has no exit status of the tool's in it.
+    Failed(anyhow::Error),
 }
 
-/// An entrypoint named as some target's input (I8).
+/// An entrypoint named as some target's input (N2).
 #[derive(Debug, thiserror::Error)]
 #[error(
     "{entrypoint} is an entrypoint (`entrypoint = True`) and cannot be an input{}: an entrypoint runs in \
@@ -103,17 +180,17 @@ impl EntrypointAsInput {
 }
 
 /// An entrypoint reached by a build: a direct `result_addr`, a multi-target
-/// selection, or anything else that would execute it (I8).
+/// selection, or anything else that would execute it (N2, R14).
 #[derive(Debug, thiserror::Error)]
 #[error(
     "{addr} is an entrypoint (`entrypoint = True`): it is invoked on its own with `heph run {addr}`, never \
-     built, and never as part of a multi-target selection"
+     built, and never as part of a multi-target selection. Select it alone, or select what it runs"
 )]
 pub struct EntrypointNotBuildable {
     pub addr: Addr,
 }
 
-/// Trailing args for an entrypoint that did not declare `args = True` (D18).
+/// Trailing args for an entrypoint that did not declare `args = True` (N5).
 #[derive(Debug, thiserror::Error)]
 #[error(
     "{addr} takes no arguments, but was given {count}. Declare `args = True` on it to pass the \
@@ -122,17 +199,6 @@ pub struct EntrypointNotBuildable {
 pub struct UndeclaredArgs {
     pub addr: Addr,
     pub count: usize,
-}
-
-/// A target whose def is an entrypoint, parsed by a driver that registered no
-/// hook to prepare one. Only a builtin wiring mistake reaches this.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{addr} is an entrypoint, but its `{driver}` driver has no entrypoint hook to prepare it with"
-)]
-pub struct EntrypointWithoutHook {
-    pub addr: Addr,
-    pub driver: String,
 }
 
 impl Engine {
@@ -160,75 +226,78 @@ impl Engine {
         Ok(())
     }
 
-    /// The hook that prepares `addr`, refusing a target that is not an
-    /// entrypoint and one whose driver has no hook.
-    fn entrypoint_driver(
-        &self,
-        driver: &str,
-        addr: &Addr,
-        target: &hplugin::driver::targetdef::TargetDef,
-    ) -> anyhow::Result<Arc<dyn EntrypointDriver>> {
-        if target.entrypoint.is_none() {
-            anyhow::bail!(
-                "{addr} is not an entrypoint; declare `entrypoint = True` on an exec or bash \
-                 target to invoke it"
-            );
-        }
-        self.drivers_by_name
-            .get(driver)
-            .with_context(|| format!("driver not found: {driver}"))?
-            .entrypoint
-            .clone()
-            .ok_or_else(|| {
-                EntrypointWithoutHook {
-                    addr: addr.clone(),
-                    driver: driver.to_string(),
-                }
-                .into()
-            })
-    }
-
-    /// Prepare `req.addr` to run: see the module docs.
+    /// Run `req.addr`, an entrypoint: see the module docs. `Err` is a failure
+    /// before the target resolved to an entrypoint; everything after is an
+    /// [`InvokeOutcome`].
     pub async fn invoke(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         req: InvokeRequest,
-    ) -> anyhow::Result<PreparedInvocation> {
-        let addr = &req.addr;
-        rs.track_dep(addr).map_err(anyhow::Error::new)?;
+    ) -> anyhow::Result<InvokeOutcome> {
+        let addr = req.addr.clone();
+        rs.track_dep(&addr).map_err(anyhow::Error::new)?;
         let rs = rs.with_parent(addr.clone());
 
         let spec = Arc::clone(&self)
-            .get_spec_no_track(rs.clone(), addr)
+            .get_spec_no_track(rs.clone(), &addr)
             .await?;
-        let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
+        let def = Arc::clone(&self)
+            .get_def_no_track(rs.clone(), &addr)
+            .await?;
         let target = Arc::clone(&def.target_def);
-        let driver = self.entrypoint_driver(&spec.driver, addr, &target)?;
+        let Some(entrypoint) = target.entrypoint else {
+            anyhow::bail!(
+                "{addr} is not an entrypoint; declare `entrypoint = True` on an exec or bash \
+                 target to invoke it"
+            );
+        };
 
-        // After the spec resolves, before any dep builds: a flagless release
+        let res = self
+            .invoke_resolved(&rs, &spec, target, entrypoint, req)
+            .await;
+        Ok(match res {
+            Ok(Ok(())) => InvokeOutcome::Exited(Exit::Code(0)),
+            // Only the driver's own run is read for a process exit.
+            Ok(Err(e)) => match hplugin::error::process_exit(&e) {
+                Some(exit) => InvokeOutcome::Exited(exit),
+                None => InvokeOutcome::Failed(e),
+            },
+            Err(e) => InvokeOutcome::Failed(e),
+        })
+    }
+
+    /// Everything after resolution. The outer `Err` is heph's; the inner one
+    /// is the driver's run.
+    async fn invoke_resolved(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        spec: &crate::engine::EngineTargetSpec,
+        target: Arc<crate::engine::driver::targetdef::TargetDef>,
+        entrypoint: crate::engine::driver::targetdef::Entrypoint,
+        req: InvokeRequest,
+    ) -> anyhow::Result<anyhow::Result<()>> {
+        let addr = &req.addr;
+        // After the def resolves, before any dep builds: a flagless release
         // script must not swallow a mistyped `--dry-run` and run for real.
-        if !req.caller.args.is_empty() && !driver.accepts_args(&target) {
+        if !req.args.is_empty() && !entrypoint.accepts_args {
             return Err(UndeclaredArgs {
                 addr: addr.clone(),
-                count: req.caller.args.len(),
+                count: req.args.len(),
             }
             .into());
         }
-        let deferred_refs = self.deferred_refs(&spec.spec, &spec.driver)?;
-        if let Some(r) = deferred_refs.iter().find(|r| r.needs_sandbox()) {
-            anyhow::bail!(
-                "{addr}: {:?} names a `${{src://…}}`, which needs a sandbox path; an \
-                 entrypoint has no sandbox. Use `$SRC_<group>` with a dep instead",
-                r.raw
-            );
-        }
+        let driver = self
+            .drivers_by_name
+            .get(&spec.driver)
+            .with_context(|| format!("driver not found: {}", spec.driver))?
+            .clone();
 
         // The closure. Expanding the inputs is what refuses an entrypoint
-        // among them (I8); linking selects the runtime ones and their outputs.
-        let expanded = Arc::clone(&self)
+        // among them (N2); linking selects the runtime ones and their outputs.
+        let expanded = Arc::clone(self)
             .expanded_inputs_for(rs.clone(), addr)
             .await?;
-        let linked = Arc::clone(&self)
+        let linked = Arc::clone(self)
             .link(rs.clone(), Arc::clone(&target))
             .await?;
 
@@ -237,23 +306,8 @@ impl Engine {
         // invocation depends on them having been built — they are just not
         // wired in.
         let fail_fast = rs.fail_fast();
-        let runtime = linked.inputs.iter().map(|input| {
-            let engine = Arc::clone(&self);
-            let rs = rs.clone();
-            async move {
-                let res = engine
-                    .result_addr(
-                        rs,
-                        &input.target.addr,
-                        OutputMatcher::Exact(input.output_names.clone()),
-                        &ResultOptions::default(),
-                    )
-                    .await?;
-                anyhow::Ok((input, res))
-            }
-        });
         let hash_only = expanded.iter().filter(|i| !i.runtime).map(|input| {
-            let engine = Arc::clone(&self);
+            let engine = Arc::clone(self);
             let rs = rs.clone();
             async move {
                 engine
@@ -267,102 +321,124 @@ impl Engine {
                 anyhow::Ok(())
             }
         });
-        let (runtime, hash_only) = futures::future::join(
-            crate::engine::fanout::join_all_failable(runtime, fail_fast),
+        let (inputs, hash_only) = futures::future::join(
+            Arc::clone(self).inputs_result_exec(rs.clone(), &linked.inputs),
             crate::engine::fanout::join_all_failable(hash_only, fail_fast),
         )
         .await;
-        let built = runtime?;
+        let inputs = inputs?;
         hash_only?;
 
         // The process may exit as soon as the tool does, without the teardown
-        // that would otherwise flush what these builds queued: drain it now, so
-        // a cold call leaves its deps cached (D43).
+        // that would otherwise flush what these builds queued: drain it now,
+        // so a cold call leaves its deps cached (E15).
         self.sqlite_writes.drain_queued_writes().await;
         rs.bg_pending().wait_drained().await;
 
-        // `${read://…}` in the entrypoint's own options, through the same
-        // resolver `execute` uses (D46).
+        let deferred_refs = self.deferred_refs(&spec.spec, &spec.driver)?;
         let deferred = self
-            .resolve_deferred(&rs, &target, &deferred_refs)
+            .resolve_deferred(rs, &target, &deferred_refs)
             .await
             .with_context(|| format!("resolve deferred values for {addr}"))?;
+        let resolved_scratch = self
+            .resolve_scratch(rs, addr, &target.inputs)
+            .await
+            .with_context(|| format!("resolve scratch for {addr}"))?;
+        let (scratch, _scratch_guards) = self
+            .acquire_scratch(rs, addr, &resolved_scratch, false)
+            .await
+            .with_context(|| format!("acquire scratch for {addr}"))?;
+        let credentials = self
+            .resolve_credentials(rs, addr, &target.inputs)
+            .await
+            .with_context(|| format!("resolve credentials for {addr}"))?;
 
-        // Stage and hold every entry the closure points at (I4, D27).
-        let stage_root = self.home.join("stage");
-        let mut holds = StageHolds::new();
-        let mut staged: Vec<StagedInput> = Vec::with_capacity(built.len());
-        let mut results = Vec::with_capacity(built.len());
-        for (input, res) in built {
-            let source = input.target.addr.format();
-            let mut files = Vec::new();
-            for artifact in &res.artifacts {
-                let entry = holds
-                    .hold_content(artifact, &stage_root, &source, rs.ctoken())
-                    .await
-                    .with_context(|| format!("stage {source} for {addr}"))?;
-                files.extend(
-                    staged_files(&entry, &input.filters)
-                        .with_context(|| format!("list staged {source}"))?,
-                );
-            }
-            files.sort();
-            staged.push(StagedInput {
-                origin_id: input.origin_id.clone(),
-                files,
-            });
-            results.push(res);
+        // The invocation's own sandbox, created exclusively; then any sibling a
+        // crashed heph left, swept off the request's path.
+        let parent = invoke_parent(&self.home, addr);
+        let pending = rs.bg_pending();
+        let sandbox = hcore::blocking::run({
+            let (parent, pending) = (parent.clone(), Arc::clone(&pending));
+            move || InvokeSandbox::create(&parent, Some(pending))
+        })
+        .await?;
+        crate::engine::sandbox_cleaner::enqueue(
+            crate::engine::sandbox_cleaner::Lane::Reclaim,
+            format!("sweep invocation sandboxes under {}", parent.display()),
+            Box::new(move || {
+                crate::engine::invoke_sandbox::sweep(&parent);
+                Ok(())
+            }),
+            pending,
+        );
+
+        let cwd = match entrypoint.workdir {
+            Workdir::Caller => Some(req.cwd.clone()),
+            Workdir::Root => Some(self.cfg.root.clone()),
+            Workdir::Sandbox => None,
+        };
+        let args = entrypoint.accepts_args.then_some(req.args);
+        tracing::info!(
+            addr = %addr,
+            args = ?args,
+            cwd = ?cwd,
+            sandbox = %sandbox.dir().display(),
+            accepts_args = entrypoint.accepts_args,
+            shell = req.shell,
+            "invoking",
+        );
+        // The caller's env, then the real root under a name of its own:
+        // `$WORKSPACE_ROOT` is the sandbox's, consistent with `$SRC_x` (R17).
+        let mut base_env = req.env;
+        base_env.push((
+            OsString::from("HEPH_ROOT"),
+            self.cfg.root.clone().into_os_string(),
+        ));
+        let mut options =
+            RunOptions::default()
+                .with_base_env(base_env)
+                .with_stdio(RunStdio::Inherit(Foreground::new(
+                    req.signals,
+                    req.dispositions,
+                )));
+        if let Some(cwd) = cwd {
+            options = options.with_cwd(cwd);
+        }
+        if let Some(args) = args {
+            options = options.with_args(args);
         }
 
-        let token = Invocation::for_engine_invoke();
-        let links = driver.toolbin(&token, &target, &staged)?;
-        let toolbin = if links.is_empty() {
-            None
-        } else {
-            Some(
-                holds
-                    .hold_toolbin(&stage_root, &links, rs.ctoken())
-                    .await
-                    .with_context(|| format!("toolbin for {addr}"))?,
-            )
-        };
-
-        // `--shell`: the init file is per invocation, under heph's home and
-        // never the caller's cwd, and goes with the invocation (D13).
-        let shell_dir = if req.shell {
-            let tmp = self.home.join("tmp");
-            std::fs::create_dir_all(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-            Some(
-                tempfile::Builder::new()
-                    .prefix("entrypoint-shell-")
-                    .tempdir_in(&tmp)
-                    .with_context(|| format!("create a shell init dir under {}", tmp.display()))?,
-            )
-        } else {
-            None
-        };
-        let shell_init = shell_dir.as_ref().map(|d| d.path().join("init.sh"));
-
-        let command = driver
-            .prepare(
-                &token,
-                PrepareRequest {
-                    target: &target,
-                    inputs: &staged,
-                    toolbin: toolbin.as_deref(),
-                    deferred: &deferred,
-                    caller: &req.caller,
-                    root: &self.cfg.root,
-                    shell_init: shell_init.as_deref(),
+        let ran = self
+            .run_in_sandbox(
+                rs,
+                addr,
+                SandboxLease::invocation(&sandbox),
+                SandboxRun {
+                    driver,
+                    target,
+                    inputs,
+                    hashin: String::new(),
+                    scratch,
+                    credentials,
+                    deferred,
+                    wrapper: req.wrapper,
+                    shell: req.shell,
+                    options,
                 },
             )
-            .with_context(|| format!("prepare {addr}"))?;
+            .await;
+        // The run's guards (stage holds, slots) go before the tree does; the
+        // response carries nothing else an invocation keeps.
+        let ran = ran.map(|r| r.map(drop));
 
-        Ok(PreparedInvocation {
-            command,
-            holds,
-            _results: results,
-            _shell_dir: shell_dir,
-        })
+        // Every exit removes the sandbox, before this returns (E20).
+        if let Err(e) = hcore::blocking::run(move || sandbox.teardown()).await {
+            tracing::warn!(
+                addr = %addr,
+                error = %e,
+                "could not remove the invocation sandbox; the next invocation or `heph gc` sweeps it",
+            );
+        }
+        ran
     }
 }

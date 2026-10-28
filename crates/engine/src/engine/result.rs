@@ -4302,6 +4302,12 @@ impl Engine {
             None
         };
 
+        // The entrypoint attribute is the parse's (R13): carried across
+        // `apply_transitive` — a driver, or a plugin across the ABI, that does
+        // not echo it back must not turn an entrypoint into a buildable,
+        // cacheable target — and a transitive form that names a different one
+        // is refused rather than believed.
+        let parsed_entrypoint = def.entrypoint;
         let mut def = match &all_transitive {
             Some(sb) if !sb.empty() => {
                 let res = driver
@@ -4317,7 +4323,17 @@ impl Engine {
                     .await
                     .with_context(|| "apply transitive")?;
 
-                res.target_def
+                let mut transitive = res.target_def;
+                match (parsed_entrypoint, transitive.entrypoint) {
+                    (parsed, Some(after)) if parsed != Some(after) => anyhow::bail!(
+                        "{addr}: driver `{}` changed the target's entrypoint attribute when \
+                         applying transitive deps ({parsed:?} at parse, {after:?} after); an \
+                         entrypoint is decided by `parse` alone",
+                        spec.driver
+                    ),
+                    _ => transitive.entrypoint = parsed_entrypoint,
+                }
+                transitive
             }
             _ => def,
         };
