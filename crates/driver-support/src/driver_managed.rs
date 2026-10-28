@@ -147,6 +147,10 @@ pub async fn invoke_inner<'a, 'io>(
     // participates and no plugin ships its own copy of the rule.
     complete_deferred(&mut req, &inputs)
         .with_context(|| format!("deferred `${{src://…}}` for {}", req.target.addr.format()))?;
+    // Everything heph does before the program exists is done: a run in the
+    // caller's terminal is handed over from here (the binary stops reading
+    // Ctrl-C as "cancel"). Host-side, so it covers a cdylib driver too.
+    req.options.fire_handover();
     let mreq = ManagedRunRequest {
         sandbox_dir,
         sandbox_ws_dir: ws_dir,

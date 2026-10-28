@@ -1335,6 +1335,12 @@ pub struct Foreground {
     /// state, so it travels as data. Signals not listed are left as the
     /// spawn would leave them.
     pub dispositions: Vec<(Signal, Disposition)>,
+    /// Host-only: what the host does at the moment the terminal is handed to
+    /// the program — after the inputs are materialized, right before the
+    /// driver that spawns it is called. Fired at most once, by the managed
+    /// layer for a managed driver and by the engine for any other. Never
+    /// crosses the plugin seam. See [`Handover`].
+    pub handover: Option<Handover>,
 }
 
 impl Foreground {
@@ -1342,6 +1348,48 @@ impl Foreground {
         Self {
             signals,
             dispositions,
+            handover: None,
+        }
+    }
+
+    pub fn with_handover(mut self, handover: Handover) -> Self {
+        self.handover = Some(handover);
+        self
+    }
+}
+
+/// A one-shot hook the host runs when a run in the caller's terminal is about
+/// to spawn its program ([`Foreground::handover`]): the binary stops treating
+/// Ctrl-C as "cancel" from that moment, while everything before it — deps,
+/// materializing the closure — stays cancellable (R9).
+pub struct Handover(Box<dyn FnOnce() + Send + Sync>);
+
+impl Handover {
+    pub fn new(f: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self(Box::new(f))
+    }
+
+    /// Run the hook.
+    pub fn fire(self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for Handover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Handover")
+    }
+}
+
+impl RunOptions {
+    /// Fire the [`Foreground::handover`] hook, if this run has one that has
+    /// not fired yet. Called by whoever hands the request to the driver that
+    /// spawns the program.
+    pub fn fire_handover(&mut self) {
+        if let RunStdio::Inherit(fg) = &mut self.stdio
+            && let Some(h) = fg.handover.take()
+        {
+            h.fire();
         }
     }
 }

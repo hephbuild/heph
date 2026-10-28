@@ -221,6 +221,11 @@ fn request_dump() {
 /// `SIGUSR2` handler: request a dump. Only stores to an atomic, so it is
 /// async-signal-safe.
 extern "C" fn on_sigusr2(_sig: libc::c_int) {
+    // A SIGUSR2 sent to heph while an entrypoint runs is the tool's (the relay
+    // forwards it); heph acts on no signal of its own then (R9).
+    if hcore::shutdown::is_transparent() {
+        return;
+    }
     request_dump();
 }
 

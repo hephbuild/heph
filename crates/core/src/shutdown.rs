@@ -2,7 +2,7 @@
 //! TUI's Ctrl+C handler. Lives here (the lowest crate) so the TUI can hold a
 //! `ShutdownTrigger` without depending on the bin's bootstrap module.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -37,7 +37,7 @@ impl ShutdownTrigger {
     }
 
     pub fn trigger(&self) {
-        if self.suppressed.load(Ordering::Acquire) {
+        if self.suppressed.load(Ordering::Acquire) || is_transparent() {
             return;
         }
         _ = self.tx.send(());
@@ -58,6 +58,54 @@ pub struct SuppressionHandle {
 impl SuppressionHandle {
     pub fn set(&self, suppressed: bool) {
         self.flag.store(suppressed, Ordering::Release);
+    }
+}
+
+/// How many [`TransparencyGuard`]s are alive in this process.
+static TRANSPARENT: AtomicUsize = AtomicUsize::new(0);
+
+/// While held, heph is *transparent*: a program it handed the terminal to (an
+/// entrypoint, E8/N4a) owns every signal, and heph acts on none of them. The
+/// shutdown trigger drops every press, a press already queued is dropped by
+/// its consumer, and the diagnostic handlers (`SIGQUIT` dump, `SIGUSR1`
+/// per-thread backtraces, `SIGUSR2` profile dump) do nothing.
+///
+/// Refcounted, so two invocations in one process never end each other's
+/// transparency: it lasts while any guard is alive. Taken right before the
+/// program is forked — before that, Ctrl-C cancels as on any run — and
+/// normally kept until heph exits ([`TransparencyGuard::until_exit`]), so a
+/// signal arriving while heph tears down after the program exits prints
+/// nothing either.
+#[derive(Debug)]
+#[must_use = "transparency ends when the guard drops"]
+pub struct TransparencyGuard(());
+
+/// Become transparent until the returned guard drops (see
+/// [`TransparencyGuard`]).
+pub fn hold_transparent() -> TransparencyGuard {
+    TRANSPARENT.fetch_add(1, Ordering::AcqRel);
+    TransparencyGuard(())
+}
+
+/// Whether any [`TransparencyGuard`] is alive. One atomic load, so it is safe
+/// to call from a signal handler.
+pub fn is_transparent() -> bool {
+    TRANSPARENT.load(Ordering::Acquire) > 0
+}
+
+impl TransparencyGuard {
+    /// Keep the hold for the rest of the process's life: heph exits with the
+    /// program's status once it ends, and nothing in between is heph's to act
+    /// on.
+    pub fn until_exit(self) {
+        // Never dropped: the count stays up until the process is gone.
+        let _held = std::mem::ManuallyDrop::new(self);
+    }
+}
+
+impl Drop for TransparencyGuard {
+    fn drop(&mut self) {
+        TRANSPARENT.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -112,6 +160,28 @@ mod tests {
     // Serialized: TERMINAL_RESTORE is a process-global static, so concurrent
     // test runs on the same binary would stomp each other's registration.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Two holders never end each other's transparency, and a press while
+    /// either is held is dropped — the case a single bool got wrong: the
+    /// first invocation to finish cleared it under the second.
+    #[test]
+    fn transparency_is_refcounted_and_drops_presses() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (trigger, mut rx) = ShutdownTrigger::new();
+        assert!(!is_transparent());
+
+        let first = hold_transparent();
+        let second = hold_transparent();
+        drop(first);
+        assert!(is_transparent(), "the second holder still holds");
+        trigger.trigger();
+        assert!(rx.try_recv().is_err(), "a press while held is dropped");
+
+        drop(second);
+        assert!(!is_transparent());
+        trigger.trigger();
+        assert!(rx.try_recv().is_ok(), "presses count again once released");
+    }
 
     #[test]
     fn restore_terminal_is_noop_when_nothing_registered() {

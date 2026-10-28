@@ -98,6 +98,11 @@ static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// async-signal-safe — and it *returns*, so the process keeps running rather than
 /// taking the default `SIGQUIT` action of terminating.
 extern "C" fn on_sigquit(_sig: libc::c_int) {
+    // While an entrypoint holds the terminal, a `Ctrl-\` (or a QUIT sent to
+    // heph) is the tool's, and heph acts on no signal of its own (R9).
+    if hcore::shutdown::is_transparent() {
+        return;
+    }
     DUMP_REQUESTED.store(true, Ordering::Relaxed);
 }
 
@@ -173,7 +178,11 @@ fn spawn_sweeper() {
                 .spawn(|| {
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(200));
-                        if DUMP_REQUESTED.swap(false, Ordering::Relaxed) {
+                        // A request that raced the handover is dropped too:
+                        // the dump's `warn!` would land in the tool's output.
+                        if DUMP_REQUESTED.swap(false, Ordering::Relaxed)
+                            && !hcore::shutdown::is_transparent()
+                        {
                             sweep(&dump_path());
                         }
                     }
@@ -452,6 +461,12 @@ fn os_tid() -> i64 {
 }
 
 extern "C" fn on_dump_signal(_sig: libc::c_int) {
+    // Once installed this handler stays: a SIGUSR1 sent to heph while an
+    // entrypoint runs is the tool's (the relay forwards it), not a request
+    // for heph's own stacks (R9).
+    if hcore::shutdown::is_transparent() {
+        return;
+    }
     let fd = DIAG_FD.load(Ordering::Relaxed);
     if fd < 0 {
         return;

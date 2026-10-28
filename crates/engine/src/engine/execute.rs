@@ -45,9 +45,11 @@ impl Engine {
         // The backstop for a direct `result_addr` on an entrypoint: it runs
         // only through `Engine::invoke`, never in a sandbox (D30, I8).
         if def.target.entrypoint.is_some() {
-            return Err(
-                crate::engine::invoke::EntrypointNotBuildable { addr: addr.clone() }.into(),
-            );
+            return Err(crate::engine::invoke::EntrypointNotBuildable {
+                addr: addr.clone(),
+                selected: None,
+            }
+            .into());
         }
 
         hcore::hmemoizer::set_phase("execute:inputs_result_exec");
@@ -344,6 +346,11 @@ impl Engine {
                     req.credentials = credential_mounts;
                     req.deferred = deferred;
                     req.options = options;
+                    // A plain driver spawns straight from `run`; a managed
+                    // one materializes first and its layer fires it.
+                    if !driver.managed {
+                        req.options.fire_handover();
+                    }
                     let res = if shell {
                         driver.driver.run_shell(req, rs.ctoken()).await
                     } else {

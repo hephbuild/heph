@@ -589,6 +589,11 @@ pub struct Provider {
 pub struct Driver {
     pub name: String,
     pub driver: Box<dyn SDKDriver>,
+    /// Registered as a managed driver: wrapped in the sandbox layer, which
+    /// materializes the inputs inside `run` and fires a terminal run's
+    /// handover itself, right before the inner driver spawns
+    /// (`RunOptions::fire_handover`). For a plain driver the engine fires it.
+    pub managed: bool,
 }
 
 /// Create the home if needed and make it ignore itself: a `<home>/.gitignore`
@@ -1011,9 +1016,9 @@ impl Engine {
 
         let mut resolved: Vec<Arc<Driver>> = Vec::with_capacity(drivers.len());
         for driver in drivers {
-            let driver: Box<dyn SDKDriver> = match driver {
-                PluginDriver::Plain(d) => d,
-                PluginDriver::Managed(m) => Box::new(self.new_managed_driver(m)),
+            let (driver, managed): (Box<dyn SDKDriver>, bool) = match driver {
+                PluginDriver::Plain(d) => (d, false),
+                PluginDriver::Managed(m) => (Box::new(self.new_managed_driver(m)), true),
             };
             let local = driver
                 .config(driver::ConfigRequest {})
@@ -1026,7 +1031,11 @@ impl Engine {
                      plugin its own local name (at most one may omit it)"
                 );
             }
-            resolved.push(Arc::new(Driver { name: full, driver }));
+            resolved.push(Arc::new(Driver {
+                name: full,
+                driver,
+                managed,
+            }));
         }
 
         // Plugin names are unique and a component name always starts with its
