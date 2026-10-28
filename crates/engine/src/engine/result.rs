@@ -3055,14 +3055,62 @@ impl Engine {
             return Err(HashUnknownError { addr: addr.clone() }.into());
         }
         drop(read);
-        let write = self
-            .acquire_with_notice(
-                &rs,
-                addr,
-                Some(hashin),
-                self.result_lock().write(addr, hashin, ctoken),
-            )
-            .await?;
+        // The write lock, without queueing behind readers of a revision that
+        // has become a hit since the probe. A blocking `write` waits for every
+        // reader to drain, and a reader may be a long-running consumer riding
+        // the entry a concurrent builder just produced — an entrypoint's tool
+        // holds its closure's reads for its whole run — so a miss that lost
+        // the race to build would wait for that consumer to exit rather than
+        // share the result (N10). Instead: try; when taken, wait for the
+        // target's gateway (free once any build of it is done), re-probe
+        // under a read, and share a hit; a miss still contended was a passing
+        // prober's read, so back off and try again.
+        let mut backoff = std::time::Duration::from_millis(5);
+        let write = loop {
+            if let Some(write) = self.result_lock().try_write(addr, hashin)? {
+                break write;
+            }
+            drop(
+                self.acquire_with_notice(
+                    &rs,
+                    addr,
+                    Some(hashin),
+                    self.result_lock().lock_target(addr, ctoken),
+                )
+                .await?,
+            );
+            let read = self
+                .acquire_with_notice(
+                    &rs,
+                    addr,
+                    Some(hashin),
+                    self.result_lock().read(addr, hashin, ctoken),
+                )
+                .await?;
+            if let Some(manifest) = self.probe_cache_manifest(&rs, def, opts).await? {
+                // Branch A, reached late.
+                let (slot, read) =
+                    GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
+                return Ok((
+                    Arc::new(LockedResolution {
+                        guard: Some(slot),
+                        executed: None,
+                        manifest: Some(manifest),
+                        remote: RemoteCell::new(),
+                    }),
+                    Some(read),
+                ));
+            }
+            drop(read);
+            tokio::select! {
+                () = ctoken.cancelled() => {
+                    return Err(anyhow::Error::new(hplugin::error::CancelledError))
+                        .with_context(|| format!("acquiring result lock for {addr}"));
+                }
+                () = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(std::time::Duration::from_millis(100));
+        };
 
         // Re-check (manifest level) under the write lock: covers the drop window
         // above and any writer that produced the artifacts while we waited. The
