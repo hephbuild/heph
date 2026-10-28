@@ -209,7 +209,7 @@ impl Engine {
             // a credential edge, and the members of a group — so this is the one
             // place an entrypoint is refused as one (I8). Otherwise a build step
             // could run something in a developer's cwd.
-            if def.target_def.entrypoint {
+            if def.target_def.entrypoint.is_some() {
                 return Err(EntrypointAsInput {
                     entrypoint: input.r#ref.r#ref.clone(),
                     origin_id: input.origin_id.clone(),

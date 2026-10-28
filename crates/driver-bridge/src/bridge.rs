@@ -318,20 +318,8 @@ mod shell_fallback_tests {
 
         let target_def = TargetDef::default();
         let request_id = "shell-fallback-test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: tmp.path().to_path_buf(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: sandbox.clone(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, sandbox.clone());
+        req.tree_root_path = tmp.path().to_path_buf();
 
         bridge.run_shell(req, &ctoken).await?;
 

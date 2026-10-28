@@ -4299,7 +4299,7 @@ impl Engine {
         // because every cache decision downstream reads `def.cache` before
         // anything executes — a zero-output remote "hit" must never make
         // `go test` a no-op (I6, D43).
-        if def.entrypoint {
+        if def.entrypoint.is_some() {
             def.cache = crate::engine::driver::targetdef::CacheConfig::off();
         }
 
@@ -8852,6 +8852,7 @@ mod tests {
         let e = anyhow::Error::new(ProcessFailed {
             status: "exit status: 1".to_string(),
             log: Arc::new(hcore::hartifactcontent::FileContent::new(&log_path)),
+            exit: None,
         })
         .context("driver run")
         .context("execute //pkg:a");
@@ -8889,6 +8890,7 @@ mod tests {
         let e = anyhow::Error::new(ProcessFailed {
             status: "exit status: 1".to_string(),
             log: Arc::new(hcore::hartifactcontent::FileContent::new(&log_path)),
+            exit: None,
         })
         .context("execute //pkg:a");
 
@@ -11784,6 +11786,7 @@ mod tests {
                 return Err(anyhow::Error::new(crate::engine::error::ProcessFailed {
                     status: "exit status: 1".to_string(),
                     log: SArc::new(hcore::hartifactcontent::FileContent::new(&self.log_path)),
+                    exit: None,
                 })
                 .context("driver run"));
             }

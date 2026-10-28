@@ -713,25 +713,11 @@ mod tests {
             })
             .collect();
 
-        Driver
-            .run(
-                RunRequest {
-                    request_id: &"test".to_string(),
-                    target: def,
-                    tree_root_path: Default::default(),
-                    inputs,
-                    hashin: "hashin",
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
-                    sandbox_dir: Default::default(),
-                    scratch: vec![],
-                    credentials: vec![],
-                    deferred: Default::default(),
-                },
-                &ctoken(),
-            )
-            .await
+        let request_id = "test".to_string();
+        let mut req = RunRequest::new(&request_id, def, std::path::PathBuf::new());
+        req.inputs = inputs;
+        req.hashin = "hashin";
+        Driver.run(req, &ctoken()).await
     }
 
     /// `RunResponse` has no `Debug`, so `expect_err` is unavailable.

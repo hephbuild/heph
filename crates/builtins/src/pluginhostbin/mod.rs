@@ -313,22 +313,12 @@ mod tests {
         target: &'a TargetDef,
         request_id: &'a String,
         sandbox_dir: &std::path::Path,
-        hashin: &'a String,
+        hashin: &'a str,
     ) -> RunRequest<'a, 'static> {
-        RunRequest {
-            request_id,
-            target,
-            tree_root_path: sandbox_dir.to_path_buf(),
-            inputs: vec![],
-            hashin,
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: sandbox_dir.to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        }
+        let mut req = RunRequest::new(request_id, target, sandbox_dir);
+        req.tree_root_path = sandbox_dir.to_path_buf();
+        req.hashin = hashin;
+        req
     }
 
     #[tokio::test]

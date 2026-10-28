@@ -2334,7 +2334,10 @@ nested: { a: 1, b: [x, y] }
     #[test]
     fn a_target_def_from_the_wire_is_never_an_entrypoint() {
         let mut td = full_target_def();
-        td.entrypoint = true;
+        td.entrypoint = Some(hplugin::driver::targetdef::Entrypoint::new(
+            false,
+            hplugin::driver::targetdef::Workdir::Caller,
+        ));
         let wire = target_def_to_pb(&td).expect("encode");
         assert_eq!(
             wire,
@@ -2342,7 +2345,10 @@ nested: { a: 1, b: [x, y] }
             "the flag puts nothing on the wire"
         );
         let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
-        assert!(!back.entrypoint, "a converted def is never an entrypoint");
+        assert!(
+            back.entrypoint.is_none(),
+            "a converted def is never an entrypoint"
+        );
     }
 
     fn full_target_def_pb() -> pb::TargetDef {

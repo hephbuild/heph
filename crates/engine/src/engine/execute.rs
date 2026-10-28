@@ -44,7 +44,7 @@ impl Engine {
             .cloned()?;
         // The backstop for a direct `result_addr` on an entrypoint: it runs
         // only through `Engine::invoke`, never in a sandbox (D30, I8).
-        if def.target.entrypoint {
+        if def.target.entrypoint.is_some() {
             return Err(
                 crate::engine::invoke::EntrypointNotBuildable { addr: addr.clone() }.into(),
             );
@@ -246,20 +246,17 @@ impl Engine {
                         (driver, def, rs, self => engine, sandbox_dir, scratch_mounts, credential_mounts, deferred)
                         move |stdin, stdout, stderr| {
                             Box::pin(async move {
-                                let req = RunRequest {
-                                    request_id: rs.request_id(),
-                                    target: &def.target,
-                                    tree_root_path: engine.cfg.root.clone(),
-                                    inputs: deps_result,
-                                    hashin: &hashin,
-                                    stdin,
-                                    stdout,
-                                    stderr,
-                                    sandbox_dir,
-                                    scratch: scratch_mounts,
-                                    credentials: credential_mounts,
-                                    deferred,
-                                };
+                                let mut req =
+                                    RunRequest::new(rs.request_id(), &def.target, sandbox_dir);
+                                req.tree_root_path = engine.cfg.root.clone();
+                                req.inputs = deps_result;
+                                req.hashin = &hashin;
+                                req.stdin = stdin;
+                                req.stdout = stdout;
+                                req.stderr = stderr;
+                                req.scratch = scratch_mounts;
+                                req.credentials = credential_mounts;
+                                req.deferred = deferred;
                                 let res = if shell {
                                     driver.driver.run_shell(req, rs.ctoken()).await?
                                 } else {

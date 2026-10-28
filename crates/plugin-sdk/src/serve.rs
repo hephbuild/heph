@@ -1530,20 +1530,15 @@ async fn run_once(
     // made a cdylib driver's build log disappear.
     let mut stdout_sink = FrameSink::new(out, false);
     let mut stderr_sink = FrameSink::new(out, true);
-    let rr = RunRequest {
-        request_id: &request_id,
-        target: &start.target,
-        tree_root_path: start.tree_root_path,
-        inputs: run_inputs,
-        hashin: start.hashin.as_str(),
-        stdin: None,
-        stdout: Some(&mut stdout_sink),
-        stderr: Some(&mut stderr_sink),
-        sandbox_dir: start.sandbox_dir.clone(),
-        scratch: start.scratch,
-        credentials: start.credentials,
-        deferred: start.deferred,
-    };
+    let mut rr = RunRequest::new(&request_id, &start.target, start.sandbox_dir.clone());
+    rr.tree_root_path = start.tree_root_path;
+    rr.inputs = run_inputs;
+    rr.hashin = start.hashin.as_str();
+    rr.stdout = Some(&mut stdout_sink);
+    rr.stderr = Some(&mut stderr_sink);
+    rr.scratch = start.scratch;
+    rr.credentials = start.credentials;
+    rr.deferred = start.deferred;
     let mrr = ManagedRunRequest {
         request: rr,
         sandbox_dir: start.sandbox_dir,

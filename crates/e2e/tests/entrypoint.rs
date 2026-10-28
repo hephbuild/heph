@@ -466,7 +466,10 @@ impl hplugin::driver::Driver for CachingEntrypoint {
             target_def: hplugin::driver::targetdef::TargetDef {
                 addr: req.target_spec.addr.clone(),
                 cache: hplugin::driver::targetdef::CacheConfig::on(true),
-                entrypoint: true,
+                entrypoint: Some(hplugin::driver::targetdef::Entrypoint::new(
+                    false,
+                    hplugin::driver::targetdef::Workdir::Caller,
+                )),
                 hash: b"caching".to_vec(),
                 ..Default::default()
             },

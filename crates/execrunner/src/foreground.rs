@@ -23,15 +23,11 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-/// How the program ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ForegroundExit {
-    /// Exited with this status.
-    Code(i32),
-    /// Killed by this signal. The caller re-raises it rather than exiting
-    /// `128 + n`: a shell tells the two apart.
-    Signal(i32),
-}
+/// How the program ended: the driver contract's [`Exit`](hcore::process::Exit),
+/// which this enum was merged into (R6).
+// TODO(entrypoint-L3): drop the alias with the binary's spawn, which is its
+// last user; the driver-run path names `hcore::process::Exit` directly.
+pub use hcore::process::Exit as ForegroundExit;
 
 /// `sigaction` dispositions saved on construction and restored on drop.
 struct IgnoredSignals {
@@ -78,7 +74,7 @@ pub fn run_foreground(
     env: &[(OsString, OsString)],
     cwd: &Path,
 ) -> std::io::Result<ForegroundExit> {
-    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    use std::os::unix::process::CommandExt as _;
 
     let Some((program, args)) = argv.split_first() else {
         return Err(std::io::Error::new(
@@ -107,12 +103,8 @@ pub fn run_foreground(
     // wait must not take heph down while its child lives.
     let _ignored = IgnoredSignals::ignore(&[libc::SIGINT, libc::SIGQUIT])?;
     let status = cmd.spawn()?.wait()?;
-    Ok(match (status.code(), status.signal()) {
-        (Some(code), _) => ForegroundExit::Code(code),
-        (None, Some(sig)) => ForegroundExit::Signal(sig),
-        // Neither exited nor signalled is a stop, which `wait` does not report.
-        (None, None) => ForegroundExit::Code(1),
-    })
+    // Neither exited nor signalled is a stop, which `wait` does not report.
+    Ok(ForegroundExit::from_std(status).unwrap_or(ForegroundExit::Code(1)))
 }
 
 /// Die of `sig`, as the program did: restore its default disposition, make

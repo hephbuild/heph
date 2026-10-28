@@ -144,7 +144,7 @@ impl Engine {
         addr: &Addr,
     ) -> anyhow::Result<bool> {
         let def = Arc::clone(self).get_def(rs.clone(), addr).await?;
-        Ok(def.target_def.entrypoint)
+        Ok(def.target_def.entrypoint.is_some())
     }
 
     /// Refuse an entrypoint reached by a multi-target selection, before
@@ -168,7 +168,7 @@ impl Engine {
         addr: &Addr,
         target: &hplugin::driver::targetdef::TargetDef,
     ) -> anyhow::Result<Arc<dyn EntrypointDriver>> {
-        if !target.entrypoint {
+        if target.entrypoint.is_none() {
             anyhow::bail!(
                 "{addr} is not an entrypoint; declare `entrypoint = True` on an exec or bash \
                  target to invoke it"

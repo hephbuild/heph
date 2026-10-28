@@ -634,20 +634,10 @@ mod tests {
         let def = parse_def(&[("path", s("c"))], "gocache")
             .await
             .expect("parse");
-        let req = RunRequest {
-            request_id: &"t".to_string(),
-            target: &def,
-            tree_root_path: std::path::PathBuf::from("/"),
-            inputs: vec![],
-            hashin: "h",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: std::path::PathBuf::from("/tmp"),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let request_id = "t".to_string();
+        let mut req = RunRequest::new(&request_id, &def, "/tmp");
+        req.tree_root_path = std::path::PathBuf::from("/");
+        req.hashin = "h";
         let res = Driver
             .run(req, &ctoken())
             .await

@@ -1561,6 +1561,10 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         let hash = self.def_hash(&def, || {
             format!("exec_def_{}", req.target_spec.addr.format())
         });
+        let engine_entrypoint = def
+            .entrypoint
+            .as_ref()
+            .map(entrypoint::EntrypointMode::engine_attribute);
         // Never cached. The engine forces this again from the def's
         // `entrypoint` (D43); saying it here too keeps `inspect def` honest.
         let cache = if is_entrypoint {
@@ -1596,7 +1600,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 outputs,
                 support_files,
                 cache,
-                entrypoint: is_entrypoint,
+                entrypoint: engine_entrypoint,
                 pty: true,
                 hash,
                 ..Default::default()
@@ -2462,6 +2466,7 @@ impl Driver {
             return Err(hplugin::error::ProcessFailed {
                 status: status.to_string(),
                 log,
+                exit: hplugin::error::Exit::from_std(status),
             }
             .into());
         }
@@ -2745,20 +2750,7 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         let res = tokio::time::timeout(
             proc_exec::DRAIN_DEADLINE * 20,
@@ -3078,20 +3070,8 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
 
         let _res = driver.run(make_req(req), &ctoken).await?;
 
@@ -3131,20 +3111,7 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         let res = driver.run(make_req(req), &ctoken).await;
         let Err(err) = res else {
@@ -3190,20 +3157,9 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: Some(&mut stdin),
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdin = Some(&mut stdin);
+        req.stdout = Some(&mut stdout);
 
         // Use a timeout to detect the hang
         let _res = tokio::time::timeout(
@@ -3239,20 +3195,8 @@ mod tests {
         // Use a pipe that will never resolve to simulate a hang
         let (mut reader, _writer) = io::duplex(64);
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: Some(&mut reader),
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdin = Some(&mut reader);
 
         let run_fut = driver.run(make_req(req), &ctoken);
 
@@ -3294,20 +3238,7 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         let run_fut = driver.run(make_req(req), &ctoken);
 
@@ -3350,20 +3281,8 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
 
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -3513,20 +3432,9 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut out_handle),
-            stderr: Some(&mut err_handle),
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut out_handle);
+        req.stderr = Some(&mut err_handle);
 
         tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
             .await
@@ -3581,20 +3489,7 @@ mod tests {
 
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         driver.run(make_req(req), &ctoken).await?;
 
@@ -3642,20 +3537,9 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: Some(&mut stderr),
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
+        req.stderr = Some(&mut stderr);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(60),
@@ -3785,20 +3669,9 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: Some(&mut stdin),
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdin = Some(&mut stdin);
+        req.stdout = Some(&mut stdout);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(60),
@@ -3874,20 +3747,8 @@ mod tests {
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
         let tmp = tempfile::tempdir()?;
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
     }
@@ -4445,7 +4306,7 @@ bash apply_transitive: 26a90abee4625d43
             config.insert("entrypoint".to_string(), Value::Bool(false));
             let def = parse(driver(), config).await?;
             assert_eq!(String::from_utf8_lossy(&def.hash), "61dea7f3aa15aa34");
-            assert!(!def.entrypoint);
+            assert!(def.entrypoint.is_none());
             let json = serde_json::to_string(&def)?;
             assert!(!json.contains("entrypoint"), "{json}");
             assert!(!json.contains("workdir"), "{json}");
@@ -5231,20 +5092,7 @@ bash apply_transitive: 26a90abee4625d43
         let target_def = make_tool_target_def(vec!["mytool".to_string()], origin_id, "");
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver
             .run(
                 ManagedRunRequest {
@@ -5280,20 +5128,8 @@ bash apply_transitive: 26a90abee4625d43
 
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver
             .run(
                 ManagedRunRequest {
@@ -5349,20 +5185,8 @@ bash apply_transitive: 26a90abee4625d43
 
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver
             .run(
                 ManagedRunRequest {
@@ -5494,20 +5318,10 @@ bash apply_transitive: 26a90abee4625d43
         );
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: tmp.path().to_path_buf(),
-            inputs: artifacts,
-            hashin: "h",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: sandbox.clone(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, sandbox.clone());
+        req.tree_root_path = tmp.path().to_path_buf();
+        req.inputs = artifacts;
+        req.hashin = "h";
 
         os.run_inner(req, &ctoken, false).await?;
 
@@ -5593,20 +5407,7 @@ bash apply_transitive: 26a90abee4625d43
         let target_def = make_tool_target_def(vec!["true".to_string()], origin_id, "");
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver
             .run(
                 ManagedRunRequest {
@@ -5655,20 +5456,7 @@ bash apply_transitive: 26a90abee4625d43
         };
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver.run(make_req(req), &ctoken).await?;
 
         assert!(
@@ -5730,20 +5518,7 @@ bash apply_transitive: 26a90abee4625d43
         };
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver
             .run(
                 ManagedRunRequest {
@@ -5821,20 +5596,7 @@ bash apply_transitive: 26a90abee4625d43
         };
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver
             .run(
                 ManagedRunRequest {
@@ -5899,20 +5661,7 @@ bash apply_transitive: 26a90abee4625d43
         let request_id = "test".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         driver.run(make_req(req), &ctoken).await?;
 
@@ -6196,20 +5945,8 @@ bash apply_transitive: 26a90abee4625d43
         };
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver
             .run(
                 ManagedRunRequest {
@@ -6292,20 +6029,8 @@ bash apply_transitive: 26a90abee4625d43
 
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver
             .run(
                 ManagedRunRequest {

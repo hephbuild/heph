@@ -52,6 +52,21 @@ pub struct EntrypointMode {
     pub workdir: Workdir,
 }
 
+impl EntrypointMode {
+    /// What the engine reads off the def ([`EngineTargetDef::entrypoint`]).
+    // TODO(entrypoint-L2): exec's own `Workdir` gains `Sandbox` (E21).
+    pub(crate) fn engine_attribute(&self) -> hplugin::driver::targetdef::Entrypoint {
+        use hplugin::driver::targetdef::Workdir as EngineWorkdir;
+        hplugin::driver::targetdef::Entrypoint::new(
+            self.args,
+            match self.workdir {
+                Workdir::Caller => EngineWorkdir::Caller,
+                Workdir::Root => EngineWorkdir::Root,
+            },
+        )
+    }
+}
+
 /// Fields that mean something only on an entrypoint; refused without the flag.
 pub(crate) const ENTRYPOINT_ONLY_FIELDS: &[&str] = &["args", "workdir"];
 
@@ -702,10 +717,10 @@ mod tests {
     async fn the_flag_reaches_the_engine_def() -> anyhow::Result<()> {
         for driver_name in ["exec", "bash"] {
             let on = parse(driver_name, vec![flag()]).await?;
-            assert!(on.entrypoint, "{driver_name}");
+            assert!(on.entrypoint.is_some(), "{driver_name}");
             assert!(!on.cache.enabled, "{driver_name}");
             let off = parse(driver_name, vec![("entrypoint", Value::Bool(false))]).await?;
-            assert!(!off.entrypoint, "{driver_name}");
+            assert!(off.entrypoint.is_none(), "{driver_name}");
         }
         Ok(())
     }
