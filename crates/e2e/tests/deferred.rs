@@ -977,3 +977,96 @@ async fn a_credential_change_with_no_deferred_value_still_rebuilds_nothing() -> 
     assert_eq!(hashin(&engine, "//app:a").await?, before);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// `exec`/`bash` env
+// ---------------------------------------------------------------------------
+
+/// A reference in an `env` or `runtime_env` value reaches the process as the
+/// producer's bytes, in both modes — a value that comes in by name rather than
+/// by argv position.
+#[tokio::test]
+async fn a_reference_in_env_and_runtime_env_becomes_the_producers_bytes() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("infra/registry", "reg.example\n");
+    ws.write_file("infra/version", "1.4.2\n");
+    ws.write_build_file(
+        "infra",
+        &format!(
+            "{}{}",
+            producer("registry", "registry"),
+            producer("version", "version")
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "x", driver = "exec", out = "o.txt", cache = False,
+       env = {"REG": "${read://infra:registry-value}"},
+       runtime_env = {"TAG": "v${read://infra:version-value}"},
+       run = ["sh", "-c", "printf '%s:%s' \"$REG\" \"$TAG\" > o.txt"])
+target(name = "b", driver = "bash", out = "o.txt", cache = False,
+       env = {"REG": "${read://infra:registry-value}"},
+       runtime_env = {"TAG": "v${read://infra:version-value}"},
+       run = 'printf "%s:%s" "$REG" "$TAG" > $OUT')"#,
+    );
+    for addr in ["//app:x", "//app:b"] {
+        assert_eq!(
+            common::artifact_string(&*ws.run(addr).await?),
+            "reg.example:v1.4.2",
+            "{addr}"
+        );
+    }
+    Ok(())
+}
+
+/// `runtime_env`'s text is outside the def hash, but a reference in it is still
+/// a hashed edge: the variable rebuilds when what it reads moves. The reference
+/// is not a way to sneak a computed value past the key.
+#[tokio::test]
+async fn a_reference_in_runtime_env_moves_the_key_with_the_producer() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("infra/registry", "reg-a\n");
+    ws.write_build_file("infra", &producer("registry", "registry"));
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "exec", out = [], cache = False,
+       runtime_env = {"REG": "${read://infra:registry-value}"}, run = ["true"])"#,
+    );
+    let before_def = def_hash(&ws.engine, "//app:a").await?;
+    let before = hashin(&ws.engine, "//app:a").await?;
+
+    ws.write_file("infra/registry", "reg-b\n");
+    let engine = ws.reopen()?;
+    assert_eq!(before_def, def_hash(&engine, "//app:a").await?);
+    assert_ne!(before, hashin(&engine, "//app:a").await?);
+    Ok(())
+}
+
+/// A variable's *name* is never a value: the walk does not substitute keys, so
+/// a reference there is refused rather than becoming a variable literally named
+/// `${read://…}`.
+#[tokio::test]
+async fn a_reference_in_an_env_name_is_rejected() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    for field in ["env", "runtime_env"] {
+        ws.write_build_file(
+            "app",
+            &format!(
+                r#"target(name = "a", driver = "bash", out = [], run = "true",
+       {field} = {{"${{read://infra:v}}": "x"}})"#
+            ),
+        );
+        let engine = ws.reopen()?;
+        let addr = heph::htaddr::parse_addr("//app:a")?;
+        let err = expect_err(
+            Arc::clone(&engine)
+                .get_def(engine.new_state(), &addr)
+                .await
+                .map(|_d| ()),
+            &format!("a reference in a `{field}` name must be rejected"),
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("deferred value reference"), "{field}: {msg}");
+    }
+    Ok(())
+}
