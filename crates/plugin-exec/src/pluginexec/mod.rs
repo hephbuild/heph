@@ -1,4 +1,5 @@
 pub mod entrypoint;
+mod entrypoint_mode;
 mod filterenv;
 mod pty;
 pub mod redact;
@@ -126,11 +127,11 @@ struct TargetDef {
     /// no runner hashes byte-identically to before this field existed.
     pub runner: Option<TargetAddr>,
     /// `entrypoint = True`: the target is invoked in the caller's world rather
-    /// than built (see [`entrypoint`]). `None` for every other target, and then
-    /// absent from both the hash and the serialized def, so no existing exec or
-    /// bash def moves (pinned by `exec_def_hash_golden_populated`).
+    /// than built (see [`entrypoint_mode`]). `None` for every other target, and
+    /// then absent from both the hash and the serialized def, so no existing
+    /// exec or bash def moves (pinned by `exec_def_hash_golden_populated`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub entrypoint: Option<entrypoint::EntrypointMode>,
+    pub entrypoint: Option<entrypoint_mode::EntrypointMode>,
 }
 
 impl Hash for TargetDef {
@@ -301,6 +302,16 @@ pub(crate) fn grouped(inputs: &[(String, Input)]) -> BTreeMap<String, Vec<Input>
     out
 }
 
+/// How a transitive tool reaches the sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolStaging {
+    /// Linked from heph's shared stage: every build.
+    SharedStage,
+    /// Copied into the run's own sandbox: an entrypoint (R1), whose tool may
+    /// write next to itself.
+    Copy,
+}
+
 /// Fold a transitive closure's tools and deps into a def: every one joins
 /// `inputs`, and the runtime ones are wired into their groups. Env is the
 /// caller's to fold, because the two drivers place it differently.
@@ -310,21 +321,19 @@ pub(crate) fn fold_transitive_inputs(
     tool_groups: &mut BTreeMap<String, Vec<Input>>,
     dep_groups: &mut BTreeMap<String, Vec<Input>>,
     runtime_dep_groups: &mut BTreeMap<String, Vec<Input>>,
+    tool_staging: ToolStaging,
 ) {
     for tool in &sandbox.tools {
-        let input = Input {
-            r#ref: tool.r#ref.clone(),
-            mode: InputMode::Tool,
-            origin_id: tool.id.clone(),
-            // Tools are consumed read-only (executables on PATH, never
-            // mutated by the target), so let the OS sandbox runner stage
-            // them once into the shared stage dir and link them in rather
-            // than copying every tool into every sandbox. `stage_per_file`
-            // forces the per-file link path: the tool consumer reads each
-            // input's file list and flattens every tool file into a `bin/`
-            // dir by basename, so it needs individual files listed — not the
-            // single subtree-root symlink the default staging emits.
-            annotations: BTreeMap::from([
+        // Tools are consumed read-only (executables on PATH, never mutated by
+        // the target), so let the OS sandbox runner stage them once into the
+        // shared stage dir and link them in rather than copying every tool
+        // into every sandbox. `stage_per_file` forces the per-file link path:
+        // the tool consumer reads each input's file list and flattens every
+        // tool file into a `bin/` dir by basename, so it needs individual
+        // files listed — not the single subtree-root symlink the default
+        // staging emits. A copy lists every file already.
+        let annotations = match tool_staging {
+            ToolStaging::SharedStage => BTreeMap::from([
                 ("unpack_root".to_string(), "tools".to_string()),
                 (
                     hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
@@ -335,6 +344,13 @@ pub(crate) fn fold_transitive_inputs(
                     "true".to_string(),
                 ),
             ]),
+            ToolStaging::Copy => BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+        };
+        let input = Input {
+            r#ref: tool.r#ref.clone(),
+            mode: InputMode::Tool,
+            origin_id: tool.id.clone(),
+            annotations,
             hashed: tool.hash,
             runtime: true,
         };
@@ -431,20 +447,21 @@ fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
     env.get_template("init.sh")
         .context("load init.sh template")?
         .render(minijinja::context! {
-            entrypoint => false,
+            args_mode => false,
             cmds,
             lines => minijinja::value::Serde(lines),
         })
         .context("render init.sh template")
 }
 
-/// `init.sh` for an entrypoint's `--shell` (D13): one command line — exec's
-/// resolved argv, or bash's invocation of the script — each word quoted,
-/// followed by the args: the caller's (bash's positional parameters, kept in
-/// `__heph_args`), or a helper's own when it is given any. One line, so `run`,
-/// `xrun`, `show` and `showl` and no `runN`. Same template as exec's, its own
-/// branch, so exec's render does not move.
-pub(crate) fn render_entrypoint_shell_init(argv: &[String]) -> anyhow::Result<String> {
+/// `init.sh` in args mode, for the `--shell` of a run that accepts args
+/// (`RunOptions.args.is_some()`, even when empty; E11): one command line —
+/// exec's resolved argv, or bash's invocation of the script — each word
+/// quoted, followed by the args: the caller's (bash's positional parameters,
+/// kept in `__heph_args`), or a helper's own when it is given any. One line,
+/// so `run`, `xrun`, `show` and `showl` and no `runN`. Same template as
+/// exec's, its own branch, so the render without args does not move.
+pub(crate) fn render_args_shell_init(argv: &[String]) -> anyhow::Result<String> {
     let cmds = argv
         .iter()
         .map(|w| bash_squote(w))
@@ -456,7 +473,7 @@ pub(crate) fn render_entrypoint_shell_init(argv: &[String]) -> anyhow::Result<St
         .context("compile init.sh template")?;
     env.get_template("init.sh")
         .context("load init.sh template")?
-        .render(minijinja::context! { entrypoint => true, cmds, display })
+        .render(minijinja::context! { args_mode => true, cmds, display })
         .context("render init.sh template")
 }
 
@@ -520,11 +537,21 @@ pub fn bash_args_public(
 
     if !termargs.is_empty() {
         // https://unix.stackexchange.com/a/144519
-        // We push "bash" as a placeholder for $0 before appending termargs
-        args.push("bash".to_string());
+        // `-c` takes "bash" as a placeholder for $0 before the termargs; a
+        // script file is its own $0, so they follow it directly.
+        if bash_takes_dollar0(cmd) {
+            args.push("bash".to_string());
+        }
         args.extend(termargs);
     }
     Ok(args)
+}
+
+/// Whether [`bash_args_public`] runs `cmd` inline with `-c`, where positional
+/// args need a `$0` placeholder ahead of them, rather than from a spilled
+/// script file, which is its own `$0`.
+fn bash_takes_dollar0(cmd: &str) -> bool {
+    cmd.len() <= BASH_C_INLINE_MAX
 }
 
 impl Driver {
@@ -748,11 +775,9 @@ impl Driver {
         // in, or a heph upgrade that changes `cp` would keep serving
         // artifacts the old one built. Hashed only when the toolbox is on,
         // so a workspace that leaves it off keeps every key it has today.
-        // Never for an entrypoint, which runs on the caller's PATH and never
-        // sees the toolbox (D24).
-        if def.entrypoint.is_none()
-            && let Some(version) = self.coreutils_version()
-        {
+        // An entrypoint gets the toolbox too (behind the caller's PATH), so
+        // its never-cached def says so like any other.
+        if let Some(version) = self.coreutils_version() {
             "coreutils".hash(&mut h);
             version.hash(&mut h);
             // `tmpl` is one of those utilities, and what it renders is a
@@ -1328,30 +1353,36 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         // `entrypoint = True`, read off the raw config before the spec parse,
-        // because what is refused depends on it. (Any other value is `False`
-        // or fails that parse.)
-        let wants_entrypoint = matches!(
-            req.target_spec.config.get("entrypoint"),
-            Some(hcore::htvalue::Value::Bool(true))
-        );
+        // because what is refused depends on it.
+        let wants_entrypoint = match req.target_spec.config.get("entrypoint") {
+            None | Some(hcore::htvalue::Value::Bool(false)) => false,
+            Some(hcore::htvalue::Value::Bool(true)) => true,
+            Some(other) => anyhow::bail!(
+                "`entrypoint` on {}, a `{}` target, must be `True` or `False`, got {other:?}",
+                req.target_spec.addr.format(),
+                self.name,
+            ),
+        };
         let spec = if wants_entrypoint {
             let addr = req.target_spec.addr.format();
-            entrypoint::refuse_fields(&req.target_spec.config, &addr, &self.name)?;
-            let context = || format!("the entrypoint `{}` target {addr}", self.name);
-            let (config, env) =
-                entrypoint::split_env(&req.target_spec.config).with_context(context)?;
-            spec::TargetSpec {
-                env,
-                ..spec::TargetSpec::from(&config).with_context(context)?
+            entrypoint_mode::refuse_fields(&req.target_spec.config, &addr, &self.name)?;
+            let spec = spec::TargetSpec::from(&req.target_spec.config)
+                .with_context(|| format!("the entrypoint `{}` target {addr}", self.name))?;
+            // exec has no shell to expand `$SRC_x` in its argv (R19); bash
+            // expands it natively.
+            if !self.wraps_in_shell {
+                entrypoint_mode::refuse_literal_closure_vars(&spec.run, &addr)?;
             }
+            spec
         } else {
             // `args` and `workdir` shape an invocation; without the flag there
             // is none. Refused by name, saying where they belong.
-            for field in entrypoint::ENTRYPOINT_ONLY_FIELDS {
+            for field in entrypoint_mode::ENTRYPOINT_ONLY_FIELDS {
                 if req.target_spec.config.contains_key(*field) {
                     anyhow::bail!(
                         "`{field}` is only accepted with `entrypoint = True`; {} is a `{}` \
-                         target built in a sandbox, not invoked in the caller's world",
+                         target built in a sandbox, not invoked in the caller's world. Add \
+                         `entrypoint = True` to invoke it with `heph run`, or drop `{field}`",
                         req.target_spec.addr.format(),
                         self.name,
                     );
@@ -1552,7 +1583,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             runtime_pass_env: spec.runtime_pass_env,
             runtime_env: spec.runtime_env,
             runner: runner.clone(),
-            entrypoint: is_entrypoint.then_some(entrypoint::EntrypointMode {
+            entrypoint: is_entrypoint.then_some(entrypoint_mode::EntrypointMode {
                 args: spec.args,
                 workdir: spec.workdir,
             }),
@@ -1564,7 +1595,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         let engine_entrypoint = def
             .entrypoint
             .as_ref()
-            .map(entrypoint::EntrypointMode::engine_attribute);
+            .map(entrypoint_mode::EntrypointMode::engine_attribute);
         // Never cached. The engine forces this again from the def's
         // `entrypoint` (D43); saying it here too keeps `inspect def` honest.
         let cache = if is_entrypoint {
@@ -1615,14 +1646,24 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
     ) -> anyhow::Result<ApplyTransitiveResponse> {
         let mut def = req.target_def.clone();
         let mut xdef = def.def::<TargetDef>().clone();
+        let is_entrypoint = xdef.entrypoint.is_some();
         fold_transitive_inputs(
             &req.sandbox,
             &mut def.inputs,
             &mut xdef.tool_group_inputs,
             &mut xdef.dep_group_inputs,
             &mut xdef.runtime_dep_group_inputs,
+            // R1: an entrypoint's tool may write next to itself (a `.vite`
+            // cache, `__pycache__`), so it gets a copy, never a link into the
+            // shared stage, which a write would corrupt for every build that
+            // links the same entry. Decided here, on the def, because the
+            // managed layer materializes inputs before `run` sees the request.
+            if is_entrypoint {
+                ToolStaging::Copy
+            } else {
+                ToolStaging::SharedStage
+            },
         );
-        let is_entrypoint = xdef.entrypoint.is_some();
         for (name, env) in req.sandbox.env {
             match env.value {
                 // An entrypoint runs with the caller's whole environment as
@@ -1695,6 +1736,41 @@ impl Driver {
         }
     }
 
+    /// The `--shell` argv of a run that accepts args (E11): an interactive
+    /// bash whose rcfile is `init.sh` in args mode and whose positional
+    /// parameters are the caller's args (appended by the caller after `--`).
+    /// `init.sh`'s one command line is what the run itself would execute:
+    /// exec's argv, or bash's invocation of the script with its `$0`.
+    fn args_mode_shell(
+        &self,
+        sandbox_dir: &std::path::Path,
+        run: &[String],
+        local: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut words = (self.wrap_run)(sandbox_dir, run)?;
+        if words.is_empty() {
+            anyhow::bail!("`run` is empty")
+        }
+        if local && self.wraps_in_shell {
+            words = self.resolve_shell(words)?;
+        }
+        if self.wraps_in_shell && bash_takes_dollar0(&run.join("\n")) {
+            words.push("bash".to_string());
+        }
+        let init = sandbox_dir.join("init.sh");
+        std::fs::write(&init, render_args_shell_init(&words)?)
+            .with_context(|| format!("write the shell init file {}", init.display()))?;
+        Ok(vec![
+            "bash".to_string(),
+            "--noprofile".to_string(),
+            "--rcfile".to_string(),
+            init.to_string_lossy().into_owned(),
+            "-i".to_string(),
+            "-s".to_string(),
+            "--".to_string(),
+        ])
+    }
+
     async fn run_inner<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
@@ -1702,7 +1778,11 @@ impl Driver {
         shell: bool,
     ) -> anyhow::Result<ManagedRunResponse> {
         hcore::hmemoizer::set_phase("pluginexec:sandbox_setup");
-        let rreq = req.request;
+        let mut rreq = req.request;
+        // The caller's side of the run (cwd, base env, args, stdio). Default
+        // for every build; honoured field by field below, never by asking what
+        // kind of target this is (N8).
+        let options = std::mem::take(&mut rreq.options);
         let def = rreq.target.def::<TargetDef>();
 
         // Resolved here, by the host's map, and nowhere else — a driver that
@@ -1713,8 +1793,27 @@ impl Driver {
             .iter()
             .map(|d| rreq.resolve(d).map(str::to_string))
             .collect::<anyhow::Result<_>>()?;
+        // A run that accepts args gets them appended to the command; bash's
+        // inline `-c` form needs a `$0` first so they land in `"$@"`. In
+        // `--shell` they are the shell's positional parameters instead, and
+        // its `run` appends them (E11).
+        let caller_args: Vec<OsString> = match &options.args {
+            None => Vec::new(),
+            Some(args)
+                if !shell
+                    && self.wraps_in_shell
+                    && bash_takes_dollar0(&resolved_run.join("\n")) =>
+            {
+                std::iter::once(OsString::from("bash"))
+                    .chain(args.iter().cloned())
+                    .collect()
+            }
+            Some(args) => args.clone(),
+        };
         let run = {
-            let wrapped = if shell {
+            let wrapped = if shell && options.args.is_some() {
+                self.args_mode_shell(&rreq.sandbox_dir, &resolved_run, def.runner.is_none())?
+            } else if shell {
                 (self.wrap_run_shell)(&rreq.sandbox_dir, &resolved_run)?
             } else {
                 (self.wrap_run)(&rreq.sandbox_dir, &resolved_run)?
@@ -1749,7 +1848,11 @@ impl Driver {
         // an undeclared host binary is reaching outside its cache key, and the
         // failure should say so rather than silently succeed on one machine.
         // `path:` names directories back for a workspace that needs them.
-        if def.runner.is_none() && !self.search_path.is_empty() {
+        //
+        // A run with a base env (the caller's) takes its `PATH` from there
+        // instead: the target's tools still lead and the builtins still trail
+        // it, composed by `hexecrunner` below.
+        if def.runner.is_none() && !self.search_path.is_empty() && options.base_env.is_none() {
             env.insert("PATH".to_string(), self.search_path.join(":"));
         }
         env.insert(
@@ -2091,21 +2194,11 @@ impl Driver {
                 .collect(),
         };
 
+        // Created for every run: in the caller's terminal nothing is teed, so
+        // it stays empty, and the run still reports one log artifact (E6).
         let output_log_path = req.sandbox_dir.join("log.txt");
         let output_log =
             std::fs::File::create(&output_log_path).with_context(|| "create log file")?;
-        let output_log_file = Arc::new(std::sync::Mutex::new(output_log));
-
-        // Shell mode runs the child attached to a freshly-allocated PTY so bash
-        // sees a real terminal and runs interactively. The parent forwards
-        // stdin/stdout via the PTY master through the same tee paths used by
-        // the non-shell case (`tee_stream` on AsyncPty for PTY; `tee_output`
-        // on the merged OutputReader for piped stdio).
-        let pty_pair = if shell {
-            Some(pty::open_pty().context("openpty")?)
-        } else {
-            None
-        };
 
         // run is guaranteed non-empty by the bail! above, so [0] and [1..] are safe
         let (program, args) = {
@@ -2116,7 +2209,7 @@ impl Driver {
             (run[0].clone(), run[1..].to_vec())
         };
 
-        let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let args_os: Vec<OsString> = args.iter().map(OsString::from).chain(caller_args).collect();
 
         // execve caps total argv+envp at ARG_MAX and each entry at MAX_ARG_STRLEN.
         // Drop overlong entries and evict longest until under the limit.
@@ -2130,10 +2223,137 @@ impl Driver {
         // file would keep the credential on Linux and drop it on macOS, then run
         // unauthenticated or against whatever ambient identity the host had.
         let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter, &credential_env_names)?;
-        let env_pairs: Vec<(OsString, OsString)> = env_vec
-            .into_iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect();
+        // The run's own layers sit on the caller's base env, which is neither
+        // filtered nor converted: it reaches the process byte for byte (E6).
+        let has_base_env = options.base_env.is_some();
+        let env_pairs = layer_env(options.base_env.unwrap_or_default(), env_vec);
+        let spawn_size = SpawnSize::of(&program, &args_os, &env_pairs);
+
+        let cwd = match options.cwd {
+            Some(cwd) => {
+                // Checked here so a deleted or mistyped directory is named as
+                // such; `chdir` failing in the child surfaces as a bare ENOENT
+                // that reads like a missing program.
+                anyhow::ensure!(
+                    cwd.is_dir(),
+                    "the run's working directory {cwd:?} does not exist or is not a directory \
+                     (was it deleted, or is it on an unmounted volume?); run from an existing \
+                     directory"
+                );
+                cwd
+            }
+            None => req.sandbox_pkg_dir.clone(),
+        };
+
+        // The runner was resolved at parse and is already a hashed input, so
+        // the host's lookup here is a memoizer hit.
+        let runner_ref = match &def.runner {
+            Some(target) => RunnerRef::target(rreq.request_id, &target.r#ref),
+            None => RunnerRef::local(),
+        };
+        // Formatted only on the error path. The spawn error stays a typed
+        // `io::Error` so the NotFound and E2BIG arms can say what was
+        // configured — and `spawned_as` carries the program that was
+        // *actually* executed, which under a runner is the wrapper rather than
+        // the target's own command.
+        let spawn_error = |e: std::io::Error, spawned_as: &hexecrunner::SpawnedAs| {
+            let program = run.first().map_or("", String::as_str);
+            // Under a runner the program that failed to exec is the wrapper,
+            // not the target's command — say which, or the message sends the
+            // reader looking for the wrong binary.
+            let via = match &def.runner {
+                Some(target) => format!(
+                    " (via exec runner {}, which spawned {:?})",
+                    target.r#ref.format(),
+                    spawned_as.program,
+                ),
+                None => String::new(),
+            };
+            if e.raw_os_error() == Some(libc::E2BIG) {
+                anyhow::anyhow!(
+                    "spawn child process {program:?}{via}: its arguments and environment are \
+                     larger than this system accepts (E2BIG: {spawn_size}). Pass fewer or \
+                     shorter arguments, or unset large environment variables{caller}",
+                    caller = if has_base_env {
+                        "; the caller's own environment is passed through unfiltered"
+                    } else {
+                        ""
+                    },
+                )
+            } else if e.kind() == std::io::ErrorKind::NotFound && has_base_env {
+                anyhow::anyhow!(
+                    "spawn child process {program:?}{via}: {e} — not found on the run's PATH \
+                     (the target's tools, then the caller's PATH, then heph's builtin \
+                     utilities). Declare it as a tool, call it by absolute path, or put it on \
+                     your PATH. Also check that the working directory {cwd:?} exists.",
+                    cwd = spawned_as.cwd,
+                )
+            } else if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "spawn child process {program:?}{via}: {e} — not found on the target's PATH ({path}). A target sees only what it declares as a tool plus heph's builtin utilities; the host's directories are deliberately not there, so a program on your interactive PATH is still missing here. Declare it as a tool, call it by absolute path, or name the directories back with the driver's `path` option in .hephconfig. Also check that the working directory {cwd:?} exists.",
+                    path = self.sandbox_path_display(),
+                    cwd = spawned_as.cwd,
+                )
+            } else {
+                anyhow::Error::new(e).context(format!("spawn child process {program:?}{via}"))
+            }
+        };
+
+        // The caller's own terminal: inherited fds 0–2, no PTY, no tee, no
+        // session of its own (E6). `--shell` keeps its PTY whatever the stdio,
+        // since a shell is always on a terminal; it takes only the relay's
+        // signals, below (Open 7).
+        let (inherit, shell_signals) = match options.stdio {
+            hplugin::driver::RunStdio::Inherit(fg) if shell => (None, Some(fg.signals)),
+            hplugin::driver::RunStdio::Inherit(fg) => (Some(fg), None),
+            _ => (None, None),
+        };
+        if let Some(fg) = inherit {
+            drop(output_log);
+            hcore::hmemoizer::set_phase("pluginexec:spawn");
+            let cmd = hexecrunner::foreground::ForegroundCommand::new(
+                PathBuf::from(program),
+                args_os,
+                env_pairs,
+                cwd,
+            )
+            .with_dispositions(fg.dispositions);
+            let (spawned, spawned_as) =
+                hexecrunner::foreground::spawn_foreground(runner_ref, cmd, &path_policy, ctoken)
+                    .await?;
+            let child = spawned.map_err(|e| spawn_error(e, &spawned_as))?;
+            hcore::hmemoizer::set_phase("pluginexec:wait_subprocess");
+            let exit = child
+                .wait(fg.signals, ctoken)
+                .await
+                .context("wait for child process")?;
+            if ctoken.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            if exit != hplugin::error::Exit::Code(0) {
+                // Nothing was captured: the log is empty, never a handle into
+                // a sandbox that is about to be removed (R22).
+                return Err(hplugin::error::ProcessFailed {
+                    status: exit_display(exit),
+                    log: Arc::new(EmptyLog),
+                    exit: Some(exit),
+                }
+                .into());
+            }
+            return log_response(&output_log_path);
+        }
+        let output_log_file = Arc::new(std::sync::Mutex::new(output_log));
+
+        // Shell mode runs the child attached to a freshly-allocated PTY so bash
+        // sees a real terminal and runs interactively. The parent forwards
+        // stdin/stdout via the PTY master through the same tee paths used by
+        // the non-shell case (`tee_stream` on AsyncPty for PTY; `tee_output`
+        // on the merged OutputReader for piped stdio).
+        let pty_pair = if shell {
+            Some(pty::open_pty().context("openpty")?)
+        } else {
+            None
+        };
 
         let spec = if let Some((master, slave)) = &pty_pair {
             // Inherit the parent's terminal size so bash can wrap and place the
@@ -2156,7 +2376,7 @@ impl Driver {
                 program: PathBuf::from(program),
                 args: args_os,
                 env: env_pairs,
-                cwd: req.sandbox_pkg_dir.clone(),
+                cwd: cwd.clone(),
                 stdin: proc_exec::StdioSpec::Fd(stdin_fd),
                 stdout: proc_exec::StdioSpec::Fd(stdout_fd),
                 stderr: proc_exec::StdioSpec::Fd(stderr_fd),
@@ -2185,7 +2405,7 @@ impl Driver {
                 program: PathBuf::from(program),
                 args: args_os,
                 env: env_pairs,
-                cwd: req.sandbox_pkg_dir.clone(),
+                cwd: cwd.clone(),
                 stdin,
                 stdout: proc_exec::StdioSpec::Piped,
                 stderr: proc_exec::StdioSpec::Piped,
@@ -2195,45 +2415,29 @@ impl Driver {
         };
 
         hcore::hmemoizer::set_phase("pluginexec:spawn");
-        // Program/PATH/cwd are only formatted here, on the error path — `run`
-        // and `req` are still fully owned locals at this point (only cloned
-        // versions of their fields were moved into `spec` above), so no work
-        // happens on the far more common spawn-succeeds path.
-        // The runner was resolved at parse and is already a hashed input, so
-        // the host's lookup here is a memoizer hit. The spawn error stays a
-        // typed `io::Error` so the NotFound arm below can still render the
-        // sandbox-PATH diagnostic — and `spawned_as` carries the program that
-        // was *actually* executed, which under a runner is the wrapper rather
-        // than the target's own command.
-        let runner_ref = match &def.runner {
-            Some(target) => RunnerRef::target(rreq.request_id, &target.r#ref),
-            None => RunnerRef::local(),
-        };
         let (spawned, spawned_as) =
             hexecrunner::spawn_io_with_path(runner_ref, spec, &path_policy, ctoken).await?;
-        let mut handle = spawned.map_err(|e| {
-            let program = run.first().map_or("", String::as_str);
-            // Under a runner the program that failed to exec is the wrapper,
-            // not the target's command — say which, or the message sends the
-            // reader looking for the wrong binary.
-            let via = match &def.runner {
-                Some(target) => format!(
-                    " (via exec runner {}, which spawned {:?})",
-                    target.r#ref.format(),
-                    spawned_as.program,
-                ),
-                None => String::new(),
-            };
-            if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "spawn child process {program:?}{via}: {e} — not found on the target's PATH ({path}). A target sees only what it declares as a tool plus heph's builtin utilities; the host's directories are deliberately not there, so a program on your interactive PATH is still missing here. Declare it as a tool, call it by absolute path, or name the directories back with the driver's `path` option in .hephconfig. Also check that the working directory {cwd:?} exists.",
-                    path = self.sandbox_path_display(),
-                    cwd = req.sandbox_pkg_dir,
-                )
-            } else {
-                anyhow::Error::new(e).context(format!("spawn child process {program:?}{via}"))
-            }
-        })?;
+        let mut handle = spawned.map_err(|e| spawn_error(e, &spawned_as))?;
+        // Open 7: a `--shell` session runs in its own session on its PTY, so
+        // the terminal's signals never reach heph's group; of the relayed
+        // ones it takes only TERM and HUP (a `timeout` or a closed terminal
+        // ending heph), delivered to the session's group. Everything else is
+        // the user's to type into the shell. Stopped as soon as the wait
+        // returns; a signal racing the reap in between can reach only an
+        // exited group (ESRCH), since the session's pgid is not reused while
+        // a sibling of the shell holds it.
+        let shell_relay = shell_signals.map(|mut signals| {
+            let pgid = handle.pid();
+            tokio::spawn(async move {
+                while let Some(sig) = signals.recv().await {
+                    let raw = sig.as_raw();
+                    if raw == libc::SIGTERM || raw == libc::SIGHUP {
+                        // SAFETY: signalling the group this run spawned.
+                        unsafe { libc::killpg(pgid, raw) };
+                    }
+                }
+            })
+        });
 
         // Drop the parent's copy of the slave so the master sees EOF when the
         // child exits.
@@ -2445,6 +2649,9 @@ impl Driver {
             }
         };
 
+        if let Some(relay) = shell_relay {
+            relay.abort();
+        }
         hcore::hmemoizer::set_phase("pluginexec:post_wait_status_check");
         // Cancellation takes precedence over whatever the wait task returned
         // (`wait_or_cancel` surfaces an io error on cancel) so we preserve the
@@ -2472,25 +2679,121 @@ impl Driver {
         }
         hcore::hmemoizer::set_phase("pluginexec:post_wait_done");
 
-        Ok(ManagedRunResponse {
-            artifacts: vec![outputartifact::OutputArtifact {
-                group: "".to_string(),
-                name: "log.txt".to_string(),
-                r#type: outputartifact::Type::Log,
-                content: outputartifact::Content::File(outputartifact::ContentFile {
-                    source_path: output_log_path
-                        .to_str()
-                        .ok_or_else(|| anyhow::anyhow!("log path is not valid UTF-8"))?
-                        .parse()?,
-                    out_path: "log.txt".to_string(),
-                    x: false,
-                    // Log lives in the sandbox (cleaned after caching): never
-                    // passthrough — it must be packed into the cache.
-                    passthrough: false,
-                }),
-                hashout: "".to_string(),
-            }],
-        })
+        log_response(&output_log_path)
+    }
+}
+
+/// A run's response: its one `log.txt` artifact.
+fn log_response(output_log_path: &std::path::Path) -> anyhow::Result<ManagedRunResponse> {
+    Ok(ManagedRunResponse {
+        artifacts: vec![outputartifact::OutputArtifact {
+            group: "".to_string(),
+            name: "log.txt".to_string(),
+            r#type: outputartifact::Type::Log,
+            content: outputartifact::Content::File(outputartifact::ContentFile {
+                source_path: output_log_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("log path is not valid UTF-8"))?
+                    .parse()?,
+                out_path: "log.txt".to_string(),
+                x: false,
+                // Log lives in the sandbox (cleaned after caching): never
+                // passthrough — it must be packed into the cache.
+                passthrough: false,
+            }),
+            hashout: "".to_string(),
+        }],
+    })
+}
+
+/// `ProcessFailed.status` for an [`Exit`](hplugin::error::Exit): the same
+/// words std's `ExitStatus` display uses for the common cases.
+fn exit_display(exit: hplugin::error::Exit) -> String {
+    match exit {
+        hplugin::error::Exit::Code(code) => format!("exit status: {code}"),
+        hplugin::error::Exit::Signal(sig) => format!("signal: {sig}"),
+    }
+}
+
+/// The log of a run in the caller's terminal: nothing was captured (R22).
+/// Never a handle into the run's sandbox, which is removed when it ends.
+struct EmptyLog;
+
+impl hcore::hartifactcontent::Content for EmptyLog {
+    fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+        Ok(Box::new(std::io::empty()))
+    }
+
+    fn walk(
+        &self,
+    ) -> anyhow::Result<
+        Box<dyn Iterator<Item = anyhow::Result<hcore::hartifactcontent::WalkEntry>> + '_>,
+    > {
+        Ok(Box::new(std::iter::empty()))
+    }
+
+    fn hashout(&self) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    fn byte_size(&self) -> Option<u64> {
+        Some(0)
+    }
+}
+
+/// The run's environment: the caller's `base` at the bottom, the run's own
+/// `layers` on top (they win on a duplicate key). In `base`, a later duplicate
+/// wins, as `execve` consumers resolve one; its order and bytes are kept.
+fn layer_env(
+    base: Vec<(OsString, OsString)>,
+    layers: Vec<(String, String)>,
+) -> Vec<(OsString, OsString)> {
+    let mut out: Vec<(OsString, OsString)> = Vec::with_capacity(base.len() + layers.len());
+    let mut index: HashMap<OsString, usize> = HashMap::with_capacity(base.len() + layers.len());
+    let entries = base.into_iter().chain(
+        layers
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v))),
+    );
+    for (k, v) in entries {
+        match index.get(&k) {
+            Some(&i) => {
+                if let Some(slot) = out.get_mut(i) {
+                    slot.1 = v;
+                }
+            }
+            None => {
+                index.insert(k.clone(), out.len());
+                out.push((k, v));
+            }
+        }
+    }
+    out
+}
+
+/// What a spawn hands `execve`, for an E2BIG message.
+#[derive(Clone, Copy)]
+struct SpawnSize {
+    argv_bytes: usize,
+    env_bytes: usize,
+}
+
+impl SpawnSize {
+    fn of(program: &str, args: &[OsString], env: &[(OsString, OsString)]) -> Self {
+        Self {
+            argv_bytes: program.len() + 1 + args.iter().map(|a| a.len() + 1).sum::<usize>(),
+            env_bytes: env.iter().map(|(k, v)| k.len() + v.len() + 2).sum(),
+        }
+    }
+}
+
+impl std::fmt::Display for SpawnSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} bytes of arguments and {} bytes of environment",
+            self.argv_bytes, self.env_bytes
+        )
     }
 }
 
@@ -2506,6 +2809,10 @@ mod tests {
     use hplugin::driver::Deferred as D;
     use hplugin::driver::RunRequest;
     use hplugin::driver::targetdef::CacheConfig;
+
+    /// `RunOptions` (cwd, base env, args, inherited stdio) and `--shell`'s args
+    /// mode.
+    mod run_options;
 
     /// Captures `tracing` events emitted on the calling OS thread while the
     /// returned guard is alive. `#[tokio::test]`'s default `current_thread`
@@ -4277,7 +4584,7 @@ bash apply_transitive: 26a90abee4625d43
     /// the hash moves with the flag itself and with each of `run`, `env`,
     /// `workdir` and `args`.
     #[tokio::test]
-    async fn entrypoint_flag_off_matches_golden_flag_on_hash_moves() -> anyhow::Result<()> {
+    async fn exec_def_hash_flag_on_differs() -> anyhow::Result<()> {
         use hcore::htvalue::Value;
         let ctoken = StdCancellationToken::new();
         let parse = |driver: Driver, config: HashMap<String, Value>| {
@@ -4336,6 +4643,7 @@ bash apply_transitive: 26a90abee4625d43
                     Value::Map(HashMap::from([("A".to_string(), s("1"))])),
                 ),
                 ("workdir", s("root")),
+                ("workdir", s("sandbox")),
                 ("args", Value::Bool(true)),
             ] {
                 let mut config = base();

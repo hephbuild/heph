@@ -15,163 +15,24 @@
 //! `$TOOL_<group>` expanded by heph and the args appended. `bash` runs `run` as
 //! a script through exec's bash invocation, with the args as its positional
 //! parameters (`"$@"`); the shell expands the variables itself.
+//!
+//! TODO(entrypoint-L3): this whole module is the prepare hook the engine and
+//! the binary still call. An entrypoint now runs through the driver's own
+//! `run`/`run_shell` with `RunOptions`; the parse side lives in
+//! [`super::entrypoint_mode`]. Remove this module with the engine's
+//! `PreparedInvocation` and the binary's spawn.
 
 use super::TargetDef;
+pub use super::entrypoint_mode::{EntrypointMode, Workdir};
 use anyhow::Context;
 use hplugin::driver::Deferred;
 use hplugin::driver::entrypoint::{
     Caller, EntrypointDriver, Invocation, PrepareRequest, PreparedCommand, StagedInput,
 };
 use hplugin::driver::targetdef::TargetDef as EngineTargetDef;
-use hplugin::htspec::Spec;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-
-/// Where the process runs.
-///
-/// An enum, not a flag, so `"sandbox"` can return (D11).
-#[derive(
-    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, serde::Serialize, crate::htspec::SpecEnum,
-)]
-pub enum Workdir {
-    /// The caller's cwd, captured raw at startup. May be outside the workspace.
-    #[default]
-    Caller,
-    /// The workspace root.
-    Root,
-}
-
-/// What `entrypoint = True` adds to an exec def. Present only with the flag,
-/// so a def without it hashes and serializes as it always did; with it, all of
-/// it is hashed.
-#[derive(Clone, Debug, Hash, serde::Serialize)]
-pub struct EntrypointMode {
-    /// Append the caller's arguments to the command.
-    pub args: bool,
-    pub workdir: Workdir,
-}
-
-impl EntrypointMode {
-    /// What the engine reads off the def ([`EngineTargetDef::entrypoint`]).
-    // TODO(entrypoint-L2): exec's own `Workdir` gains `Sandbox` (E21).
-    pub(crate) fn engine_attribute(&self) -> hplugin::driver::targetdef::Entrypoint {
-        use hplugin::driver::targetdef::Workdir as EngineWorkdir;
-        hplugin::driver::targetdef::Entrypoint::new(
-            self.args,
-            match self.workdir {
-                Workdir::Caller => EngineWorkdir::Caller,
-                Workdir::Root => EngineWorkdir::Root,
-            },
-        )
-    }
-}
-
-/// Fields that mean something only on an entrypoint; refused without the flag.
-pub(crate) const ENTRYPOINT_ONLY_FIELDS: &[&str] = &["args", "workdir"];
-
-/// An entrypoint's `env`, which — unlike a sandboxed target's — may hold a
-/// `${read://…}`: the hook resolves it when it prepares the command (D46).
-#[derive(Spec)]
-struct EntrypointEnv {
-    env: BTreeMap<String, Deferred<String>>,
-}
-
-type DeferredEnv = HashMap<String, Deferred<String>>;
-
-/// Split an entrypoint's config into everything but `env`, for exec's spec
-/// parse, and `env` parsed as deferrable values, kept as their raw text (the
-/// def is a pure function of the spec; the hook resolves at prepare).
-pub(crate) fn split_env(
-    config: &HashMap<String, hcore::htvalue::Value>,
-) -> anyhow::Result<(HashMap<String, hcore::htvalue::Value>, DeferredEnv)> {
-    let mut rest = config.clone();
-    let Some(env) = rest.remove("env") else {
-        return Ok((rest, HashMap::new()));
-    };
-    let env = EntrypointEnv::from(&HashMap::from([("env".to_string(), env)]))?
-        .env
-        .into_iter()
-        .collect();
-    Ok((rest, env))
-}
-
-/// Fields an entrypoint refuses, each with why. The error names the field and
-/// the target.
-const REFUSED_FIELDS: &[(&str, &str)] = &[
-    (
-        "out",
-        "an entrypoint has no outputs: it runs in your world, not a sandbox, and nothing it \
-         writes is captured",
-    ),
-    ("cache", "an entrypoint is never cached"),
-    ("codegen", "an entrypoint has no outputs to write back"),
-    (
-        "support_files",
-        "an entrypoint has no sandbox to materialize support files into; reach a file through a \
-         dep and `$SRC_<group>`",
-    ),
-    (
-        "scratch",
-        "an entrypoint has no sandbox to mount a scratch cache into",
-    ),
-    (
-        "read_only_deps",
-        "an entrypoint has no sandbox; every dep it uses is staged read-only already",
-    ),
-    (
-        "pass_env",
-        "an entrypoint already runs with the caller's whole environment",
-    ),
-    (
-        "runtime_pass_env",
-        "an entrypoint already runs with the caller's whole environment",
-    ),
-    (
-        "runtime_env",
-        "an entrypoint is never hashed, so `env` already is runtime-only",
-    ),
-    (
-        "credentials",
-        "presenting a credential to an entrypoint would leak its material into your working tree \
-         and environment; a program run from your shell already has your ambient identity",
-    ),
-    (
-        "runner",
-        "not supported yet: an entrypoint under a runner needs the runner protocol to carry the \
-         caller's environment (base_env, plugin ABI 0.18.0)",
-    ),
-];
-
-/// Refuse the fields an entrypoint does not take, by name, before the generic
-/// parser sees them.
-pub(crate) fn refuse_fields(
-    config: &HashMap<String, hcore::htvalue::Value>,
-    addr: &str,
-    driver: &str,
-) -> anyhow::Result<()> {
-    // Sorted, so a target with several gets the same error every time.
-    let mut keys: Vec<&str> = config.keys().map(String::as_str).collect();
-    keys.sort_unstable();
-    for key in keys {
-        if let Some((_, why)) = REFUSED_FIELDS.iter().find(|(f, _)| *f == key) {
-            anyhow::bail!(
-                "`{key}` is not accepted on {addr}, an entrypoint `{driver}` target \
-                 (`entrypoint = True`): {why}"
-            );
-        }
-    }
-    if let Some(hcore::htvalue::Value::String(w)) = config.get("workdir")
-        && w == "sandbox"
-    {
-        anyhow::bail!(
-            "`workdir = \"sandbox\"` is not supported yet on {addr}, an entrypoint `{driver}` \
-             target: `workdir` is \"caller\" (the caller's cwd, the default) or \"root\" (the \
-             workspace root)"
-        );
-    }
-    Ok(())
-}
 
 /// The `$SRC_*`/`$TOOL_*`/`WORKSPACE_ROOT` values for a prepared invocation.
 fn closure_vars(
@@ -529,7 +390,7 @@ impl EntrypointDriver for Entrypoint {
                         })
                     })
                     .collect::<anyhow::Result<Vec<String>>>()?;
-                let rendered = super::render_entrypoint_shell_init(&words)?;
+                let rendered = super::render_args_shell_init(&words)?;
                 std::fs::write(init, rendered)
                     .with_context(|| format!("write the shell init file {}", init.display()))?;
                 let bash = super::resolve_on_host_path("bash", "entrypoint --shell")?;
@@ -551,6 +412,10 @@ impl EntrypointDriver for Entrypoint {
         let cwd = match mode.workdir {
             Workdir::Caller => req.caller.cwd.clone(),
             Workdir::Root => req.root.to_path_buf(),
+            Workdir::Sandbox => anyhow::bail!(
+                "`workdir = \"sandbox\"` on {} runs through the driver's `run`, not this hook",
+                req.target.addr.format()
+            ),
         };
         Ok(PreparedCommand { argv, env, cwd })
     }
@@ -564,6 +429,7 @@ mod tests {
     use hdriver_support::driver_managed::ManagedDriver as _;
     use hmodel::htaddr::parse_addr;
     use hplugin::driver::ParseRequest;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn s(v: &str) -> Value {
@@ -602,184 +468,6 @@ mod tests {
     fn flag() -> (&'static str, Value) {
         ("entrypoint", Value::Bool(true))
     }
-
-    /// Every refusal names the field and the target; the ones with a reason
-    /// give it.
-    #[tokio::test]
-    async fn entrypoint_parse_refusals() {
-        let rows: Vec<(&str, Value, &[&str])> = vec![
-            ("out", s("bin/x"), &["`out`", "no outputs"]),
-            ("cache", Value::Bool(true), &["`cache`", "never cached"]),
-            ("codegen", s("copy"), &["`codegen`"]),
-            (
-                "support_files",
-                Value::List(vec![s("x")]),
-                &["`support_files`"],
-            ),
-            (
-                "scratch",
-                Value::List(vec![s("//c:gocache")]),
-                &["`scratch`"],
-            ),
-            (
-                "read_only_deps",
-                Value::List(vec![s("d")]),
-                &["`read_only_deps`"],
-            ),
-            (
-                "pass_env",
-                Value::List(vec![s("HOME")]),
-                &["`pass_env`", "whole environment"],
-            ),
-            (
-                "runtime_pass_env",
-                Value::List(vec![s("HOME")]),
-                &["`runtime_pass_env`", "whole environment"],
-            ),
-            (
-                "runtime_env",
-                Value::Map(HashMap::from([("A".to_string(), s("1"))])),
-                &["`runtime_env`"],
-            ),
-            (
-                "credentials",
-                Value::List(vec![s("//auth:aws")]),
-                &["`credentials`", "leak its material"],
-            ),
-            (
-                "runner",
-                s("//tools/devenv:runner"),
-                &["`runner`", "not supported yet"],
-            ),
-            (
-                "workdir",
-                s("sandbox"),
-                &["`workdir = \"sandbox\"`", "\"caller\"", "\"root\""],
-            ),
-            (
-                "workdir",
-                s("nonsense"),
-                &["workdir", "nonsense", "caller", "root"],
-            ),
-            ("unknown_field", s("x"), &["unknown_field"]),
-            ("run", Value::Int(3), &["run"]),
-            ("args", s("yes"), &["args"]),
-            ("env", Value::List(vec![s("x")]), &["env"]),
-            ("workdir", Value::Bool(true), &["workdir"]),
-        ];
-        for driver_name in ["exec", "bash"] {
-            for (field, value, needles) in &rows {
-                let err = match parse(driver_name, vec![flag(), (field, value.clone())]).await {
-                    Ok(_) => panic!("{driver_name}: {field} = {value:?} must be refused"),
-                    Err(e) => format!("{e:#}"),
-                };
-                assert!(
-                    err.contains("//tools:go"),
-                    "{driver_name} {field}: names the target: {err}"
-                );
-                for needle in *needles {
-                    assert!(
-                        err.contains(needle),
-                        "{driver_name} {field}: {needle:?} missing from: {err}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// `args` and `workdir` shape an invocation: without `entrypoint = True`
-    /// (absent or `False`) they are refused, naming the target and the flag
-    /// (D18).
-    #[tokio::test]
-    async fn args_and_workdir_refused_outside_entrypoint() {
-        for driver_name in ["exec", "bash"] {
-            for (field, value) in [("args", Value::Bool(true)), ("workdir", s("root"))] {
-                for flag in [None, Some(Value::Bool(false))] {
-                    let mut extra = vec![(field, value.clone())];
-                    if let Some(f) = &flag {
-                        extra.push(("entrypoint", f.clone()));
-                    }
-                    let err = match parse(driver_name, extra).await {
-                        Ok(_) => panic!("{driver_name} must refuse `{field}` with {flag:?}"),
-                        Err(e) => format!("{e:#}"),
-                    };
-                    assert!(err.contains("//tools:go"), "{err}");
-                    assert!(err.contains(&format!("`{field}`")), "{err}");
-                    assert!(err.contains("entrypoint = True"), "{err}");
-                }
-            }
-        }
-    }
-
-    /// The flag reaches the engine's def, which forces nothing else: the
-    /// driver itself already says uncached.
-    #[tokio::test]
-    async fn the_flag_reaches_the_engine_def() -> anyhow::Result<()> {
-        for driver_name in ["exec", "bash"] {
-            let on = parse(driver_name, vec![flag()]).await?;
-            assert!(on.entrypoint.is_some(), "{driver_name}");
-            assert!(!on.cache.enabled, "{driver_name}");
-            let off = parse(driver_name, vec![("entrypoint", Value::Bool(false))]).await?;
-            assert!(off.entrypoint.is_none(), "{driver_name}");
-        }
-        Ok(())
-    }
-
-    /// The workspace `runner:` default never applies to an entrypoint (D24).
-    #[tokio::test]
-    async fn default_runner_not_applied_to_entrypoint() -> anyhow::Result<()> {
-        let mut d = super::super::Driver::new_exec();
-        d.default_runner = Some("//tools/devenv:runner".to_string());
-        let def = d
-            .parse(
-                ParseRequest {
-                    request_id: "t".to_string(),
-                    target_spec: Arc::new(hplugin::provider::TargetSpec {
-                        addr: parse_addr("//tools:go")?,
-                        driver: "exec".to_string(),
-                        config: HashMap::from([
-                            ("run".to_string(), Value::List(vec![s("go")])),
-                            ("entrypoint".to_string(), Value::Bool(true)),
-                        ]),
-                        ..Default::default()
-                    }),
-                },
-                &StdCancellationToken::new(),
-            )
-            .await?
-            .target_def;
-        assert!(def.inputs.iter().all(|i| i.origin_id != "runner"));
-        Ok(())
-    }
-
-    /// The `shim` label is generation's and validate's to check, never
-    /// parse's (D36).
-    #[tokio::test]
-    async fn shim_label_is_not_refused_at_parse() -> anyhow::Result<()> {
-        let def = super::super::Driver::new_exec()
-            .parse(
-                ParseRequest {
-                    request_id: "t".to_string(),
-                    target_spec: Arc::new(hplugin::provider::TargetSpec {
-                        addr: parse_addr("//tools:go")?,
-                        driver: "exec".to_string(),
-                        config: HashMap::from([
-                            ("run".to_string(), Value::List(vec![s("go")])),
-                            ("entrypoint".to_string(), Value::Bool(true)),
-                            ("args".to_string(), Value::Bool(false)),
-                        ]),
-                        labels: vec!["shim".to_string()],
-                        ..Default::default()
-                    }),
-                },
-                &StdCancellationToken::new(),
-            )
-            .await?
-            .target_def;
-        assert_eq!(def.labels, vec!["shim".to_string()]);
-        Ok(())
-    }
-
     #[test]
     fn expand_closure_vars_only_touches_known_names() {
         let vars = BTreeMap::from([
@@ -831,113 +519,6 @@ mod tests {
             .collect();
         assert!(!bashes.is_empty(), "no bash to test with");
         bashes
-    }
-
-    /// The rendered `init.sh` hands the program its argv plus the args exactly,
-    /// whatever bytes they hold; a helper's own args replace the originals for
-    /// that call only; `show` quotes them; there is no `runN` (D13).
-    #[test]
-    fn entrypoint_shell_init_args_exact() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let init = dir.path().join("init.sh");
-        let argv = ["printf", "<%s>", "fixed"].map(str::to_string);
-        std::fs::write(
-            &init,
-            super::super::render_entrypoint_shell_init(&argv).expect("render"),
-        )
-        .expect("write init.sh");
-        let expect = |args: &[&str]| {
-            let mut s = "<fixed>".to_string();
-            for a in args {
-                s.push_str(&format!("<{a}>"));
-            }
-            s
-        };
-
-        for bash in &bashes() {
-            let rows: &[&[&str]] = &[
-                &[],
-                &[""],
-                &[" "],
-                &["a\nb"],
-                &["'", "\"", "it's \"q\""],
-                &["$HOME", "`id`", "$(id)"],
-                &["-n", "--quiet"],
-                &["é", "日本"],
-                &["\u{1}\u{7f}"],
-                &["", "x", ""],
-            ];
-            for args in rows {
-                for helper in ["run", "xrun"] {
-                    let (out, err) = in_shell(bash, &init, args, helper);
-                    assert_eq!(
-                        out,
-                        expect(args),
-                        "{bash} {helper} with {args:?}; stderr: {err}"
-                    );
-                }
-            }
-
-            let originals = ["orig1", "orig 2"];
-            for (snippet, want) in [
-                ("run a 'b c'", expect(&["a", "b c"])),
-                ("run ''", expect(&[""])),
-                ("xrun z", expect(&["z"])),
-                (
-                    "run x; run",
-                    format!("{}{}", expect(&["x"]), expect(&originals)),
-                ),
-                ("run", expect(&originals)),
-                // One command line, so no `runN`/`xrunN`.
-                (
-                    "for f in run1 xrun1; do declare -F \"$f\" >/dev/null && echo \"$f defined\"; done; echo none",
-                    "none\n".to_string(),
-                ),
-            ] {
-                let (out, err) = in_shell(bash, &init, &originals, snippet);
-                assert_eq!(out, want, "{bash}: `{snippet}`; stderr: {err}");
-            }
-
-            let (out, _) = in_shell(bash, &init, &["a b", ""], "show");
-            assert_eq!(out, "'printf' '<%s>' 'fixed' a\\ b ''\n", "{bash}: show");
-            let (out, _) = in_shell(bash, &init, &["a b"], "show 'c d'");
-            assert_eq!(
-                out, "'printf' '<%s>' 'fixed' c\\ d\n",
-                "{bash}: show with args"
-            );
-            let (out, _) = in_shell(bash, &init, &[], "showl");
-            assert_eq!(out, "1 │ 'printf' '<%s>' 'fixed'\n", "{bash}: showl");
-
-            // The real shape: an interactive bash reading the file as its
-            // rcfile, the args as its positional parameters, the commands on
-            // stdin. The rcfile must already see them.
-            let mut child = std::process::Command::new(bash)
-                .args(["--noprofile", "--rcfile"])
-                .arg(&init)
-                .args(["-i", "-s", "--", "a b", ""])
-                .env_clear()
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("spawn interactive bash");
-            {
-                use std::io::Write as _;
-                let mut stdin = child.stdin.take().expect("stdin");
-                stdin
-                    .write_all(b"echo; echo BEGIN; run; echo; exit 3\n")
-                    .expect("type");
-            }
-            let out = child.wait_with_output().expect("wait");
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let after = stdout.split("BEGIN\n").nth(1).unwrap_or_default();
-            assert_eq!(
-                after,
-                format!("{}\n", expect(&["a b", ""])),
-                "{bash}: {stdout}"
-            );
-            assert_eq!(out.status.code(), Some(3), "{bash}: the shell's status");
-        }
     }
 
     /// A `bash` entrypoint is its script run through exec's bash invocation,

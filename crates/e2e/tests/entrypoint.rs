@@ -156,12 +156,10 @@ async fn entrypoint_runs_in_caller_cwd_and_env() -> anyhow::Result<()> {
     ws.write_build_file(
         "app",
         r#"
-target(name = "ep", driver = "exec", entrypoint = True,
+target(name = "ep", driver = "bash", entrypoint = True,
        deps = {"d": "//tools:data"}, tools = {"t": "//tools:tool"},
        env = {"FROM_TARGET": "$SRC_D"},
-       run = ["/bin/sh", "-c",
-              "cat $SRC_D; echo; mytool x; echo \"cwd=$(pwd)\"; echo \"caller=$HEPH_TEST_CALLER\"; echo \"target=$FROM_TARGET\"; printf '<%s>' \"$@\"",
-              "sh"],
+       run = "cat $SRC_D; echo; mytool x; echo \"cwd=$(pwd)\"; echo \"caller=$HEPH_TEST_CALLER\"; echo \"target=$FROM_TARGET\"; printf '<%s>' \"$@\"",
        args = True)
 "#,
     );

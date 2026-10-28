@@ -21,7 +21,7 @@ __heph_render_banner
 echo ''
 echo "=========== Help ==========="
 echo 'Shell mode, to exit; run exit or ctrl-d'
-{% if entrypoint %}
+{% if args_mode %}
 # The caller's args are this shell's positional parameters, copied at top level
 # because run and xrun are functions with their own "$@". An interactive bash
 # binds them only after reading its rcfile, so they are taken again just before

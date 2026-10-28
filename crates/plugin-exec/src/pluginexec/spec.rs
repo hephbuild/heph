@@ -93,20 +93,26 @@ pub(crate) struct TargetSpec {
     pub runner: String,
     /// Make this target an entrypoint: `heph run` invokes it in the caller's
     /// world — their cwd (or the workspace root), their environment, their
-    /// stdio — instead of building it in a sandbox. Never cached and never an
-    /// input. `deps`, `hash_deps`, `runtime_deps`, `tools`, `env` and `run`
-    /// keep their meaning, with `$SRC_<group>`/`$TOOL_<group>` absolute paths
-    /// in heph's read-only stage; the sandbox's fields (`out`, `cache`,
-    /// `codegen`, `support_files`, `scratch`, the `*_env` fields, `runner`,
-    /// `credentials`, `read_only_deps`) are refused.
+    /// terminal — instead of building it. Never cached and never an input.
+    /// `deps`, `hash_deps`, `runtime_deps`, `tools`, `env`, `credentials` and
+    /// `run` keep their meaning: the closure is copied into a sandbox of the
+    /// invocation's own, removed when it exits, and `$SRC_<group>`,
+    /// `$TOOL_<group>` and `$WORKSPACE_ROOT` name paths inside it (`$HEPH_ROOT`
+    /// is the real workspace root). What only a build uses is refused: `out`,
+    /// `cache`, `codegen`, `support_files`, `read_only_deps`, the `*_env`
+    /// fields, `runner`, and `scratch` outside `workdir = "sandbox"`. An `exec`
+    /// argv cannot name `$SRC_<group>` (there is no shell): use
+    /// `${src://pkg:name}`, or `driver = "bash"`.
     pub entrypoint: bool,
     /// With `entrypoint = True`: append the caller's arguments
     /// (`heph run //x -- a b`) to the command (`"$@"` for `bash`). Without it,
     /// trailing arguments are refused before anything builds.
     pub args: bool,
     /// With `entrypoint = True`: where the program runs, `"caller"` (the
-    /// caller's cwd, the default) or `"root"` (the workspace root).
-    pub workdir: super::entrypoint::Workdir,
+    /// caller's cwd, the default), `"root"` (the workspace root) or
+    /// `"sandbox"` (the invocation's own sandbox package dir, as a build runs;
+    /// nothing written there survives the run).
+    pub workdir: super::entrypoint_mode::Workdir,
 }
 
 #[cfg(test)]
