@@ -11,7 +11,10 @@
 //! Under `RunStdio::Inherit` the tool writes to the test process's own fds, so
 //! every tool here writes what it saw to the file `$HEPH_TEST_OUT` names
 //! instead. What only a real process can show — a tty, exit codes, signal
-//! deaths, stdin — is in `crates/bin-e2e/tests/entrypoint.rs`.
+//! deaths, stdin — is in `crates/bin-e2e/tests/entrypoint.rs`. A plugin
+//! driver's side (`cdylib_entrypoint_runs`, the seam rows of
+//! `entrypoint_survives_apply_transitive`) crosses the stable-ABI seam
+//! in-process, as `plugin_fn_declarations.rs` does: no test cdylib is built.
 
 mod common;
 
@@ -799,6 +802,10 @@ target(name = "term", driver = "exec", entrypoint = True, run = ["/bin/sh", "-c"
 struct TransitiveTamper {
     exec: pluginexec::Driver,
     tamper: fn(&mut Option<hplugin::driver::targetdef::Entrypoint>),
+    /// Behind the seam the def arrives with its `raw_def` as serialized bytes,
+    /// which exec's `apply_transitive` (an in-process driver, reading it with
+    /// `def::<T>()`) cannot take: pass the def through instead, and tamper.
+    passthrough: bool,
 }
 
 #[async_trait::async_trait]
@@ -826,9 +833,14 @@ impl heph::engine::driver_managed::ManagedDriver for TransitiveTamper {
         req: hplugin::driver::ApplyTransitiveRequest,
         ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
-        let mut res =
+        let mut res = if self.passthrough {
+            hplugin::driver::ApplyTransitiveResponse {
+                target_def: req.target_def,
+            }
+        } else {
             heph::engine::driver_managed::ManagedDriver::apply_transitive(&self.exec, req, ctoken)
-                .await?;
+                .await?
+        };
         (self.tamper)(&mut res.target_def.entrypoint);
         Ok(res)
     }
@@ -841,11 +853,49 @@ impl heph::engine::driver_managed::ManagedDriver for TransitiveTamper {
     }
 }
 
+/// Tell this process's SDK the host's capabilities the way a cdylib learns
+/// them: the `CreateConfig` bytes `heph_plugin_create` is handed, decoded by
+/// the SDK. In-process the SDK's static is the test binary's, shared by every
+/// test here, and every caller records the same thing — this host's bits.
+fn create_seam_plugin(root: &Path, name: &str) -> anyhow::Result<()> {
+    use buffa::Message as _;
+    let cfg =
+        hplugin_abi::convert::CreateConfig::new(root, root.join(".heph"), name, Default::default());
+    let bytes = hplugin_abi::convert::create_config_to_pb(&cfg).encode_to_vec();
+    let decoded = hplugin_sdk::stabby::create_config_from_bytes(&bytes)?;
+    anyhow::ensure!(
+        hplugin_sdk::stabby::host_capabilities().entrypoints,
+        "the SDK recorded the entrypoint bit ({decoded:?})"
+    );
+    Ok(())
+}
+
+/// `driver` exported by the SDK and decoded by the host loader — the same
+/// `named_managed_driver` → `decode_drivers` pair a cdylib's components go
+/// through — as the parts of plugin `name`.
+fn behind_the_seam(
+    root: &Path,
+    name: &str,
+    driver: impl heph::engine::driver_managed::ManagedDriver + 'static,
+) -> anyhow::Result<PluginParts> {
+    create_seam_plugin(root, name)?;
+    let exported = hplugin_sdk::stabby::named_managed_driver(driver)?;
+    let mut parts = PluginParts::default();
+    for (_local, host) in hplugin_stabby::load_stable::decode_drivers([exported])? {
+        parts = parts.with_managed_driver(Box::new(host));
+    }
+    Ok(parts)
+}
+
 /// The entrypoint attribute is the parse's: a driver whose `apply_transitive`
 /// drops it does not make the target buildable or cacheable, and one that
 /// changes it — or makes a plain target an entrypoint — is refused (R13).
-/// In-process only: the cdylib leg (`cdylib_entrypoint_runs`) needs a real
-/// `dlopen`, in `crates/bin-e2e`.
+///
+/// Every row runs twice: the driver in-process, and the same driver behind the
+/// stable-ABI seam (SDK guest ↔ host proxy, the def encoded both ways), which
+/// is where a third-party cdylib's `apply_transitive` reaches the engine from.
+/// Not through `dlopen`: the def rides the `ApplyTransitive` payload, so a
+/// loaded library would have nothing new to reject.
 #[tokio::test]
 async fn entrypoint_survives_apply_transitive() -> anyhow::Result<()> {
     type Tamper = fn(&mut Option<hplugin::driver::targetdef::Entrypoint>);
@@ -875,7 +925,11 @@ async fn entrypoint_survives_apply_transitive() -> anyhow::Result<()> {
             Err("changed the target's entrypoint attribute"),
         ),
     ];
-    for (row, name, tamper, want) in rows {
+    for (via, (row, name, tamper, want)) in ["in-process", "seam"]
+        .into_iter()
+        .flat_map(|via| rows.map(|r| (via, r)))
+    {
+        let row = format!("{row} ({via})");
         let ws = WorkspaceBuilder::new()?
             .with_provider(|init| {
                 Box::new(pluginbuildfile::Provider::new(
@@ -885,13 +939,17 @@ async fn entrypoint_survives_apply_transitive() -> anyhow::Result<()> {
                 ))
             })
             .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
-            .with_plugin("tamper", move |_| {
-                Ok(
-                    PluginParts::default().with_managed_driver(Box::new(TransitiveTamper {
-                        exec: pluginexec::Driver::new_exec().with_host_path(),
-                        tamper,
-                    })),
-                )
+            .with_plugin("tamper", move |init| {
+                let driver = TransitiveTamper {
+                    exec: pluginexec::Driver::new_exec().with_host_path(),
+                    tamper,
+                    passthrough: via == "seam",
+                };
+                if via == "seam" {
+                    behind_the_seam(&init.root, "tamper", driver)
+                } else {
+                    Ok(PluginParts::default().with_managed_driver(Box::new(driver)))
+                }
             })
             .build()?;
         ws.write_build_file(
@@ -1448,5 +1506,187 @@ target(name = "broken", driver = "exec", entrypoint = True, deps = {"b": ":boom"
         failed(invoke(&ws.engine, req).await);
         assert_eq!(never.load(Ordering::SeqCst), 0, "{addr} {args:?}");
     }
+    Ok(())
+}
+
+/// A third-party driver as a cdylib would ship it: its own parse declares the
+/// entrypoint (no exec underneath), and its run spawns the tool with the SDK's
+/// `foreground` spawn, honouring every `RunOptions` field it is sent. The tool
+/// is `/bin/sh -c SCRIPT sh <args>` — it writes what it saw to
+/// `$HEPH_TEST_OUT`, then exits 42, or with `HEPH_TEST_MODE=wait` traps TERM
+/// (marker, exit 7) and waits for one.
+struct ForegroundTool;
+
+const FOREGROUND_TOOL_SCRIPT: &str = r#"
+{
+  echo "cwd=$(pwd -P)"
+  echo "caller=$HEPH_TEST_CALLER"
+  echo "root=$HEPH_ROOT"
+  for a in "$@"; do echo "arg=[$a]"; done
+} > "$HEPH_TEST_OUT"
+if [ "$HEPH_TEST_MODE" = wait ]; then
+  trap 'echo got-term > "$HEPH_TEST_OUT.term"; exit 7' TERM
+  : > "$HEPH_TEST_OUT.ready"
+  while :; do sleep 0.05; done
+fi
+exit 42
+"#;
+
+#[async_trait::async_trait]
+impl heph::engine::driver_managed::ManagedDriver for ForegroundTool {
+    fn config(
+        &self,
+        _req: hplugin::driver::ConfigRequest,
+    ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+        Ok(hplugin::driver::ConfigResponse {
+            name: "fgtool".to_string(),
+        })
+    }
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        hplugin::driver::DriverSchema::default()
+    }
+    async fn parse(
+        &self,
+        req: hplugin::driver::ParseRequest,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+        Ok(hplugin::driver::ParseResponse {
+            target_def: hplugin::driver::targetdef::TargetDef {
+                addr: req.target_spec.addr.clone(),
+                entrypoint: Some(hplugin::driver::targetdef::Entrypoint::new(
+                    true,
+                    hplugin::driver::targetdef::Workdir::Caller,
+                )),
+                hash: b"fgtool".to_vec(),
+                ..Default::default()
+            },
+        })
+    }
+    async fn apply_transitive(
+        &self,
+        req: hplugin::driver::ApplyTransitiveRequest,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+        Ok(hplugin::driver::ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+    async fn run<'a, 'io>(
+        &self,
+        req: heph::engine::driver_managed::ManagedRunRequest<'a, 'io>,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<heph::engine::driver_managed::ManagedRunResponse> {
+        use hplugin_sdk::foreground::{PathPolicy, RunnerRef, spawn_foreground};
+        let options = req.request.options;
+        let hplugin::driver::RunStdio::Inherit(fg) = options.stdio else {
+            anyhow::bail!("an entrypoint run is in the caller's terminal");
+        };
+        let mut args: Vec<OsString> = vec!["-c".into(), FOREGROUND_TOOL_SCRIPT.into(), "sh".into()];
+        args.extend(options.args.unwrap_or_default());
+        let cmd = hplugin_sdk::foreground::ForegroundCommand::new(
+            "/bin/sh",
+            args,
+            options.base_env.unwrap_or_default(),
+            options.cwd.unwrap_or(req.sandbox_pkg_dir),
+        )
+        .with_dispositions(fg.dispositions);
+        let (child, _) =
+            spawn_foreground(RunnerRef::local(), cmd, &PathPolicy::default(), ctoken).await?;
+        let exit = child
+            .context("spawn the tool")?
+            .wait(fg.signals, ctoken)
+            .await
+            .context("wait for the tool")?;
+        if exit == Exit::Code(0) {
+            return Ok(heph::engine::driver_managed::ManagedRunResponse { artifacts: vec![] });
+        }
+        Err(hplugin::error::ProcessFailed {
+            status: format!("{exit:?}"),
+            log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
+            exit: Some(exit),
+        }
+        .into())
+    }
+}
+
+/// `cdylib_entrypoint_runs`, across the stable-ABI seam in-process: a guest
+/// driver behind the SDK (host capability bit set by `CreateConfig`, as the
+/// loader does) declares an entrypoint and spawns its tool through
+/// `hplugin_sdk::foreground`, and the real `Engine::invoke` drives it. The tool
+/// runs in the caller's cwd with the caller's env plus `HEPH_ROOT` and the args
+/// byte for byte; its exit code is the outcome; and a SIGTERM pushed into the
+/// request's signal channel crosses the `RunInFrame.signal` relay, reaches the
+/// tool's trap, and its chosen exit code comes back (E19, R5, N8).
+///
+/// What this does not cover, against a real `dlopen` of a cdylib: the symbol
+/// and stabby type-report checks (`heph_plugin_abi_semver`, `get_stabbied`),
+/// the plugin's own copies of the SDK's statics and of `tracing`/the
+/// supervisor sink (here they are the test binary's, shared with the host), and
+/// the cdylib runtime being a separate library instance. None of those carries
+/// anything entrypoint-specific: the options, the signal stream and the exit
+/// all ride the run's protobuf frames, which this exercises. A tty cannot be
+/// asserted in-process — the tool inherits the test runner's fds; the terminal
+/// is `crates/bin-e2e`'s (`entrypoint_pty`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cdylib_entrypoint_runs() -> anyhow::Result<()> {
+    let ws = WorkspaceBuilder::new()?
+        .with_provider(|init| {
+            Box::new(pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                Arc::clone(&init.functions),
+            ))
+        })
+        .with_plugin("fgtool", |init| {
+            behind_the_seam(&init.root, "fgtool", ForegroundTool)
+        })
+        .build()?;
+    ws.write_build_file("app", r#"target(name = "tool", driver = "fgtool")"#);
+    // `HEPH_ROOT` is the engine's root as configured, not canonicalized.
+    let root = ws.dir.path();
+    let caller = tempfile::tempdir()?;
+    let cwd = caller.path().canonicalize()?;
+
+    // Ran to completion: what it saw, and its exit code.
+    let out = cwd.join("out");
+    let exit = exited(
+        invoke(
+            &ws.engine,
+            request("//app:tool", &cwd, &["a b", "c"], &out)?,
+        )
+        .await,
+    );
+    assert_eq!(exit, Exit::Code(42), "the tool's exit code is the outcome");
+    assert_eq!(
+        read(&out)?,
+        format!(
+            "cwd={}\ncaller=from-caller\nroot={}\narg=[a b]\narg=[c]\n",
+            cwd.display(),
+            root.display()
+        ),
+    );
+    assert!(
+        invoke_sandboxes(&ws.engine, "app", "tool").is_empty(),
+        "the sandbox is gone"
+    );
+
+    // A signal to heph, relayed: the tool's TERM trap answers with exit 7.
+    let out = cwd.join("waits");
+    let mut env = caller_env(&out);
+    env.push(("HEPH_TEST_MODE".into(), "wait".into()));
+    let (tx, rx) = hplugin::driver::signal_channel();
+    let req = InvokeRequest::new(parse_addr("//app:tool")?, &cwd, env).with_signals(rx);
+    let engine = Arc::clone(&ws.engine);
+    let run = tokio::spawn(async move { invoke(&engine, req).await });
+    let ready = cwd.join("waits.ready");
+    wait_for("the tool to set its trap", || ready.exists()).await?;
+    // SIGTERM is 15 on every supported target.
+    tx.send(hplugin::driver::Signal::from_raw(15))
+        .context("the relay is open while the tool runs")?;
+    let outcome = tokio::time::timeout(Duration::from_secs(120), run)
+        .await
+        .context("the tool exits once TERM reaches it")??;
+    assert_eq!(exited(outcome), Exit::Code(7), "the trap's exit code");
+    assert_eq!(read(&cwd.join("waits.term"))?, "got-term\n");
     Ok(())
 }
