@@ -194,6 +194,69 @@ message ManagedRunRequest {
   repeated ScratchMount scratch = 11;
   repeated CredentialMount credentials = 12;
   map<string, string> deferred = 13;
+  // The run's caller-side options (since 0.17.1). Absent is the default: a
+  // build's sandboxed, captured run. The host sends it only for a def that
+  // declared an entrypoint, so a plugin that predates it never receives one.
+  RunOptions options = 14;
+}
+
+// Mirrors driver::RunOptions. Every field is absent unless set, and absence is
+// the default; `base_env` and `args` are wrapper messages so "unset" stays apart
+// from "set, empty". Paths, env and args are bytes: a non-UTF-8 value crosses
+// as the OS bytes it is.
+message RunOptions {
+  bytes cwd = 1;
+  EnvList base_env = 2;
+  ArgList args = 3;
+  // Absent is CAPTURED.
+  RunStdio stdio = 4;
+  // Only with stdio = INHERIT: the dispositions the child execs with.
+  repeated SignalDispositionEntry dispositions = 5;
+}
+
+message EnvList {
+  repeated EnvVar vars = 1;
+}
+
+// `key` is required; an absent `value` is empty.
+message EnvVar {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message ArgList {
+  repeated bytes args = 1;
+}
+
+enum RunStdio {
+  RUN_STDIO_UNSPECIFIED = 0;
+  RUN_STDIO_CAPTURED = 1;
+  // The child inherits the process's fds 0-2 and terminal. Signals the host
+  // relays arrive as RunInFrame.signal.
+  RUN_STDIO_INHERIT = 2;
+}
+
+enum SignalDisposition {
+  SIGNAL_DISPOSITION_UNSPECIFIED = 0;
+  SIGNAL_DISPOSITION_DEFAULT = 1;
+  SIGNAL_DISPOSITION_IGNORE = 2;
+}
+
+// `signo` and `disposition` are required. `signo` is an OS-local signal
+// number, meaningful only to the host and plugin sharing this process; it is
+// never persisted.
+message SignalDispositionEntry {
+  int32 signo = 1;
+  SignalDisposition disposition = 2;
+}
+
+// How a run's process ended. Mirrors hcore::process::Exit. `signal` is an
+// OS-local signal number, never persisted.
+message ExitStatus {
+  oneof status {
+    int32 code = 1;
+    int32 signal = 2;
+  }
 }
 
 message ManagedRunResponse {
@@ -208,11 +271,21 @@ message ManagedRunResponse {
 // rides one StreamItem (its `item` is an encoded RunInFrame / RunOutFrame). The
 // stdio variants are reserved — unused until live streaming is wired — so adding
 // them is an additive, wire-only change (no ABI break).
+//
+// Lifetime of the request stream (since 0.17.1): the host keeps it open until it
+// has read the run's terminal frame, and only then ends it. The plugin never
+// waits for the request stream to end before sending its terminal frame. A
+// plugin on an older host sees the stream end right after `start`, which means
+// "no signals will come", never a cancel.
 message RunInFrame {
   oneof msg {
     ManagedRunRequest start = 1; // first item: the run request
     bytes stdin_chunk = 2;       // live stdin bytes
     bool stdin_close = 3;        // stdin EOF (value ignored)
+    // A signal the host relays to the run's process (since 0.17.1). Sent only
+    // to a run with RunOptions.stdio = INHERIT. An OS-local signal number,
+    // meaningful only within this process; never persisted.
+    int32 signal = 4;
   }
 }
 message RunOutFrame {
@@ -222,4 +295,8 @@ message RunOutFrame {
     ManagedRunResponse response = 3; // terminal: artifacts
     string error = 4;                // terminal: failure message
   }
+  // Only beside `error` (since 0.17.1): the structured status of the process
+  // whose exit is the failure. Outside the oneof so that `error` stays the one
+  // terminal failure frame, and an older host still reads the message.
+  ExitStatus exit = 5;
 }

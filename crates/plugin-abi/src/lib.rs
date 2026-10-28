@@ -32,6 +32,19 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
+/// 0.17.1 (additive, a patch): entrypoints. `TargetDef.entrypoint` (11) — a
+/// driver declares a target invoked rather than built; `ManagedRunRequest.options`
+/// (14) — the run's caller-side cwd, base env, args and stdio, sent only for a
+/// def that declared one; `RunInFrame.signal` (4) — signals the host relays,
+/// which makes the request stream live until the run's terminal frame;
+/// `RunOutFrame.exit` (5), outside the oneof — the structured status beside an
+/// `error`; and `CreateConfig.host_capabilities` (5), whose `entrypoints` bit
+/// tells a plugin the host honours the attribute. Every field is absent from and
+/// ignored by a 0.17.0 peer: an old plugin never declares one so is never sent
+/// options, and a new plugin on an old host sees no capability bit and refuses
+/// to declare one. No plugin must be rebuilt; the SDK's Rust source does change
+/// (`RunRequest` is `#[non_exhaustive]`, built with `RunRequest::new`).
+///
 /// 0.17.0: the wire stays protobuf — same messages, same field numbers and
 /// types — but the protos are edition 2024 with explicit presence on every
 /// singular field, and the codegen is buffa instead of prost. A field the
@@ -194,7 +207,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.17.0";
+pub const ABI_SEMVER: &str = "0.17.1";
 
 /// The start of the ABI lane this host loads: a plugin is accepted iff its
 /// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
@@ -211,7 +224,7 @@ pub const MIN_PLUGIN_ABI: &str = "0.17.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
-pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.17.0";
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.17.1";
 
 /// Decode a wire message from a trusted peer.
 ///

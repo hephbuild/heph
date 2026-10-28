@@ -1346,6 +1346,9 @@ fn pull_run_start(req: &DynItemStream) -> Result<(String, pb::ManagedRunRequest)
         Some(pb::run_in_frame::Msg::StdinClose(_)) => {
             anyhow::bail!("run: the first frame is a stdin close, not a start frame")
         }
+        Some(pb::run_in_frame::Msg::Signal(signo)) => {
+            anyhow::bail!("run: the first frame is a signal ({signo}), not a start frame")
+        }
         None => anyhow::bail!("run: the first frame is empty, not a start frame"),
     }
 }
