@@ -62,15 +62,14 @@ struct EntrypointEnv {
     env: BTreeMap<String, Deferred<String>>,
 }
 
+type DeferredEnv = HashMap<String, Deferred<String>>;
+
 /// Split an entrypoint's config into everything but `env`, for exec's spec
 /// parse, and `env` parsed as deferrable values, kept as their raw text (the
 /// def is a pure function of the spec; the hook resolves at prepare).
 pub(crate) fn split_env(
     config: &HashMap<String, hcore::htvalue::Value>,
-) -> anyhow::Result<(
-    HashMap<String, hcore::htvalue::Value>,
-    HashMap<String, String>,
-)> {
+) -> anyhow::Result<(HashMap<String, hcore::htvalue::Value>, DeferredEnv)> {
     let mut rest = config.clone();
     let Some(env) = rest.remove("env") else {
         return Ok((rest, HashMap::new()));
@@ -78,7 +77,6 @@ pub(crate) fn split_env(
     let env = EntrypointEnv::from(&HashMap::from([("env".to_string(), env)]))?
         .env
         .into_iter()
-        .map(|(k, v)| (k, v.raw().to_string()))
         .collect();
     Ok((rest, env))
 }
@@ -398,8 +396,7 @@ impl Entrypoint {
         let mut declared_path: Option<OsString> = None;
         for (k, v) in &def.env {
             let v = OsString::from(
-                field_value(req, &Deferred::new(v.as_str()), Some(vars))
-                    .with_context(|| format!("`env.{k}`"))?,
+                field_value(req, v, Some(vars)).with_context(|| format!("`env.{k}`"))?,
             );
             if k == "PATH" {
                 declared_path = Some(v);
@@ -409,7 +406,13 @@ impl Entrypoint {
         }
         // The transitive closure's literals, in exec's order: hashed ones
         // (folded into `pass_env`), then unhashed ones (`runtime_env`).
-        for (k, v) in def.pass_env.iter().chain(&def.runtime_env) {
+        let runtime_env = def.runtime_env.iter().map(|(k, v)| (k, v.raw()));
+        for (k, v) in def
+            .pass_env
+            .iter()
+            .map(|(k, v)| (k, v.as_str()))
+            .chain(runtime_env)
+        {
             let v = OsString::from(expand_closure_vars(v, vars));
             if k == "PATH" {
                 declared_path = Some(v);
