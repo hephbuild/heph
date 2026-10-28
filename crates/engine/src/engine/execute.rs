@@ -326,8 +326,11 @@ impl Engine {
 
         let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<RunResponse>>();
         // Under `Inherit` the process has heph's own fds: there is nothing to
-        // copy, so whatever the wrapper hands in is not passed on.
-        let inherit = matches!(options.stdio, crate::engine::driver::RunStdio::Inherit(_));
+        // copy, so whatever the wrapper hands in is not passed on — except to
+        // a shell, which runs on a PTY of its own and ignores `stdio`: the
+        // streams are how the terminal reaches that PTY.
+        let inherit =
+            !shell && matches!(options.stdio, crate::engine::driver::RunStdio::Inherit(_));
 
         let inner: InteractiveInner = Box::new(enclose!(
             (rs, self => engine, sandbox_dir)

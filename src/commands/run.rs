@@ -293,24 +293,45 @@ impl RunApp {
             .with_handover(crate::engine::driver::Handover::new(|| {
                 hcore::shutdown::hold_transparent().until_exit();
             }));
-        if ctx.interactive() {
-            // Neither the TUI nor the stall notice may draw over the tool.
-            // `Output`, not `Input`: this wraps the whole driver run,
-            // materializing included, and until the handover a Ctrl-C there
-            // must still cancel. From the handover the transparency hold owns
-            // Ctrl-C, for a `--shell` session as much as for a plain tool.
-            // The streams are not handed in: the tool inherits heph's own fds.
-            let pauser = ctx.pauser();
-            let pause: InteractiveWrapper = Arc::new(move |inner| {
-                let pauser = pauser.clone();
-                Box::pin(async move {
-                    let _guard = pauser.pause_for(tui::PauseFor::Output).await;
-                    let _quiet = hengine::engine::diag::global().suppress_stall();
-                    inner(None, None, None).await
-                })
-            });
-            req = req.with_wrapper(pause);
-        }
+        // Neither the TUI nor the stall notice may draw over the tool, with or
+        // without a TUI: nothing progresses while it runs, which is what the
+        // watchdog reads as wedged. `Output`, not `Input`: this wraps the
+        // whole driver run, materializing included, and until the handover a
+        // Ctrl-C there must still cancel. From the handover the transparency
+        // hold owns Ctrl-C, for a `--shell` session as much as for a tool.
+        //
+        // A tool inherits heph's own fds, so no stream is handed in — except
+        // to a `--shell` session, which runs on a PTY of its own and is
+        // relayed to and from the terminal through them.
+        let pauser = ctx.interactive().then(|| ctx.pauser());
+        let shell = self.args.shell.is_some();
+        let pause: InteractiveWrapper = Arc::new(move |inner| {
+            let pauser = pauser.clone();
+            Box::pin(async move {
+                let _guard = match &pauser {
+                    Some(p) => Some(p.pause_for(tui::PauseFor::Output).await),
+                    None => None,
+                };
+                let _quiet = hengine::engine::diag::global().suppress_stall();
+                if !shell {
+                    return inner(None, None, None).await;
+                }
+                // As for a build's `--shell`: `TtyReader`, not tokio's stdin,
+                // whose blocking read could not be cancelled at exit.
+                let mut stdin = tui::tty::TtyReader::from_stdin().ok();
+                let mut stdout = tokio::io::stdout();
+                let mut stderr = tokio::io::stderr();
+                inner(
+                    stdin
+                        .as_mut()
+                        .map(|s| s as &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)),
+                    Some(&mut stdout),
+                    Some(&mut stderr),
+                )
+                .await
+            })
+        });
+        req = req.with_wrapper(pause);
         match self.engine.clone().invoke(rs.clone(), req).await {
             Ok(InvokeOutcome::Exited(exit)) => Ok(Some(exit)),
             Ok(InvokeOutcome::Failed(e)) => {
@@ -323,7 +344,11 @@ impl RunApp {
                     EXIT_HEPH_FAILED
                 };
                 let res: anyhow::Result<()> = Err(e);
-                let error = match crate::commands::errors::finalize!(ctx, rs, res) {
+                // In a block of its own: `finalize!` returns early with `?`,
+                // which would skip the wrapping below.
+                let finalized: anyhow::Result<()> =
+                    async { crate::commands::errors::finalize!(ctx, rs, res) }.await;
+                let error = match finalized {
                     Err(error) => error,
                     // `finalize!` swallows only a `CancelledError`.
                     Ok(()) => anyhow::anyhow!("cancelled"),
