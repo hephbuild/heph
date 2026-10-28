@@ -15,6 +15,8 @@
 pub use hplugin::{driver, eresult, function, hook, provider};
 
 #[cfg(feature = "stabby")]
+mod capabilities;
+#[cfg(feature = "stabby")]
 mod guest;
 #[cfg(feature = "stabby")]
 mod logsink;
@@ -46,11 +48,12 @@ pub mod stabby {
     pub use crate::supervisor::{install_supervisor, supervisor_sink};
 
     /// The cdylib create-entry config, and its decoder from the bytes the host
-    /// hands `heph_plugin_create`. `root`, `home` and `name` are required; the
-    /// `options` map is the plugin's `options:`, which authors read via
-    /// [`hplugin::config::decode_opt`], exactly as in-process plugins do. The
-    /// wire form stays inside the SDK.
-    pub use plugin_abi::convert::{CreateConfig, create_config_from_bytes};
+    /// hands `heph_plugin_create` — which also records the host's capabilities
+    /// for this plugin ([`host_capabilities`]).
+    pub use crate::capabilities::{
+        create_config_from_bytes, host_capabilities, require_entrypoint_support,
+    };
+    pub use plugin_abi::convert::{CreateConfig, HostCapabilities};
 
     /// The ABI version this transport builds against.
     pub use plugin_abi::ABI_SEMVER;
