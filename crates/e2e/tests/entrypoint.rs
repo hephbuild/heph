@@ -28,7 +28,16 @@ use htestkit::WorkspaceBuilder;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+/// A handover hook that counts how often it fired.
+fn handover_counter(count: &Arc<AtomicUsize>) -> hplugin::driver::Handover {
+    let count = Arc::clone(count);
+    hplugin::driver::Handover::new(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+    })
+}
 
 /// The caller's environment every test hands in: a `PATH`, a marker, and the
 /// file the tool writes its observations to.
@@ -421,19 +430,44 @@ target(name = "ep_dep", driver = "exec", entrypoint = True, run = ["true"], deps
     );
     assert!(format!("{err:#}").contains("cannot be an input"), "{err:#}");
 
-    // Selections: a label, a package pattern.
-    for matcher in [
-        heph::htmatcher::Matcher::Label("shim".to_string()),
-        heph::htmatcher::Matcher::PackagePrefix("ep".into()),
+    // Selections: a label, a package pattern. Under keep-going (the CLI's
+    // default) the walk finishes and the refusal names the selection's size
+    // (R18): even a selection of one is not an invocation. Fail-fast stops the
+    // walk at the refusal, so it names no count.
+    for (matcher, size) in [
+        (
+            heph::htmatcher::Matcher::Label("shim".to_string()),
+            "the only target the selection resolved to",
+        ),
+        (
+            heph::htmatcher::Matcher::PackagePrefix("ep".into()),
+            "one of the 3 targets the selection resolved to",
+        ),
     ] {
         let err = match ws.run_matcher(&matcher).await {
             Err(e) => e,
             Ok(_) => panic!("a selection built an entrypoint"),
         };
-        assert!(
-            format!("{err:#}").contains("//ep:tool is an entrypoint"),
-            "{err:#}"
-        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("//ep:tool is an entrypoint"), "{msg}");
+        assert!(!msg.contains("selection resolved to"), "fail-fast: {msg}");
+
+        let batch = Arc::clone(&ws.engine)
+            .result(
+                ws.engine.new_state_with_fail_fast(false),
+                &matcher,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        let refused: Vec<String> = batch
+            .errors
+            .iter()
+            .map(|(_, e)| format!("{e:#}"))
+            .filter(|m| m.contains("//ep:tool is an entrypoint"))
+            .collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains(size), "{}", refused[0]);
     }
     // A direct build — `heph run` of it as a build, `inspect outputs`,
     // `inspect hashout`, all `result_addr` on it — hits the execute backstop.
@@ -563,6 +597,8 @@ struct SeenOptions {
     args: Option<Vec<OsString>>,
     inherit: bool,
     sandbox_dir: PathBuf,
+    /// The handover was still unfired when the run reached the driver.
+    handover_pending: bool,
 }
 
 /// A plain driver whose def is an entrypoint that says "cache me" — the shape
@@ -630,6 +666,10 @@ impl hplugin::driver::Driver for RecordingEntrypoint {
             args: o.args.clone(),
             inherit: matches!(o.stdio, hplugin::driver::RunStdio::Inherit(_)),
             sandbox_dir: req.sandbox_dir.clone(),
+            handover_pending: matches!(
+                &o.stdio,
+                hplugin::driver::RunStdio::Inherit(fg) if fg.handover.is_some()
+            ),
         });
         anyhow::ensure!(req.sandbox_dir.is_dir(), "the sandbox exists for the run");
         Ok(hplugin::driver::RunResponse {
@@ -654,6 +694,7 @@ impl hplugin::driver::Driver for RecordingEntrypoint {
 /// none, the caller's terminal (N8, N9, R17).
 #[tokio::test]
 async fn entrypoint_runs_through_driver_run_with_options() -> anyhow::Result<()> {
+    let handovers = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(std::sync::Mutex::new(None));
     let driver_seen = Arc::clone(&seen);
     let ws = WorkspaceBuilder::new()?
@@ -687,11 +728,13 @@ async fn entrypoint_runs_through_driver_run_with_options() -> anyhow::Result<()>
     let exit = exited(
         invoke(
             &ws.engine,
-            request("//app:ep", elsewhere.path(), &[], &out)?,
+            request("//app:ep", elsewhere.path(), &[], &out)?
+                .with_handover(handover_counter(&handovers)),
         )
         .await,
     );
     assert_eq!(exit, Exit::Code(0));
+    assert_eq!(handovers.load(Ordering::SeqCst), 1, "handed over once");
     let seen = seen
         .lock()
         .expect("seen")
@@ -721,6 +764,10 @@ async fn entrypoint_runs_through_driver_run_with_options() -> anyhow::Result<()>
         seen.sandbox_dir
     );
     assert!(!seen.sandbox_dir.exists(), "and it is gone");
+    assert!(
+        !seen.handover_pending,
+        "a plain driver spawns from `run`, so the engine fired the handover before it"
+    );
     Ok(())
 }
 
@@ -1358,5 +1405,48 @@ target(name = "noargs", driver = "exec", entrypoint = True, deps = {"b": ":boom"
             .is_some(),
         "refused before the failing dep built: {err:#}"
     );
+    Ok(())
+}
+
+/// The handover — where the CLI stops reading Ctrl-C as "cancel" (R9) —
+/// fires exactly once, after everything heph does first and before the tool
+/// runs: the managed layer fires it for exec once the closure is
+/// materialized. A run that fails before the tool (a refused arg, a failing
+/// dep) never hands over, so Ctrl-C keeps cancelling it.
+#[tokio::test]
+async fn entrypoint_handover_fires_once_before_the_tool() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "dep", driver = "bash", run = "printf d > $OUT", out = "d")
+target(name = "boom", driver = "bash", run = "exit 1", out = "x")
+target(name = "check", driver = "exec", entrypoint = True, deps = {"d": ":dep"},
+       run = ["/bin/sh", "-c", "test -f \"$HEPH_TEST_OUT\""])
+target(name = "broken", driver = "exec", entrypoint = True, deps = {"b": ":boom"},
+       run = ["/bin/true"])
+"#,
+    );
+    let cwd = ws.dir.path().to_path_buf();
+    let marker = ws.dir.path().join("handed-over");
+    let handovers = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&handovers);
+    let marked = marker.clone();
+    // The tool exits 0 only if the handover already ran when it started.
+    let req = request("//app:check", &cwd, &[], &marker)?.with_handover(
+        hplugin::driver::Handover::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            drop(std::fs::write(&marked, b""));
+        }),
+    );
+    assert_eq!(exited(invoke(&ws.engine, req).await), Exit::Code(0));
+    assert_eq!(handovers.load(Ordering::SeqCst), 1);
+
+    for (addr, args) in [("//app:check", &["x"][..]), ("//app:broken", &[][..])] {
+        let never = Arc::new(AtomicUsize::new(0));
+        let req = request(addr, &cwd, args, &marker)?.with_handover(handover_counter(&never));
+        failed(invoke(&ws.engine, req).await);
+        assert_eq!(never.load(Ordering::SeqCst), 0, "{addr} {args:?}");
+    }
     Ok(())
 }

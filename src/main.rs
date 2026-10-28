@@ -41,6 +41,13 @@ fn main() -> ExitCode {
         heph::process_supervisor::run_supervisor_main(fd);
     }
 
+    // What the caller gave this process — signal dispositions and the
+    // open-file limit — before anything below changes them (the TTOU/TTIN
+    // ignore, the INT/QUIT/USR handlers, the raised limit). An entrypoint gets
+    // them back (N4, R8). The self-upgrade restores them before its `execv`,
+    // so the pinned binary records the caller's too.
+    hcore::process::record_inherited();
+
     // The two exec-runner subcommands, dispatched here for the same reason:
     // they must not pull in logging, a runtime, clap or the TUI. Unlike
     // `__supervisor` these are a pure prefix strip — `__runner-exec`'s argv IS
@@ -205,14 +212,25 @@ fn main() -> ExitCode {
     let result = match &exec_result {
         Ok(_) => ExitCode::SUCCESS,
         Err(_) if tool_exit.is_some() => match tool_exit {
-            // TODO(entrypoint-L4): 125 for a heph-side failure after
-            // resolution (`InvokeOutcome::Failed`), with its box.
+            // A wait status carries 0–255, so the conversion never falls back.
             Some(hcore::process::Exit::Code(code)) => {
                 ExitCode::from(u8::try_from(code).unwrap_or(1))
             }
             // Re-raised below, once everything else on the way out has run.
             _ => ExitCode::FAILURE,
         },
+        // heph's own failure after the target resolved to an entrypoint (or
+        // a Ctrl-C before its tool started): its box, and 125 (or 130), so it
+        // is never read as the tool's status (R4).
+        Err(e) if e.downcast_ref::<commands::run::InvokeFailed>().is_some() => {
+            let failed = e.downcast_ref::<commands::run::InvokeFailed>();
+            if let Some(f) = failed
+                && !heph::commands::errors::render_anyhow(&f.error)
+            {
+                error!(error = %format!("{:#}", f.error), "Failed");
+            }
+            ExitCode::from(failed.map_or(1, |f| f.code))
+        }
         Err(e) => {
             // Render a graphical diagnostic if the error chain carries one
             // (Starlark/Go diagnostics from single-error commands). The TUI is

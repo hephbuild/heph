@@ -2073,6 +2073,9 @@ impl Engine {
         let mut cancelled = rs.ctoken().cancelled();
         // Whether the loop ended because the walk did, rather than by breaking.
         let mut walk_finished = false;
+        // How many matched addrs were admitted: the selection's size once the
+        // walk finished, which an entrypoint's refusal names (R18).
+        let mut admitted = 0usize;
         loop {
             let Some(next) = matched_rx.recv().await else {
                 walk_finished = true;
@@ -2135,6 +2138,7 @@ impl Engine {
             if fatal.is_some() {
                 break;
             }
+            admitted += 1;
             hcore::hmemoizer::join_set_spawn(
                 &mut set,
                 enclose!((self => engine, rs, opts, addr, outputs) async move {
@@ -2206,6 +2210,14 @@ impl Engine {
 
         while let Some(joined) = set.join_next().await {
             Self::classify_joined(joined, fail_fast, &rs, &mut ok, &mut errors, &mut fatal);
+        }
+
+        // Only a finished walk knows the selection's size.
+        if walk_finished {
+            for (_, e) in &mut errors {
+                let taken = std::mem::replace(e, anyhow::anyhow!("taken"));
+                *e = crate::engine::invoke::EntrypointNotBuildable::name_selection(taken, admitted);
+            }
         }
 
         if let Some(e) = fatal {

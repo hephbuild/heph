@@ -125,6 +125,22 @@ pub struct RunArgs {
     /// Arguments for an entrypoint (`entrypoint = True`) that declares `args = True`,
     /// after `--`: appended to its command, verbatim. Everything after `--`
     /// is the program's, flags included (`heph run //t:go -- --version`).
+    ///
+    /// An entrypoint runs in your terminal, in your directory, with your
+    /// environment, and the run ends as the program does. Exit status:
+    /// the program's own code, unchanged (0 included); killed by a signal,
+    /// and the run dies of the same signal; 125 when the run failed before
+    /// the program started (a dependency, a refused argument, the closure,
+    /// credentials, the spawn), with the error shown; 130 when Ctrl-C
+    /// cancelled it before the program started; 1 when the target could not
+    /// be resolved at all. Nothing but the program writes to stdout.
+    ///
+    /// While the program runs, every signal is the program's: Ctrl-C,
+    /// Ctrl-\ and signals sent to the run's own pid reach it once, and the
+    /// run acts on none of them. A program that traps INT and QUIT is
+    /// stopped with `kill -9` on the run's pid; its supervisor then reaps
+    /// the program. `--shell` opens a shell with the same command ready:
+    /// `show` prints what `run` would execute.
     #[arg(last = true, value_name = "ARGS")]
     pub args: Vec<OsString>,
 }
@@ -145,6 +161,70 @@ impl std::fmt::Display for ToolExit {
 }
 
 impl std::error::Error for ToolExit {}
+
+/// heph failed after the target resolved to an entrypoint (R4): a dep build,
+/// a refused arg, materializing the closure, credentials, the spawn itself —
+/// exit 125, with `error`'s box — or the run was cancelled before the tool
+/// ran (Ctrl-C while its deps built) — exit 130. Either way the tool's own
+/// status is not in it, so it can never be mistaken for one.
+#[derive(Debug)]
+pub struct InvokeFailed {
+    pub code: u8,
+    pub error: anyhow::Error,
+}
+
+/// Exit status for a heph-side failure after resolution (R4): outside the
+/// range a tool usually uses for itself, as `env`/`timeout`/`git` use it.
+pub const EXIT_HEPH_FAILED: u8 = 125;
+/// Exit status for a run cancelled (Ctrl-C) before its tool started.
+pub const EXIT_CANCELLED: u8 = 130;
+
+impl std::fmt::Display for InvokeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for InvokeFailed {}
+
+/// The header label, shared with the TUI view so it can change once the run
+/// learns it is invoking an entrypoint rather than building (R20).
+#[derive(Clone)]
+struct SharedLabel(Arc<std::sync::Mutex<String>>);
+
+impl SharedLabel {
+    fn new(label: String) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(label)))
+    }
+
+    fn set(&self, label: String) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = label;
+    }
+
+    fn get(&self) -> String {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// [`tui::BuildHeader`] with a label that can change mid-run.
+struct RunHeader {
+    counts: tui::BuildHeader,
+    label: SharedLabel,
+}
+
+impl tui::ProgressHeader for RunHeader {
+    fn header(&self, core: &tui::BuildState, scope: tui::CountScope) -> Vec<tui::HeaderItem> {
+        self.counts.header(core, scope)
+    }
+
+    fn label(&self) -> String {
+        self.label.get()
+    }
+
+    fn last_render(&self, core: &tui::BuildState, scope: tui::CountScope) -> String {
+        self.counts.last_render(core, scope)
+    }
+}
 
 /// The caller's raw cwd and environment, captured before anything else ran:
 /// what an entrypoint target runs with.
@@ -167,61 +247,96 @@ struct RunApp {
     /// the TUI approval handler (so keypresses resolve them). Unused in non-TUI
     /// mode, which prompts on the terminal instead.
     approval: tui::ApprovalCenter,
+    /// The TUI header's label: "Running …", or "Invoking …" once the target
+    /// turns out to be an entrypoint.
+    label: SharedLabel,
 }
 
 impl RunApp {
     fn progress_label(&self) -> String {
+        format!("Running {}", self.selection())
+    }
+
+    fn selection(&self) -> String {
         match &self.matcher {
-            Matcher::Addr(a) => format!("Running {}", a.format()),
-            other => format!("Running {}", crate::htquery::format(other)),
+            Matcher::Addr(a) => a.format(),
+            other => crate::htquery::format(other),
         }
     }
 }
 
 impl RunApp {
     /// An entrypoint: run it through `Engine::invoke`, the TUI paused for it,
-    /// and hand how it ended out of the app so the binary exits as it did.
+    /// and hand how it ended out of the app so the binary exits as it did
+    /// (R4): the tool's status as is, [`InvokeFailed`] for heph's own failure
+    /// after resolution, and an ordinary error before it.
     ///
-    /// TODO(entrypoint-L4): the signal relay (the binary's listener, handed in
-    /// as `with_signals`), the recorded dispositions, the refcounted
-    /// suppression guard over the run, and exit 125 for
-    /// `InvokeOutcome::Failed`. Until then the channel is closed, no
-    /// disposition is restored, and a heph-side failure renders as any other.
+    /// Signals (R9): the relay's listener forwards every signal heph receives
+    /// into the run, and the driver delivers it to the tool. Until the tool
+    /// is about to be spawned — deps building, the closure materializing —
+    /// Ctrl-C cancels as on any run. From the handover on, heph is
+    /// transparent until it exits: it cancels nothing, prints nothing, and
+    /// its diagnostic signal handlers stand down.
     async fn invoke(
         self,
         ctx: AppContext,
         rs: Arc<crate::engine::request_state::RequestState>,
         addr: crate::htaddr::Addr,
     ) -> anyhow::Result<Option<hcore::process::Exit>> {
+        self.label.set(format!("Invoking {}", addr.format()));
+        let signals = bootstrap::spawn_signal_relay()?;
         let mut req = InvokeRequest::new(addr, self.caller.cwd, self.caller.env)
             .with_args(self.args.args)
-            .with_shell(self.args.shell.is_some());
+            .with_shell(self.args.shell.is_some())
+            .with_signals(signals)
+            .with_dispositions(hcore::process::inherited_dispositions().to_vec())
+            .with_handover(crate::engine::driver::Handover::new(|| {
+                hcore::shutdown::hold_transparent().until_exit();
+            }));
         if ctx.interactive() {
-            // Paused for input, so neither the TUI nor the stall notice draws
-            // over the tool. The streams are not handed in: the tool inherits
-            // heph's own fds.
+            // Neither the TUI nor the stall notice may draw over the tool.
+            // `Output`, not `Input`: this wraps the whole driver run,
+            // materializing included, and until the handover a Ctrl-C there
+            // must still cancel. From the handover the transparency hold owns
+            // Ctrl-C, for a `--shell` session as much as for a plain tool.
+            // The streams are not handed in: the tool inherits heph's own fds.
             let pauser = ctx.pauser();
             let pause: InteractiveWrapper = Arc::new(move |inner| {
                 let pauser = pauser.clone();
                 Box::pin(async move {
-                    let _guard = pauser.pause_for(tui::PauseFor::Input).await;
+                    let _guard = pauser.pause_for(tui::PauseFor::Output).await;
                     let _quiet = hengine::engine::diag::global().suppress_stall();
                     inner(None, None, None).await
                 })
             });
             req = req.with_wrapper(pause);
         }
-        let res = self.engine.clone().invoke(rs.clone(), req).await;
-        let (res, exit) = match res {
-            Ok(InvokeOutcome::Exited(exit)) => (Ok(()), Some(exit)),
-            Ok(InvokeOutcome::Failed(e)) | Err(e) => (Err(e), None),
-            Ok(other) => (
-                Err(anyhow::anyhow!("unknown invocation outcome {other:?}")),
-                None,
-            ),
-        };
-        crate::commands::errors::finalize!(ctx, rs, res)?;
-        Ok(exit)
+        match self.engine.clone().invoke(rs.clone(), req).await {
+            Ok(InvokeOutcome::Exited(exit)) => Ok(Some(exit)),
+            Ok(InvokeOutcome::Failed(e)) => {
+                // A cancellation reaches here as the driver's bare
+                // "cancelled", not a `CancelledError`: the request's token is
+                // what says whether this was Ctrl-C.
+                let code = if rs.ctoken().is_cancelled() {
+                    EXIT_CANCELLED
+                } else {
+                    EXIT_HEPH_FAILED
+                };
+                let res: anyhow::Result<()> = Err(e);
+                let error = match crate::commands::errors::finalize!(ctx, rs, res) {
+                    Err(error) => error,
+                    // `finalize!` swallows only a `CancelledError`.
+                    Ok(()) => anyhow::anyhow!("cancelled"),
+                };
+                Err(InvokeFailed { code, error }.into())
+            }
+            Err(e) => {
+                let res: anyhow::Result<()> = Err(e);
+                crate::commands::errors::finalize!(ctx, rs, res)?;
+                Ok(None)
+            }
+            Ok(other) => Err(anyhow::anyhow!("unknown invocation outcome {other:?}")),
+        }
     }
 }
 
@@ -232,7 +347,12 @@ impl App for RunApp {
     type CiView = tui::CiProgressView;
 
     fn tui_view(&self) -> Self::TuiView {
-        tui::TuiProgressView::new(self.progress_label()).with_approval(self.approval.clone())
+        self.label.set(self.progress_label());
+        tui::TuiProgressView::with_header(Box::new(RunHeader {
+            counts: tui::BuildHeader::new(String::new()),
+            label: self.label.clone(),
+        }))
+        .with_approval(self.approval.clone())
     }
 
     fn ci_view(&self) -> Self::CiView {
@@ -340,7 +460,7 @@ impl App for RunApp {
             anyhow::bail!(
                 "arguments after `--` are taken only by a single entrypoint target \
                  (`entrypoint = True`) that declares `args = True`; {} is not one",
-                self.progress_label().trim_start_matches("Running "),
+                self.selection(),
             );
         }
 
@@ -439,6 +559,45 @@ impl App for RunApp {
     }
 }
 
+/// The two ways tool args end up where heph cannot use them (R18), refused
+/// with what to type instead:
+///
+/// - `--` with no target before it (`heph run -- a b`): with `last = true`
+///   everything after `--` is the tool's, so nothing names a target.
+/// - a target address followed by a bare word (`heph run //t:go build`): the
+///   positional pair is `<LABEL> <PACKAGE_MATCHER>`, and an address is no
+///   label, so the word was meant for the tool. (A bare `--flag` after the
+///   address is clap's to refuse, and its error already says `-- --flag`.)
+fn refuse_misplaced_tool_args(
+    args: &RunArgs,
+    base_pkg: &crate::htpkg::PkgBuf,
+) -> anyhow::Result<()> {
+    if args.expr.is_none() && args.arg1.is_none() && !args.args.is_empty() {
+        anyhow::bail!(
+            "arguments after `--` need a target before it: `heph run //pkg:tool -- {}`",
+            quote_args(&args.args)
+        );
+    }
+    if args.expr.is_none()
+        && let (Some(arg1), Some(arg2)) = (&args.arg1, &args.arg2)
+        && crate::htaddr::parse_addr_with_base(arg1, base_pkg).is_ok()
+    {
+        anyhow::bail!(
+            "`{arg1}` is a target address, so `{arg2}` is not a package matcher; to pass \
+             arguments to an entrypoint, put them after `--`: `heph run {arg1} -- {arg2}`"
+        );
+    }
+    Ok(())
+}
+
+/// Args for a hint, lossily and space-joined: only ever shown, never run.
+fn quote_args(args: &[OsString]) -> String {
+    args.iter()
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
     bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
 }
@@ -452,6 +611,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         env: std::env::vars_os().collect(),
     };
     let base_pkg = get_cwp()?;
+    refuse_misplaced_tool_args(&args, &base_pkg)?;
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = RunApp {
@@ -463,6 +623,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         auto_approve: global.auto_approve,
         scratch_off: global.no_scratch,
         approval: tui::ApprovalCenter::new(),
+        label: SharedLabel::new(String::new()),
     };
     let interactive = tui::should_use_tui(global.no_tui);
 
@@ -573,5 +734,70 @@ mod tests {
             "a bare `--` is fine"
         );
         assert!(parse(&["//t:go"]).args.is_empty());
+    }
+
+    fn misplaced(argv: &[&str]) -> Option<String> {
+        refuse_misplaced_tool_args(&parse(argv), &crate::htpkg::PkgBuf::from("app"))
+            .err()
+            .map(|e| format!("{e:#}"))
+    }
+
+    /// The selection parser rows (R18): what parses, what is refused with a
+    /// hint before anything resolves, and what reaches the run (where the
+    /// selection decides).
+    #[test]
+    fn selection_parser_rows() {
+        // `-e` with args: parses; refused at run time unless the expression is
+        // a single entrypoint address.
+        let args = parse(&["-e", "//app:x", "--", "a"]);
+        assert_eq!(args.expr.as_deref(), Some("//app:x"));
+        assert_eq!(args.args, [OsString::from("a")]);
+        assert_eq!(misplaced(&["-e", "//app:x", "--", "a"]), None);
+
+        // A label and a package with args: parses as the label form; the run
+        // refuses the args, since a selection is never an invocation.
+        let args = parse(&["lint", "//app/...", "--", "a"]);
+        assert_eq!(
+            (args.arg1.as_deref(), args.arg2.as_deref()),
+            (Some("lint"), Some("//app/..."))
+        );
+        assert_eq!(misplaced(&["lint", "//app/...", "--", "a"]), None);
+
+        // `--` with no target before it: everything after is the tool's, so
+        // nothing names a target.
+        let args = parse(&["--", "//app:x", "a"]);
+        assert_eq!(args.arg1, None, "`last = true`: `-- //x` names no target");
+        let msg = misplaced(&["--", "//app:x", "a"]).expect("refused");
+        assert!(msg.contains("need a target before it"), "{msg}");
+        assert!(msg.contains("heph run //pkg:tool -- //app:x a"), "{msg}");
+
+        // A bare word after an address was meant for the tool.
+        let msg = misplaced(&["//app:x", "build"]).expect("refused");
+        assert!(msg.contains("heph run //app:x -- build"), "{msg}");
+        let msg = misplaced(&[":x", "build"]).expect("relative address too");
+        assert!(msg.contains("put them after `--`"), "{msg}");
+
+        // A bare flag after an address is clap's to refuse, and it says how.
+        let err = Cli::try_parse_from(["run", "//app:x", "--verbose-tool"])
+            .err()
+            .expect("an unknown flag");
+        let rendered = err.render().to_string();
+        assert!(rendered.contains("-- --verbose-tool"), "{rendered}");
+    }
+
+    /// Non-UTF-8 args reach the tool byte for byte.
+    #[test]
+    fn non_utf8_args_are_kept() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw = OsString::from_vec(vec![b'a', 0xff, b'b']);
+        let args = Cli::try_parse_from([
+            OsString::from("run"),
+            OsString::from("//app:x"),
+            OsString::from("--"),
+            raw.clone(),
+        ])
+        .expect("parse")
+        .run;
+        assert_eq!(args.args, [raw]);
     }
 }

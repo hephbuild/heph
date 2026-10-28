@@ -321,19 +321,61 @@ fn spawn_sigint_producer(trigger: ShutdownTrigger) {
 /// points already running on a `bootstrap::block_on` runtime.
 fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedReceiver<()>) {
     tokio::spawn(async move {
-        if rx.recv().await.is_none() {
-            return;
+        let mut presses = 0usize;
+        while rx.recv().await.is_some() {
+            // Queued before an entrypoint was handed the terminal, read after:
+            // the press is the tool's now, and heph prints nothing (R9).
+            if hcore::shutdown::is_transparent() {
+                continue;
+            }
+            presses += 1;
+            if presses == 1 {
+                tracing::warn!(
+                    "ctrl-c received, cancelling in-flight work (press ctrl-c again to abort)"
+                );
+                if let Some(e) = engine.upgrade() {
+                    e.cancel_all_requests();
+                }
+            } else {
+                tracing::error!("second ctrl-c, aborting");
+                hard_abort(|code| std::process::exit(code));
+            }
         }
-        tracing::warn!("ctrl-c received, cancelling in-flight work (press ctrl-c again to abort)");
-        if let Some(e) = engine.upgrade() {
-            e.cancel_all_requests();
-        }
-        if rx.recv().await.is_none() {
-            return;
-        }
-        tracing::error!("second ctrl-c, aborting");
-        hard_abort(|code| std::process::exit(code));
     });
+}
+
+/// The relay's listener (E17, R9): every signal in
+/// [`RELAYED_SIGNALS`](hexecrunner::foreground::RELAYED_SIGNALS) that reaches
+/// heph is forwarded, as is and unfiltered, into the returned receiver, which
+/// `Engine::invoke` hands to the driver that spawns an entrypoint. The driver
+/// decides what the terminal already delivered (R2) — only it knows the
+/// tool's pid.
+///
+/// Listening also means heph no longer dies of TERM, HUP, USR1 or USR2 for
+/// the rest of the process: it is transparent while the tool runs and exits
+/// with the tool's status once it ends. A signal that arrives before the
+/// tool exists waits in the channel and is delivered once it does. When the
+/// receiver is gone, each listener stops forwarding.
+///
+/// Must be called from inside the runtime; the handlers are installed before
+/// it returns.
+pub fn spawn_signal_relay() -> anyhow::Result<engine::driver::SignalReceiver> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (tx, rx) = engine::driver::signal_channel();
+    for &signo in &hexecrunner::foreground::RELAYED_SIGNALS {
+        let mut listener = signal(SignalKind::from_raw(signo))
+            .with_context(|| format!("listening for signal {signo} to relay it"))?;
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while listener.recv().await.is_some() {
+                if tx.send(engine::driver::Signal::from_raw(signo)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    Ok(rx)
 }
 
 /// The second-Ctrl-C abort sequence, with the actual exit call taken as a

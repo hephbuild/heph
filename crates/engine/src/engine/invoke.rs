@@ -24,7 +24,7 @@ use crate::engine::Engine;
 use crate::engine::InteractiveWrapper;
 use crate::engine::driver::targetdef::Workdir;
 use crate::engine::driver::{
-    Disposition, Foreground, RunOptions, RunStdio, Signal, SignalReceiver,
+    Disposition, Foreground, Handover, RunOptions, RunStdio, Signal, SignalReceiver,
 };
 use crate::engine::execute::{SandboxLease, SandboxRun};
 use crate::engine::invoke_sandbox::{InvokeSandbox, invoke_parent};
@@ -65,6 +65,9 @@ pub struct InvokeRequest {
     /// Wraps the driver's run, as for a build: the CLI pauses its TUI here.
     /// The streams it hands in are ignored — the tool inherits heph's fds.
     pub wrapper: Option<InteractiveWrapper>,
+    /// Run once the closure is materialized, right before the driver spawns
+    /// the tool: where the CLI stops treating Ctrl-C as "cancel" (R9).
+    pub handover: Option<Handover>,
 }
 
 impl InvokeRequest {
@@ -81,7 +84,13 @@ impl InvokeRequest {
             signals,
             dispositions: Vec::new(),
             wrapper: None,
+            handover: None,
         }
+    }
+
+    pub fn with_handover(mut self, handover: Handover) -> Self {
+        self.handover = Some(handover);
+        self
     }
 
     pub fn with_args(mut self, args: Vec<OsString>) -> Self {
@@ -122,6 +131,7 @@ impl std::fmt::Debug for InvokeRequest {
             .field("shell", &self.shell)
             .field("dispositions", &self.dispositions)
             .field("wrapper", &self.wrapper.is_some())
+            .field("handover", &self.handover.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -183,11 +193,34 @@ impl EntrypointAsInput {
 /// selection, or anything else that would execute it (N2, R14).
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{addr} is an entrypoint (`entrypoint = True`): it is invoked on its own with `heph run {addr}`, never \
-     built, and never as part of a multi-target selection. Select it alone, or select what it runs"
+    "{addr} is an entrypoint (`entrypoint = True`){}: it is invoked on its own with `heph run {addr}`, \
+     never built, and never as part of a multi-target selection. Select it alone, or select what it runs",
+    selection_clause(*.selected)
 )]
 pub struct EntrypointNotBuildable {
     pub addr: Addr,
+    /// How many targets the selection that reached it resolved to, once the
+    /// walk knows (R18); `None` for a direct build of the address.
+    pub selected: Option<usize>,
+}
+
+fn selection_clause(selected: Option<usize>) -> String {
+    match selected {
+        Some(1) => ", the only target the selection resolved to".to_string(),
+        Some(n) => format!(", one of the {n} targets the selection resolved to"),
+        None => String::new(),
+    }
+}
+
+impl EntrypointNotBuildable {
+    /// Name the selection's size on an [`EntrypointNotBuildable`] in `e`'s
+    /// chain, and leave any other error alone.
+    pub(crate) fn name_selection(mut e: anyhow::Error, selected: usize) -> anyhow::Error {
+        if let Some(refused) = e.downcast_mut::<EntrypointNotBuildable>() {
+            refused.selected = Some(selected);
+        }
+        e
+    }
 }
 
 /// Trailing args for an entrypoint that did not declare `args = True` (N5).
@@ -221,7 +254,11 @@ impl Engine {
         addr: &Addr,
     ) -> anyhow::Result<()> {
         if self.is_entrypoint(rs, addr).await? {
-            return Err(EntrypointNotBuildable { addr: addr.clone() }.into());
+            return Err(EntrypointNotBuildable {
+                addr: addr.clone(),
+                selected: None,
+            }
+            .into());
         }
         Ok(())
     }
@@ -394,13 +431,13 @@ impl Engine {
             OsString::from("HEPH_ROOT"),
             self.cfg.root.clone().into_os_string(),
         ));
-        let mut options =
-            RunOptions::default()
-                .with_base_env(base_env)
-                .with_stdio(RunStdio::Inherit(Foreground::new(
-                    req.signals,
-                    req.dispositions,
-                )));
+        let mut foreground = Foreground::new(req.signals, req.dispositions);
+        if let Some(handover) = req.handover {
+            foreground = foreground.with_handover(handover);
+        }
+        let mut options = RunOptions::default()
+            .with_base_env(base_env)
+            .with_stdio(RunStdio::Inherit(foreground));
         if let Some(cwd) = cwd {
             options = options.with_cwd(cwd);
         }
