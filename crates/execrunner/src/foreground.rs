@@ -89,30 +89,14 @@ impl ForegroundCommand {
 const RESET_TO_DEFAULT: [libc::c_int; 4] =
     [libc::SIGINT, libc::SIGQUIT, libc::SIGTTOU, libc::SIGTTIN];
 
-/// The soft `RLIMIT_NOFILE` heph inherited, before it raised its own.
-static INHERITED_NOFILE: std::sync::OnceLock<libc::rlim_t> = std::sync::OnceLock::new();
-
-/// Record the open-file soft limit heph was started with, so a foreground child
-/// gets it back rather than heph's raised one (R8). Call once at the top of
-/// `main`, before anything raises it; later calls are no-ops. A cdylib never
-/// calls it, and its foreground children keep the process's current limit.
-pub fn record_inherited_nofile() {
-    let mut lim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: a valid resource and a pointer to a live `rlimit`.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
-        // A second call keeps the first record: it is the one taken before
-        // anything changed the limit.
-        let _first_wins = INHERITED_NOFILE.set(lim.rlim_cur);
-    }
-}
-
 /// The `rlimit` to set in the child, computed in the parent so `pre_exec` only
-/// makes the syscall. `None` when nothing was recorded or nothing would change.
+/// makes the syscall: the soft limit heph inherited
+/// ([`hcore::process::record_inherited`], at the top of `main`) rather than
+/// the one it raised (R8). `None` when nothing was recorded — a cdylib's own
+/// copy of the record is never set, so its foreground children keep the
+/// process's current limit — or when nothing would change.
 fn nofile_to_restore() -> Option<libc::rlimit> {
-    let recorded = *INHERITED_NOFILE.get()?;
+    let recorded = hcore::process::inherited_nofile()?;
     let mut now = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -140,7 +124,7 @@ fn nofile_to_restore() -> Option<libc::rlimit> {
 /// does not `setsid`, and stays in heph's process group. In the child, before
 /// exec, it resets [`RESET_TO_DEFAULT`] to `SIG_DFL`, applies `cmd`'s
 /// dispositions, and restores the recorded `RLIMIT_NOFILE` soft limit
-/// ([`record_inherited_nofile`]). The pid is tracked with the process
+/// ([`hcore::process::record_inherited`]). The pid is tracked with the process
 /// supervisor (by pid, not pgid: the child leads no group), so a SIGKILLed heph
 /// does not orphan it.
 pub async fn spawn_foreground(
