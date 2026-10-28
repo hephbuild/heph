@@ -32,12 +32,6 @@ use std::path::{Path, PathBuf};
 
 pub use hcore::process::{Disposition, Exit, Signal};
 
-/// How the program ended: the driver contract's [`Exit`], which this enum was
-/// merged into (R6).
-// TODO(entrypoint-L3): drop the alias with the binary's spawn, which is its
-// last user; the driver-run path names `hcore::process::Exit` directly.
-pub use hcore::process::Exit as ForegroundExit;
-
 /// The receiving end of a run's signal relay: the same type as the driver
 /// contract's `SignalReceiver`. A closed channel means "no more signals",
 /// never a cancel.
@@ -478,86 +472,6 @@ pub fn should_relay(sig: Signal, ctx: &RelayContext) -> bool {
     let terminal_delivered =
         ctx.terminal_pgrp == Some(ctx.own_pgrp) && ctx.tool_pgrp == Some(ctx.own_pgrp);
     !terminal_delivered
-}
-
-/// `sigaction` dispositions saved on construction and restored on drop.
-struct IgnoredSignals {
-    saved: Vec<(libc::c_int, libc::sigaction)>,
-}
-
-impl IgnoredSignals {
-    fn ignore(signals: &[libc::c_int]) -> std::io::Result<Self> {
-        let mut saved = Vec::with_capacity(signals.len());
-        for &sig in signals {
-            // SAFETY: zeroed `sigaction` is a valid "no flags, empty mask"
-            // value, filled in below before use.
-            let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
-            ignore.sa_sigaction = libc::SIG_IGN;
-            // SAFETY: as above; `old` is written by `sigaction`.
-            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-            // SAFETY: both pointers are to live, properly aligned values.
-            if unsafe { libc::sigaction(sig, &ignore, &mut old) } != 0 {
-                let err = std::io::Error::last_os_error();
-                drop(Self { saved });
-                return Err(err);
-            }
-            saved.push((sig, old));
-        }
-        Ok(Self { saved })
-    }
-}
-
-impl Drop for IgnoredSignals {
-    fn drop(&mut self) {
-        for (sig, old) in self.saved.drain(..).rev() {
-            // SAFETY: `old` is the disposition `sigaction` returned for `sig`.
-            unsafe { libc::sigaction(sig, &old, std::ptr::null_mut()) };
-        }
-    }
-}
-
-/// Spawn `argv` with exactly `env` in `cwd`, stdio inherited, and wait for it.
-///
-/// `argv[0]` without a `/` is looked up on the `PATH` in `env`, not heph's.
-/// Blocking: call it off the async runtime's workers.
-// TODO(entrypoint-L3): the binary's spawn, superseded by `spawn_foreground`
-// through the driver's run; remove with it.
-pub fn run_foreground(
-    argv: &[OsString],
-    env: &[(OsString, OsString)],
-    cwd: &Path,
-) -> std::io::Result<ForegroundExit> {
-    use std::os::unix::process::CommandExt as _;
-
-    let Some((program, args)) = argv.split_first() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "empty argv",
-        ));
-    };
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args)
-        .env_clear()
-        .envs(env.iter().map(|(k, v)| (k, v)))
-        .current_dir(cwd);
-    let restore_defaults = || {
-        for sig in RESET_TO_DEFAULT {
-            // SAFETY: `signal(2)` is async-signal-safe, as the code between
-            // fork and exec must be.
-            unsafe { libc::signal(sig, libc::SIG_DFL) };
-        }
-        Ok(())
-    };
-    // SAFETY: the closure runs between fork and exec and calls only
-    // async-signal-safe functions; it allocates nothing.
-    unsafe { cmd.pre_exec(restore_defaults) };
-
-    // Before the fork, as `system(3)` does: a Ctrl-C between the fork and the
-    // wait must not take heph down while its child lives.
-    let _ignored = IgnoredSignals::ignore(&[libc::SIGINT, libc::SIGQUIT])?;
-    let status = cmd.spawn()?.wait()?;
-    // Neither exited nor signalled is a stop, which `wait` does not report.
-    Ok(ForegroundExit::from_std(status).unwrap_or(ForegroundExit::Code(1)))
 }
 
 /// Die of `sig`, as the program did: restore its default disposition, make

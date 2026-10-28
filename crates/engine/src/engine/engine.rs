@@ -1,7 +1,6 @@
 use crate::engine::config::Config;
 use crate::engine::config_yaml::{FuseConfig, Options};
 use crate::engine::driver::Driver as SDKDriver;
-use crate::engine::driver::entrypoint::EntrypointDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use crate::engine::hook::Hook as SDKHook;
 use crate::engine::local_cache::LocalCache;
@@ -75,11 +74,6 @@ pub(crate) fn normalize_skip(entry: &str) -> &str {
 pub enum PluginDriver {
     Plain(Box<dyn SDKDriver>),
     Managed(Box<dyn SDKManagedDriver>),
-    /// A managed driver whose targets may be entrypoints (`entrypoint = True`
-    /// on exec/bash), with the hook that prepares one for `Engine::invoke`.
-    /// Builtin only: a cdylib's parts never carry one, and a def converted
-    /// from the plugin ABI is never an entrypoint.
-    ManagedWithEntrypoint(Box<dyn SDKManagedDriver>, Arc<dyn EntrypointDriver>),
 }
 
 /// Everything one plugin contributes. It carries no name: the engine supplies
@@ -115,17 +109,6 @@ impl PluginParts {
 
     pub fn with_managed_driver(mut self, driver: Box<dyn SDKManagedDriver>) -> Self {
         self.drivers.push(PluginDriver::Managed(driver));
-        self
-    }
-
-    /// A managed driver plus the hook that prepares its entrypoint targets.
-    pub fn with_managed_entrypoint_driver(
-        mut self,
-        driver: Box<dyn SDKManagedDriver>,
-        entrypoint: Arc<dyn EntrypointDriver>,
-    ) -> Self {
-        self.drivers
-            .push(PluginDriver::ManagedWithEntrypoint(driver, entrypoint));
         self
     }
 }
@@ -606,11 +589,6 @@ pub struct Provider {
 pub struct Driver {
     pub name: String,
     pub driver: Box<dyn SDKDriver>,
-    /// The hook that prepares this driver's entrypoint targets for
-    /// [`Engine::invoke`], for a driver that has one. Whether a target *is* an
-    /// entrypoint is its def's [`entrypoint`](crate::engine::driver::targetdef::TargetDef::entrypoint),
-    /// never this.
-    pub entrypoint: Option<Arc<dyn EntrypointDriver>>,
 }
 
 /// Create the home if needed and make it ignore itself: a `<home>/.gitignore`
@@ -1033,12 +1011,9 @@ impl Engine {
 
         let mut resolved: Vec<Arc<Driver>> = Vec::with_capacity(drivers.len());
         for driver in drivers {
-            let (driver, entrypoint): (Box<dyn SDKDriver>, _) = match driver {
-                PluginDriver::Plain(d) => (d, None),
-                PluginDriver::Managed(m) => (Box::new(self.new_managed_driver(m)), None),
-                PluginDriver::ManagedWithEntrypoint(m, e) => {
-                    (Box::new(self.new_managed_driver(m)), Some(e))
-                }
+            let driver: Box<dyn SDKDriver> = match driver {
+                PluginDriver::Plain(d) => d,
+                PluginDriver::Managed(m) => Box::new(self.new_managed_driver(m)),
             };
             let local = driver
                 .config(driver::ConfigRequest {})
@@ -1051,11 +1026,7 @@ impl Engine {
                      plugin its own local name (at most one may omit it)"
                 );
             }
-            resolved.push(Arc::new(Driver {
-                name: full,
-                driver,
-                entrypoint,
-            }));
+            resolved.push(Arc::new(Driver { name: full, driver }));
         }
 
         // Plugin names are unique and a component name always starts with its
@@ -1169,9 +1140,7 @@ impl Engine {
     fn insert_bare_driver(&mut self, driver: PluginDriver) -> anyhow::Result<()> {
         let name = match &driver {
             PluginDriver::Plain(d) => d.config(driver::ConfigRequest {})?.name,
-            PluginDriver::Managed(m) | PluginDriver::ManagedWithEntrypoint(m, _) => {
-                m.config(driver::ConfigRequest {})?.name
-            }
+            PluginDriver::Managed(m) => m.config(driver::ConfigRequest {})?.name,
         };
         let source = format!("register_driver of driver {name:?}");
         let parts = PluginParts {

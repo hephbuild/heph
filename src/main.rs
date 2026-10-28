@@ -205,7 +205,9 @@ fn main() -> ExitCode {
     let result = match &exec_result {
         Ok(_) => ExitCode::SUCCESS,
         Err(_) if tool_exit.is_some() => match tool_exit {
-            Some(hexecrunner::foreground::ForegroundExit::Code(code)) => {
+            // TODO(entrypoint-L4): 125 for a heph-side failure after
+            // resolution (`InvokeOutcome::Failed`), with its box.
+            Some(hcore::process::Exit::Code(code)) => {
                 ExitCode::from(u8::try_from(code).unwrap_or(1))
             }
             // Re-raised below, once everything else on the way out has run.
@@ -247,7 +249,7 @@ fn main() -> ExitCode {
 
     // Die of the signal that killed the program, rather than exit 128+N: a
     // shell treats "killed by SIGINT" and "exited 130" differently.
-    if let Some(hexecrunner::foreground::ForegroundExit::Signal(sig)) = tool_exit {
+    if let Some(hcore::process::Exit::Signal(sig)) = tool_exit {
         hexecrunner::foreground::reraise(sig);
     }
 

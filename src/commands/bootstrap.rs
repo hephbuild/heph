@@ -178,27 +178,17 @@ pub fn register_builtin_factories(
     // depend on the forty utility crates to know it has a directory to put on
     // PATH. Resolved lazily, so a `heph query` never touches the filesystem.
     let (coreutils_exec, coreutils_bash) = (coreutils_shims(home_dir), coreutils_shims(home_dir));
-    // Each with the hook that prepares its `entrypoint = True` targets. The hook
-    // takes none of the plugin's options: the workspace `runner:` default,
-    // `path:` and `coreutils:` are for sandboxed targets, and an entrypoint runs
-    // in the caller's world (D24).
     e.register_plugin_factory("exec", move |_init, opts| {
-        Ok(PluginParts::default().with_managed_entrypoint_driver(
-            Box::new(
-                pluginexec::Driver::from_options_exec(opts)?
-                    .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_exec.clone()),
-            ),
-            Arc::new(pluginexec::entrypoint::Entrypoint::exec()),
-        ))
+        Ok(PluginParts::default().with_managed_driver(Box::new(
+            pluginexec::Driver::from_options_exec(opts)?
+                .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_exec.clone()),
+        )))
     })?;
     e.register_plugin_factory("bash", move |_init, opts| {
-        Ok(PluginParts::default().with_managed_entrypoint_driver(
-            Box::new(
-                pluginexec::Driver::from_options_bash(opts)?
-                    .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_bash.clone()),
-            ),
-            Arc::new(pluginexec::entrypoint::Entrypoint::bash()),
-        ))
+        Ok(PluginParts::default().with_managed_driver(Box::new(
+            pluginexec::Driver::from_options_bash(opts)?
+                .with_coreutils(hcoreutils::COREUTILS_VERSION, coreutils_bash.clone()),
+        )))
     })?;
     Ok(())
 }

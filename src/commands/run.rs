@@ -11,9 +11,8 @@ use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
 use crate::commands::utils::resolve_matcher;
-use crate::engine::driver::entrypoint::{Caller, PreparedCommand};
 use crate::engine::{
-    Discovery, Engine, Gaps, InteractiveWrapper, InvokeRequest, OutputMatcher, PreparedInvocation,
+    Discovery, Engine, Gaps, InteractiveWrapper, InvokeOutcome, InvokeRequest, OutputMatcher,
     ResultOptions, get_cwp,
 };
 use crate::htmatcher::Matcher;
@@ -134,27 +133,30 @@ pub struct RunArgs {
 /// with its code, or by re-raising the signal that killed it. Carried out to
 /// `main` as an error so the exit goes through its usual tail.
 #[derive(Debug)]
-pub struct ToolExit(pub hexecrunner::foreground::ForegroundExit);
+pub struct ToolExit(pub hcore::process::Exit);
 
 impl std::fmt::Display for ToolExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            hexecrunner::foreground::ForegroundExit::Code(c) => write!(f, "exited with {c}"),
-            hexecrunner::foreground::ForegroundExit::Signal(s) => {
-                write!(f, "killed by signal {s}")
-            }
+            hcore::process::Exit::Code(c) => write!(f, "exited with {c}"),
+            hcore::process::Exit::Signal(s) => write!(f, "killed by signal {s}"),
         }
     }
 }
 
 impl std::error::Error for ToolExit {}
 
+/// The caller's raw cwd and environment, captured before anything else ran:
+/// what an entrypoint target runs with.
+struct Caller {
+    cwd: std::path::PathBuf,
+    env: Vec<(OsString, OsString)>,
+}
+
 struct RunApp {
     args: RunArgs,
     engine: Arc<Engine>,
     matcher: Matcher,
-    /// The caller's raw cwd and environment, captured before anything else
-    /// ran: what an entrypoint target runs with.
     caller: Caller,
     fail_fast: bool,
     auto_approve: bool,
@@ -177,40 +179,55 @@ impl RunApp {
 }
 
 impl RunApp {
-    /// An entrypoint: prepare it, and hand the command out of the app so the
-    /// binary spawns it once the TUI is gone.
+    /// An entrypoint: run it through `Engine::invoke`, the TUI paused for it,
+    /// and hand how it ended out of the app so the binary exits as it did.
+    ///
+    /// TODO(entrypoint-L4): the signal relay (the binary's listener, handed in
+    /// as `with_signals`), the recorded dispositions, the refcounted
+    /// suppression guard over the run, and exit 125 for
+    /// `InvokeOutcome::Failed`. Until then the channel is closed, no
+    /// disposition is restored, and a heph-side failure renders as any other.
     async fn invoke(
         self,
         ctx: AppContext,
         rs: Arc<crate::engine::request_state::RequestState>,
         addr: crate::htaddr::Addr,
-    ) -> anyhow::Result<Option<PreparedInvocation>> {
-        let mut caller = self.caller;
-        caller.args = self.args.args;
-        let res = self
-            .engine
-            .clone()
-            .invoke(
-                rs.clone(),
-                InvokeRequest {
-                    addr,
-                    caller,
-                    shell: self.args.shell.is_some(),
-                },
-            )
-            .await;
-        let (res, prepared) = match res {
-            Ok(p) => (Ok(()), Some(p)),
-            Err(e) => (Err(e), None),
+    ) -> anyhow::Result<Option<hcore::process::Exit>> {
+        let mut req = InvokeRequest::new(addr, self.caller.cwd, self.caller.env)
+            .with_args(self.args.args)
+            .with_shell(self.args.shell.is_some());
+        if ctx.interactive() {
+            // Paused for input, so neither the TUI nor the stall notice draws
+            // over the tool. The streams are not handed in: the tool inherits
+            // heph's own fds.
+            let pauser = ctx.pauser();
+            let pause: InteractiveWrapper = Arc::new(move |inner| {
+                let pauser = pauser.clone();
+                Box::pin(async move {
+                    let _guard = pauser.pause_for(tui::PauseFor::Input).await;
+                    let _quiet = hengine::engine::diag::global().suppress_stall();
+                    inner(None, None, None).await
+                })
+            });
+            req = req.with_wrapper(pause);
+        }
+        let res = self.engine.clone().invoke(rs.clone(), req).await;
+        let (res, exit) = match res {
+            Ok(InvokeOutcome::Exited(exit)) => (Ok(()), Some(exit)),
+            Ok(InvokeOutcome::Failed(e)) | Err(e) => (Err(e), None),
+            Ok(other) => (
+                Err(anyhow::anyhow!("unknown invocation outcome {other:?}")),
+                None,
+            ),
         };
         crate::commands::errors::finalize!(ctx, rs, res)?;
-        Ok(prepared)
+        Ok(exit)
     }
 }
 
 #[async_trait]
 impl App for RunApp {
-    type Output = Option<PreparedInvocation>;
+    type Output = Option<hcore::process::Exit>;
     type TuiView = tui::TuiProgressView;
     type CiView = tui::CiProgressView;
 
@@ -222,7 +239,7 @@ impl App for RunApp {
         tui::CiProgressView::new(self.progress_label())
     }
 
-    async fn run(self, ctx: AppContext) -> anyhow::Result<Option<PreparedInvocation>> {
+    async fn run(self, ctx: AppContext) -> anyhow::Result<Option<hcore::process::Exit>> {
         let interactive: Option<InteractiveWrapper> = if ctx.interactive() {
             let pauser = ctx.pauser();
             // Who owns Ctrl-C while the target holds the terminal. `--shell` puts
@@ -433,7 +450,6 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     let caller = Caller {
         cwd: std::env::current_dir().context("read the current directory")?,
         env: std::env::vars_os().collect(),
-        args: Vec::new(),
     };
     let base_pkg = get_cwp()?;
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
@@ -516,28 +532,11 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     // await any hook's final out-of-process flush before returning so a process
     // exit never races it.
     engine.await_hooks().await;
+    // An entrypoint's tool ended: heph exits as it did, now that the TUI has
+    // torn down.
     match result? {
-        None => Ok(()),
-        Some(prepared) => run_prepared(prepared).await,
-    }
-}
-
-/// Run an entrypoint's prepared command in the foreground, now that the TUI
-/// has torn down, and exit as it did. The holds on its closure are released
-/// only once it has exited.
-async fn run_prepared(prepared: PreparedInvocation) -> anyhow::Result<()> {
-    let PreparedCommand { argv, env, cwd } = prepared.command.clone();
-    let program = argv.first().cloned().unwrap_or_default();
-    let started_in = cwd.clone();
-    let exit = tokio::task::spawn_blocking(move || {
-        hexecrunner::foreground::run_foreground(&argv, &env, &cwd)
-    })
-    .await
-    .context("the foreground wait panicked")?;
-    drop(prepared);
-    match exit.with_context(|| format!("start {program:?} in {}", started_in.display()))? {
-        hexecrunner::foreground::ForegroundExit::Code(0) => Ok(()),
-        other => Err(ToolExit(other).into()),
+        None | Some(hcore::process::Exit::Code(0)) => Ok(()),
+        Some(exit) => Err(ToolExit(exit).into()),
     }
 }
 

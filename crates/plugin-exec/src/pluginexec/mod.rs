@@ -1,4 +1,3 @@
-pub mod entrypoint;
 mod entrypoint_mode;
 mod filterenv;
 mod pty;
