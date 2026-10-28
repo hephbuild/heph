@@ -670,40 +670,12 @@ fn echo_marker_prints_the_marker_without_typing_it() {
     );
 }
 
-/// [`SET_PROMPT`]'s contract, in both directions — the same two halves as
-/// `echo_marker_prints_the_marker_without_typing_it`, for the line `ready`
-/// syncs on.
-///
-/// The first half is the regression guard. When the typed line contained the
-/// prompt, `ready` returned on the terminal's echo of it, and a Ctrl-D sent
-/// next could reach bash before readline had taken its terminal out of
-/// canonical mode; on Linux that EOF is then read back as a NUL byte and bash
-/// never exits (see `ready`). Nothing about that is deterministic in a pty
-/// run — it failed ~1% of the time, Linux only — but the precondition is, and
-/// this pins it.
-/// Every directory named like an entrypoint shell's init dir under `root`.
+/// The invocation sandboxes of `//pkg:tool` under the workspace's home: the
+/// one a running `--shell` session's `init.sh` lives in.
 fn entrypoint_shell_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if !p.is_dir() || p.is_symlink() {
-                continue;
-            }
-            if e.file_name()
-                .to_string_lossy()
-                .starts_with("entrypoint-shell-")
-            {
-                found.push(p.clone());
-            }
-            stack.push(p);
-        }
-    }
-    found
+    std::fs::read_dir(root.join(".heph/sandbox/pkg/__invoke/tool"))
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
 }
 
 /// `heph run --shell` on an entrypoint (D13): an interactive bash in
@@ -732,7 +704,7 @@ fn entrypoint_shell_pty() {
     assert_eq!(
         entrypoint_shell_dirs(ws.root()).len(),
         1,
-        "the init file lives under heph's home while the shell runs"
+        "the init file lives in the invocation's sandbox while the shell runs"
     );
 
     // `run` with no args: the program's argv plus the caller's.
@@ -743,6 +715,12 @@ fn entrypoint_shell_pty() {
     // `run x`: its own args, not the originals. The line ends right after it.
     session.send_str("run override\n");
     session.wait_for("<override>\r\n", Duration::from_secs(10));
+    session.wait_for(PROMPT, Duration::from_secs(10));
+
+    // `show`: what `run` would execute, args shell-quoted — "what will it
+    // run" (R20). The typed `'q r'` is not the printed `q\ r`.
+    session.send_str("show 'q r'\n");
+    session.wait_for(r"q\ r", Duration::from_secs(10));
     session.wait_for(PROMPT, Duration::from_secs(10));
 
     // Ctrl-C at the prompt reaches the shell, not heph.
@@ -784,10 +762,21 @@ fn entrypoint_shell_pty() {
     assert!(!screen.screen().hide_cursor(), "left the cursor hidden");
     assert!(
         entrypoint_shell_dirs(ws.root()).is_empty(),
-        "the init file outlived the shell"
+        "the invocation's sandbox (and its init file) outlived the shell"
     );
 }
 
+/// [`SET_PROMPT`]'s contract, in both directions — the same two halves as
+/// `echo_marker_prints_the_marker_without_typing_it`, for the line `ready`
+/// syncs on.
+///
+/// The first half is the regression guard. When the typed line contained the
+/// prompt, `ready` returned on the terminal's echo of it, and a Ctrl-D sent
+/// next could reach bash before readline had taken its terminal out of
+/// canonical mode; on Linux that EOF is then read back as a NUL byte and bash
+/// never exits (see `ready`). Nothing about that is deterministic in a pty
+/// run — it failed ~1% of the time, Linux only — but the precondition is, and
+/// this pins it.
 #[test]
 fn set_prompt_installs_the_prompt_without_typing_it() {
     assert!(

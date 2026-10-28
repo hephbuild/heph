@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
+pub mod pty;
+
 /// Env var naming the staged artifact directory.
 ///
 /// Set by the `e2e` devenv script, which is the only supported entrypoint —
@@ -239,6 +241,36 @@ pub fn take_dsr_queries(tail: &mut Vec<u8>) -> usize {
         tail.drain(..excess);
     }
     queries
+}
+
+/// Send `sig` to `pid`.
+pub fn signal(pid: i32, sig: i32) {
+    // SAFETY: a plain syscall on integers.
+    let rc = unsafe { libc::kill(pid, sig) };
+    assert_eq!(
+        rc,
+        0,
+        "kill({pid}, {sig}): {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Whether `pid` still exists (a zombie counts).
+pub fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the pid exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Poll `cond` until it holds, or panic naming `what`.
+pub fn wait_until(what: &str, timeout: std::time::Duration, mut cond: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !cond() {
+        assert!(
+            started.elapsed() < timeout,
+            "timed out after {timeout:?} waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Host os/arch in the published-artifact spelling heph's manifest resolver

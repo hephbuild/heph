@@ -16,6 +16,7 @@ use common::{Dist, Workspace, describe};
 use std::io::Write as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::Stdio;
+use std::time::Duration;
 
 const BUILD: &str = r#"
 target(name = "code", driver = "exec", entrypoint = True,
@@ -120,5 +121,310 @@ fn entrypoint_signal_death_is_reraised() -> anyhow::Result<()> {
         assert!(!out.status.core_dumped(), "SIG{name}: heph dumped core");
         assert_eq!(out.status.code(), None, "SIG{name}: not an exit code");
     }
+    Ok(())
+}
+
+const SIGTERM: i32 = libc::SIGTERM;
+
+/// The tool reports its SIGINT, SIGTTOU, SIGTTIN and SIGQUIT dispositions. heph
+/// itself ignores TTOU/TTIN and handles INT and QUIT, so a child that merely
+/// inherited heph's state would read `IGNORE IGNORE IGNORE DEFAULT` (handlers
+/// reset to default across exec, ignores do not) whatever the caller gave.
+const DISPOSITIONS_BUILD: &str = r#"
+target(name = "disp", driver = "exec", entrypoint = True,
+       run = ["/usr/bin/perl", "-e",
+              "print join(q( ), map { $SIG{$_} // q(DEFAULT) } qw(INT TTOU TTIN QUIT)), qq(\n)"])
+"#;
+
+/// The tool starts with the dispositions heph inherited, not heph's own (N4,
+/// E9, R8): under a `nohup`-like caller SIGINT (and here TTOU/TTIN) stay
+/// ignored; under a plain shell every one is default, although heph ignores
+/// TTOU/TTIN and handles INT/QUIT itself.
+#[test]
+fn entrypoint_keeps_inherited_dispositions() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = Workspace::new()?;
+    ws.write("app/BUILD", DISPOSITIONS_BUILD)?;
+
+    let out = ws.run(&dist, &["run", "//app:disp"])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "DEFAULT DEFAULT DEFAULT DEFAULT\n",
+        "plain caller\n{}",
+        describe(&out)
+    );
+
+    let cmd = ws.cmd(&dist, &[]);
+    let envs: Vec<_> = cmd
+        .get_envs()
+        .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
+        .collect();
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", "trap '' INT TTOU TTIN; exec \"$0\" \"$@\""])
+        .arg(dist.heph())
+        .args(["run", "//app:disp"])
+        .current_dir(ws.root())
+        .envs(envs)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "IGNORE IGNORE IGNORE DEFAULT\n",
+        "caller ignored INT, TTOU and TTIN\n{}",
+        describe(&out)
+    );
+    Ok(())
+}
+
+/// A tool that logs every TERM and USR1 it receives and exits 4 once told to.
+const TRAP_BUILD: &str = r#"
+target(name = "trap", driver = "bash", entrypoint = True, run = """
+trap 'echo term >> "$HEPH_E2E_LOG"' TERM
+trap 'echo usr1 >> "$HEPH_E2E_LOG"' USR1
+echo ready >> "$HEPH_E2E_LOG"
+while [ ! -e "$HEPH_E2E_STOP" ]; do sleep 0.05; done
+exit 4
+""")
+target(name = "hold", driver = "bash", entrypoint = True, run = """
+echo $$ > "$HEPH_E2E_PID"
+exec sleep 30
+""")
+"#;
+
+/// The tool's pid, once it has written it to `path`.
+fn read_pid(path: &std::path::Path) -> i32 {
+    common::wait_until("the tool to write its pid", Duration::from_secs(60), || {
+        std::fs::read_to_string(path).is_ok_and(|s| s.ends_with('\n'))
+    });
+    std::fs::read_to_string(path)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("a pid")
+}
+
+/// SIGTERM and SIGUSR1 sent to heph's pid reach the tool exactly once each
+/// — they are not the terminal's, so only the relay delivers them (E17) — and
+/// heph neither dies of them nor acts on them; it exits with the tool's
+/// status. A TERM that kills the tool (what `timeout` sends) leaves no tool
+/// running: heph forwards it, then dies of it as the tool did.
+#[test]
+fn entrypoint_signal_to_heph_is_forwarded() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = Workspace::new()?;
+    ws.write("app/BUILD", TRAP_BUILD)?;
+    let log = ws.root().join("signals.log");
+    let stop = ws.root().join("stop");
+    let lines = || std::fs::read_to_string(&log).unwrap_or_default();
+
+    let child = ws
+        .cmd(&dist, &["run", "//app:trap"])
+        .env("HEPH_E2E_LOG", &log)
+        .env("HEPH_E2E_STOP", &stop)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let heph = i32::try_from(child.id())?;
+    common::wait_until("the tool to set its traps", Duration::from_secs(60), || {
+        lines() == "ready\n"
+    });
+    common::signal(heph, SIGTERM);
+    common::wait_until("TERM to reach the tool", Duration::from_secs(10), || {
+        lines() == "ready\nterm\n"
+    });
+    common::signal(heph, libc::SIGUSR1);
+    common::wait_until("USR1 to reach the tool", Duration::from_secs(10), || {
+        lines() == "ready\nterm\nusr1\n"
+    });
+    // Long enough for a second, duplicate delivery to have landed.
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(&stop, b"")?;
+    let out = child.wait_with_output()?;
+    assert_eq!(out.status.code(), Some(4), "{}", describe(&out));
+    assert_eq!(lines(), "ready\nterm\nusr1\n", "each delivered once");
+    assert!(
+        out.stdout.is_empty(),
+        "heph wrote to stdout: {}",
+        describe(&out)
+    );
+
+    // `timeout`'s shape: one TERM at heph, the tool does not trap it.
+    let pid_file = ws.root().join("hold.pid");
+    let mut child = ws
+        .cmd(&dist, &["run", "//app:hold"])
+        .env("HEPH_E2E_PID", &pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let tool = read_pid(&pid_file);
+    common::signal(i32::try_from(child.id())?, SIGTERM);
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "heph outlived its TERM"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.signal(),
+        Some(SIGTERM),
+        "heph dies of the tool's TERM"
+    );
+    assert!(!common::alive(tool), "the tool is gone with heph");
+    Ok(())
+}
+
+/// heph's own failure after the target resolved exits 125 with its box, so it
+/// is never read as the tool's status (R4): a program that does not exist (an
+/// error from the driver's run that carries no exit status), a dependency
+/// that fails to build, an argument the target does not take. Before
+/// resolution it is 1, as for any command.
+#[test]
+fn error_frame_without_exit_exits_125_with_box() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = Workspace::new()?;
+    ws.write(
+        "app/BUILD",
+        r#"
+target(name = "missing", driver = "exec", entrypoint = True, run = ["heph-e2e-no-such-program"])
+target(name = "boom", driver = "bash", run = "echo e2e-dep-broke; exit 1", out = "x")
+target(name = "broken", driver = "exec", entrypoint = True, deps = {"b": ":boom"}, run = ["/bin/true"])
+target(name = "noargs", driver = "exec", entrypoint = True, run = ["/bin/true"])
+"#,
+    )?;
+    for (args, code, says) in [
+        (
+            &["run", "//app:missing"][..],
+            125,
+            "heph-e2e-no-such-program",
+        ),
+        (&["run", "//app:broken"][..], 125, "//app:boom"),
+        (
+            &["run", "//app:noargs", "--", "x"][..],
+            125,
+            "takes no arguments",
+        ),
+        (&["run", "//app:nosuch"][..], 1, "nosuch"),
+    ] {
+        let out = ws.run(&dist, args)?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{args:?}\n{}",
+            describe(&out)
+        );
+        assert!(stderr.contains('×'), "{args:?}: no box\n{}", describe(&out));
+        assert!(
+            stderr.contains(says),
+            "{args:?}: {says:?}\n{}",
+            describe(&out)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{args:?}: stdout\n{}",
+            describe(&out)
+        );
+    }
+    Ok(())
+}
+
+/// heph SIGKILLed while its tool runs: the supervisor reaps the tool, and the
+/// sandbox the dead invocation left is swept by the next invocation of the
+/// target (E20, R23).
+#[test]
+fn sigkilled_heph_tool_reaped_and_sandbox_swept() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = Workspace::new()?;
+    ws.write(
+        "app/BUILD",
+        r#"
+target(name = "hold", driver = "bash", entrypoint = True, args = True, run = """
+[ "${1:-}" = quick ] && exit 0
+echo $$ > "$HEPH_E2E_PID"
+exec sleep 30
+""")
+"#,
+    )?;
+    let sandboxes = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(ws.root().join(".heph/sandbox/app/__invoke/hold"))
+            .map(|d| d.filter_map(Result::ok).map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    let pid_file = ws.root().join("hold.pid");
+    let mut child = ws
+        .cmd(&dist, &["run", "//app:hold"])
+        .env("HEPH_E2E_PID", &pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let tool = read_pid(&pid_file);
+    let left = sandboxes();
+    assert_eq!(left.len(), 1, "one live invocation: {left:?}");
+    common::signal(i32::try_from(child.id())?, libc::SIGKILL);
+    child.wait()?;
+    common::wait_until(
+        "the supervisor to reap the tool",
+        Duration::from_secs(20),
+        || !common::alive(tool),
+    );
+    assert!(
+        left[0].exists(),
+        "a SIGKILLed heph cannot clean up after itself"
+    );
+
+    let out = ws.run(&dist, &["run", "//app:hold", "--", "quick"])?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        !left[0].exists(),
+        "swept by the next invocation: {:?}",
+        sandboxes()
+    );
+    Ok(())
+}
+
+/// Ctrl-C (SIGINT at heph) while the entrypoint's dependency is still
+/// building is an ordinary cancel: the tool never starts, and the run exits
+/// 130 (R9, R23).
+#[test]
+fn ctrl_c_during_dep_build_cancels() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = Workspace::new()?;
+    let started = ws.root().join("dep-started");
+    let ran = ws.root().join("tool-ran");
+    ws.write(
+        "app/BUILD",
+        &format!(
+            r#"
+target(name = "slow", driver = "bash", run = "printf x > {started}; sleep 600", out = "x", cache = False)
+target(name = "tool", driver = "exec", entrypoint = True, deps = {{"s": ":slow"}},
+       run = ["/usr/bin/touch", "{ran}"])
+"#,
+            started = started.display(),
+            ran = ran.display(),
+        ),
+    )?;
+    let child = ws
+        .cmd(&dist, &["run", "//app:tool"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    common::wait_until("the dependency to start", Duration::from_secs(60), || {
+        started.exists()
+    });
+    common::signal(i32::try_from(child.id())?, libc::SIGINT);
+    let out = child.wait_with_output()?;
+    assert_eq!(out.status.code(), Some(130), "{}", describe(&out));
+    assert!(!ran.exists(), "the tool ran after a cancel");
     Ok(())
 }
