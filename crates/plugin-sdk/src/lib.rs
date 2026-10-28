@@ -14,6 +14,26 @@
 /// Re-export of the author-facing contract so a plugin depends only on the SDK.
 pub use hplugin::{driver, eresult, function, hook, provider};
 
+/// Running a program in the caller's terminal, for a driver that honours
+/// `RunStdio::Inherit` (an entrypoint's run). The same spawn exec uses:
+/// inherited fds 0–2, the recorded dispositions restored, the pid tracked with
+/// the host's supervisor, and the run's signals relayed by
+/// [`ForegroundChild::wait`](foreground::ForegroundChild::wait) without ever
+/// signalling a reaped pid.
+///
+/// ```ignore
+/// let RunStdio::Inherit(fg) = std::mem::take(&mut req.options.stdio) else { … };
+/// let cmd = ForegroundCommand::new(program, args, env, cwd).with_dispositions(fg.dispositions);
+/// let (child, _) = spawn_foreground(RunnerRef::local(), cmd, &PathPolicy::default(), ctoken).await?;
+/// let exit = child?.wait(fg.signals, ctoken).await?;
+/// ```
+pub mod foreground {
+    pub use hexecrunner::foreground::{
+        ForegroundChild, ForegroundCommand, RelayContext, should_relay, spawn_foreground,
+    };
+    pub use hexecrunner::{PathPolicy, RunnerRef, SpawnedAs};
+}
+
 #[cfg(feature = "stabby")]
 mod capabilities;
 #[cfg(feature = "stabby")]
