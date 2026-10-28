@@ -73,6 +73,7 @@ impl ManagedDriverOs {
             .with_context(|| format!("output-collision check for {}", req.target.addr.format()))?;
 
         let mut inputs: Vec<ManagedRunInput> = Vec::new();
+        let mut holds: Vec<crate::stage::StageHold> = Vec::new();
         for (unpack_root, group) in groups {
             fs::create_dir_all(&unpack_root)
                 .with_context(|| format!("create unpack root {:?}", unpack_root))?;
@@ -80,7 +81,7 @@ impl ManagedDriverOs {
                 let list_path = list_path_for(&input, &list_dir);
                 match self.stage_dir.as_deref() {
                     Some(stage_dir) if crate::stage::is_read_only(&input.annotations) => {
-                        crate::stage::stage_and_link(
+                        let hold = crate::stage::stage_and_link(
                             &input.artifact.content,
                             stage_dir,
                             &input.source_addr.format(),
@@ -99,6 +100,10 @@ impl ManagedDriverOs {
                                 unpack_root,
                             )
                         })?;
+                        // Held until the run's guards drop, so `gc` cannot
+                        // clear the entry under its links (N3). On an error
+                        // anywhere below, `holds` drops with this frame.
+                        holds.extend(hold);
                     }
                     _ => {
                         // Writes the input's entire tree to disk — off the
@@ -150,11 +155,18 @@ impl ManagedDriverOs {
         )
         .await?;
 
+        // The stage holds ride out with the response: the engine drops them
+        // with the rest of the run's guards, after it has read the sandbox.
+        let sandbox_guards = holds
+            .into_iter()
+            .map(|h| Box::new(h) as hplugin::driver::SandboxGuard)
+            .collect();
+
         if shell {
             return Ok(RunResponse {
                 artifacts: vec![],
                 sandbox_cleanup: sandbox_cleanup.take(),
-                sandbox_guards: Vec::new(),
+                sandbox_guards,
             });
         }
 
@@ -164,7 +176,125 @@ impl ManagedDriverOs {
         Ok(RunResponse {
             artifacts: res.artifacts,
             sandbox_cleanup: sandbox_cleanup.take(),
-            sandbox_guards: Vec::new(),
+            sandbox_guards,
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "tests assert inside `anyhow::Result` bodies so setup failures carry context"
+)]
+mod tests {
+    use super::*;
+    use crate::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+    use async_trait::async_trait;
+    use hcore::hasync::StdCancellationToken;
+    use hplugin::driver::inputartifact::{InputArtifact, Type};
+    use hplugin::driver::targetdef::TargetDef;
+    use hplugin::driver::{
+        ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse,
+        ParseRequest, ParseResponse,
+    };
+
+    /// A driver whose run succeeds or fails, and does nothing else.
+    struct Outcome(bool);
+
+    #[async_trait]
+    impl ManagedDriver for Outcome {
+        fn config(&self, _: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "outcome".to_string(),
+            })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            hplugin::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _: ParseRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            anyhow::bail!("not parsed in this test")
+        }
+        async fn apply_transitive(
+            &self,
+            req: ApplyTransitiveRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            Ok(ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _: ManagedRunRequest<'a, 'io>,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            anyhow::ensure!(self.0, "the run failed");
+            Ok(ManagedRunResponse { artifacts: vec![] })
+        }
+    }
+
+    fn os(ok: bool, stage: &std::path::Path) -> ManagedDriverOs {
+        let fallback = Arc::new(ShellFallback {
+            driver: Arc::new(Outcome(true)),
+            spec_template: Arc::new(hplugin::provider::TargetSpec::default()),
+        });
+        ManagedDriverOs {
+            driver: Arc::new(Box::new(Outcome(ok))),
+            shell_fallback: fallback,
+            stage_dir: Some(stage.to_path_buf()),
+        }
+    }
+
+    fn read_only_input() -> RunInput {
+        let content = crate::stage::tests::content("abc", &[("sdk/bin/go", "go", true)]);
+        RunInput {
+            artifact: InputArtifact {
+                r#type: Type::Dep,
+                origin_id: "sdk".to_string(),
+                content,
+            },
+            origin_id: "sdk".to_string(),
+            source_addr: hmodel::htaddr::parse_addr("//sdk:go").expect("addr"),
+            filters: vec![],
+            annotations: BTreeMap::from([(
+                crate::stage::READ_ONLY_ANNOTATION.to_string(),
+                "true".to_string(),
+            )]),
+        }
+    }
+
+    /// A successful run hands its stage holds out as `sandbox_guards`, which
+    /// keep `gc` off the entry until they drop; a failing run drops them with
+    /// its frame, so nothing stays held (R16).
+    #[tokio::test]
+    async fn stage_holds_ride_the_guards_and_drop_on_failure() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let stage = tmp.path().join("stage");
+        let target = TargetDef::default();
+        let id = "t".to_string();
+        let ct = StdCancellationToken::new();
+
+        let mut req = RunRequest::new(&id, &target, tmp.path().join("ok"));
+        req.inputs = vec![read_only_input()];
+        let res = os(true, &stage).run_inner(req, &ct, false).await?;
+        assert_eq!(res.sandbox_guards.len(), 1, "one held entry");
+        assert_eq!(crate::stage::clear_stage(&stage).0, 0, "held by the guard");
+        drop(res);
+        assert_eq!(crate::stage::clear_stage(&stage).0, 1, "released with it");
+
+        let mut req = RunRequest::new(&id, &target, tmp.path().join("fail"));
+        req.inputs = vec![read_only_input()];
+        let failed = os(false, &stage).run_inner(req, &ct, false).await;
+        assert!(failed.is_err(), "the run fails");
+        assert_eq!(
+            crate::stage::clear_stage(&stage).0,
+            1,
+            "a failed run holds nothing"
+        );
+        Ok(())
     }
 }

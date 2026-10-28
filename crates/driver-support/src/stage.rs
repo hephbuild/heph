@@ -62,7 +62,17 @@ fn sanitize_component(key: &str) -> String {
 /// `Send` across the lock-acquire await.
 ///
 /// Falls back to a direct (unshared) unpack into `link_root` when the artifact
-/// has no content hash — without a stable key there is nothing to share on.
+/// has no content hash — without a stable key there is nothing to share on,
+/// and nothing to hold (`Ok(None)`).
+///
+/// Otherwise the entry is **held** before anything links to it (N3, E14): a
+/// shared `flock` on its `<hash>.lock`, taken after materializing, with
+/// `.ready` re-checked under it, and returned as a [`StageHold`]. The caller
+/// keeps it for as long as the run uses the links — the managed layer hands
+/// it out through `RunResponse.sandbox_guards` — and `clear_stage`, which
+/// takes the same lock exclusively with a non-blocking try, skips the entry
+/// meanwhile instead of deleting it under the run. On any error the hold
+/// drops with the future, so a failed or cancelled stage holds nothing.
 #[expect(
     clippy::too_many_arguments,
     reason = "each parameter is a distinct, irreducible input (content, stage root, \
@@ -78,25 +88,55 @@ pub async fn stage_and_link(
     filters: &[String],
     per_file: bool,
     ctoken: &(dyn Cancellable + Send + Sync),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<StageHold>> {
+    stage_and_link_with_hook(
+        content,
+        stage_root,
+        key_prefix,
+        link_root,
+        list_path,
+        filters,
+        per_file,
+        ctoken,
+        &|_| {},
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`stage_and_link`'s parameters plus the test hook"
+)]
+async fn stage_and_link_with_hook(
+    content: &Arc<dyn Content>,
+    stage_root: &Path,
+    key_prefix: &str,
+    link_root: &Path,
+    list_path: Option<&Path>,
+    filters: &[String],
+    per_file: bool,
+    ctoken: &(dyn Cancellable + Send + Sync),
+    hook: HoldHook<'_>,
+) -> anyhow::Result<Option<StageHold>> {
     let hashout = content
         .hashout()
         .with_context(|| format!("hashout for staging ({key_prefix})"))?;
     if hashout.is_empty() {
         // No stable key → nothing to dedup on; behave like the copy path.
-        return crate::driver_managed::unpack_blocking(
+        crate::driver_managed::unpack_blocking(
             Arc::clone(content),
             link_root.to_path_buf(),
             list_path.map(Path::to_path_buf),
             filters.to_vec(),
         )
         .await
-        .with_context(|| format!("unshared unpack into {:?} (no content hash)", link_root));
+        .with_context(|| format!("unshared unpack into {:?} (no content hash)", link_root))?;
+        return Ok(None);
     }
 
     let group_dir = stage_root.join(sanitize_component(key_prefix));
     let entry = group_dir.join(&hashout);
-    ensure_materialized(content, &group_dir, &hashout, ctoken).await?;
+    let hold = hold_entry(content, &group_dir, &hashout, ctoken, hook).await?;
 
     // Unfiltered inputs (the common case: a whole self-contained read-only tree
     // like the Go SDK) get the *largest non-colliding subtree* symlinked in —
@@ -113,17 +153,42 @@ pub async fn stage_and_link(
     // with empty filters links the whole tree.
     //
     // Both link paths stay on the calling worker, unlike the materialize above:
-    // they touch no cache and cannot park on the write queue, they hold no lock,
-    // and the common one (`link_symlinked`) is O(depth) syscalls. `link_tree` is
-    // O(files) and would be worth offloading if a filtered input ever got large
-    // — the exec `tools` shape it serves is a handful of files.
+    // they touch no cache and cannot park on the write queue, they wait on no
+    // lock (the hold is already in hand), and the common one (`link_symlinked`)
+    // is O(depth) syscalls. `link_tree` is O(files) and would be worth
+    // offloading if a filtered input ever got large — the exec `tools` shape it
+    // serves is a handful of files.
     if !filters.is_empty() || per_file {
         link_tree(&entry, link_root, list_path, filters)
-            .with_context(|| format!("link staged {:?} into {:?}", entry, link_root))
+            .with_context(|| format!("link staged {:?} into {:?}", entry, link_root))?;
     } else {
         link_symlinked(&entry, link_root, list_path)
-            .with_context(|| format!("symlink staged {:?} into {:?}", entry, link_root))
+            .with_context(|| format!("symlink staged {:?} into {:?}", entry, link_root))?;
     }
+    Ok(Some(hold))
+}
+
+/// Materialize the entry if it is not, then take its shared hold and re-check
+/// `.ready` under it; retried when a `clear_stage` lands in the window between
+/// the two.
+async fn hold_entry(
+    content: &Arc<dyn Content>,
+    group_dir: &Path,
+    hashout: &str,
+    ctoken: &(dyn Cancellable + Send + Sync),
+    hook: HoldHook<'_>,
+) -> anyhow::Result<StageHold> {
+    for _ in 0..HOLD_ATTEMPTS {
+        ensure_materialized(content, group_dir, hashout, ctoken).await?;
+        if let Some(hold) = try_hold(group_dir, hashout, ctoken, hook).await? {
+            return Ok(hold);
+        }
+    }
+    anyhow::bail!(
+        "stage entry {} kept disappearing between materializing and holding it \
+         ({HOLD_ATTEMPTS} attempts); is something clearing the stage in a loop?",
+        group_dir.join(hashout).display()
+    )
 }
 
 /// Materialize `content` as the stage entry `<group_dir>/<hashout>` unless its
@@ -185,21 +250,19 @@ async fn ensure_materialized(
     Ok(())
 }
 
-/// The stage group the toolbin entries live in. Never a sanitized address,
-/// which always starts `__` (from `//`).
-pub const TOOLBIN_GROUP: &str = "toolbin";
-
 /// How many times a hold re-materializes an entry that vanished between its
 /// `.ready` check and its lock before giving up. Each round needs a `gc` to
 /// land in a window of a few syscalls.
 const HOLD_ATTEMPTS: usize = 8;
 
 /// The in-use hold on one stage entry: a shared `flock` on its `<key>.lock`,
-/// for as long as a running tool uses it (I4, D27).
+/// for as long as a run links to it (N3, E14).
 ///
 /// `clear_stage` takes the same lock exclusively with a non-blocking try, so
-/// it skips a held entry rather than deleting it under the tool. The fd is
-/// `CLOEXEC`: only heph holds it, never the tool.
+/// it skips a held entry rather than deleting it under the run. The fd is
+/// `CLOEXEC`: only heph holds it, never the process it spawns. A shared
+/// release never deletes the lock file, so a warm path that had to create it
+/// leaves it for the next one.
 #[derive(Debug)]
 pub struct StageHold {
     path: PathBuf,
@@ -213,185 +276,9 @@ impl StageHold {
     }
 }
 
-/// Every hold one invocation takes, one per entry path: two tools linked from
-/// one entry share it, so heph never queues behind its own shared lock (D27).
-#[derive(Debug, Default)]
-pub struct StageHolds {
-    held: std::collections::BTreeMap<PathBuf, StageHold>,
-}
-
 /// The test hook between a hold's `.ready` check and its lock — the window a
 /// concurrent `gc` can land in.
 type HoldHook<'h> = &'h (dyn Fn(&Path) + Send + Sync);
-
-impl StageHolds {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// How many distinct entries are held.
-    pub fn len(&self) -> usize {
-        self.held.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.held.is_empty()
-    }
-
-    /// Whether `entry` is held.
-    pub fn contains(&self, entry: &Path) -> bool {
-        self.held.contains_key(entry)
-    }
-
-    /// Materialize `content` in the stage if it is not already, and hold it.
-    /// Returns the entry's directory.
-    ///
-    /// An artifact with no content hash has no stage entry to key or hold, so
-    /// it is refused, naming `key_prefix` (D9).
-    pub async fn hold_content(
-        &mut self,
-        content: &Arc<dyn Content>,
-        stage_root: &Path,
-        key_prefix: &str,
-        ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<PathBuf> {
-        self.hold_content_with_hook(content, stage_root, key_prefix, ctoken, &|_| {})
-            .await
-    }
-
-    async fn hold_content_with_hook(
-        &mut self,
-        content: &Arc<dyn Content>,
-        stage_root: &Path,
-        key_prefix: &str,
-        ctoken: &(dyn Cancellable + Send + Sync),
-        hook: HoldHook<'_>,
-    ) -> anyhow::Result<PathBuf> {
-        let hashout = content
-            .hashout()
-            .with_context(|| format!("hashout for staging ({key_prefix})"))?;
-        if hashout.is_empty() {
-            anyhow::bail!(
-                "{key_prefix} produced an artifact with no content hash, so it has no stage entry \
-                 an entrypoint could run from or hold"
-            );
-        }
-        let group_dir = stage_root.join(sanitize_component(key_prefix));
-        let entry = group_dir.join(&hashout);
-        if self.held.contains_key(&entry) {
-            return Ok(entry);
-        }
-        for _ in 0..HOLD_ATTEMPTS {
-            ensure_materialized(content, &group_dir, &hashout, ctoken).await?;
-            if let Some(hold) = try_hold(&group_dir, &hashout, ctoken, hook).await? {
-                self.held.insert(entry.clone(), hold);
-                return Ok(entry);
-            }
-        }
-        anyhow::bail!(
-            "stage entry {} kept disappearing between materializing and holding it ({HOLD_ATTEMPTS} \
-             attempts); is something clearing the stage in a loop?",
-            entry.display()
-        )
-    }
-
-    /// Flatten `links` (basename → absolute staged file) into one stage
-    /// entry, `<stage>/toolbin/<key>`, and hold it. The key is a hash of the
-    /// sorted map; staged paths are content-addressed, so the key moves exactly
-    /// when a tool's content does (D9). Created under the stage's `.lock` /
-    /// `.ready` protocol, so a toolbin a killed heph left half-linked has no
-    /// `.ready` and is redone.
-    pub async fn hold_toolbin(
-        &mut self,
-        stage_root: &Path,
-        links: &std::collections::BTreeMap<std::ffi::OsString, PathBuf>,
-        ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<PathBuf> {
-        self.hold_toolbin_with_hook(stage_root, links, ctoken, &|_| {})
-            .await
-    }
-
-    async fn hold_toolbin_with_hook(
-        &mut self,
-        stage_root: &Path,
-        links: &std::collections::BTreeMap<std::ffi::OsString, PathBuf>,
-        ctoken: &(dyn Cancellable + Send + Sync),
-        hook: HoldHook<'_>,
-    ) -> anyhow::Result<PathBuf> {
-        let key = toolbin_key(links);
-        let group_dir = stage_root.join(TOOLBIN_GROUP);
-        let entry = group_dir.join(&key);
-        if self.held.contains_key(&entry) {
-            return Ok(entry);
-        }
-        for _ in 0..HOLD_ATTEMPTS {
-            ensure_toolbin(&group_dir, &key, links, ctoken).await?;
-            if let Some(hold) = try_hold(&group_dir, &key, ctoken, hook).await? {
-                self.held.insert(entry.clone(), hold);
-                return Ok(entry);
-            }
-        }
-        anyhow::bail!(
-            "toolbin {} kept disappearing between creating and holding it ({HOLD_ATTEMPTS} \
-             attempts); is something clearing the stage in a loop?",
-            entry.display()
-        )
-    }
-}
-
-/// The toolbin's key: a hash of the sorted basename → path map, with each
-/// field length-prefixed so no two maps share a byte stream.
-fn toolbin_key(links: &std::collections::BTreeMap<std::ffi::OsString, PathBuf>) -> String {
-    use std::hash::Hasher as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    let mut h = xxhash_rust::xxh3::Xxh3Default::new();
-    h.write_u64(1); // format version
-    for (name, path) in links {
-        for field in [name.as_bytes(), path.as_os_str().as_bytes()] {
-            h.write_u64(field.len() as u64);
-            h.write(field);
-        }
-    }
-    format!("{:016x}", h.finish())
-}
-
-/// Create the toolbin entry unless `.ready` says it is complete. Links only:
-/// nothing here reads an artifact byte.
-async fn ensure_toolbin(
-    group_dir: &Path,
-    key: &str,
-    links: &std::collections::BTreeMap<std::ffi::OsString, PathBuf>,
-    ctoken: &(dyn Cancellable + Send + Sync),
-) -> anyhow::Result<()> {
-    let entry = group_dir.join(key);
-    let ready = group_dir.join(format!("{key}.ready"));
-    if ready.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(group_dir)
-        .with_context(|| format!("create stage group dir {:?}", group_dir))?;
-    let lock_path = group_dir.join(format!("{key}.lock"));
-    let _guard = FLock::new(&lock_path)
-        .lock(ctoken)
-        .await
-        .with_context(|| format!("acquire stage lock {:?}", lock_path))?;
-    if ready.exists() {
-        return Ok(());
-    }
-    // Whatever sits here without a `.ready` is a half-linked leftover.
-    match hcore::fsutil::remove_dir_all(&entry) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("clear partial toolbin {:?}", entry)),
-    }
-    std::fs::create_dir_all(&entry).with_context(|| format!("create toolbin {:?}", entry))?;
-    for (name, target) in links {
-        let link = entry.join(name);
-        std::os::unix::fs::symlink(target, &link)
-            .with_context(|| format!("link tool {:?} -> {:?}", link, target))?;
-    }
-    std::fs::write(&ready, b"").with_context(|| format!("write toolbin ready marker {:?}", ready))
-}
 
 /// Take the shared hold on `<group_dir>/<key>`, then re-check under it that
 /// the entry is still whole: `.ready` present and the directory there. The lock
@@ -422,28 +309,6 @@ async fn try_hold(
     } else {
         Ok(None)
     }
-}
-
-/// Every file (and symlink) under a held stage entry, absolute and sorted,
-/// restricted to `filters` when non-empty. A `readdir` walk: no artifact bytes
-/// are read.
-pub fn staged_files(entry: &Path, filters: &[String]) -> anyhow::Result<Vec<PathBuf>> {
-    let filters = hcore::hartifactcontent::PathFilter::new(filters);
-    let mut out = Vec::new();
-    for ent in walkdir::WalkDir::new(entry).sort_by_file_name() {
-        let ent = ent.with_context(|| format!("walk staged tree {:?}", entry))?;
-        if ent.file_type().is_dir() {
-            continue;
-        }
-        let rel = ent
-            .path()
-            .strip_prefix(entry)
-            .with_context(|| format!("strip {:?}", ent.path()))?;
-        if filters.matches(rel) {
-            out.push(ent.path().to_path_buf());
-        }
-    }
-    Ok(out)
 }
 
 /// Expose the staged tree under `link_root` by symlinking the deepest subtrees
@@ -872,7 +737,8 @@ pub fn clear_stage(stage_root: &Path) -> (usize, u64) {
                 continue;
             }
             let hash = ent.file_name().to_string_lossy().into_owned();
-            // Non-blocking: a held lock means a materializer is mid-write — skip
+            // Non-blocking: a held lock means a materializer is mid-write, or a
+            // run is linked to the entry (`stage_and_link`'s shared hold) — skip
             // and let the next sweep reclaim it.
             let lock = FLock::new(gpath.join(format!("{hash}.lock")));
             let _guard = match lock.try_lock() {
@@ -935,7 +801,7 @@ fn dir_size(dir: &Path) -> u64 {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hcore::hartifactcontent::WalkEntry;
     use hcore::hartifactcontent::tar::{TarPacker, TarWalker};
@@ -961,7 +827,8 @@ mod tests {
         }
     }
 
-    fn content(hash: &str, files: &[(&str, &str, bool)]) -> Arc<dyn Content> {
+    /// Tar content with the given hashout: `(path, body, executable)` per file.
+    pub(crate) fn content(hash: &str, files: &[(&str, &str, bool)]) -> Arc<dyn Content> {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut packer = TarPacker::new();
         for (rel, body, x) in files {
@@ -1780,24 +1647,218 @@ mod tests {
             entry.parent().expect("group").join(format!("{key}.lock"))
         }
 
-        /// A held entry survives `clear_stage`; once released, the next sweep
-        /// reclaims it (D27).
+        /// Stage and link `c` into a fresh dir under `tmp`, returning the hold.
+        async fn link(
+            c: &Arc<dyn Content>,
+            stage: &Path,
+            into: &Path,
+        ) -> anyhow::Result<StageHold> {
+            stage_and_link(c, stage, "//sdk:go", into, None, &[], false, &ct())
+                .await?
+                .context("a hashed artifact is held")
+        }
+
+        /// `stage_and_link` returns the hold, the links stay usable while it
+        /// lives, and `clear_stage` reclaims the entry only once it drops (N3).
         #[tokio::test]
-        async fn clear_stage_skips_in_use_entry() -> anyhow::Result<()> {
+        async fn stage_link_holds_until_guard_drops() -> anyhow::Result<()> {
             let tmp = tempfile::tempdir()?;
             let stage = tmp.path().join("stage");
             let c = content("aaa", &[("sdk/bin/go", "go", true)]);
-            let mut holds = StageHolds::new();
-            let entry = holds.hold_content(&c, &stage, "//sdk:go", &ct()).await?;
+            let hold = link(&c, &stage, &tmp.path().join("a")).await?;
+            let entry = hold.path().to_path_buf();
+            assert!(hlock::hlock::FRWLock::is_path_locked(lock_of(&entry))?);
 
-            let (removed, _) = clear_stage(&stage);
-            assert_eq!(removed, 0, "a held entry is skipped");
-            assert!(ready_and_whole(&entry, "sdk/bin/go"));
+            for _ in 0..2 {
+                let (removed, _) = clear_stage(&stage);
+                assert_eq!(removed, 0, "a held entry is skipped, every sweep");
+                assert!(ready_and_whole(&entry, "sdk/bin/go"));
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("a/sdk/bin/go"))?,
+                    "go",
+                    "the linked tree is readable through the hold"
+                );
+            }
 
-            drop(holds);
+            drop(hold);
             let (removed, _) = clear_stage(&stage);
             assert_eq!(removed, 1, "released, it is collected");
             assert!(!entry.exists());
+            Ok(())
+        }
+
+        /// The skip is the exclusive try-lock: any shared holder, from this
+        /// process or another fd, keeps the entry and its `.ready` (R16).
+        #[tokio::test]
+        async fn clear_stage_skips_held_entry() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let root = tmp.path().join("stage");
+            let entry = make_stage_entry(&root, "g", "h");
+            let hold = {
+                use hlock::hlock::RWLock as _;
+                hlock::hlock::FRWLock::new(root.join("g/h.lock"))
+                    .read(&ct())
+                    .await?
+            };
+            assert_eq!(clear_stage(&root).0, 0);
+            assert!(ready_and_whole(&entry, "blob"), "held: untouched");
+            drop(hold);
+            assert_eq!(clear_stage(&root).0, 1);
+            Ok(())
+        }
+
+        /// A warm hit after a cold one finds no lock file — the cold path's
+        /// exclusive release unlinked it. The hold creates it, and a shared
+        /// release never deletes it (R16).
+        #[tokio::test]
+        async fn warm_hold_creates_a_missing_lock_file() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let stage = tmp.path().join("stage");
+            let c = content("fff", &[("sdk/bin/go", "go", true)]);
+            let cold = link(&c, &stage, &tmp.path().join("a")).await?;
+            let entry = cold.path().to_path_buf();
+            drop(cold);
+            std::fs::remove_file(lock_of(&entry)).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
+            assert!(
+                !lock_of(&entry).exists(),
+                "the warm path finds no lock file"
+            );
+
+            let warm = link(&c, &stage, &tmp.path().join("b")).await?;
+            assert!(lock_of(&entry).exists(), "the hold created it");
+            assert_eq!(clear_stage(&stage).0, 0, "and it protects the entry");
+            drop(warm);
+            assert!(
+                lock_of(&entry).exists(),
+                "a shared release leaves the lock file"
+            );
+            assert_eq!(clear_stage(&stage).0, 1);
+            Ok(())
+        }
+
+        /// Cancelled while a materializer holds the entry's lock: the stage
+        /// fails as cancelled, links nothing and holds nothing (R16).
+        #[tokio::test]
+        async fn cancelled_acquire_holds_nothing() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let stage = tmp.path().join("stage");
+            let c = content("ggg", &[("sdk/bin/go", "go", true)]);
+            let group = stage.join(sanitize_component("//sdk:go"));
+            std::fs::create_dir_all(&group)?;
+            let busy = FLock::new(group.join("ggg.lock")).lock(&ct()).await?;
+
+            let token = ct();
+            let into = tmp.path().join("a");
+            let staging = stage_and_link(&c, &stage, "//sdk:go", &into, None, &[], false, &token);
+            let cancel = async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                token.cancel();
+            };
+            let (res, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::join!(staging, cancel)
+            })
+            .await
+            .context("a cancelled acquire must return")?;
+            let err = match res {
+                Ok(_) => anyhow::bail!("expected a cancellation"),
+                Err(e) => e,
+            };
+            assert!(hplugin::error::is_cancelled(&err), "{err:#}");
+            assert!(!into.join("sdk").exists(), "nothing linked");
+            drop(busy);
+            assert!(
+                !hlock::hlock::FRWLock::is_path_locked(group.join("ggg.lock"))?,
+                "nothing held"
+            );
+            Ok(())
+        }
+
+        /// `gc` sweeping in a loop while runs stage, link and read: every run
+        /// that got its hold reads a whole tree through its links, never a
+        /// partial or vanished one (R16, E14).
+        #[test]
+        fn gc_concurrent_with_build_never_links_partial_tree() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let stage = tmp.path().join("stage");
+            let files: Vec<(String, String, bool)> = (0..64)
+                .map(|i| (format!("sdk/f{i:02}"), format!("body-{i}"), false))
+                .collect();
+            let borrowed: Vec<(&str, &str, bool)> = files
+                .iter()
+                .map(|(p, b, x)| (p.as_str(), b.as_str(), *x))
+                .collect();
+            let c = content("hhh", &borrowed);
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let sweeper = {
+                let (stage, stop) = (stage.clone(), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mut swept = 0usize;
+                    // A pause per sweep, as any real `gc` has: a sweeper
+                    // spinning flat out can win every hold window, which the
+                    // hold reports as an error after its bounded retries.
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        swept += clear_stage(&stage).0;
+                        std::thread::sleep(std::time::Duration::from_micros(500));
+                    }
+                    swept
+                })
+            };
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()?;
+            let res: anyhow::Result<()> = rt.block_on(async {
+                let runs = (0..4).map(|w| {
+                    let (c, stage, root) =
+                        (Arc::clone(&c), stage.clone(), tmp.path().to_path_buf());
+                    tokio::spawn(async move {
+                        for round in 0..25 {
+                            let into = root.join(format!("run-{w}-{round}"));
+                            let hold = stage_and_link(
+                                &c,
+                                &stage,
+                                "//sdk:go",
+                                &into,
+                                None,
+                                &[],
+                                false,
+                                &ct(),
+                            )
+                            .await?
+                            .context("held")?;
+                            for i in 0..64 {
+                                let got =
+                                    std::fs::read_to_string(into.join(format!("sdk/f{i:02}")))
+                                        .with_context(|| format!("run {w}/{round}: file {i}"))?;
+                                anyhow::ensure!(got == format!("body-{i}"), "partial tree: {got}");
+                            }
+                            drop(hold);
+                            // A window with nothing held, for the sweeper.
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                        anyhow::Ok(())
+                    })
+                });
+                for r in runs.collect::<Vec<_>>() {
+                    r.await??;
+                }
+                Ok(())
+            });
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let swept = sweeper
+                .join()
+                .map_err(|_panic| anyhow::anyhow!("sweeper panicked"))?;
+            res?;
+            assert!(
+                swept > 0,
+                "the sweeper must have raced the runs at least once"
+            );
             Ok(())
         }
 
@@ -1836,9 +1897,7 @@ mod tests {
                 let stage = tmp.path().join("stage");
                 let c = content("bbb", &[("sdk/bin/go", "go", true)]);
                 // Materialized and ready before the hold starts, as a warm call finds it.
-                let mut warm = StageHolds::new();
-                drop(warm.hold_content(&c, &stage, "//sdk:go", &ct()).await?);
-                drop(warm);
+                drop(link(&c, &stage, &tmp.path().join("warm")).await?);
 
                 let fired = std::sync::atomic::AtomicBool::new(false);
                 let hook = |entry: &Path| {
@@ -1846,10 +1905,26 @@ mod tests {
                         interfere(entry);
                     }
                 };
-                let mut holds = StageHolds::new();
-                let entry = holds
-                    .hold_content_with_hook(&c, &stage, "//sdk:go", &ct(), &hook)
-                    .await?;
+                let into = tmp.path().join("raced");
+                let hold = stage_and_link_with_hook(
+                    &c,
+                    &stage,
+                    "//sdk:go",
+                    &into,
+                    None,
+                    &[],
+                    false,
+                    &ct(),
+                    &hook,
+                )
+                .await?
+                .context("held")?;
+                let entry = hold.path().to_path_buf();
+                assert_eq!(
+                    std::fs::read_to_string(into.join("sdk/bin/go"))?,
+                    "go",
+                    "{row}: linked to a whole tree"
+                );
                 assert!(
                     fired.load(std::sync::atomic::Ordering::SeqCst),
                     "{row}: hook ran"
@@ -1894,113 +1969,29 @@ mod tests {
             assert!(!entry.exists() && !root.join("g/h.ready").exists());
         }
 
-        /// One hold per entry path: the same content twice and a toolbin linking
-        /// into it take two holds (the entry and the toolbin), and materializing a
-        /// sibling entry while holding never deadlocks (D27).
+        /// Two inputs of one run with the same content each take their own
+        /// shared hold on the one entry; staging a sibling entry meanwhile
+        /// never deadlocks against them.
         #[tokio::test]
-        async fn hold_dedupes_by_path() -> anyhow::Result<()> {
+        async fn one_entry_held_twice_and_a_sibling_staged() -> anyhow::Result<()> {
             let tmp = tempfile::tempdir()?;
             let stage = tmp.path().join("stage");
-            let sdk = content(
-                "ccc",
-                &[("sdk/bin/go", "go", true), ("sdk/bin/gofmt", "f", true)],
-            );
-            let mut holds = StageHolds::new();
-            let a = holds.hold_content(&sdk, &stage, "//sdk:go", &ct()).await?;
-            let b = holds.hold_content(&sdk, &stage, "//sdk:go", &ct()).await?;
-            assert_eq!(a, b);
-            assert_eq!(holds.len(), 1, "one hold for one entry");
-
-            let links = std::collections::BTreeMap::from([
-                (std::ffi::OsString::from("go"), a.join("sdk/bin/go")),
-                (std::ffi::OsString::from("gofmt"), a.join("sdk/bin/gofmt")),
-            ]);
-            let tb1 = holds.hold_toolbin(&stage, &links, &ct()).await?;
-            let tb2 = holds.hold_toolbin(&stage, &links, &ct()).await?;
-            assert_eq!(tb1, tb2);
-            assert_eq!(holds.len(), 2, "the toolbin is its own entry, held once");
-
+            let sdk = content("ccc", &[("sdk/bin/go", "go", true)]);
+            let a = link(&sdk, &stage, &tmp.path().join("a")).await?;
+            let b = link(&sdk, &stage, &tmp.path().join("b")).await?;
+            assert_eq!(a.path(), b.path());
             let sibling = content("ddd", &[("sdk/bin/go", "other", true)]);
             let sib = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                holds.hold_content(&sibling, &stage, "//sdk:go", &ct()),
+                link(&sibling, &stage, &tmp.path().join("c")),
             )
             .await
-            .map_err(|_elapsed| {
-                anyhow::anyhow!("materializing a sibling while holding deadlocked")
-            })??;
-            assert_ne!(sib, a);
-            assert_eq!(holds.len(), 3);
-            Ok(())
-        }
-
-        /// A toolbin a killed heph left with links but no `.ready` is redone, never
-        /// used as it stands.
-        #[tokio::test]
-        async fn toolbin_survives_sigkill_mid_build() -> anyhow::Result<()> {
-            let tmp = tempfile::tempdir()?;
-            let stage = tmp.path().join("stage");
-            let target_a = tmp.path().join("a");
-            let target_b = tmp.path().join("b");
-            std::fs::write(&target_a, b"a")?;
-            std::fs::write(&target_b, b"b")?;
-            let links = std::collections::BTreeMap::from([
-                (std::ffi::OsString::from("a"), target_a.clone()),
-                (std::ffi::OsString::from("b"), target_b.clone()),
-            ]);
-            let entry = stage.join(TOOLBIN_GROUP).join(toolbin_key(&links));
-            // The leftover: one link of two, and a stray file, no `.ready`.
-            std::fs::create_dir_all(&entry)?;
-            std::os::unix::fs::symlink(&target_a, entry.join("a"))?;
-            std::fs::write(entry.join("stray"), b"x")?;
-
-            let mut holds = StageHolds::new();
-            let held = holds.hold_toolbin(&stage, &links, &ct()).await?;
-            assert_eq!(held, entry);
-            assert_eq!(std::fs::read_link(entry.join("a"))?, target_a);
-            assert_eq!(std::fs::read_link(entry.join("b"))?, target_b);
-            assert!(
-                !entry.join("stray").exists(),
-                "the partial leftover was redone"
-            );
-
-            // Same closure → same key; one tool's path changed → a new key.
-            let moved = std::collections::BTreeMap::from([
-                (std::ffi::OsString::from("a"), target_b.clone()),
-                (std::ffi::OsString::from("b"), target_b),
-            ]);
-            assert_eq!(toolbin_key(&links), toolbin_key(&links.clone()));
-            assert_ne!(toolbin_key(&links), toolbin_key(&moved));
-            Ok(())
-        }
-
-        /// An artifact with no content hash has no entry to hold: refused, naming it.
-        #[tokio::test]
-        async fn hold_refuses_an_unhashed_artifact() {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let c = content("", &[("x", "y", false)]);
-            let err = StageHolds::new()
-                .hold_content(&c, &tmp.path().join("stage"), "//gen:unhashed", &ct())
-                .await
-                .expect_err("unhashed must be refused");
-            assert!(format!("{err:#}").contains("//gen:unhashed"), "{err:#}");
-        }
-
-        #[tokio::test]
-        async fn staged_files_lists_files_and_applies_filters() -> anyhow::Result<()> {
-            let tmp = tempfile::tempdir()?;
-            let stage = tmp.path().join("stage");
-            let c = content("eee", &[("p/b.txt", "b", false), ("p/a.txt", "a", false)]);
-            let mut holds = StageHolds::new();
-            let entry = holds.hold_content(&c, &stage, "//p:x", &ct()).await?;
-            assert_eq!(
-                staged_files(&entry, &[])?,
-                vec![entry.join("p/a.txt"), entry.join("p/b.txt")]
-            );
-            assert_eq!(
-                staged_files(&entry, &["p/b.txt".to_string()])?,
-                vec![entry.join("p/b.txt")]
-            );
+            .map_err(|_elapsed| anyhow::anyhow!("staging a sibling while holding deadlocked"))??;
+            assert_ne!(sib.path(), a.path());
+            drop(a);
+            assert_eq!(clear_stage(&stage).0, 0, "b and the sibling still hold");
+            drop((b, sib));
+            assert_eq!(clear_stage(&stage).0, 2);
             Ok(())
         }
     }
