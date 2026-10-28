@@ -149,6 +149,10 @@ pub struct GcStats {
     /// Staged read-only input entries (`<home>/stage/`) reclaimed because their
     /// content hash is no longer referenced by any surviving manifest.
     pub stage_entries_removed: usize,
+    /// Entrypoint invocation sandboxes a killed heph left behind
+    /// (`<home>/sandbox/<pkg>/__invoke/<name>/<random>` whose `.owner` lock
+    /// was free).
+    pub invoke_sandboxes_removed: usize,
 }
 
 /// Per-target result of a GC pass, accumulated into [`GcStats`].
@@ -655,6 +659,13 @@ impl Engine {
         let (stage_removed, stage_bytes) = hcore::blocking::run(move || engine.gc_stage()).await;
         stats.stage_entries_removed = stage_removed;
         stats.bytes_removed = stats.bytes_removed.saturating_add(stage_bytes);
+
+        // Invocation sandboxes a SIGKILLed heph left; a live one holds its
+        // `.owner` lock and is skipped.
+        let sandbox_root = self.home.join("sandbox");
+        stats.invoke_sandboxes_removed =
+            hcore::blocking::run(move || crate::engine::invoke_sandbox::sweep_all(&sandbox_root))
+                .await;
 
         Ok(stats)
     }
