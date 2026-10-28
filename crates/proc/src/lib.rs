@@ -3,6 +3,7 @@
 //! (`process_supervisor`), and the macOS kqueue-based exit watcher
 //! (`process_watcher`). Depends only on `heph-core` (cancellation).
 
+pub mod fork_safety;
 pub mod proc_exec;
 pub mod process_supervisor;
 #[cfg(target_os = "macos")]

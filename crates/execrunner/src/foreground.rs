@@ -241,6 +241,10 @@ fn spawn_inherited(
 
     // D2: with its own group the child would `setpgid(0, 0)` here and heph
     // would hand it the terminal with `tcsetpgrp`, taking it back on exit.
+    // The `pre_exec` closure makes this a `fork`; on macOS a child forked
+    // while another thread forks for the first time can die in libSystem's
+    // atfork handler before it reaches exec (`hproc::fork_safety`).
+    hproc::fork_safety::prime();
     let child = cmd.spawn()?;
     // D2: report and track the pgid instead (`track(pgid)`), as every
     // captured spawn does.
@@ -717,6 +721,96 @@ mod tests {
         .expect("runner");
         let err = child.expect_err("must not spawn");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Set in the re-executed copies of this test binary that race two first
+    /// foreground spawns (see below).
+    const FIRST_FORKS_CHILD: &str = "HEPH_EXECRUNNER_FIRST_FORKS_CHILD";
+
+    /// Two foreground spawns racing in a fresh process — one of a program that
+    /// does not exist, one of a short `sh` — must both reach `exec`. On macOS
+    /// a child forked while the process's libnotify globals were still being
+    /// initialized died in libSystem's `atfork` handler with SIGKILL, and std
+    /// reported the missing program as spawned (`hproc::fork_safety`). The race
+    /// only exists before the first initialization, so each attempt is a
+    /// fresh process; this was `foreground_spawn_missing_program_is_not_found`
+    /// failing in ~1 of 3 runs of the whole test binary.
+    #[test]
+    fn first_concurrent_foreground_spawns_reach_exec() {
+        if std::env::var_os(FIRST_FORKS_CHILD).is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        for attempt in 0..30 {
+            let out = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "foreground::tests::first_forks_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(FIRST_FORKS_CHILD, "1")
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "attempt {attempt}: {}\nstdout: {stdout}\nstderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "child ran nothing: {stdout}");
+        }
+    }
+
+    /// Only does anything in a re-executed binary (see above).
+    #[test]
+    fn first_forks_child() {
+        if std::env::var_os(FIRST_FORKS_CHILD).is_none() {
+            return;
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime")
+        };
+        let missing = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                runtime().block_on(async {
+                    spawn_foreground(
+                        RunnerRef::local(),
+                        ForegroundCommand::new("heph-no-such-program", vec![], host_path(), "/"),
+                        &PathPolicy::default(),
+                        &StdCancellationToken::new(),
+                    )
+                    .await
+                    .expect("runner")
+                    .0
+                    .map(drop)
+                })
+            })
+        };
+        let sh_exit = std::thread::spawn(move || {
+            barrier.wait();
+            runtime().block_on(async {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                drop(tx);
+                spawn(sh("exit 5"))
+                    .await
+                    .wait(rx, &StdCancellationToken::new())
+                    .await
+                    .expect("wait")
+            })
+        });
+        let err = missing
+            .join()
+            .expect("missing-program thread")
+            .expect_err("a missing program must not spawn");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(sh_exit.join().expect("sh thread"), Exit::Code(5));
     }
 
     /// Set in the re-executed copy of this test binary, which closes fds 0–2
