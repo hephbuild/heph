@@ -336,8 +336,8 @@ store, `RunRequest.deferred`, `Deferred<String>`, the `//`-address claiming rule
 the whole-driver schema gate — and `${src://…}`, whose path is filled in by the
 managed-driver layer, the only place that knows where an artifact landed (under
 FUSE the sandbox root is redirected after the host has set it). Consumers: the
-credential driver's presentation templates, the `exec` driver's `run` in
-**both exec and bash mode**, `oci.push`'s `ref`, and the `template` driver's
+credential driver's presentation templates, the `exec` driver's `run`, `env`
+and `runtime_env` values in **both exec and bash mode**, `oci.push`'s `ref`, and the `template` driver's
 `vars` (`${read:}` only — it renders without a sandbox, so `${src:}` is refused at
 parse; see [TEMPLATE.md](TEMPLATE.md)).
 
@@ -381,6 +381,15 @@ prints a PID.
 group*: it names a group, and its value is the space-joined list of that group's
 paths. `${read://x:y}` declares the edge inline and is a single value. They are
 different things that happen to overlap.
+
+In `env` and `runtime_env` only a **value** may hold a reference; a variable's
+name may not, because the walk does not substitute map keys. `runtime_env`'s text
+stays out of the def hash as before, but its reference is the same hashed edge as
+anywhere else, so a runtime-only variable fed by `${read:}` still moves the key
+when the producer's content does — "runtime only" describes the literal, not a
+computed value. An `env` handed down through a dep's `transitive` is never
+resolved (the walk covers the target's own config), so a reference there is
+refused at `apply_transitive`.
 
 **Does not ship yet:** `heph.core.read()` as a Starlark function, which is
 discoverability rather than capability; `inspect deps` "via" lines and

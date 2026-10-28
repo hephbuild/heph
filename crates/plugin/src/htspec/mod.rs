@@ -328,6 +328,27 @@ impl FromSpecValue for std::collections::HashMap<String, String> {
     }
 }
 
+/// The same lenient map, whose **values** may carry a deferred reference.
+///
+/// Keys stay reserved: the host's walk does not recurse into them, so a
+/// reference there would never be substituted and would name a variable
+/// literally `${read://a:b}`.
+impl FromSpecValue for std::collections::HashMap<String, crate::driver::Deferred<String>> {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        parse_map_string_string(v)?
+            .into_iter()
+            .map(|(k, v)| {
+                reject_deferred_reference(&k)?;
+                Ok((k, crate::driver::Deferred::new(v)))
+            })
+            .collect()
+    }
+
+    fn spec_param_type() -> ParamType {
+        <std::collections::HashMap<String, String>>::spec_param_type()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +490,41 @@ mod tests {
         let plain = digest(&|s| "echo".to_string().hash(s));
         let deferred = digest(&|s| Deferred::<String>::new("echo").hash(s));
         assert_eq!(plain, deferred);
+    }
+
+    /// An env-shaped map takes a reference in a value, never in a key, and keeps
+    /// the lenient shapes of the plain map it replaced.
+    #[test]
+    fn a_deferred_env_map_accepts_references_in_values_only() {
+        use crate::driver::Deferred;
+        type M = HashMap<String, Deferred<String>>;
+        let r = "${read://infra:role}";
+
+        let m = M::from_spec_value(&Value::Map(HashMap::from([
+            ("ROLE".to_string(), Value::String(r.to_string())),
+            ("PLAIN".to_string(), Value::String("x".to_string())),
+        ])))
+        .expect("a reference in a value");
+        assert_eq!(m["ROLE"].raw(), r);
+        assert_eq!(m["PLAIN"].raw(), "x");
+
+        let err = M::from_spec_value(&Value::Map(HashMap::from([(
+            r.to_string(),
+            Value::String("x".to_string()),
+        )])))
+        .expect_err("a reference in a key");
+        assert!(
+            err.to_string().contains("deferred value reference"),
+            "{err}"
+        );
+
+        // The bare-string shorthand still decodes, as it does for `HashMap<String, String>`.
+        let m = M::from_spec_value(&Value::String("v".to_string())).expect("bare string");
+        assert_eq!(m[""].raw(), "v");
+        assert_eq!(
+            M::spec_param_type(),
+            HashMap::<String, String>::spec_param_type()
+        );
     }
 
     /// The whole-driver gate is derived from the field types, so that "one field

@@ -70,13 +70,22 @@ pub(crate) struct TargetSpec {
     /// Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.
     pub cache: TargetSpecCache,
     /// Environment variables set for the command.
-    pub env: HashMap<String, String>,
+    ///
+    /// A value may carry a `${read://pkg:name}` reference, resolved by the host
+    /// before the command runs; a name may not. The def hash covers the
+    /// reference text, and the producer's content reaches the key as for `run`.
+    pub env: HashMap<String, hplugin::driver::Deferred<String>>,
     /// Names of host environment variables passed through (hashed). `"*"` passes all.
     pub pass_env: Vec<String>,
     /// Host env vars passed through at runtime only (not hashed). `"*"` passes all.
     pub runtime_pass_env: Vec<String>,
     /// Environment variables set at runtime only (not hashed).
-    pub runtime_env: HashMap<String, String>,
+    ///
+    /// A value may carry a `${read://pkg:name}` reference. The value's text
+    /// stays out of the key, but every reference is a hashed edge, so the
+    /// *producer's* content still reaches it: a runtime-only variable fed by a
+    /// reference rebuilds when what it reads changes.
+    pub runtime_env: HashMap<String, hplugin::driver::Deferred<String>>,
     /// Exec runner this command runs under: a target address producing a
     /// `runner.json`. Absent (or the literal `"local"`) spawns on this host as
     /// before. The runner is a hashed dependency, so changing it changes this
@@ -257,7 +266,19 @@ mod tests {
             )])),
         )])
         .unwrap();
-        assert_eq!(spec.runtime_env.get("KEY"), Some(&"value".to_string()));
+        assert_eq!(spec.runtime_env.get("KEY").map(|d| d.raw()), Some("value"));
+    }
+
+    #[test]
+    fn env_and_runtime_env_accept_a_deferred_reference() {
+        let env = |r: &str| Value::Map(HashMap::from([("K".to_string(), Value::String(r.into()))]));
+        let spec = make_spec([
+            ("env", env("${read://a:b}")),
+            ("runtime_env", env("prefix-${read://c:d}")),
+        ])
+        .unwrap();
+        assert_eq!(spec.env["K"].raw(), "${read://a:b}");
+        assert_eq!(spec.runtime_env["K"].raw(), "prefix-${read://c:d}");
     }
 
     #[test]

@@ -105,10 +105,13 @@ struct TargetDef {
     /// Declared `support_files`, normalized. Hashed for the same reason as
     /// `outputs` — they are packed into the target's artifact set.
     pub support_files: Vec<Path>,
-    pub env: BTreeMap<String, String>,
+    /// Unresolved like `run`, and for the same reason. `Deferred`'s `Hash` is its
+    /// raw text, so a def with no reference hashes as it did when this was a
+    /// `String` map.
+    pub env: BTreeMap<String, hplugin::driver::Deferred<String>>,
     pub pass_env: BTreeMap<String, String>,
     pub runtime_pass_env: Vec<String>,
-    pub runtime_env: HashMap<String, String>,
+    pub runtime_env: HashMap<String, hplugin::driver::Deferred<String>>,
     /// Exec runner for this target, already resolved (per-target field, then
     /// the driver default, then none).
     ///
@@ -1097,6 +1100,12 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 hplugin::htspec::reject_deferred_reference(r.raw())
                     .with_context(|| format!("`run[{i}]` of a `{}` target", self.name))?;
             }
+            for (field, map) in [("env", &spec.env), ("runtime_env", &spec.runtime_env)] {
+                for (k, v) in map {
+                    hplugin::htspec::reject_deferred_reference(v.raw())
+                        .with_context(|| format!("`{field}.{k}` of a `{}` target", self.name))?;
+                }
+            }
         }
 
         let pkg = req.target_spec.addr.package.clone();
@@ -1459,10 +1468,17 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     }
                 }
                 EnvValue::Literal(v) => {
+                    // The host's walk covers the target's own config, not what a
+                    // dep hands down, so a reference here has no edge: it would
+                    // reach the process as text, or `resolve` would call it a heph
+                    // bug. Refuse it as the author's instead.
+                    hplugin::htspec::reject_deferred_reference(&v)
+                        .with_context(|| format!("transitive `env.{name}`"))?;
                     if env.hash {
                         xdef.pass_env.insert(name, v);
                     } else {
-                        xdef.runtime_env.insert(name, v);
+                        xdef.runtime_env
+                            .insert(name, hplugin::driver::Deferred::new(v));
                     }
                 }
             }
@@ -1571,7 +1587,7 @@ impl Driver {
         );
 
         for (k, v) in &def.env {
-            env.insert(k.clone(), v.clone());
+            env.insert(k.clone(), rreq.resolve(v)?.to_string());
         }
 
         let pkg_prefix = {
@@ -1810,7 +1826,9 @@ impl Driver {
             }
         }
 
-        env.extend(def.runtime_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        for (k, v) in &def.runtime_env {
+            env.insert(k.clone(), rreq.resolve(v)?.to_string());
+        }
 
         // Scratch caches: each declaration names the variable its tool reads the
         // directory from, so a consumer needs no wiring of its own — declaring
@@ -3842,7 +3860,7 @@ mod tests {
         run_cmd: &str,
         pass_env: BTreeMap<String, String>,
         runtime_pass_env: Vec<String>,
-        runtime_env: HashMap<String, String>,
+        runtime_env: HashMap<String, D<String>>,
     ) -> anyhow::Result<String> {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
@@ -3910,10 +3928,7 @@ mod tests {
             "echo $MY_RUNTIME_ENV",
             BTreeMap::new(),
             vec![],
-            HashMap::from([(
-                "MY_RUNTIME_ENV".to_string(),
-                "runtime_env_value".to_string(),
-            )]),
+            HashMap::from([("MY_RUNTIME_ENV".to_string(), D::new("runtime_env_value"))]),
         )
         .await?;
         assert_eq!(out, "runtime_env_value");
@@ -5927,6 +5942,36 @@ mod tests {
             "8505d329f96f4aa6",
             "the toolbox-off transitive def hash must not move"
         );
+        Ok(())
+    }
+
+    /// A dep's transitive `env` is never walked for references, so one there
+    /// has no edge and no value. It is refused, hashed or not, rather than
+    /// reaching the process as text or failing at `resolve` as a heph bug.
+    #[tokio::test]
+    async fn a_reference_in_a_transitive_env_is_refused() -> anyhow::Result<()> {
+        for hash in [true, false] {
+            let mut sandbox = hplugin::driver::sandbox::Sandbox::default();
+            sandbox.env.insert(
+                "TR_VAR".to_string(),
+                hplugin::driver::sandbox::Env {
+                    value: hplugin::driver::sandbox::EnvValue::Literal(
+                        "${read://infra:v}".to_string(),
+                    ),
+                    hash,
+                    append: false,
+                    append_prefix: String::new(),
+                },
+            );
+            let Err(err) = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await else {
+                panic!("hash={hash}: a transitive reference must be refused");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("transitive `env.TR_VAR`") && msg.contains("deferred value reference"),
+                "hash={hash}: {msg}"
+            );
+        }
         Ok(())
     }
 
