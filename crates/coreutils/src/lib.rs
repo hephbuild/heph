@@ -24,6 +24,7 @@ mod tmpl;
 use anyhow::Context as _;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Identity of the builtin toolbox, as it reaches a target's cache key.
 ///
@@ -178,13 +179,18 @@ pub fn shim_dir(home: &Path, exe: &Path) -> anyhow::Result<PathBuf> {
         return Ok(dir);
     }
 
+    // Unique per call, not just per process: concurrent targets in one heph
+    // all reach a cold shim dir at once, and a shared staging dir let one
+    // caller's cleanup below race another's symlinks ("Directory not empty").
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
     let staging = root.join(format!(
-        ".tmp-{}-{}",
+        ".tmp-{}-{}-{}",
         std::process::id(),
+        STAGING_SEQ.fetch_add(1, Ordering::Relaxed),
         shim_dir_name(exe)
     ));
-    // A leftover from a process that died mid-build: its content is keyed the
-    // same way, but only a *renamed* directory is known-complete.
+    // A leftover from a process that died mid-build and whose pid was reused:
+    // only a *renamed* directory is known-complete.
     if staging.exists() {
         std::fs::remove_dir_all(&staging)
             .with_context(|| format!("clear stale coreutils staging dir {staging:?}"))?;
@@ -550,6 +556,35 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "staging dir was not cleaned up");
+    }
+
+    #[test]
+    fn shim_dir_survives_concurrent_cold_start_in_one_process() {
+        // Concurrent targets in one heph process all reach a cold shim dir at
+        // once. A staging name keyed on the pid alone was shared between them,
+        // so one caller's stale-dir cleanup raced another's symlinks and
+        // failed with "Directory not empty". Repeat to make the window likely.
+        for _ in 0..20 {
+            let home = tempfile::tempdir().unwrap();
+            let exe = home.path().join("heph");
+            std::fs::write(&exe, "b").unwrap();
+
+            let barrier = std::sync::Barrier::new(16);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..16)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            shim_dir(home.path(), &exe)
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    let dir = h.join().unwrap().unwrap();
+                    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), APPLETS.len());
+                }
+            });
+        }
     }
 
     #[test]
