@@ -508,6 +508,16 @@ pub fn reraise(sig: i32) -> ! {
     };
     // SAFETY: a valid resource and a pointer to a live `rlimit`.
     unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+    // Not enough on Linux: when `core_pattern` pipes to a collector (apport,
+    // systemd-coredump — every stock Ubuntu, CI runners included) the kernel
+    // does not apply RLIMIT_CORE and dumps anyway. A non-dumpable process is
+    // never dumped, whatever the pattern. macOS has no such pipe; the limit
+    // covers it. Same outcome on both: heph dumps no core.
+    #[cfg(target_os = "linux")]
+    // SAFETY: a plain prctl on this process, which is about to die.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
     // SAFETY: restoring a default disposition.
     unsafe { libc::signal(sig, libc::SIG_DFL) };
     // SAFETY: a zeroed `sigset_t` is initialized by `sigemptyset` just below.
@@ -809,6 +819,69 @@ mod tests {
         .expect("runner");
         let err = child.expect_err("must not spawn");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Set in the re-executed copy of this test binary that re-raises a signal.
+    const RERAISE_CHILD: &str = "HEPH_EXECRUNNER_RERAISE_CHILD";
+
+    /// `reraise` dies of the signal and dumps no core, even with the core
+    /// limit at its maximum — and on Linux even when `core_pattern` pipes to
+    /// a collector, which ignores RLIMIT_CORE (CI's runners do).
+    #[test]
+    fn reraise_dies_of_the_signal_without_a_core() {
+        use std::os::unix::process::ExitStatusExt as _;
+        if std::env::var_os(RERAISE_CHILD).is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, sig) in [("QUIT", libc::SIGQUIT), ("ABRT", libc::SIGABRT)] {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args([
+                "--exact",
+                "foreground::tests::reraise_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(RERAISE_CHILD, sig.to_string())
+            // A core written to the cwd lands in the tempdir, not the tree.
+            .current_dir(dir.path());
+            fn core_limit_to_max() -> std::io::Result<()> {
+                let mut lim = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: a valid resource and a pointer to a live `rlimit`.
+                if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut lim) } == 0 {
+                    lim.rlim_cur = lim.rlim_max;
+                    // SAFETY: raising the soft limit to the hard one.
+                    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &lim) };
+                }
+                Ok(())
+            }
+            // SAFETY: the closure only makes two async-signal-safe syscalls.
+            unsafe { std::os::unix::process::CommandExt::pre_exec(&mut cmd, core_limit_to_max) };
+            let out = cmd.output().expect("re-exec the test binary");
+            assert_eq!(
+                out.status.signal(),
+                Some(sig),
+                "SIG{name}: {:?}",
+                out.status
+            );
+            assert!(!out.status.core_dumped(), "SIG{name}: dumped core");
+        }
+    }
+
+    /// Only does anything in the re-executed binary (see above).
+    #[test]
+    fn reraise_child() {
+        let Some(sig) = std::env::var(RERAISE_CHILD)
+            .ok()
+            .and_then(|s| s.parse().ok())
+        else {
+            return;
+        };
+        reraise(sig);
     }
 
     /// Set in the re-executed copies of this test binary that race two first
