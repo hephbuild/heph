@@ -29,7 +29,7 @@ a multi-target selection: it is invoked on its own, by address.
 | `workdir` | `"caller"` | Where the command runs: `"caller"` (the directory you ran `heph` from, which may be outside the workspace), `"root"` (the workspace root), or `"sandbox"` (the invocation's own sandbox, as a build runs). Nothing written in the sandbox survives the run, so `"sandbox"` suits tools that read the closure or print, not ones that act on your tree. `scratch` is accepted only with `"sandbox"`. |
 
 Refused on an entrypoint, each with what to do instead: `out`, `cache`,
-`codegen`, `support_files`, `read_only_deps`, `pass_env`, `runtime_pass_env`,
+`codegen`, `support_files`, `pass_env`, `runtime_pass_env`,
 `runtime_env`, `runner`. An `exec` argv element naming `$SRC_x`, `$TOOL_x` or
 `$OUT` is refused too — even inside `["sh", "-c", "…"]`: exec passes its argv
 as written, and heph cannot tell a variable meant for a shell you start from
@@ -47,10 +47,12 @@ Entrypoints always run on the OS sandbox: `fuse.enabled` is ignored for them.
   `$SRC_x`: the closure's paths live there.
 - **`$HEPH_ROOT`** is the *real* workspace root, the one you checked out. Use it
   for a tool that acts on your tree from another `workdir`.
-- **Inputs** are writable copies in a sandbox private to this invocation, so a
-  tool may write caches next to what it reads (`.vite`, `__pycache__`). Two
-  invocations of the same target run concurrently, each in its own sandbox,
-  which is removed when the tool exits.
+- **Inputs** are laid out as for a build, in a sandbox private to this
+  invocation: a dep is a copy, while tools and `read_only_deps` are linked
+  read-only from heph's shared stage. Do not write next to a linked input (a
+  `.vite` cache, `__pycache__`): the write would reach every build that links
+  the same entry. Two invocations of the same target run concurrently, each in
+  its own sandbox, which is removed when the tool exits.
 - **Terminal and signals**: the tool inherits heph's stdin, stdout and stderr,
   and the signal dispositions and signal mask heph itself inherited (under
   `nohup`, SIGINT stays ignored; under `trap '' PIPE`, SIGPIPE stays ignored).
@@ -97,10 +99,10 @@ still with the tool's status, and without printing a cancellation.
 - A tool that traps INT and QUIT and keeps running can still be stopped with
   `kill -9 <heph pid>`: heph's supervisor then kills and reaps the tool.
 
-Before the tool starts — dependencies building, the closure being copied —
+Before the tool starts — dependencies building, the closure being laid out —
 heph is an ordinary run: Ctrl-C cancels it, TERM and HUP end it, SIGQUIT
 writes its diagnostic dump, as for any command. Nothing sent then is held for
-the tool. While the TUI has stepped aside, copying a large closure prints
+the tool. While the TUI has stepped aside, laying out a large closure prints
 nothing; it is still heph's, and Ctrl-C still cancels it.
 
 ## What will it run?

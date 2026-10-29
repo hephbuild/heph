@@ -94,13 +94,13 @@ pub(crate) struct TargetSpec {
     /// Make this target an entrypoint: `heph run` invokes it in the caller's
     /// world — their cwd (or the workspace root), their environment, their
     /// terminal — instead of building it. Never cached and never an input.
-    /// `deps`, `hash_deps`, `runtime_deps`, `tools`, `env`, `credentials` and
-    /// `run` keep their meaning: the closure is copied into a sandbox of the
-    /// invocation's own, removed when it exits, and `$SRC_<group>`,
-    /// `$TOOL_<group>` and `$WORKSPACE_ROOT` name paths inside it (`$HEPH_ROOT`
-    /// is the real workspace root). What only a build uses is refused: `out`,
-    /// `cache`, `codegen`, `support_files`, `read_only_deps`, the `*_env`
-    /// fields, `runner`, and `scratch` outside `workdir = "sandbox"`. An `exec`
+    /// `deps`, `hash_deps`, `runtime_deps`, `read_only_deps`, `tools`, `env`,
+    /// `credentials` and `run` keep their meaning: the closure is laid out as
+    /// for a build, in a sandbox of the invocation's own removed when it
+    /// exits, and `$SRC_<group>`, `$TOOL_<group>` and `$WORKSPACE_ROOT` name
+    /// paths inside it (`$HEPH_ROOT` is the real workspace root). What only a
+    /// build uses is refused: `out`, `cache`, `codegen`, `support_files`, the
+    /// `*_env` fields, `runner`, and `scratch` outside `workdir = "sandbox"`. An `exec`
     /// argv cannot name `$SRC_<group>` (there is no shell): use
     /// `${src://pkg:name}`, or `driver = "bash"`.
     pub entrypoint: bool,

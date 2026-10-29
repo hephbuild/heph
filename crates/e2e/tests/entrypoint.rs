@@ -1158,45 +1158,51 @@ target(name = "cancel", driver = "exec", entrypoint = True,
     Ok(())
 }
 
-/// An invocation copies its whole closure — deps and tools — and links
-/// nothing from the stage: the files are writable, and a change to one
-/// cannot reach what cached builds share (R1, replacing E13).
+/// An invocation lays out its closure as a build does (R29, replacing R1):
+/// a `read_only_deps` dep is symlinked from the shared stage, a transitive
+/// tool is hardlinked from it, and an ordinary dep is a copy in the invocation's
+/// sandbox. The first two lines are resolved paths; the third names the stage
+/// file the tool is the same inode as.
 #[tokio::test]
-async fn entrypoint_deps_are_copied_not_linked() -> anyhow::Result<()> {
+async fn entrypoint_closure_is_staged_like_a_build() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file("tools", TOOLS_BUILD);
     ws.write_build_file(
+        "ro",
+        r#"target(name = "data", driver = "bash", run = "printf ro > $OUT", out = "ro.txt")"#,
+    );
+    let stage = ws.engine.home.join("stage");
+    ws.write_build_file(
         "app",
-        r#"
+        &format!(
+            r#"
+target(name = "carrier", driver = "bash", run = "printf c > $OUT", out = "c",
+       transitive = {{"tools": {{"t": ["//tools:tool"]}}}})
 target(name = "ep", driver = "bash", entrypoint = True,
-       deps = {"d": "//tools:data"}, tools = {"t": "//tools:tool"},
-       run = "exec > \"$HEPH_TEST_OUT\"; t=$(command -v mytool); for f in \"$SRC_D\" \"$t\"; do [ -L \"$f\" ] && echo \"link $(readlink \"$f\")\"; [ -w \"$f\" ] && echo writable; done; echo more >> \"$SRC_D\" && cat \"$SRC_D\"")
+       deps = {{"d": "//tools:data", "r": "//ro:data", "c": ":carrier"}},
+       read_only_deps = ["r"], env = {{"STAGE": "{}"}},
+       run = "exec > \"$HEPH_TEST_OUT\"; realpath \"$SRC_D\" \"$SRC_R\"; t=$(command -v mytool); for s in \"$STAGE\"/*/*/mytool \"$STAGE\"/*/*/*/mytool; do [ \"$t\" -ef \"$s\" ] && echo \"same inode as $s\"; done; true")
 "#,
+            stage.display()
+        ),
     );
     let out = ws.dir.path().join("out.txt");
     let exit = exited(invoke(&ws.engine, request("//app:ep", ws.dir.path(), &[], &out)?).await);
     assert_eq!(exit, Exit::Code(0));
     let got = read(&out)?;
+    let lines: Vec<&str> = got.lines().collect();
+    let [dep, read_only, tool] = lines.as_slice() else {
+        anyhow::bail!("three lines: {got}\nstage: {:?}", walk(&stage));
+    };
+    assert!(!dep.contains("/stage/"), "an ordinary dep is copied: {got}");
     assert!(
-        !got.contains("/stage/"),
-        "nothing links into the stage: {got}"
+        read_only.contains("/stage/"),
+        "a read-only dep is symlinked: {got}"
     );
-    assert_eq!(
-        got.matches("writable").count(),
-        2,
-        "the dep and the tool are writable copies: {got}"
-    );
-    assert!(got.ends_with("payloadmore\n"), "{got}");
-    let stage = ws.engine.home.join("stage");
     assert!(
-        walk(&stage)
-            .iter()
-            .all(|p| !p.to_string_lossy().contains("tools")),
-        "the closure was never staged"
+        tool.starts_with("same inode as "),
+        "a tool is hardlinked: {got}"
     );
-    // The cached dep is untouched by the tool's write.
-    let data = ws.run("//tools:data").await?;
-    assert_eq!(common::artifact_string(&data), "payload");
     Ok(())
 }
 

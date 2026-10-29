@@ -80,11 +80,6 @@ const REFUSED_FIELDS: &[(&str, &str)] = &[
          (`deps` and `$SRC_<group>`) instead",
     ),
     (
-        "read_only_deps",
-        "an entrypoint gets its own writable copy of every input, so a tool may write next to \
-         what it reads without touching heph's shared stage. Drop `read_only_deps`",
-    ),
-    (
         "pass_env",
         "an entrypoint already runs with the caller's whole environment. Drop `pass_env`",
     ),
@@ -274,10 +269,6 @@ mod tests {
             (
                 vec![flag(), ("support_files", Value::List(vec![s("x")]))],
                 &["`support_files`", "through a dep"],
-            ),
-            (
-                vec![flag(), ("read_only_deps", Value::List(vec![s("d")]))],
-                &["`read_only_deps`", "writable copy", "Drop `read_only_deps`"],
             ),
             (
                 vec![flag(), ("pass_env", Value::List(vec![s("HOME")]))],
@@ -485,10 +476,10 @@ mod tests {
         Ok(())
     }
 
-    /// R1: an entrypoint's transitive tools are copied into its sandbox, never
-    /// linked from the shared stage; every other target keeps the link.
+    /// R29: an entrypoint's transitive tools are linked from the shared stage,
+    /// exactly as a build's are.
     #[tokio::test]
-    async fn entrypoint_tools_are_copied_not_linked() -> anyhow::Result<()> {
+    async fn entrypoint_tools_are_linked_like_a_build() -> anyhow::Result<()> {
         use hplugin::driver::ApplyTransitiveRequest;
         let tool = hplugin::driver::sandbox::Tool {
             r#ref: hplugin::driver::TargetAddr::parse(
@@ -499,7 +490,7 @@ mod tests {
             group: "node".to_string(),
             hash: true,
         };
-        for (flag_on, want_link) in [(true, false), (false, true)] {
+        for flag_on in [true, false] {
             let d = driver("exec");
             let mut extra = vec![];
             if flag_on {
@@ -524,9 +515,8 @@ mod tests {
                 .iter()
                 .find(|i| i.origin_id == "t0")
                 .expect("the tool input");
-            assert_eq!(
+            assert!(
                 hdriver_support::stage::is_read_only(&input.annotations),
-                want_link,
                 "entrypoint = {flag_on}"
             );
         }

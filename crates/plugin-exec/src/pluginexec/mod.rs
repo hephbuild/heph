@@ -301,16 +301,6 @@ pub(crate) fn grouped(inputs: &[(String, Input)]) -> BTreeMap<String, Vec<Input>
     out
 }
 
-/// How a transitive tool reaches the sandbox.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolStaging {
-    /// Linked from heph's shared stage: every build.
-    SharedStage,
-    /// Copied into the run's own sandbox: an entrypoint (R1), whose tool may
-    /// write next to itself.
-    Copy,
-}
-
 /// Fold a transitive closure's tools and deps into a def: every one joins
 /// `inputs`, and the runtime ones are wired into their groups. Env is the
 /// caller's to fold, because the two drivers place it differently.
@@ -320,7 +310,6 @@ pub(crate) fn fold_transitive_inputs(
     tool_groups: &mut BTreeMap<String, Vec<Input>>,
     dep_groups: &mut BTreeMap<String, Vec<Input>>,
     runtime_dep_groups: &mut BTreeMap<String, Vec<Input>>,
-    tool_staging: ToolStaging,
 ) {
     for tool in &sandbox.tools {
         // Tools are consumed read-only (executables on PATH, never mutated by
@@ -330,21 +319,18 @@ pub(crate) fn fold_transitive_inputs(
         // the tool consumer reads each input's file list and flattens every
         // tool file into a `bin/` dir by basename, so it needs individual
         // files listed — not the single subtree-root symlink the default
-        // staging emits. A copy lists every file already.
-        let annotations = match tool_staging {
-            ToolStaging::SharedStage => BTreeMap::from([
-                ("unpack_root".to_string(), "tools".to_string()),
-                (
-                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                    "true".to_string(),
-                ),
-                (
-                    hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
-                    "true".to_string(),
-                ),
-            ]),
-            ToolStaging::Copy => BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
-        };
+        // staging emits.
+        let annotations = BTreeMap::from([
+            ("unpack_root".to_string(), "tools".to_string()),
+            (
+                hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                "true".to_string(),
+            ),
+            (
+                hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
+                "true".to_string(),
+            ),
+        ]);
         let input = Input {
             r#ref: tool.r#ref.clone(),
             mode: InputMode::Tool,
@@ -1652,16 +1638,6 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             &mut xdef.tool_group_inputs,
             &mut xdef.dep_group_inputs,
             &mut xdef.runtime_dep_group_inputs,
-            // R1: an entrypoint's tool may write next to itself (a `.vite`
-            // cache, `__pycache__`), so it gets a copy, never a link into the
-            // shared stage, which a write would corrupt for every build that
-            // links the same entry. Decided here, on the def, because the
-            // managed layer materializes inputs before `run` sees the request.
-            if is_entrypoint {
-                ToolStaging::Copy
-            } else {
-                ToolStaging::SharedStage
-            },
         );
         for (name, env) in req.sandbox.env {
             match env.value {

@@ -74,22 +74,12 @@ impl ManagedDriverOs {
 
         let mut inputs: Vec<ManagedRunInput> = Vec::new();
         let mut holds: Vec<crate::stage::StageHold> = Vec::new();
-        // R1: an entrypoint's run copies every input and links nothing from
-        // the stage, whatever its annotations say — the tool runs in the
-        // caller's world, and a write through a link would reach the shared
-        // stage entry. Enforced here, for every driver, not only by exec's
-        // `apply_transitive`.
-        let stage_dir = if req.target.entrypoint.is_some() {
-            None
-        } else {
-            self.stage_dir.as_deref()
-        };
         for (unpack_root, group) in groups {
             fs::create_dir_all(&unpack_root)
                 .with_context(|| format!("create unpack root {:?}", unpack_root))?;
             for input in group {
                 let list_path = list_path_for(&input, &list_dir);
-                match stage_dir {
+                match self.stage_dir.as_deref() {
                     Some(stage_dir) if crate::stage::is_read_only(&input.annotations) => {
                         let hold = crate::stage::stage_and_link(
                             &input.artifact.content,
@@ -308,11 +298,10 @@ mod tests {
         Ok(())
     }
 
-    /// R1, for every driver: an entrypoint's read-only input is a writable
-    /// copy in its sandbox — never a link into the stage, and nothing staged
-    /// or held — whatever its annotations say.
+    /// R29, for every driver: an entrypoint's read-only input is linked from
+    /// the stage as a build's is, and held for as long as the run's guards.
     #[tokio::test]
-    async fn entrypoint_read_only_input_is_copied_not_linked() -> anyhow::Result<()> {
+    async fn entrypoint_read_only_input_is_linked_like_a_build() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let stage = tmp.path().join("stage");
         let target = TargetDef {
@@ -329,14 +318,18 @@ mod tests {
         let mut req = RunRequest::new(&id, &target, sandbox.clone());
         req.inputs = vec![read_only_input()];
         let res = os(true, &stage).run_inner(req, &ct, false).await?;
-        assert!(res.sandbox_guards.is_empty(), "nothing held");
+        assert_eq!(res.sandbox_guards.len(), 1, "the staged entry is held");
         let file = sandbox.join("ws/sdk/bin/go");
-        let meta = std::fs::symlink_metadata(&file)
+        let real = std::fs::canonicalize(&file)
             .with_context(|| format!("the input at {}", file.display()))?;
-        assert!(meta.file_type().is_file(), "a copy, not a link: {meta:?}");
-        assert!(!meta.permissions().readonly(), "writable");
-        std::fs::write(&file, b"changed")?;
-        assert_eq!(crate::stage::clear_stage(&stage).0, 0, "nothing was staged");
+        assert!(
+            real.starts_with(std::fs::canonicalize(&stage)?),
+            "linked from the stage: {}",
+            real.display()
+        );
+        assert_eq!(crate::stage::clear_stage(&stage).0, 0, "held by the guard");
+        drop(res);
+        assert_eq!(crate::stage::clear_stage(&stage).0, 1, "released with it");
         Ok(())
     }
 }
