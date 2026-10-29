@@ -1889,3 +1889,84 @@ async fn entrypoint_name_with_build_sandbox_prefix_is_refused() -> anyhow::Resul
     assert!(invoke_sandboxes(&ws.engine, "app", "__target_x").is_empty());
     Ok(())
 }
+
+/// Diagnosability of the contended miss (D1): a target whose dep another
+/// engine on the same home is building — or an invocation's tool is holding
+/// — waits for it, and says so: one `ResultLockWaitStart` for the dep once the
+/// wait outlasts the notice threshold (five seconds), one `ResultLockWaitEnd`
+/// when it ends, and the dep is shared, not rebuilt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dep_held_by_another_engine_announces_the_wait() -> anyhow::Result<()> {
+    use heph::engine::event::BuildEventKind;
+    let ws = Workspace::new();
+    let started = ws.dir.path().join("started");
+    let built = ws.dir.path().join("built.txt");
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"
+target(name = "dep", driver = "bash", out = "d",
+       run = "echo x >> {built}; printf x > {started}; sleep 7; printf d > $OUT")
+target(name = "top", driver = "bash", deps = {{"d": ":dep"}}, out = "t",
+       run = "cat $SRC_D > $OUT")
+"#,
+            built = built.display(),
+            started = started.display(),
+        ),
+    );
+    let other = ws.reopen()?;
+    let holder = tokio::spawn({
+        let other = Arc::clone(&other);
+        async move {
+            let rs = other.new_state();
+            Arc::clone(&other)
+                .result(
+                    rs,
+                    &heph::htmatcher::Matcher::Addr(parse_addr("//app:dep")?),
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                )
+                .await
+                .map(drop)
+        }
+    });
+    wait_for("the other engine to start building the dep", || {
+        started.exists()
+    })
+    .await?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = ws.engine.new_state_with_events(false, Some(tx));
+    let res = tokio::time::timeout(
+        Duration::from_secs(120),
+        Arc::clone(&ws.engine).result(
+            rs.clone(),
+            &heph::htmatcher::Matcher::Addr(parse_addr("//app:top")?),
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        ),
+    )
+    .await
+    .context("the waiter never finished")?;
+    res?;
+    drop(rs);
+    tokio::time::timeout(Duration::from_secs(120), holder).await???;
+
+    let mut kinds = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        kinds.push(ev.kind);
+    }
+    let on_dep = |k: &BuildEventKind| match k {
+        BuildEventKind::ResultLockWaitStart { addr, .. } => Some(("start", addr == "//app:dep")),
+        BuildEventKind::ResultLockWaitEnd { addr } => Some(("end", addr == "//app:dep")),
+        _ => None,
+    };
+    let waits: Vec<_> = kinds.iter().filter_map(on_dep).collect();
+    assert_eq!(
+        waits,
+        [("start", true), ("end", true)],
+        "one announced wait on the dep: {kinds:?}"
+    );
+    assert_eq!(read(&built)?, "x\n", "the dep was shared, not rebuilt");
+    Ok(())
+}
