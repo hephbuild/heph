@@ -241,10 +241,24 @@ fn entrypoint_keeps_callers_open_file_limit_and_mask() -> anyhow::Result<()> {
         describe(&out)
     );
 
-    // perl blocks SIGUSR1, then execs the shell that lowers the limit and
-    // execs heph: both survive `exec`.
-    let mut cmd = via_shell(&ws, &dist, "ulimit -S -n 300", &["run", "//app:limits"]);
-    let shell_args: Vec<_> = cmd.get_args().map(|a| a.to_os_string()).collect();
+    let out = output(blocking_usr1(
+        &ws,
+        via_shell(&ws, &dist, "ulimit -S -n 300", &["run", "//app:limits"]),
+    ))?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "300 BLOCKED\n",
+        "a blocked signal\n{}",
+        describe(&out)
+    );
+    Ok(())
+}
+
+/// `shell` (a [`via_shell`] command) started by perl with SIGUSR1 blocked:
+/// perl blocks it, then execs the shell that lowers the limit and execs heph,
+/// and the mask survives both `exec`s.
+fn blocking_usr1(ws: &Workspace, shell: std::process::Command) -> std::process::Command {
     let mut blocked = std::process::Command::new("/usr/bin/perl");
     blocked
         .args([
@@ -253,19 +267,54 @@ fn entrypoint_keeps_callers_open_file_limit_and_mask() -> anyhow::Result<()> {
             "sigprocmask(SIG_BLOCK, POSIX::SigSet->new(SIGUSR1)) or die; exec @ARGV or die",
             "/bin/sh",
         ])
-        .args(shell_args)
-        .current_dir(ws.root())
-        .envs(
-            cmd.get_envs()
-                .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string()))),
-        );
-    cmd = blocked;
-    let out = output(cmd)?;
+        .args(shell.get_args())
+        .current_dir(ws.root());
+    for (k, v) in shell.get_envs() {
+        match v {
+            Some(v) => blocked.env(k, v),
+            None => blocked.env_remove(k),
+        };
+    }
+    blocked
+}
+
+/// R8 through the self-upgrade path: a launcher heph that re-execs into the
+/// workspace's pinned binary hands it the caller's open-file soft limit and
+/// signal mask, not the limit it raised for itself or the mask std clears, so
+/// an entrypoint the pinned heph runs still sees the caller's.
+///
+/// Offline: the pin names a version whose binary is already in the version
+/// cache (`$HOME/.heph/versions/<tag>/heph_<os>_<arch>`, a copy of the binary
+/// under test), so `ensure_binary` finds it and downloads nothing. The tool
+/// printing `HEPH_SELF_UPDATED` proves the run went through `exec_into`, the
+/// only place that sets it.
+#[test]
+fn self_upgraded_heph_keeps_callers_open_file_limit_and_mask() -> anyhow::Result<()> {
+    const TAG: &str = "v99.0.0";
+    let dist = Dist::locate();
+    let ws = Workspace::new()?;
+    ws.config(&format!("version: {TAG}\n{}", common::BASE_CONFIG))?;
+    ws.write(
+        "app/BUILD",
+        r#"
+target(name = "limits", driver = "exec", entrypoint = True,
+       run = ["/bin/sh", "-c",
+              "printf 'upgraded=%s %s ' \"${HEPH_SELF_UPDATED:-no}\" \"$(ulimit -n)\"; exec /usr/bin/perl -MPOSIX -e '$s = POSIX::SigSet->new; sigprocmask(SIG_BLOCK, undef, $s) or die; print $s->ismember(SIGUSR1) ? qq(BLOCKED\\n) : qq(OPEN\\n)'"])
+"#,
+    )?;
+    let (os, arch) = common::host_os_arch();
+    let versions = ws.home().join(".heph/versions").join(TAG);
+    std::fs::create_dir_all(&versions)?;
+    std::fs::copy(dist.heph(), versions.join(format!("heph_{os}_{arch}")))?;
+
+    let mut shell = via_shell(&ws, &dist, "ulimit -S -n 300", &["run", "//app:limits"]);
+    shell.env_remove("HEPH_NO_SELF_UPDATE");
+    let out = output(blocking_usr1(&ws, shell))?;
     assert!(out.status.success(), "{}", describe(&out));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "300 BLOCKED\n",
-        "a blocked signal\n{}",
+        "upgraded=1 300 BLOCKED\n",
+        "the pinned heph's tool\n{}",
         describe(&out)
     );
     Ok(())
