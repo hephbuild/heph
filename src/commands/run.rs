@@ -140,7 +140,9 @@ pub struct RunArgs {
     /// program's: Ctrl-C, Ctrl-\ and signals sent to the run's own pid reach
     /// it once (a `kill -INT` of the pid while the run owns the terminal is
     /// taken for the terminal's own; see docs/ENTRYPOINTS.md), and the run
-    /// acts on none of them. A program that traps INT and QUIT is
+    /// acts on none of them. After it exits, Ctrl-C, TERM or HUP cancel
+    /// what the run is still finishing (cache uploads); the exit status stays
+    /// the program's. A program that traps INT and QUIT is
     /// stopped with `kill -9` on the run's pid; its supervisor then reaps
     /// the program. `--shell` opens a shell with the same command ready:
     /// `show` prints what `run` would execute.
@@ -277,10 +279,12 @@ impl RunApp {
     /// Signals (R9): until the tool is about to be spawned — deps building,
     /// the closure materializing — heph is an ordinary run: Ctrl-C cancels,
     /// TERM and HUP end it, SIGQUIT dumps diagnostics. The handover makes it
-    /// transparent until it exits (it cancels nothing, prints nothing, its
-    /// diagnostic handlers stand down) and installs the relay's listeners,
-    /// which forward every signal heph receives from then on into the run;
-    /// the driver delivers each to the tool.
+    /// transparent while the tool runs (it cancels nothing, prints nothing,
+    /// its diagnostic handlers stand down) and installs the relay's
+    /// listeners, which forward every signal heph receives into the run; the
+    /// driver delivers each to the tool. Once the tool exits (R27), signals
+    /// are heph's again: Ctrl-C, TERM and HUP cancel what heph is still
+    /// finishing (uploads), silently, and the exit status stays the tool's.
     async fn invoke(
         self,
         ctx: AppContext,
@@ -288,7 +292,16 @@ impl RunApp {
         addr: crate::htaddr::Addr,
     ) -> anyhow::Result<Option<hcore::process::Exit>> {
         self.label.set(format!("Invoking {}", addr.format()));
-        let (relay, signals) = bootstrap::signal_relay();
+        let engine = Arc::downgrade(&self.engine);
+        let (relay, signals) = bootstrap::signal_relay(move || {
+            if let Some(e) = engine.upgrade() {
+                e.cancel_all_requests();
+            }
+        });
+        // This invocation's transparency: taken at the handover, handed to
+        // `tool_exited` once the tool is done.
+        let held: Arc<std::sync::Mutex<Option<hcore::shutdown::TransparencyGuard>>> =
+            Arc::default();
         let mut req = InvokeRequest::new(addr, self.caller.cwd, self.caller.env)
             .with_args(self.args.args)
             .with_shell(self.args.shell.is_some())
@@ -296,14 +309,18 @@ impl RunApp {
             .with_dispositions(hcore::process::inherited_dispositions().to_vec())
             .with_nofile(hcore::process::inherited_nofile())
             .with_blocked(hcore::process::inherited_blocked().to_vec())
-            .with_handover(crate::engine::driver::Handover::new(move || {
-                // Transparent first: a Ctrl-C between the two must not
-                // cancel a run whose tool is about to own the terminal.
-                hcore::shutdown::hold_transparent().until_exit();
-                if let Err(error) = relay.install() {
-                    // The tool still runs; only signals sent to heph's own
-                    // pid stop reaching it (the terminal's reach it anyway).
-                    tracing::error!(error = ?error, "signal relay not installed");
+            .with_handover(crate::engine::driver::Handover::new({
+                let held = Arc::clone(&held);
+                move || {
+                    // Transparent first: a Ctrl-C between the two must not
+                    // cancel a run whose tool is about to own the terminal.
+                    let guard = hcore::shutdown::hold_transparent();
+                    *held.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+                    if let Err(error) = relay.install() {
+                        // The tool still runs; only signals sent to heph's own
+                        // pid stop reaching it (the terminal's reach it anyway).
+                        tracing::error!(error = ?error, "signal relay not installed");
+                    }
                 }
             }));
         // Neither the TUI nor the stall notice may draw over the tool, with or
@@ -345,13 +362,21 @@ impl RunApp {
             })
         });
         req = req.with_wrapper(pause);
-        match self.engine.clone().invoke(rs.clone(), req).await {
+        let outcome = self.engine.clone().invoke(rs.clone(), req).await;
+        // Read before the tool is marked exited: a signal after that cancels
+        // only what heph is finishing, never the run's own outcome.
+        let cancelled = rs.ctoken().is_cancelled();
+        let guard = held.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(guard) = guard {
+            hcore::shutdown::tool_exited(guard);
+        }
+        match outcome {
             Ok(InvokeOutcome::Exited(exit)) => Ok(Some(exit)),
             Ok(InvokeOutcome::Failed(e)) => {
                 // A cancellation reaches here as the driver's bare
                 // "cancelled", not a `CancelledError`: the request's token is
                 // what says whether this was Ctrl-C.
-                let code = if rs.ctoken().is_cancelled() {
+                let code = if cancelled {
                     EXIT_CANCELLED
                 } else {
                     EXIT_HEPH_FAILED

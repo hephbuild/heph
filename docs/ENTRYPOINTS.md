@@ -72,8 +72,13 @@ stderr.
 
 ## Signals while the tool runs
 
-From the moment the tool is about to start until heph exits, heph is
+From the moment the tool is about to start until it exits, heph is
 transparent: every signal is the tool's, and heph acts on none of them.
+
+Once the tool has exited, heph may still be finishing on its behalf —
+uploading the freshly built dependencies to a remote cache. Signals are heph's
+again then: Ctrl-C, TERM or HUP cancel what is left and heph exits at once,
+still with the tool's status, and without printing a cancellation.
 
 - Ctrl-C, Ctrl-\ and Ctrl-Z come from the terminal straight to the tool, which
   shares heph's process group. A second Ctrl-C is not special.

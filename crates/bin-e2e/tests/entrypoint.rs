@@ -611,3 +611,99 @@ fn quit_during_dep_build_does_not_reach_the_tool() -> anyhow::Result<()> {
     assert!(slow.ran.exists(), "the tool never ran\n{}", describe(&out));
     Ok(())
 }
+
+/// An S3 endpoint that accepts every connection and never answers: an upload
+/// to it stalls until heph gives up or is told to stop.
+struct StallingRemote {
+    port: u16,
+    connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StallingRemote {
+    fn start() -> anyhow::Result<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&connections);
+        std::thread::spawn(move || {
+            // Held, never read from or written to, for the test's life.
+            let mut open = Vec::new();
+            for stream in listener.incoming().flatten() {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                open.push(stream);
+            }
+        });
+        Ok(Self { port, connections })
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// R27: once the tool has exited, signals are heph's again. With the dep's
+/// upload stalled on an unresponsive remote, heph is still finishing after
+/// the tool exits; a Ctrl-C (SIGINT at heph) or a TERM then cancels the
+/// upload, and heph exits promptly — with the tool's status, printing no
+/// cancellation of its own.
+#[test]
+fn signal_after_the_tool_exits_cancels_the_uploads() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    for (name, sig) in [("INT", libc::SIGINT), ("TERM", SIGTERM)] {
+        let remote = StallingRemote::start()?;
+        let ws = Workspace::new()?;
+        ws.config(&format!(
+            "{}caches:\n  stall:\n    uri: s3://bucket/p\n    endpoint: http://127.0.0.1:{}\n    \
+             region: us-east-1\n    read: false\n    write: true\n",
+            common::BASE_CONFIG,
+            remote.port
+        ))?;
+        ws.write(
+            "app/BUILD",
+            r#"
+target(name = "dep", driver = "bash", run = "printf d > $OUT", out = "d")
+target(name = "tool", driver = "bash", entrypoint = True, deps = {"d": ":dep"},
+       run = "touch \"$HEPH_E2E_RAN\"; exit 3")
+"#,
+        )?;
+        let ran = ws.root().join("ran");
+        let mut child = ws
+            .cmd(&dist, &["run", "//app:tool"])
+            .env("HEPH_E2E_RAN", &ran)
+            .env("AWS_ACCESS_KEY_ID", "heph-e2e")
+            .env("AWS_SECRET_ACCESS_KEY", "heph-e2e")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        common::wait_until("the tool to run", Duration::from_secs(120), || ran.exists());
+        common::wait_until(
+            "the dep's upload to reach the remote",
+            Duration::from_secs(60),
+            || remote.connections() > 0,
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            child.try_wait()?.is_none(),
+            "SIG{name}: heph must still be waiting on the stalled upload"
+        );
+        common::signal(i32::try_from(child.id())?, sig);
+        let out = common::wait_output(child, Duration::from_secs(20))
+            .map_err(|e| anyhow::anyhow!("SIG{name} did not end the upload wait: {e:#}"))?;
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "SIG{name}: the tool's status\n{}",
+            describe(&out)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        for heph_said in ["ctrl-c", "aborting"] {
+            assert!(
+                !stderr.contains(heph_said),
+                "SIG{name}: heph reacted as to a cancel ({heph_said:?})\n{}",
+                describe(&out)
+            );
+        }
+    }
+    Ok(())
+}

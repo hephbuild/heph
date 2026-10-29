@@ -328,6 +328,16 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
             // existed, so it is heph's — a cancel, which the spawn's own
             // check then honours — even when this task reads it just after
             // the handover. Dropping it here would lose that Ctrl-C.
+            //
+            // After an entrypoint's tool exited (R27), a press cancels what heph
+            // is still finishing — uploads, cleanup — and nothing else: no
+            // message, no hard abort, and the exit status stays the tool's.
+            if hcore::shutdown::is_after_tool() {
+                if let Some(e) = engine.upgrade() {
+                    e.cancel_all_requests();
+                }
+                continue;
+            }
             presses += 1;
             if presses == 1 {
                 tracing::warn!(
@@ -361,24 +371,48 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
 /// build cannot kill the tool later.
 ///
 /// Once installed, heph no longer dies of TERM, HUP, USR1 or USR2 for the
-/// rest of the process (a tokio handler is never uninstalled): it is
-/// transparent while the tool runs and exits with the tool's status once it
-/// ends. When the receiver is gone, each listener stops forwarding.
-#[derive(Debug)]
+/// rest of the process (a tokio handler is never uninstalled), so the
+/// listeners stay and change what they do when the tool exits (R27): from
+/// [`hcore::shutdown::tool_exited`] on — once no other invocation's tool still
+/// runs — they forward nothing, and a TERM or HUP calls `after_tool`, which
+/// cancels what heph is still finishing (uploads, cleanup) so it exits
+/// promptly, with the tool's status. Ctrl-C reaches the same cancel through
+/// the shutdown trigger.
 pub struct SignalRelay {
     tx: engine::driver::SignalSender,
+    after_tool: Arc<dyn Fn() + Send + Sync>,
 }
 
-/// The relay's channel, its listeners not yet installed.
-pub fn signal_relay() -> (SignalRelay, engine::driver::SignalReceiver) {
+impl std::fmt::Debug for SignalRelay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalRelay").finish_non_exhaustive()
+    }
+}
+
+/// The relay's channel, its listeners not yet installed. `after_tool` is
+/// what a TERM or HUP does once the tool has exited.
+pub fn signal_relay(
+    after_tool: impl Fn() + Send + Sync + 'static,
+) -> (SignalRelay, engine::driver::SignalReceiver) {
     let (tx, rx) = engine::driver::signal_channel();
-    (SignalRelay { tx }, rx)
+    (
+        SignalRelay {
+            tx,
+            after_tool: Arc::new(after_tool),
+        },
+        rx,
+    )
 }
 
 impl SignalRelay {
     /// Install the listeners. Must be called on a thread inside the runtime
-    /// (the handover fires on one); every handler is installed before it
-    /// returns, so a signal is either before the relay or forwarded by it.
+    /// (the handover fires on one).
+    ///
+    /// tokio arms the OS handler inside `signal()` before the listener it
+    /// returns is subscribed, so a signal landing in that instant — a few
+    /// microseconds per signal, once per invocation — is lost rather than
+    /// relayed. Accepted: arming every handler up front would swallow TERM
+    /// and HUP before the handover, which is worse.
     pub fn install(self) -> anyhow::Result<()> {
         use tokio::signal::unix::{SignalKind, signal};
 
@@ -386,15 +420,28 @@ impl SignalRelay {
         let handle = tokio::runtime::Handle::try_current()
             .context("installing the signal relay outside the runtime")?;
         let _enter = handle.enter();
-        for &signo in &hexecrunner::foreground::RELAYED_SIGNALS {
-            let mut listener = signal(SignalKind::from_raw(signo))
-                .with_context(|| format!("listening for signal {signo} to relay it"))?;
+        let listeners = hexecrunner::foreground::RELAYED_SIGNALS
+            .iter()
+            .map(|&signo| {
+                signal(SignalKind::from_raw(signo))
+                    .map(|l| (signo, l))
+                    .with_context(|| format!("listening for signal {signo} to relay it"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for (signo, mut listener) in listeners {
             let tx = self.tx.clone();
+            let after_tool = Arc::clone(&self.after_tool);
             handle.spawn(async move {
                 while listener.recv().await.is_some() {
-                    if tx.send(engine::driver::Signal::from_raw(signo)).is_err() {
-                        return;
+                    if hcore::shutdown::is_after_tool() && !hcore::shutdown::is_transparent() {
+                        if signo == libc::SIGTERM || signo == libc::SIGHUP {
+                            after_tool();
+                        }
+                        continue;
                     }
+                    // A closed receiver: this invocation's tool is gone, and
+                    // there is nothing to forward to.
+                    let _forwarded = tx.send(engine::driver::Signal::from_raw(signo));
                 }
             });
         }

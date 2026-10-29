@@ -74,9 +74,8 @@ static TRANSPARENT: AtomicUsize = AtomicUsize::new(0);
 /// Refcounted, so two invocations in one process never end each other's
 /// transparency: it lasts while any guard is alive. Taken right before the
 /// program is forked — before that, Ctrl-C cancels as on any run — and
-/// normally kept until heph exits ([`TransparencyGuard::until_exit`]), so a
-/// signal arriving while heph tears down after the program exits prints
-/// nothing either.
+/// handed back to [`tool_exited`] once the program exits, after which a
+/// signal is heph's again but changes nothing about how heph exits (R27).
 #[derive(Debug)]
 #[must_use = "transparency ends when the guard drops"]
 pub struct TransparencyGuard(());
@@ -94,20 +93,33 @@ pub fn is_transparent() -> bool {
     TRANSPARENT.load(Ordering::Acquire) > 0
 }
 
-impl TransparencyGuard {
-    /// Keep the hold for the rest of the process's life: heph exits with the
-    /// program's status once it ends, and nothing in between is heph's to act
-    /// on.
-    pub fn until_exit(self) {
-        // Never dropped: the count stays up until the process is gone.
-        let _held = std::mem::ManuallyDrop::new(self);
-    }
-}
-
 impl Drop for TransparencyGuard {
     fn drop(&mut self) {
         TRANSPARENT.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// Set once a program heph handed the terminal to has exited (R27).
+static AFTER_TOOL: AtomicBool = AtomicBool::new(false);
+
+/// The program heph handed the terminal to has exited: end this invocation's
+/// transparency (`guard`), and from now on, once no other program holds it,
+/// heph is finishing up on the program's behalf — uploads, cleanup — and
+/// exits with the program's status whatever happens.
+///
+/// Signals are heph's again (R27): Ctrl-C, TERM and HUP cancel what is
+/// left, so heph exits promptly. Only one thing of R9 survives: such a late
+/// signal prints nothing and never changes the exit status (no cancellation
+/// box, no 130, no hard abort). Read with [`is_after_tool`].
+pub fn tool_exited(guard: TransparencyGuard) {
+    AFTER_TOOL.store(true, Ordering::Release);
+    drop(guard);
+}
+
+/// Whether a program heph handed the terminal to has exited
+/// ([`tool_exited`]). One atomic load: signal-handler safe.
+pub fn is_after_tool() -> bool {
+    AFTER_TOOL.load(Ordering::Acquire)
 }
 
 type RestoreFn = Arc<dyn Fn() + Send + Sync>;
@@ -182,6 +194,26 @@ mod tests {
         assert!(!is_transparent());
         trigger.trigger();
         assert!(rx.try_recv().is_ok(), "presses count again once released");
+    }
+
+    /// R27: one tool exiting ends only its own transparency — a press is
+    /// still dropped while another invocation's tool runs — and once none
+    /// runs, presses reach heph again, which now knows a tool has exited.
+    #[test]
+    fn tool_exited_ends_only_its_own_transparency() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (trigger, mut rx) = ShutdownTrigger::new();
+        let first = hold_transparent();
+        let second = hold_transparent();
+        tool_exited(first);
+        assert!(is_after_tool());
+        assert!(is_transparent(), "the other tool still runs");
+        trigger.trigger();
+        assert!(rx.try_recv().is_err(), "its press is the tool's");
+        tool_exited(second);
+        assert!(!is_transparent());
+        trigger.trigger();
+        assert!(rx.try_recv().is_ok(), "heph's again once no tool runs");
     }
 
     #[test]
