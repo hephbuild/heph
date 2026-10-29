@@ -14,7 +14,8 @@
 //! deaths, stdin — is in `crates/bin-e2e/tests/entrypoint.rs`. A plugin
 //! driver's side (`cdylib_entrypoint_runs`, the seam rows of
 //! `entrypoint_survives_apply_transitive`) crosses the stable-ABI seam
-//! in-process, as `plugin_fn_declarations.rs` does: no test cdylib is built.
+//! in-process, as `plugin_fn_declarations.rs` does; the same driver as a real
+//! cdylib, through `dlopen`, is `crates/bin-e2e/tests/cdylib_entrypoint.rs`.
 
 mod common;
 
@@ -1622,15 +1623,16 @@ impl heph::engine::driver_managed::ManagedDriver for ForegroundTool {
 /// request's signal channel crosses the `RunInFrame.signal` relay, reaches the
 /// tool's trap, and its chosen exit code comes back (E19, R5, N8).
 ///
-/// What this does not cover, against a real `dlopen` of a cdylib: the symbol
-/// and stabby type-report checks (`heph_plugin_abi_semver`, `get_stabbied`),
-/// the plugin's own copies of the SDK's statics and of `tracing`/the
-/// supervisor sink (here they are the test binary's, shared with the host), and
-/// the cdylib runtime being a separate library instance. None of those carries
-/// anything entrypoint-specific: the options, the signal stream and the exit
-/// all ride the run's protobuf frames, which this exercises. A tty cannot be
-/// asserted in-process — the tool inherits the test runner's fds; the terminal
-/// is `crates/bin-e2e`'s (`entrypoint_pty`).
+/// The same rows through a real `dlopen` are `crates/bin-e2e`'s
+/// `cdylib_entrypoint_runs` (`tests/cdylib_entrypoint.rs`, against the
+/// test-only `crates/plugin-entrypoint-test-cdylib`, this driver's twin),
+/// which adds what this one cannot: the symbol and stabby type-report checks
+/// (`heph_plugin_abi_semver`, `get_stabbied`), the plugin's own copies of the
+/// SDK's statics and of `tracing`/the supervisor sink (here they are the test
+/// binary's, shared with the host), the cdylib runtime being a separate
+/// library instance, and a tty (in-process the tool inherits the test
+/// runner's fds). This one stays for its cheaper rows: the sandbox being gone
+/// and the run in seconds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cdylib_entrypoint_runs() -> anyhow::Result<()> {
     let ws = WorkspaceBuilder::new()?

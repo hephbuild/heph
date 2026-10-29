@@ -74,6 +74,13 @@ impl Dist {
     pub fn plugin(&self, name: &str) -> PathBuf {
         self.root.join(format!("heph-{name}-plugin.{DYLIB_EXT}"))
     }
+
+    /// Path to a test-only plugin cdylib, built and staged with the shipped
+    /// ones but never published, e.g. `test_plugin("entrypoint")` →
+    /// `<dist>/test-entrypoint-plugin.<ext>`.
+    pub fn test_plugin(&self, name: &str) -> PathBuf {
+        self.root.join(format!("test-{name}-plugin.{DYLIB_EXT}"))
+    }
 }
 
 /// A throwaway workspace: a temp tree with a `.hephconfig`, plus a temp `HOME`
