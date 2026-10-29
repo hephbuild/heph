@@ -5051,6 +5051,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-entrypoint-test-cdylib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "driver-support",
+ "plugin",
+ "plugin-sdk",
+ "stabby",
+ "tracing",
+]
+
+[[package]]
 name = "plugin-exec"
 version = "0.1.0"
 dependencies = [

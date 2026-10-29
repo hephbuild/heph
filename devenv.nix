@@ -145,7 +145,7 @@ let
   };
 
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p coreutils -p template -p sqlite -p walk -p proc -p execrunner -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-devenv -p plugin-devenv-cdylib -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p telemetry -p tui -p lock -p fetch -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
+  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p coreutils -p template -p sqlite -p walk -p proc -p execrunner -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-devenv -p plugin-devenv-cdylib -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-entrypoint-test-cdylib -p telemetry -p tui -p lock -p fetch -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
 in
 {
   # https://devenv.sh/basics/
@@ -452,7 +452,9 @@ in
   '';
 
   # Binary end-to-end suite: black-box tests against the artifacts CI publishes
-  # (the `heph` binary + the go/gha plugin cdylibs). ONE entrypoint, identical
+  # (the `heph` binary + the plugin cdylibs), plus one test-only cdylib the
+  # build job uploads but never publishes (`plugin-entrypoint-test-cdylib`,
+  # staged as `test-entrypoint-plugin.<ext>`). ONE entrypoint, identical
   # locally and in CI — the only difference is where the artifacts come from:
   #
   #   e2e                      # build them from this tree (local default)
@@ -501,10 +503,15 @@ in
       cp "$src/heph-gha-plugin_''${os}_''${arch}.$ext" "$dist/heph-gha-plugin.$ext"
       cp "$src/heph-oci-plugin_''${os}_''${arch}.$ext" "$dist/heph-oci-plugin.$ext"
       cp "$src/heph-devenv-plugin_''${os}_''${arch}.$ext" "$dist/heph-devenv-plugin.$ext"
+      # A test fixture, not a shipped artifact: named `test-*` so that
+      # `upload_artifacts`' `heph*` pattern never publishes it.
+      cp "$src/test-entrypoint-plugin_''${os}_''${arch}.$ext" "$dist/test-entrypoint-plugin.$ext"
     else
       # Local: build the same artifacts the build job builds, the same way (one
       # invocation so cargo overlaps their LTO tails — see heph.yml).
-      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib
+      # Plus the test-only entrypoint cdylib, which the build job also builds
+      # (and uploads unpublished).
+      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib -p plugin-entrypoint-test-cdylib
       out="$target/release"
 
       # cargo's build lock covers the build but not the gap between it and the
@@ -521,15 +528,16 @@ in
       fingerprint() {
         stat -c '%i %s %Y' "$@" 2>/dev/null || stat -f '%i %z %m' "$@"
       }
-      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext")"
+      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext" "$out/libplugin_entrypoint_test_cdylib.$ext")"
 
       cp "$out/heph"                       "$dist/heph"
       cp "$out/libplugin_go_cdylib.$ext"   "$dist/heph-go-plugin.$ext"
       cp "$out/libplugin_gha_cdylib.$ext"  "$dist/heph-gha-plugin.$ext"
       cp "$out/libplugin_oci_cdylib.$ext"  "$dist/heph-oci-plugin.$ext"
       cp "$out/libplugin_devenv_cdylib.$ext" "$dist/heph-devenv-plugin.$ext"
+      cp "$out/libplugin_entrypoint_test_cdylib.$ext" "$dist/test-entrypoint-plugin.$ext"
 
-      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext")"
+      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext" "$out/libplugin_entrypoint_test_cdylib.$ext")"
       if [ "$before" != "$after" ]; then
         echo "e2e: $out changed while staging — another build in this" >&2
         echo "e2e: worktree raced this one. Re-run." >&2
@@ -539,7 +547,7 @@ in
       if [ "$os" = "darwin" ]; then
         # Same post-processing the shipped macOS artifacts get, so a local run
         # tests the same bytes CI would publish.
-        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext"; do
+        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext" "$dist/test-entrypoint-plugin.$ext"; do
           bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$f"
         done
       fi
@@ -555,7 +563,7 @@ in
       # After macos-portable.sh, not before: both re-sign, and this one must
       # have the last word or the signature covers pre-patch bytes.
       version="$(bash "$DEVENV_ROOT/.github/workflows/version.sh")"
-      for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext"; do
+      for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext" "$dist/test-entrypoint-plugin.$ext"; do
         bash "$DEVENV_ROOT/scripts/patch-slot.sh" "$f" "version=$version"
       done
     fi
