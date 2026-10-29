@@ -32,6 +32,35 @@ fn workspace() -> anyhow::Result<Workspace> {
     Ok(ws)
 }
 
+/// Run `cmd` to completion with both streams captured, bounded by
+/// [`common::RUN_DEADLINE`].
+fn output(mut cmd: std::process::Command) -> anyhow::Result<std::process::Output> {
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    common::wait_output(child, common::RUN_DEADLINE)
+}
+
+/// `heph <args>` started by `/bin/sh -c '<setup>; exec heph …'`: a caller
+/// that changed its own state (a trap, a limit) before running heph, with the
+/// workspace's environment.
+fn via_shell(ws: &Workspace, dist: &Dist, setup: &str, args: &[&str]) -> std::process::Command {
+    let envs: Vec<_> = ws
+        .cmd(dist, &[])
+        .get_envs()
+        .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
+        .collect();
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.args(["-c", &format!("{setup}; exec \"$0\" \"$@\"")])
+        .arg(dist.heph())
+        .args(args)
+        .current_dir(ws.root())
+        .envs(envs);
+    cmd
+}
+
 /// The program's exit code is heph's, unchanged.
 #[test]
 fn entrypoint_exit_code_passes_through() -> anyhow::Result<()> {
@@ -66,7 +95,7 @@ fn entrypoint_stdin_passes_through() -> anyhow::Result<()> {
             std::io::Result::Ok(())
         })
     };
-    let out = child.wait_with_output()?;
+    let out = common::wait_output(child, common::RUN_DEADLINE)?;
     writer
         .join()
         .map_err(|_panic| anyhow::anyhow!("the stdin writer panicked"))??;
@@ -98,20 +127,12 @@ fn entrypoint_signal_death_is_reraised() -> anyhow::Result<()> {
     ] {
         // heph under an unlimited core limit; the program lowers its own, so
         // only a heph core could appear.
-        let heph = dist.heph();
-        let cmd = ws.cmd(&dist, &[]);
-        let envs: Vec<_> = cmd
-            .get_envs()
-            .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
-            .collect();
-        let out = std::process::Command::new("/bin/sh")
-            .args(["-c", "ulimit -c \"$(ulimit -H -c)\"; exec \"$0\" \"$@\""])
-            .arg(&heph)
-            .args(["run", "//app:die", "--", name])
-            .current_dir(ws.root())
-            .envs(envs)
-            .stdin(Stdio::null())
-            .output()?;
+        let out = output(via_shell(
+            &ws,
+            &dist,
+            "ulimit -c \"$(ulimit -H -c)\"",
+            &["run", "//app:die", "--", name],
+        ))?;
         assert_eq!(
             out.status.signal(),
             Some(number),
@@ -126,20 +147,23 @@ fn entrypoint_signal_death_is_reraised() -> anyhow::Result<()> {
 
 const SIGTERM: i32 = libc::SIGTERM;
 
-/// The tool reports its SIGINT, SIGTTOU, SIGTTIN and SIGQUIT dispositions. heph
-/// itself ignores TTOU/TTIN and handles INT and QUIT, so a child that merely
-/// inherited heph's state would read `IGNORE IGNORE IGNORE DEFAULT` (handlers
-/// reset to default across exec, ignores do not) whatever the caller gave.
+/// The tool reports its SIGINT, SIGTTOU, SIGTTIN, SIGQUIT and SIGPIPE
+/// dispositions. heph itself ignores TTOU/TTIN and PIPE (std, before `main`)
+/// and handles INT and QUIT, so a child that merely inherited heph's state
+/// would read `IGNORE IGNORE IGNORE DEFAULT IGNORE` (handlers reset to default
+/// across exec, ignores do not) whatever the caller gave.
 const DISPOSITIONS_BUILD: &str = r#"
 target(name = "disp", driver = "exec", entrypoint = True,
        run = ["/usr/bin/perl", "-e",
-              "print join(q( ), map { $SIG{$_} // q(DEFAULT) } qw(INT TTOU TTIN QUIT)), qq(\n)"])
+              "print join(q( ), map { $SIG{$_} // q(DEFAULT) } qw(INT TTOU TTIN QUIT PIPE)), qq(\n)"])
 "#;
 
 /// The tool starts with the dispositions heph inherited, not heph's own (N4,
 /// E9, R8): under a `nohup`-like caller SIGINT (and here TTOU/TTIN) stay
-/// ignored; under a plain shell every one is default, although heph ignores
-/// TTOU/TTIN and handles INT/QUIT itself.
+/// ignored, as does a SIGPIPE ignored with `trap '' PIPE` — recorded before
+/// std's runtime ignores it, so X6 is no longer a limit; under a plain shell
+/// every one is default, although heph ignores TTOU/TTIN and PIPE and handles
+/// INT/QUIT itself.
 #[test]
 fn entrypoint_keeps_inherited_dispositions() -> anyhow::Result<()> {
     let dist = Dist::locate();
@@ -150,29 +174,98 @@ fn entrypoint_keeps_inherited_dispositions() -> anyhow::Result<()> {
     assert!(out.status.success(), "{}", describe(&out));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "DEFAULT DEFAULT DEFAULT DEFAULT\n",
+        "DEFAULT DEFAULT DEFAULT DEFAULT DEFAULT\n",
         "plain caller\n{}",
         describe(&out)
     );
 
-    let cmd = ws.cmd(&dist, &[]);
-    let envs: Vec<_> = cmd
-        .get_envs()
-        .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
-        .collect();
-    let out = std::process::Command::new("/bin/sh")
-        .args(["-c", "trap '' INT TTOU TTIN; exec \"$0\" \"$@\""])
-        .arg(dist.heph())
-        .args(["run", "//app:disp"])
-        .current_dir(ws.root())
-        .envs(envs)
-        .stdin(Stdio::null())
-        .output()?;
+    let out = output(via_shell(
+        &ws,
+        &dist,
+        "trap '' INT TTOU TTIN",
+        &["run", "//app:disp"],
+    ))?;
     assert!(out.status.success(), "{}", describe(&out));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "IGNORE IGNORE IGNORE DEFAULT\n",
+        "IGNORE IGNORE IGNORE DEFAULT DEFAULT\n",
         "caller ignored INT, TTOU and TTIN\n{}",
+        describe(&out)
+    );
+
+    let out = output(via_shell(
+        &ws,
+        &dist,
+        "trap '' PIPE",
+        &["run", "//app:disp"],
+    ))?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "DEFAULT DEFAULT DEFAULT DEFAULT IGNORE\n",
+        "caller ignored PIPE\n{}",
+        describe(&out)
+    );
+    Ok(())
+}
+
+/// The tool reports its open-file soft limit and whether SIGUSR1 is blocked.
+const LIMITS_BUILD: &str = r#"
+target(name = "limits", driver = "exec", entrypoint = True,
+       run = ["/bin/sh", "-c",
+              "printf '%s ' \"$(ulimit -n)\"; exec /usr/bin/perl -MPOSIX -e '$s = POSIX::SigSet->new; sigprocmask(SIG_BLOCK, undef, $s) or die; print $s->ismember(SIGUSR1) ? qq(BLOCKED\\n) : qq(OPEN\\n)'"])
+"#;
+
+/// The tool gets the caller's open-file soft limit, not the one heph raised
+/// for itself, and the caller's signal mask, which std clears in every child
+/// (R8, D5).
+#[test]
+fn entrypoint_keeps_callers_open_file_limit_and_mask() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = Workspace::new()?;
+    ws.write("app/BUILD", LIMITS_BUILD)?;
+
+    // Soft only: heph raises its own soft limit towards the hard one, so the
+    // tool must not just be seeing a cap.
+    let out = output(via_shell(
+        &ws,
+        &dist,
+        "ulimit -S -n 200",
+        &["run", "//app:limits"],
+    ))?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "200 OPEN\n",
+        "a lowered limit\n{}",
+        describe(&out)
+    );
+
+    // perl blocks SIGUSR1, then execs the shell that lowers the limit and
+    // execs heph: both survive `exec`.
+    let mut cmd = via_shell(&ws, &dist, "ulimit -S -n 300", &["run", "//app:limits"]);
+    let shell_args: Vec<_> = cmd.get_args().map(|a| a.to_os_string()).collect();
+    let mut blocked = std::process::Command::new("/usr/bin/perl");
+    blocked
+        .args([
+            "-MPOSIX",
+            "-e",
+            "sigprocmask(SIG_BLOCK, POSIX::SigSet->new(SIGUSR1)) or die; exec @ARGV or die",
+            "/bin/sh",
+        ])
+        .args(shell_args)
+        .current_dir(ws.root())
+        .envs(
+            cmd.get_envs()
+                .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string()))),
+        );
+    cmd = blocked;
+    let out = output(cmd)?;
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "300 BLOCKED\n",
+        "a blocked signal\n{}",
         describe(&out)
     );
     Ok(())
@@ -242,7 +335,7 @@ fn entrypoint_signal_to_heph_is_forwarded() -> anyhow::Result<()> {
     // Long enough for a second, duplicate delivery to have landed.
     std::thread::sleep(Duration::from_millis(300));
     std::fs::write(&stop, b"")?;
-    let out = child.wait_with_output()?;
+    let out = common::wait_output(child, common::RUN_DEADLINE)?;
     assert_eq!(out.status.code(), Some(4), "{}", describe(&out));
     assert_eq!(lines(), "ready\nterm\nusr1\n", "each delivered once");
     assert!(
@@ -392,39 +485,129 @@ exec sleep 30
     Ok(())
 }
 
+/// An entrypoint whose dependency builds until `go` exists (or two minutes
+/// pass), and a tool that marks that it ran and lives a second — long enough
+/// for a signal queued before it existed to reach it.
+struct SlowDep {
+    ws: Workspace,
+    started: std::path::PathBuf,
+    go: std::path::PathBuf,
+    ran: std::path::PathBuf,
+}
+
+impl SlowDep {
+    fn new() -> anyhow::Result<Self> {
+        let ws = Workspace::new()?;
+        let started = ws.root().join("dep-started");
+        let go = ws.root().join("go");
+        let ran = ws.root().join("tool-ran");
+        ws.write(
+            "app/BUILD",
+            &format!(
+                r#"
+target(name = "slow", driver = "bash", out = "x", cache = False, run = """
+printf x > {started}
+i=0
+while [ ! -e {go} ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done
+printf x > x
+""")
+target(name = "tool", driver = "exec", entrypoint = True, deps = {{"s": ":slow"}},
+       run = ["/bin/sh", "-c", "touch {ran}; sleep 1"])
+"#,
+                started = started.display(),
+                go = go.display(),
+                ran = ran.display(),
+            ),
+        )?;
+        Ok(Self {
+            ws,
+            started,
+            go,
+            ran,
+        })
+    }
+
+    /// `heph run //app:tool`, once its dependency is building.
+    fn start(&self, dist: &Dist) -> anyhow::Result<std::process::Child> {
+        let child = self
+            .ws
+            .cmd(dist, &["run", "//app:tool"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        common::wait_until("the dependency to start", Duration::from_secs(60), || {
+            self.started.exists()
+        });
+        Ok(child)
+    }
+
+    /// The invocation sandboxes on disk.
+    fn sandboxes(&self) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(self.ws.root().join(".heph/sandbox/app/__invoke/tool"))
+            .map(|d| d.filter_map(Result::ok).map(|e| e.path()).collect())
+            .unwrap_or_default()
+    }
+}
+
 /// Ctrl-C (SIGINT at heph) while the entrypoint's dependency is still
 /// building is an ordinary cancel: the tool never starts, and the run exits
 /// 130 (R9, R23).
 #[test]
 fn ctrl_c_during_dep_build_cancels() -> anyhow::Result<()> {
     let dist = Dist::locate();
-    let ws = Workspace::new()?;
-    let started = ws.root().join("dep-started");
-    let ran = ws.root().join("tool-ran");
-    ws.write(
-        "app/BUILD",
-        &format!(
-            r#"
-target(name = "slow", driver = "bash", run = "printf x > {started}; sleep 600", out = "x", cache = False)
-target(name = "tool", driver = "exec", entrypoint = True, deps = {{"s": ":slow"}},
-       run = ["/usr/bin/touch", "{ran}"])
-"#,
-            started = started.display(),
-            ran = ran.display(),
-        ),
-    )?;
-    let child = ws
-        .cmd(&dist, &["run", "//app:tool"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    common::wait_until("the dependency to start", Duration::from_secs(60), || {
-        started.exists()
-    });
+    let slow = SlowDep::new()?;
+    let child = slow.start(&dist)?;
     common::signal(i32::try_from(child.id())?, libc::SIGINT);
-    let out = child.wait_with_output()?;
+    let out = common::wait_output(child, Duration::from_secs(60))?;
     assert_eq!(out.status.code(), Some(130), "{}", describe(&out));
-    assert!(!ran.exists(), "the tool ran after a cancel");
+    assert!(!slow.ran.exists(), "the tool ran after a cancel");
+    assert!(slow.sandboxes().is_empty(), "{:?}", slow.sandboxes());
+    Ok(())
+}
+
+/// Before the tool exists heph is an ordinary run (N4a: the relay starts at
+/// the spawn): a TERM or HUP while a dependency builds ends heph at once, as
+/// on any command, rather than waiting in the relay for a tool that is never
+/// spawned. Nothing ran and no invocation sandbox is left.
+#[test]
+fn term_or_hup_during_dep_build_ends_heph() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    for (name, sig) in [("TERM", libc::SIGTERM), ("HUP", libc::SIGHUP)] {
+        let slow = SlowDep::new()?;
+        let child = slow.start(&dist)?;
+        common::signal(i32::try_from(child.id())?, sig);
+        let out = common::wait_output(child, Duration::from_secs(20))
+            .map_err(|e| anyhow::anyhow!("SIG{name} did not end heph promptly: {e:#}"))?;
+        assert_eq!(
+            out.status.signal(),
+            Some(sig),
+            "SIG{name}: heph dies of it\n{}",
+            describe(&out)
+        );
+        assert!(!slow.ran.exists(), "SIG{name}: the tool ran");
+        assert!(
+            slow.sandboxes().is_empty(),
+            "SIG{name}: {:?}",
+            slow.sandboxes()
+        );
+    }
+    Ok(())
+}
+
+/// A SIGQUIT sent to look at a slow dependency build is heph's diagnostic
+/// dump, as on any run — it is not queued for the tool, which would then die
+/// of it the moment it starts.
+#[test]
+fn quit_during_dep_build_does_not_reach_the_tool() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let slow = SlowDep::new()?;
+    let child = slow.start(&dist)?;
+    common::signal(i32::try_from(child.id())?, libc::SIGQUIT);
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(&slow.go, b"")?;
+    let out = common::wait_output(child, common::RUN_DEADLINE)?;
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    assert!(slow.ran.exists(), "the tool never ran\n{}", describe(&out));
     Ok(())
 }

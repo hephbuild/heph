@@ -15,6 +15,22 @@ mod pprof_dump;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// SIGPIPE as the caller gave it, read before `main`: std's runtime setup
+/// ignores SIGPIPE before calling `main`, so `record_inherited` alone could
+/// never tell an inherited ignore (`trap '' PIPE`) from heph's own. The
+/// loader runs this entry (glibc's `.init_array`, dyld's `__mod_init_func`)
+/// before std's `lang_start`. It only reads the disposition and stores an
+/// atomic, which is sound before std is initialized.
+#[used]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+static NOTE_INHERITED_SIGPIPE: extern "C" fn() = {
+    extern "C" fn note() {
+        hcore::process::note_inherited_sigpipe();
+    }
+    note
+};
+
 #[derive(Parser)]
 #[command(name = "heph")]
 #[command(about = "An efficient build system", long_about = None)]
@@ -48,6 +64,13 @@ fn main() -> ExitCode {
     // so the pinned binary records the caller's too.
     hcore::process::record_inherited();
 
+    // Once, while this process is still single-threaded, so every later fork
+    // from any thread — the runner agent's, telemetry's, a build's, an
+    // entrypoint's — copies a settled libSystem state (`hproc::fork_safety`;
+    // a no-op on Linux). The spawns that call it themselves keep doing so for
+    // the processes that never run this `main` (tests, embedders).
+    hproc::fork_safety::prime();
+
     // The two exec-runner subcommands, dispatched here for the same reason:
     // they must not pull in logging, a runtime, clap or the TUI. Unlike
     // `__supervisor` these are a pure prefix strip — `__runner-exec`'s argv IS
@@ -64,13 +87,6 @@ fn main() -> ExitCode {
     // subcommands: its argv and its stdin belong to the *calling tool* — Docker
     // appends `get`, git appends `get`/`store`/`erase`, and both write a request
     // on stdin — so parsing it as flags would misread somebody else's protocol.
-    // Once, while this process is still single-threaded, so every later fork
-    // from any thread — the runner agent's, telemetry's, a build's, an
-    // entrypoint's — copies a settled libSystem state (`hproc::fork_safety`;
-    // a no-op on Linux). The spawns that call it themselves keep doing so for
-    // the processes that never run this `main` (tests, embedders).
-    hproc::fork_safety::prime();
-
     // It also must not pull in logging or the TUI: it is a callback running
     // inside another tool, and anything it writes to stdout is that tool's
     // document.

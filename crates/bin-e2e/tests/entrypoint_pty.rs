@@ -40,6 +40,8 @@ n=0
 trap 'n=$((n+1)); echo "got-int-$n"; [ "$n" -ge 2 ] && exit 7' INT
 m=0
 trap 'm=$((m+1)); echo "got-usr1-$m"' USR1
+t=0
+trap 't=$((t+1)); echo "got-term-$t"' TERM
 trap '' HUP
 echo "tool-pid-$$."
 echo "trap-""ready"
@@ -111,6 +113,52 @@ fn entrypoint_ctrl_c_goes_to_tool() -> anyhow::Result<()> {
             "heph reacted to the tool's Ctrl-C ({heph_said:?})\n{seen}"
         );
     }
+    assert!(pty.cursor_visible(), "cursor left hidden\n{}", pty.screen());
+    Ok(())
+}
+
+/// Signals sent with `kill` while heph is the terminal's foreground (R2):
+/// - a TERM to heph's pid is relayed, exactly once;
+/// - an INT to heph's pid is dropped (X5): in the shared group it cannot be
+///   told apart from the terminal's own, which already reached the tool;
+/// - a TERM to the whole group (`kill -TERM -<pgid>`, `kill 0`) reaches the
+///   tool at least once — from the kernel, and again from the relay, which
+///   cannot tell it from one sent to heph's pid alone (D11).
+///
+/// heph acts on none of them.
+#[test]
+fn entrypoint_kill_under_a_terminal() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = workspace()?;
+    let mut pty = Pty::spawn(&dist, ws.root(), &["run", "//app:trapper"], &[]);
+    pty.wait_for("trap-ready", DEADLINE);
+
+    common::signal(pty.pid(), libc::SIGTERM);
+    pty.wait_for("got-term-1", Duration::from_secs(20));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !pty.seen().contains("got-term-2"),
+        "one TERM, two deliveries\n{}",
+        pty.screen()
+    );
+
+    common::signal(pty.pid(), libc::SIGINT);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !pty.seen().contains("got-int-1"),
+        "an INT to heph's pid under the terminal is dropped (X5)\n{}",
+        pty.screen()
+    );
+
+    // heph leads the PTY's session, so its group is its pid.
+    common::signal(-pty.pid(), libc::SIGTERM);
+    pty.wait_for("got-term-2", Duration::from_secs(20));
+
+    pty.send(&[0x03]);
+    pty.wait_for("got-int-1", Duration::from_secs(20));
+    pty.send(&[0x03]);
+    pty.wait_for("got-int-2", Duration::from_secs(20));
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(7), "{}", pty.seen());
     assert!(pty.cursor_visible(), "cursor left hidden\n{}", pty.screen());
     Ok(())
 }

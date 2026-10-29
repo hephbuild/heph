@@ -138,11 +138,47 @@ impl Workspace {
 
     /// Run to completion with both streams captured (so stderr is *not* a tty
     /// and the CI line renderer is selected).
+    ///
+    /// Bounded by [`RUN_DEADLINE`]: a hung heph is killed and the test fails
+    /// naming the command, instead of stalling the suite until CI's timeout.
     pub fn run(&self, dist: &Dist, args: &[&str]) -> Result<Output> {
-        self.cmd(dist, args)
+        let child = self
+            .cmd(dist, args)
             .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("spawn heph {}", args.join(" ")))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawn heph {}", args.join(" ")))?;
+        wait_output(child, RUN_DEADLINE).with_context(|| format!("heph {}", args.join(" ")))
+    }
+}
+
+/// How long any one heph run may take before the suite kills it: generous for
+/// a release binary building a dependency on a shared CI runner.
+pub const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `wait_with_output`, bounded: past `timeout` the child is SIGKILLed (its
+/// supervisor then reaps whatever it ran) and this is an error carrying what
+/// it printed so far.
+pub fn wait_output(child: std::process::Child, timeout: std::time::Duration) -> Result<Output> {
+    let pid = i32::try_from(child.id()).context("pid")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver gone means the caller already gave up on it.
+        drop(tx.send(child.wait_with_output()));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(out) => out.context("wait for heph"),
+        Err(_) => {
+            // SAFETY: a plain syscall on integers; the waiter thread still
+            // owns the child, so the pid cannot have been reaped and reused.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let out = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map(|o| o.map(|o| describe(&o)).unwrap_or_default())
+                .unwrap_or_default();
+            anyhow::bail!("still running after {timeout:?}; killed\n{out}")
+        }
     }
 }
 
