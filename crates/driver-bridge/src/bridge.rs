@@ -157,8 +157,9 @@ impl ManagedDriverBridge {
     /// 8): its sandbox is a unique per-invocation directory the engine
     /// creates, owns through a lock file inside it and removes itself, while
     /// the FUSE runner redirects `sandbox_dir` into its upper side and owns
-    /// that teardown. And R1 copies every input of an invocation anyway, which
-    /// is what the OS runner does with an input that is not read-only.
+    /// that teardown. And R1 copies every input of an invocation anyway: the
+    /// OS runner ignores the stage for a def with `entrypoint` set, so even a
+    /// read-only input is copied, never linked (`ManagedDriverOs::run_inner`).
     fn pick(&self, req: &RunRequest<'_, '_>) -> anyhow::Result<Pick> {
         if req.target.entrypoint.is_some() {
             return Ok(Pick::Os);
