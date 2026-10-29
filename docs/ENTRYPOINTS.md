@@ -51,7 +51,9 @@ Entrypoints always run on the OS sandbox: `fuse.enabled` is ignored for them.
   invocation: a dep is a copy, while tools and `read_only_deps` are linked
   read-only from heph's shared stage. Do not write next to a linked input (a
   `.vite` cache, `__pycache__`): the write would reach every build that links
-  the same entry. Two invocations of the same target run concurrently, each in
+  the same entry. (On macOS a transitive tool's files are copy-on-write clones,
+  so a write to one stays in the sandbox; on Linux they are hardlinks, and
+  `read_only_deps` is a directory symlink on both.) Two invocations of the same target run concurrently, each in
   its own sandbox, which is removed when the tool exits.
 - **Terminal and signals**: the tool inherits heph's stdin, stdout and stderr,
   and the signal dispositions and signal mask heph itself inherited (under
