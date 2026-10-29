@@ -27,7 +27,7 @@ use crate::engine::driver::{
     Disposition, Foreground, Handover, RunOptions, RunStdio, Signal, SignalReceiver,
 };
 use crate::engine::execute::{SandboxLease, SandboxRun};
-use crate::engine::invoke_sandbox::{InvokeSandbox, invoke_parent};
+use crate::engine::invoke_sandbox::{BUILD_SANDBOX_PREFIX, InvokeSandbox, invoke_parent};
 use crate::engine::request_state::RequestState;
 use crate::engine::result::{OutputMatcher, ResultOptions};
 use anyhow::Context;
@@ -315,7 +315,13 @@ impl Engine {
             Ok(Ok(())) => InvokeOutcome::Exited(Exit::Code(0)),
             // Only the driver's own run is read for a process exit.
             Ok(Err(e)) => match hplugin::error::process_exit(&e) {
-                Some(exit) => InvokeOutcome::Exited(exit),
+                Some(exit) if exit.is_failure_status() => InvokeOutcome::Exited(exit),
+                // A status no failed process can have (a plugin's code 0 or
+                // 300, a SIGSTOP): heph cannot exit with it, so it is heph's
+                // failure, with the driver's message.
+                Some(exit) => InvokeOutcome::Failed(e.context(format!(
+                    "the driver reported the impossible exit status {exit:?} for a failed run"
+                ))),
                 None => InvokeOutcome::Failed(e),
             },
             Err(e) => InvokeOutcome::Failed(e),
@@ -342,6 +348,14 @@ impl Engine {
             }
             .into());
         }
+        // `<pkg>/__invoke/__target_x/` is also where the build sandbox of
+        // `//<pkg>/__invoke:x` lives: an invocation must never land in it.
+        if addr.name.starts_with(BUILD_SANDBOX_PREFIX) {
+            anyhow::bail!(
+                "{addr}: an entrypoint's name cannot start with `{BUILD_SANDBOX_PREFIX}` (heph's \
+                 build sandboxes use that prefix); rename the target"
+            );
+        }
         let driver = self
             .drivers_by_name
             .get(&spec.driver)
@@ -363,9 +377,7 @@ impl Engine {
         // wired in.
         let fail_fast = rs.fail_fast();
         let hash_only = expanded.iter().filter(|i| !i.runtime).map(|input| {
-            let engine = Arc::clone(self);
-            let rs = rs.clone();
-            async move {
+            enclose::enclose!((Arc::clone(self) => engine, rs) async move {
                 engine
                     .result_addr(
                         rs,
@@ -375,7 +387,7 @@ impl Engine {
                     )
                     .await?;
                 anyhow::Ok(())
-            }
+            })
         });
         let (inputs, hash_only) = futures::future::join(
             Arc::clone(self).inputs_result_exec(rs.clone(), &linked.inputs),
@@ -387,9 +399,21 @@ impl Engine {
 
         // The process may exit as soon as the tool does, without the teardown
         // that would otherwise flush what these builds queued: drain it now,
-        // so a cold call leaves its deps cached (E15).
-        self.sqlite_writes.drain_queued_writes().await;
-        rs.bg_pending().wait_drained().await;
+        // so a cold call leaves its deps cached (E15). The local cache only:
+        // the request's other background work — remote uploads above all,
+        // which can take minutes — runs on beside the tool and is drained as
+        // for any command once it exits, rather than delaying its start.
+        // Cancellable: a Ctrl-C while a slow write commits ends the run here.
+        // Biased: a cancel that landed while a dep build was stuck elsewhere
+        // wins over a drain that has just become ready.
+        tokio::select! {
+            biased;
+            () = hcore::hasync::Cancellable::cancelled(rs.ctoken()) => {
+                return Err(anyhow::Error::new(hplugin::error::CancelledError))
+                    .with_context(|| format!("waiting for {addr}'s deps to be cached"));
+            }
+            () = self.sqlite_writes.drain_queued_writes() => {}
+        }
 
         let deferred_refs = self.deferred_refs(&spec.spec, &spec.driver)?;
         let deferred = self

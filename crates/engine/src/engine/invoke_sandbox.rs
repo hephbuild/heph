@@ -26,9 +26,13 @@
 //!   `.owner` fd is held until `remove_dir_all` has finished, so a sweeper
 //!   cannot race the teardown into the same tree.
 //! * **Swept** when a crash left one: only a directory containing `.owner`
-//!   whose lock is free is eligible, nothing is followed through a symlink, and
-//!   a directory without `.owner` — a crash between the create and the rename,
-//!   or anything else that happens to live there — is left alone. `invoke`
+//!   (or, a crash between the lock and the rename, only `.owner-pending`)
+//!   whose lock is free is eligible, nothing is followed through a symlink,
+//!   and a directory with neither — anything else that happens to live there —
+//!   is left alone. A creator whose fresh `.owner-pending` a sweeper locked
+//!   first takes another name. The lock file is removed last, so a teardown
+//!   that fails partway stays sweepable. A live invocation's tree is never
+//!   walked into. `invoke`
 //!   sweeps its own target's siblings (on the cleaner's reclaim lane);
 //!   `heph gc` sweeps every one under `<home>/sandbox`.
 //!
@@ -48,6 +52,9 @@ use std::path::{Path, PathBuf};
 /// The directory component every invocation sandbox lives under, inside its
 /// package's sandbox dir.
 pub(crate) const INVOKE_DIR: &str = "__invoke";
+/// The prefix of a build's per-address sandbox (`__target_<name>`), which an
+/// invocation's directory must never be mistaken for or land in.
+pub(crate) const BUILD_SANDBOX_PREFIX: &str = "__target_";
 /// The lock file that marks a live invocation.
 const OWNER: &str = ".owner";
 /// The lock file's name until it is held.
@@ -123,6 +130,10 @@ impl InvokeSandbox {
             }
             let owner = match claim(&dir) {
                 Ok(owner) => owner,
+                // A sweeper took the fresh `.owner-pending` for a crash's
+                // leftover in the instant before we locked it, and is removing
+                // the directory: take another name.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => {
                     // Ours, and nobody else's yet: leave nothing behind.
                     drop(hcore::fsutil::remove_dir_all(&dir));
@@ -176,9 +187,55 @@ impl Drop for InvokeSandbox {
     }
 }
 
-/// `remove_dir_all`, with an already-gone tree a success.
+/// Remove an owned invocation sandbox, with an already-gone tree a success.
+///
+/// The lock file goes last: a removal that fails partway (EACCES on something
+/// the tool left, EBUSY) leaves the tree with its `.owner` — or its
+/// `.owner-pending` — still there, so the next sweep finds it eligible once
+/// the lock is free, instead of an owner-less tree no sweep may touch. A
+/// directory the tool made read-only is made writable and the removal retried
+/// once, as `hcore::fsutil::remove_dir_all` does.
 fn remove(dir: &Path) -> io::Result<()> {
-    match hcore::fsutil::remove_dir_all(dir) {
+    match remove_owner_last(dir) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            hcore::fsutil::make_readwrite_tree(dir);
+            remove_owner_last(dir)
+        }
+        other => other,
+    }
+}
+
+fn remove_owner_last(dir: &Path) -> io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == OWNER || name == OWNER_PENDING {
+            continue;
+        }
+        let path = entry.path();
+        // The entry's own type: a symlink is unlinked, never followed.
+        let res = if entry.file_type()?.is_dir() {
+            hcore::fsutil::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match res {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    for lock in [OWNER, OWNER_PENDING] {
+        match std::fs::remove_file(dir.join(lock)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    match std::fs::remove_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
@@ -252,31 +309,53 @@ pub(crate) fn sweep(parent: &Path) -> usize {
     removed
 }
 
-/// Remove `dir` if it has an `.owner` nobody holds. `Ok(false)` when it is
-/// not eligible or is live.
-fn sweep_one(dir: &Path) -> io::Result<bool> {
-    let owner = match std::fs::OpenOptions::new()
+/// Open `dir/name` as a lock file: `None` when it is absent or not a plain
+/// file (a symlink is never followed).
+fn open_lock(dir: &Path, name: &str) -> io::Result<Option<File>> {
+    match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dir.join(OWNER))
+        .open(dir.join(name))
     {
-        Ok(f) => f,
-        // No `.owner` (or a symlink in its place): not an invocation sandbox
-        // this sweep may touch.
+        Ok(f) if f.metadata()?.is_file() => Ok(Some(f)),
+        Ok(_) => Ok(None),
         Err(e)
             if e.kind() == io::ErrorKind::NotFound
                 || e.raw_os_error() == Some(libc::ELOOP)
                 || e.raw_os_error() == Some(libc::ENOTDIR) =>
         {
-            return Ok(false);
+            Ok(None)
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `dir` is an invocation sandbox, live or not: it has a lock file.
+fn has_lock_file(dir: &Path) -> bool {
+    [OWNER, OWNER_PENDING]
+        .iter()
+        .any(|name| std::fs::symlink_metadata(dir.join(name)).is_ok_and(|m| m.is_file()))
+}
+
+/// Remove `dir` if it has an `.owner` nobody holds — or, failing that, an
+/// `.owner-pending` nobody holds: a crash between the lock and the rename.
+/// A creator that has made `.owner-pending` but not locked it yet loses the
+/// race to the lock and takes another name. `Ok(false)` when it is not
+/// eligible or is live.
+fn sweep_one(dir: &Path) -> io::Result<bool> {
+    let lock = match open_lock(dir, OWNER)? {
+        Some(owner) => owner,
+        None => match open_lock(dir, OWNER_PENDING)? {
+            Some(pending) => pending,
+            // No lock file: not an invocation sandbox this sweep may touch.
+            None => return Ok(false),
+        },
     };
-    if !owner.metadata()?.is_file() || !try_lock_exclusive(&owner)? {
+    if !try_lock_exclusive(&lock)? {
         return Ok(false);
     }
     // Held across the removal, as the owner's own teardown holds it.
-    match hcore::fsutil::remove_dir_all(dir) {
+    match remove(dir) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
@@ -300,10 +379,15 @@ pub(crate) fn sweep_all(sandbox_root: &Path) -> usize {
             }
             let name = entry.file_name();
             let name = name.as_encoded_bytes();
-            if name.starts_with(b"__target_") || name.starts_with(b".") {
+            if name.starts_with(BUILD_SANDBOX_PREFIX.as_bytes()) || name.starts_with(b".") {
                 continue;
             }
             let path = entry.path();
+            // A live invocation's own tree (what the sweep below left) is
+            // never walked: it is the tool's, and can be arbitrarily deep.
+            if has_lock_file(&path) {
+                continue;
+            }
             if name == INVOKE_DIR.as_bytes() {
                 // `__invoke/<name>/<random>`: sweep each target's siblings. A
                 // package component that happens to be named `__invoke` is
@@ -312,7 +396,10 @@ pub(crate) fn sweep_all(sandbox_root: &Path) -> usize {
                 if let Ok(targets) = std::fs::read_dir(&path) {
                     for t in targets.flatten() {
                         if t.file_type().is_ok_and(|ft| ft.is_dir())
-                            && !t.file_name().as_encoded_bytes().starts_with(b"__target_")
+                            && !t
+                                .file_name()
+                                .as_encoded_bytes()
+                                .starts_with(BUILD_SANDBOX_PREFIX.as_bytes())
                         {
                             removed += sweep(&t.path());
                         }
@@ -405,12 +492,18 @@ mod tests {
         // Live in this process.
         let live = InvokeSandbox::create(&parent, None)?;
 
-        // No `.owner` at all, and the pre-rename state of a create.
+        // No lock file at all; a crash between the lock and the rename (an
+        // unlocked `.owner-pending`, swept); a create in that window, live.
         let bare = parent.join("bare");
         std::fs::create_dir_all(&bare)?;
         let pending = parent.join("pending");
         std::fs::create_dir_all(&pending)?;
         std::fs::write(pending.join(OWNER_PENDING), b"")?;
+        let pending_live = parent.join("pending-live");
+        std::fs::create_dir_all(&pending_live)?;
+        std::fs::write(pending_live.join(OWNER_PENDING), b"")?;
+        let pending_lock = std::fs::File::open(pending_live.join(OWNER_PENDING))?;
+        assert!(try_lock_exclusive(&pending_lock)?);
 
         // `.owner` as a symlink to a free lock file elsewhere.
         let linked = parent.join("linked");
@@ -442,14 +535,30 @@ mod tests {
         {
             use std::io::BufRead as _;
             let out = holder.stdout.take().context("holder stdout")?;
-            let mut lines = std::io::BufReader::new(out).lines();
-            let locked = lines.find(|l| l.as_ref().is_ok_and(|l| l.contains("heph-owner-locked")));
-            assert!(locked.is_some(), "the holder took the lock");
+            // Read off-thread, bounded: a holder that never locks must fail
+            // the test, not hang it.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut lines = std::io::BufReader::new(out).lines();
+                let locked =
+                    lines.any(|l| l.as_ref().is_ok_and(|l| l.contains("heph-owner-locked")));
+                // A gone receiver already failed the test.
+                let _sent = tx.send(locked);
+            });
+            let locked = rx.recv_timeout(std::time::Duration::from_secs(60));
+            if locked != Ok(true) {
+                drop(holder.kill());
+                panic!("the holder never took the lock: {locked:?}");
+            }
         }
 
-        assert_eq!(sweep(&parent), 1, "only the crash leftover goes");
+        assert_eq!(sweep(&parent), 2, "only the crash leftovers go");
         assert!(!dead_dir.exists());
-        for kept in [live.dir(), &bare, &pending, &linked, &other_dir] {
+        assert!(
+            !pending.exists(),
+            "an unlocked `.owner-pending` is a leftover"
+        );
+        for kept in [live.dir(), &bare, &pending_live, &linked, &other_dir] {
             assert!(kept.exists(), "{} kept", kept.display());
         }
         assert!(victim.join(OWNER).exists(), "a symlink is never followed");
@@ -459,9 +568,10 @@ mod tests {
         holder.wait()?;
         let live_dir = live.dir().to_path_buf();
         drop(live);
-        assert_eq!(sweep(&parent), 2);
-        assert!(!live_dir.exists() && !other_dir.exists());
-        assert!(bare.exists() && pending.exists() && linked.exists());
+        drop(pending_lock);
+        assert_eq!(sweep(&parent), 3);
+        assert!(!live_dir.exists() && !other_dir.exists() && !pending_live.exists());
+        assert!(bare.exists() && linked.exists());
         Ok(())
     }
 
@@ -481,11 +591,22 @@ mod tests {
         let inside = root.join("a/__target_y/__invoke/v/z");
         std::fs::create_dir_all(&inside)?;
         std::fs::write(inside.join(OWNER), b"")?;
+        // A live invocation whose tool built what looks like a leftover in its
+        // own tree: the walk never descends into a live invocation.
+        let live = InvokeSandbox::create(&root.join("c/__invoke/w"), None)?;
+        let nested = live.dir().join("ws/c/__invoke/n/q");
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(nested.join(OWNER), b"")?;
         let (a_dir, b_dir) = (a.dir().to_path_buf(), b.dir().to_path_buf());
         drop((a, b));
         assert_eq!(sweep_all(&root), 2);
         assert!(!a_dir.exists() && !b_dir.exists());
         assert!(inside.exists(), "a build sandbox is never walked into");
+        assert!(
+            nested.exists(),
+            "a live invocation's tree is never walked into"
+        );
+        live.teardown()?;
         Ok(())
     }
 }

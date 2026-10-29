@@ -1761,3 +1761,131 @@ target(name = "ep", driver = "bash", entrypoint = True,
     assert_eq!(read(&out)?, want, "across the seam");
     Ok(())
 }
+
+/// Ctrl-C after the deps built but before the handover — here while invoke
+/// waits for their queued cache writes (held), the last wait before the
+/// sandbox is made and the closure materialized — cancels the run: a
+/// heph-side failure, the handover never fired, the tool never ran, no
+/// sandbox left (R9, R23). A `hash_deps` dep, as in
+/// `fast_exit_flushes_pending_cache_writes`: only the drain waits for its
+/// write.
+#[tokio::test]
+async fn cancel_before_the_handover_spawns_nothing() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let ran = ws.dir.path().join("ran");
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"
+target(name = "dep", driver = "bash", run = "printf d > $OUT", out = "d")
+target(name = "ep", driver = "exec", entrypoint = True, hash_deps = [":dep"],
+       run = ["/usr/bin/touch", "{}"])
+"#,
+            ran.display()
+        ),
+    );
+    let out = ws.dir.path().join("out.txt");
+    let fired = Arc::new(AtomicUsize::new(0));
+    let hold = ws.engine.hold_local_cache_writes();
+    let rs = ws.engine.new_state();
+    let req =
+        request("//app:ep", ws.dir.path(), &[], &out)?.with_handover(handover_counter(&fired));
+    let engine = Arc::clone(&ws.engine);
+    let run = tokio::spawn({
+        let rs = Arc::clone(&rs);
+        async move { engine.invoke(rs, req).await }
+    });
+    // The dep built and its write is queued behind the hold.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!run.is_finished(), "invoke must wait for the dep's write");
+    rs.ctoken().cancel();
+    // Released after the cancel: wherever the wait was — a dep's own write
+    // is not cancellable — the run must not go on to the tool.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(hold);
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .context("a cancelled run must end")??;
+    let err = failed(outcome);
+    assert!(
+        format!("{err:#}").contains("cancel"),
+        "a cancellation: {err:#}"
+    );
+    assert_eq!(fired.load(Ordering::SeqCst), 0, "no handover");
+    assert!(!ran.exists(), "the tool never ran");
+    assert!(invoke_sandboxes(&ws.engine, "app", "ep").is_empty());
+    Ok(())
+}
+
+/// An invoking future dropped mid-run (its task aborted — the process is not
+/// exiting) still reclaims: the tool is killed, the sandbox removed off the
+/// request's path, and its `.owner` lock released with it (R11, E20).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_invocation_is_reclaimed() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "hold", driver = "bash", entrypoint = True,
+       run = "echo $$ > \"$HEPH_TEST_OUT\"; exec sleep 60")
+"#,
+    );
+    let pid_file = ws.dir.path().join("pid");
+    let engine = Arc::clone(&ws.engine);
+    let req = request("//app:hold", ws.dir.path(), &[], &pid_file)?;
+    let run = tokio::spawn(async move { invoke(&engine, req).await });
+    wait_for("the tool to start", || {
+        std::fs::read_to_string(&pid_file).is_ok_and(|s| s.ends_with('\n'))
+    })
+    .await?;
+    let pid: i32 = read(&pid_file)?.trim().parse()?;
+    let live = invoke_sandboxes(&ws.engine, "app", "hold");
+    assert_eq!(live.len(), 1, "{live:?}");
+
+    run.abort();
+    assert!(run.await.is_err_and(|e| e.is_cancelled()));
+    let alive = move || {
+        // SAFETY: signal 0 only checks that the pid exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    };
+    wait_for("the tool to be killed", || !alive()).await?;
+    wait_for("the sandbox to be reclaimed", || !live[0].exists()).await?;
+    // Nothing left for a sweep, and no lock still held on the parent's
+    // contents: a fresh invocation runs and cleans up as usual.
+    let exit = exited(
+        invoke(
+            &ws.engine,
+            request("//app:hold", ws.dir.path(), &[], &ws.dir.path().join("x"))?.with_signals({
+                let (tx, rx) = hplugin::driver::signal_channel();
+                tx.send(hplugin::driver::Signal::from_raw(libc::SIGTERM))?;
+                rx
+            }),
+        )
+        .await,
+    );
+    assert_eq!(exit, Exit::Signal(libc::SIGTERM));
+    assert!(invoke_sandboxes(&ws.engine, "app", "hold").is_empty());
+    Ok(())
+}
+
+/// An entrypoint named `__target_<x>` would put its invocations inside the
+/// build sandbox of `//<pkg>/__invoke:<x>`: refused, before any dep builds.
+#[tokio::test]
+async fn entrypoint_name_with_build_sandbox_prefix_is_refused() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"target(name = "__target_x", driver = "exec", entrypoint = True, run = ["true"])"#,
+    );
+    let out = ws.dir.path().join("out");
+    let err = failed(
+        invoke(
+            &ws.engine,
+            request("//app:__target_x", ws.dir.path(), &[], &out)?,
+        )
+        .await,
+    );
+    assert!(format!("{err:#}").contains("`__target_`"), "{err:#}");
+    assert!(invoke_sandboxes(&ws.engine, "app", "__target_x").is_empty());
+    Ok(())
+}

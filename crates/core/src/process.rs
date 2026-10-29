@@ -36,7 +36,34 @@ impl Exit {
             (None, None) => None,
         }
     }
+
+    /// Whether this is a status a process can end a failed run with, so heph
+    /// can exit with it: a code in 1–255 (what a wait status carries), or a
+    /// signal whose default action terminates. A driver — a plugin's above
+    /// all — that reports anything else (code 0 or 300, a SIGSTOP, a SIGCHLD,
+    /// which re-raised would not end heph) is reporting heph's own failure.
+    pub fn is_failure_status(self) -> bool {
+        match self {
+            Exit::Code(code) => (1..=255).contains(&code),
+            Exit::Signal(sig) => (1..=MAX_SIGNAL).contains(&sig) && !NON_TERMINATING.contains(&sig),
+        }
+    }
 }
+
+/// Signals whose default action stops, continues or ignores rather than
+/// terminates: no process dies of one.
+const NON_TERMINATING: &[libc::c_int] = &[
+    libc::SIGSTOP,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGCONT,
+    libc::SIGCHLD,
+    libc::SIGWINCH,
+    libc::SIGURG,
+    #[cfg(target_os = "macos")]
+    libc::SIGINFO,
+];
 
 /// An OS signal number, as a type, so a signal is never confused with an exit
 /// code or a pid. OS-local (see the module docs).
@@ -265,13 +292,42 @@ mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt as _;
 
+    /// Which reported statuses heph can exit with, and which mean the driver
+    /// reported something no failed process ends with.
+    #[test]
+    fn failure_status_table() {
+        let rows = [
+            (Exit::Code(1), true),
+            (Exit::Code(255), true),
+            (Exit::Code(0), false),
+            (Exit::Code(256), false),
+            (Exit::Code(300), false),
+            (Exit::Code(-1), false),
+            (Exit::Signal(libc::SIGTERM), true),
+            (Exit::Signal(libc::SIGKILL), true),
+            (Exit::Signal(libc::SIGSEGV), true),
+            (Exit::Signal(libc::SIGSTOP), false),
+            (Exit::Signal(libc::SIGTSTP), false),
+            (Exit::Signal(libc::SIGCHLD), false),
+            (Exit::Signal(libc::SIGWINCH), false),
+            (Exit::Signal(0), false),
+            (Exit::Signal(-15), false),
+            (Exit::Signal(MAX_SIGNAL + 1), false),
+        ];
+        for (exit, want) in rows {
+            assert_eq!(exit.is_failure_status(), want, "{exit:?}");
+        }
+    }
+
     /// Set in the re-executed copy of this test binary, which changes its own
     /// dispositions: doing that in the shared test process would leak into
     /// every parallel test.
     const RECORD_CHILD: &str = "HEPH_CORE_RECORD_INHERITED_CHILD";
 
     /// What the caller ignored is recorded as ignored, what it left default as
-    /// default, and SIGPIPE — ignored by Rust before `main` — as default (X6).
+    /// default, and SIGPIPE — ignored by Rust before `main`, and noted before
+    /// it only by heph's binary (`bin-e2e`'s `entrypoint_keeps_inherited_dispositions`)
+    /// — as default.
     /// Changes made after the record do not move it, and restoring puts the
     /// recorded state back.
     #[test]
@@ -331,7 +387,7 @@ mod tests {
         assert_eq!(get(libc::SIGTTOU), Some(Disposition::Ignore));
         assert_eq!(get(libc::SIGTTIN), Some(Disposition::Default));
         assert_eq!(get(libc::SIGTERM), Some(Disposition::Default));
-        assert_eq!(get(libc::SIGPIPE), Some(Disposition::Default), "X6");
+        assert_eq!(get(libc::SIGPIPE), Some(Disposition::Default), "not noted");
         assert_eq!(inherited_dispositions().len(), RECORDED_SIGNALS.len());
         assert!(inherited_nofile().is_some());
         assert_eq!(
